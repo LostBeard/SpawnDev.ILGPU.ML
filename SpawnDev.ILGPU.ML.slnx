@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SpawnDev.ILGPU.ML.Demo/SpawnDev.ILGPU.ML.Demo.csproj" />
+  <Project Path="SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML.csproj" />
+</Solution>
