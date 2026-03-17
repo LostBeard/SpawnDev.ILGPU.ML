@@ -32,6 +32,7 @@ public class Dav3Inference
 
     // Kernels
     private readonly Conv2DKernel _conv2d;
+    private readonly ConvTranspose2DKernel _convTranspose;
     private readonly MatMulKernel _matMul;
     private readonly LayerNormKernel _layerNorm;
     private readonly SoftmaxKernel _softmax;
@@ -60,6 +61,7 @@ public class Dav3Inference
         _weights = weights;
 
         _conv2d = new Conv2DKernel(accelerator);
+        _convTranspose = new ConvTranspose2DKernel(accelerator);
         _matMul = new MatMulKernel(accelerator);
         _layerNorm = new LayerNormKernel(accelerator);
         _softmax = new SoftmaxKernel(accelerator);
@@ -93,7 +95,7 @@ public class Dav3Inference
             _blockOutputs[i] = _accelerator.Allocate1D<float>(T * C);
 
         // DPT head — pre-allocates all intermediate buffers to avoid lifetime issues
-        _dptHead = new DptHead(_accelerator, _conv2d, _elementWise, _layerNorm);
+        _dptHead = new DptHead(_accelerator, _conv2d, _convTranspose, _elementWise, _layerNorm);
         _dptHead.Initialize();
 
         Console.WriteLine($"[Dav3] Initialized: 12 blocks, buffers allocated");
@@ -180,7 +182,7 @@ public class Dav3Inference
         return _lastDepthBuf;
     }
 
-    /// <summary>Read back depth output to CPU. Call after RunFull. Returns [2, 37, 37] (depth + confidence).</summary>
+    /// <summary>Read back depth output to CPU. Call after RunFull. Returns [2, 296, 296] (depth + confidence).</summary>
     public async Task<float[]> ReadDepthOutputAsync()
     {
         if (_lastDepthBuf == null) throw new InvalidOperationException("Run RunFull first.");
