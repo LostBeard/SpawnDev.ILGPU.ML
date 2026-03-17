@@ -92,8 +92,9 @@ public class Dav3Inference
         for (int i = 4; i < 12; i++)
             _blockOutputs[i] = _accelerator.Allocate1D<float>(T * C);
 
-        // DPT head
+        // DPT head — pre-allocates all intermediate buffers to avoid lifetime issues
         _dptHead = new DptHead(_accelerator, _conv2d, _elementWise, _layerNorm);
+        _dptHead.Initialize();
 
         Console.WriteLine($"[Dav3] Initialized: 12 blocks, buffers allocated");
     }
@@ -134,11 +135,12 @@ public class Dav3Inference
         }
 
         // Step 4: Run 12 transformer blocks, saving outputs 4-11 for DPT head
+        // Zero block output buffers first so AddInPlace acts as a copy (supports repeated calls)
+        for (int i = 4; i < 12; i++)
+            _elementWise.ScaleInPlace(_blockOutputs![i].View, T * C, 0f);
+
         var currentIn = _tokenBuf1!.View;
         var currentOut = _tokenBuf2!.View;
-        var nativeAccel = _accelerator.NativeAccelerator;
-        var device = nativeAccel.NativeDevice!;
-        var queue = nativeAccel.Queue!;
 
         for (int b = 0; b < 12; b++)
         {
@@ -146,18 +148,7 @@ public class Dav3Inference
 
             // Save block output for DPT head (blocks 4-11)
             if (b >= 4 && _blockOutputs != null && _blockOutputs[b] != null)
-            {
-                // GPU→GPU copy via WebGPU CopyBufferToBuffer
-                var srcBuf = (b % 2 == 0) ? _tokenBuf2!.GetGPUBuffer() : _tokenBuf1!.GetGPUBuffer();
-                var dstBuf = _blockOutputs[b].GetGPUBuffer();
-                if (srcBuf != null && dstBuf != null)
-                {
-                    using var enc = device.CreateCommandEncoder();
-                    enc.CopyBufferToBuffer(srcBuf, 0, dstBuf, 0, (ulong)(T * C * sizeof(float)));
-                    using var cmd = enc.Finish();
-                    queue.Submit(new[] { cmd });
-                }
-            }
+                _elementWise.AddInPlace(_blockOutputs![b].View, currentOut, T * C);
 
             (currentIn, currentOut) = (currentOut, currentIn);
         }
@@ -184,7 +175,6 @@ public class Dav3Inference
         for (int i = 4; i < 12; i++)
             blockViews[i] = _blockOutputs![i].View;
 
-        _lastDepthBuf?.Dispose();
         _lastDepthBuf = _dptHead!.Forward(blockViews, _weights);
 
         return _lastDepthBuf;
@@ -212,6 +202,54 @@ public class Dav3Inference
         return await _blockOutputs[blockIndex].CopyToHostAsync<float>(0, count);
     }
 
+    /// <summary>
+    /// Diagnostic: run just the DPT head's first 3 stages for level 0 (concat→norm→transpose→proj)
+    /// and return the first N values of the projection output. Reveals if DPT head has zero input.
+    /// </summary>
+    public async Task<float[]> DebugDptLevel0ProjAsync(int count = 10)
+    {
+        if (_blockOutputs == null) throw new InvalidOperationException("Call Initialize() and RunBackbone() first.");
+
+        // Stage 1: ConcatLastDim [T,384] + [T,384] → [T,768]
+        using var concatBuf = _accelerator.Allocate1D<float>(T * 768);
+        _elementWise.ConcatLastDim(_blockOutputs[4].View, _blockOutputs[5].View, concatBuf.View, T, C);
+        await _accelerator.SynchronizeAsync();
+        var concatSample = await concatBuf.CopyToHostAsync<float>(0, count);
+        float concatMax = concatSample.Max(v => MathF.Abs(v));
+        Console.WriteLine($"[DptDbg] After concat: maxAbs={concatMax:E3}  [{string.Join(", ", concatSample.Select(v => v.ToString("E2")))}]");
+
+        // Stage 2: LayerNorm [T, 768]
+        using var normBuf = _accelerator.Allocate1D<float>(T * 768);
+        var normGamma = _weights.GetView("head.norm.weight");
+        var normBeta  = _weights.GetView("head.norm.bias");
+        _layerNorm.Forward(concatBuf.View, normBuf.View, normGamma, normBeta, rows: T, C: 768);
+        await _accelerator.SynchronizeAsync();
+        var normSample = await normBuf.CopyToHostAsync<float>(0, count);
+        float normMax = normSample.Max(v => MathF.Abs(v));
+        Console.WriteLine($"[DptDbg] After layernorm: maxAbs={normMax:E3}  [{string.Join(", ", normSample.Select(v => v.ToString("E2")))}]");
+
+        // Stage 3: TransposeLastTwo [T,768] → [768,T]
+        using var transposeBuf = _accelerator.Allocate1D<float>(768 * T);
+        _elementWise.TransposeLastTwo(normBuf.View, transposeBuf.View, 1, T, 768);
+        await _accelerator.SynchronizeAsync();
+        var transSample = await transposeBuf.CopyToHostAsync<float>(0, count);
+        float transMax = transSample.Max(v => MathF.Abs(v));
+        Console.WriteLine($"[DptDbg] After transpose: maxAbs={transMax:E3}");
+
+        // Stage 4: Conv1×1 [768→48]
+        using var projScratch = _accelerator.Allocate1D<float>(48 * GRID_SIZE * GRID_SIZE);
+        var projW = _weights.GetView("head.projects.0.weight");
+        var projB = _weights.GetView("head.projects.0.bias");
+        _conv2d.Forward(transposeBuf.View, projW, projB, projScratch.View,
+            768, GRID_SIZE, GRID_SIZE, 48, 1, 1);
+        await _accelerator.SynchronizeAsync();
+        var projSample = await projScratch.CopyToHostAsync<float>(0, count);
+        float projMax = projSample.Max(v => MathF.Abs(v));
+        Console.WriteLine($"[DptDbg] After proj[0] (768→48): maxAbs={projMax:E3}  [{string.Join(", ", projSample.Select(v => v.ToString("E2")))}]");
+
+        return projSample;
+    }
+
     /// <summary>Dispose persistent GPU buffers.</summary>
     public void Dispose()
     {
@@ -219,5 +257,8 @@ public class Dav3Inference
         _tokenBuf1?.Dispose();
         _tokenBuf2?.Dispose();
         _tmpBuffers?.Dispose();
+        _dptHead?.Dispose();
+        if (_blockOutputs != null)
+            for (int i = 4; i < 12; i++) _blockOutputs[i]?.Dispose();
     }
 }
