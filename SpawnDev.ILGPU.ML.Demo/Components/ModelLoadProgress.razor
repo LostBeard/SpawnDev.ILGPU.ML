@@ -1,0 +1,136 @@
+<div class="model-progress @(IsComplete ? "complete" : "") @(IsLoading ? "loading" : "")">
+    <div class="mp-header">
+        <span class="mp-label">@ModelName</span>
+        @if (IsComplete)
+        {
+            <span class="mp-status mp-status-ready">Ready</span>
+        }
+        else if (IsLoading)
+        {
+            <span class="mp-status mp-status-loading">@(ProgressPercent.ToString("F0"))%</span>
+        }
+        else if (!string.IsNullOrEmpty(ErrorMessage))
+        {
+            <span class="mp-status mp-status-error">Error</span>
+        }
+        else
+        {
+            <span class="mp-status mp-status-idle">Not loaded</span>
+        }
+    </div>
+
+    @if (IsLoading)
+    {
+        <div class="mp-track">
+            <div class="mp-fill" style="width: @(ProgressPercent)%;"></div>
+        </div>
+        @if (TotalSizeMB > 0)
+        {
+            <div class="mp-detail">
+                @((TotalSizeMB * ProgressPercent / 100).ToString("F1")) / @TotalSizeMB.ToString("F1") MB
+            </div>
+        }
+    }
+
+    @if (!string.IsNullOrEmpty(ErrorMessage))
+    {
+        <div class="mp-error">@ErrorMessage</div>
+    }
+</div>
+
+@code {
+    [Parameter] public string ModelName { get; set; } = "Model";
+    [Parameter] public bool IsLoading { get; set; }
+    [Parameter] public bool IsComplete { get; set; }
+    [Parameter] public double ProgressPercent { get; set; }
+    [Parameter] public double TotalSizeMB { get; set; }
+    [Parameter] public string? ErrorMessage { get; set; }
+}
+
+<style>
+    .model-progress {
+        padding: 0.6rem 0.8rem;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .model-progress.complete {
+        border-color: rgba(52, 211, 153, 0.2);
+        background: rgba(52, 211, 153, 0.04);
+    }
+
+    .model-progress.loading {
+        border-color: rgba(56, 189, 248, 0.2);
+        background: rgba(56, 189, 248, 0.04);
+    }
+
+    .mp-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.25rem;
+    }
+
+    .mp-label {
+        color: #cbd5e1;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+
+    .mp-status {
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+    }
+
+    .mp-status-ready {
+        color: #34d399;
+        background: rgba(52, 211, 153, 0.1);
+    }
+
+    .mp-status-loading {
+        color: #38bdf8;
+        background: rgba(56, 189, 248, 0.1);
+    }
+
+    .mp-status-idle {
+        color: #64748b;
+        background: rgba(100, 116, 139, 0.1);
+    }
+
+    .mp-status-error {
+        color: #f87171;
+        background: rgba(248, 113, 113, 0.1);
+    }
+
+    .mp-track {
+        height: 6px;
+        background: rgba(255, 255, 255, 0.06);
+        border-radius: 3px;
+        overflow: hidden;
+        margin-bottom: 0.25rem;
+    }
+
+    .mp-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+        border-radius: 3px;
+        transition: width 0.3s ease;
+    }
+
+    .mp-detail {
+        color: #64748b;
+        font-size: 0.75rem;
+        font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    }
+
+    .mp-error {
+        color: #f87171;
+        font-size: 0.8rem;
+        margin-top: 0.25rem;
+    }
+</style>

@@ -251,9 +251,9 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        // Always use simple kernel for batched MatMul — the tiled 2D grid version
-        // (Grid.IdxY for batch) produces zeros on WebGPU due to a dispatch/codegen issue.
-        // The simple auto-grouped kernel works correctly on all backends.
+        // WORKAROUND: Use simple kernel until SpawnDev.ILGPU 4.4.1+ with 2D grid fix.
+        // The tiled version works correctly with the fix (committed in SpawnDev.ILGPU aeeb457).
+        // Re-enable tiled batched MatMul after updating SpawnDev.ILGPU NuGet.
         _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
     }
 

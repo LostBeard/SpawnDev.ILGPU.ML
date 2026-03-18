@@ -1,0 +1,227 @@
+@page "/classify"
+
+<PageTitle>Image Classification — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Image Classification"
+            Description="Classify images using MobileNetV2. Compare inference speed across all available backends."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="MobileNetV2"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="13">
+
+    <div class="classify-layout">
+        <div class="classify-input">
+            <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                           OnImageLoaded="@HandleImageLoaded"
+                           SampleImages="@_samples" />
+        </div>
+
+        <div class="classify-results">
+            <ConfidenceBars Predictions="@_predictions" MaxItems="5" />
+
+            @if (_isModelLoaded && _predictions?.Any() != true && _imageDataUrl != null)
+            {
+                <button class="run-btn" @onclick="RunInference">Classify</button>
+            }
+        </div>
+    </div>
+
+    @if (_isModelLoaded && _raceResults?.Any() == true)
+    {
+        <div class="race-section">
+            <h3 class="race-title">Race Mode Results</h3>
+            <div class="race-results">
+                @foreach (var result in _raceResults.OrderBy(r => r.TimeMs))
+                {
+                    <div class="race-row">
+                        <span class="race-backend">@result.Backend</span>
+                        <div class="race-bar-track">
+                            <div class="race-bar-fill" style="width: @(result.TimeMs / _raceResults.Max(r => r.TimeMs) * 100)%;"></div>
+                        </div>
+                        <span class="race-time">@result.TimeMs.ToString("F1") ms</span>
+                    </div>
+                }
+            </div>
+            <button class="copy-results-btn" @onclick="CopyRaceResults">Copy Results</button>
+        </div>
+    }
+
+</DemoLayout>
+
+<style>
+    .classify-layout {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+        align-items: start;
+    }
+
+    .run-btn {
+        margin-top: 1rem;
+        padding: 0.6rem 1.5rem;
+        border-radius: 8px;
+        border: none;
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+        color: white;
+        font-weight: 600;
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .run-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.3);
+    }
+
+    .race-section {
+        margin-top: 2rem;
+        padding: 1.25rem;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+    }
+
+    .race-title {
+        color: #f1f5f9;
+        font-size: 1.1rem;
+        font-weight: 600;
+        margin-bottom: 1rem;
+    }
+
+    .race-results {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .race-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    .race-backend {
+        flex: 0 0 80px;
+        color: #cbd5e1;
+        font-size: 0.85rem;
+        font-weight: 600;
+        text-align: right;
+    }
+
+    .race-bar-track {
+        flex: 1;
+        height: 20px;
+        background: rgba(255, 255, 255, 0.04);
+        border-radius: 5px;
+        overflow: hidden;
+    }
+
+    .race-bar-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+        border-radius: 5px;
+        transition: width 0.5s ease;
+    }
+
+    .race-time {
+        flex: 0 0 70px;
+        color: #94a3b8;
+        font-size: 0.8rem;
+        font-family: 'JetBrains Mono', 'Consolas', monospace;
+        text-align: right;
+    }
+
+    .copy-results-btn {
+        margin-top: 0.75rem;
+        padding: 0.35rem 0.8rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: #94a3b8;
+        font-size: 0.8rem;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .copy-results-btn:hover {
+        background: rgba(139, 92, 246, 0.15);
+        border-color: rgba(139, 92, 246, 0.3);
+        color: #e2e8f0;
+    }
+
+    @@media (max-width: 640px) {
+        .classify-layout {
+            grid-template-columns: 1fr;
+        }
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string? _imageDataUrl;
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+    private List<ConfidenceBars.Prediction>? _predictions;
+    private List<RaceResult>? _raceResults;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private List<ImageDropZone.SampleImage> _samples = new()
+    {
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Dog", Url = "samples/dog.jpg" },
+        new() { Label = "Landscape", Url = "samples/landscape.jpg" },
+    };
+
+    private Task HandleBackendChange(string backend)
+    {
+        // TODO: Switch accelerator backend
+        return Task.CompletedTask;
+    }
+
+    private Task HandleImageLoaded(byte[] imageBytes)
+    {
+        // TODO: Preprocess image and run inference
+        return Task.CompletedTask;
+    }
+
+    private Task RunInference()
+    {
+        // TODO: Run classification through InferenceSession
+        return Task.CompletedTask;
+    }
+
+    private async Task CopyRaceResults()
+    {
+        if (_raceResults == null) return;
+        var text = "SpawnDev.ILGPU.ML — Backend Showdown (MobileNetV2)\n";
+        foreach (var r in _raceResults.OrderBy(r => r.TimeMs))
+        {
+            text += $"  {r.Backend}: {r.TimeMs:F1}ms\n";
+        }
+        // TODO: Copy to clipboard via JS interop
+    }
+
+    private class RaceResult
+    {
+        public string Backend { get; set; } = "";
+        public double TimeMs { get; set; }
+    }
+}

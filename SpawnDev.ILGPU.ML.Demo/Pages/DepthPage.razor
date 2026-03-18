@@ -1,0 +1,135 @@
+@page "/depth"
+
+<PageTitle>Depth Estimation — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Depth Estimation"
+            Description="Estimate monocular depth using Depth Anything. Upload an image to generate a color-mapped depth map."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="Depth Anything V2 Small"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="50">
+
+    <div class="depth-controls">
+        <label class="palette-label">Color palette:</label>
+        <select class="palette-select" @bind="_colorPalette">
+            <option value="plasma">Plasma</option>
+            <option value="viridis">Viridis</option>
+            <option value="inferno">Inferno</option>
+            <option value="grayscale">Grayscale</option>
+        </select>
+    </div>
+
+    @if (_depthImageUrl != null && _imageDataUrl != null)
+    {
+        <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
+                           AfterImageUrl="@_depthImageUrl"
+                           BeforeLabel="Original"
+                           AfterLabel="Depth" />
+    }
+    else
+    {
+        <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                       OnImageLoaded="@HandleImageLoaded"
+                       SampleImages="@_samples" />
+    }
+
+    @if (_imageDataUrl != null && _depthImageUrl == null && _isModelLoaded)
+    {
+        <button class="run-btn" @onclick="RunDepthEstimation">Estimate Depth</button>
+    }
+
+</DemoLayout>
+
+<style>
+    .depth-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+    }
+
+    .palette-label {
+        color: #64748b;
+        font-size: 0.85rem;
+    }
+
+    .palette-select {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        color: #e2e8f0;
+        padding: 0.3rem 0.5rem;
+        font-size: 0.85rem;
+    }
+
+    .palette-select option {
+        background: #1e293b;
+    }
+
+    .run-btn {
+        margin-top: 1rem;
+        padding: 0.6rem 1.5rem;
+        border-radius: 8px;
+        border: none;
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+        color: white;
+        font-weight: 600;
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .run-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.3);
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string? _imageDataUrl;
+    private string? _depthImageUrl;
+    private string _colorPalette = "plasma";
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private List<ImageDropZone.SampleImage> _samples = new()
+    {
+        new() { Label = "Street", Url = "samples/street.jpg" },
+        new() { Label = "Room", Url = "samples/room.jpg" },
+        new() { Label = "Landscape", Url = "samples/landscape.jpg" },
+    };
+
+    private Task HandleBackendChange(string backend) => Task.CompletedTask;
+
+    private Task HandleImageLoaded(byte[] imageBytes)
+    {
+        _depthImageUrl = null;
+        // TODO: Preprocess image
+        return Task.CompletedTask;
+    }
+
+    private Task RunDepthEstimation()
+    {
+        // TODO: Run depth estimation through InferenceSession
+        return Task.CompletedTask;
+    }
+}

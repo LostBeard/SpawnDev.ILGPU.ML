@@ -1,0 +1,166 @@
+@page "/detect"
+
+<PageTitle>Object Detection — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Object Detection"
+            Description="Real-time object detection using YOLOv8-Nano. Use your webcam or upload an image."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowFps="true"
+            ShowModelProgress="true"
+            ModelName="YOLOv8-Nano"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="4">
+
+    <div class="detect-controls">
+        <label class="threshold-label">Confidence:</label>
+        <input type="range" min="10" max="95" step="5" @bind="_confidenceThreshold" class="threshold-slider" />
+        <span class="threshold-value">@_confidenceThreshold%</span>
+
+        <div class="mode-toggle">
+            <button class="mode-btn @(_useWebcam ? "" : "active")" @onclick="() => _useWebcam = false">Image</button>
+            <button class="mode-btn @(_useWebcam ? "active" : "")" @onclick="() => _useWebcam = true">Webcam</button>
+        </div>
+    </div>
+
+    @if (_useWebcam)
+    {
+        <BoundingBoxOverlay Detections="@_detections"
+                            ImageWidth="640" ImageHeight="480"
+                            ConfidenceThreshold="@(_confidenceThreshold / 100f)">
+            <WebcamCapture OnFrameCaptured="@HandleFrame"
+                           AutoCapture="true"
+                           CaptureIntervalMs="100"
+                           ShowCaptureButton="false" />
+        </BoundingBoxOverlay>
+    }
+    else
+    {
+        <BoundingBoxOverlay Detections="@_detections"
+                            ImageWidth="640" ImageHeight="480"
+                            ConfidenceThreshold="@(_confidenceThreshold / 100f)">
+            <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                           OnImageLoaded="@HandleImageLoaded" />
+        </BoundingBoxOverlay>
+    }
+
+    @if (_detections?.Any() == true)
+    {
+        <div class="detection-summary">
+            @foreach (var group in _detections
+                .Where(d => d.Confidence >= _confidenceThreshold / 100f)
+                .GroupBy(d => d.Label)
+                .OrderByDescending(g => g.Count()))
+            {
+                <span class="detection-chip">@group.Key (@group.Count())</span>
+            }
+        </div>
+    }
+
+</DemoLayout>
+
+<style>
+    .detect-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+    }
+
+    .threshold-label {
+        color: #64748b;
+        font-size: 0.85rem;
+    }
+
+    .threshold-slider {
+        width: 120px;
+        accent-color: #8b5cf6;
+    }
+
+    .threshold-value {
+        color: #94a3b8;
+        font-size: 0.8rem;
+        font-family: 'JetBrains Mono', 'Consolas', monospace;
+        min-width: 35px;
+    }
+
+    .mode-toggle {
+        display: flex;
+        border-radius: 6px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        margin-left: auto;
+    }
+
+    .mode-btn {
+        padding: 0.3rem 0.75rem;
+        border: none;
+        background: rgba(255, 255, 255, 0.04);
+        color: #64748b;
+        font-size: 0.8rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .mode-btn.active {
+        background: rgba(139, 92, 246, 0.2);
+        color: #e2e8f0;
+    }
+
+    .mode-btn:hover:not(.active) {
+        background: rgba(255, 255, 255, 0.08);
+    }
+
+    .detection-summary {
+        display: flex;
+        gap: 0.4rem;
+        flex-wrap: wrap;
+        margin-top: 0.75rem;
+    }
+
+    .detection-chip {
+        padding: 0.2rem 0.6rem;
+        border-radius: 12px;
+        background: rgba(139, 92, 246, 0.12);
+        border: 1px solid rgba(139, 92, 246, 0.25);
+        color: #c4b5fd;
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string? _imageDataUrl;
+    private bool _useWebcam;
+    private int _confidenceThreshold = 50;
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+    private List<BoundingBoxOverlay.Detection>? _detections;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private Task HandleBackendChange(string backend) => Task.CompletedTask;
+    private Task HandleImageLoaded(byte[] imageBytes) => Task.CompletedTask;
+    private Task HandleFrame(byte[] frameBytes)
+    {
+        // TODO: Run YOLO detection on frame
+        return Task.CompletedTask;
+    }
+}

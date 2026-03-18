@@ -1,0 +1,93 @@
+<div class="backend-selector">
+    <label class="bs-label">Backend</label>
+    <select class="bs-select" value="@SelectedBackend" @onchange="HandleBackendChange">
+        @foreach (var backend in AvailableBackends)
+        {
+            <option value="@backend.Id">@backend.DisplayName</option>
+        }
+    </select>
+    @if (!string.IsNullOrEmpty(DeviceName))
+    {
+        <span class="bs-device" title="@DeviceName">@TruncateDevice(DeviceName)</span>
+    }
+</div>
+
+@code {
+    [Parameter] public string SelectedBackend { get; set; } = "";
+    [Parameter] public EventCallback<string> SelectedBackendChanged { get; set; }
+    [Parameter] public EventCallback<string> OnBackendChange { get; set; }
+    [Parameter] public List<BackendInfo> AvailableBackends { get; set; } = new();
+    [Parameter] public string? DeviceName { get; set; }
+
+    private async Task HandleBackendChange(ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString() ?? "";
+        SelectedBackend = value;
+        await SelectedBackendChanged.InvokeAsync(value);
+        await OnBackendChange.InvokeAsync(value);
+    }
+
+    private string TruncateDevice(string name)
+    {
+        return name.Length > 30 ? name[..27] + "..." : name;
+    }
+
+    public class BackendInfo
+    {
+        public string Id { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+    }
+}
+
+<style>
+    .backend-selector {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.35rem 0.7rem;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .bs-label {
+        color: #64748b;
+        font-size: 0.8rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+
+    .bs-select {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        color: #e2e8f0;
+        padding: 0.3rem 0.5rem;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        outline: none;
+    }
+
+    .bs-select:focus {
+        border-color: rgba(139, 92, 246, 0.5);
+        box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.15);
+    }
+
+    .bs-select option {
+        background: #1e293b;
+        color: #e2e8f0;
+    }
+
+    .bs-device {
+        color: #475569;
+        font-size: 0.75rem;
+        padding-left: 0.5rem;
+        border-left: 1px solid rgba(255, 255, 255, 0.08);
+        max-width: 200px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+</style>

@@ -1,0 +1,138 @@
+<div class="ba-container" @ref="_container">
+    <div class="ba-image ba-before">
+        <img src="@BeforeImageUrl" alt="Before" />
+        <span class="ba-label ba-label-before">@BeforeLabel</span>
+    </div>
+    <div class="ba-image ba-after" style="clip-path: inset(0 0 0 @(SliderPosition)%);">
+        <img src="@AfterImageUrl" alt="After" />
+        <span class="ba-label ba-label-after">@AfterLabel</span>
+    </div>
+    <div class="ba-slider" style="left: @(SliderPosition)%;">
+        <div class="ba-slider-line"></div>
+        <div class="ba-slider-handle">
+            <span class="ba-handle-arrows">&lsaquo; &rsaquo;</span>
+        </div>
+    </div>
+    <input type="range" min="0" max="100" value="@SliderPosition"
+           class="ba-range"
+           @oninput="HandleSliderInput" />
+</div>
+
+@code {
+    private ElementReference _container;
+
+    [Parameter] public string? BeforeImageUrl { get; set; }
+    [Parameter] public string? AfterImageUrl { get; set; }
+    [Parameter] public string BeforeLabel { get; set; } = "Original";
+    [Parameter] public string AfterLabel { get; set; } = "Result";
+    [Parameter] public double SliderPosition { get; set; } = 50;
+
+    private void HandleSliderInput(ChangeEventArgs e)
+    {
+        if (double.TryParse(e.Value?.ToString(), out var val))
+        {
+            SliderPosition = val;
+        }
+    }
+}
+
+<style>
+    .ba-container {
+        position: relative;
+        width: 100%;
+        overflow: hidden;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: #0a0a0a;
+        user-select: none;
+    }
+
+    .ba-image {
+        width: 100%;
+    }
+
+    .ba-image img {
+        width: 100%;
+        display: block;
+    }
+
+    .ba-before {
+        position: relative;
+    }
+
+    .ba-after {
+        position: absolute;
+        inset: 0;
+    }
+
+    .ba-label {
+        position: absolute;
+        bottom: 0.75rem;
+        padding: 0.25rem 0.6rem;
+        border-radius: 4px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        background: rgba(0, 0, 0, 0.6);
+        color: #e2e8f0;
+        backdrop-filter: blur(4px);
+    }
+
+    .ba-label-before {
+        left: 0.75rem;
+    }
+
+    .ba-label-after {
+        right: 0.75rem;
+    }
+
+    .ba-slider {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        z-index: 2;
+    }
+
+    .ba-slider-line {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        background: white;
+        box-shadow: 0 0 8px rgba(0, 0, 0, 0.5);
+    }
+
+    .ba-slider-handle {
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        background: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+        z-index: 3;
+    }
+
+    .ba-handle-arrows {
+        color: #1e293b;
+        font-size: 1rem;
+        font-weight: 700;
+        letter-spacing: 0.2em;
+    }
+
+    .ba-range {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        opacity: 0;
+        cursor: col-resize;
+        z-index: 4;
+        margin: 0;
+    }
+</style>

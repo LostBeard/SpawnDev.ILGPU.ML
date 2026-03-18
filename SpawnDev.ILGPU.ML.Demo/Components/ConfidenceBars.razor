@@ -1,0 +1,104 @@
+<div class="confidence-bars">
+    @if (Predictions?.Any() == true)
+    {
+        @foreach (var pred in Predictions.Take(MaxItems))
+        {
+            <div class="cb-row">
+                <span class="cb-label" title="@pred.Label">@TruncateLabel(pred.Label)</span>
+                <div class="cb-bar-track">
+                    <div class="cb-bar-fill" style="width: @(pred.Confidence * 100)%; background: @GetBarColor(pred.Confidence);"></div>
+                </div>
+                <span class="cb-value">@((pred.Confidence * 100).ToString("F1"))%</span>
+            </div>
+        }
+    }
+    else
+    {
+        <div class="cb-empty">No predictions yet</div>
+    }
+</div>
+
+@code {
+    [Parameter] public List<Prediction>? Predictions { get; set; }
+    [Parameter] public int MaxItems { get; set; } = 5;
+
+    private string TruncateLabel(string label)
+    {
+        return label.Length > 24 ? label[..21] + "..." : label;
+    }
+
+    private string GetBarColor(float confidence)
+    {
+        if (confidence > 0.7f) return "#34d399";
+        if (confidence > 0.3f) return "#38bdf8";
+        return "#64748b";
+    }
+
+    public class Prediction
+    {
+        public string Label { get; set; } = "";
+        public float Confidence { get; set; }
+    }
+}
+
+<style>
+    .confidence-bars {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        width: 100%;
+    }
+
+    .cb-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        animation: cb-fadein 0.3s ease-out;
+    }
+
+    .cb-label {
+        flex: 0 0 140px;
+        color: #cbd5e1;
+        font-size: 0.85rem;
+        text-align: right;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .cb-bar-track {
+        flex: 1;
+        height: 22px;
+        background: rgba(255, 255, 255, 0.04);
+        border-radius: 6px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .cb-bar-fill {
+        height: 100%;
+        border-radius: 5px;
+        transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+        min-width: 2px;
+    }
+
+    .cb-value {
+        flex: 0 0 50px;
+        color: #94a3b8;
+        font-size: 0.8rem;
+        font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+        text-align: right;
+    }
+
+    .cb-empty {
+        color: #475569;
+        font-size: 0.9rem;
+        text-align: center;
+        padding: 1rem;
+    }
+
+    @@keyframes cb-fadein {
+        from { opacity: 0; transform: translateX(-8px); }
+        to { opacity: 1; transform: translateX(0); }
+    }
+</style>

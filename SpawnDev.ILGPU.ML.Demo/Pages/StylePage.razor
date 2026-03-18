@@ -1,0 +1,146 @@
+@page "/style"
+
+<PageTitle>Style Transfer — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Style Transfer"
+            Description="Apply artistic styles to images in real-time. Each style model is only ~6MB."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowFps="@_useWebcam"
+            ShowModelProgress="true"
+            ModelName="@_selectedStyle"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="6.5">
+
+    <div class="style-gallery">
+        @foreach (var style in _styles)
+        {
+            <button class="style-thumb @(style.Name == _selectedStyle ? "selected" : "")"
+                    @onclick="() => SelectStyle(style.Name)">
+                <span class="style-name">@style.Name</span>
+            </button>
+        }
+    </div>
+
+    <div class="style-mode-toggle">
+        <button class="mode-btn @(!_useWebcam ? "active" : "")" @onclick="() => _useWebcam = false">Image</button>
+        <button class="mode-btn @(_useWebcam ? "active" : "")" @onclick="() => _useWebcam = true">Live Webcam</button>
+    </div>
+
+    @if (_useWebcam)
+    {
+        <WebcamCapture OnFrameCaptured="@HandleFrame"
+                       AutoCapture="true"
+                       CaptureIntervalMs="50"
+                       ShowCaptureButton="false" />
+    }
+    else if (_styledImageUrl != null && _imageDataUrl != null)
+    {
+        <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
+                           AfterImageUrl="@_styledImageUrl"
+                           BeforeLabel="Original"
+                           AfterLabel="@_selectedStyle" />
+    }
+    else
+    {
+        <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                       OnImageLoaded="@HandleImageLoaded" />
+    }
+
+</DemoLayout>
+
+<style>
+    .style-gallery {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        margin-bottom: 1rem;
+    }
+
+    .style-thumb {
+        padding: 0.5rem 1rem;
+        border-radius: 8px;
+        border: 2px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.04);
+        color: #94a3b8;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .style-thumb:hover {
+        border-color: rgba(139, 92, 246, 0.3);
+        background: rgba(139, 92, 246, 0.08);
+        color: #e2e8f0;
+    }
+
+    .style-thumb.selected {
+        border-color: #8b5cf6;
+        background: rgba(139, 92, 246, 0.15);
+        color: #e2e8f0;
+    }
+
+    .style-mode-toggle {
+        display: flex;
+        border-radius: 6px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        margin-bottom: 1rem;
+        width: fit-content;
+    }
+
+    .mode-btn {
+        padding: 0.35rem 0.85rem;
+        border: none;
+        background: rgba(255, 255, 255, 0.04);
+        color: #64748b;
+        font-size: 0.85rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .mode-btn.active {
+        background: rgba(139, 92, 246, 0.2);
+        color: #e2e8f0;
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _selectedStyle = "Mosaic";
+    private string? _imageDataUrl;
+    private string? _styledImageUrl;
+    private bool _useWebcam;
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private record StyleOption(string Name);
+    private List<StyleOption> _styles = new()
+    {
+        new("Mosaic"), new("Candy"), new("Rain Princess"),
+        new("Udnie"), new("Pointilism"), new("Starry Night")
+    };
+
+    private Task HandleBackendChange(string backend) => Task.CompletedTask;
+    private void SelectStyle(string name) { _selectedStyle = name; _styledImageUrl = null; }
+    private Task HandleImageLoaded(byte[] imageBytes) { _styledImageUrl = null; return Task.CompletedTask; }
+    private Task HandleFrame(byte[] frameBytes) => Task.CompletedTask;
+}

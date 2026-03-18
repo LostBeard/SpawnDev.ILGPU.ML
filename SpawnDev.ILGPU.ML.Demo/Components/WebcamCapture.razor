@@ -1,0 +1,197 @@
+@using Microsoft.JSInterop
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="webcam-container">
+    @if (!_isStreaming)
+    {
+        <button class="webcam-start-btn" @onclick="StartCamera">
+            <span class="webcam-btn-icon">&#x1F4F7;</span> Enable Camera
+        </button>
+    }
+    else
+    {
+        <div class="webcam-live">
+            <video @ref="_videoRef" autoplay playsinline muted class="webcam-video"></video>
+            @if (ShowCaptureButton)
+            {
+                <button class="webcam-capture-btn" @onclick="CaptureFrame" title="Capture frame">
+                    &#x23FA;
+                </button>
+            }
+            <button class="webcam-stop-btn" @onclick="StopCamera" title="Stop camera">
+                &#x23F9;
+            </button>
+        </div>
+    }
+    <canvas @ref="_canvasRef" style="display: none;"></canvas>
+</div>
+
+@code {
+    private ElementReference _videoRef;
+    private ElementReference _canvasRef;
+    private IJSObjectReference? _module;
+    private bool _isStreaming;
+
+    [Parameter] public EventCallback<byte[]> OnFrameCaptured { get; set; }
+    [Parameter] public EventCallback<string> OnFrameDataUrl { get; set; }
+    [Parameter] public bool ShowCaptureButton { get; set; } = true;
+    [Parameter] public bool AutoCapture { get; set; }
+    [Parameter] public int CaptureIntervalMs { get; set; } = 100;
+    [Parameter] public int Width { get; set; } = 640;
+    [Parameter] public int Height { get; set; } = 480;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _module = await JS.InvokeAsync<IJSObjectReference>("import",
+                "./Components/WebcamCapture.razor.js");
+        }
+    }
+
+    private async Task StartCamera()
+    {
+        if (_module == null) return;
+        var success = await _module.InvokeAsync<bool>("startCamera", _videoRef, Width, Height);
+        if (success)
+        {
+            _isStreaming = true;
+            StateHasChanged();
+
+            if (AutoCapture)
+            {
+                _ = AutoCaptureLoop();
+            }
+        }
+    }
+
+    private async Task StopCamera()
+    {
+        if (_module == null) return;
+        await _module.InvokeVoidAsync("stopCamera", _videoRef);
+        _isStreaming = false;
+    }
+
+    public async Task CaptureFrame()
+    {
+        if (_module == null || !_isStreaming) return;
+        var dataUrl = await _module.InvokeAsync<string>("captureFrame", _videoRef, _canvasRef, Width, Height);
+        if (!string.IsNullOrEmpty(dataUrl))
+        {
+            await OnFrameDataUrl.InvokeAsync(dataUrl);
+
+            // Convert data URL to bytes if handler is attached
+            if (OnFrameCaptured.HasDelegate)
+            {
+                var base64 = dataUrl.Substring(dataUrl.IndexOf(',') + 1);
+                var bytes = Convert.FromBase64String(base64);
+                await OnFrameCaptured.InvokeAsync(bytes);
+            }
+        }
+    }
+
+    private async Task AutoCaptureLoop()
+    {
+        while (_isStreaming)
+        {
+            await CaptureFrame();
+            await Task.Delay(CaptureIntervalMs);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _isStreaming = false;
+        if (_module != null)
+        {
+            try { await _module.InvokeVoidAsync("stopCamera", _videoRef); } catch { }
+            await _module.DisposeAsync();
+        }
+    }
+}
+
+<style>
+    .webcam-container {
+        position: relative;
+        border-radius: 10px;
+        overflow: hidden;
+        background: rgba(0, 0, 0, 0.3);
+        min-height: 200px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .webcam-start-btn {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.75rem 1.5rem;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.06);
+        color: #e2e8f0;
+        font-size: 0.95rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .webcam-start-btn:hover {
+        background: rgba(139, 92, 246, 0.15);
+        border-color: rgba(139, 92, 246, 0.3);
+    }
+
+    .webcam-btn-icon {
+        font-size: 1.2rem;
+    }
+
+    .webcam-live {
+        position: relative;
+        width: 100%;
+    }
+
+    .webcam-video {
+        width: 100%;
+        display: block;
+        border-radius: 10px;
+    }
+
+    .webcam-capture-btn,
+    .webcam-stop-btn {
+        position: absolute;
+        bottom: 0.75rem;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        border: none;
+        color: white;
+        font-size: 1rem;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s ease;
+    }
+
+    .webcam-capture-btn {
+        right: 3.5rem;
+        background: rgba(59, 130, 246, 0.8);
+    }
+
+    .webcam-capture-btn:hover {
+        background: #3b82f6;
+        transform: scale(1.1);
+    }
+
+    .webcam-stop-btn {
+        right: 0.75rem;
+        background: rgba(239, 68, 68, 0.8);
+    }
+
+    .webcam-stop-btn:hover {
+        background: #ef4444;
+        transform: scale(1.1);
+    }
+</style>

@@ -1,0 +1,231 @@
+@using Microsoft.AspNetCore.Components.Forms
+
+<div class="image-dropzone @(_isDragOver ? "drag-over" : "") @(HasImage ? "has-image" : "")"
+     @ondragover="HandleDragOver"
+     @ondragover:preventDefault
+     @ondragleave="HandleDragLeave"
+     @ondrop="HandleDrop"
+     @ondrop:preventDefault>
+
+    @if (HasImage && ImageDataUrl != null)
+    {
+        <div class="image-preview">
+            <img src="@ImageDataUrl" alt="Uploaded image" />
+            <button class="clear-btn" @onclick="ClearImage" title="Remove image">&#x2715;</button>
+        </div>
+    }
+    else
+    {
+        <div class="dropzone-prompt">
+            <div class="dropzone-icon">&#x1F5BC;</div>
+            <p class="dropzone-text">Drop an image here or click to browse</p>
+            <p class="dropzone-hint">Supports JPG, PNG, WebP</p>
+            <InputFile OnChange="HandleFileSelected" accept="image/*" class="dropzone-input" />
+        </div>
+    }
+</div>
+
+@if (SampleImages?.Any() == true)
+{
+    <div class="sample-images">
+        <span class="sample-label">Or try a sample:</span>
+        @foreach (var sample in SampleImages)
+        {
+            <button class="sample-btn" @onclick="() => LoadSampleImage(sample.Url)">
+                @sample.Label
+            </button>
+        }
+    </div>
+}
+
+@code {
+    private bool _isDragOver;
+
+    [Parameter] public string? ImageDataUrl { get; set; }
+    [Parameter] public EventCallback<string> ImageDataUrlChanged { get; set; }
+    [Parameter] public EventCallback<byte[]> OnImageLoaded { get; set; }
+    [Parameter] public List<SampleImage>? SampleImages { get; set; }
+    [Parameter] public int MaxFileSizeMB { get; set; } = 10;
+
+    public bool HasImage => !string.IsNullOrEmpty(ImageDataUrl);
+
+    private void HandleDragOver() => _isDragOver = true;
+    private void HandleDragLeave() => _isDragOver = false;
+
+    private async Task HandleDrop()
+    {
+        _isDragOver = false;
+        // Drop is handled by InputFile's OnChange
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+        if (!file.ContentType.StartsWith("image/")) return;
+
+        long maxSize = MaxFileSizeMB * 1024L * 1024L;
+        using var stream = file.OpenReadStream(maxSize);
+        using var ms = new MemoryStream();
+        await stream.CopyToAsync(ms);
+        var bytes = ms.ToArray();
+
+        var dataUrl = $"data:{file.ContentType};base64,{Convert.ToBase64String(bytes)}";
+        ImageDataUrl = dataUrl;
+        await ImageDataUrlChanged.InvokeAsync(dataUrl);
+        await OnImageLoaded.InvokeAsync(bytes);
+    }
+
+    private async Task LoadSampleImage(string url)
+    {
+        using var http = new HttpClient();
+        var bytes = await http.GetByteArrayAsync(url);
+        var dataUrl = $"data:image/jpeg;base64,{Convert.ToBase64String(bytes)}";
+        ImageDataUrl = dataUrl;
+        await ImageDataUrlChanged.InvokeAsync(dataUrl);
+        await OnImageLoaded.InvokeAsync(bytes);
+    }
+
+    private async Task ClearImage()
+    {
+        ImageDataUrl = null;
+        await ImageDataUrlChanged.InvokeAsync(null);
+    }
+
+    public class SampleImage
+    {
+        public string Label { get; set; } = "";
+        public string Url { get; set; } = "";
+    }
+}
+
+<style>
+    .image-dropzone {
+        position: relative;
+        border: 2px dashed rgba(255, 255, 255, 0.15);
+        border-radius: 12px;
+        min-height: 250px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.2s ease;
+        background: rgba(255, 255, 255, 0.02);
+        overflow: hidden;
+    }
+
+    .image-dropzone:hover {
+        border-color: rgba(139, 92, 246, 0.4);
+        background: rgba(139, 92, 246, 0.05);
+    }
+
+    .image-dropzone.drag-over {
+        border-color: #3b82f6;
+        background: rgba(59, 130, 246, 0.08);
+        box-shadow: 0 0 20px rgba(59, 130, 246, 0.15);
+    }
+
+    .image-dropzone.has-image {
+        border-style: solid;
+        border-color: rgba(255, 255, 255, 0.1);
+    }
+
+    .dropzone-prompt {
+        text-align: center;
+        padding: 2rem;
+        position: relative;
+        cursor: pointer;
+    }
+
+    .dropzone-icon {
+        font-size: 3rem;
+        margin-bottom: 0.75rem;
+        opacity: 0.5;
+    }
+
+    .dropzone-text {
+        color: #94a3b8;
+        font-size: 1rem;
+        margin-bottom: 0.25rem;
+    }
+
+    .dropzone-hint {
+        color: #475569;
+        font-size: 0.8rem;
+    }
+
+    .dropzone-input {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        cursor: pointer;
+        width: 100%;
+        height: 100%;
+    }
+
+    .image-preview {
+        position: relative;
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .image-preview img {
+        max-width: 100%;
+        max-height: 400px;
+        object-fit: contain;
+        border-radius: 8px;
+    }
+
+    .clear-btn {
+        position: absolute;
+        top: 0.5rem;
+        right: 0.5rem;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: none;
+        background: rgba(0, 0, 0, 0.6);
+        color: white;
+        font-size: 0.9rem;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.2s;
+    }
+
+    .clear-btn:hover {
+        background: rgba(239, 68, 68, 0.8);
+    }
+
+    .sample-images {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+        flex-wrap: wrap;
+    }
+
+    .sample-label {
+        color: #64748b;
+        font-size: 0.85rem;
+    }
+
+    .sample-btn {
+        padding: 0.3rem 0.7rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: #94a3b8;
+        font-size: 0.8rem;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .sample-btn:hover {
+        background: rgba(139, 92, 246, 0.15);
+        border-color: rgba(139, 92, 246, 0.3);
+        color: #e2e8f0;
+    }
+</style>
