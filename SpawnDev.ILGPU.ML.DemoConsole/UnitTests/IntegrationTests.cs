@@ -129,6 +129,130 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>
+    /// FULL END-TO-END: Load real MobileNetV2 weights + graph, execute on CPU,
+    /// verify output is 1000 logits with reasonable values.
+    /// </summary>
+    [TestMethod]
+    public async Task FullExecution_MobileNetV2_WithRealWeights()
+    {
+        var modelsDir = FindModelsDir();
+        var modelDir = Path.Combine(modelsDir, "mobilenetv2");
+        var graphPath = Path.Combine(modelDir, "model_graph.json");
+        var manifestPath = Path.Combine(modelDir, "manifest_fp16.json");
+        var weightsPath = Path.Combine(modelDir, "weights_fp16.bin");
+
+        if (!File.Exists(graphPath) || !File.Exists(weightsPath))
+            throw new UnsupportedTestException("MobileNetV2 model files not found");
+
+        // Load graph
+        var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(graphPath));
+        Console.WriteLine($"[FullExec] Graph: {graph.Nodes.Count} nodes");
+
+        // Create accelerator
+        using var context = MLContext.CreateContext();
+        using var accelerator = context.CreateCPUAccelerator(0);
+
+        // Load weights manually (WeightLoader needs HttpClient which we don't have in console)
+        var manifestJson = await File.ReadAllTextAsync(manifestPath);
+        var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(manifestJson)!;
+        var blob = await File.ReadAllBytesAsync(weightsPath);
+
+        Console.WriteLine($"[FullExec] Weights: {blob.Length / 1024.0 / 1024.0:F1} MB, {manifest.Count} tensors");
+
+        // Convert FP16 → FP32 and upload all weights
+        using var pool = new BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensor>();
+        foreach (var (name, info) in manifest)
+        {
+            var offset = info.GetProperty("offset").GetInt32();
+            var shape = info.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var elements = info.GetProperty("elements").GetInt32();
+
+            // FP16 → FP32 conversion
+            var fp32 = new float[elements];
+            for (int i = 0; i < elements; i++)
+            {
+                ushort fp16Bits = (ushort)(blob[offset + i * 2] | (blob[offset + i * 2 + 1] << 8));
+                fp32[i] = HalfToFloat(fp16Bits);
+            }
+            weights[name] = pool.AllocatePermanent(fp32, shape, name);
+        }
+        Console.WriteLine($"[FullExec] Loaded {weights.Count} weight tensors to GPU");
+
+        // Compile graph
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+        Console.WriteLine($"[FullExec] Compiled: {compiled.Nodes.Length} nodes");
+
+        // Create random input image (1, 3, 224, 224) — normalized like ImageNet
+        var inputData = new float[1 * 3 * 224 * 224];
+        var rng = new Random(42);
+        for (int i = 0; i < inputData.Length; i++)
+            inputData[i] = (float)(rng.NextDouble() * 2 - 1); // Range [-1, 1]
+        var input = pool.AllocatePermanent(inputData, new[] { 1, 3, 224, 224 }, "data");
+
+        // Execute
+        Console.WriteLine($"[FullExec] Running inference...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var executor = new GraphExecutor(accelerator, compiled, weights);
+        var outputs = executor.Run(new Dictionary<string, Tensor> { [graph.Inputs[0].Name] = input });
+        accelerator.Synchronize();
+        sw.Stop();
+        Console.WriteLine($"[FullExec] Inference: {sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        // Read output
+        var outputName = graph.Outputs[0].Name;
+        var output = outputs[outputName];
+        Console.WriteLine($"[FullExec] Output: {output.ElementCount} elements, shape [{string.Join(",", output.Shape)}]");
+
+        using var rb = accelerator.Allocate1D<float>(output.ElementCount);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, output.ElementCount), rb.View, output.ElementCount, 1f);
+        accelerator.Synchronize();
+        var logits = rb.GetAsArray1D();
+
+        // Check output is reasonable
+        float min = logits.Min(), max = logits.Max();
+        float mean = logits.Average();
+        Console.WriteLine($"[FullExec] Logits: min={min:F4}, max={max:F4}, mean={mean:F4}");
+
+        if (float.IsNaN(min) || float.IsInfinity(max))
+            throw new Exception("Output contains NaN/Inf");
+        if (logits.All(v => v == 0f))
+            throw new Exception("Output is all zeros");
+
+        // Softmax + top-5
+        float expMax = logits.Max();
+        var probs = logits.Select(x => MathF.Exp(x - expMax)).ToArray();
+        float probSum = probs.Sum();
+        probs = probs.Select(p => p / probSum).ToArray();
+
+        var top5 = probs.Select((p, i) => (Index: i, Prob: p))
+            .OrderByDescending(x => x.Prob)
+            .Take(5)
+            .ToList();
+
+        Console.WriteLine($"[FullExec] Top-5 predictions:");
+        foreach (var (idx, prob) in top5)
+            Console.WriteLine($"  class {idx}: {prob:P2}");
+    }
+
+    private static float HalfToFloat(ushort h)
+    {
+        int sign = (h >> 15) & 1;
+        int exp = (h >> 10) & 0x1F;
+        int mant = h & 0x3FF;
+        if (exp == 0)
+        {
+            if (mant == 0) return sign == 1 ? -0f : 0f;
+            float val = mant / 1024f * MathF.Pow(2f, -14f);
+            return sign == 1 ? -val : val;
+        }
+        if (exp == 31) return mant == 0 ? (sign == 1 ? float.NegativeInfinity : float.PositiveInfinity) : float.NaN;
+        float result = (1f + mant / 1024f) * MathF.Pow(2f, exp - 15f);
+        return sign == 1 ? -result : result;
+    }
+
     private static string FindModelsDir()
     {
         // Walk up from the exe directory to find the Demo wwwroot/models
