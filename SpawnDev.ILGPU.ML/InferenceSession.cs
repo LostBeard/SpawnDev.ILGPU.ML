@@ -114,7 +114,8 @@ public class InferenceSession : IDisposable
                 // produces silent zeros on WebGPU.
                 int count = Tensors.TensorHelpers.ElementCount(shape);
                 var ownBuf = accelerator.Allocate1D<float>(count);
-                view.Value.SubView(0, count).CopyTo(ownBuf.View);
+                // Use Scale kernel (GPU→GPU copy) instead of CopyTo (sync, fails on WebGPU)
+                registry.ElementWise.Scale(view.Value.SubView(0, count), ownBuf.View, count, 1f);
                 weights[name] = new Tensor(ownBuf.View, shape, name);
                 loadedCount++;
             }
