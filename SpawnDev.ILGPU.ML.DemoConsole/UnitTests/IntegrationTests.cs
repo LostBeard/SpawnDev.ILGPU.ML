@@ -314,6 +314,74 @@ public class IntegrationTests
         foreach (var (idx, prob) in top5) Console.WriteLine($"  class {idx}: {prob:P2}");
     }
 
+    [TestMethod]
+    public async Task FullExecution_ESPCN_SuperResolution()
+    {
+        var modelsDir = FindModelsDir();
+        var modelDir = Path.Combine(modelsDir, "super-resolution");
+        var graphPath = Path.Combine(modelDir, "model_graph.json");
+        var manifestPath = Path.Combine(modelDir, "manifest_fp16.json");
+        var weightsPath = Path.Combine(modelDir, "weights_fp16.bin");
+
+        if (!File.Exists(graphPath) || !File.Exists(weightsPath))
+            throw new UnsupportedTestException("ESPCN model files not found");
+
+        var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(graphPath));
+
+        using var context = MLContext.CreateContext();
+        using var accelerator = context.CreateCPUAccelerator(0);
+
+        var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+            await File.ReadAllTextAsync(manifestPath))!;
+        var blob = await File.ReadAllBytesAsync(weightsPath);
+
+        using var pool = new BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensor>();
+        foreach (var (name, info) in manifest)
+        {
+            var offset = info.GetProperty("offset").GetInt32();
+            var shape = info.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var elements = info.GetProperty("elements").GetInt32();
+            var fp32 = new float[elements];
+            for (int i = 0; i < elements; i++)
+            {
+                ushort fp16 = (ushort)(blob[offset + i * 2] | (blob[offset + i * 2 + 1] << 8));
+                fp32[i] = HalfToFloat(fp16);
+            }
+            weights[name] = pool.AllocatePermanent(fp32, shape, name);
+        }
+
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+
+        // Small input for speed: [1, 1, 32, 32] (Y luminance channel)
+        var inputData = new float[1 * 1 * 32 * 32];
+        var rng = new Random(42);
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = (float)rng.NextDouble();
+        var input = pool.AllocatePermanent(inputData, new[] { 1, 1, 32, 32 }, "input");
+
+        Console.WriteLine($"[FullExec] Running ESPCN super-resolution...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var executor = new GraphExecutor(accelerator, compiled, weights);
+        var outputs = executor.Run(new Dictionary<string, Tensor> { ["input"] = input });
+        accelerator.Synchronize();
+        sw.Stop();
+        Console.WriteLine($"[FullExec] ESPCN: {sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        var output = outputs[graph.Outputs[0].Name];
+        Console.WriteLine($"[FullExec] Output: {output.ElementCount} elements, shape [{string.Join(",", output.Shape)}]");
+
+        using var rb = accelerator.Allocate1D<float>(Math.Min(output.ElementCount, 10));
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, Math.Min(output.ElementCount, 10)),
+            rb.View, Math.Min(output.ElementCount, 10), 1f);
+        accelerator.Synchronize();
+        var sample = rb.GetAsArray1D();
+        Console.WriteLine($"[FullExec] First 10: [{string.Join(", ", sample.Select(v => v.ToString("F4")))}]");
+
+        if (sample.All(v => v == 0f)) throw new Exception("Output is zeros");
+        if (sample.Any(v => float.IsNaN(v))) throw new Exception("Output has NaN");
+    }
+
     private static float HalfToFloat(ushort h)
     {
         int sign = (h >> 15) & 1;

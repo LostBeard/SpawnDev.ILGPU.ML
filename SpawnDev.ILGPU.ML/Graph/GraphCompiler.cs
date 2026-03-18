@@ -32,14 +32,23 @@ public class GraphCompiler
         // Shape inference: track known shapes from inputs, initializers, and outputs
         var knownShapes = new Dictionary<string, int[]>();
         foreach (var input in graph.Inputs)
-            knownShapes[input.Name] = input.Shape;
+        {
+            // Replace dynamic dimensions (-1) with 1 (default batch size)
+            var shape = input.Shape.Select(d => d <= 0 ? 1 : d).ToArray();
+            knownShapes[input.Name] = shape;
+        }
         foreach (var (name, shape) in graph.Initializers)
             knownShapes[name] = shape;
         // Pre-register graph output shapes (overrides inferred shapes for Reshape etc.)
         var graphOutputShapes = new Dictionary<string, int[]>();
         foreach (var output in graph.Outputs)
-            if (output.Shape.Length > 0 && output.Shape.All(d => d > 0))
-                graphOutputShapes[output.Name] = output.Shape;
+        {
+            if (output.Shape.Length > 0)
+            {
+                var shape = output.Shape.Select(d => d <= 0 ? 1 : d).ToArray();
+                graphOutputShapes[output.Name] = shape;
+            }
+        }
 
         // Compile each node
         var compiledNodes = new List<CompiledNode>();
