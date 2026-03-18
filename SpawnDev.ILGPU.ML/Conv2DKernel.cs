@@ -111,12 +111,11 @@ public class Conv2DKernel
         int outW = (inW + 2 * padding - kW) / stride + 1;
         int totalOutputElements = outC * outH * outW;
 
-        // Pack params into buffer
-        if (_paramsBuf == null)
-            _paramsBuf = _accelerator.Allocate1D<int>(8);
-        _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
+        // Allocate fresh params buffer per call — persistent buffers get overwritten
+        // between dispatches on WebGPU before the GPU reads them.
+        using var paramsBuf = _accelerator.Allocate1D(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
 
-        _conv2dKernel!(totalOutputElements, input, weight, bias, output, _paramsBuf.View);
+        _conv2dKernel!(totalOutputElements, input, weight, bias, output, paramsBuf.View);
     }
 
     /// <summary>
@@ -180,11 +179,9 @@ public class Conv2DKernel
         int outH = (inH + 2 * padding - kH) / stride + 1;
         int outW = (inW + 2 * padding - kW) / stride + 1;
 
-        if (_paramsBuf == null)
-            _paramsBuf = _accelerator.Allocate1D<int>(8);
-        _paramsBuf.CopyFromCPU(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
+        using var paramsBuf = _accelerator.Allocate1D(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
 
-        _depthwiseKernel!(C * outH * outW, input, weight, bias, output, _paramsBuf.View);
+        _depthwiseKernel!(C * outH * outW, input, weight, bias, output, paramsBuf.View);
     }
 
     private void EnsureLoaded()

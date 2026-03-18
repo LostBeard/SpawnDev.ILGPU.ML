@@ -92,10 +92,9 @@ public class ConvTranspose2DKernel
         int outH = (inH - 1) * stride - 2 * padding + kH;
         int outW = (inW - 1) * stride - 2 * padding + kW;
 
-        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
-        _paramsBuf.CopyFromCPU(new[] { inC, inH, inW, outC, kH, kW, stride, padding });
+        using var paramsBuf = _accelerator.Allocate1D(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
 
-        _kernel!(outC * outH * outW, input, weight, bias, output, _paramsBuf.View);
+        _kernel!(outC * outH * outW, input, weight, bias, output, paramsBuf.View);
     }
 
     public static int OutputSize(int inputSize, int kernelSize, int stride, int padding)

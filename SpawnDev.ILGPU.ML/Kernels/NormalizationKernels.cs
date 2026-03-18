@@ -126,9 +126,8 @@ public class NormalizationKernels
         int N, int C, int spatial)
     {
         EnsureLoaded();
-        _bnParams ??= _accelerator.Allocate1D<int>(3);
-        _bnParams.CopyFromCPU(new[] { N, C, spatial });
-        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, _bnParams.View);
+        using var bnParams = _accelerator.Allocate1D(new int[] { N, C, spatial });
+        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, bnParams.View);
     }
 
     /// <summary>
@@ -154,9 +153,8 @@ public class NormalizationKernels
         int N, int C, int spatial)
     {
         EnsureLoaded();
-        _bnParams ??= _accelerator.Allocate1D<int>(3);
-        _bnParams.CopyFromCPU(new[] { N, C, spatial });
-        _instanceNormKernel!(N * C * spatial, input, output, scale, bias, _bnParams.View);
+        using var instParams = _accelerator.Allocate1D(new int[] { N, C, spatial });
+        _instanceNormKernel!(N * C * spatial, input, output, scale, bias, instParams.View);
     }
 
     private void EnsureLoaded()
