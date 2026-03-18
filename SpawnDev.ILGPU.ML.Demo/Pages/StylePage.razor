@@ -114,6 +114,7 @@
 </style>
 
 @code {
+    // UI state fields — methods in StylePage.razor.cs
     private string _selectedBackend = "WebGPU";
     private string _selectedStyle = "Mosaic";
     private string? _imageDataUrl;
@@ -139,8 +140,6 @@
         new("Udnie"), new("Pointilism"), new("Starry Night")
     };
 
-    private Task HandleBackendChange(string backend) => Task.CompletedTask;
     private void SelectStyle(string name) { _selectedStyle = name; _styledImageUrl = null; }
-    private Task HandleImageLoaded(byte[] imageBytes) { _styledImageUrl = null; return Task.CompletedTask; }
     private Task HandleFrame(byte[] frameBytes) => Task.CompletedTask;
 }

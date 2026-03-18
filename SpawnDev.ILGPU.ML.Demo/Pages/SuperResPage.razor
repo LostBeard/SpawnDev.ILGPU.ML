@@ -121,11 +121,5 @@
         new() { Label = "Low-res Photo", Url = "samples/lowres.jpg" },
     };
 
-    private Task HandleBackendChange(string backend) => Task.CompletedTask;
-    private Task HandleImageLoaded(byte[] imageBytes) { _enhancedImageUrl = null; return Task.CompletedTask; }
-    private Task RunSuperRes()
-    {
-        // TODO: Run SR model through InferenceSession
-        return Task.CompletedTask;
-    }
+    // Methods in SuperResPage.razor.cs
 }
