@@ -6,7 +6,7 @@
         var path = window.location.pathname.split('/');
         // If hostname contains github.io AND we aren't at the root, use the subfolder
         var isGitHubPages = window.location.hostname.includes('github.io');
-        var baseHref = (isGitHubPages && path[1] === 'SpawnDev.ILGPU.ML.Demo') ? '/SpawnDev.ILGPU.ML.Demo/' : '/';
+        var baseHref = (isGitHubPages && path[1] === 'SpawnDev.ILGPU.ML') ? '/SpawnDev.ILGPU.ML/' : '/';
         document.write('<base href="' + baseHref + '" />');
     </script>
     <meta charset="utf-8" />
