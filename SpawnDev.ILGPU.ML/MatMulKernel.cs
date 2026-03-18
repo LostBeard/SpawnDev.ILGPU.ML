@@ -251,19 +251,10 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        if (_useSimpleKernels)
-        {
-            _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
-        }
-        else
-        {
-            int numTilesM = (M + TILE - 1) / TILE;
-            int numTilesN = (N + TILE - 1) / TILE;
-            int totalTiles = numTilesM * numTilesN;
-            var gridDim = new Index2D(totalTiles, batchSize);
-            var groupDim = new Index2D(TILE * TILE, 1);
-            _batchedMatMulKernel!(new KernelConfig(gridDim, groupDim), A, B, C, M, K, N, numTilesN);
-        }
+        // Always use simple kernel for batched MatMul — the tiled 2D grid version
+        // (Grid.IdxY for batch) produces zeros on WebGPU due to a dispatch/codegen issue.
+        // The simple auto-grouped kernel works correctly on all backends.
+        _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
     }
 
     private void EnsureKernelsLoaded(Accelerator accelerator)
