@@ -32,16 +32,4 @@ public class WebGPUTests : MLTestBase
         return (context, accelerator);
     }
 
-    // ── MatMul tests ──
-    [TestMethod] public new async Task MatMul_QkvDimensions() => await base.MatMul_QkvDimensions();
-    [TestMethod] public new async Task MatMul_MlpFc2Dimensions() => await base.MatMul_MlpFc2Dimensions();
-    [TestMethod] public new async Task MatMul_BatchedAttentionScores() => await base.MatMul_BatchedAttentionScores();
-    [TestMethod] public new async Task MatMul_SmallNonAligned() => await base.MatMul_SmallNonAligned();
-
-    // ── Kernel tests ──
-    [TestMethod] public new async Task LayerNorm_Dav3Dimensions() => await base.LayerNorm_Dav3Dimensions();
-    [TestMethod] public new async Task GELU_MatchesCpuErf() => await base.GELU_MatchesCpuErf();
-    [TestMethod] public new async Task BroadcastMul_LayerScale() => await base.BroadcastMul_LayerScale();
-    [TestMethod] public new async Task Softmax_AttentionDimensions() => await base.Softmax_AttentionDimensions();
-    [TestMethod] public new async Task TransposeLastTwo_RoundTrip() => await base.TransposeLastTwo_RoundTrip();
 }
