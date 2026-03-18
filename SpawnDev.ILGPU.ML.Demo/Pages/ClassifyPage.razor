@@ -166,6 +166,7 @@
 </style>
 
 @code {
+    // UI state — referenced by the markup
     private string _selectedBackend = "WebGPU";
     private string? _imageDataUrl;
     private bool _isRunning;
@@ -173,51 +174,22 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
-    private List<ConfidenceBars.Prediction>? _predictions;
+    private List<Components.ConfidenceBars.Prediction>? _predictions;
     private List<RaceResult>? _raceResults;
 
-    private List<BackendSelector.BackendInfo> _backends = new()
+    private List<Components.BackendSelector.BackendInfo> _backends = new()
     {
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
         new() { Id = "WebGL", DisplayName = "WebGL" },
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    private List<ImageDropZone.SampleImage> _samples = new()
+    private List<Components.ImageDropZone.SampleImage> _samples = new()
     {
         new() { Label = "Cat", Url = "samples/cat.jpg" },
         new() { Label = "Dog", Url = "samples/dog.jpg" },
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
-
-    private Task HandleBackendChange(string backend)
-    {
-        // TODO: Switch accelerator backend
-        return Task.CompletedTask;
-    }
-
-    private Task HandleImageLoaded(byte[] imageBytes)
-    {
-        // TODO: Preprocess image and run inference
-        return Task.CompletedTask;
-    }
-
-    private Task RunInference()
-    {
-        // TODO: Run classification through InferenceSession
-        return Task.CompletedTask;
-    }
-
-    private async Task CopyRaceResults()
-    {
-        if (_raceResults == null) return;
-        var text = "SpawnDev.ILGPU.ML — Backend Showdown (MobileNetV2)\n";
-        foreach (var r in _raceResults.OrderBy(r => r.TimeMs))
-        {
-            text += $"  {r.Backend}: {r.TimeMs:F1}ms\n";
-        }
-        // TODO: Copy to clipboard via JS interop
-    }
 
     private class RaceResult
     {
