@@ -45,6 +45,20 @@ public class GraphExecutor : IDisposable
         // Execute each node in topological order
         foreach (var node in _graph.Nodes)
         {
+            // Constant nodes: output is already in weights (stored by extraction script)
+            if (node.OpType == "Constant")
+            {
+                for (int i = 0; i < node.OutputNames.Length; i++)
+                {
+                    var outName = node.OutputNames[i];
+                    if (tensors.ContainsKey(outName)) continue; // Already registered as weight
+                    // Allocate empty tensor if not found (shouldn't happen with fixed extraction)
+                    var shape = node.OutputShapes.Length > i ? node.OutputShapes[i] : new[] { 1 };
+                    tensors[outName] = _pool.Rent(shape, outName);
+                }
+                continue;
+            }
+
             // Gather input tensors
             var nodeInputs = new Tensor[node.InputNames.Length];
             for (int i = 0; i < node.InputNames.Length; i++)
