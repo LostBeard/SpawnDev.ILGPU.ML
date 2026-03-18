@@ -76,10 +76,11 @@
         await OnImageLoaded.InvokeAsync(bytes);
     }
 
+    [Inject] HttpClient Http { get; set; } = default!;
+
     private async Task LoadSampleImage(string url)
     {
-        using var http = new HttpClient();
-        var bytes = await http.GetByteArrayAsync(url);
+        var bytes = await Http.GetByteArrayAsync(url);
         var dataUrl = $"data:image/jpeg;base64,{Convert.ToBase64String(bytes)}";
         ImageDataUrl = dataUrl;
         await ImageDataUrlChanged.InvokeAsync(dataUrl);
