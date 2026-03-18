@@ -112,6 +112,15 @@ public class InferenceSession : IDisposable
             }
         }
 
+        // Log weight loading stats
+        int missingCount = allInitNames.Count - loadedCount;
+        if (missingCount > 0)
+        {
+            var missing = allInitNames.Where(n => !weights.ContainsKey(n)).Take(5);
+            Console.WriteLine($"[InferenceSession] WARNING: {missingCount} initializers not found in weights. First few: {string.Join(", ", missing)}");
+        }
+        Console.WriteLine($"[InferenceSession] Loaded {loadedCount}/{allInitNames.Count} weights, {compiled.Nodes.Length} nodes compiled");
+
         // Create executor
         var executor = new GraphExecutor(accelerator, compiled, weights);
         onProgress?.Invoke("ready", 100);
