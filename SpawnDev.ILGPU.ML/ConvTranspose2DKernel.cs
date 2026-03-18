@@ -5,15 +5,13 @@ namespace SpawnDev.ILGPU.ML;
 
 /// <summary>
 /// Transposed 2D Convolution (deconvolution / fractionally-strided convolution).
-/// Used for the DPT head resize_layers that upsample spatial resolution.
+/// Used for DPT head resize_layers that upsample spatial resolution.
 ///
 /// Weight layout (PyTorch ConvTranspose2d): [inC, outC, kH, kW]
-///
 /// Output size (no output_padding): outH = (inH - 1) * stride - 2 * padding + kH
 ///
 /// Implemented in "gather" direction — one thread per output element, no atomics.
-/// For stride == kernel_size (no overlap): each output element receives exactly one contribution,
-/// making this very efficient (k=4,s=4 or k=2,s=2).
+/// Parameters packed into ArrayView to avoid WebGPU scalar packing issues.
 /// </summary>
 public class ConvTranspose2DKernel
 {
@@ -21,31 +19,34 @@ public class ConvTranspose2DKernel
 
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,  // input
-        ArrayView1D<float, Stride1D.Dense>,  // weight [inC, outC, kH, kW]
-        ArrayView1D<float, Stride1D.Dense>,  // bias [outC] or empty
+        ArrayView1D<float, Stride1D.Dense>,  // weight
+        ArrayView1D<float, Stride1D.Dense>,  // bias
         ArrayView1D<float, Stride1D.Dense>,  // output
-        int, int, int,    // inC, inH, inW
-        int, int, int,    // outC, kH, kW
-        int, int>?        // stride, padding
+        ArrayView1D<int, Stride1D.Dense>>?   // params [8]
         _kernel;
+
+    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
 
     public ConvTranspose2DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
+    /// <summary>
+    /// params: [inC, inH, inW, outC, kH, kW, stride, padding]
+    /// </summary>
     private static void ConvTranspose2DImpl(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> weight,
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output,
-        int inC, int inH, int inW,
-        int outC, int kH, int kW,
-        int stride, int padding)
+        ArrayView1D<int, Stride1D.Dense> p)
     {
-        // Output dimensions (no output_padding)
+        int inC = p[0]; int inH = p[1]; int inW = p[2];
+        int outC = p[3]; int kH = p[4]; int kW = p[5];
+        int stride = p[6]; int padding = p[7];
+
         int outH = (inH - 1) * stride - 2 * padding + kH;
         int outW = (inW - 1) * stride - 2 * padding + kW;
 
-        // Decompose linear index → (oc, oy, ox)
         int ox = idx % outW;
         int rem = idx / outW;
         int oy = rem % outH;
@@ -57,8 +58,6 @@ public class ConvTranspose2DKernel
         {
             for (int ky = 0; ky < kH; ky++)
             {
-                // For ConvTranspose: input[iy] contributes to output[iy*stride + ky].
-                // Gather direction: for output[oy], need iy = (oy + padding - ky) / stride
                 int diffY = oy + padding - ky;
                 if (diffY < 0 || diffY % stride != 0) continue;
                 int iy = diffY / stride;
@@ -71,7 +70,6 @@ public class ConvTranspose2DKernel
                     int ix = diffX / stride;
                     if (ix >= inW) continue;
 
-                    // weight layout: [inC, outC, kH, kW]
                     float w = weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
                     sum += input[ic * inH * inW + iy * inW + ix] * w;
                 }
@@ -81,12 +79,6 @@ public class ConvTranspose2DKernel
         output[idx] = sum;
     }
 
-    /// <summary>
-    /// Run ConvTranspose2D. Input: [inC, inH, inW]. Output: [outC, outH, outW].
-    /// Weight: [inC, outC, kH, kW] (PyTorch ConvTranspose2d convention).
-    /// Bias: [outC] or empty.
-    /// Output size: outH = (inH-1)*stride - 2*padding + kH
-    /// </summary>
     public void Forward(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> weight,
@@ -99,11 +91,13 @@ public class ConvTranspose2DKernel
         EnsureLoaded();
         int outH = (inH - 1) * stride - 2 * padding + kH;
         int outW = (inW - 1) * stride - 2 * padding + kW;
-        _kernel!(outC * outH * outW, input, weight, bias, output,
-            inC, inH, inW, outC, kH, kW, stride, padding);
+
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new[] { inC, inH, inW, outC, kH, kW, stride, padding });
+
+        _kernel!(outC * outH * outW, input, weight, bias, output, _paramsBuf.View);
     }
 
-    /// <summary>Compute output spatial size for given parameters.</summary>
     public static int OutputSize(int inputSize, int kernelSize, int stride, int padding)
         => (inputSize - 1) * stride - 2 * padding + kernelSize;
 
@@ -114,8 +108,6 @@ public class ConvTranspose2DKernel
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int, int, int,
-            int, int, int,
-            int, int>(ConvTranspose2DImpl);
+            ArrayView1D<int, Stride1D.Dense>>(ConvTranspose2DImpl);
     }
 }

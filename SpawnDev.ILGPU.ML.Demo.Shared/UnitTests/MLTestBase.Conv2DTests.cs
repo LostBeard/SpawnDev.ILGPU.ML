@@ -161,6 +161,57 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ConvTranspose2D_Stride4() => await RunTest(async accelerator =>
+    {
+        // DPT resize_layer: ConvTranspose [48,48,4,4] stride=4 → 37→148
+        int inC = 4, inH = 5, inW = 5, outC = 4, kH = 4, kW = 4, stride = 4, padding = 0;
+        int outH = (inH - 1) * stride + kH; // 20
+        int outW = (inW - 1) * stride + kW; // 20
+        var input = RandomFloats(inC * inH * inW, seed: 120, scale: 0.5f);
+        var weight = RandomFloats(inC * outC * kH * kW, seed: 121, scale: 0.1f);
+        var bias = RandomFloats(outC, seed: 122, scale: 0.01f);
+
+        // CPU reference (gather direction)
+        var expected = new float[outC * outH * outW];
+        for (int oc = 0; oc < outC; oc++)
+            for (int oy = 0; oy < outH; oy++)
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    float sum = bias[oc];
+                    for (int ic = 0; ic < inC; ic++)
+                        for (int ky = 0; ky < kH; ky++)
+                        {
+                            int diffY = oy + padding - ky;
+                            if (diffY < 0 || diffY % stride != 0) continue;
+                            int iy = diffY / stride;
+                            if (iy >= inH) continue;
+                            for (int kx = 0; kx < kW; kx++)
+                            {
+                                int diffX = ox + padding - kx;
+                                if (diffX < 0 || diffX % stride != 0) continue;
+                                int ix = diffX / stride;
+                                if (ix >= inW) continue;
+                                sum += input[ic * inH * inW + iy * inW + ix]
+                                     * weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
+                            }
+                        }
+                    expected[oc * outH * outW + oy * outW + ox] = sum;
+                }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(outC * outH * outW);
+
+        var convT = new ConvTranspose2DKernel(accelerator);
+        convT.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride, padding);
+        await accelerator.SynchronizeAsync();
+
+        var actual = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
+        AssertClose(expected, actual, inC * kH * kW * 2e-5f, "ConvTranspose2D s4: ");
+    });
+
+    [TestMethod]
     public async Task AttentionSplitMerge_RoundTrip() => await RunTest(async accelerator =>
     {
         // SplitHeads → MergeHeads should recover the original data
