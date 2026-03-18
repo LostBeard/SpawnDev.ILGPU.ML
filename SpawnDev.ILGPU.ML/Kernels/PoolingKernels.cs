@@ -107,8 +107,9 @@ public class PoolingKernels
         EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
-        using var poolParams = _accelerator.Allocate1D(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
-        _maxPool2d!(N * C * outH * outW, input, output, poolParams.View);
+        _poolParams ??= _accelerator.Allocate1D<int>(10);
+        _poolParams.CopyFromCPU(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
+        _maxPool2d!(N * C * outH * outW, input, output, _poolParams.View);
     }
 
     public void AvgPool2D(ArrayView1D<float, Stride1D.Dense> input,
@@ -118,8 +119,9 @@ public class PoolingKernels
         EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
-        using var poolParams = _accelerator.Allocate1D(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
-        _avgPool2d!(N * C * outH * outW, input, output, poolParams.View);
+        _poolParams ??= _accelerator.Allocate1D<int>(10);
+        _poolParams.CopyFromCPU(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
+        _avgPool2d!(N * C * outH * outW, input, output, _poolParams.View);
     }
 
     public void GlobalAvgPool(ArrayView1D<float, Stride1D.Dense> input,

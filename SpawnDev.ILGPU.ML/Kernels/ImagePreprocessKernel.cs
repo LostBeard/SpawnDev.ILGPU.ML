@@ -95,14 +95,15 @@ public class ImagePreprocessKernel
         mean ??= new[] { 0.485f, 0.456f, 0.406f }; // ImageNet RGB mean
         std ??= new[] { 0.229f, 0.224f, 0.225f };   // ImageNet RGB std
 
-        using var paramsBuf = _accelerator.Allocate1D(new float[] {
+        _paramsBuf ??= _accelerator.Allocate1D<float>(10);
+        _paramsBuf.CopyFromCPU(new float[] {
             srcW, srcH, dstW, dstH,
             mean[0], mean[1], mean[2],
             1f / std[0], 1f / std[1], 1f / std[2]
         });
 
         int totalOutput = 3 * dstH * dstW;
-        _preprocessKernel!(totalOutput, rgba, output, paramsBuf.View);
+        _preprocessKernel!(totalOutput, rgba, output, _paramsBuf.View);
     }
 
     private void EnsureLoaded()
