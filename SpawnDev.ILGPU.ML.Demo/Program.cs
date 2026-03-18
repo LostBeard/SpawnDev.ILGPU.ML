@@ -11,9 +11,9 @@ builder.Services.AddBlazorJSRuntime();
 
 // Register test types as singletons for UnitTestsView discovery
 builder.Services.AddSingleton<WebGPUTests>();
-//builder.Services.AddSingleton<WasmTests>();
-//builder.Services.AddSingleton<WebGLTests>();
-//builder.Services.AddSingleton<DefaultTests>();
+builder.Services.AddSingleton<WasmTests>();
+builder.Services.AddSingleton<WebGLTests>();
+builder.Services.AddSingleton<DefaultTests>();
 
 builder.Services.AddScoped(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 
