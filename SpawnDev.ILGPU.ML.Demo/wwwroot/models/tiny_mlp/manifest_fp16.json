@@ -1,0 +1,21 @@
+{
+  "W": {
+    "offset": 0,
+    "shape": [
+      4,
+      3
+    ],
+    "elements": 12,
+    "bytes": 24,
+    "dtype": "fp16"
+  },
+  "B": {
+    "offset": 128,
+    "shape": [
+      3
+    ],
+    "elements": 3,
+    "bytes": 6,
+    "dtype": "fp16"
+  }
+}
