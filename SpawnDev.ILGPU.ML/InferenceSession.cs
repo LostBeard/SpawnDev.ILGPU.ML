@@ -121,6 +121,13 @@ public class InferenceSession : IDisposable
         }
         Console.WriteLine($"[InferenceSession] Loaded {loadedCount}/{allInitNames.Count} weights, {compiled.Nodes.Length} nodes compiled");
 
+        // Diagnostic: check first weight tensor has non-zero values
+        if (weights.Count > 0)
+        {
+            var firstWeight = weights.Values.First();
+            Console.WriteLine($"[InferenceSession] First weight '{firstWeight.Name}': shape=[{string.Join(",", firstWeight.Shape)}], elements={firstWeight.ElementCount}");
+        }
+
         // Create executor
         var executor = new GraphExecutor(accelerator, compiled, weights);
         onProgress?.Invoke("ready", 100);
