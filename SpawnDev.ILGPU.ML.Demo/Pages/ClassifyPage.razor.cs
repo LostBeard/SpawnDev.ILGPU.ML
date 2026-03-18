@@ -124,7 +124,9 @@ public partial class ClassifyPage : IDisposable
                 Confidence = r.Confidence
             }).ToList();
 
-            Console.WriteLine($"[Classify] {ms:F1}ms — {results[0].Label} ({results[0].Confidence:P1})");
+            Console.WriteLine($"[Classify] {ms:F1}ms — Top-5:");
+            foreach (var r in results)
+                Console.WriteLine($"  {r.Label} ({r.Confidence:P2}, class {r.ClassIndex})");
         }
         catch (Exception ex)
         {
