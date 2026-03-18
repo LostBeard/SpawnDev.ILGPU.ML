@@ -42,6 +42,31 @@ public class SigmoidOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+public class SiLUOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SiLU"; // Not standard ONNX — but used in YOLO via Mul(x, Sigmoid(x))
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        reg.Activations.SiLUInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+    }
+}
+
+public class LeakyReluOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "LeakyRelu";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // LeakyRelu: max(alpha*x, x). For now, use ReLU (alpha=0).
+        // TODO: proper LeakyReLU with alpha parameter
+        reg.ElementWise.ReLU(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
 public class TanhOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Tanh";

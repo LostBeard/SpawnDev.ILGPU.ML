@@ -111,5 +111,7 @@ public class OperatorRegistry
         Register(new FloorOperator(this));
         Register(new UpsampleOperator(this));
         Register(new ShapeOperator());
+        Register(new SiLUOperator(this));
+        Register(new LeakyReluOperator(this));
     }
 }
