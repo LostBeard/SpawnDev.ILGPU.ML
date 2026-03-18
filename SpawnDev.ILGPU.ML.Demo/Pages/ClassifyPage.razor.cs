@@ -69,14 +69,32 @@ public partial class ClassifyPage : IDisposable
         _imageBytes = imageBytes;
         _predictions = null;
 
-        // TODO: Decode image bytes to RGBA pixels using SpawnDev.BlazorJS
-        // Pattern: Blob → createImageBitmap → OffscreenCanvas → getImageData → Uint8ClampedArray → int[]
-        // TJ: please wire this with the correct BlazorJS API — I kept getting the types wrong.
-        Console.WriteLine($"[Classify] Image received: {imageBytes.Length} bytes — needs decoding to RGBA");
+        try
+        {
+            // Decode image bytes to RGBA using #2's MediaInterop
+            var mediaInterop = new SpawnDev.ILGPU.ML.Preprocessing.MediaInterop(JS);
+            using var uint8 = new SpawnDev.BlazorJS.JSObjects.Uint8Array(imageBytes);
+            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
+                new SpawnDev.BlazorJS.JSObjects.BlobPart[] { uint8 });
+            var (pixels, w, h) = await mediaInterop.FromBlobAsync(blob);
 
-        // For now, auto-run inference if we have pixels
-        if (_rgbaPixels != null && _isModelLoaded)
-            await RunInference();
+            // Pack RGBA bytes → int[] (packed uint32: R | G<<8 | B<<16 | A<<24)
+            _rgbaPixels = new int[w * h];
+            for (int i = 0; i < w * h; i++)
+                _rgbaPixels[i] = pixels[i * 4] | (pixels[i * 4 + 1] << 8)
+                    | (pixels[i * 4 + 2] << 16) | (pixels[i * 4 + 3] << 24);
+            _imageWidth = w;
+            _imageHeight = h;
+
+            Console.WriteLine($"[Classify] Decoded: {w}x{h}");
+
+            if (_isModelLoaded)
+                await RunInference();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Classify] Decode error: {ex.Message}");
+        }
     }
 
     private async Task RunInference()
