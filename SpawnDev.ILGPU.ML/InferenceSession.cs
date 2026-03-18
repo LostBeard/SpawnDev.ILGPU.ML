@@ -107,7 +107,15 @@ public class InferenceSession : IDisposable
             var view = weightLoader.TryGetView(name);
             if (view != null && weightLoader.Shapes.TryGetValue(name, out var shape))
             {
-                weights[name] = new Tensor(view.Value, shape, name);
+                // Copy each weight into its OWN buffer. WeightLoader uses a single
+                // shared buffer with SubViews, but WebGPU doesn't allow binding the
+                // same GPUBuffer to multiple storage slots in one kernel dispatch.
+                // Without separate buffers, Conv2D (weight + bias from same buffer)
+                // produces silent zeros on WebGPU.
+                int count = Tensors.TensorHelpers.ElementCount(shape);
+                var ownBuf = accelerator.Allocate1D<float>(count);
+                view.Value.SubView(0, count).CopyTo(ownBuf.View);
+                weights[name] = new Tensor(ownBuf.View, shape, name);
                 loadedCount++;
             }
         }
