@@ -58,24 +58,24 @@ public class Conv2DKernel
 
         float sum = (bias.Length > 0) ? bias[oc] : 0f;
 
-        // Single flat loop to avoid WebGPU WGSL codegen issues with triple-nested loops.
-        int kHkW = kH * kW;
-        int totalIter = inC * kHkW;
-        for (int i = 0; i < totalIter; i++)
+        // Triple-nested convolution loop. Requires SpawnDev.ILGPU with the
+        // PushPhiValuesTransitive fix (commit 2b6b314) for correct WGSL codegen.
+        for (int ic = 0; ic < inC; ic++)
         {
-            int ic = i / kHkW;
-            int kRem = i % kHkW;
-            int ky = kRem / kW;
-            int kx = kRem % kW;
-
-            int iy = oy * stride + ky - padding;
-            int ix = ox * stride + kx - padding;
-
-            if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+            int icBase = ic * inH * inW;
+            int wcBase = oc * inC * kH * kW + ic * kH * kW;
+            for (int ky = 0; ky < kH; ky++)
             {
-                float inputVal = input[ic * inH * inW + iy * inW + ix];
-                float weightVal = weight[oc * inC * kHkW + ic * kHkW + ky * kW + kx];
-                sum += inputVal * weightVal;
+                int iy = oy * stride + ky - padding;
+                if (iy < 0 || iy >= inH) continue;
+
+                for (int kx = 0; kx < kW; kx++)
+                {
+                    int ix = ox * stride + kx - padding;
+                    if (ix < 0 || ix >= inW) continue;
+
+                    sum += input[icBase + iy * inW + ix] * weight[wcBase + ky * kW + kx];
+                }
             }
         }
 
