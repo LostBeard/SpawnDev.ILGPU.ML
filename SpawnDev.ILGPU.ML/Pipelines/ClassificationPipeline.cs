@@ -67,24 +67,37 @@ public class ClassificationPipeline : IDisposable
         await _accelerator.SynchronizeAsync();
         var logits = await readBuf.CopyToHostAsync<float>(0, numClasses);
 
-        // Softmax + top-K
-        return TopK(logits, topK);
+        // Check if output is already softmax'd (values sum to ~1.0)
+        // If so, skip softmax to avoid double-softmax flattening
+        float outputSum = logits.Sum();
+        bool alreadySoftmaxed = outputSum > 0.9f && outputSum < 1.1f && logits.All(v => v >= 0f);
+
+        return TopK(logits, topK, applySoftmax: !alreadySoftmaxed);
     }
 
-    private ClassificationResult[] TopK(float[] logits, int k)
+    private ClassificationResult[] TopK(float[] logits, int k, bool applySoftmax = true)
     {
-        float max = logits.Max();
-        var exps = new float[logits.Length];
-        float sum = 0;
-        for (int i = 0; i < logits.Length; i++)
+        float[] probs;
+        if (applySoftmax)
         {
-            exps[i] = MathF.Exp(logits[i] - max);
-            sum += exps[i];
+            float max = logits.Max();
+            var exps = new float[logits.Length];
+            float sum = 0;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                exps[i] = MathF.Exp(logits[i] - max);
+                sum += exps[i];
+            }
+            probs = exps.Select(e => e / sum).ToArray();
+        }
+        else
+        {
+            probs = logits; // Already probabilities
         }
 
-        var results = new (int Index, float Prob)[logits.Length];
-        for (int i = 0; i < logits.Length; i++)
-            results[i] = (i, exps[i] / sum);
+        var results = new (int Index, float Prob)[probs.Length];
+        for (int i = 0; i < probs.Length; i++)
+            results[i] = (i, probs[i]);
 
         Array.Sort(results, (a, b) => b.Prob.CompareTo(a.Prob));
 
