@@ -139,8 +139,73 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        // Div needs a reciprocal kernel — for now, only support scalar divisor
-        throw new NotSupportedException("Div operator not yet implemented — need reciprocal kernel");
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+        {
+            reg.ElementWise.Div(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        }
+        else
+        {
+            // Broadcast div: compute reciprocal of b, then broadcast multiply
+            // For now, only support per-channel broadcast (b is last dim of a)
+            throw new NotSupportedException($"Div broadcast not yet implemented for shapes [{string.Join(",", a.Shape)}] / [{string.Join(",", b.Shape)}]");
+        }
+    }
+}
+
+public class AbsOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Abs";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Abs(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class ErfOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Erf";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Erf(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class PowOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Pow";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Pow(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Where";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[1] }; // shape of x
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Where(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Inputs[2].Data,
+            ctx.Outputs[0].Data, ctx.Inputs[1].ElementCount);
+    }
+}
+
+public class ReciprocalOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Reciprocal";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Reciprocal(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -153,8 +218,7 @@ public class SqrtOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // Need a Sqrt kernel — placeholder
-        throw new NotSupportedException("Sqrt operator not yet implemented — need Sqrt kernel");
+        reg.ElementWise.Sqrt(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -165,7 +229,7 @@ public class ExpOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Exp operator not yet implemented — need Exp kernel");
+        reg.ElementWise.Exp(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 

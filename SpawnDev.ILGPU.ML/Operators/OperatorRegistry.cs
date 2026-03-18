@@ -89,5 +89,10 @@ public class OperatorRegistry
         Register(new ExpOperator(this));
         Register(new NegOperator(this));
         Register(new DivOperator(this));
+        Register(new AbsOperator(this));
+        Register(new ErfOperator(this));
+        Register(new PowOperator(this));
+        Register(new WhereOperator(this));
+        Register(new ReciprocalOperator(this));
     }
 }
