@@ -28,6 +28,16 @@ public class Conv2DKernel
         _conv2dKernel;
 
     // Persistent params buffer (reused across calls)
+    // Depthwise Conv2D: group=inC, each channel convolved independently
+    // Weight: [C, 1, kH, kW], params: [C, inH, inW, kH, kW, stride, padding]
+    private Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>?
+        _depthwiseKernel;
+
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
 
     public Conv2DKernel(Accelerator accelerator) => _accelerator = accelerator;
@@ -109,6 +119,74 @@ public class Conv2DKernel
         _conv2dKernel!(totalOutputElements, input, weight, bias, output, _paramsBuf.View);
     }
 
+    /// <summary>
+    /// Depthwise Conv2D: each input channel convolved independently.
+    /// Weight: [C, 1, kH, kW]. params: [C, inH, inW, kH, kW, stride, padding]
+    /// </summary>
+    private static void DepthwiseConv2DImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int C = p[0]; int inH = p[1]; int inW = p[2];
+        int kH = p[3]; int kW = p[4]; int stride = p[5]; int padding = p[6];
+
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+
+        int ox = idx % outW;
+        int rem = idx / outW;
+        int oy = rem % outH;
+        int c = rem / outH;
+
+        float sum = (bias.Length > 0) ? bias[c] : 0f;
+
+        int inBase = c * inH * inW;
+        int wBase = c * kH * kW; // weight [C, 1, kH, kW] = [C, kH*kW]
+        for (int ky = 0; ky < kH; ky++)
+        {
+            int iy = oy * stride + ky - padding;
+            if (iy < 0 || iy >= inH) continue;
+
+            for (int kx = 0; kx < kW; kx++)
+            {
+                int ix = ox * stride + kx - padding;
+                if (ix < 0 || ix >= inW) continue;
+
+                sum += input[inBase + iy * inW + ix] * weight[wBase + ky * kW + kx];
+            }
+        }
+
+        output[idx] = sum;
+    }
+
+    /// <summary>
+    /// Depthwise Conv2D: group=inC, each channel convolved independently.
+    /// Weight: [C, 1, kH, kW]. Bias: [C] or empty.
+    /// </summary>
+    public void ForwardDepthwise(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW,
+        int kH, int kW,
+        int stride = 1, int padding = 0)
+    {
+        EnsureLoaded();
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+
+        if (_paramsBuf == null)
+            _paramsBuf = _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
+
+        _depthwiseKernel!(C * outH * outW, input, weight, bias, output, _paramsBuf.View);
+    }
+
     private void EnsureLoaded()
     {
         _conv2dKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
@@ -117,5 +195,11 @@ public class Conv2DKernel
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(Conv2DImpl);
+        _depthwiseKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(DepthwiseConv2DImpl);
     }
 }

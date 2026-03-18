@@ -161,6 +161,46 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Conv2D_Depthwise3x3() => await RunTest(async accelerator =>
+    {
+        int C = 32, inH = 8, inW = 8, kH = 3, kW = 3, stride = 1, padding = 1;
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+        var input = RandomFloats(C * inH * inW, seed: 125, scale: 0.5f);
+        var weight = RandomFloats(C * kH * kW, seed: 126, scale: 0.1f);
+        var bias = RandomFloats(C, seed: 127, scale: 0.01f);
+
+        var expected = new float[C * outH * outW];
+        for (int c = 0; c < C; c++)
+            for (int oy = 0; oy < outH; oy++)
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    float sum = bias[c];
+                    for (int ky = 0; ky < kH; ky++)
+                        for (int kx = 0; kx < kW; kx++)
+                        {
+                            int iy = oy * stride + ky - padding;
+                            int ix = ox * stride + kx - padding;
+                            if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+                                sum += input[c * inH * inW + iy * inW + ix] * weight[c * kH * kW + ky * kW + kx];
+                        }
+                    expected[c * outH * outW + oy * outW + ox] = sum;
+                }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(C * outH * outW);
+
+        var conv = new Conv2DKernel(accelerator);
+        conv.ForwardDepthwise(inBuf.View, wBuf.View, bBuf.View, outBuf.View, C, inH, inW, kH, kW, stride, padding);
+        await accelerator.SynchronizeAsync();
+
+        var actual = await outBuf.CopyToHostAsync<float>(0, C * outH * outW);
+        AssertClose(expected, actual, kH * kW * 2e-5f, "Depthwise Conv2D: ");
+    });
+
+    [TestMethod]
     public async Task ConvTranspose2D_Stride4() => await RunTest(async accelerator =>
     {
         // DPT resize_layer: ConvTranspose [48,48,4,4] stride=4 → 37→148

@@ -120,12 +120,27 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
         var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
+        int group = ctx.GetInt("group", 1);
         int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
         int outC = w.Shape[0]; int kH = w.Shape[2]; int kW = w.Shape[3];
-        var bias = ctx.Inputs.Length > 2 ? ctx.Inputs[2].Data : default;
-        // For batch > 1, need to loop (current Conv2D is single-image)
-        reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-            inC, inH, inW, outC, kH, kW, stride, pad);
+        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null ? ctx.Inputs[2].Data : default;
+
+        if (group == inC && group == outC)
+        {
+            // Depthwise convolution: each channel convolved independently
+            reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                inC, inH, inW, kH, kW, stride, pad);
+        }
+        else if (group == 1)
+        {
+            // Standard convolution
+            reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                inC, inH, inW, outC, kH, kW, stride, pad);
+        }
+        else
+        {
+            throw new NotSupportedException($"Conv with group={group} (inC={inC}, outC={outC}) not yet implemented — only group=1 and depthwise (group=inC=outC) supported");
+        }
     }
 }
 
