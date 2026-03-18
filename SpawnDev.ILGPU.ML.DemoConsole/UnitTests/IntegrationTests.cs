@@ -237,6 +237,83 @@ public class IntegrationTests
             Console.WriteLine($"  class {idx}: {prob:P2}");
     }
 
+    [TestMethod]
+    public async Task FullExecution_SqueezeNet_WithRealWeights()
+    {
+        var modelsDir = FindModelsDir();
+        var modelDir = Path.Combine(modelsDir, "squeezenet");
+        var graphPath = Path.Combine(modelDir, "model_graph.json");
+        var manifestPath = Path.Combine(modelDir, "manifest_fp16.json");
+        var weightsPath = Path.Combine(modelDir, "weights_fp16.bin");
+
+        if (!File.Exists(graphPath) || !File.Exists(weightsPath))
+            throw new UnsupportedTestException("SqueezeNet model files not found");
+
+        var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(graphPath));
+        Console.WriteLine($"[FullExec] SqueezeNet: {graph.Nodes.Count} nodes");
+
+        using var context = MLContext.CreateContext();
+        using var accelerator = context.CreateCPUAccelerator(0);
+
+        var manifestJson = await File.ReadAllTextAsync(manifestPath);
+        var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(manifestJson)!;
+        var blob = await File.ReadAllBytesAsync(weightsPath);
+
+        using var pool = new BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensor>();
+        foreach (var (name, info) in manifest)
+        {
+            var offset = info.GetProperty("offset").GetInt32();
+            var shape = info.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var elements = info.GetProperty("elements").GetInt32();
+            var fp32 = new float[elements];
+            for (int i = 0; i < elements; i++)
+            {
+                ushort fp16Bits = (ushort)(blob[offset + i * 2] | (blob[offset + i * 2 + 1] << 8));
+                fp32[i] = HalfToFloat(fp16Bits);
+            }
+            weights[name] = pool.AllocatePermanent(fp32, shape, name);
+        }
+
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+
+        var inputData = new float[1 * 3 * 224 * 224];
+        var rng = new Random(42);
+        for (int i = 0; i < inputData.Length; i++) inputData[i] = (float)(rng.NextDouble() * 2 - 1);
+        var input = pool.AllocatePermanent(inputData, new[] { 1, 3, 224, 224 }, "data");
+
+        Console.WriteLine($"[FullExec] Running SqueezeNet inference...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var executor = new GraphExecutor(accelerator, compiled, weights);
+        var outputs = executor.Run(new Dictionary<string, Tensor> { [graph.Inputs[0].Name] = input });
+        accelerator.Synchronize();
+        sw.Stop();
+        Console.WriteLine($"[FullExec] SqueezeNet inference: {sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        var output = outputs[graph.Outputs[0].Name];
+        Console.WriteLine($"[FullExec] Output: {output.ElementCount} elements");
+
+        using var rb = accelerator.Allocate1D<float>(output.ElementCount);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, output.ElementCount), rb.View, output.ElementCount, 1f);
+        accelerator.Synchronize();
+        var logits = rb.GetAsArray1D();
+
+        float min = logits.Min(), max = logits.Max();
+        Console.WriteLine($"[FullExec] Logits: min={min:F4}, max={max:F4}, mean={logits.Average():F4}");
+
+        if (float.IsNaN(min) || logits.All(v => v == 0f))
+            throw new Exception("Output is NaN or zeros");
+
+        // Top-5
+        float expMax = logits.Max();
+        var probs = logits.Select(x => MathF.Exp(x - expMax)).ToArray();
+        float probSum = probs.Sum();
+        var top5 = probs.Select((p, i) => (i, p / probSum)).OrderByDescending(x => x.Item2).Take(5);
+        Console.WriteLine("[FullExec] Top-5:");
+        foreach (var (idx, prob) in top5) Console.WriteLine($"  class {idx}: {prob:P2}");
+    }
+
     private static float HalfToFloat(ushort h)
     {
         int sign = (h >> 15) & 1;
