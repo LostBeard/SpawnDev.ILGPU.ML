@@ -50,11 +50,12 @@ public partial class ClassifyPage : IDisposable
             _selectedBackend = "WebGPU";
 
             _classService = new ClassificationService(Http);
-            await _classService.LoadModelAsync("models/mobilenetv2", _accelerator);
+            // SqueezeNet (2.4MB) loads faster than MobileNetV2 (6.8MB)
+            await _classService.LoadModelAsync("models/squeezenet", _accelerator);
 
             _isModelLoaded = true;
             _isModelLoading = false;
-            Console.WriteLine("[Classify] MobileNetV2 loaded on WebGPU");
+            Console.WriteLine($"[Classify] Model loaded: {_classService.ModelInfo}");
         }
         catch (Exception ex)
         {
