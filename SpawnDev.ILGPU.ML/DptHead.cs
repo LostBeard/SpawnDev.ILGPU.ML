@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -36,7 +35,7 @@ public class DptHead : IDisposable
     private const int H0 = 148;  // level 0: ConvTranspose stride=4 → 37→148
     private const int H_MID = 296; // refinenet1 internal 2× resize: 148→296
 
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
     private readonly Conv2DKernel _conv2d;
     private readonly ConvTranspose2DKernel _convTranspose;
     private readonly ElementWiseKernels _elementWise;
@@ -76,7 +75,7 @@ public class DptHead : IDisposable
     public const int OutputH = 518;
     public const int OutputW = 518;
 
-    public DptHead(WebGPUAccelerator accelerator, Conv2DKernel conv2d,
+    public DptHead(Accelerator accelerator, Conv2DKernel conv2d,
         ConvTranspose2DKernel convTranspose,
         ElementWiseKernels elementWise, LayerNormKernel layerNorm)
     {

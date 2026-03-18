@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -25,7 +24,7 @@ public class AttentionKernels
     private const int H = TransformerBlock.H;     // 6
     private const int D = TransformerBlock.D;     // 64
 
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _splitHeadsKernel;
@@ -33,7 +32,7 @@ public class AttentionKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int>? _mergeHeadsKernel;
 
-    public AttentionKernels(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public AttentionKernels(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
     /// Split QKV [T, 3*C] into Q[H*T*D], K[H*T*D], V[H*T*D] each as contiguous [H, T, D].

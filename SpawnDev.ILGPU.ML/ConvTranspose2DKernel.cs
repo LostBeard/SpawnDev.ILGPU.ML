@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -18,7 +17,7 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public class ConvTranspose2DKernel
 {
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
 
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,  // input
@@ -30,7 +29,7 @@ public class ConvTranspose2DKernel
         int, int>?        // stride, padding
         _kernel;
 
-    public ConvTranspose2DKernel(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public ConvTranspose2DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     private static void ConvTranspose2DImpl(
         Index1D idx,

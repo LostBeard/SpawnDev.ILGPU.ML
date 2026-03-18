@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -17,7 +16,8 @@ public class MatMulKernel
 {
     private const int TILE = 16; // 16×16 = 256 threads = WebGPU max workgroup size
 
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
+    private readonly bool _useSimpleKernels; // CPU/WebGL can't handle 256-thread groups
 
     // LoadStreamKernel returns Action<KernelConfig, ...>
     private Action<KernelConfig,
@@ -34,7 +34,14 @@ public class MatMulKernel
                    int, int, int, int>?  // M, K, N, numTilesN
         _batchedMatMulKernel;
 
-    public MatMulKernel(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public MatMulKernel(Accelerator accelerator, bool forceSimpleKernels = false)
+    {
+        _accelerator = accelerator;
+        // CPU backend has max group dim of 16 per axis — can't do 256-thread tiled kernels
+        // WebGL has no shared memory — must use simple kernels
+        // forceSimpleKernels: bypass tiled kernels for debugging (test if tiled MatMul is the bug)
+        _useSimpleKernels = forceSimpleKernels || accelerator.MaxNumThreadsPerGroup < TILE * TILE;
+    }
 
     // ─────────────────────────────────────────────────────────────
     //  GPU Kernels (1D shared memory, manual 2D indexing)
@@ -219,10 +226,17 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        int numTilesM = (M + TILE - 1) / TILE;
-        int numTilesN = (N + TILE - 1) / TILE;
-        int totalTiles = numTilesM * numTilesN;
-        _matMulKernel!(new KernelConfig(totalTiles, TILE * TILE), A, B, C, M, K, N, numTilesN);
+        if (_useSimpleKernels)
+        {
+            _simpleMatMulKernel!(M * N, A, B, C, M, K, N);
+        }
+        else
+        {
+            int numTilesM = (M + TILE - 1) / TILE;
+            int numTilesN = (N + TILE - 1) / TILE;
+            int totalTiles = numTilesM * numTilesN;
+            _matMulKernel!(new KernelConfig(totalTiles, TILE * TILE), A, B, C, M, K, N, numTilesN);
+        }
     }
 
     /// <summary>
@@ -237,15 +251,22 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        int numTilesM = (M + TILE - 1) / TILE;
-        int numTilesN = (N + TILE - 1) / TILE;
-        int totalTiles = numTilesM * numTilesN;
-        var gridDim = new Index2D(totalTiles, batchSize);
-        var groupDim = new Index2D(TILE * TILE, 1);
-        _batchedMatMulKernel!(new KernelConfig(gridDim, groupDim), A, B, C, M, K, N, numTilesN);
+        if (_useSimpleKernels)
+        {
+            _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
+        }
+        else
+        {
+            int numTilesM = (M + TILE - 1) / TILE;
+            int numTilesN = (N + TILE - 1) / TILE;
+            int totalTiles = numTilesM * numTilesN;
+            var gridDim = new Index2D(totalTiles, batchSize);
+            var groupDim = new Index2D(TILE * TILE, 1);
+            _batchedMatMulKernel!(new KernelConfig(gridDim, groupDim), A, B, C, M, K, N, numTilesN);
+        }
     }
 
-    private void EnsureKernelsLoaded(WebGPUAccelerator accelerator)
+    private void EnsureKernelsLoaded(Accelerator accelerator)
     {
         _simpleMatMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,

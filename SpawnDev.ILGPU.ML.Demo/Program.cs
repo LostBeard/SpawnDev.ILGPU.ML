@@ -2,9 +2,16 @@ using Microsoft.AspNetCore.Components.Web;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
 using SpawnDev.BlazorJS;
 using SpawnDev.ILGPU.ML.Demo;
+using SpawnDev.ILGPU.ML.Demo.UnitTests;
+using SpawnDev.UnitTesting;
+using System.Reflection;
 
 var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddBlazorJSRuntime();
+
+// Register test types as singletons for UnitTestsView discovery
+builder.Services.AddSingleton<WebGPUTests>();
+
 builder.Services.AddScoped(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 
 builder.RootComponents.Add<App>("#app");

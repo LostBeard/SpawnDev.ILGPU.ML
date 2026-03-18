@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -139,10 +138,6 @@ public class TransformerBlock
         _elementWise.AddBias(tmp.ProjOut, w.ProjBias, TC, C);
 
         // LayerScale1 + Residual: output = input + ls1 * proj_out
-        _elementWise.Mul(tmp.ProjOut, w.Ls1Gamma, tmp.Scaled, TC);  // broadcast: ls1[c] * proj[t,c]
-        // Note: Mul broadcasts ls1[C] across T rows — need AddBias-style broadcast
-        // Actually Mul with [T*C] × [C] needs broadcast. Let me handle this properly.
-        // For now, use the broadcast pattern: tmp.Scaled[i] = tmp.ProjOut[i] * w.Ls1Gamma[i % C]
         LayerScaleMul(tmp.ProjOut, w.Ls1Gamma, tmp.Scaled, TC, C);
         _elementWise.Add(input, tmp.Scaled, output, TC);
 
@@ -165,6 +160,74 @@ public class TransformerBlock
         // LayerScale2 + Residual: output += ls2 * fc2_out (in-place to avoid aliasing)
         LayerScaleMul(tmp.ProjOut, w.Ls2Gamma, tmp.Scaled, TC, C);
         _elementWise.AddInPlace(output, tmp.Scaled, TC);
+    }
+
+    /// <summary>
+    /// Diagnostic: run block forward with per-step logging. SLOW — syncs after each step.
+    /// Logs first 5 values of CLS token (position 0) and first patch (position 1) at each step.
+    /// </summary>
+    public async Task ForwardDiagnosticAsync(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        BlockWeights w, int T, TempBuffers tmp,
+        Accelerator accelerator, int blockIdx)
+    {
+        int TC = T * C;
+        async Task Log(string step, MemoryBuffer1D<float, Stride1D.Dense>? buf, int offset, int count)
+        {
+            await accelerator.SynchronizeAsync();
+            if (buf == null) return;
+            var data = await buf.CopyToHostAsync<float>(offset, Math.Min(count, (int)buf.Length - offset));
+            float min = float.MaxValue, max = float.MinValue;
+            double sum = 0, sumSq = 0;
+            for (int i = 0; i < data.Length; i++) { float v = data[i]; if (v < min) min = v; if (v > max) max = v; sum += v; sumSq += (double)v * v; }
+            double std = Math.Sqrt(sumSq / data.Length - (sum / data.Length) * (sum / data.Length));
+            var first5 = string.Join(", ", data.Take(5).Select(v => v.ToString("F4")));
+            Console.WriteLine($"[Block{blockIdx}] {step}: min={min:F4} max={max:F4} std={std:F4} first5=[{first5}]");
+        }
+
+        // ── Attention branch ──
+        _layerNorm.Forward(input, tmp.Norm, w.Norm1Weight, w.Norm1Bias, T, C);
+        await Log("LN1", tmp.NormBuf, 0, TC);
+
+        _matMul.MatMul(tmp.Norm, w.QkvWeight, tmp.Qkv, T, C, 3 * C);
+        _elementWise.AddBias(tmp.Qkv, w.QkvBias, T * 3 * C, 3 * C);
+        await Log("QKV+bias", tmp.QkvBuf, 0, T * 3 * C);
+
+        RunAttention(tmp.Qkv, tmp.AttnOut, T, tmp);
+        await Log("Attn", tmp.AttnOutBuf, 0, TC);
+
+        _matMul.MatMul(tmp.AttnOut, w.ProjWeight, tmp.ProjOut, T, C, C);
+        _elementWise.AddBias(tmp.ProjOut, w.ProjBias, TC, C);
+        await Log("Proj+bias", tmp.ProjOutBuf, 0, TC);
+
+        LayerScaleMul(tmp.ProjOut, w.Ls1Gamma, tmp.Scaled, TC, C);
+        await Log("LS1*Proj", tmp.ScaledBuf, 0, TC);
+
+        _elementWise.Add(input, tmp.Scaled, output, TC);
+        await Log("Resid1", null, 0, 0); // output is a view, can't easily read — skip for now
+
+        // ── MLP branch ──
+        _layerNorm.Forward(output, tmp.Norm, w.Norm2Weight, w.Norm2Bias, T, C);
+        await Log("LN2", tmp.NormBuf, 0, TC);
+
+        _matMul.MatMul(tmp.Norm, w.Fc1Weight, tmp.MlpHidden, T, C, MLP_DIM);
+        _elementWise.AddBias(tmp.MlpHidden, w.Fc1Bias, T * MLP_DIM, MLP_DIM);
+        await Log("FC1+bias", tmp.MlpHiddenBuf, 0, T * MLP_DIM);
+
+        _elementWise.GELUInPlace(tmp.MlpHidden, T * MLP_DIM);
+        await Log("GELU", tmp.MlpHiddenBuf, 0, T * MLP_DIM);
+
+        _matMul.MatMul(tmp.MlpHidden, w.Fc2Weight, tmp.ProjOut, T, MLP_DIM, C);
+        _elementWise.AddBias(tmp.ProjOut, w.Fc2Bias, TC, C);
+        await Log("FC2+bias", tmp.ProjOutBuf, 0, TC);
+
+        LayerScaleMul(tmp.ProjOut, w.Ls2Gamma, tmp.Scaled, TC, C);
+        await Log("LS2*FC2", tmp.ScaledBuf, 0, TC);
+
+        _elementWise.AddInPlace(output, tmp.Scaled, TC);
+        // Can't easily log output view here
+        Console.WriteLine($"[Block{blockIdx}] Done");
     }
 
     /// <summary>
@@ -273,7 +336,7 @@ public class TransformerBlock
         public ArrayView1D<float, Stride1D.Dense> KTransposed => KTransposedBuf.View;
         public ArrayView1D<float, Stride1D.Dense> AttnHeadOut => AttnHeadOutBuf.View;
 
-        public TempBuffers(WebGPUAccelerator accelerator, int T)
+        public TempBuffers(Accelerator accelerator, int T)
         {
             NormBuf = accelerator.Allocate1D<float>(T * C);
             QkvBuf = accelerator.Allocate1D<float>(T * 3 * C);

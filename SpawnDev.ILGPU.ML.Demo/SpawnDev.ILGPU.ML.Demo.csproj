@@ -5,15 +5,34 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <OverrideHtmlAssetPlaceholders>true</OverrideHtmlAssetPlaceholders>
+    <!-- Disable IL trimming to preserve ILGPU kernel methods invoked via reflection -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <!-- Disable AOT compilation - ILGPU needs IL reflection to work -->
+    <RunAOTCompilation>false</RunAOTCompilation>
+    <!-- mark as testable by PlaywrightMultiTest -->
+    <PlaywrightMultiTest>
+
+    </PlaywrightMultiTest>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.4" />
     <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="10.0.4" PrivateAssets="all" />
+    <PackageReference Include="SpawnDev.ILGPU" Version="4.2.1" />
+    <PackageReference Include="SpawnDev.UnitTesting.Blazor" Version="2.3.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Remove="playwright-test.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="playwright-test.json" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+    <ProjectReference Include="..\SpawnDev.ILGPU.ML.Demo.Shared\SpawnDev.ILGPU.ML.Demo.Shared.csproj" />
   </ItemGroup>
 
 </Project>

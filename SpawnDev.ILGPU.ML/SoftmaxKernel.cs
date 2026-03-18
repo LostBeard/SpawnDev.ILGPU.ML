@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -17,7 +16,7 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public class SoftmaxKernel
 {
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
 
     // Pass 1: compute per-row max and sum(exp), store exp values in-place
     private Action<Index1D,
@@ -37,7 +36,7 @@ public class SoftmaxKernel
     private MemoryBuffer1D<float, Stride1D.Dense>? _rowSumsBuf;
     private int _rowSumsCapacity;
 
-    public SoftmaxKernel(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public SoftmaxKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
     /// Pass 1: One thread per row. Find max, compute exp(x-max), accumulate sum.
@@ -120,7 +119,7 @@ public class SoftmaxKernel
         }
     }
 
-    private void EnsureLoaded(WebGPUAccelerator accelerator)
+    private void EnsureLoaded(Accelerator accelerator)
     {
         _softmaxExpKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,

@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 using System.Text.Json;
 
 namespace SpawnDev.ILGPU.ML;
@@ -17,7 +16,7 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public class WeightLoader
 {
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
     private readonly HttpClient _http;
 
     /// <summary>
@@ -34,7 +33,7 @@ public class WeightLoader
     public bool IsLoaded => _weightBuffer != null;
     public int TensorCount => _tensorSlices.Count;
 
-    public WeightLoader(WebGPUAccelerator accelerator, HttpClient http)
+    public WeightLoader(Accelerator accelerator, HttpClient http)
     {
         _accelerator = accelerator;
         _http = http;

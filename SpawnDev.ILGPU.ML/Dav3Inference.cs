@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -28,7 +27,7 @@ public class Dav3Inference
     private const int PATCH_SIZE = 14;
     private const int GRID_SIZE = 37; // 518 / 14 = 37
 
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
     private readonly WeightLoader _weights;
 
     // Kernels
@@ -56,14 +55,16 @@ public class Dav3Inference
 
     public bool IsInitialized => _blockWeights != null;
 
-    public Dav3Inference(WebGPUAccelerator accelerator, WeightLoader weights)
+    /// <param name="forceSimpleMatMul">When true, bypasses tiled MatMul even on WebGPU.
+    /// Use for debugging — if depth improves, the tiled MatMul is the bug.</param>
+    public Dav3Inference(Accelerator accelerator, WeightLoader weights, bool forceSimpleMatMul = false)
     {
         _accelerator = accelerator;
         _weights = weights;
 
         _conv2d = new Conv2DKernel(accelerator);
         _convTranspose = new ConvTranspose2DKernel(accelerator);
-        _matMul = new MatMulKernel(accelerator);
+        _matMul = new MatMulKernel(accelerator, forceSimpleMatMul);
         _layerNorm = new LayerNormKernel(accelerator);
         _softmax = new SoftmaxKernel(accelerator);
         _elementWise = new ElementWiseKernels(accelerator);
@@ -99,7 +100,7 @@ public class Dav3Inference
         _dptHead = new DptHead(_accelerator, _conv2d, _convTranspose, _elementWise, _layerNorm);
         _dptHead.Initialize();
 
-        Console.WriteLine($"[Dav3] Initialized: 12 blocks, buffers allocated");
+        Console.WriteLine($"[Dav3] Initialized: 12 blocks, buffers allocated (build: 2026-03-18T10:00)");
     }
 
     /// <summary>
@@ -163,11 +164,182 @@ public class Dav3Inference
         return currentIn;
     }
 
+    /// <summary>
+    /// Run backbone with per-block diagnostic output.
+    /// Syncs GPU after each block and logs min/max/std/first values.
+    /// SLOW — for debugging only. Compare output with ORT reference values.
+    /// </summary>
+    public async Task<ArrayView1D<float, Stride1D.Dense>> RunBackboneDiagnosticAsync(
+        ArrayView1D<float, Stride1D.Dense> input)
+    {
+        if (_blockWeights == null || _tmpBuffers == null)
+            throw new InvalidOperationException("Call Initialize() first.");
+
+        // Steps 1-4: same as RunBackbone
+        var patchWeight = _weights.GetView("backbone.pretrained.patch_embed.proj.weight");
+        var patchBias = _weights.GetView("backbone.pretrained.patch_embed.proj.bias");
+        _conv2d.Forward(input, patchWeight, patchBias, _patchEmbedOut!.View,
+            inC: 3, inH: INPUT_SIZE, inW: INPUT_SIZE,
+            outC: C, kH: PATCH_SIZE, kW: PATCH_SIZE,
+            stride: PATCH_SIZE, padding: 0);
+        _elementWise.TransposeLastTwo(_patchEmbedOut!.View, _tokenBuf1!.View.SubView(C, T * C), 1, C, T);
+        var posEmbed = _weights.TryGetView("/backbone/Transpose_output_0");
+        if (posEmbed != null)
+        {
+            _elementWise.TransposeLastTwo(posEmbed.Value, _tokenBuf2!.View.SubView(0, T * C), 1, C, T);
+            _elementWise.AddInPlace(_tokenBuf1!.View.SubView(C, T * C), _tokenBuf2!.View.SubView(0, T * C), T * C);
+        }
+        _elementWise.ScaleInPlace(_tokenBuf1!.View.SubView(0, C), C, 0f);
+        var clsToken = _weights.GetView("backbone.pretrained.cls_token");
+        _elementWise.AddInPlace(_tokenBuf1!.View.SubView(0, C), clsToken.SubView(0, C), C);
+        _elementWise.AddInPlace(_tokenBuf1!.View.SubView(0, C), clsToken.SubView(0, C), C);
+
+        // Log input to block 0
+        await _accelerator.SynchronizeAsync();
+        await LogBufferStatsAsync("pre-backbone", _tokenBuf1!, 0, T_FULL * C);
+
+        for (int i = 4; i < 12; i++)
+            _elementWise.ScaleInPlace(_blockOutputs![i].View, T * C, 0f);
+
+        var currentIn = _tokenBuf1!.View.SubView(0, T_FULL * C);
+        var currentOut = _tokenBuf2!.View.SubView(0, T_FULL * C);
+        // Track which buffer holds currentOut for readback
+        var currentOutBuf = _tokenBuf2!;
+
+        for (int b = 0; b < 12; b++)
+        {
+            if (b == 0)
+            {
+                // CPU cross-check for block 0: verify GPU LayerNorm1 + QKV MatMul against CPU
+                await VerifyBlock0CpuAsync(currentIn);
+
+                // Intra-block diagnostic for block 0
+                await _transformer.ForwardDiagnosticAsync(
+                    currentIn, currentOut, _blockWeights[b], T_FULL, _tmpBuffers,
+                    _accelerator, b);
+            }
+            else
+            {
+                _transformer.Forward(currentIn, currentOut, _blockWeights[b], T_FULL, _tmpBuffers);
+            }
+
+            if (b >= 4 && _blockOutputs != null && _blockOutputs[b] != null)
+                _elementWise.AddInPlace(_blockOutputs![b].View, currentOut.SubView(C, T * C), T * C);
+
+            // Diagnostic: sync and log after each block
+            await _accelerator.SynchronizeAsync();
+            await LogBufferStatsAsync($"block[{b}]", currentOutBuf, 0, T_FULL * C);
+
+            (currentIn, currentOut) = (currentOut, currentIn);
+            currentOutBuf = (currentOutBuf == _tokenBuf1!) ? _tokenBuf2! : _tokenBuf1!;
+        }
+
+        _lastResultBuf = _tokenBuf1;
+        return currentIn;
+    }
+
+    /// <summary>
+    /// Read GPU ArrayView data to CPU via temp buffer.
+    /// </summary>
+    private async Task<float[]> ReadViewToCpuAsync(ArrayView1D<float, Stride1D.Dense> view, int count)
+    {
+        using var temp = _accelerator.Allocate1D<float>(count);
+        _elementWise.ScaleInPlace(temp.View, count, 0f);
+        _elementWise.AddInPlace(temp.View, view.SubView(0, count), count);
+        await _accelerator.SynchronizeAsync();
+        return await temp.CopyToHostAsync<float>(0, count);
+    }
+
+    /// <summary>
+    /// CPU cross-check: verify GPU LayerNorm1 + QKV MatMul against CPU for block 0, row 0.
+    /// Definitively detects WGSL code generation bugs.
+    /// </summary>
+    private async Task VerifyBlock0CpuAsync(ArrayView1D<float, Stride1D.Dense> input)
+    {
+        var w = _blockWeights![0];
+        await _accelerator.SynchronizeAsync();
+
+        // Read back row 0 of input (CLS token, 384 elements)
+        var inputRow = await _tokenBuf1!.CopyToHostAsync<float>(0, C);
+        // Read back norm1 weights and bias
+        var norm1W = await ReadViewToCpuAsync(w.Norm1Weight, C);
+        var norm1B = await ReadViewToCpuAsync(w.Norm1Bias, C);
+
+        // CPU LayerNorm on row 0
+        float sum = 0;
+        for (int i = 0; i < C; i++) sum += inputRow[i];
+        float mean = sum / C;
+        float varSum = 0;
+        for (int i = 0; i < C; i++) { float d = inputRow[i] - mean; varSum += d * d; }
+        float invStd = 1f / MathF.Sqrt(varSum / C + 1e-6f);
+        var cpuLn = new float[C];
+        for (int i = 0; i < C; i++)
+            cpuLn[i] = norm1W[i] * ((inputRow[i] - mean) * invStd) + norm1B[i];
+
+        // GPU LN1 output for row 0
+        _layerNorm.Forward(input, _tmpBuffers!.Norm, w.Norm1Weight, w.Norm1Bias, T_FULL, C);
+        await _accelerator.SynchronizeAsync();
+        var gpuLn = await _tmpBuffers.NormBuf.CopyToHostAsync<float>(0, C);
+
+        // Compare
+        float maxErr = 0;
+        for (int i = 0; i < C; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(cpuLn[i] - gpuLn[i]));
+        Console.WriteLine($"[CPUCheck] LN1 row0: CPU first5=[{string.Join(", ", cpuLn.Take(5).Select(v => v.ToString("F4")))}]");
+        Console.WriteLine($"[CPUCheck] LN1 row0: GPU first5=[{string.Join(", ", gpuLn.Take(5).Select(v => v.ToString("F4")))}]");
+        Console.WriteLine($"[CPUCheck] LN1 row0: maxErr={maxErr:E3} ({(maxErr < 1e-3 ? "PASS" : "FAIL")})");
+
+        // Now check QKV MatMul: compute dot product on CPU for first 5 output elements
+        var qkvWeight = await ReadViewToCpuAsync(w.QkvWeight, C * 3 * C);
+        var qkvBias = await ReadViewToCpuAsync(w.QkvBias, 3 * C);
+
+        // CPU: QKV[0, n] = sum_k(LN1[0,k] * W[k,n]) + bias[n], W is [384, 1152] row-major
+        var cpuQkv = new float[5];
+        for (int n = 0; n < 5; n++)
+        {
+            float s = 0;
+            for (int k = 0; k < C; k++)
+                s += gpuLn[k] * qkvWeight[k * 3 * C + n];
+            cpuQkv[n] = s + qkvBias[n];
+        }
+
+        // GPU QKV output row 0
+        _matMul.MatMul(_tmpBuffers.Norm, w.QkvWeight, _tmpBuffers.Qkv, T_FULL, C, 3 * C);
+        _elementWise.AddBias(_tmpBuffers.Qkv, w.QkvBias, T_FULL * 3 * C, 3 * C);
+        await _accelerator.SynchronizeAsync();
+        var gpuQkv = await _tmpBuffers.QkvBuf.CopyToHostAsync<float>(0, 5);
+
+        Console.WriteLine($"[CPUCheck] QKV row0: CPU first5=[{string.Join(", ", cpuQkv.Select(v => v.ToString("F4")))}]");
+        Console.WriteLine($"[CPUCheck] QKV row0: GPU first5=[{string.Join(", ", gpuQkv.Select(v => v.ToString("F4")))}]");
+        float qkvErr = 0;
+        for (int i = 0; i < 5; i++) qkvErr = MathF.Max(qkvErr, MathF.Abs(cpuQkv[i] - gpuQkv[i]));
+        Console.WriteLine($"[CPUCheck] QKV row0: maxErr={qkvErr:E3} ({(qkvErr < 0.05 ? "PASS" : "FAIL")})");
+    }
+
+    private async Task LogBufferStatsAsync(string label, MemoryBuffer1D<float, Stride1D.Dense> buffer, int offset, int count)
+    {
+        var data = await buffer.CopyToHostAsync<float>(offset, count);
+        float min = float.MaxValue, max = float.MinValue;
+        double sum = 0, sumSq = 0;
+        for (int i = 0; i < data.Length; i++)
+        {
+            float v = data[i];
+            if (v < min) min = v;
+            if (v > max) max = v;
+            sum += v;
+            sumSq += (double)v * v;
+        }
+        double mean = sum / data.Length;
+        double std = Math.Sqrt(sumSq / data.Length - mean * mean);
+        var first5 = string.Join(", ", data.Take(5).Select(v => v.ToString("F4")));
+        Console.WriteLine($"[Dav3Diag] {label}: min={min:F4} max={max:F4} std={std:F4} first5=[{first5}]");
+    }
+
     private MemoryBuffer1D<float, Stride1D.Dense>? _lastResultBuf;
     private MemoryBuffer1D<float, Stride1D.Dense>? _lastDepthBuf;
 
     /// <summary>
-    /// Run full inference: backbone + DPT head → depth map [2, 37, 37].
+    /// Run full inference: backbone + DPT head → depth map [2, 518, 518].
     /// Channel 0 = depth, Channel 1 = confidence.
     /// Input: preprocessed NCHW float [3, 518, 518] on GPU.
     /// </summary>
@@ -177,6 +349,24 @@ public class Dav3Inference
         RunBackbone(input);
 
         // Run DPT head with saved block outputs
+        var blockViews = new ArrayView1D<float, Stride1D.Dense>[12];
+        for (int i = 4; i < 12; i++)
+            blockViews[i] = _blockOutputs![i].View;
+
+        _lastDepthBuf = _dptHead!.Forward(blockViews, _weights);
+
+        return _lastDepthBuf;
+    }
+
+    /// <summary>
+    /// Diagnostic version: runs backbone with per-block logging, then DPT head.
+    /// SLOW — syncs GPU after every block. For debugging backbone divergence.
+    /// </summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> RunFullDiagnosticAsync(
+        ArrayView1D<float, Stride1D.Dense> input)
+    {
+        await RunBackboneDiagnosticAsync(input);
+
         var blockViews = new ArrayView1D<float, Stride1D.Dense>[12];
         for (int i = 4; i < 12; i++)
             blockViews[i] = _blockOutputs![i].View;

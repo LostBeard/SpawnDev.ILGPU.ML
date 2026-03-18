@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -12,7 +11,7 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public class ElementWiseKernels
 {
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _geluKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _reluKernel;
@@ -30,15 +29,15 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleACKernel;
 
-    public ElementWiseKernels(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public ElementWiseKernels(Accelerator accelerator) => _accelerator = accelerator;
 
     // ─────────────────────────────────────────────────────────────
     //  Kernel implementations
     // ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// GELU activation (fast approximation):
-    /// y = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    /// GELU activation using erf approximation (matches PyTorch nn.GELU default):
+    /// GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
     /// </summary>
     private static void GELUImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -47,14 +46,23 @@ public class ElementWiseKernels
         float x = input[idx];
         if (x > 10f) { output[idx] = x; return; }
         if (x < -10f) { output[idx] = 0f; return; }
-        const float sqrt2pi = 0.7978845608f;
-        float inner = sqrt2pi * (x + 0.044715f * x * x * x);
-        float clamped = inner * 2f;
-        if (clamped > 80f) clamped = 80f;
-        if (clamped < -80f) clamped = -80f;
-        float exp2x = MathF.Exp(clamped);
-        float tanh = (exp2x - 1f) / (exp2x + 1f);
-        output[idx] = 0.5f * x * (1f + tanh);
+        const float INV_SQRT2 = 0.7071067811865475f;
+        float z = x * INV_SQRT2;
+        float az = z < 0f ? -z : z;
+        const float p = 0.3275911f;
+        const float a1 = 0.254829592f;
+        const float a2 = -0.284496736f;
+        const float a3 = 1.421413741f;
+        const float a4 = -1.453152027f;
+        const float a5 = 1.061405429f;
+        float t = 1f / (1f + p * az);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float t4 = t3 * t;
+        float t5 = t4 * t;
+        float erfAbs = 1f - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * MathF.Exp(-az * az);
+        float erf = z < 0f ? -erfAbs : erfAbs;
+        output[idx] = 0.5f * x * (1f + erf);
     }
 
     /// <summary>ReLU: y = max(0, x)</summary>
@@ -126,22 +134,36 @@ public class ElementWiseKernels
         output[idx] = input[idx] * scalar;
     }
 
-    /// <summary>In-place GELU: data[i] = gelu(data[i]). Single binding. Clamped to prevent exp overflow.</summary>
+    /// <summary>
+    /// In-place GELU using erf approximation (matches PyTorch nn.GELU default / ONNX Erf subgraph):
+    /// GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+    /// erf approximated via Abramowitz & Stegun (max error 1.5e-7).
+    /// </summary>
     private static void GELUInPlaceImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> data)
     {
         float x = data[idx];
         // For large |x|, GELU(x) ≈ x (positive) or 0 (negative)
-        if (x > 10f) { return; } // data[idx] already = x ≈ GELU(x)
+        if (x > 10f) { return; }
         if (x < -10f) { data[idx] = 0f; return; }
-        const float sqrt2pi = 0.7978845608f;
-        float inner = sqrt2pi * (x + 0.044715f * x * x * x);
-        float clamped = inner * 2f;
-        if (clamped > 80f) clamped = 80f; // prevent exp overflow
-        if (clamped < -80f) clamped = -80f;
-        float exp2x = MathF.Exp(clamped);
-        float tanh = (exp2x - 1f) / (exp2x + 1f);
-        data[idx] = 0.5f * x * (1f + tanh);
+        // erf(x/√2) via Abramowitz & Stegun 5-term approximation
+        const float INV_SQRT2 = 0.7071067811865475f;
+        float z = x * INV_SQRT2;
+        float az = z < 0f ? -z : z; // |z|
+        const float p = 0.3275911f;
+        const float a1 = 0.254829592f;
+        const float a2 = -0.284496736f;
+        const float a3 = 1.421413741f;
+        const float a4 = -1.453152027f;
+        const float a5 = 1.061405429f;
+        float t = 1f / (1f + p * az);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float t4 = t3 * t;
+        float t5 = t4 * t;
+        float erfAbs = 1f - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * MathF.Exp(-az * az);
+        float erf = z < 0f ? -erfAbs : erfAbs;
+        data[idx] = 0.5f * x * (1f + erf);
     }
 
     /// <summary>In-place scale: data[i] *= scalar. Single binding, no aliasing.</summary>
@@ -444,15 +466,26 @@ public class ElementWiseKernels
         var input = new float[count];
         for (int i = 0; i < count; i++) input[i] = (float)(rng.NextDouble() * 6 - 3);
 
-        // CPU reference (same fast GELU approximation)
+        // CPU reference (erf-based GELU matching GPU implementation)
         var cpuOut = new float[count];
         for (int i = 0; i < count; i++)
         {
             float x = input[i];
-            float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
-            float exp2x = MathF.Exp(2f * inner);
-            float tanh = (exp2x - 1f) / (exp2x + 1f);
-            cpuOut[i] = 0.5f * x * (1f + tanh);
+            // erf-based GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+            double erfVal = Erf(x / Math.Sqrt(2.0));
+            cpuOut[i] = (float)(0.5 * x * (1.0 + erfVal));
+        }
+
+        // Abramowitz & Stegun erf approximation (same as GPU kernel)
+        static double Erf(double x)
+        {
+            double ax = Math.Abs(x);
+            const double p = 0.3275911;
+            const double a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+            const double a4 = -1.453152027, a5 = 1.061405429;
+            double t = 1.0 / (1.0 + p * ax);
+            double erfAbs = 1.0 - (a1 * t + a2 * t * t + a3 * t * t * t + a4 * t * t * t * t + a5 * t * t * t * t * t) * Math.Exp(-ax * ax);
+            return x < 0 ? -erfAbs : erfAbs;
         }
 
         using var inputBuf = accelerator.Allocate1D(input);

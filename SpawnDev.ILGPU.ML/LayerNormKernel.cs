@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -17,7 +16,7 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public class LayerNormKernel
 {
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
 
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,  // input [rows*C]
@@ -27,7 +26,7 @@ public class LayerNormKernel
         int, float>?                          // C, epsilon
         _kernel;
 
-    public LayerNormKernel(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public LayerNormKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
     /// One thread per row. Sequential mean/var/normalize over C elements.
@@ -75,7 +74,7 @@ public class LayerNormKernel
         _kernel!(rows, input, output, gamma, beta, C, epsilon);
     }
 
-    private void EnsureLoaded(WebGPUAccelerator accelerator)
+    private void EnsureLoaded(Accelerator accelerator)
     {
         _kernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,

@@ -1,6 +1,5 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.WebGPU;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -22,7 +21,7 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public class Conv2DKernel
 {
-    private readonly WebGPUAccelerator _accelerator;
+    private readonly Accelerator _accelerator;
 
     // General Conv2D: one thread per output element
     private Action<Index1D,
@@ -35,7 +34,7 @@ public class Conv2DKernel
         int, int>?       // stride, padding
         _conv2dKernel;
 
-    public Conv2DKernel(WebGPUAccelerator accelerator) => _accelerator = accelerator;
+    public Conv2DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
     /// Conv2D: one thread per output element.

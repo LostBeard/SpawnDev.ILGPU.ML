@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<!-- mark as testable by PlaywrightMultiTest -->
+		<PlaywrightMultiTest>
+
+		</PlaywrightMultiTest>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+		<ProjectReference Include="..\SpawnDev.ILGPU.ML.Demo.Shared\SpawnDev.ILGPU.ML.Demo.Shared.csproj" />
+	</ItemGroup>
+
+</Project>
