@@ -1,0 +1,239 @@
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@inject BlazorJSRuntime JS
+@implements IDisposable
+
+<div class="webcam-container">
+    @if (!_isStreaming)
+    {
+        <button class="webcam-start-btn" @onclick="StartCamera">
+            <span class="webcam-btn-icon">&#x1F4F7;</span> Enable Camera
+        </button>
+    }
+    else
+    {
+        <div class="webcam-live">
+            <video @ref="_videoRef" autoplay playsinline muted class="webcam-video"></video>
+            @if (ShowCaptureButton)
+            {
+                <button class="webcam-capture-btn" @onclick="CaptureFrame" title="Capture frame">
+                    &#x23FA;
+                </button>
+            }
+            <button class="webcam-stop-btn" @onclick="StopCamera" title="Stop camera">
+                &#x23F9;
+            </button>
+        </div>
+    }
+</div>
+
+@code {
+    private ElementReference _videoRef;
+    private MediaStream? _stream;
+    private HTMLVideoElement? _videoElement;
+    private HTMLCanvasElement? _canvas;
+    private CanvasRenderingContext2D? _ctx;
+    private bool _isStreaming;
+    private CancellationTokenSource? _autoCts;
+
+    [Parameter] public EventCallback<byte[]> OnFrameCaptured { get; set; }
+    [Parameter] public EventCallback<string> OnFrameDataUrl { get; set; }
+    [Parameter] public bool ShowCaptureButton { get; set; } = true;
+    [Parameter] public bool AutoCapture { get; set; }
+    [Parameter] public int CaptureIntervalMs { get; set; } = 100;
+    [Parameter] public int Width { get; set; } = 640;
+    [Parameter] public int Height { get; set; } = 480;
+
+    private async Task StartCamera()
+    {
+        try
+        {
+            using var navigator = JS.Get<Navigator>("navigator");
+            using var mediaDevices = navigator.MediaDevices;
+            _stream = await mediaDevices.GetUserMedia(video: true, audio: false);
+            if (_stream == null) return;
+
+            _isStreaming = true;
+            StateHasChanged();
+
+            // Wait for Blazor to render the video element
+            await Task.Delay(50);
+
+            // Get the rendered video element via ElementReference and attach the stream
+            _videoElement = new HTMLVideoElement(_videoRef);
+            _videoElement.SrcObject = _stream;
+            _videoElement.Play();
+
+            // Create offscreen canvas for frame capture
+            _canvas = new HTMLCanvasElement();
+            _canvas.Width = Width;
+            _canvas.Height = Height;
+            _ctx = _canvas.Get2DContext();
+
+            if (AutoCapture)
+            {
+                _autoCts = new CancellationTokenSource();
+                _ = AutoCaptureLoop(_autoCts.Token);
+            }
+        }
+        catch
+        {
+            _isStreaming = false;
+            StateHasChanged();
+        }
+    }
+
+    private void StopCamera()
+    {
+        _autoCts?.Cancel();
+        _autoCts?.Dispose();
+        _autoCts = null;
+
+        StopStream();
+
+        _ctx?.Dispose();
+        _ctx = null;
+        _canvas?.Dispose();
+        _canvas = null;
+        _videoElement?.Dispose();
+        _videoElement = null;
+
+        _isStreaming = false;
+        StateHasChanged();
+    }
+
+    private void StopStream()
+    {
+        if (_stream == null) return;
+        using var tracks = _stream.GetTracks();
+        tracks.ToArray().UsingEach(track => track.Stop());
+        _stream.Dispose();
+        _stream = null;
+    }
+
+    public async Task CaptureFrame()
+    {
+        if (_ctx == null || _videoElement == null || _canvas == null) return;
+
+        _ctx.DrawImage(_videoElement, 0, 0, Width, Height);
+        var dataUrl = _canvas.ToDataURL("image/jpeg");
+
+        if (OnFrameDataUrl.HasDelegate)
+            await OnFrameDataUrl.InvokeAsync(dataUrl);
+
+        if (OnFrameCaptured.HasDelegate)
+        {
+            var base64 = dataUrl[(dataUrl.IndexOf(',') + 1)..];
+            var bytes = Convert.FromBase64String(base64);
+            await OnFrameCaptured.InvokeAsync(bytes);
+        }
+    }
+
+    private async Task AutoCaptureLoop(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && _isStreaming)
+        {
+            try
+            {
+                await CaptureFrame();
+                await Task.Delay(CaptureIntervalMs, ct);
+            }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    public void Dispose()
+    {
+        _autoCts?.Cancel();
+        _autoCts?.Dispose();
+        _ctx?.Dispose();
+        _canvas?.Dispose();
+        _videoElement?.Dispose();
+        try { StopStream(); } catch { }
+    }
+}
+
+<style>
+    .webcam-container {
+        position: relative;
+        border-radius: 10px;
+        overflow: hidden;
+        background: rgba(0, 0, 0, 0.3);
+        min-height: 200px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .webcam-start-btn {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.75rem 1.5rem;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.06);
+        color: #e2e8f0;
+        font-size: 0.95rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .webcam-start-btn:hover {
+        background: rgba(139, 92, 246, 0.15);
+        border-color: rgba(139, 92, 246, 0.3);
+    }
+
+    .webcam-btn-icon {
+        font-size: 1.2rem;
+    }
+
+    .webcam-live {
+        position: relative;
+        width: 100%;
+    }
+
+    .webcam-video {
+        width: 100%;
+        display: block;
+        border-radius: 10px;
+    }
+
+    .webcam-capture-btn,
+    .webcam-stop-btn {
+        position: absolute;
+        bottom: 0.75rem;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        border: none;
+        color: white;
+        font-size: 1rem;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.15s ease;
+    }
+
+    .webcam-capture-btn {
+        right: 3.5rem;
+        background: rgba(59, 130, 246, 0.8);
+    }
+
+    .webcam-capture-btn:hover {
+        background: #3b82f6;
+        transform: scale(1.1);
+    }
+
+    .webcam-stop-btn {
+        right: 0.75rem;
+        background: rgba(239, 68, 68, 0.8);
+    }
+
+    .webcam-stop-btn:hover {
+        background: #ef4444;
+        transform: scale(1.1);
+    }
+</style>

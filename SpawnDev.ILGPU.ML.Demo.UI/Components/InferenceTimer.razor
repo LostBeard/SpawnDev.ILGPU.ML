@@ -1,0 +1,103 @@
+<div class="inference-timer @(IsRunning ? "running" : "")">
+    @if (ShowBackendName && !string.IsNullOrEmpty(BackendName))
+    {
+        <span class="timer-backend">@BackendName</span>
+    }
+    <div class="timer-value">
+        @if (InferenceTimeMs > 0)
+        {
+            <span class="timer-ms">@InferenceTimeMs.ToString("F1")</span>
+            <span class="timer-unit">ms</span>
+            @if (ShowFps && InferenceTimeMs > 0)
+            {
+                <span class="timer-separator">|</span>
+                <span class="timer-fps">@((1000.0 / InferenceTimeMs).ToString("F1"))</span>
+                <span class="timer-unit">FPS</span>
+            }
+        }
+        else if (IsRunning)
+        {
+            <span class="timer-running">Running...</span>
+        }
+        else
+        {
+            <span class="timer-idle">Ready</span>
+        }
+    </div>
+</div>
+
+@code {
+    [Parameter] public double InferenceTimeMs { get; set; }
+    [Parameter] public bool IsRunning { get; set; }
+    [Parameter] public bool ShowFps { get; set; }
+    [Parameter] public bool ShowBackendName { get; set; } = true;
+    [Parameter] public string? BackendName { get; set; }
+}
+
+<style>
+    .inference-timer {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.4rem 0.8rem;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+        font-size: 0.85rem;
+    }
+
+    .inference-timer.running {
+        border-color: rgba(56, 189, 248, 0.3);
+        background: rgba(56, 189, 248, 0.06);
+    }
+
+    .timer-backend {
+        color: #94a3b8;
+        font-weight: 600;
+        padding-right: 0.6rem;
+        border-right: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .timer-value {
+        display: flex;
+        align-items: baseline;
+        gap: 0.2rem;
+    }
+
+    .timer-ms {
+        color: #34d399;
+        font-weight: 700;
+        font-size: 1rem;
+    }
+
+    .timer-fps {
+        color: #38bdf8;
+        font-weight: 700;
+        font-size: 1rem;
+    }
+
+    .timer-unit {
+        color: #64748b;
+        font-size: 0.75rem;
+    }
+
+    .timer-separator {
+        color: rgba(255, 255, 255, 0.15);
+        margin: 0 0.2rem;
+    }
+
+    .timer-running {
+        color: #38bdf8;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .timer-idle {
+        color: #475569;
+    }
+
+    @@keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+    }
+</style>

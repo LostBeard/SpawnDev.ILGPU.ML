@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.DemoConsole.UnitTests;
 
 /// <summary>
 /// Runs ML kernel tests on the OpenCL backend (AMD/Intel/NVIDIA GPU).
-/// Uses tiled MatMul with shared memory.
+/// EnableAlgorithms() required for MathF intrinsics (Exp, Sqrt, etc.).
 /// </summary>
 public class OpenCLTests : MLTestBase
 {
@@ -16,7 +16,9 @@ public class OpenCLTests : MLTestBase
 
     protected override Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {
-        var context = Context.CreateDefault();
+        var context = Context.Create()
+            .EnableAlgorithms()
+            .ToContext();
         var clDevices = context.GetCLDevices();
         if (clDevices.Count == 0)
             throw new UnsupportedTestException("No OpenCL devices found");
