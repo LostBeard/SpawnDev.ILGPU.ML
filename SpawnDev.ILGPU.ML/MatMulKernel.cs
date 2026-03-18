@@ -154,6 +154,55 @@ public class MatMulKernel
     }
 
     // ─────────────────────────────────────────────────────────────
+    //  Simple (non-tiled) kernels — no shared memory, uses LoadAutoGroupedStreamKernel
+    //  Avoids WGSL redeclaration bug in LoadStreamKernel
+    // ─────────────────────────────────────────────────────────────
+
+    /// <summary>Simple MatMul: one thread per output element. No shared memory.</summary>
+    private static void SimpleMatMulImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+    {
+        int col = idx % N;
+        int row = idx / N;
+        if (row >= M) return;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[row * K + k] * B[k * N + col];
+        C[idx] = sum;
+    }
+
+    /// <summary>Simple batched MatMul: one thread per output element across all batches.</summary>
+    private static void SimpleBatchedMatMulImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int batchSize, int M, int K, int N)
+    {
+        int elementsPerBatch = M * N;
+        int batch = idx / elementsPerBatch;
+        int local = idx % elementsPerBatch;
+        int col = local % N;
+        int row = local / N;
+        if (batch >= batchSize || row >= M) return;
+        int aOff = batch * M * K;
+        int bOff = batch * K * N;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[aOff + row * K + k] * B[bOff + k * N + col];
+        C[idx] = sum;
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulKernel;
+
+    // ─────────────────────────────────────────────────────────────
     //  Public API
     // ─────────────────────────────────────────────────────────────
 
@@ -173,8 +222,6 @@ public class MatMulKernel
         int numTilesM = (M + TILE - 1) / TILE;
         int numTilesN = (N + TILE - 1) / TILE;
         int totalTiles = numTilesM * numTilesN;
-
-        // 1D grid of totalTiles workgroups, each with TILE*TILE (256) threads
         _matMulKernel!(new KernelConfig(totalTiles, TILE * TILE), A, B, C, M, K, N, numTilesN);
     }
 
@@ -193,16 +240,20 @@ public class MatMulKernel
         int numTilesM = (M + TILE - 1) / TILE;
         int numTilesN = (N + TILE - 1) / TILE;
         int totalTiles = numTilesM * numTilesN;
-
-        // 2D grid: X = tile index, Y = batch index
         var gridDim = new Index2D(totalTiles, batchSize);
         var groupDim = new Index2D(TILE * TILE, 1);
-
         _batchedMatMulKernel!(new KernelConfig(gridDim, groupDim), A, B, C, M, K, N, numTilesN);
     }
 
     private void EnsureKernelsLoaded(WebGPUAccelerator accelerator)
     {
+        _simpleMatMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulImpl);
+        _simpleBatchedMatMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulImpl);
+
         _matMulKernel ??= accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

@@ -34,6 +34,7 @@ public class DptHead : IDisposable
     private const int H2 = 37;   // level 2: identity
     private const int H1 = 74;   // level 1: ConvTranspose stride=2 → 37→74
     private const int H0 = 148;  // level 0: ConvTranspose stride=4 → 37→148
+    private const int H_MID = 296; // refinenet1 internal 2× resize: 148→296
 
     private readonly WebGPUAccelerator _accelerator;
     private readonly Conv2DKernel _conv2d;
@@ -109,14 +110,14 @@ public class DptHead : IDisposable
             _layerRnOutputs[i] = _accelerator.Allocate1D<float>(64 * h * h);
         }
 
-        // RefineNet working buffers sized to H0 (largest level)
-        _refineBuf   = _accelerator.Allocate1D<float>(64 * H0 * H0);
-        _refineTemp  = _accelerator.Allocate1D<float>(64 * H0 * H0);
-        _upsampleBuf = _accelerator.Allocate1D<float>(64 * H0 * H0); // upsample scratch
+        // RefineNet working buffers sized to H_MID (largest after refinenet1's 2× resize)
+        _refineBuf   = _accelerator.Allocate1D<float>(64 * H_MID * H_MID);
+        _refineTemp  = _accelerator.Allocate1D<float>(64 * H_MID * H_MID);
+        _upsampleBuf = _accelerator.Allocate1D<float>(64 * H_MID * H_MID);
 
-        // Output conv buffers
-        _oc1Out  = _accelerator.Allocate1D<float>(32 * H0 * H0);          // output_conv1 at 148×148
-        _oc21Out = _accelerator.Allocate1D<float>(32 * OutputH * OutputW); // after resize 148→518
+        // Output conv buffers — refinenet1 resizes to 296, then output_conv1 at 296, resize 296→518, output_conv2 at 518
+        _oc1Out  = _accelerator.Allocate1D<float>(32 * H_MID * H_MID);    // output_conv1 at 296×296
+        _oc21Out = _accelerator.Allocate1D<float>(32 * OutputH * OutputW); // after resize 296→518
         _oc2Out  = _accelerator.Allocate1D<float>(32 * OutputH * OutputW); // output_conv2.0 at 518×518
         _depthOut = _accelerator.Allocate1D<float>(2 * OutputH * OutputW); // output_conv2.2 at 518×518
     }
@@ -193,6 +194,11 @@ public class DptHead : IDisposable
             var projB = weights.GetView($"head.projects.{level}.bias");
             _conv2d.Forward(_transposeBuf.View, projW, projB, _projScratch!.View,
                 C_CONCAT, GRID, GRID, pc, 1, 1);
+
+            // Add constant spatial bias (precomputed from ONNX Expand operations)
+            var expandBias = weights.TryGetView($"_expand_proj{level}");
+            if (expandBias != null)
+                _elementWise.AddInPlace(_projScratch.View, expandBias.Value, pc * GRID * GRID);
 
             // Resize to target spatial resolution
             if (level == 0)
@@ -328,22 +334,30 @@ public class DptHead : IDisposable
             weights.GetView("head.scratch.refinenet1.resConfUnit2.conv2.bias"),
             refineC, H0, H0);
 
-        _conv2d.Forward(_layerRnOutputs[0].View,
+        // ONNX: refinenet1 Resize 148→296 (2×) THEN out_conv at 296
+        _elementWise.BilinearUpsampleAlignCorners(_layerRnOutputs[0].View, _upsampleBuf.View,
+            refineC, H0, H0, H_MID, H_MID);
+        _conv2d.Forward(_upsampleBuf.View,
             weights.GetView("head.scratch.refinenet1.out_conv.weight"),
             weights.GetView("head.scratch.refinenet1.out_conv.bias"),
-            _refineTemp.View, refineC, H0, H0, refineC, 1, 1);
-        // _refineTemp = refinenet1 output [64, 148, 148]
+            _refineTemp.View, refineC, H_MID, H_MID, refineC, 1, 1);
+        // _refineTemp = refinenet1 output [64, 296, 296]
 
         // ── Step 3: Output convolutions ───────────────────────────────────────
-        // output_conv1: [64→32, 3×3] — NO ReLU (ONNX graph: Conv → Resize directly)
+        // output_conv1: [64→32, 3×3] at 296×296 — NO ReLU
         _conv2d.Forward(_refineTemp.View,
             weights.GetView("head.scratch.output_conv1.weight"),
             weights.GetView("head.scratch.output_conv1.bias"),
-            _oc1Out!.View, refineC, H0, H0, 32, 3, 3, 1, 1);
+            _oc1Out!.View, refineC, H_MID, H_MID, 32, 3, 3, 1, 1);
 
-        // Resize 148→518 (ONNX graph resizes to input resolution before output_conv2)
+        // Resize 296→518 (ONNX graph resizes to input resolution before output_conv2)
         _elementWise.BilinearUpsampleAlignCorners(_oc1Out.View, _oc21Out!.View,
-            32, H0, H0, OutputH, OutputW);
+            32, H_MID, H_MID, OutputH, OutputW);
+
+        // Add constant spatial bias before output_conv2 (from ONNX Expand_14)
+        var expandOutput = weights.TryGetView("_expand_output");
+        if (expandOutput != null)
+            _elementWise.AddInPlace(_oc21Out.View, expandOutput.Value, 32 * OutputH * OutputW);
 
         // output_conv2.0: [32→32, 3×3] + ReLU  (at 518×518)
         _conv2d.Forward(_oc21Out.View,
@@ -359,6 +373,13 @@ public class DptHead : IDisposable
             _depthOut!.View, 32, OutputH, OutputW, 2, 1, 1);
 
         return _depthOut;
+    }
+
+    /// <summary>Debug: get layer_rn buffer view for a specific level (0-3).</summary>
+    public ArrayView1D<float, Stride1D.Dense>? DebugGetLayerRnView(int level)
+    {
+        if (_layerRnOutputs == null || level < 0 || level >= _layerRnOutputs.Length) return null;
+        return _layerRnOutputs[level]?.View;
     }
 
     public void Dispose()

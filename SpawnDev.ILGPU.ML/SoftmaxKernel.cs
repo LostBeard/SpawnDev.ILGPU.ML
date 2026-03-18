@@ -26,11 +26,11 @@ public class SoftmaxKernel
         int>?
         _softmaxExpKernel;
 
-    // Pass 2: normalize each element by row sum
+    // Pass 2: normalize each element by row sum (with row offset for batching)
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
-        int>?
+        int, int>?
         _softmaxNormKernel;
 
     // Persistent temp buffer for row sums (reused across calls, resized as needed)
@@ -72,21 +72,25 @@ public class SoftmaxKernel
 
     /// <summary>
     /// Pass 2: One thread per element. Divide by row sum.
+    /// rowOffset allows batching rows to stay within WebGPU dispatch limits.
     /// </summary>
     private static void SoftmaxNormImpl(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> data,
         ArrayView1D<float, Stride1D.Dense> rowSums,
-        int cols)
+        int cols, int rowOffset)
     {
-        int row = idx / cols;
-        data[idx] *= 1f / rowSums[row];
+        int localRow = idx / cols;
+        data[idx] *= 1f / rowSums[localRow + rowOffset];
     }
 
     /// <summary>
     /// In-place row-wise softmax. data: [rows, cols] flat.
     /// Uses internal temp buffer for row sums.
     /// </summary>
+    // WebGPU 1D dispatch limit: 65535 workgroups × 64 threads = 4,194,240 elements
+    private const int MAX_DISPATCH = 65535 * 64;
+
     public void Forward(
         ArrayView1D<float, Stride1D.Dense> data,
         int rows, int cols)
@@ -102,8 +106,18 @@ public class SoftmaxKernel
             _rowSumsCapacity = rows;
         }
 
+        // Pass 1: one thread per row — always within limits for reasonable row counts
         _softmaxExpKernel!(rows, data, _rowSumsBuf.View, cols);
-        _softmaxNormKernel!(rows * cols, data, _rowSumsBuf.View, cols);
+
+        // Pass 2: one thread per element — batch by rows to stay within WebGPU dispatch limit
+        int rowsPerBatch = MAX_DISPATCH / cols;
+        if (rowsPerBatch < 1) rowsPerBatch = 1;
+        for (int rowStart = 0; rowStart < rows; rowStart += rowsPerBatch)
+        {
+            int batchRows = Math.Min(rowsPerBatch, rows - rowStart);
+            int count = batchRows * cols;
+            _softmaxNormKernel!(count, data.SubView(rowStart * cols, count), _rowSumsBuf.View, cols, rowStart);
+        }
     }
 
     private void EnsureLoaded(WebGPUAccelerator accelerator)
@@ -116,7 +130,7 @@ public class SoftmaxKernel
         _softmaxNormKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int>(SoftmaxNormImpl);
+            int, int>(SoftmaxNormImpl);
     }
 
     public async Task DiagnosticAsync()

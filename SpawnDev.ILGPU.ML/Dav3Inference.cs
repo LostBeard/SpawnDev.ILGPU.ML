@@ -133,11 +133,12 @@ public class Dav3Inference
         }
 
         // Step 4: Prepend CLS token at position 0
-        // Zero position 0, then add cls_token weight
+        // ONNX graph adds cls_token TWICE: once as token value, once as CLS "position embedding"
         _elementWise.ScaleInPlace(_tokenBuf1!.View.SubView(0, C), C, 0f);
         var clsToken = _weights.GetView("backbone.pretrained.cls_token");
         _elementWise.AddInPlace(_tokenBuf1!.View.SubView(0, C), clsToken.SubView(0, C), C);
-        // _tokenBuf1 now has [CLS, patch1, patch2, ..., patch1369] = [1370, 384]
+        _elementWise.AddInPlace(_tokenBuf1!.View.SubView(0, C), clsToken.SubView(0, C), C);
+        // _tokenBuf1 now has [2*CLS, patch1+pos1, patch2+pos2, ...] = [1370, 384]
 
         // Step 5: Run 12 transformer blocks with T_FULL=1370 tokens
         // Zero block output buffers (patches only, T=1369)
@@ -198,6 +199,9 @@ public class Dav3Inference
         if (_lastResultBuf == null) throw new InvalidOperationException("Run RunBackbone first.");
         return await _lastResultBuf.CopyToHostAsync<float>(offset, count);
     }
+
+    /// <summary>Get layer4_rn buffer view for diagnostics. Returns null if not available.</summary>
+    public ArrayView1D<float, Stride1D.Dense>? DebugGetLayerRn3() => _dptHead?.DebugGetLayerRnView(3);
 
     /// <summary>Read first N values from a saved block output (blocks 4-11) for diagnostics.</summary>
     public async Task<float[]> ReadBlockOutputAsync(int blockIndex, int count = 10)
