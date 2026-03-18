@@ -175,7 +175,29 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else if (b.ElementCount == a.Shape[^1])
         {
+            // Last-dim broadcast: a[..., C] * b[C]
             reg.ElementWise.BroadcastMul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount, b.ElementCount);
+        }
+        else if (b.ElementCount == 1)
+        {
+            // Scalar broadcast — need to read the scalar value
+            // For now, use BroadcastMul with C=1
+            reg.ElementWise.BroadcastMul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount, 1);
+        }
+        else if (a.Rank == 4 && b.Rank == 1 && b.ElementCount == a.Shape[1])
+        {
+            // NCHW per-channel: a[N,C,H,W] * b[C]
+            int C = a.Shape[1]; int spatial = a.Shape[2] * a.Shape[3];
+            for (int nc = 0; nc < a.Shape[0] * C; nc++)
+            {
+                int c = nc % C;
+                int offset = nc * spatial;
+                reg.ElementWise.BroadcastMul(
+                    a.Data.SubView(offset, spatial),
+                    b.Data.SubView(c, 1),
+                    ctx.Outputs[0].Data.SubView(offset, spatial),
+                    spatial, 1);
+            }
         }
         else
         {
