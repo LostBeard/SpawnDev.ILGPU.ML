@@ -1,6 +1,6 @@
 using System.Reflection;
 
-namespace SpawnDev.ILGPU.ML.Demo.UI.Data;
+namespace SpawnDev.ILGPU.ML.Data;
 
 /// <summary>
 /// ImageNet 1000-class labels for classification models (MobileNetV2, EfficientNet, etc.).

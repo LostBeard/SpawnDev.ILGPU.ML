@@ -14,6 +14,8 @@
 <h4>Generated WGSL Sources</h4>
 <button @onclick="RefreshWGSL">Refresh WGSL</button>
 <button @onclick="ClearWGSL">Clear WGSL List</button>
+<button @onclick="CopyAllWGSL">Copy All to Clipboard</button>
+@if (_copyStatus != null) { <span style="color:green;margin-left:8px;">@_copyStatus</span> }
 @if (_allWGSL != null && _allWGSL.Count > 0)
 {
     <p>Total shaders: @_allWGSL.Count</p>
@@ -44,9 +46,12 @@ else
     <p><em>No GLSL generated yet. Run a WebGL test first, then click Refresh.</em></p>
 }
 
+@inject SpawnDev.BlazorJS.BlazorJSRuntime JS
+
 @code {
     [Inject]
     IServiceCollection ServiceDescriptors { get; set; } = default!;
+    string? _copyStatus;
     List<Assembly>? Assemblies = new List<Assembly>();
     List<Type>? Types = new List<Type>();
     object? TestTypeResolver(Type testType)
@@ -64,6 +69,49 @@ else
     {
         WebGPUBackend.AllGeneratedWGSL.Clear();
         _allWGSL = null;
+        _copyStatus = null;
+        StateHasChanged();
+    }
+    async Task CopyAllWGSL()
+    {
+        RefreshWGSL();
+        if (_allWGSL == null || _allWGSL.Count == 0)
+        {
+            _copyStatus = "No shaders to copy";
+            return;
+        }
+        var sb = new System.Text.StringBuilder();
+        // Use registry for named entries if available
+        var registry = WebGPUBackend.WGSLRegistry;
+        if (registry.Count > 0)
+        {
+            foreach (var (name, entry) in registry)
+            {
+                sb.AppendLine($"// ═══ Kernel: {name} ═══");
+                sb.AppendLine(entry.Source);
+                sb.AppendLine();
+            }
+        }
+        else
+        {
+            for (int i = 0; i < _allWGSL.Count; i++)
+            {
+                sb.AppendLine($"// ═══ Shader {i + 1} of {_allWGSL.Count} ═══");
+                sb.AppendLine(_allWGSL[i]);
+                sb.AppendLine();
+            }
+        }
+        try
+        {
+            using var navigator = JS.Get<SpawnDev.BlazorJS.JSObjects.Navigator>("navigator");
+            using var clipboard = navigator.Clipboard;
+            await clipboard.WriteText(sb.ToString());
+            _copyStatus = $"Copied {(registry.Count > 0 ? registry.Count : _allWGSL.Count)} shaders to clipboard!";
+        }
+        catch (Exception ex)
+        {
+            _copyStatus = $"Copy failed: {ex.Message}";
+        }
         StateHasChanged();
     }
     string? _lastGLSL;

@@ -1,4 +1,4 @@
-namespace SpawnDev.ILGPU.ML.Demo.UI.Data;
+namespace SpawnDev.ILGPU.ML.Preprocessing;
 
 /// <summary>
 /// Color palettes for depth map visualization.

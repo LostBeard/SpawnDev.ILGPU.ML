@@ -12,11 +12,11 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.4" />
-    <PackageReference Include="SpawnDev.BlazorJS" Version="2.5.36" />
+    <PackageReference Include="SpawnDev.BlazorJS" Version="3.4.0" />
   </ItemGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Data\imagenet_classes.txt" />
+    <ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
   </ItemGroup>
 
 </Project>

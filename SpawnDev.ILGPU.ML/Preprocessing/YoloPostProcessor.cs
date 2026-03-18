@@ -1,4 +1,6 @@
-namespace SpawnDev.ILGPU.ML.Demo.UI.Data;
+using SpawnDev.ILGPU.ML.Data;
+
+namespace SpawnDev.ILGPU.ML.Preprocessing;
 
 /// <summary>
 /// CPU-side postprocessing for YOLOv8 detection output.

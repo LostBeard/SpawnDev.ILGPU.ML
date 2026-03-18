@@ -50,4 +50,8 @@
 		<SupportedPlatform Include="macos" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<EmbeddedResource Include="Data\imagenet_classes.txt" />
+	</ItemGroup>
+
 </Project>

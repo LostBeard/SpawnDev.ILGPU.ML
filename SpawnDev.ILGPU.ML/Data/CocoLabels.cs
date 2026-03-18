@@ -1,4 +1,4 @@
-namespace SpawnDev.ILGPU.ML.Demo.UI.Data;
+namespace SpawnDev.ILGPU.ML.Data;
 
 /// <summary>
 /// COCO 80-class labels used by YOLO and other detection models.
