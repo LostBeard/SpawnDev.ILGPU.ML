@@ -1,7 +1,534 @@
-﻿@page "/"
+@page "/"
 
-<PageTitle>Home</PageTitle>
+<PageTitle>SpawnDev.ILGPU.ML — Neural Network Inference for .NET</PageTitle>
 
-<h1>Hello, world!</h1>
+<div class="hero-section">
+    <div class="hero-content">
+        <h1 class="hero-title">
+            <span class="gradient-text">SpawnDev.ILGPU.ML</span>
+        </h1>
+        <p class="hero-subtitle">Neural network inference in C# — no runtime dependencies</p>
+        <p class="hero-description">
+            GPU-accelerated inference kernels written entirely in C# and transpiled to native compute shaders
+            via <a href="https://github.com/LostBeard/SpawnDev.ILGPU" target="_blank">SpawnDev.ILGPU</a>.
+            The same code runs in the browser and on desktop across six backends.
+            No ONNX Runtime, no JavaScript, no native binaries.
+        </p>
+        <div class="hero-buttons">
+            <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML" target="_blank" class="btn btn-primary btn-lg">
+                GitHub
+            </a>
+            <a href="https://www.nuget.org/packages/SpawnDev.ILGPU.ML" target="_blank" class="btn btn-secondary btn-lg">
+                NuGet
+            </a>
+            <a href="tests" class="btn btn-secondary btn-lg">
+                Run Tests
+            </a>
+        </div>
+    </div>
+</div>
 
-Welcome to your new app.
+<div class="features-section">
+    <h2 class="section-title">How It Works</h2>
+    <p class="section-desc">
+        Neural network operations are implemented as
+        <a href="https://github.com/m4rs-mt/ILGPU" target="_blank">ILGPU</a> kernels in C#.
+        At runtime, SpawnDev.ILGPU transpiles each kernel to the appropriate shader language or binary for the target backend.
+    </p>
+
+    <div class="pipeline-visual">
+        <div class="pipeline-box pipeline-source">C# Kernel</div>
+        <div class="pipeline-arrow"></div>
+        <div class="pipeline-box pipeline-compiler">SpawnDev.ILGPU</div>
+        <div class="pipeline-arrow"></div>
+        <div class="pipeline-targets">
+            <span class="pipeline-target target-browser">WGSL</span>
+            <span class="pipeline-target target-browser">GLSL</span>
+            <span class="pipeline-target target-browser">Wasm</span>
+            <span class="pipeline-target target-desktop">PTX</span>
+            <span class="pipeline-target target-desktop">OpenCL C</span>
+            <span class="pipeline-target target-desktop">CPU</span>
+        </div>
+    </div>
+</div>
+
+<div class="features-section">
+    <h2 class="section-title">Six Backends, One Codebase</h2>
+
+    <h3 class="subsection-title">Browser (Blazor WebAssembly)</h3>
+    <div class="features-grid features-grid-3">
+        <div class="feature-card feature-highlight-browser">
+            <h3>WebGPU</h3>
+            <p>C# kernels transpiled to WGSL compute shaders. Shared memory, barriers, and atomics for tiled matrix multiplication and parallel reductions.</p>
+            <div class="feature-tag">GPU &mdash; fastest browser path</div>
+        </div>
+        <div class="feature-card feature-highlight-browser">
+            <h3>WebGL</h3>
+            <p>Transpiled to GLSL ES 3.0 via Transform Feedback. Works on virtually every browser and device, including mobile and older desktops.</p>
+            <div class="feature-tag">GPU &mdash; widest compatibility</div>
+        </div>
+        <div class="feature-card feature-highlight-browser">
+            <h3>Wasm</h3>
+            <p>Compiled to native WebAssembly binary and dispatched to Web Workers. Full shared memory and barrier support for parallel CPU inference.</p>
+            <div class="feature-tag">CPU &mdash; universal fallback</div>
+        </div>
+    </div>
+
+    <h3 class="subsection-title">Desktop (Console, WPF, ASP.NET)</h3>
+    <div class="features-grid features-grid-3">
+        <div class="feature-card feature-highlight-desktop">
+            <h3>CUDA</h3>
+            <p>Direct PTX compilation for NVIDIA GPUs. Maximum throughput with full hardware access.</p>
+            <div class="feature-tag">NVIDIA GPU</div>
+        </div>
+        <div class="feature-card feature-highlight-desktop">
+            <h3>OpenCL</h3>
+            <p>Cross-vendor GPU compute. Runs on NVIDIA, AMD, and Intel GPUs and integrated graphics.</p>
+            <div class="feature-tag">Any GPU</div>
+        </div>
+        <div class="feature-card feature-highlight-desktop">
+            <h3>CPU</h3>
+            <p>Multi-threaded CPU accelerator. Useful for debugging, headless servers, and machines without a GPU.</p>
+            <div class="feature-tag">Debug and fallback</div>
+        </div>
+    </div>
+</div>
+
+<div class="features-section">
+    <h2 class="section-title">Implemented Operations</h2>
+    <div class="features-grid features-grid-3">
+        <div class="feature-card">
+            <h3>Matrix Multiplication</h3>
+            <p>Tiled 16x16 with shared memory. Batched variant for multi-head attention. Auto-falls back to simple kernel on backends without shared memory.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Convolution</h3>
+            <p>Conv2D with arbitrary kernel size, stride, and padding. ConvTranspose2D for upsampling. Used for patch embedding and DPT head refinement.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Normalization</h3>
+            <p>Row-wise LayerNorm with learned gamma and beta parameters. Two-pass numerically stable Softmax for attention score computation.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Activations</h3>
+            <p>GELU (erf-based with overflow clamping) and ReLU. Both standard and in-place variants to minimize buffer allocations.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Multi-Head Attention</h3>
+            <p>Full MHSA pipeline: QKV split, batched Q*K^T, softmax, attention*V, head merge. Configurable head count and dimension.</p>
+        </div>
+        <div class="feature-card">
+            <h3>Transformer Block</h3>
+            <p>Complete Vision Transformer block with pre-LayerNorm, multi-head self-attention, MLP, residual connections, and LayerScale.</p>
+        </div>
+    </div>
+</div>
+
+<div class="features-section">
+    <h2 class="section-title">Roadmap</h2>
+    <p class="section-desc">
+        SpawnDev.ILGPU.ML is being developed toward a complete cross-platform inference engine.
+    </p>
+    <div class="roadmap-grid">
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">Cross-backend kernel migration</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">PlaywrightMultiTest infrastructure</div>
+        </div>
+        <div class="roadmap-item active">
+            <div class="roadmap-status">Active</div>
+            <div class="roadmap-label">Tensor abstraction and buffer pool</div>
+        </div>
+        <div class="roadmap-item planned">
+            <div class="roadmap-status">Planned</div>
+            <div class="roadmap-label">Expanded kernel library (~40 new operations)</div>
+        </div>
+        <div class="roadmap-item planned">
+            <div class="roadmap-status">Planned</div>
+            <div class="roadmap-label">ONNX operator registry (~55 ops)</div>
+        </div>
+        <div class="roadmap-item planned">
+            <div class="roadmap-status">Planned</div>
+            <div class="roadmap-label">ONNX model loading and graph execution</div>
+        </div>
+        <div class="roadmap-item planned">
+            <div class="roadmap-status">Planned</div>
+            <div class="roadmap-label">InferenceSession API</div>
+        </div>
+        <div class="roadmap-item planned">
+            <div class="roadmap-status">Planned</div>
+            <div class="roadmap-label">Pipeline abstractions (depth, classification, detection)</div>
+        </div>
+    </div>
+</div>
+
+<footer class="demo-footer">
+    <div class="footer-content">
+        <p>
+            Built upon the excellent <a href="https://github.com/m4rs-mt/ILGPU" target="_blank">ILGPU</a> library
+            by <a href="https://github.com/m4rs-mt" target="_blank">Marcel Koester</a> and
+            <a href="https://github.com/m4rs-mt/ILGPU/graphs/contributors" target="_blank">contributors</a>.
+        </p>
+        <p>SpawnDev.ILGPU.ML by <a href="https://github.com/LostBeard" target="_blank">LostBeard</a>.</p>
+    </div>
+</footer>
+
+<style>
+    .demo-footer {
+        margin-top: 4rem;
+        padding: 2rem 1rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: center;
+        color: #64748b;
+        font-size: 0.9rem;
+    }
+
+    .footer-content a {
+        color: #3b82f6;
+        text-decoration: none;
+    }
+
+    .footer-content a:hover {
+        text-decoration: underline;
+    }
+
+    .hero-section {
+        text-align: center;
+        padding: 3rem 1rem;
+        margin-bottom: 1rem;
+    }
+
+    .hero-title {
+        font-size: 2.5rem;
+        font-weight: 800;
+        margin-bottom: 0.5rem;
+    }
+
+    .gradient-text {
+        background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+
+    .hero-subtitle {
+        font-size: 1.35rem;
+        color: #94a3b8;
+        margin-bottom: 1rem;
+    }
+
+    .hero-description {
+        max-width: 620px;
+        margin: 0 auto 2rem auto;
+        color: #64748b;
+        line-height: 1.7;
+    }
+
+    .hero-description a {
+        color: #3b82f6;
+        text-decoration: none;
+    }
+
+    .hero-description a:hover {
+        text-decoration: underline;
+    }
+
+    .hero-buttons {
+        display: flex;
+        gap: 1rem;
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+
+    .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.7rem 1.4rem;
+        border-radius: 8px;
+        font-weight: 600;
+        text-decoration: none;
+        transition: all 0.2s ease;
+        font-size: 0.95rem;
+    }
+
+    .btn-primary {
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+        color: white;
+        border: none;
+    }
+
+    .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 20px rgba(59, 130, 246, 0.3);
+        color: white;
+    }
+
+    .btn-secondary {
+        background: rgba(255, 255, 255, 0.06);
+        color: #e2e8f0;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+    }
+
+    .btn-secondary:hover {
+        background: rgba(255, 255, 255, 0.1);
+        transform: translateY(-2px);
+        color: white;
+    }
+
+    /* Pipeline visualization */
+    .pipeline-visual {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 1rem;
+        margin: 2rem 0;
+        flex-wrap: wrap;
+    }
+
+    .pipeline-box {
+        padding: 0.6rem 1.2rem;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 0.9rem;
+    }
+
+    .pipeline-source {
+        background: rgba(56, 189, 248, 0.12);
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        color: #38bdf8;
+    }
+
+    .pipeline-compiler {
+        background: rgba(139, 92, 246, 0.12);
+        border: 1px solid rgba(139, 92, 246, 0.3);
+        color: #a78bfa;
+    }
+
+    .pipeline-arrow {
+        width: 2rem;
+        height: 2px;
+        background: rgba(255, 255, 255, 0.2);
+        position: relative;
+    }
+
+    .pipeline-arrow::after {
+        content: '';
+        position: absolute;
+        right: 0;
+        top: -4px;
+        border: 5px solid transparent;
+        border-left-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .pipeline-targets {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+
+    .pipeline-target {
+        padding: 0.35rem 0.7rem;
+        border-radius: 6px;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+
+    .target-browser {
+        background: rgba(0, 212, 255, 0.1);
+        border: 1px solid rgba(0, 212, 255, 0.25);
+        color: #67e8f9;
+    }
+
+    .target-desktop {
+        background: rgba(52, 211, 153, 0.1);
+        border: 1px solid rgba(52, 211, 153, 0.25);
+        color: #6ee7b7;
+    }
+
+    /* Sections */
+    .section-title {
+        font-size: 1.6rem;
+        font-weight: 700;
+        margin-bottom: 0.75rem;
+        text-align: center;
+        color: #f1f5f9;
+    }
+
+    .section-desc {
+        text-align: center;
+        color: #64748b;
+        max-width: 600px;
+        margin: 0 auto 1.5rem auto;
+        line-height: 1.6;
+    }
+
+    .section-desc a {
+        color: #3b82f6;
+        text-decoration: none;
+    }
+
+    .section-desc a:hover {
+        text-decoration: underline;
+    }
+
+    .features-section {
+        padding: 2rem 0;
+    }
+
+    .subsection-title {
+        font-size: 1.15rem;
+        font-weight: 700;
+        color: #cbd5e1;
+        margin: 2rem 0 1rem 0;
+    }
+
+    .features-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 1.25rem;
+    }
+
+    .features-grid-3 {
+        grid-template-columns: repeat(3, 1fr);
+    }
+
+    .feature-card {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        padding: 1.25rem;
+        transition: all 0.2s ease;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .feature-card:hover {
+        background: rgba(255, 255, 255, 0.06);
+        border-color: rgba(139, 92, 246, 0.25);
+    }
+
+    .feature-card.feature-highlight-browser {
+        background: rgba(0, 212, 255, 0.04);
+        border-color: rgba(0, 212, 255, 0.15);
+    }
+
+    .feature-card.feature-highlight-browser:hover {
+        background: rgba(0, 212, 255, 0.08);
+        border-color: rgba(0, 212, 255, 0.3);
+    }
+
+    .feature-card.feature-highlight-desktop {
+        background: rgba(52, 211, 153, 0.04);
+        border-color: rgba(52, 211, 153, 0.15);
+    }
+
+    .feature-card.feature-highlight-desktop:hover {
+        background: rgba(52, 211, 153, 0.08);
+        border-color: rgba(52, 211, 153, 0.3);
+    }
+
+    .feature-card h3 {
+        font-size: 1rem;
+        font-weight: 600;
+        color: #f1f5f9;
+        margin-bottom: 0.4rem;
+    }
+
+    .feature-card p {
+        color: #94a3b8;
+        font-size: 0.85rem;
+        line-height: 1.5;
+        margin: 0;
+        flex: 1;
+    }
+
+    .feature-tag {
+        margin-top: 0.6rem;
+        display: inline-block;
+        font-size: 0.72rem;
+        font-weight: 600;
+        color: #94a3b8;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 5px;
+        padding: 0.15rem 0.5rem;
+        align-self: flex-start;
+    }
+
+    /* Roadmap */
+    .roadmap-grid {
+        display: flex;
+        flex-direction: column;
+        gap: 0.6rem;
+        max-width: 550px;
+        margin: 0 auto;
+    }
+
+    .roadmap-item {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 0.6rem 1rem;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .roadmap-status {
+        font-size: 0.72rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        min-width: 60px;
+        text-align: center;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+    }
+
+    .roadmap-item.done .roadmap-status {
+        color: #34d399;
+        background: rgba(52, 211, 153, 0.1);
+    }
+
+    .roadmap-item.active .roadmap-status {
+        color: #38bdf8;
+        background: rgba(56, 189, 248, 0.1);
+    }
+
+    .roadmap-item.planned .roadmap-status {
+        color: #64748b;
+        background: rgba(100, 116, 139, 0.1);
+    }
+
+    .roadmap-label {
+        color: #cbd5e1;
+        font-size: 0.9rem;
+    }
+
+    .roadmap-item.planned .roadmap-label {
+        color: #64748b;
+    }
+
+    @@media (max-width: 640px) {
+        .features-grid-3 {
+            grid-template-columns: 1fr;
+        }
+
+        .hero-title {
+            font-size: 1.8rem;
+        }
+
+        .pipeline-arrow {
+            display: none;
+        }
+
+        .pipeline-visual {
+            flex-direction: column;
+        }
+    }
+</style>
