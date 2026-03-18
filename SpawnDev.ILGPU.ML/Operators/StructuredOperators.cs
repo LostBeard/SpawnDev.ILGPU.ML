@@ -257,17 +257,37 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     {
         int axis = ctx.GetInt("axis", 0);
         if (axis < 0) axis += ctx.Inputs[0].Shape.Length;
-        // For last-dim concat of 2 inputs, use existing ConcatLastDim
-        if (axis == ctx.Inputs[0].Rank - 1 && ctx.Inputs.Length == 2)
+
+        // General concat: copy each input's blocks to the output at the correct offset.
+        // For axis=1 (NCHW channel concat): outer=N, concat dim=C, inner=H*W
+        var shape0 = ctx.Inputs[0].Shape;
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape0[i];
+        int inner = 1; for (int i = axis + 1; i < shape0.Length; i++) inner *= shape0[i];
+
+        int outOffset = 0;
+        int totalConcatDim = 0;
+        for (int n = 0; n < ctx.Inputs.Length; n++)
+            totalConcatDim += ctx.Inputs[n].Shape[axis];
+
+        // For each outer block, copy each input's slice
+        for (int n = 0; n < ctx.Inputs.Length; n++)
         {
-            int T = 1; for (int i = 0; i < axis; i++) T *= ctx.Inputs[0].Shape[i];
-            int C = ctx.Inputs[0].Shape[axis];
-            reg.ElementWise.ConcatLastDim(ctx.Inputs[0].Data, ctx.Inputs[1].Data,
-                ctx.Outputs[0].Data, T, C);
-        }
-        else
-        {
-            throw new NotSupportedException($"Concat on axis {axis} with {ctx.Inputs.Length} inputs not yet implemented");
+            var inp = ctx.Inputs[n];
+            int concatDim = inp.Shape[axis];
+            int blockSize = concatDim * inner;
+
+            for (int o = 0; o < outer; o++)
+            {
+                int srcOffset = o * blockSize;
+                int dstOffset = o * totalConcatDim * inner + outOffset;
+
+                // Copy blockSize elements
+                reg.ElementWise.Scale(
+                    inp.Data.SubView(srcOffset, blockSize),
+                    ctx.Outputs[0].Data.SubView(dstOffset, blockSize),
+                    blockSize, 1f);
+            }
+            outOffset += concatDim * inner;
         }
     }
 }
