@@ -1,0 +1,83 @@
+using ILGPU;
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
+using SpawnDev.UnitTesting;
+
+namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
+
+public abstract partial class MLTestBase
+{
+    [TestMethod]
+    public async Task BatchNorm_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        int N = 2, C = 64, H = 7, W = 7;
+        int spatial = H * W;
+        var input = RandomFloats(N * C * spatial, seed: 140);
+        var scale = RandomFloats(C, seed: 141, scale: 0.5f);
+        var bias = RandomFloats(C, seed: 142, scale: 0.1f);
+        var mean = RandomFloats(C, seed: 143, scale: 2f);
+        var variance = RandomFloats(C, seed: 144, scale: 1f);
+        for (int i = 0; i < C; i++) variance[i] = MathF.Abs(variance[i]) + 0.1f; // positive
+
+        // CPU reference
+        float eps = 1e-5f;
+        var expected = new float[N * C * spatial];
+        for (int i = 0; i < expected.Length; i++)
+        {
+            int c = (i / spatial) % C;
+            float invStd = 1f / MathF.Sqrt(variance[c] + eps);
+            expected[i] = scale[c] * (input[i] - mean[c]) * invStd + bias[c];
+        }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var outBuf = accelerator.Allocate1D<float>(N * C * spatial);
+        using var sBuf = accelerator.Allocate1D(scale);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var mBuf = accelerator.Allocate1D(mean);
+        using var vBuf = accelerator.Allocate1D(variance);
+
+        var norm = new NormalizationKernels(accelerator);
+        norm.BatchNorm(inBuf.View, outBuf.View, sBuf.View, bBuf.View, mBuf.View, vBuf.View, N, C, spatial);
+        await accelerator.SynchronizeAsync();
+
+        var actual = await outBuf.CopyToHostAsync<float>(0, N * C * spatial);
+        AssertClose(expected, actual, 1e-4f, "BatchNorm: ");
+    });
+
+    [TestMethod]
+    public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        int rows = 100, C = 384;
+        var input = RandomFloats(rows * C, seed: 145);
+        var weight = RandomFloats(C, seed: 146, scale: 0.5f);
+        for (int i = 0; i < C; i++) weight[i] = MathF.Abs(weight[i]) + 0.5f;
+
+        // CPU reference
+        float eps = 1e-6f;
+        var expected = new float[rows * C];
+        for (int r = 0; r < rows; r++)
+        {
+            float sumSq = 0;
+            for (int i = 0; i < C; i++)
+            {
+                float v = input[r * C + i];
+                sumSq += v * v;
+            }
+            float rms = MathF.Sqrt(sumSq / C + eps);
+            float invRms = 1f / rms;
+            for (int i = 0; i < C; i++)
+                expected[r * C + i] = input[r * C + i] * invRms * weight[i];
+        }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var outBuf = accelerator.Allocate1D<float>(rows * C);
+        using var wBuf = accelerator.Allocate1D(weight);
+
+        var norm = new NormalizationKernels(accelerator);
+        norm.RMSNorm(inBuf.View, outBuf.View, wBuf.View, rows, C);
+        await accelerator.SynchronizeAsync();
+
+        var actual = await outBuf.CopyToHostAsync<float>(0, rows * C);
+        AssertClose(expected, actual, 1e-4f, "RMSNorm: ");
+    });
+}
