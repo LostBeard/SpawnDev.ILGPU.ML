@@ -471,6 +471,14 @@ public class ElementWiseKernels
     private static void MaxImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = a[idx] > b[idx] ? a[idx] : b[idx]; }
 
+    private static void ClipImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, float minVal, float maxVal)
+    {
+        float x = input[idx];
+        if (x < minVal) x = minVal;
+        if (x > maxVal) x = maxVal;
+        output[idx] = x;
+    }
+
     /// <summary>Where: output[i] = condition[i] != 0 ? x[i] : y[i].</summary>
     private static void WhereImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> cond,
         ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> y,
@@ -493,6 +501,7 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _roundKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _minKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _maxKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _clipKernel;
 
     public void Sqrt(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _sqrtKernel!(count, input, output); }
@@ -526,6 +535,8 @@ public class ElementWiseKernels
     { EnsureLoaded2(); _minKernel!(count, a, b, output); }
     public void Max(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _maxKernel!(count, a, b, output); }
+    public void Clip(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float minVal, float maxVal)
+    { EnsureLoaded2(); _clipKernel!(count, input, output, minVal, maxVal); }
 
     private void EnsureLoaded2()
     {
@@ -546,6 +557,7 @@ public class ElementWiseKernels
         _roundKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(RoundImpl);
         _minKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MinImpl);
         _maxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
+        _clipKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);
     }
 
     private void EnsureLoaded()

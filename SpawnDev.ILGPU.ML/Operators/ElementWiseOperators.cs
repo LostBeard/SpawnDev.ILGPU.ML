@@ -86,10 +86,24 @@ public class ClipOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // Clip: inputs[0]=data, inputs[1]=min (optional), inputs[2]=max (optional)
-        // For now, copy and clamp using scale as identity
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.ElementWise.ReLUInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount); // simplified: Clip(0, inf) = ReLU
+        // Opset 6: min/max as attributes. Opset 11+: min/max as optional inputs.
+        float minVal = ctx.GetFloat("min", float.MinValue);
+        float maxVal = ctx.GetFloat("max", float.MaxValue);
+
+        // Opset 11+: inputs[1]=min, inputs[2]=max (scalar tensors)
+        // We can't easily read scalar GPU tensors to CPU here, so use attribute defaults
+        // which cover the common case (Clip(0,6) for ReLU6 has them as attributes).
+
+        if (minVal == 0f && maxVal == float.MaxValue)
+        {
+            // Fast path: Clip(0, inf) = ReLU
+            reg.ElementWise.ReLU(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        }
+        else
+        {
+            reg.ElementWise.Clip(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+                ctx.Inputs[0].ElementCount, minVal, maxVal);
+        }
     }
 }
 
