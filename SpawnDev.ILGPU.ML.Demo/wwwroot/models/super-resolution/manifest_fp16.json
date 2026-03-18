@@ -1,0 +1,86 @@
+{
+  "conv1.bias": {
+    "offset": 0,
+    "shape": [
+      64
+    ],
+    "elements": 64,
+    "bytes": 128,
+    "dtype": "fp16"
+  },
+  "conv1.weight": {
+    "offset": 128,
+    "shape": [
+      64,
+      1,
+      5,
+      5
+    ],
+    "elements": 1600,
+    "bytes": 3200,
+    "dtype": "fp16"
+  },
+  "conv2.bias": {
+    "offset": 3328,
+    "shape": [
+      64
+    ],
+    "elements": 64,
+    "bytes": 128,
+    "dtype": "fp16"
+  },
+  "conv2.weight": {
+    "offset": 3456,
+    "shape": [
+      64,
+      64,
+      3,
+      3
+    ],
+    "elements": 36864,
+    "bytes": 73728,
+    "dtype": "fp16"
+  },
+  "conv3.bias": {
+    "offset": 77184,
+    "shape": [
+      32
+    ],
+    "elements": 32,
+    "bytes": 64,
+    "dtype": "fp16"
+  },
+  "conv3.weight": {
+    "offset": 77312,
+    "shape": [
+      32,
+      64,
+      3,
+      3
+    ],
+    "elements": 18432,
+    "bytes": 36864,
+    "dtype": "fp16"
+  },
+  "conv4.bias": {
+    "offset": 114176,
+    "shape": [
+      9
+    ],
+    "elements": 9,
+    "bytes": 18,
+    "dtype": "fp16"
+  },
+  "conv4.weight": {
+    "offset": 114304,
+    "shape": [
+      9,
+      32,
+      3,
+      3
+    ],
+    "elements": 2592,
+    "bytes": 5184,
+    "dtype": "fp16"
+  }
+}
