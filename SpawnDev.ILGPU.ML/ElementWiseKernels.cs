@@ -471,6 +471,15 @@ public class ElementWiseKernels
     private static void MaxImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = a[idx] > b[idx] ? a[idx] : b[idx]; }
 
+    private static void EqualImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
+    { output[idx] = a[idx] == b[idx] ? 1f : 0f; }
+
+    private static void GreaterImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
+    { output[idx] = a[idx] > b[idx] ? 1f : 0f; }
+
+    private static void LessImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
+    { output[idx] = a[idx] < b[idx] ? 1f : 0f; }
+
     private static void ClipImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, float minVal, float maxVal)
     {
         float x = input[idx];
@@ -502,6 +511,9 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _minKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _maxKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _clipKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _equalKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _greaterKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _lessKernel;
 
     public void Sqrt(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _sqrtKernel!(count, input, output); }
@@ -537,6 +549,12 @@ public class ElementWiseKernels
     { EnsureLoaded2(); _maxKernel!(count, a, b, output); }
     public void Clip(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float minVal, float maxVal)
     { EnsureLoaded2(); _clipKernel!(count, input, output, minVal, maxVal); }
+    public void Equal(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded2(); _equalKernel!(count, a, b, output); }
+    public void Greater(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded2(); _greaterKernel!(count, a, b, output); }
+    public void Less(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded2(); _lessKernel!(count, a, b, output); }
 
     private void EnsureLoaded2()
     {
@@ -558,6 +576,9 @@ public class ElementWiseKernels
         _minKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MinImpl);
         _maxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
         _clipKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);
+        _equalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
+        _greaterKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
+        _lessKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);
     }
 
     private void EnsureLoaded()

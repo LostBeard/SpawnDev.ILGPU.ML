@@ -337,7 +337,7 @@ public class EqualOperator(OperatorRegistry reg) : IOnnxOperator
     {
         // Output 1.0 where equal, 0.0 where not — needs a kernel
         // For now, placeholder
-        throw new NotSupportedException("Equal not yet implemented");
+        reg.ElementWise.Equal(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -348,7 +348,7 @@ public class GreaterOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Greater not yet implemented");
+        reg.ElementWise.Greater(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -359,7 +359,7 @@ public class LessOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Less not yet implemented");
+        reg.ElementWise.Less(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 

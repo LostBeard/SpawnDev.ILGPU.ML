@@ -101,8 +101,8 @@ public class OperatorRegistry
         Register(new ResizeOperator(this));
         Register(new PadOperator(this));
         Register(new ConvOperator(this));
-        Register(new SplitOperator());
-        Register(new SliceOperator());
+        Register(new SplitOperator(this));
+        Register(new SliceOperator(this));
         Register(new DropoutOperator(this));
         Register(new GemmOperator(this));
         Register(new InstanceNormOperator(this));

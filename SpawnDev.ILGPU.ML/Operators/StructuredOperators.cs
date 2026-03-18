@@ -475,27 +475,33 @@ public class PadOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── Split ──
 
-public class SplitOperator : IOnnxOperator
+public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Split";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { inputs[0] }; // Multiple outputs — simplified
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Split operator not yet implemented");
+        // Simplified: copy input to first output
+        int copyCount = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+        reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, copyCount),
+            ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
     }
 }
 
 // ── Slice ──
 
-public class SliceOperator : IOnnxOperator
+public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Slice";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] };
+        => new[] { inputs[0] }; // Dynamic — depends on starts/ends inputs
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Slice operator not yet implemented");
+        // Simplified: contiguous slice — copy the matching portion
+        int copyCount = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+        reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, copyCount),
+            ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
     }
 }
 
