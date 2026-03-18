@@ -21,6 +21,12 @@ public partial class StylePage : IDisposable
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
 
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadStyle("mosaic");
+    }
+
     private async Task LoadStyle(string styleName)
     {
         try
@@ -42,7 +48,8 @@ public partial class StylePage : IDisposable
             _session?.Dispose();
             _pipeline?.Dispose();
 
-            _session = await InferenceSession.CreateAsync(_accelerator, Http, $"models/style-{styleName}");
+            var modelName = styleName.ToLowerInvariant().Replace(" ", "-");
+            _session = await InferenceSession.CreateAsync(_accelerator, Http, $"models/style-{modelName}");
             _pipeline = new StyleTransferPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

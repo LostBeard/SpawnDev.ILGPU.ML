@@ -140,6 +140,6 @@
         new("Udnie"), new("Pointilism"), new("Starry Night")
     };
 
-    private void SelectStyle(string name) { _selectedStyle = name; _styledImageUrl = null; }
+    private async void SelectStyle(string name) { _selectedStyle = name; _styledImageUrl = null; await LoadStyle(name); }
     private Task HandleFrame(byte[] frameBytes) => Task.CompletedTask;
 }
