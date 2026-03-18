@@ -67,6 +67,7 @@ def main():
         model_graph["outputs"].append({"name": out.name, "shape": shape})
 
     # Nodes
+    extra_tensors = []  # (name, numpy_array) from Constant node attributes
     for node in graph.node:
         node_dict = {
             "opType": node.op_type,
@@ -87,11 +88,13 @@ def main():
             elif attr.type == onnx.AttributeProto.FLOATS:
                 attrs[attr.name] = list(attr.floats)
             elif attr.type == onnx.AttributeProto.TENSOR:
-                # Constant tensor attribute — store as initializer
+                # Constant tensor attribute — extract and store as initializer
                 tensor = numpy_helper.to_array(attr.t)
-                tensor_name = f"_attr_{node.output[0]}_{attr.name}"
+                tensor_name = f"_const_{node.output[0]}"
                 init_names.add(tensor_name)
-                # Will be added to weights below
+                # Replace Constant node with a reference to the initializer
+                # The node's output name becomes an alias for this tensor
+                extra_tensors.append((node.output[0], tensor))
         if attrs:
             node_dict["attributes"] = attrs
         model_graph["nodes"].append(node_dict)
@@ -102,8 +105,11 @@ def main():
     weight_data = bytearray()
     current_offset = 0
 
-    for init in graph.initializer:
-        tensor = numpy_helper.to_array(init)
+    # Combine graph initializers + Constant node attribute tensors
+    all_tensors = [(init.name, numpy_helper.to_array(init)) for init in graph.initializer]
+    all_tensors.extend(extra_tensors)
+
+    for name, tensor in all_tensors:
         shape = list(tensor.shape)
 
         # Align offset
@@ -116,14 +122,14 @@ def main():
         weight_data.extend(fp16_data)
 
         elements = int(np.prod(shape)) if len(shape) > 0 else 1
-        manifest[init.name] = {
+        manifest[name] = {
             "offset": current_offset,
             "shape": shape,
             "elements": elements,
             "bytes": len(fp16_data),
             "dtype": "fp16"
         }
-        model_graph["initializers"][init.name] = shape
+        model_graph["initializers"][name] = shape
         current_offset += len(fp16_data)
 
     # ── Write outputs ──
