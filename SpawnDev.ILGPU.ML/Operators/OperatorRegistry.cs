@@ -69,7 +69,7 @@ public class OperatorRegistry
         Register(new AddOperator(this));
         Register(new MulOperator(this));
         Register(new SubOperator(this));
-        Register(new ReshapeOperator());
+        Register(new ReshapeOperator(this));
         Register(new TransposeOperator(this));
         Register(new SoftmaxOperator(this));
         Register(new LayerNormOperator(this));

@@ -8,16 +8,17 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// When they don't (graph executor allocated a separate output), we do a trivial copy.
 /// </summary>
 
-public class ReshapeOperator : IOnnxOperator
+public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Reshape";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { inputs[0] }; // Resolved from shape tensor at graph compile time
     public void Execute(OnnxOpContext ctx)
     {
-        // Output is pre-shaped by graph executor. Data identity is handled
-        // by the executor's buffer aliasing — if it can't alias, it copies.
-        // Nothing to do here if executor handled it.
+        // Copy input to output (different buffers allocated by executor).
+        // Zero-copy would be ideal but requires buffer aliasing in the executor.
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+            ctx.Inputs[0].ElementCount, 1f);
     }
 }
 

@@ -29,12 +29,17 @@ public class GraphCompiler
         // Topological sort
         var sorted = TopologicalSort(graph.Nodes);
 
-        // Shape inference: track known shapes from inputs and initializers
+        // Shape inference: track known shapes from inputs, initializers, and outputs
         var knownShapes = new Dictionary<string, int[]>();
         foreach (var input in graph.Inputs)
             knownShapes[input.Name] = input.Shape;
         foreach (var (name, shape) in graph.Initializers)
             knownShapes[name] = shape;
+        // Pre-register graph output shapes (overrides inferred shapes for Reshape etc.)
+        var graphOutputShapes = new Dictionary<string, int[]>();
+        foreach (var output in graph.Outputs)
+            if (output.Shape.Length > 0 && output.Shape.All(d => d > 0))
+                graphOutputShapes[output.Name] = output.Shape;
 
         // Compile each node
         var compiledNodes = new List<CompiledNode>();
@@ -60,9 +65,14 @@ public class GraphCompiler
                 outputShapes = new[] { inputShapes[0] };
             }
 
-            // Register output shapes
+            // Register output shapes (override with graph output shapes if known)
             for (int i = 0; i < node.Outputs.Count && i < outputShapes.Length; i++)
-                knownShapes[node.Outputs[i]] = outputShapes[i];
+            {
+                var outName = node.Outputs[i];
+                if (graphOutputShapes.TryGetValue(outName, out var knownOutShape))
+                    outputShapes[i] = knownOutShape; // Use known graph output shape
+                knownShapes[outName] = outputShapes[i];
+            }
 
             compiledNodes.Add(new CompiledNode
             {
