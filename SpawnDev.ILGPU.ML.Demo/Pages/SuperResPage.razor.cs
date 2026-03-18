@@ -96,8 +96,8 @@ public partial class SuperResPage : IDisposable
             var result = await _pipeline.UpscaleAsync(_rgbaPixels, _imageWidth, _imageHeight);
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
+            _enhancedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.RgbaPixels, result.Width, result.Height);
             Console.WriteLine($"[SuperRes] {_inferenceMs:F0}ms, {_imageWidth}x{_imageHeight} → {result.Width}x{result.Height}");
-            // TODO: Convert result.RgbaPixels to data URL for display
         }
         catch (Exception ex)
         {

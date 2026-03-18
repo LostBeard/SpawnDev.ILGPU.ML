@@ -97,7 +97,7 @@ public partial class StylePage : IDisposable
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
 
-            // TODO: Convert result.RgbaPixels to data URL for display
+            _styledImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.RgbaPixels, result.Width, result.Height);
             Console.WriteLine($"[Style] {_inferenceMs:F0}ms, output {result.Width}x{result.Height}");
         }
         catch (Exception ex)
