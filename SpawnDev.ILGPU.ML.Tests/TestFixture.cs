@@ -15,7 +15,7 @@ public class AcceleratorFixture : IDisposable
 
     public AcceleratorFixture()
     {
-        Context = Context.CreateDefault();
+        Context = MLContext.CreateContext();
         Accelerator = Context.CreateCPUAccelerator(0);
     }
 

@@ -16,8 +16,7 @@ public class CudaTests : MLTestBase
 
     protected override Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {
-        var context = Context.Create()
-            .EnableAlgorithms()
+        var context = MLContext.Create()
             .ToContext();
         var cudaDevices = context.GetCudaDevices();
         if (cudaDevices.Count == 0)

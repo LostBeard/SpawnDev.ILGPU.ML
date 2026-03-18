@@ -35,7 +35,7 @@ public partial class ClassifyPage : IDisposable
             _isModelLoading = true;
             StateHasChanged();
 
-            var builder = Context.Create();
+            var builder = MLContext.Create();
             await builder.WebGPU();
             _context = builder.ToContext();
             var devices = _context.GetWebGPUDevices();

@@ -16,8 +16,7 @@ public class OpenCLTests : MLTestBase
 
     protected override Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {
-        var context = Context.Create()
-            .EnableAlgorithms()
+        var context = MLContext.Create()
             .ToContext();
         var clDevices = context.GetCLDevices();
         if (clDevices.Count == 0)

@@ -18,7 +18,7 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
 
         protected override async Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
         {
-            var builder = Context.Create();
+            var builder = MLContext.Create();
             await builder.WebGL();
             var context = builder.ToContext();
             var devices = context.GetWebGLDevices();
@@ -30,7 +30,7 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
 
         //protected override async Task<(Context context, Accelerator accelerator)> CreateEmulatedAcceleratorAsync()
         //{
-        //    var builder = Context.Create();
+        //    var builder = MLContext.Create();
         //    await builder.WebGL();
         //    var context = builder.ToContext();
         //    var devices = context.GetWebGLDevices();

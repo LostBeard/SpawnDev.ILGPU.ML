@@ -15,7 +15,7 @@ public class CPUTests : MLTestBase
 
     protected override Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {
-        var context = Context.CreateDefault();
+        var context = MLContext.CreateContext();
         var accelerator = context.CreateCPUAccelerator(0);
         return Task.FromResult((context, (Accelerator)accelerator));
     }

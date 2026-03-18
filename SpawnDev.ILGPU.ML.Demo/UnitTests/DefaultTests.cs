@@ -18,7 +18,7 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
         [TestMethod]
         public async Task DeviceEnumerationTest()
         {
-            var builder = Context.Create();
+            var builder = MLContext.Create();
             await builder.AllAcceleratorsAsync();
             using var context = builder.ToContext();
 
@@ -52,7 +52,7 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
         [TestMethod]
         public async Task PreferredAcceleratorTest()
         {
-            var builder = Context.Create();
+            var builder = MLContext.Create();
             await builder.AllAcceleratorsAsync();
             using var context = builder.ToContext();
 
@@ -87,7 +87,7 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
         [TestMethod]
         public async Task DefaultKernelExecutionTest()
         {
-            var builder = Context.Create();
+            var builder = MLContext.Create();
             await builder.AllAcceleratorsAsync();
             using var context = builder.ToContext();
 

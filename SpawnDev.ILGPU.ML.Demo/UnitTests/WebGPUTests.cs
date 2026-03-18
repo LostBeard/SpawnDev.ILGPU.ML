@@ -22,7 +22,7 @@ public class WebGPUTests : MLTestBase
 
     protected override async Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {
-        var builder = Context.Create();
+        var builder = MLContext.Create();
         await builder.WebGPU();
         var context = builder.ToContext();
         var devices = context.GetWebGPUDevices();
