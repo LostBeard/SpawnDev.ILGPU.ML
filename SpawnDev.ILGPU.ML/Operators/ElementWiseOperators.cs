@@ -198,6 +198,19 @@ public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+/// <summary>Dropout: no-op at inference (pass-through).</summary>
+public class DropoutOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Dropout";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Inference mode: output = input (no dropout applied)
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+    }
+}
+
 public class ReciprocalOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Reciprocal";
