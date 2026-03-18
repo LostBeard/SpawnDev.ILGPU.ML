@@ -326,16 +326,27 @@ public class GemmOperator(OperatorRegistry reg) : IOnnxOperator
     {
         float alpha = ctx.GetFloat("alpha", 1f);
         float beta = ctx.GetFloat("beta", 1f);
+        int transA = ctx.GetInt("transA", 0);
         int transB = ctx.GetInt("transB", 0);
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+
+        if (transA != 0)
+            throw new NotSupportedException("Gemm with transA=1 not yet implemented");
+
         int M = a.Shape[0]; int K = a.Shape[1];
         int N = transB != 0 ? b.Shape[0] : b.Shape[1];
 
-        // TODO: handle transA/transB via Transpose kernel
-        if (ctx.GetInt("transA", 0) != 0 || transB != 0)
-            throw new NotSupportedException("Gemm with transA/transB not yet implemented");
-
-        reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
+        if (transB != 0)
+        {
+            // B is [N, K], need [K, N] for MatMul. Transpose it.
+            var bT = ctx.Pool.Rent(new[] { K, N });
+            reg.Transpose.Transpose(b.Data, bT.Data, b.Shape, new[] { 1, 0 });
+            reg.MatMul.MatMul(a.Data, bT.Data, ctx.Outputs[0].Data, M, K, N);
+        }
+        else
+        {
+            reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
+        }
 
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null && beta != 0f)
             reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[2].Data, M * N, N);

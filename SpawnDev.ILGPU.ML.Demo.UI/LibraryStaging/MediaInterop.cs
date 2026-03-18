@@ -73,7 +73,7 @@ public class MediaInterop
     /// Uses CopyTo for direct buffer access — the most efficient path for video.
     /// Falls back to canvas if CopyTo format isn't RGBA.
     /// </summary>
-    public byte[] FromVideoFrame(VideoFrame frame, int? targetWidth = null, int? targetHeight = null)
+    public async Task<byte[]> FromVideoFrameAsync(VideoFrame frame, int? targetWidth = null, int? targetHeight = null)
     {
         int w = targetWidth ?? frame.DisplayWidth;
         int h = targetHeight ?? frame.DisplayHeight;
@@ -83,7 +83,7 @@ public class MediaInterop
         {
             int size = frame.AllocationSize();
             var buffer = new byte[size];
-            frame.CopyTo(buffer);
+            await frame.CopyTo(buffer); // CopyTo is async (returns Promise per spec)
 
             if (frame.Format == "BGRA")
             {
@@ -224,9 +224,9 @@ public class MediaInterop
     /// VideoFrame → preprocessed NCHW float tensor in one call.
     /// Optimal for WebCodecs-based video processing.
     /// </summary>
-    public float[] VideoFrameToTensor(VideoFrame frame, ModelConfig config)
+    public async Task<float[]> VideoFrameToTensorAsync(VideoFrame frame, ModelConfig config)
     {
-        var rgba = FromVideoFrame(frame, config.InputWidth, config.InputHeight);
+        var rgba = await FromVideoFrameAsync(frame, config.InputWidth, config.InputHeight);
         return config.Preprocess(rgba, config.InputWidth, config.InputHeight);
     }
 
