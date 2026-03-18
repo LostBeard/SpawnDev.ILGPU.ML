@@ -292,6 +292,23 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── InstanceNormalization ──
+
+public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "InstanceNormalization";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        int N = shape[0]; int C = shape[1];
+        int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
+        reg.Normalization.InstanceNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+            ctx.Inputs[1].Data, ctx.Inputs[2].Data, N, C, spatial);
+    }
+}
+
 // ── Gemm (General Matrix Multiply) ──
 
 public class GemmOperator(OperatorRegistry reg) : IOnnxOperator

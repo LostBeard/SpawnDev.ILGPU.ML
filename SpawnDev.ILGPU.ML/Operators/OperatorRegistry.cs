@@ -105,5 +105,11 @@ public class OperatorRegistry
         Register(new SliceOperator());
         Register(new DropoutOperator(this));
         Register(new GemmOperator(this));
+        Register(new InstanceNormOperator(this));
+        Register(new ConstantOperator());
+        Register(new CastOperator(this));
+        Register(new FloorOperator(this));
+        Register(new UpsampleOperator(this));
+        Register(new ShapeOperator());
     }
 }

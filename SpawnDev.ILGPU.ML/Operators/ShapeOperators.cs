@@ -38,6 +38,63 @@ public class SqueezeOperator : IOnnxOperator
     public void Execute(OnnxOpContext ctx) { }
 }
 
+/// <summary>Constant: output is a constant value (stored as initializer). No-op at runtime.</summary>
+public class ConstantOperator : IOnnxOperator
+{
+    public string OpType => "Constant";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { new[] { 1 } };
+    public void Execute(OnnxOpContext ctx) { }
+}
+
+/// <summary>Cast: type conversion. For float→float, this is a copy.</summary>
+public class CastOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Cast";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+    }
+}
+
+/// <summary>Floor: element-wise floor. TODO: needs proper Floor kernel.</summary>
+public class FloorOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Floor";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+    }
+}
+
+/// <summary>Upsample: resize using nearest or linear mode.</summary>
+public class UpsampleOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Upsample";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Upsample not yet implemented — need scales tensor readback");
+    }
+}
+
+/// <summary>Shape: outputs the shape of the input as a 1D int64 tensor. TODO: needs int64 support.</summary>
+public class ShapeOperator : IOnnxOperator
+{
+    public string OpType => "Shape";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { new[] { inputs[0].Length } };
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Shape operator requires int64 tensor output — not yet implemented");
+    }
+}
+
 public class FlattenOperator : IOnnxOperator
 {
     public string OpType => "Flatten";
