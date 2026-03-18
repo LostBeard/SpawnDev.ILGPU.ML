@@ -121,11 +121,38 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator
         {
             reg.ElementWise.Add(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         }
-        else if (b.ElementCount == a.Shape[^1]) // per-channel broadcast
+        else if (b.ElementCount == a.Shape[^1])
         {
-            // Copy a to output, then AddBias
+            // Last-dim broadcast: b[C] + a[..., C]
             reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
             reg.ElementWise.AddBias(ctx.Outputs[0].Data, b.Data, a.ElementCount, b.ElementCount);
+        }
+        else if (a.Rank == 4 && b.Rank == 1 && b.ElementCount == a.Shape[1])
+        {
+            // NCHW per-channel broadcast: a[N,C,H,W] + b[C]
+            // AddBias broadcasts over the last dim. For NCHW we need per-channel.
+            // Reshape conceptually: each C-channel has H*W elements
+            int C = a.Shape[1]; int spatial = a.Shape[2] * a.Shape[3];
+            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
+            // Use BroadcastMul pattern but for Add — need a per-channel add kernel
+            // For now, iterate channels on CPU dispatch (each channel gets AddBias)
+            for (int nc = 0; nc < a.Shape[0] * C; nc++)
+            {
+                int c = nc % C;
+                int offset = nc * spatial;
+                // Add scalar bias[c] to each element in this channel's spatial slice
+                // We don't have a scalar-add kernel, so use AddBias with spatial=1 trick
+                // Actually, just use Scale(1) + AddBias over the spatial dim
+                reg.ElementWise.AddBias(
+                    ctx.Outputs[0].Data.SubView(offset, spatial),
+                    b.Data.SubView(c, 1), spatial, 1);
+            }
+        }
+        else if (b.ElementCount == 1)
+        {
+            // Scalar broadcast
+            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
+            reg.ElementWise.AddBias(ctx.Outputs[0].Data, b.Data, a.ElementCount, 1);
         }
         else
         {
