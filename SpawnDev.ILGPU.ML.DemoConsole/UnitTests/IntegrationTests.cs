@@ -453,6 +453,80 @@ public class IntegrationTests
             Console.WriteLine($"  {r.Label}: {r.Confidence:P2} (class {r.ClassIndex})");
     }
 
+    /// <summary>
+    /// Pipeline test: verify SqueezeNet produces discriminative (non-uniform) output.
+    /// This catches the uniform-logits bug seen in the browser demo.
+    /// </summary>
+    [TestMethod]
+    public async Task Pipeline_SqueezeNet_NonUniformLogits()
+    {
+        var modelsDir = FindModelsDir();
+        var modelDir = Path.Combine(modelsDir, "squeezenet");
+        if (!File.Exists(Path.Combine(modelDir, "model_graph.json")))
+            throw new UnsupportedTestException("SqueezeNet not found");
+
+        var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(Path.Combine(modelDir, "model_graph.json")));
+        var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+            await File.ReadAllTextAsync(Path.Combine(modelDir, "manifest_fp16.json")))!;
+        var blob = await File.ReadAllBytesAsync(Path.Combine(modelDir, "weights_fp16.bin"));
+
+        using var context = MLContext.CreateContext();
+        using var accelerator = context.CreateCPUAccelerator(0);
+        using var pool = new BufferPool(accelerator);
+
+        var weights = new Dictionary<string, Tensor>();
+        foreach (var (name, info) in manifest)
+        {
+            var offset = info.GetProperty("offset").GetInt32();
+            var shape = info.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var elements = info.GetProperty("elements").GetInt32();
+            var fp32 = new float[elements];
+            for (int i = 0; i < elements; i++)
+            {
+                ushort fp16 = (ushort)(blob[offset + i * 2] | (blob[offset + i * 2 + 1] << 8));
+                fp32[i] = HalfToFloat(fp16);
+            }
+            weights[name] = pool.AllocatePermanent(fp32, shape, name);
+        }
+
+        Console.WriteLine($"[PipelineTest] Loaded {weights.Count} weight tensors");
+
+        // Check: are the graph's initializer names matching the weight names?
+        int matched = 0, unmatched = 0;
+        foreach (var initName in graph.Initializers.Keys)
+        {
+            if (weights.ContainsKey(initName)) matched++;
+            else { unmatched++; if (unmatched <= 3) Console.WriteLine($"[PipelineTest] Missing weight: {initName}"); }
+        }
+        Console.WriteLine($"[PipelineTest] Initializers: {matched} matched, {unmatched} missing");
+
+        var session = InferenceSession.Create(accelerator, graph, weights);
+        var pipeline = new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(session, accelerator);
+
+        Console.WriteLine($"[PipelineTest] {session}");
+
+        // Gradient test image
+        int w = 64, h = 64;
+        var pixels = new int[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                pixels[y * w + x] = (int)(x * 255f / w) | ((int)(y * 255f / h) << 8) | (128 << 16) | (0xFF << 24);
+
+        var results = await pipeline.ClassifyAsync(pixels, w, h, 10);
+
+        Console.WriteLine($"[PipelineTest] Top-10:");
+        foreach (var r in results)
+            Console.WriteLine($"  {r.Label} ({r.Confidence:P2}, class {r.ClassIndex})");
+
+        float topConf = results[0].Confidence;
+        float botConf = results[^1].Confidence;
+        float ratio = topConf / Math.Max(botConf, 1e-10f);
+        Console.WriteLine($"[PipelineTest] Top/bottom ratio: {ratio:F1}x");
+
+        if (ratio < 1.5f)
+            throw new Exception($"Output uniform: top={topConf:P3}, bot={botConf:P3}, ratio={ratio:F1}x");
+    }
+
     private static float HalfToFloat(ushort h)
     {
         int sign = (h >> 15) & 1;
