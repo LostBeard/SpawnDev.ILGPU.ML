@@ -1,0 +1,93 @@
+using ILGPU;
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
+
+namespace SpawnDev.ILGPU.ML.Operators;
+
+/// <summary>
+/// Registry of ONNX operator implementations.
+/// Automatically registers all built-in operators on construction.
+/// Custom operators can be added via Register().
+/// </summary>
+public class OperatorRegistry
+{
+    private readonly Dictionary<string, IOnnxOperator> _ops = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Accelerator _accelerator;
+
+    // Kernel instances (shared across operators)
+    public MatMulKernel MatMul { get; }
+    public LayerNormKernel LayerNorm { get; }
+    public SoftmaxKernel Softmax { get; }
+    public ElementWiseKernels ElementWise { get; }
+    public Conv2DKernel Conv2D { get; }
+    public ActivationKernels Activations { get; }
+    public ReductionKernels Reductions { get; }
+    public PoolingKernels Pooling { get; }
+    public NormalizationKernels Normalization { get; }
+    public TransposeKernel Transpose { get; }
+    public GatherKernel Gather { get; }
+
+    public OperatorRegistry(Accelerator accelerator)
+    {
+        _accelerator = accelerator;
+
+        // Create kernel instances
+        MatMul = new MatMulKernel(accelerator);
+        LayerNorm = new LayerNormKernel(accelerator);
+        Softmax = new SoftmaxKernel(accelerator);
+        ElementWise = new ElementWiseKernels(accelerator);
+        Conv2D = new Conv2DKernel(accelerator);
+        Activations = new ActivationKernels(accelerator);
+        Reductions = new ReductionKernels(accelerator);
+        Pooling = new PoolingKernels(accelerator);
+        Normalization = new NormalizationKernels(accelerator);
+        Transpose = new TransposeKernel(accelerator);
+        Gather = new GatherKernel(accelerator);
+
+        // Register built-in operators
+        RegisterBuiltins();
+    }
+
+    public void Register(IOnnxOperator op) => _ops[op.OpType] = op;
+
+    public IOnnxOperator Resolve(string opType)
+        => _ops.TryGetValue(opType, out var op) ? op
+           : throw new NotSupportedException($"Unsupported ONNX operator: {opType}");
+
+    public bool IsSupported(string opType) => _ops.ContainsKey(opType);
+
+    public IReadOnlyList<string> SupportedOps => _ops.Keys.ToList();
+
+    private void RegisterBuiltins()
+    {
+        // Tier 1: Essential ops
+        Register(new MatMulOperator(this));
+        Register(new ReluOperator(this));
+        Register(new GeluOperator(this));
+        Register(new AddOperator(this));
+        Register(new MulOperator(this));
+        Register(new SubOperator(this));
+        Register(new ReshapeOperator());
+        Register(new TransposeOperator(this));
+        Register(new SoftmaxOperator(this));
+        Register(new LayerNormOperator(this));
+        Register(new UnsqueezeOperator());
+        Register(new SqueezeOperator());
+        Register(new FlattenOperator());
+        Register(new ConcatOperator(this));
+        Register(new GatherOperator(this));
+        Register(new ClipOperator(this));
+
+        // Tier 2: Common ops
+        Register(new SigmoidOperator(this));
+        Register(new TanhOperator(this));
+        Register(new BatchNormOperator(this));
+        Register(new GlobalAvgPoolOperator(this));
+        Register(new ReduceMeanOperator(this));
+        Register(new ReduceSumOperator(this));
+        Register(new SqrtOperator(this));
+        Register(new ExpOperator(this));
+        Register(new NegOperator(this));
+        Register(new DivOperator(this));
+    }
+}
