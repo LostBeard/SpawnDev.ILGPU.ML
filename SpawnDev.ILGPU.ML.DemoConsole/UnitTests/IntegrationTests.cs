@@ -382,6 +382,77 @@ public class IntegrationTests
         if (sample.Any(v => float.IsNaN(v))) throw new Exception("Output has NaN");
     }
 
+    /// <summary>
+    /// Full ClassificationPipeline test: load model, create pipeline, classify test image.
+    /// Uses a solid blue test image — won't get correct label but verifies the full pipeline runs.
+    /// </summary>
+    [TestMethod]
+    public async Task ClassificationPipeline_FullEndToEnd()
+    {
+        var modelsDir = FindModelsDir();
+        var modelDir = Path.Combine(modelsDir, "squeezenet"); // SqueezeNet is simpler
+        var graphPath = Path.Combine(modelDir, "model_graph.json");
+        var manifestPath = Path.Combine(modelDir, "manifest_fp16.json");
+        var weightsPath = Path.Combine(modelDir, "weights_fp16.bin");
+
+        if (!File.Exists(graphPath)) throw new UnsupportedTestException("Model not found");
+
+        var graph = ModelGraph.FromJson(await File.ReadAllTextAsync(graphPath));
+
+        using var context = MLContext.CreateContext();
+        using var accelerator = context.CreateCPUAccelerator(0);
+
+        // Load weights
+        var manifest = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(
+            await File.ReadAllTextAsync(manifestPath))!;
+        var blob = await File.ReadAllBytesAsync(weightsPath);
+
+        using var pool = new BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensor>();
+        foreach (var (name, info) in manifest)
+        {
+            var offset = info.GetProperty("offset").GetInt32();
+            var shape = info.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var elements = info.GetProperty("elements").GetInt32();
+            var fp32 = new float[elements];
+            for (int i = 0; i < elements; i++)
+            {
+                ushort fp16 = (ushort)(blob[offset + i * 2] | (blob[offset + i * 2 + 1] << 8));
+                fp32[i] = HalfToFloat(fp16);
+            }
+            weights[name] = pool.AllocatePermanent(fp32, shape, name);
+        }
+
+        // Create session + pipeline
+        var session = InferenceSession.Create(accelerator, graph, weights);
+        var pipeline = new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(session, accelerator);
+
+        Console.WriteLine($"[Pipeline] Model: {session}");
+
+        // Create a solid blue test image (64x64 RGBA)
+        int w = 64, h = 64;
+        var pixels = new int[w * h];
+        for (int i = 0; i < pixels.Length; i++)
+            pixels[i] = 0x00 | (0x00 << 8) | (0xFF << 16) | (0xFF << 24); // Blue + Alpha
+
+        // Classify
+        Console.WriteLine("[Pipeline] Running classification...");
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var results = await pipeline.ClassifyAsync(pixels, w, h);
+        sw.Stop();
+        Console.WriteLine($"[Pipeline] Done in {sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        // Verify results
+        if (results.Length != 5) throw new Exception($"Expected 5 results, got {results.Length}");
+        if (results[0].Confidence <= 0) throw new Exception("Top confidence is 0");
+        if (string.IsNullOrEmpty(results[0].Label)) throw new Exception("Top label is empty");
+
+        float totalProb = results.Sum(r => r.Confidence);
+        Console.WriteLine($"[Pipeline] Top-5 (sum={totalProb:P1}):");
+        foreach (var r in results)
+            Console.WriteLine($"  {r.Label}: {r.Confidence:P2} (class {r.ClassIndex})");
+    }
+
     private static float HalfToFloat(ushort h)
     {
         int sign = (h >> 15) & 1;
