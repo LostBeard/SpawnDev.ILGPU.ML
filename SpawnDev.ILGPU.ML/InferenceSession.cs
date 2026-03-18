@@ -39,6 +39,18 @@ public class InferenceSession : IDisposable
     /// <summary>Number of supported ONNX operators.</summary>
     public int SupportedOpCount => _registry.SupportedOps.Count;
 
+    /// <summary>Number of nodes in the compiled graph.</summary>
+    public int NodeCount => _compiled.Nodes.Length;
+
+    /// <summary>Number of weight tensors loaded.</summary>
+    public int WeightCount => _weights.Count;
+
+    /// <summary>Distinct operator types used in this model.</summary>
+    public string[] OperatorTypes => _compiled.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s).ToArray();
+
+    /// <summary>Model name (from graph metadata).</summary>
+    public string ModelName { get; private set; } = "";
+
     private InferenceSession(Accelerator accelerator, OperatorRegistry registry,
         CompiledGraph compiled, GraphExecutor executor, BufferPool pool,
         Dictionary<string, Tensor> weights)
@@ -96,7 +108,10 @@ public class InferenceSession : IDisposable
         // Create executor
         var executor = new GraphExecutor(accelerator, compiled, weights);
 
-        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights);
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
+        {
+            ModelName = modelGraph.Name
+        };
     }
 
     /// <summary>
@@ -111,7 +126,10 @@ public class InferenceSession : IDisposable
         var compiled = compiler.Compile(graph);
         var pool = new BufferPool(accelerator);
         var executor = new GraphExecutor(accelerator, compiled, weights);
-        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights);
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
+        {
+            ModelName = graph.Name
+        };
     }
 
     /// <summary>Run inference with named input tensors. Returns named output tensors.</summary>
@@ -123,6 +141,14 @@ public class InferenceSession : IDisposable
     {
         var outputs = _executor.Run(new Dictionary<string, Tensor> { [inputName] = input });
         return outputs.Values.First();
+    }
+
+    /// <summary>Summary string for logging/display.</summary>
+    public override string ToString()
+    {
+        var inShape = InputShapes.Count > 0 ? $"[{string.Join(",", InputShapes.Values.First())}]" : "?";
+        var outShape = OutputShapes.Count > 0 ? $"[{string.Join(",", OutputShapes.Values.First())}]" : "?";
+        return $"{ModelName}: {NodeCount} nodes, {WeightCount} weights, {string.Join("+", OperatorTypes)}, input={inShape} output={outShape}";
     }
 
     public void Dispose()
