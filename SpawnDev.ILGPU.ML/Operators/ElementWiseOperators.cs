@@ -223,6 +223,78 @@ public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Expand";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Dynamic — depends on shape input
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Simple case: if input and output have same element count, just copy
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+            Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount), 1f);
+    }
+}
+
+public class EqualOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Equal";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Output 1.0 where equal, 0.0 where not — needs a kernel
+        // For now, placeholder
+        throw new NotSupportedException("Equal not yet implemented");
+    }
+}
+
+public class GreaterOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Greater";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Greater not yet implemented");
+    }
+}
+
+public class LessOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Less";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Less not yet implemented");
+    }
+}
+
+public class HardSigmoidOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "HardSigmoid";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        reg.Activations.HardSigmoidInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+    }
+}
+
+public class HardSwishOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "HardSwish";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        reg.Activations.HardSwishInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+    }
+}
+
 /// <summary>Dropout: no-op at inference (pass-through).</summary>
 public class DropoutOperator(OperatorRegistry reg) : IOnnxOperator
 {

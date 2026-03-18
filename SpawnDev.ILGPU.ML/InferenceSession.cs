@@ -74,14 +74,22 @@ public class InferenceSession : IDisposable
         var compiled = compiler.Compile(modelGraph);
 
         // Create weight tensors from WeightLoader
+        // Include both compiled initializer names AND all graph initializers
+        // (Constant node outputs are stored as initializers by the extraction script)
         var pool = new BufferPool(accelerator);
         var weights = new Dictionary<string, Tensor>();
-        foreach (var name in compiled.InitializerNames)
+        var allInitNames = new HashSet<string>(compiled.InitializerNames);
+        foreach (var name in modelGraph.Initializers.Keys)
+            allInitNames.Add(name);
+
+        int loadedCount = 0;
+        foreach (var name in allInitNames)
         {
             var view = weightLoader.TryGetView(name);
             if (view != null && weightLoader.Shapes.TryGetValue(name, out var shape))
             {
                 weights[name] = new Tensor(view.Value, shape, name);
+                loadedCount++;
             }
         }
 

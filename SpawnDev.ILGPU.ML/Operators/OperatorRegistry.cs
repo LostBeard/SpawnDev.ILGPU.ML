@@ -111,11 +111,19 @@ public class OperatorRegistry
         Register(new LogOperator(this));
         Register(new MinOperator(this));
         Register(new MaxOnnxOperator(this));
+        Register(new ReduceMaxOperator(this));
+        Register(new ReduceMinOperator(this));
         Register(new CastOperator(this));
         Register(new FloorOperator(this));
         Register(new UpsampleOperator(this));
         Register(new ShapeOperator());
         Register(new SiLUOperator(this));
         Register(new LeakyReluOperator(this));
+        Register(new ExpandOperator(this));
+        Register(new EqualOperator(this));
+        Register(new GreaterOperator(this));
+        Register(new LessOperator(this));
+        Register(new HardSigmoidOperator(this));
+        Register(new HardSwishOperator(this));
     }
 }

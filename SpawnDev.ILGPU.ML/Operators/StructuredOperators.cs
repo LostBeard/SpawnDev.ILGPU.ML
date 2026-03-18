@@ -214,6 +214,42 @@ public class ReduceSumOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── ReduceMax / ReduceMin ──
+
+public class ReduceMaxOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ReduceMax";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
+    public void Execute(OnnxOpContext ctx)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        var axes = ctx.GetLongs("axes");
+        int axis = axes.Length > 0 ? (int)(axes[0] < 0 ? axes[0] + shape.Length : axes[0]) : shape.Length - 1;
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
+        int reduce = shape[axis];
+        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        reg.Reductions.ReduceMax(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
+    }
+}
+
+public class ReduceMinOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ReduceMin";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new ReduceMeanOperator(reg).InferOutputShapes(inputs, attrs);
+    public void Execute(OnnxOpContext ctx)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        var axes = ctx.GetLongs("axes");
+        int axis = axes.Length > 0 ? (int)(axes[0] < 0 ? axes[0] + shape.Length : axes[0]) : shape.Length - 1;
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
+        int reduce = shape[axis];
+        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        reg.Reductions.ReduceMin(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
+    }
+}
+
 // ── Gather ──
 
 public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
