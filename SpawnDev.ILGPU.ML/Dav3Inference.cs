@@ -22,7 +22,8 @@ namespace SpawnDev.ILGPU.ML;
 public class Dav3Inference
 {
     private const int C = 384;       // Embedding dimension
-    private const int T = 1369;      // 37×37 patches
+    private const int T = 1369;      // 37×37 patches (spatial tokens only)
+    private const int T_FULL = 1370; // T + 1 CLS token (what the backbone actually processes)
     private const int INPUT_SIZE = 518;
     private const int PATCH_SIZE = 14;
     private const int GRID_SIZE = 37; // 518 / 14 = 37
@@ -83,13 +84,13 @@ public class Dav3Inference
         for (int i = 0; i < 12; i++)
             _blockWeights[i] = TransformerBlock.ResolveWeights(_weights, i);
 
-        // Allocate persistent buffers
+        // Allocate persistent buffers — backbone processes T_FULL tokens (CLS + patches)
         _patchEmbedOut = _accelerator.Allocate1D<float>(C * GRID_SIZE * GRID_SIZE);
-        _tokenBuf1 = _accelerator.Allocate1D<float>(T * C);
-        _tokenBuf2 = _accelerator.Allocate1D<float>(T * C);
-        _tmpBuffers = new TransformerBlock.TempBuffers(_accelerator, T);
+        _tokenBuf1 = _accelerator.Allocate1D<float>(T_FULL * C);
+        _tokenBuf2 = _accelerator.Allocate1D<float>(T_FULL * C);
+        _tmpBuffers = new TransformerBlock.TempBuffers(_accelerator, T_FULL);
 
-        // Saved block outputs for DPT head (blocks 4-11)
+        // Saved block outputs for DPT head (blocks 4-11) — patches only, no CLS
         _blockOutputs = new MemoryBuffer1D<float, Stride1D.Dense>[12];
         for (int i = 4; i < 12; i++)
             _blockOutputs[i] = _accelerator.Allocate1D<float>(T * C);
@@ -102,9 +103,9 @@ public class Dav3Inference
     }
 
     /// <summary>
-    /// Run the full backbone: patch embed → position embed → 12 transformer blocks.
+    /// Run the full backbone: patch embed → position embed → prepend CLS → 12 transformer blocks.
     /// Input: preprocessed NCHW float [3, 518, 518] on GPU.
-    /// Returns: token features [T, C] = [1369, 384] on GPU.
+    /// Returns: token features [T_FULL, C] = [1370, 384] on GPU (CLS at index 0, patches at 1-1369).
     /// </summary>
     public ArrayView1D<float, Stride1D.Dense> RunBackbone(ArrayView1D<float, Stride1D.Dense> input)
     {
@@ -112,7 +113,6 @@ public class Dav3Inference
             throw new InvalidOperationException("Call Initialize() first.");
 
         // Step 1: Patch embedding — Conv2D 14×14 stride 14
-        // Input: [3, 518, 518], Weight: [384, 3, 14, 14], Output: [384, 37, 37]
         var patchWeight = _weights.GetView("backbone.pretrained.patch_embed.proj.weight");
         var patchBias = _weights.GetView("backbone.pretrained.patch_embed.proj.bias");
         _conv2d.Forward(input, patchWeight, patchBias, _patchEmbedOut!.View,
@@ -121,36 +121,39 @@ public class Dav3Inference
             stride: PATCH_SIZE, padding: 0);
 
         // Step 2: Reshape [384, 37, 37] → [1369, 384] (transpose: CHW → HW×C)
-        // The patch embed output is [C, H, W]. We need [H*W, C] for the transformer.
-        // Use TransposeLastTwo to go from [1, 384, 1369] → [1, 1369, 384]
-        _elementWise.TransposeLastTwo(_patchEmbedOut!.View, _tokenBuf1!.View, 1, C, T);
+        // Write patches to _tokenBuf1 starting at offset C (leave room for CLS at position 0)
+        _elementWise.TransposeLastTwo(_patchEmbedOut!.View, _tokenBuf1!.View.SubView(C, T * C), 1, C, T);
 
-        // Step 3: Add position embedding
-        // DAv3 stores position embedding as [1, 384, 37, 37] transposed output
+        // Step 3: Add position embedding to PATCHES only (positions 1-1369, not CLS)
         var posEmbed = _weights.TryGetView("/backbone/Transpose_output_0");
         if (posEmbed != null)
         {
-            // Position embedding is [1, 384, 37, 37] = [384, 1369] after flatten
-            // Need to transpose [384, 1369] → [1369, 384] then add
-            _elementWise.TransposeLastTwo(posEmbed.Value, _tokenBuf2!.View, 1, C, T);
-            _elementWise.AddInPlace(_tokenBuf1!.View, _tokenBuf2!.View, T * C);
+            _elementWise.TransposeLastTwo(posEmbed.Value, _tokenBuf2!.View.SubView(0, T * C), 1, C, T);
+            _elementWise.AddInPlace(_tokenBuf1!.View.SubView(C, T * C), _tokenBuf2!.View.SubView(0, T * C), T * C);
         }
 
-        // Step 4: Run 12 transformer blocks, saving outputs 4-11 for DPT head
-        // Zero block output buffers first so AddInPlace acts as a copy (supports repeated calls)
+        // Step 4: Prepend CLS token at position 0
+        // Zero position 0, then add cls_token weight
+        _elementWise.ScaleInPlace(_tokenBuf1!.View.SubView(0, C), C, 0f);
+        var clsToken = _weights.GetView("backbone.pretrained.cls_token");
+        _elementWise.AddInPlace(_tokenBuf1!.View.SubView(0, C), clsToken.SubView(0, C), C);
+        // _tokenBuf1 now has [CLS, patch1, patch2, ..., patch1369] = [1370, 384]
+
+        // Step 5: Run 12 transformer blocks with T_FULL=1370 tokens
+        // Zero block output buffers (patches only, T=1369)
         for (int i = 4; i < 12; i++)
             _elementWise.ScaleInPlace(_blockOutputs![i].View, T * C, 0f);
 
-        var currentIn = _tokenBuf1!.View;
-        var currentOut = _tokenBuf2!.View;
+        var currentIn = _tokenBuf1!.View.SubView(0, T_FULL * C);
+        var currentOut = _tokenBuf2!.View.SubView(0, T_FULL * C);
 
         for (int b = 0; b < 12; b++)
         {
-            _transformer.Forward(currentIn, currentOut, _blockWeights[b], T, _tmpBuffers);
+            _transformer.Forward(currentIn, currentOut, _blockWeights[b], T_FULL, _tmpBuffers);
 
-            // Save block output for DPT head (blocks 4-11)
+            // Save block output for DPT head (blocks 4-11) — patches only, skip CLS at index 0
             if (b >= 4 && _blockOutputs != null && _blockOutputs[b] != null)
-                _elementWise.AddInPlace(_blockOutputs![b].View, currentOut, T * C);
+                _elementWise.AddInPlace(_blockOutputs![b].View, currentOut.SubView(C, T * C), T * C);
 
             (currentIn, currentOut) = (currentOut, currentIn);
         }

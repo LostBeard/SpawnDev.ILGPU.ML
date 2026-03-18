@@ -28,6 +28,7 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleACKernel;
 
     public ElementWiseKernels(WebGPUAccelerator accelerator) => _accelerator = accelerator;
 
@@ -195,9 +196,7 @@ public class ElementWiseKernels
     }
 
     /// <summary>
-    /// Bilinear upsample: [C, inH, inW] → [C, outH, outW].
-    /// Each output thread samples from the input using bilinear interpolation.
-    /// Scale = outH / inH (independently per axis).
+    /// Bilinear upsample: [C, inH, inW] → [C, outH, outW]. Align-corners=false.
     /// </summary>
     private static void BilinearUpsampleImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -209,29 +208,50 @@ public class ElementWiseKernels
         int oy = rem % outH;
         int c = rem / outH;
 
-        // Map output coord to input coord (align corners = false)
         float fy = ((oy + 0.5f) * inH / outH) - 0.5f;
         float fx = ((ox + 0.5f) * inW / outW) - 0.5f;
 
         int y0 = (int)fy; int y1 = y0 + 1;
         int x0 = (int)fx; int x1 = x0 + 1;
-
-        float ty = fy - y0;
-        float tx = fx - x0;
-
+        float ty = fy - y0; float tx = fx - x0;
         if (y0 < 0) y0 = 0; if (y1 >= inH) y1 = inH - 1;
         if (x0 < 0) x0 = 0; if (x1 >= inW) x1 = inW - 1;
 
         int b = c * inH * inW;
-        float v00 = input[b + y0 * inW + x0];
-        float v01 = input[b + y0 * inW + x1];
-        float v10 = input[b + y1 * inW + x0];
-        float v11 = input[b + y1 * inW + x1];
+        float v00 = input[b + y0 * inW + x0]; float v01 = input[b + y0 * inW + x1];
+        float v10 = input[b + y1 * inW + x0]; float v11 = input[b + y1 * inW + x1];
+        output[idx] = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
+                    + v10 * ty * (1f - tx) + v11 * ty * tx;
+    }
 
-        output[idx] = v00 * (1f - ty) * (1f - tx)
-                    + v01 * (1f - ty) * tx
-                    + v10 * ty * (1f - tx)
-                    + v11 * ty * tx;
+    /// <summary>
+    /// Bilinear upsample: [C, inH, inW] → [C, outH, outW]. Align-corners=true.
+    /// Matches ONNX Resize with coordinate_transformation_mode=align_corners.
+    /// </summary>
+    private static void BilinearUpsampleACImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int outH, int outW)
+    {
+        int ox = idx % outW;
+        int rem = idx / outW;
+        int oy = rem % outH;
+        int c = rem / outH;
+
+        float fy = (outH > 1) ? (float)oy * (inH - 1) / (outH - 1) : 0f;
+        float fx = (outW > 1) ? (float)ox * (inW - 1) / (outW - 1) : 0f;
+
+        int y0 = (int)fy; int y1 = y0 + 1;
+        int x0 = (int)fx; int x1 = x0 + 1;
+        float ty = fy - y0; float tx = fx - x0;
+        if (y1 >= inH) y1 = inH - 1;
+        if (x1 >= inW) x1 = inW - 1;
+
+        int b = c * inH * inW;
+        float v00 = input[b + y0 * inW + x0]; float v01 = input[b + y0 * inW + x1];
+        float v10 = input[b + y1 * inW + x0]; float v11 = input[b + y1 * inW + x1];
+        output[idx] = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
+                    + v10 * ty * (1f - tx) + v11 * ty * tx;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -348,6 +368,19 @@ public class ElementWiseKernels
         _bilinearUpsampleKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
     }
 
+    /// <summary>
+    /// Bilinear upsample [C, inH, inW] → [C, outH, outW]. Align-corners=true.
+    /// Matches ONNX Resize with coordinate_transformation_mode=align_corners.
+    /// </summary>
+    public void BilinearUpsampleAlignCorners(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int outH, int outW)
+    {
+        EnsureLoaded();
+        _bilinearUpsampleACKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
+    }
+
     /// <summary>In-place add: data[i] += other[i]. Two separate buffers required.</summary>
     public void AddInPlace(ArrayView1D<float, Stride1D.Dense> data,
         ArrayView1D<float, Stride1D.Dense> other, int count)
@@ -395,6 +428,9 @@ public class ElementWiseKernels
         _bilinearUpsampleKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int, int>(BilinearUpsampleImpl);
+        _bilinearUpsampleACKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int>(BilinearUpsampleACImpl);
     }
 
     /// <summary>Validate GELU against CPU reference.</summary>

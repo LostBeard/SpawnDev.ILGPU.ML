@@ -71,9 +71,9 @@ public class DptHead : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _oc21Out; // [32, 296, 296]  after 2× bilinear
     private MemoryBuffer1D<float, Stride1D.Dense>? _depthOut; // [2, 296, 296]
 
-    // Output spatial size
-    public const int OutputH = 296;
-    public const int OutputW = 296;
+    // Output spatial size — matches ONNX graph (resize 148→518 before output_conv2)
+    public const int OutputH = 518;
+    public const int OutputW = 518;
 
     public DptHead(WebGPUAccelerator accelerator, Conv2DKernel conv2d,
         ConvTranspose2DKernel convTranspose,
@@ -114,13 +114,11 @@ public class DptHead : IDisposable
         _refineTemp  = _accelerator.Allocate1D<float>(64 * H0 * H0);
         _upsampleBuf = _accelerator.Allocate1D<float>(64 * H0 * H0); // upsample scratch
 
-        // Output conv buffers at H0=148
-        _oc1Out  = _accelerator.Allocate1D<float>(32 * H0 * H0);
-        _oc2Out  = _accelerator.Allocate1D<float>(32 * H0 * H0);
-
-        // output_conv2.1 bilinear 2×: 148→296
-        _oc21Out  = _accelerator.Allocate1D<float>(32 * OutputH * OutputW);
-        _depthOut = _accelerator.Allocate1D<float>(2 * OutputH * OutputW);
+        // Output conv buffers
+        _oc1Out  = _accelerator.Allocate1D<float>(32 * H0 * H0);          // output_conv1 at 148×148
+        _oc21Out = _accelerator.Allocate1D<float>(32 * OutputH * OutputW); // after resize 148→518
+        _oc2Out  = _accelerator.Allocate1D<float>(32 * OutputH * OutputW); // output_conv2.0 at 518×518
+        _depthOut = _accelerator.Allocate1D<float>(2 * OutputH * OutputW); // output_conv2.2 at 518×518
     }
 
     /// <summary>
@@ -161,6 +159,11 @@ public class DptHead : IDisposable
         var normGamma = weights.GetView("head.norm.weight");
         var normBeta  = weights.GetView("head.norm.bias");
 
+        // backbone.pretrained.norm — applied to the second block of each pair before concat
+        // (ONNX graph: blocks 5,7,9,11 go through this 384-dim LayerNorm)
+        var bbNormGamma = weights.GetView("backbone.pretrained.norm.weight");
+        var bbNormBeta  = weights.GetView("backbone.pretrained.norm.bias");
+
         // ── Step 1: Per-level encode → resize → layer_rn ──────────────────────
         for (int level = 0; level < 4; level++)
         {
@@ -169,12 +172,17 @@ public class DptHead : IDisposable
             int pc = projC[level];
             int h  = spatialH[level];
 
-            // Concat [T, 384] + [T, 384] → [T, 768]
-            _elementWise.ConcatLastDim(blockOutputs[bA], blockOutputs[bB],
+            // Apply backbone.pretrained.norm to block B (second of pair)
+            // Use _normBuf as temp: norm blockB [T, 384] → first T*C elements of _normBuf
+            _layerNorm.Forward(blockOutputs[bB], _normBuf!.View, bbNormGamma, bbNormBeta,
+                rows: T, C: C);
+
+            // Concat [T, 384] (blockA raw) + [T, 384] (blockB normed) → [T, 768]
+            _elementWise.ConcatLastDim(blockOutputs[bA], _normBuf.View.SubView(0, T * C),
                 _concatBuf!.View, T, C);
 
-            // LayerNorm [T, 768]
-            _layerNorm.Forward(_concatBuf.View, _normBuf!.View, normGamma, normBeta,
+            // LayerNorm [T, 768] (head.norm — shared across all levels)
+            _layerNorm.Forward(_concatBuf.View, _normBuf.View, normGamma, normBeta,
                 rows: T, C: C_CONCAT);
 
             // Transpose [T, 768] → [768, GRID, GRID]
@@ -242,10 +250,12 @@ public class DptHead : IDisposable
             _refineTemp.View, refineC, H3, H3, refineC, 1, 1);
         // _refineTemp now holds refinenet4 output [64, 19, 19]
 
-        // RefineNet3: level 2 (H2=37). Upsample 19→37 then fuse.
-        _elementWise.BilinearUpsample(_refineTemp.View, _upsampleBuf!.View,
+        // RefineNet3: level 2 (H2=37).
+        // ONNX order: RCU1(skip) → fuse(prev + RCU1) → RCU2(fused) → out_conv
+        // Buffer strategy: upsample prev FIRST (reads _refineTemp), then RCU1 (uses _refineTemp as temp)
+        _elementWise.BilinearUpsampleAlignCorners(_refineTemp.View, _upsampleBuf!.View,
             refineC, H3, H3, H2, H2);
-        _elementWise.AddInPlace(_layerRnOutputs[2].View, _upsampleBuf.View, refineC * H2 * H2);
+        // _upsampleBuf = upsampled refinenet4 output [64, 37, 37]
 
         ResConfUnit(_layerRnOutputs[2].View, _refineBuf.View, _refineTemp.View,
             weights.GetView("head.scratch.refinenet3.resConfUnit1.conv1.weight"),
@@ -253,22 +263,28 @@ public class DptHead : IDisposable
             weights.GetView("head.scratch.refinenet3.resConfUnit1.conv2.weight"),
             weights.GetView("head.scratch.refinenet3.resConfUnit1.conv2.bias"),
             refineC, H2, H2);
+        // _refineBuf = RCU1(layer_rn[2])
+
+        _elementWise.AddInPlace(_refineBuf.View, _upsampleBuf.View, refineC * H2 * H2);
+        // _refineBuf = RCU1(skip) + upsampled_prev  (fused)
+
         ResConfUnit(_refineBuf.View, _layerRnOutputs[2].View, _refineTemp.View,
             weights.GetView("head.scratch.refinenet3.resConfUnit2.conv1.weight"),
             weights.GetView("head.scratch.refinenet3.resConfUnit2.conv1.bias"),
             weights.GetView("head.scratch.refinenet3.resConfUnit2.conv2.weight"),
             weights.GetView("head.scratch.refinenet3.resConfUnit2.conv2.bias"),
             refineC, H2, H2);
+        // _layerRnOutputs[2] = RCU2(fused)
+
         _conv2d.Forward(_layerRnOutputs[2].View,
             weights.GetView("head.scratch.refinenet3.out_conv.weight"),
             weights.GetView("head.scratch.refinenet3.out_conv.bias"),
             _refineTemp.View, refineC, H2, H2, refineC, 1, 1);
-        // _refineTemp now holds refinenet3 output [64, 37, 37]
+        // _refineTemp = refinenet3 output [64, 37, 37]
 
-        // RefineNet2: level 1 (H1=74). Upsample 37→74 then fuse.
-        _elementWise.BilinearUpsample(_refineTemp.View, _upsampleBuf.View,
+        // RefineNet2: level 1 (H1=74). Same order: upsample → RCU1(skip) → fuse → RCU2 → out_conv
+        _elementWise.BilinearUpsampleAlignCorners(_refineTemp.View, _upsampleBuf.View,
             refineC, H2, H2, H1, H1);
-        _elementWise.AddInPlace(_layerRnOutputs[1].View, _upsampleBuf.View, refineC * H1 * H1);
 
         ResConfUnit(_layerRnOutputs[1].View, _refineBuf.View, _refineTemp.View,
             weights.GetView("head.scratch.refinenet2.resConfUnit1.conv1.weight"),
@@ -276,22 +292,25 @@ public class DptHead : IDisposable
             weights.GetView("head.scratch.refinenet2.resConfUnit1.conv2.weight"),
             weights.GetView("head.scratch.refinenet2.resConfUnit1.conv2.bias"),
             refineC, H1, H1);
+
+        _elementWise.AddInPlace(_refineBuf.View, _upsampleBuf.View, refineC * H1 * H1);
+
         ResConfUnit(_refineBuf.View, _layerRnOutputs[1].View, _refineTemp.View,
             weights.GetView("head.scratch.refinenet2.resConfUnit2.conv1.weight"),
             weights.GetView("head.scratch.refinenet2.resConfUnit2.conv1.bias"),
             weights.GetView("head.scratch.refinenet2.resConfUnit2.conv2.weight"),
             weights.GetView("head.scratch.refinenet2.resConfUnit2.conv2.bias"),
             refineC, H1, H1);
+
         _conv2d.Forward(_layerRnOutputs[1].View,
             weights.GetView("head.scratch.refinenet2.out_conv.weight"),
             weights.GetView("head.scratch.refinenet2.out_conv.bias"),
             _refineTemp.View, refineC, H1, H1, refineC, 1, 1);
-        // _refineTemp now holds refinenet2 output [64, 74, 74]
+        // _refineTemp = refinenet2 output [64, 74, 74]
 
-        // RefineNet1: level 0 (H0=148). Upsample 74→148 then fuse.
-        _elementWise.BilinearUpsample(_refineTemp.View, _upsampleBuf.View,
+        // RefineNet1: level 0 (H0=148). Same order.
+        _elementWise.BilinearUpsampleAlignCorners(_refineTemp.View, _upsampleBuf.View,
             refineC, H1, H1, H0, H0);
-        _elementWise.AddInPlace(_layerRnOutputs[0].View, _upsampleBuf.View, refineC * H0 * H0);
 
         ResConfUnit(_layerRnOutputs[0].View, _refineBuf.View, _refineTemp.View,
             weights.GetView("head.scratch.refinenet1.resConfUnit1.conv1.weight"),
@@ -299,39 +318,42 @@ public class DptHead : IDisposable
             weights.GetView("head.scratch.refinenet1.resConfUnit1.conv2.weight"),
             weights.GetView("head.scratch.refinenet1.resConfUnit1.conv2.bias"),
             refineC, H0, H0);
+
+        _elementWise.AddInPlace(_refineBuf.View, _upsampleBuf.View, refineC * H0 * H0);
+
         ResConfUnit(_refineBuf.View, _layerRnOutputs[0].View, _refineTemp.View,
             weights.GetView("head.scratch.refinenet1.resConfUnit2.conv1.weight"),
             weights.GetView("head.scratch.refinenet1.resConfUnit2.conv1.bias"),
             weights.GetView("head.scratch.refinenet1.resConfUnit2.conv2.weight"),
             weights.GetView("head.scratch.refinenet1.resConfUnit2.conv2.bias"),
             refineC, H0, H0);
+
         _conv2d.Forward(_layerRnOutputs[0].View,
             weights.GetView("head.scratch.refinenet1.out_conv.weight"),
             weights.GetView("head.scratch.refinenet1.out_conv.bias"),
             _refineTemp.View, refineC, H0, H0, refineC, 1, 1);
-        // _refineTemp now holds refinenet1 output [64, 148, 148]
+        // _refineTemp = refinenet1 output [64, 148, 148]
 
         // ── Step 3: Output convolutions ───────────────────────────────────────
-        // output_conv1: [64→32, 3×3] + ReLU  (at 148×148)
+        // output_conv1: [64→32, 3×3] — NO ReLU (ONNX graph: Conv → Resize directly)
         _conv2d.Forward(_refineTemp.View,
             weights.GetView("head.scratch.output_conv1.weight"),
             weights.GetView("head.scratch.output_conv1.bias"),
             _oc1Out!.View, refineC, H0, H0, 32, 3, 3, 1, 1);
-        _elementWise.ReLUInPlace(_oc1Out.View, 32 * H0 * H0);
 
-        // output_conv2.0: [32→32, 3×3] + ReLU  (at 148×148)
-        _conv2d.Forward(_oc1Out.View,
-            weights.GetView("head.scratch.output_conv2.0.weight"),
-            weights.GetView("head.scratch.output_conv2.0.bias"),
-            _oc2Out!.View, 32, H0, H0, 32, 3, 3, 1, 1);
-        _elementWise.ReLUInPlace(_oc2Out.View, 32 * H0 * H0);
-
-        // output_conv2.1: bilinear 2×  148→296
-        _elementWise.BilinearUpsample(_oc2Out.View, _oc21Out!.View,
+        // Resize 148→518 (ONNX graph resizes to input resolution before output_conv2)
+        _elementWise.BilinearUpsampleAlignCorners(_oc1Out.View, _oc21Out!.View,
             32, H0, H0, OutputH, OutputW);
 
-        // output_conv2.2: [32→2, 1×1]  (at 296×296)
+        // output_conv2.0: [32→32, 3×3] + ReLU  (at 518×518)
         _conv2d.Forward(_oc21Out.View,
+            weights.GetView("head.scratch.output_conv2.0.weight"),
+            weights.GetView("head.scratch.output_conv2.0.bias"),
+            _oc2Out!.View, 32, OutputH, OutputW, 32, 3, 3, 1, 1);
+        _elementWise.ReLUInPlace(_oc2Out.View, 32 * OutputH * OutputW);
+
+        // output_conv2.2: [32→2, 1×1]  (at 518×518)
+        _conv2d.Forward(_oc2Out.View,
             weights.GetView("head.scratch.output_conv2.2.weight"),
             weights.GetView("head.scratch.output_conv2.2.bias"),
             _depthOut!.View, 32, OutputH, OutputW, 2, 1, 1);
