@@ -123,6 +123,9 @@ public class OperatorRegistry
         Register(new EqualOperator(this));
         Register(new GreaterOperator(this));
         Register(new LessOperator(this));
+        Register(new NotOperator(this));
+        Register(new ConstantOfShapeOperator(this));
+        Register(new RangeOperator());
         Register(new HardSigmoidOperator(this));
         Register(new HardSwishOperator(this));
     }

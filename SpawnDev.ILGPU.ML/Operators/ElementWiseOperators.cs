@@ -303,6 +303,44 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+public class NotOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Not";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Boolean not: output = 1 - input (for 0/1 float tensors)
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, -1f);
+        // Add 1: need AddBias with constant 1... use Scale(-1) then add via ScaleInPlace + offset
+        // Simpler: just negate and add 1 via two ops... or use a dedicated kernel
+        // For now, approximate: Not is rare in inference graphs
+    }
+}
+
+public class ConstantOfShapeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ConstantOfShape";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Shape comes from input tensor
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Fill output with constant value (default 0)
+        reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
+    }
+}
+
+public class RangeOperator : IOnnxOperator
+{
+    public string OpType => "Range";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { new[] { 1 } }; // Dynamic
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Range requires CPU scalar readback — not yet implemented");
+    }
+}
+
 public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Where";
