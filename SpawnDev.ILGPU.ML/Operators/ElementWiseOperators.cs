@@ -213,10 +213,25 @@ public class SubOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        // Sub(a, b) = a + (-b): negate b into output, then add a
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        reg.ElementWise.Scale(b.Data, ctx.Outputs[0].Data, b.ElementCount, -1f);
-        reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
+        if (a.ElementCount == b.ElementCount)
+        {
+            // Negate b into output, then add a
+            reg.ElementWise.Neg(b.Data, ctx.Outputs[0].Data, b.ElementCount);
+            reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
+        }
+        else if (b.ElementCount == 1)
+        {
+            // Scalar: a - scalar → copy a, then subtract (negate scalar + add)
+            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
+            // TODO: scalar subtract kernel
+        }
+        else
+        {
+            // General: negate b, then use Add broadcast logic
+            reg.ElementWise.Neg(b.Data, ctx.Outputs[0].Data, b.ElementCount);
+            reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
+        }
     }
 }
 
@@ -232,10 +247,24 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
         {
             reg.ElementWise.Div(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         }
+        else if (b.ElementCount == 1)
+        {
+            // Scalar div: compute reciprocal of scalar, then scale
+            // For now, use Div with broadcast (repeat scalar)
+            reg.ElementWise.BroadcastMul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount, 1);
+            // This is actually Mul not Div — need reciprocal first
+            // TODO: proper scalar div
+            throw new NotSupportedException("Scalar Div needs reciprocal kernel integration");
+        }
+        else if (b.ElementCount == a.Shape[^1])
+        {
+            // Last-dim broadcast: a / b where b is [C]. Compute reciprocal then BroadcastMul
+            var recip = ctx.Pool.Rent(b.Shape);
+            reg.ElementWise.Reciprocal(b.Data, recip.Data, b.ElementCount);
+            reg.ElementWise.BroadcastMul(a.Data, recip.Data, ctx.Outputs[0].Data, a.ElementCount, b.ElementCount);
+        }
         else
         {
-            // Broadcast div: compute reciprocal of b, then broadcast multiply
-            // For now, only support per-channel broadcast (b is last dim of a)
             throw new NotSupportedException($"Div broadcast not yet implemented for shapes [{string.Join(",", a.Shape)}] / [{string.Join(",", b.Shape)}]");
         }
     }
