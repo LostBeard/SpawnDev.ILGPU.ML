@@ -71,22 +71,27 @@ public partial class ClassifyPage : IDisposable
 
         try
         {
-            // Decode image bytes to RGBA using #2's MediaInterop
-            var mediaInterop = new SpawnDev.ILGPU.ML.Preprocessing.MediaInterop(JS);
-            using var uint8 = new SpawnDev.BlazorJS.JSObjects.Uint8Array(imageBytes);
+            // Decode image file bytes → RGBA int[] using browser native decoding
             using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
-                new SpawnDev.BlazorJS.JSObjects.BlobPart[] { uint8 });
-            var (pixels, w, h) = await mediaInterop.FromBlobAsync(blob);
+                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
 
-            // Pack RGBA bytes → int[] (packed uint32: R | G<<8 | B<<16 | A<<24)
-            _rgbaPixels = new int[w * h];
-            for (int i = 0; i < w * h; i++)
-                _rgbaPixels[i] = pixels[i * 4] | (pixels[i * 4 + 1] << 8)
-                    | (pixels[i * 4 + 2] << 16) | (pixels[i * 4 + 3] << 24);
+            int w = (int)bitmap.Width;
+            int h = (int)bitmap.Height;
+
+            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w;
+            canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            _rgbaPixels = data.Read<int>(); // Each int = one packed RGBA pixel
             _imageWidth = w;
             _imageHeight = h;
 
-            Console.WriteLine($"[Classify] Decoded: {w}x{h}");
+            Console.WriteLine($"[Classify] Decoded: {w}x{h}, {_rgbaPixels.Length} pixels");
 
             if (_isModelLoaded)
                 await RunInference();

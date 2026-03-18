@@ -104,5 +104,6 @@ public class OperatorRegistry
         Register(new SplitOperator());
         Register(new SliceOperator());
         Register(new DropoutOperator(this));
+        Register(new GemmOperator(this));
     }
 }

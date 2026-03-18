@@ -292,6 +292,42 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── Gemm (General Matrix Multiply) ──
+
+public class GemmOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Gemm";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        int transA = attrs.ContainsKey("transA") ? Convert.ToInt32(attrs["transA"]) : 0;
+        int transB = attrs.ContainsKey("transB") ? Convert.ToInt32(attrs["transB"]) : 0;
+        int M = transA != 0 ? inputs[0][1] : inputs[0][0];
+        int N = transB != 0 ? inputs[1][0] : inputs[1][1];
+        return new[] { new[] { M, N } };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        float alpha = ctx.GetFloat("alpha", 1f);
+        float beta = ctx.GetFloat("beta", 1f);
+        int transB = ctx.GetInt("transB", 0);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        int M = a.Shape[0]; int K = a.Shape[1];
+        int N = transB != 0 ? b.Shape[0] : b.Shape[1];
+
+        // TODO: handle transA/transB via Transpose kernel
+        if (ctx.GetInt("transA", 0) != 0 || transB != 0)
+            throw new NotSupportedException("Gemm with transA/transB not yet implemented");
+
+        reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
+
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null && beta != 0f)
+            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[2].Data, M * N, N);
+
+        if (alpha != 1f)
+            reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, M * N, alpha);
+    }
+}
+
 // ── MaxPool ──
 
 public class MaxPoolOperator(OperatorRegistry reg) : IOnnxOperator
