@@ -15,6 +15,12 @@ public abstract partial class MLTestBase : IDisposable
     protected abstract Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync();
     protected abstract string BackendName { get; }
 
+    /// <summary>
+    /// HttpClient for loading models via HTTP. Browser subclasses inject from DI.
+    /// Desktop subclasses can provide a file-based HttpClient or leave null.
+    /// </summary>
+    protected virtual System.Net.Http.HttpClient? GetHttpClient() => null;
+
     private Context? _cachedContext;
     private Accelerator? _cachedAccelerator;
 
