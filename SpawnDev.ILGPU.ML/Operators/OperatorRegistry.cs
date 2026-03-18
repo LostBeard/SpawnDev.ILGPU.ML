@@ -26,6 +26,7 @@ public class OperatorRegistry
     public NormalizationKernels Normalization { get; }
     public TransposeKernel Transpose { get; }
     public GatherKernel Gather { get; }
+    public PadKernel Pad { get; }
 
     public OperatorRegistry(Accelerator accelerator)
     {
@@ -43,6 +44,7 @@ public class OperatorRegistry
         Normalization = new NormalizationKernels(accelerator);
         Transpose = new TransposeKernel(accelerator);
         Gather = new GatherKernel(accelerator);
+        Pad = new PadKernel(accelerator);
 
         // Register built-in operators
         RegisterBuiltins();
@@ -94,5 +96,12 @@ public class OperatorRegistry
         Register(new PowOperator(this));
         Register(new WhereOperator(this));
         Register(new ReciprocalOperator(this));
+        Register(new MaxPoolOperator(this));
+        Register(new AveragePoolOperator(this));
+        Register(new ResizeOperator(this));
+        Register(new PadOperator(this));
+        Register(new ConvOperator(this));
+        Register(new SplitOperator());
+        Register(new SliceOperator());
     }
 }

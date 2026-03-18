@@ -257,6 +257,113 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── MaxPool ──
+
+public class MaxPoolOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "MaxPool";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var x = inputs[0];
+        var kernelShape = attrs.ContainsKey("kernel_shape") ? ((long[])attrs["kernel_shape"]).Select(k => (int)k).ToArray() : new[] { 2, 2 };
+        var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
+        var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[4];
+        int outH = (x[2] + pads[0] + pads[2] - kernelShape[0]) / strides[0] + 1;
+        int outW = (x[3] + pads[1] + pads[3] - kernelShape[1]) / strides[1] + 1;
+        return new[] { new[] { x[0], x[1], outH, outW } };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0];
+        var ks = ctx.GetInts("kernel_shape"); int kH = ks.Length > 0 ? ks[0] : 2; int kW = ks.Length > 1 ? ks[1] : kH;
+        var st = ctx.GetInts("strides"); int sH = st.Length > 0 ? st[0] : 1; int sW = st.Length > 1 ? st[1] : sH;
+        var pa = ctx.GetInts("pads"); int pH = pa.Length > 0 ? pa[0] : 0; int pW = pa.Length > 1 ? pa[1] : 0;
+        reg.Pooling.MaxPool2D(x.Data, ctx.Outputs[0].Data, x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3], kH, kW, sH, sW, pH, pW);
+    }
+}
+
+// ── AveragePool ──
+
+public class AveragePoolOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "AveragePool";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new MaxPoolOperator(reg).InferOutputShapes(inputs, attrs);
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0];
+        var ks = ctx.GetInts("kernel_shape"); int kH = ks[0]; int kW = ks.Length > 1 ? ks[1] : kH;
+        var st = ctx.GetInts("strides"); int sH = st.Length > 0 ? st[0] : 1; int sW = st.Length > 1 ? st[1] : sH;
+        var pa = ctx.GetInts("pads"); int pH = pa.Length > 0 ? pa[0] : 0; int pW = pa.Length > 1 ? pa[1] : 0;
+        reg.Pooling.AvgPool2D(x.Data, ctx.Outputs[0].Data, x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3], kH, kW, sH, sW, pH, pW);
+    }
+}
+
+// ── Resize ──
+
+public class ResizeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Resize";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Requires sizes input — resolved at runtime
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Simplified: NCHW bilinear resize using sizes from output shape
+        var inShape = ctx.Inputs[0].Shape;
+        var outShape = ctx.Outputs[0].Shape;
+        int C = inShape[0] * inShape[1]; // N*C for batch
+        int inH = inShape[2]; int inW = inShape[3];
+        int outH = outShape[2]; int outW = outShape[3];
+        // Use align_corners based on coordinate_transform_mode attribute
+        var mode = ctx.GetString("coordinate_transformation_mode", "half_pixel");
+        if (mode == "align_corners")
+            reg.ElementWise.BilinearUpsampleAlignCorners(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);
+        else
+            reg.ElementWise.BilinearUpsample(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);
+    }
+}
+
+// ── Pad ──
+
+public class PadOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Pad";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Requires pads input
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Pads come from inputs[1] (constant tensor) — need to read them
+        // For now, placeholder
+        throw new NotSupportedException("Pad operator requires int tensor input — not yet wired");
+    }
+}
+
+// ── Split ──
+
+public class SplitOperator : IOnnxOperator
+{
+    public string OpType => "Split";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Multiple outputs — simplified
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Split operator not yet implemented");
+    }
+}
+
+// ── Slice ──
+
+public class SliceOperator : IOnnxOperator
+{
+    public string OpType => "Slice";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        throw new NotSupportedException("Slice operator not yet implemented");
+    }
+}
+
 // ── Transpose ──
 
 public class TransposeOperator(OperatorRegistry reg) : IOnnxOperator
