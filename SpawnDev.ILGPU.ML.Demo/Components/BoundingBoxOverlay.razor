@@ -13,10 +13,7 @@
                       fill="none" stroke="@color" stroke-width="@StrokeWidth" rx="3" />
                 <rect x="@det.X" y="@(det.Y - 18)" width="@LabelWidth(det)" height="18"
                       fill="@color" rx="2" />
-                <text x="@(det.X + 4)" y="@(det.Y - 5)"
-                      fill="white" font-size="12" font-weight="600" font-family="sans-serif">
-                    @det.Label @((det.Confidence * 100).ToString("F0"))%
-                </text>
+                @((MarkupString)$"<text x=\"{det.X + 4}\" y=\"{det.Y - 5}\" fill=\"white\" font-size=\"12\" font-weight=\"600\" font-family=\"sans-serif\">{det.Label} {(det.Confidence * 100):F0}%</text>")
             }
         }
     </svg>

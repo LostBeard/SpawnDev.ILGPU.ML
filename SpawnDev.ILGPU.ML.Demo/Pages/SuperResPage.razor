@@ -1,0 +1,131 @@
+@page "/super-res"
+
+<PageTitle>Super Resolution — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Super Resolution"
+            Description="Upscale images with AI. Hover to compare enhanced detail against the original pixels."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="@(_scaleMode == "2x" ? "ESPCN (2x)" : "Real-ESRGAN (4x)")"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="@(_scaleMode == "2x" ? 0.1 : 17)">
+
+    <div class="sr-controls">
+        <label class="sr-label">Scale:</label>
+        <button class="sr-scale-btn @(_scaleMode == "2x" ? "active" : "")" @onclick='() => _scaleMode = "2x"'>2x (ESPCN, ~100KB)</button>
+        <button class="sr-scale-btn @(_scaleMode == "4x" ? "active" : "")" @onclick='() => _scaleMode = "4x"'>4x (Real-ESRGAN, ~17MB)</button>
+    </div>
+
+    @if (_enhancedImageUrl != null && _imageDataUrl != null)
+    {
+        <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
+                           AfterImageUrl="@_enhancedImageUrl"
+                           BeforeLabel="Original"
+                           AfterLabel="@($"Enhanced ({_scaleMode})")" />
+    }
+    else
+    {
+        <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                       OnImageLoaded="@HandleImageLoaded"
+                       SampleImages="@_samples" />
+    }
+
+    @if (_imageDataUrl != null && _enhancedImageUrl == null && _isModelLoaded && !_isRunning)
+    {
+        <button class="run-btn" @onclick="RunSuperRes">Enhance</button>
+    }
+
+</DemoLayout>
+
+<style>
+    .sr-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 1rem;
+    }
+
+    .sr-label {
+        color: #64748b;
+        font-size: 0.85rem;
+    }
+
+    .sr-scale-btn {
+        padding: 0.35rem 0.8rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+        color: #94a3b8;
+        font-size: 0.82rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .sr-scale-btn.active {
+        background: rgba(139, 92, 246, 0.2);
+        border-color: rgba(139, 92, 246, 0.4);
+        color: #e2e8f0;
+    }
+
+    .sr-scale-btn:hover:not(.active) {
+        background: rgba(255, 255, 255, 0.08);
+    }
+
+    .run-btn {
+        margin-top: 1rem;
+        padding: 0.6rem 1.5rem;
+        border-radius: 8px;
+        border: none;
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+        color: white;
+        font-weight: 600;
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .run-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(59, 130, 246, 0.3);
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string? _imageDataUrl;
+    private string? _enhancedImageUrl;
+    private string _scaleMode = "2x";
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private List<ImageDropZone.SampleImage> _samples = new()
+    {
+        new() { Label = "Low-res Photo", Url = "samples/lowres.jpg" },
+    };
+
+    private Task HandleBackendChange(string backend) => Task.CompletedTask;
+    private Task HandleImageLoaded(byte[] imageBytes) { _enhancedImageUrl = null; return Task.CompletedTask; }
+    private Task RunSuperRes()
+    {
+        // TODO: Run SR model through InferenceSession
+        return Task.CompletedTask;
+    }
+}

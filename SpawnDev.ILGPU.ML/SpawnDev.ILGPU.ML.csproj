@@ -28,7 +28,6 @@
 
 	<ItemGroup>
 		<PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.4" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="4.2.1" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -36,6 +35,12 @@
 		<None Include="..\LICENSE.txt" Pack="true" PackagePath="\" />
 		<None Include="..\README.md" Pack="true" PackagePath="\" />
 		<None Include="wwwroot\icon-128.png" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <ProjectReference Include="..\..\..\SpawnDev.ILGPU\SpawnDev.ILGPU\ILGPU.Algorithms\ILGPU.Algorithms.csproj" />
+	  <ProjectReference Include="..\..\..\SpawnDev.ILGPU\SpawnDev.ILGPU\ILGPU\ILGPU.csproj" />
+	  <ProjectReference Include="..\..\..\SpawnDev.ILGPU\SpawnDev.ILGPU\SpawnDev.ILGPU\SpawnDev.ILGPU.csproj" />
 	</ItemGroup>
 
 	<ItemGroup>

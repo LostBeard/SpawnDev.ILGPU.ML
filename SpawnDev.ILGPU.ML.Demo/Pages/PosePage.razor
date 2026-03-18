@@ -1,0 +1,180 @@
+@page "/pose"
+
+<PageTitle>Pose Estimation — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Pose Estimation"
+            Description="Real-time body pose detection using MoveNet. 17 keypoints tracked at high frame rates."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowFps="true"
+            ShowModelProgress="true"
+            ModelName="@(_modelVariant == "lightning" ? "MoveNet Lightning" : "MoveNet Thunder")"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="@(_modelVariant == "lightning" ? 10 : 15)">
+
+    <div class="pose-controls">
+        <label class="pose-label">Model:</label>
+        <button class="pose-variant-btn @(_modelVariant == "lightning" ? "active" : "")"
+                @onclick='() => _modelVariant = "lightning"'>Lightning (fast)</button>
+        <button class="pose-variant-btn @(_modelVariant == "thunder" ? "active" : "")"
+                @onclick='() => _modelVariant = "thunder"'>Thunder (accurate)</button>
+
+        <label class="pose-label" style="margin-left: 1rem;">Trails:</label>
+        <input type="checkbox" @bind="_showTrails" class="pose-checkbox" />
+    </div>
+
+    <div class="pose-viewport">
+        <WebcamCapture OnFrameCaptured="@HandleFrame"
+                       OnFrameDataUrl="@HandleFrameDataUrl"
+                       AutoCapture="true"
+                       CaptureIntervalMs="50"
+                       ShowCaptureButton="true" />
+
+        @if (_keypoints?.Any() == true)
+        {
+            <svg class="pose-overlay" viewBox="0 0 640 480" preserveAspectRatio="xMidYMid meet">
+                @* Draw skeleton connections *@
+                @foreach (var conn in _connections)
+                {
+                    var from = _keypoints.ElementAtOrDefault(conn.From);
+                    var to = _keypoints.ElementAtOrDefault(conn.To);
+                    if (from != null && to != null && from.Confidence > 0.3f && to.Confidence > 0.3f)
+                    {
+                        <line x1="@from.X" y1="@from.Y" x2="@to.X" y2="@to.Y"
+                              stroke="#8b5cf6" stroke-width="3" stroke-linecap="round" opacity="0.8" />
+                    }
+                }
+                @* Draw keypoints *@
+                @foreach (var kp in _keypoints.Where(k => k.Confidence > 0.3f))
+                {
+                    <circle cx="@kp.X" cy="@kp.Y" r="5" fill="#34d399" stroke="#0f172a" stroke-width="2" />
+                }
+            </svg>
+        }
+    </div>
+
+    @if (_keypoints?.Any() == true)
+    {
+        <div class="pose-stats">
+            <span class="pose-stat">Keypoints detected: @_keypoints.Count(k => k.Confidence > 0.3f) / 17</span>
+        </div>
+    }
+
+</DemoLayout>
+
+<style>
+    .pose-controls {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        margin-bottom: 1rem;
+        flex-wrap: wrap;
+    }
+
+    .pose-label {
+        color: #64748b;
+        font-size: 0.85rem;
+    }
+
+    .pose-variant-btn {
+        padding: 0.3rem 0.7rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+        color: #94a3b8;
+        font-size: 0.8rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .pose-variant-btn.active {
+        background: rgba(139, 92, 246, 0.2);
+        border-color: rgba(139, 92, 246, 0.4);
+        color: #e2e8f0;
+    }
+
+    .pose-checkbox {
+        accent-color: #8b5cf6;
+        width: 16px;
+        height: 16px;
+    }
+
+    .pose-viewport {
+        position: relative;
+        border-radius: 10px;
+        overflow: hidden;
+    }
+
+    .pose-overlay {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        z-index: 2;
+    }
+
+    .pose-stats {
+        margin-top: 0.75rem;
+        display: flex;
+        gap: 1rem;
+    }
+
+    .pose-stat {
+        color: #94a3b8;
+        font-size: 0.85rem;
+        font-family: 'JetBrains Mono', 'Consolas', monospace;
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _modelVariant = "lightning";
+    private bool _showTrails;
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+    private List<Keypoint>? _keypoints;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    // MoveNet COCO skeleton connections
+    private static readonly (int From, int To)[] _connections = new[]
+    {
+        (0, 1), (0, 2), (1, 3), (2, 4),        // Head
+        (5, 6),                                    // Shoulders
+        (5, 7), (7, 9), (6, 8), (8, 10),        // Arms
+        (5, 11), (6, 12),                         // Torso
+        (11, 12),                                  // Hips
+        (11, 13), (13, 15), (12, 14), (14, 16), // Legs
+    };
+
+    private Task HandleBackendChange(string backend) => Task.CompletedTask;
+    private Task HandleFrame(byte[] frameBytes)
+    {
+        // TODO: Run MoveNet through InferenceSession, decode heatmaps to keypoints
+        return Task.CompletedTask;
+    }
+    private Task HandleFrameDataUrl(string dataUrl) => Task.CompletedTask;
+
+    private class Keypoint
+    {
+        public float X { get; set; }
+        public float Y { get; set; }
+        public float Confidence { get; set; }
+    }
+}

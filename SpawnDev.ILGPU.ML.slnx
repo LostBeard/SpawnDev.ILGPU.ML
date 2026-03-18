@@ -4,5 +4,8 @@
   <Project Path="SpawnDev.ILGPU.ML.Demo.Shared/SpawnDev.ILGPU.ML.Demo.Shared.csproj" />
   <Project Path="SpawnDev.ILGPU.ML.DemoConsole/SpawnDev.ILGPU.ML.DemoConsole.csproj" />
   <Project Path="SpawnDev.ILGPU.ML.Tests/SpawnDev.ILGPU.ML.Tests.csproj" />
+  <Project Path="../../SpawnDev.ILGPU/SpawnDev.ILGPU/ILGPU.Algorithms/ILGPU.Algorithms.csproj" />
+  <Project Path="../../SpawnDev.ILGPU/SpawnDev.ILGPU/ILGPU/ILGPU.csproj" />
+  <Project Path="../../SpawnDev.ILGPU/SpawnDev.ILGPU/SpawnDev.ILGPU/SpawnDev.ILGPU.csproj" />
   <Project Path="PlaywrightMultiTest/PlaywrightMultiTest.csproj" />
 </Solution>

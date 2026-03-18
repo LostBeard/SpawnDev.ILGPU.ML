@@ -251,10 +251,19 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        // WORKAROUND: Use simple kernel until SpawnDev.ILGPU 4.4.1+ with 2D grid fix.
-        // The tiled version works correctly with the fix (committed in SpawnDev.ILGPU aeeb457).
-        // Re-enable tiled batched MatMul after updating SpawnDev.ILGPU NuGet.
-        _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
+        if (_useSimpleKernels)
+        {
+            _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
+        }
+        else
+        {
+            int numTilesM = (M + TILE - 1) / TILE;
+            int numTilesN = (N + TILE - 1) / TILE;
+            int totalTiles = numTilesM * numTilesN;
+            var gridDim = new Index2D(totalTiles, batchSize);
+            var groupDim = new Index2D(TILE * TILE, 1);
+            _batchedMatMulKernel!(new KernelConfig(gridDim, groupDim), A, B, C, M, K, N, numTilesN);
+        }
     }
 
     private void EnsureKernelsLoaded(Accelerator accelerator)
