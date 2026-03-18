@@ -107,6 +107,10 @@ public class OperatorRegistry
         Register(new GemmOperator(this));
         Register(new InstanceNormOperator(this));
         Register(new ConstantOperator());
+        Register(new CeilOperator(this));
+        Register(new LogOperator(this));
+        Register(new MinOperator(this));
+        Register(new MaxOnnxOperator(this));
         Register(new CastOperator(this));
         Register(new FloorOperator(this));
         Register(new UpsampleOperator(this));

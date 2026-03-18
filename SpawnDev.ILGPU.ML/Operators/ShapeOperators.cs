@@ -59,7 +59,6 @@ public class CastOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-/// <summary>Floor: element-wise floor. TODO: needs proper Floor kernel.</summary>
 public class FloorOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Floor";
@@ -67,7 +66,51 @@ public class FloorOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        reg.ElementWise.Floor(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class CeilOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Ceil";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Ceil(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class LogOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Log";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Log(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class MinOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Min";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Min(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class MaxOnnxOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Max";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Max(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
