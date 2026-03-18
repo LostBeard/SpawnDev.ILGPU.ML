@@ -67,23 +67,30 @@ public class InferenceSession : IDisposable
     /// Create an InferenceSession from pre-extracted model files.
     /// Loads graph JSON + weight manifest + weight blob from the given base path.
     /// </summary>
+    /// <param name="onProgress">Optional progress callback: (stage, percent) where stage is
+    /// "graph", "weights", "compile", "ready" and percent is 0-100.</param>
     public static async Task<InferenceSession> CreateAsync(
-        Accelerator accelerator, HttpClient http, string basePath)
+        Accelerator accelerator, HttpClient http, string basePath,
+        Action<string, int>? onProgress = null)
     {
         // Load graph
+        onProgress?.Invoke("graph", 0);
         var graphJson = await http.GetStringAsync($"{basePath}/model_graph.json");
         var modelGraph = ModelGraph.FromJson(graphJson);
+        onProgress?.Invoke("graph", 100);
 
-        // Load weights via existing WeightLoader
+        // Load weights
+        onProgress?.Invoke("weights", 0);
         var weightLoader = new WeightLoader(accelerator, http);
         await weightLoader.LoadAsync(basePath);
-
-        // Create operator registry
-        var registry = new OperatorRegistry(accelerator);
+        onProgress?.Invoke("weights", 100);
 
         // Compile graph
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
         var compiler = new GraphCompiler(registry);
         var compiled = compiler.Compile(modelGraph);
+        onProgress?.Invoke("compile", 100);
 
         // Create weight tensors from WeightLoader
         // Include both compiled initializer names AND all graph initializers
@@ -107,6 +114,7 @@ public class InferenceSession : IDisposable
 
         // Create executor
         var executor = new GraphExecutor(accelerator, compiled, weights);
+        onProgress?.Invoke("ready", 100);
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
         {
