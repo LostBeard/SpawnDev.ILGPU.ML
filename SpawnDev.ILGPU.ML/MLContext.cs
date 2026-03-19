@@ -13,7 +13,7 @@ public static class MLContext
     /// Use this instead of Context.Create() for ML workloads.
     /// </summary>
     public static Context.Builder Create()
-        => Context.Create().EnableAlgorithms();
+        => Context.Create().AllAccelerators().EnableAlgorithms();
 
     /// <summary>
     /// Create a fully initialized context with Algorithms enabled.

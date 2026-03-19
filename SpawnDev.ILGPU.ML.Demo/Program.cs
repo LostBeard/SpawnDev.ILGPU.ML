@@ -6,6 +6,9 @@ using SpawnDev.ILGPU.ML.Demo.UnitTests;
 using SpawnDev.UnitTesting;
 using System.Reflection;
 
+// Print build timestamp so we can verify we're running the right build via browser console
+Console.WriteLine($"[SpawnDev.ILGPU.ML.Demo] Build: {BuildTimestamp.Value}");
+
 var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddBlazorJSRuntime();
 

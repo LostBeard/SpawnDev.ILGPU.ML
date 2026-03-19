@@ -2,8 +2,10 @@ using ILGPU;
 using ILGPU.Runtime;
 using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
+using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML.Demo.Services;
 using SpawnDev.ILGPU.WebGPU;
+using SpawnDev.ILGPU.WebGPU.Backend;
 
 namespace SpawnDev.ILGPU.ML.Demo.Pages;
 
@@ -24,71 +26,140 @@ public partial class ClassifyPage : IDisposable
     {
         if (firstRender)
         {
-            await LoadModel();
+            await LoadBackendAndModelAsync();
         }
     }
 
-    private async Task LoadModel()
+    private async Task LoadBackendAndModelAsync()
     {
         try
         {
             _isModelLoading = true;
+            _isModelLoaded = false;
+            _error = null;
+            _modelProgress = 5;
             StateHasChanged();
 
-            var builder = MLContext.Create();
-            await builder.WebGPU();
-            _context = builder.ToContext();
-            var devices = _context.GetWebGPUDevices();
-            if (devices.Count == 0)
+            // Create ILGPU context with all browser backends (first time only)
+            if (_context == null)
             {
-                Console.WriteLine("[Classify] No WebGPU devices found");
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            // Create accelerator for selected backend
+            _modelProgress = 20;
+            StateHasChanged();
+            _accelerator = await CreateAcceleratorForBackendAsync(_selectedBackend);
+            if (_accelerator == null)
+            {
+                _error = $"No {_selectedBackend} device available";
                 _isModelLoading = false;
                 StateHasChanged();
                 return;
             }
-            _accelerator = await devices[0].CreateAcceleratorAsync(_context);
-            _selectedBackend = "WebGPU";
 
+            // Load SqueezeNet model
+            _modelProgress = 50;
+            StateHasChanged();
             _classService = new ClassificationService(Http);
-            // SqueezeNet (2.4MB) loads faster than MobileNetV2 (6.8MB)
             await _classService.LoadModelAsync("models/squeezenet", _accelerator);
 
             _isModelLoaded = true;
-            _isModelLoading = false;
-            Console.WriteLine($"[Classify] Model loaded: {_classService.ModelInfo}");
+            _modelProgress = 100;
+            Console.WriteLine($"[Classify] Model loaded on {_selectedBackend}: {_classService.ModelInfo}");
         }
         catch (Exception ex)
         {
-            _isModelLoading = false;
+            _error = $"Failed to load: {ex.Message}";
             Console.WriteLine($"[Classify] Error: {ex.Message}");
         }
-        StateHasChanged();
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
+    {
+        if (_context == null) return null;
+        try
+        {
+            return backendId switch
+            {
+                "WebGPU" => await CreateWebGPUAsync(),
+                "WebGL" => await CreateWebGLAsync(),
+                "Wasm" => await CreateWasmAsync(),
+                _ => null
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Classify] Backend {backendId} failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private async Task<Accelerator?> CreateWebGPUAsync()
+    {
+        var devices = _context!.GetDevices<WebGPUILGPUDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task<Accelerator?> CreateWebGLAsync()
+    {
+        var devices = _context!.GetDevices<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task<Accelerator?> CreateWasmAsync()
+    {
+        var devices = _context!.GetDevices<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task HandleBackendChange(string backend)
+    {
+        if (backend == _selectedBackend && _isModelLoaded) return;
+        _selectedBackend = backend;
+        _predictions = null;
+
+        // Dispose old resources (not the context — it holds all backend registrations)
+        _classService?.Dispose();
+        _classService = null;
+        _accelerator?.Dispose();
+        _accelerator = null;
+
+        await LoadBackendAndModelAsync();
     }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
         _imageBytes = imageBytes;
         _predictions = null;
+        _error = null;
 
         try
         {
-            // Decode image file bytes → RGBA int[] using browser native decoding
-            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
-                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
-            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            // Decode image file bytes to RGBA int[] via browser-native createImageBitmap
+            using var blob = new Blob(
+                new[] { imageBytes }, new BlobOptions { Type = "image/png" });
+            using var window = JS.Get<Window>("window");
             using var bitmap = await window.CreateImageBitmap(blob);
 
             int w = (int)bitmap.Width;
             int h = (int)bitmap.Height;
 
-            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            using var canvas = new HTMLCanvasElement();
             canvas.Width = w;
             canvas.Height = h;
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
             using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>(); // Each int = one packed RGBA pixel
+            _rgbaPixels = data.Read<int>();
             _imageWidth = w;
             _imageHeight = h;
 
@@ -99,6 +170,7 @@ public partial class ClassifyPage : IDisposable
         }
         catch (Exception ex)
         {
+            _error = $"Image decode failed: {ex.Message}";
             Console.WriteLine($"[Classify] Decode error: {ex.Message}");
         }
     }
@@ -109,6 +181,7 @@ public partial class ClassifyPage : IDisposable
 
         _isRunning = true;
         _predictions = null;
+        _error = null;
         StateHasChanged();
         await Task.Yield();
 
@@ -124,34 +197,27 @@ public partial class ClassifyPage : IDisposable
                 Confidence = r.Confidence
             }).ToList();
 
-            Console.WriteLine($"[Classify] {ms:F1}ms — Top-5:");
-            foreach (var r in results)
-                Console.WriteLine($"  {r.Label} ({r.Confidence:P2}, class {r.ClassIndex})");
+            Console.WriteLine($"[Classify] {ms:F1}ms — Top: {results[0].Label} ({results[0].Confidence:P2})");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Classify] Error: {ex.Message}\n{ex.StackTrace}");
+            _error = $"Inference failed: {ex.Message}";
+            Console.WriteLine($"[Classify] Error: {ex.Message}");
         }
 
         _isRunning = false;
         StateHasChanged();
     }
 
-    private async Task HandleBackendChange(string backend)
-    {
-        _selectedBackend = backend;
-        // TODO: Dispose current accelerator, create new one for selected backend, reload model
-    }
-
     private async Task CopyRaceResults()
     {
         if (_raceResults == null) return;
-        var text = "SpawnDev.ILGPU.ML Backend Showdown (MobileNetV2)\n";
+        var text = "SpawnDev.ILGPU.ML Backend Showdown (SqueezeNet)\n";
         foreach (var r in _raceResults.OrderBy(r => r.TimeMs))
             text += $"  {r.Backend}: {r.TimeMs:F1}ms\n";
         try
         {
-            using var navigator = JS.Get<SpawnDev.BlazorJS.JSObjects.Navigator>("navigator");
+            using var navigator = JS.Get<Navigator>("navigator");
             using var clipboard = navigator.Clipboard;
             await clipboard.WriteText(text);
         }

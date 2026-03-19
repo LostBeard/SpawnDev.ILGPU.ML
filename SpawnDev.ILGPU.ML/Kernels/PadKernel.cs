@@ -26,11 +26,13 @@ public class PadKernel
     {
         int rank = p[0];
         int mode = p[1]; // 0=constant, 1=edge, 2=reflect
-        // Layout: [rank, mode, inShape[rank], pads[2*rank], outShape[rank], inStrides[rank], outStrides[rank]]
+        // Layout: [rank, mode, inShape[rank], pads[2*rank], inStrides[rank], outStrides[rank]]
 
         int remaining = idx;
         int srcIdx = 0;
-        bool outOfBounds = false;
+        // WORKAROUND: WGSL codegen bug #3 (SpawnDev.ILGPU PLANS.md) — using int instead of
+        // bool and removing break to avoid incorrect PHI merge at loop exit on WebGPU.
+        int outOfBounds = 0;
 
         for (int d = 0; d < rank; d++)
         {
@@ -46,7 +48,11 @@ public class PadKernel
 
             if (srcCoord < 0 || srcCoord >= inDim)
             {
-                if (mode == 0) { outOfBounds = true; break; } // constant
+                if (mode == 0) // constant — flag and clamp to valid index
+                {
+                    outOfBounds = 1;
+                    srcCoord = 0;
+                }
                 else if (mode == 1) // edge
                 {
                     srcCoord = srcCoord < 0 ? 0 : inDim - 1;
@@ -61,7 +67,7 @@ public class PadKernel
             srcIdx += srcCoord * inStride;
         }
 
-        output[idx] = outOfBounds ? constantValue : input[srcIdx];
+        output[idx] = outOfBounds != 0 ? constantValue : input[srcIdx];
     }
 
     /// <summary>

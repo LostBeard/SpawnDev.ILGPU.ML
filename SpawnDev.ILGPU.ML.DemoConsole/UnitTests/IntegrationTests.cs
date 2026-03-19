@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.CPU;
+using ILGPU.Runtime.Cuda;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Operators;
@@ -794,6 +795,61 @@ public class IntegrationTests
             if (pixels[i] != result.RgbaPixels[i]) diffCount++;
         float diffPct = (float)diffCount / pixels.Length;
         Console.WriteLine($"[DirectOnnxStyle] {diffPct:P1} pixels changed — PASS");
+    }
+
+    /// <summary>
+    /// Direct .onnx style transfer on CUDA: same as above but on GPU.
+    /// Tests end-to-end inference with InstanceNorm, Conv, Pad, Upsample, etc.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DirectOnnx_StyleTransfer_Mosaic_Cuda()
+    {
+        var onnxPath = Path.Combine(FindToolsDir(), "mosaic-9.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"ONNX file not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+
+        using var context = MLContext.CreateContext();
+        var cudaDevices = context.GetCudaDevices();
+        if (cudaDevices.Count == 0)
+        {
+            context.Dispose();
+            throw new UnsupportedTestException("No CUDA devices found");
+        }
+        using var accelerator = cudaDevices[0].CreateAccelerator(context);
+        Console.WriteLine($"[CudaStyle] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
+
+        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+        Console.WriteLine($"[CudaStyle] {session}");
+
+        int w = 64, h = 64;
+        var pixels = new int[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                pixels[y * w + x] = (int)(x * 255f / w) | ((int)(y * 255f / h) << 8) | (128 << 16) | (0xFF << 24);
+
+        var pipeline = new SpawnDev.ILGPU.ML.Pipelines.StyleTransferPipeline(session, accelerator);
+        var result = await pipeline.TransferAsync(pixels, w, h);
+
+        Console.WriteLine($"[CudaStyle] Output: {result.Width}x{result.Height}");
+
+        var firstPixel = result.RgbaPixels[0];
+        bool allSame = result.RgbaPixels.All(p => p == firstPixel);
+        if (allSame) throw new Exception("Output is uniform — all pixels identical");
+
+        int diffCount = 0;
+        for (int i = 0; i < pixels.Length; i++)
+            if (pixels[i] != result.RgbaPixels[i]) diffCount++;
+        float diffPct = (float)diffCount / pixels.Length;
+        Console.WriteLine($"[CudaStyle] {diffPct:P1} pixels changed ({diffCount}/{pixels.Length})");
+
+        if (diffPct < 0.5f)
+            throw new Exception($"Style barely changed image: only {diffPct:P1} pixels differ");
+
+        Console.WriteLine("[CudaStyle] PASS");
+        session.Dispose();
+        pipeline.Dispose();
     }
 
     /// <summary>

@@ -2,9 +2,11 @@ using ILGPU;
 using ILGPU.Runtime;
 using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
+using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.WebGPU;
+using SpawnDev.ILGPU.WebGPU.Backend;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Demo.Pages;
@@ -35,14 +37,25 @@ public partial class StylePage : IDisposable
             _selectedStyle = styleName;
             StateHasChanged();
 
-            if (_accelerator == null)
+            // Create context with all browser backends (first time only)
+            if (_context == null)
             {
                 var builder = MLContext.Create();
-                await builder.WebGPU();
+                await builder.AllAcceleratorsAsync();
                 _context = builder.ToContext();
-                var devices = _context.GetWebGPUDevices();
-                if (devices.Count == 0) return;
-                _accelerator = await devices[0].CreateAcceleratorAsync(_context);
+            }
+
+            // Create accelerator if needed
+            if (_accelerator == null)
+            {
+                _accelerator = await CreateAcceleratorForBackendAsync(_selectedBackend);
+                if (_accelerator == null)
+                {
+                    Console.WriteLine($"[Style] No {_selectedBackend} device available");
+                    _isModelLoading = false;
+                    StateHasChanged();
+                    return;
+                }
             }
 
             _session?.Dispose();
@@ -53,15 +66,39 @@ public partial class StylePage : IDisposable
             _pipeline = new StyleTransferPipeline(_session, _accelerator);
 
             _isModelLoaded = true;
-            _isModelLoading = false;
-            Console.WriteLine($"[Style] {styleName} loaded: {_session}");
+            Console.WriteLine($"[Style] {styleName} loaded on {_selectedBackend}: {_session}");
         }
         catch (Exception ex)
         {
-            _isModelLoading = false;
             Console.WriteLine($"[Style] Error: {ex.Message}");
         }
-        StateHasChanged();
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
+    {
+        if (_context == null) return null;
+        try
+        {
+            return backendId switch
+            {
+                "WebGPU" => (await TryCreateAsync<WebGPUILGPUDevice>()),
+                "WebGL" => (await TryCreateAsync<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>()),
+                "Wasm" => (await TryCreateAsync<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>()),
+                _ => null
+            };
+        }
+        catch { return null; }
+    }
+
+    private async Task<Accelerator?> TryCreateAsync<TDevice>() where TDevice : Device
+    {
+        var devices = _context!.GetDevices<TDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
     }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
@@ -116,7 +153,22 @@ public partial class StylePage : IDisposable
         StateHasChanged();
     }
 
-    private async Task HandleBackendChange(string backend) => _selectedBackend = backend;
+    private async Task HandleBackendChange(string backend)
+    {
+        if (backend == _selectedBackend && _isModelLoaded) return;
+        _selectedBackend = backend;
+        _styledImageUrl = null;
+
+        _pipeline?.Dispose();
+        _session?.Dispose();
+        _accelerator?.Dispose();
+        _pipeline = null;
+        _session = null;
+        _accelerator = null;
+
+        // Reload current style on new backend
+        await LoadStyle(_selectedStyle);
+    }
 
     private void DownloadResult()
     {

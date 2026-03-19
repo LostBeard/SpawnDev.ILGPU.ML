@@ -2,9 +2,11 @@ using ILGPU;
 using ILGPU.Runtime;
 using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
+using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.WebGPU;
+using SpawnDev.ILGPU.WebGPU.Backend;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Demo.Pages;
@@ -24,36 +26,72 @@ public partial class SuperResPage : IDisposable
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
-            await LoadModel();
+            await LoadBackendAndModelAsync();
     }
 
-    private async Task LoadModel()
+    private async Task LoadBackendAndModelAsync()
     {
         try
         {
             _isModelLoading = true;
+            _isModelLoaded = false;
             StateHasChanged();
 
-            var builder = MLContext.Create();
-            await builder.WebGPU();
-            _context = builder.ToContext();
-            var devices = _context.GetWebGPUDevices();
-            if (devices.Count == 0) return;
-            _accelerator = await devices[0].CreateAcceleratorAsync(_context);
+            // Create context with all browser backends (first time only)
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            // Create accelerator for selected backend
+            _accelerator = await CreateAcceleratorForBackendAsync(_selectedBackend);
+            if (_accelerator == null)
+            {
+                Console.WriteLine($"[SuperRes] No {_selectedBackend} device available");
+                _isModelLoading = false;
+                StateHasChanged();
+                return;
+            }
 
             _session = await InferenceSession.CreateAsync(_accelerator, Http, "models/super-resolution");
             _pipeline = new SuperResolutionPipeline(_session, _accelerator);
 
             _isModelLoaded = true;
-            _isModelLoading = false;
-            Console.WriteLine($"[SuperRes] Loaded: {_session}");
+            Console.WriteLine($"[SuperRes] Loaded on {_selectedBackend}: {_session}");
         }
         catch (Exception ex)
         {
-            _isModelLoading = false;
             Console.WriteLine($"[SuperRes] Error: {ex.Message}");
         }
-        StateHasChanged();
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
+    {
+        if (_context == null) return null;
+        try
+        {
+            return backendId switch
+            {
+                "WebGPU" => (await TryCreateAsync<WebGPUILGPUDevice>()),
+                "WebGL" => (await TryCreateAsync<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>()),
+                "Wasm" => (await TryCreateAsync<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>()),
+                _ => null
+            };
+        }
+        catch { return null; }
+    }
+
+    private async Task<Accelerator?> TryCreateAsync<TDevice>() where TDevice : Device
+    {
+        var devices = _context!.GetDevices<TDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
     }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
@@ -108,7 +146,21 @@ public partial class SuperResPage : IDisposable
         StateHasChanged();
     }
 
-    private async Task HandleBackendChange(string backend) => _selectedBackend = backend;
+    private async Task HandleBackendChange(string backend)
+    {
+        if (backend == _selectedBackend && _isModelLoaded) return;
+        _selectedBackend = backend;
+        _enhancedImageUrl = null;
+
+        _pipeline?.Dispose();
+        _session?.Dispose();
+        _accelerator?.Dispose();
+        _pipeline = null;
+        _session = null;
+        _accelerator = null;
+
+        await LoadBackendAndModelAsync();
+    }
 
     private void DownloadResult()
     {

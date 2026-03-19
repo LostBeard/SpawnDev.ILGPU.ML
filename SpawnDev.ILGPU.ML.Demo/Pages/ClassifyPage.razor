@@ -3,7 +3,7 @@
 <PageTitle>Image Classification — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Image Classification"
-            Description="Classify images using MobileNetV2. Compare inference speed across all available backends."
+            Description="Classify images using SqueezeNet. Compare inference speed across all available backends."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -11,11 +11,11 @@
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
             ShowModelProgress="true"
-            ModelName="MobileNetV2"
+            ModelName="SqueezeNet"
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="13">
+            ModelSizeMB="5">
 
     <div class="classify-layout">
         <div class="classify-input">
@@ -46,7 +46,7 @@
                Title="@(_predictions?.FirstOrDefault()?.Label ?? "")"
                ResultText="@GetShareResultText()"
                BackendName="@_selectedBackend"
-               InferenceTimeMs="@_inferenceMs"
+               InferenceMs="@_inferenceMs"
                ImageUrl="@_imageDataUrl" />
 
     @if (_isModelLoaded && _raceResults?.Any() == true)
@@ -67,6 +67,11 @@
             </div>
             <button class="copy-results-btn" @onclick="CopyRaceResults">Copy Results</button>
         </div>
+    }
+
+    @if (_error != null)
+    {
+        <div class="error-banner">@_error</div>
     }
 
     <PrivacyBadge />
@@ -180,6 +185,16 @@
     .share-action-btn { border: 1px solid rgba(139,92,246,0.3); background: rgba(139,92,246,0.1); color: #c4b5fd; }
     .share-action-btn:hover { background: rgba(139,92,246,0.2); }
 
+    .error-banner {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        background: rgba(239, 68, 68, 0.08);
+        color: #fca5a5;
+        font-size: 0.85rem;
+    }
+
     @@media (max-width: 640px) {
         .classify-layout {
             grid-template-columns: 1fr;
@@ -188,7 +203,8 @@
 </style>
 
 @code {
-    // UI state — referenced by the markup
+    // UI state — these fields are used by the markup above.
+    // Infrastructure and logic are in ClassifyPage.razor.cs (code-behind).
     private string _selectedBackend = "WebGPU";
     private string? _imageDataUrl;
     private bool _isRunning;
@@ -196,6 +212,7 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
+    private string? _error;
     private List<Components.ConfidenceBars.Prediction>? _predictions;
     private List<RaceResult>? _raceResults;
 
