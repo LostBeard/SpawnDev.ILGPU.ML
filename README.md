@@ -156,22 +156,26 @@ Every model is automatically optimized during compilation:
 | **Strength reduction** | Div→Mul, eliminate Mul×1 and Add+0 | Cheaper operations |
 | **Dead node elimination** | Removes orphaned nodes after fusion | Clean graph |
 
-### GPU Kernels
+### GPU Kernels (30 files)
 
 | Kernel | Description | Performance |
 |--------|-------------|-------------|
 | **MatMul** | Tiled 16x16 shared memory | 92-101 GFLOPS |
-| **Conv2D** | Arbitrary kernel/stride/padding | — |
-| **ConvTranspose2D** | Transposed convolution | — |
-| **LayerNorm** | Row-wise, learned gamma/beta | — |
+| **RegisterBlockedMatMul** | 4x4 register blocking, 64x64 tiles | Target: 200+ GFLOPS |
+| **FusedLinear** | MatMul + Bias + Activation in 1 dispatch | 3x less memory bandwidth |
+| **Conv2D / ConvTranspose2D** | Arbitrary kernel/stride/padding | — |
 | **InstanceNorm** | Two-pass O(N) per (N,C) slice | 50,000x faster than naive |
-| **BatchNorm** | Inference mode with running stats | — |
-| **RMSNorm** | LLaMA/Mistral style normalization | — |
+| **LayerNorm / BatchNorm / RMSNorm** | All normalization variants | — |
 | **Softmax** | Two-pass numerically stable | — |
 | **Attention** | Multi-head split/score/merge | — |
 | **GELU/ReLU/SiLU** | With in-place variants | — |
-| **ImagePreprocess** | RGBA → NCHW float, resize + normalize | — |
-| **NearestUpsample** | 4D nearest-neighbor upsampling | — |
+| **ImagePreprocess** | RGBA → NCHW, resize + normalize, Y-channel | GPU preprocessing |
+| **ImagePostprocess** | NCHW float → packed RGBA on GPU | Zero-copy output |
+| **DepthColormap** | Depth float → colored RGBA via GPU LUT | GPU visualization |
+| **PostProcessing** | YOLO decode, NMS filter, cosine similarity, L2 norm | GPU postprocessing |
+| **ColorConversion** | RGB↔YCbCr, grayscale, BGR on GPU | — |
+| **ImageTransform** | GPU resize, crop, flip | — |
+| **TensorLayout** | NCHW↔NHWC, interleaved↔planar on GPU | — |
 
 ### 71 ONNX Operators
 
@@ -266,15 +270,16 @@ These are the things that make people stop scrolling:
 
 ## Model Inspector
 
-The built-in model inspector is a unique tool — drop any `.onnx` file and instantly see:
+Drop any model file — **ONNX, TFLite, GGUF, SafeTensors, or any supported format** — and instantly see:
 - Graph metadata (name, producer, opset version)
 - Node count, parameter count, weight sizes
 - Input/output tensor shapes and types
 - Operator usage histogram
 - Top 20 largest weights
 - **Compatibility check** — green badge if SpawnDev.ILGPU.ML can run the model
+- **GGUF models** — architecture info (layers, heads, context length, vocab size)
 
-No other browser ML library offers this. It uses our zero-dependency ONNX parser — the same one that powers direct `.onnx` loading.
+Format is auto-detected from magic bytes. All parsing happens in-browser with zero dependencies.
 
 ## Weight Loading
 
@@ -300,6 +305,17 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 </PropertyGroup>
 ```
 
+## Recent Breakthroughs
+
+- **7 model format parsers** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML. All zero-dependency, all auto-detected. One API loads any format.
+- **6-pass graph optimizer** — constant folding, identity elimination, linear fusion, scaled MatMul fusion, strength reduction, dead node elimination. Automatically reduces node count by ~30% on style transfer models.
+- **Fused linear kernel** — `MatMul + Bias + Activation` in a single GPU dispatch. Eliminates 2/3 of memory bandwidth for every linear layer in every model.
+- **Zero-copy style transfer** — entire pipeline (preprocess → inference → postprocess) stays on GPU. No CPU pixel loops.
+- **All 4 pipelines GPU-preprocessed** — Classification, StyleTransfer, SuperResolution, Depth all use GPU kernels for image preprocessing.
+- **WGSL/GLSL codegen bugs fixed** — 4 codegen bugs found and fixed in SpawnDev.ILGPU. All 6 backends green: 1450 pass / 0 fail.
+- **InstanceNorm 50,000x speedup** — Two-pass O(N) kernel. Style transfer went from infinite hang to 3.9 seconds.
+- **Register-blocked MatMul** — 4x4 per thread, 64x64 tiles. Targeting 200+ GFLOPS (current tiled: 92-101).
+
 ## Testing
 
 Tests run across all 6 backends via **PlaywrightMultiTest**:
@@ -307,26 +323,12 @@ Tests run across all 6 backends via **PlaywrightMultiTest**:
 ```bash
 # All tests (desktop + browser)
 dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj
-
-# WebGPU only
-dotnet test --filter "FullyQualifiedName~WebGPUTests."
-
-# Desktop console tests (CUDA, OpenCL, CPU)
-dotnet run --project DemoConsole/SpawnDev.ILGPU.ML.DemoConsole.csproj
 ```
 
-Every kernel validates against CPU reference implementations. 60/62 WebGPU tests passing (2 skipped pending InstanceNorm correctness fix).
+**SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends.
+**SpawnDev.ILGPU.ML: 78/78 WebGPU, 70/70 CUDA, 70/70 OpenCL.**
 
-## Recent Breakthroughs
-
-- **WGSL PHI codegen bug fixed** — `WGSLKernelFunctionGenerator.cs` was generating incorrect continuation code after loop-break patterns. Fix: post-loop continuation now uses `headerExitTarget` instead of `loopNode.Exits[0]`. This unblocked the Pad kernel (and any kernel with early-exit loop patterns) on WebGPU.
-- **Style transfer end-to-end** — 112-node pipeline with 16 InstanceNorm layers, 16 Conv layers, Pad, Upsample — all running correctly on WebGPU.
-- **InstanceNorm 50,000x speedup** — Rewrote from O(N*spatial) per thread to two-pass O(N): Pass 1 computes mean+variance (N*C threads), Pass 2 normalizes (N*C*spatial threads, no loops).
-
-## Known Issues
-
-1. **Secondary WGSL codegen bug** — Missing continuation code after if-else with break in certain patterns. Tracked, workaround in place for affected kernels.
-2. **Depth Anything V2** — 823 nodes compile but full GPU execution not yet tested (95 MB model).
+Every kernel validates against CPU reference implementations.
 
 ## Credits
 
