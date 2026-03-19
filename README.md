@@ -175,30 +175,68 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | **Super Resolution** | Upload a small image, get 3x upscale. Before/after comparison with download. | **Live** |
 | **Model Inspector** | Drop any `.onnx` file for instant architecture analysis — node count, parameters, operators, compatibility check. | **Live** |
 
-### Coming Next
+### Vision Demos
 
-| Demo | What It Does | Why It's Cool |
-|------|-------------|---------------|
-| **Depth Estimation** | Generate depth maps from any photo with selectable color palettes (plasma, viridis, inferno). Before/after slider. | Depth Anything V2 (823 nodes) already compiles. Visually stunning output. |
-| **Real-Time Object Detection** | Live webcam with bounding boxes. 80 COCO classes, confidence slider, FPS counter. | YOLOv8-nano at 15-30+ FPS on WebGPU would outperform most JS implementations. GPU-accelerated NMS keeps everything on-device. |
-| **Background Removal** | One-click background removal. Transparent PNG download. Replace background with custom image or blur. | Universal use case. The "no upload" privacy angle is a strong selling point. |
-| **Pose Estimation** | Live webcam with skeleton overlay. 17 keypoints, joint angles, movement trails. | MoveNet Lightning already compiles. Skeleton overlay is inherently fun. |
-| **Zero-Shot Classification (CLIP)** | Type ANY text description. Classify images by it. No fixed categories. | Feels like magic — the user defines what to look for. |
-| **Live Webcam Style Transfer** | Real-time styled video feed. Your webcam as a living painting. | With optimized WebGPU kernels, this could run at high FPS — noticeably smoother than JS alternatives. |
-
-### The Big Vision
-
-| Demo | Description |
+| Demo | What It Does |
 |------|-------------|
-| **Backend Showdown** | Run the same model on all available backends simultaneously. Leaderboard of inference times. Copy-paste results for social media. |
-| **Depth → 3D** | Live webcam depth estimation → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
-| **Spatial Intelligence** | YOLO (find a person) + MoveNet (extract skeleton) + Depth Anything (place in 3D space). Composable AI pipelines understanding the physical world. |
-| **In-Browser GPU Training** | Draw 10-20 custom gestures → train a classifier entirely in the browser. Most browser ML can only run inference — training proves this is a complete GPU compute platform. |
-| **Image-to-3D** | Generate 3D meshes or Gaussian splats from a single photo. Open directly in [SpawnScene](https://github.com/LostBeard/SpawnScene). |
+| **Depth Estimation** | Generate depth maps from any photo. Selectable color palettes (plasma, viridis, inferno). Depth Anything V2 (823 nodes) already compiles. |
+| **Real-Time Object Detection** | Live webcam with bounding boxes. 80 COCO classes, confidence slider, FPS counter. GPU-accelerated NMS. |
+| **Background Removal** | One-click background removal. Transparent PNG download. Replace background with custom image or blur. |
+| **Pose Estimation** | Live webcam with skeleton overlay. 17 keypoints, joint angles, movement trails. MoveNet Lightning already compiles. |
+| **Face Detection** | Face detection with landmarks and confidence visualization. |
+| **Zero-Shot (CLIP)** | Type ANY text description. Classify images by it. No fixed categories — the user defines what to look for. |
 
-All demos include backend selection, inference timing, "100% client-side" privacy badges, and the voice command system ("Computer, classify this image").
+### Language & Audio Demos
 
-26 demo pages total.
+| Demo | What It Does |
+|------|-------------|
+| **Speech to Text** | Whisper-powered transcription. Upload audio or use the microphone — transcription runs on your GPU, never leaves your device. |
+| **Semantic Search** | Generate text embeddings. Find similar passages, rank by relevance — all computed locally. |
+| **Text Generation** | GPT-style text generation with greedy/top-K/top-P sampling, temperature control, and tokens/second counter. |
+
+### Experimental & Fun Demos
+
+| Demo | What It Does | Why It's Special |
+|------|-------------|-----------------|
+| **AI Assistant** | Remember Clippy, Merlin, and Robby? They're back — but now they actually think. Choose from 6 classic MS Agent-style characters (Merlin, Robby, Clippy, Peedy, Rocky, Links), talk to them via voice or text, and they respond with AI-generated text and speech. All local. | Microsoft's animated assistants had personality but no intelligence. Now imagine them powered by a local LLM on your GPU with speech recognition (Whisper) and TTS — all in the browser, all private. |
+| **Comic Chat AI** | A comic strip chat room where every character is an AI running locally. Add characters, give them personalities, and watch them converse in comic panel format. Inspired by Microsoft Comic Chat (1996), reimagined with local AI. | Multiple AI characters chatting with each other, each with distinct personality, rendered as a comic strip — all on your GPU. Pure nostalgia meets cutting-edge tech. |
+| **Inside the Network** | Peek inside the neural network. See feature maps, attention patterns, and activation heatmaps as the model processes your image — layer by layer. Scrub through layers to see what the GPU "sees." | Educational and mesmerizing. Shows that neural networks aren't magic — they're math running on your GPU, and you can watch it happen. |
+| **Draw to Train** | Draw 10-20 custom gestures → train a classifier entirely in the browser. | Most browser ML can only do inference. Training proves this is a complete GPU compute platform. |
+
+### Generative & 3D Demos
+
+| Demo | What It Does |
+|------|-------------|
+| **Image Generation** | Stable Diffusion-style image generation. Prompt, negative prompt, steps, guidance scale, seed, resolution — all running on WebGPU. |
+| **Image to 3D** | Generate 3D meshes, Gaussian splats, or point clouds from a single photo. Open directly in [SpawnScene](https://github.com/LostBeard/SpawnScene). |
+| **Depth Voxel** | Live webcam depth → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
+
+### Infrastructure Demos
+
+| Demo | What It Does |
+|------|-------------|
+| **Backend Showdown** | Run the same model on all available backends simultaneously. Leaderboard of inference times. Copy-paste shareable results. |
+| **Model Inspector** | Drop any `.onnx` file for instant architecture analysis and compatibility check. |
+| **Model Gallery** | Browse all available demo models. Load custom models from HuggingFace. |
+| **Getting Started** | 5-step interactive tutorial with code examples. |
+
+All demos include backend selection, inference timing, "100% client-side" privacy badges, keyboard shortcuts (`?` for help, `Space` = run, `D` = download), and the voice command system ("Computer, classify this image").
+
+26 demo pages. Everything runs on YOUR GPU, in YOUR browser.
+
+### The Wow Factor
+
+These are the things that make people stop scrolling:
+
+- **Backend Race Mode** — Run the same model on WebGPU, WebGL, and Wasm simultaneously. Live timing bars with medals. "Copy Results" formatted for social media. No other library can do this — this IS the differentiator.
+- **"How Fast Is Your Device?"** — A dedicated benchmark page. MatMul throughput, model load time, inference speed. Like Cinebench for browser ML. Developers love posting benchmark scores.
+- **Pipeline Composer** — Drag-and-drop model chaining: Image → Depth → Colorize → Download. Or: Webcam → Detect → Crop Faces → Classify Each. Shows this isn't just single models — it's a composable GPU pipeline.
+- **Progressive Enhancement** — Start with Wasm (slow), switch to WebGL (faster), switch to WebGPU (fastest). Animated bars showing the speedup. Tells the story of "why WebGPU matters" in 10 seconds.
+- **Offline Mode** — Toggle airplane mode. Inference still runs. "Your AI doesn't need the cloud."
+- **Collaborative Canvas** — Multiple users on different devices, all running the same model, real-time via WebRTC (using SpawnDev.BlazorJS). Multi-device ML collaboration, all in-browser.
+- **Model-to-Model Pipeline** — Photo → depth estimation → 3D point cloud → style transfer on the texture → render. Three ML models + 3D rendering, all on GPU, no server, one C# codebase. The ultimate SpawnDev ecosystem demo.
+- **Real-Time Audio + Video Fusion** — Webcam (pose + face landmarks) + microphone (speech + emotion) simultaneously: "Person speaking with happy expression, arms raised." Multi-modal real-time inference from two input streams.
+- **Screenshot Sharing** — One-click capture of demo result + timing as a shareable image card, pre-formatted for X/Twitter.
 
 ## Model Inspector
 
