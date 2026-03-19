@@ -1,0 +1,287 @@
+@page "/comic-chat"
+
+<PageTitle>Comic Chat AI — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="comic-page">
+    <div class="comic-header">
+        <h1 class="comic-title">
+            <span class="comic-icon">&#x1F4AC;</span> Comic Chat AI
+        </h1>
+        <p class="comic-desc">
+            A comic strip chat room where every character is an AI running locally in your browser.
+            Add characters, give them personalities, and watch them converse — all powered by GPU inference with zero cloud dependency.
+            Inspired by Microsoft Comic Chat (1996), reimagined with local AI.
+        </p>
+    </div>
+
+    <div class="comic-layout">
+        <div class="comic-sidebar">
+            <h3 class="sidebar-title">Characters</h3>
+
+            @foreach (var character in _characters)
+            {
+                <div class="character-card @(character.IsThinking ? "thinking" : "")">
+                    <div class="character-avatar" style="background: @character.Color;">
+                        @character.Name[0]
+                    </div>
+                    <div class="character-info">
+                        <span class="character-name">@character.Name</span>
+                        <span class="character-personality">@character.Personality</span>
+                        @if (character.IsThinking)
+                        {
+                            <span class="character-status">thinking...</span>
+                        }
+                    </div>
+                    <button class="character-remove" @onclick="() => RemoveCharacter(character.Id)" title="Remove">&times;</button>
+                </div>
+            }
+
+            <div class="add-character">
+                <input type="text" class="add-name-input" @bind="_newCharName" placeholder="Name" />
+                <select class="add-personality-select" @bind="_newCharPersonality">
+                    <option value="friendly">Friendly &amp; helpful</option>
+                    <option value="sarcastic">Witty &amp; sarcastic</option>
+                    <option value="philosopher">Deep thinker</option>
+                    <option value="pirate">Talks like a pirate</option>
+                    <option value="scientist">Science enthusiast</option>
+                    <option value="poet">Speaks in verse</option>
+                    <option value="detective">Sherlock-style deduction</option>
+                    <option value="chef">Everything relates to food</option>
+                    <option value="custom">Custom...</option>
+                </select>
+                @if (_newCharPersonality == "custom")
+                {
+                    <input type="text" class="add-custom-input" @bind="_customPersonality" placeholder="Describe personality..." />
+                }
+                <button class="add-btn" @onclick="AddCharacter">+ Add Character</button>
+            </div>
+
+            <div class="sidebar-settings">
+                <h3 class="sidebar-title">Settings</h3>
+                <label class="setting-label">
+                    <span>Comic style:</span>
+                    <select @bind="_comicStyle" class="setting-select">
+                        <option value="classic">Classic panels</option>
+                        <option value="manga">Manga style</option>
+                        <option value="minimal">Minimal</option>
+                    </select>
+                </label>
+                <label class="setting-label">
+                    <span>Response length:</span>
+                    <select @bind="_responseLength" class="setting-select">
+                        <option value="short">Short (1-2 sentences)</option>
+                        <option value="medium">Medium (2-4 sentences)</option>
+                        <option value="long">Long (paragraph)</option>
+                    </select>
+                </label>
+                <label class="setting-label">
+                    <span>Auto-chat:</span>
+                    <input type="checkbox" @bind="_autoChat" />
+                    <span class="setting-hint">Characters talk to each other</span>
+                </label>
+            </div>
+        </div>
+
+        <div class="comic-main">
+            <div class="comic-strip">
+                @if (_panels.Count == 0)
+                {
+                    <div class="comic-empty">
+                        <p>Add some characters and start chatting!</p>
+                        <p class="empty-hint">Type a message below, or enable "Auto-chat" to watch AI characters converse on their own.</p>
+                    </div>
+                }
+                @foreach (var panel in _panels)
+                {
+                    <div class="comic-panel @panel.Style">
+                        <div class="panel-character">
+                            <div class="panel-avatar" style="background: @panel.CharacterColor;">
+                                @panel.CharacterName[0]
+                            </div>
+                            <span class="panel-name">@panel.CharacterName</span>
+                        </div>
+                        <div class="speech-bubble @(panel.IsUser ? "user-bubble" : "ai-bubble")">
+                            <div class="bubble-text">@panel.Text</div>
+                            <div class="bubble-tail"></div>
+                        </div>
+                        @if (panel.InferenceMs > 0)
+                        {
+                            <span class="panel-timing">@panel.InferenceMs.ToString("F0")ms</span>
+                        }
+                    </div>
+                }
+            </div>
+
+            <div class="comic-input">
+                <div class="input-as">
+                    <span>You:</span>
+                </div>
+                <input type="text" class="chat-input" @bind="_userMessage"
+                       @onkeypress="HandleKeyPress"
+                       placeholder="Type your message... (or let the AI characters talk)" />
+                <button class="send-btn" @onclick="SendMessage" disabled="@(string.IsNullOrWhiteSpace(_userMessage) || _isGenerating)">
+                    Send
+                </button>
+                @if (_autoChat && !_isGenerating)
+                {
+                    <button class="auto-btn" @onclick="TriggerAutoChat">
+                        &#x25B6; Next
+                    </button>
+                }
+            </div>
+        </div>
+    </div>
+
+    @if (!_isModelLoaded)
+    {
+        <div class="model-needed">
+            <p>Comic Chat AI requires a text generation model (GPT-2 Small ~240MB or SmolLM ~300MB).</p>
+            <p style="margin-top: 0.5rem;">Each character gets its own conversation history and personality prompt. All inference runs locally on your GPU — the characters' conversations never leave your browser.</p>
+        </div>
+    }
+
+    <PrivacyBadge />
+</div>
+
+<style>
+    .comic-page { max-width: 1100px; margin: 0 auto; }
+    .comic-header { margin-bottom: 1.5rem; }
+    .comic-title { font-size: 1.6rem; font-weight: 800; color: #f1f5f9; display: flex; align-items: center; gap: 0.5rem; }
+    .comic-icon { font-size: 1.4rem; }
+    .comic-desc { color: #64748b; font-size: 0.9rem; line-height: 1.6; }
+
+    .comic-layout { display: flex; gap: 1.5rem; }
+    .comic-sidebar { flex: 0 0 260px; display: flex; flex-direction: column; gap: 1rem; }
+    .comic-main { flex: 1; display: flex; flex-direction: column; }
+
+    .sidebar-title { color: #f1f5f9; font-size: 0.95rem; font-weight: 600; margin-bottom: 0.5rem; }
+
+    .character-card { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; margin-bottom: 0.4rem; position: relative; }
+    .character-card.thinking { border-color: rgba(56,189,248,0.3); }
+    .character-avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-size: 1rem; flex-shrink: 0; }
+    .character-info { flex: 1; overflow: hidden; }
+    .character-name { display: block; color: #e2e8f0; font-size: 0.85rem; font-weight: 600; }
+    .character-personality { display: block; color: #64748b; font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .character-status { display: block; color: #38bdf8; font-size: 0.7rem; animation: pulse 1.5s ease-in-out infinite; }
+    .character-remove { position: absolute; top: 0.2rem; right: 0.3rem; background: none; border: none; color: #475569; cursor: pointer; font-size: 0.9rem; }
+    .character-remove:hover { color: #f87171; }
+
+    .add-character { display: flex; flex-direction: column; gap: 0.3rem; padding: 0.75rem; background: rgba(255,255,255,0.02); border: 1px dashed rgba(255,255,255,0.1); border-radius: 8px; }
+    .add-name-input, .add-custom-input { padding: 0.35rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.82rem; }
+    .add-personality-select { padding: 0.35rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.82rem; }
+    .add-personality-select option { background: #1e293b; }
+    .add-btn { padding: 0.35rem; border-radius: 6px; border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
+    .add-btn:hover { background: rgba(52,211,153,0.2); }
+
+    .sidebar-settings { padding: 0.75rem; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; }
+    .setting-label { display: flex; align-items: center; gap: 0.4rem; color: #94a3b8; font-size: 0.8rem; margin-bottom: 0.4rem; }
+    .setting-select { padding: 0.25rem 0.4rem; border-radius: 5px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.78rem; }
+    .setting-select option { background: #1e293b; }
+    .setting-hint { color: #475569; font-size: 0.72rem; }
+
+    .comic-strip { flex: 1; overflow-y: auto; max-height: 500px; display: flex; flex-direction: column; gap: 0.75rem; padding: 1rem; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; margin-bottom: 0.75rem; }
+    .comic-empty { text-align: center; padding: 3rem; color: #64748b; }
+    .empty-hint { font-size: 0.85rem; color: #475569; margin-top: 0.5rem; }
+
+    .comic-panel { display: flex; align-items: flex-start; gap: 0.75rem; padding: 0.5rem; }
+    .panel-character { display: flex; flex-direction: column; align-items: center; min-width: 50px; }
+    .panel-avatar { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: 800; font-size: 1.1rem; }
+    .panel-name { color: #94a3b8; font-size: 0.7rem; margin-top: 0.2rem; }
+
+    .speech-bubble { position: relative; max-width: 70%; padding: 0.75rem 1rem; border-radius: 12px; }
+    .ai-bubble { background: rgba(139,92,246,0.12); border: 1px solid rgba(139,92,246,0.25); }
+    .user-bubble { background: rgba(59,130,246,0.12); border: 1px solid rgba(59,130,246,0.25); margin-left: auto; }
+    .bubble-text { color: #e2e8f0; font-size: 0.9rem; line-height: 1.5; }
+    .panel-timing { color: #475569; font-size: 0.65rem; font-family: monospace; align-self: flex-end; }
+
+    .comic-input { display: flex; gap: 0.5rem; align-items: center; }
+    .input-as { color: #94a3b8; font-size: 0.85rem; font-weight: 600; min-width: 30px; }
+    .chat-input { flex: 1; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.9rem; }
+    .chat-input:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .chat-input::placeholder { color: #475569; }
+    .send-btn { padding: 0.6rem 1rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .auto-btn { padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; font-weight: 600; cursor: pointer; }
+
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; line-height: 1.5; }
+
+    @@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @@media (max-width: 768px) { .comic-layout { flex-direction: column; } .comic-sidebar { flex: none; } }
+</style>
+
+@code {
+    private List<ChatCharacter> _characters = new()
+    {
+        new() { Id = 1, Name = "Luna", Personality = "Friendly & curious", Color = "#8b5cf6" },
+        new() { Id = 2, Name = "Rex", Personality = "Witty & sarcastic", Color = "#ef4444" },
+    };
+
+    private List<ComicPanel> _panels = new();
+    private string _userMessage = "";
+    private string _newCharName = "";
+    private string _newCharPersonality = "friendly";
+    private string _customPersonality = "";
+    private string _comicStyle = "classic";
+    private string _responseLength = "short";
+    private bool _autoChat;
+    private bool _isGenerating;
+    private bool _isModelLoaded;
+    private int _nextCharId = 3;
+
+    private static readonly string[] _characterColors = { "#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316" };
+
+    private void AddCharacter()
+    {
+        if (string.IsNullOrWhiteSpace(_newCharName)) return;
+        var personality = _newCharPersonality == "custom" ? _customPersonality : _newCharPersonality;
+        _characters.Add(new ChatCharacter
+        {
+            Id = _nextCharId++,
+            Name = _newCharName,
+            Personality = personality,
+            Color = _characterColors[(_characters.Count) % _characterColors.Length],
+        });
+        _newCharName = "";
+    }
+
+    private void RemoveCharacter(int id) => _characters.RemoveAll(c => c.Id == id);
+
+    private async Task SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(_userMessage)) return;
+        _panels.Add(new ComicPanel { CharacterName = "You", CharacterColor = "#3b82f6", Text = _userMessage, IsUser = true });
+        _userMessage = "";
+        StateHasChanged();
+        // TODO: Generate AI responses from each character
+    }
+
+    private void HandleKeyPress(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") _ = SendMessage();
+    }
+
+    private Task TriggerAutoChat()
+    {
+        // TODO: Pick a random character to speak next based on conversation context
+        return Task.CompletedTask;
+    }
+
+    private class ChatCharacter
+    {
+        public int Id { get; set; }
+        public string Name { get; set; } = "";
+        public string Personality { get; set; } = "";
+        public string Color { get; set; } = "";
+        public bool IsThinking { get; set; }
+    }
+
+    private class ComicPanel
+    {
+        public string CharacterName { get; set; } = "";
+        public string CharacterColor { get; set; } = "";
+        public string Text { get; set; } = "";
+        public bool IsUser { get; set; }
+        public double InferenceMs { get; set; }
+        public string Style { get; set; } = "";
+    }
+}

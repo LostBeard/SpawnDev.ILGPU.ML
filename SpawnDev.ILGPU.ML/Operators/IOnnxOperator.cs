@@ -34,6 +34,21 @@ public class OnnxOpContext
     public required Tensor[] Outputs { get; init; }
     public required Dictionary<string, object> Attributes { get; init; }
     public required BufferPool Pool { get; init; }
+    /// <summary>Input tensor names (for looking up pre-read constant data).</summary>
+    public string[] InputNames { get; init; } = Array.Empty<string>();
+    /// <summary>Pre-read constant data from small tensors (avoids GPU→CPU readback at runtime).
+    /// Maps tensor name → float[] values. Populated during session creation.</summary>
+    public Dictionary<string, float[]>? ConstantValues { get; init; }
+
+    /// <summary>Try to get pre-read float values for an input tensor (by index).
+    /// Returns null if not available (tensor is dynamic, not pre-read).</summary>
+    public float[]? TryGetInputValues(int inputIndex)
+    {
+        if (ConstantValues == null || inputIndex >= InputNames.Length) return null;
+        var name = InputNames[inputIndex];
+        if (string.IsNullOrEmpty(name)) return null;
+        return ConstantValues.TryGetValue(name, out var vals) ? vals : null;
+    }
 
     // ── Typed attribute accessors ──
 

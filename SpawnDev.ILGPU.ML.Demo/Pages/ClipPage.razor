@@ -1,0 +1,103 @@
+@page "/clip"
+
+<PageTitle>Zero-Shot Classification — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Zero-Shot Image Classification"
+            Description="Classify images into any categories you define — no training needed. Powered by CLIP."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="CLIP ViT-B/32"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="170">
+
+    <div class="clip-input-section">
+        <div class="clip-labels-input">
+            <label class="clip-label">Categories (one per line):</label>
+            <textarea class="clip-textarea" @bind="_candidateLabels" rows="5"
+                      placeholder="a photo of a cat&#10;a photo of a dog&#10;a landscape painting&#10;food on a plate&#10;a car on a road"></textarea>
+        </div>
+    </div>
+
+    @if (_results != null && _results.Count > 0)
+    {
+        <div class="clip-results">
+            <ConfidenceBars Predictions="@_results" MaxItems="@_results.Count" />
+        </div>
+
+        <div class="result-actions">
+            <button class="action-btn clear-btn" @onclick="ClearResult">Try Another Image</button>
+        </div>
+    }
+
+    <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                   OnImageLoaded="@HandleImageLoaded"
+                   SampleImages="@_samples" />
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            CLIP model (~170MB) not yet deployed. Zero-shot classification will be enabled once the model is available.
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .clip-input-section { margin-bottom: 1rem; }
+    .clip-label { color: #94a3b8; font-size: 0.85rem; display: block; margin-bottom: 0.4rem; }
+    .clip-textarea {
+        width: 100%;
+        padding: 0.75rem;
+        border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+        color: #e2e8f0;
+        font-size: 0.9rem;
+        font-family: inherit;
+        resize: vertical;
+    }
+    .clip-textarea::placeholder { color: #475569; }
+    .clip-textarea:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .clip-results { margin: 1rem 0; }
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string? _imageDataUrl;
+    private string _candidateLabels = "a photo of a cat\na photo of a dog\na landscape\nfood\na vehicle";
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+    private List<ConfidenceBars.Prediction>? _results;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private List<ImageDropZone.SampleImage> _samples = new()
+    {
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Landscape", Url = "samples/landscape.jpg" },
+        new() { Label = "Street", Url = "samples/street.jpg" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task HandleImageLoaded(byte[] imageBytes) { _results = null; return Task.CompletedTask; }
+    private void ClearResult() { _results = null; _imageDataUrl = null; StateHasChanged(); }
+}

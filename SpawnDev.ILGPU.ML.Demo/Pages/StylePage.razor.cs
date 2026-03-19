@@ -118,6 +118,38 @@ public partial class StylePage : IDisposable
 
     private async Task HandleBackendChange(string backend) => _selectedBackend = backend;
 
+    private void DownloadResult()
+    {
+        if (_styledImageUrl == null) return;
+        try
+        {
+            using var document = JS.Get<SpawnDev.BlazorJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.BlazorJS.JSObjects.HTMLAnchorElement>("a");
+            link.Href = _styledImageUrl;
+            link.Download = $"styled-{_selectedStyle.ToLowerInvariant().Replace(" ", "-")}.png";
+            using var body = document.Body!;
+            body.AppendChild(link);
+            link.Click();
+            body.RemoveChild(link);
+        }
+        catch { }
+    }
+
+    private void ClearResult()
+    {
+        _styledImageUrl = null;
+        _imageDataUrl = null;
+        _rgbaPixels = null;
+        StateHasChanged();
+    }
+
+    private List<Components.ImageDropZone.SampleImage> _sampleImages = new()
+    {
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Landscape", Url = "samples/landscape.jpg" },
+        new() { Label = "Street", Url = "samples/street.jpg" },
+    };
+
     public void Dispose()
     {
         _pipeline?.Dispose();

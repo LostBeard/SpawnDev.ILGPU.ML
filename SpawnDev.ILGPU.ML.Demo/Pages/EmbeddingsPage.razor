@@ -1,0 +1,166 @@
+@page "/embeddings"
+
+<PageTitle>Semantic Search — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Semantic Search &amp; Embeddings"
+            Description="Compute text embeddings and search by meaning, not keywords. Compare sentence similarity in real-time."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="all-MiniLM-L6-v2"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="22">
+
+    <div class="embed-mode-toggle">
+        <button class="mode-btn @(_mode == "similarity" ? "active" : "")" @onclick='() => _mode = "similarity"'>Similarity</button>
+        <button class="mode-btn @(_mode == "search" ? "active" : "")" @onclick='() => _mode = "search"'>Semantic Search</button>
+    </div>
+
+    @if (_mode == "similarity")
+    {
+        <div class="similarity-section">
+            <div class="sim-inputs">
+                <div class="sim-input-group">
+                    <label>Sentence A:</label>
+                    <input type="text" class="sim-input" @bind="_sentenceA" placeholder="The cat sat on the mat" />
+                </div>
+                <div class="sim-input-group">
+                    <label>Sentence B:</label>
+                    <input type="text" class="sim-input" @bind="_sentenceB" placeholder="A kitten was sitting on a rug" />
+                </div>
+            </div>
+            <button class="run-btn" @onclick="ComputeSimilarity" disabled="@(!_isModelLoaded || _isRunning)">
+                Compare
+            </button>
+            @if (_similarityScore.HasValue)
+            {
+                <div class="sim-result">
+                    <div class="sim-score-bar">
+                        <div class="sim-score-fill" style="width: @(Math.Max(0, _similarityScore.Value) * 100)%;
+                             background: @GetScoreColor(_similarityScore.Value);"></div>
+                    </div>
+                    <span class="sim-score-value">@(_similarityScore.Value.ToString("F3")) — @GetScoreLabel(_similarityScore.Value)</span>
+                </div>
+            }
+        </div>
+    }
+    else
+    {
+        <div class="search-section">
+            <div class="search-corpus">
+                <label>Corpus (one document per line):</label>
+                <textarea class="search-textarea" @bind="_corpus" rows="6"
+                          placeholder="Machine learning is a subset of AI&#10;The weather today is sunny and warm&#10;Python is a popular programming language&#10;Cats are independent animals&#10;Neural networks process data in layers"></textarea>
+            </div>
+            <div class="search-query-row">
+                <input type="text" class="search-query" @bind="_searchQuery" placeholder="How do computers learn?" />
+                <button class="run-btn" @onclick="SearchCorpus" disabled="@(!_isModelLoaded || _isRunning)">
+                    Search
+                </button>
+            </div>
+            @if (_searchResults != null)
+            {
+                <div class="search-results">
+                    @foreach (var r in _searchResults)
+                    {
+                        <div class="search-result-row">
+                            <div class="search-result-score" style="background: @GetScoreColor(r.Score);">@r.Score.ToString("F2")</div>
+                            <span class="search-result-text">@r.Text</span>
+                        </div>
+                    }
+                </div>
+            }
+        </div>
+    }
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            Embedding model (all-MiniLM-L6-v2, ~22MB) not yet deployed. Semantic search will be enabled once NLP pipeline is integrated.
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .embed-mode-toggle { display: flex; border-radius: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 1rem; width: fit-content; }
+    .mode-btn { padding: 0.35rem 0.85rem; border: none; background: rgba(255,255,255,0.04); color: #64748b; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .mode-btn.active { background: rgba(139,92,246,0.2); color: #e2e8f0; }
+
+    .sim-inputs { display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1rem; }
+    .sim-input-group label { color: #94a3b8; font-size: 0.85rem; display: block; margin-bottom: 0.25rem; }
+    .sim-input { width: 100%; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.9rem; }
+    .sim-input:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+
+    .sim-result { margin-top: 1rem; }
+    .sim-score-bar { height: 24px; background: rgba(255,255,255,0.04); border-radius: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,0.06); }
+    .sim-score-fill { height: 100%; border-radius: 5px; transition: width 0.5s; }
+    .sim-score-value { color: #cbd5e1; font-size: 0.9rem; font-family: monospace; margin-top: 0.4rem; display: block; }
+
+    .search-corpus label { color: #94a3b8; font-size: 0.85rem; display: block; margin-bottom: 0.25rem; }
+    .search-textarea { width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.85rem; font-family: inherit; resize: vertical; }
+    .search-textarea:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .search-query-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+    .search-query { flex: 1; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.9rem; }
+    .search-query:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+
+    .search-results { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+    .search-result-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem; background: rgba(255,255,255,0.02); border-radius: 6px; }
+    .search-result-score { padding: 0.2rem 0.5rem; border-radius: 4px; color: white; font-size: 0.75rem; font-weight: 700; font-family: monospace; min-width: 40px; text-align: center; }
+    .search-result-text { color: #cbd5e1; font-size: 0.85rem; }
+
+    .run-btn { padding: 0.6rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .run-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+    .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _mode = "similarity";
+    private string _sentenceA = "";
+    private string _sentenceB = "";
+    private float? _similarityScore;
+    private string _corpus = "";
+    private string _searchQuery = "";
+    private List<SearchResult>? _searchResults;
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task ComputeSimilarity() => Task.CompletedTask;
+    private Task SearchCorpus() => Task.CompletedTask;
+
+    private string GetScoreColor(float score) => score switch
+    {
+        >= 0.8f => "#34d399",
+        >= 0.5f => "#38bdf8",
+        >= 0.3f => "#fbbf24",
+        _ => "#64748b",
+    };
+
+    private string GetScoreLabel(float score) => score switch
+    {
+        >= 0.8f => "Very similar",
+        >= 0.5f => "Somewhat similar",
+        >= 0.3f => "Slightly related",
+        _ => "Not similar",
+    };
+
+    private class SearchResult { public string Text { get; set; } = ""; public float Score { get; set; } }
+}

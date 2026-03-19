@@ -1,0 +1,211 @@
+@page "/generate"
+
+<PageTitle>Image Generation — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Image Generation"
+            Description="Generate images from text descriptions using Stable Diffusion. Runs entirely in your browser via WebGPU."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="SD Turbo"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="250">
+
+    <div class="gen-prompt-section">
+        <label class="gen-label">Prompt:</label>
+        <div class="gen-prompt-row">
+            <input type="text" class="gen-prompt-input" @bind="_prompt"
+                   placeholder="A serene mountain landscape at sunset with a lake reflection" />
+            <button class="gen-btn" @onclick="GenerateImage" disabled="@(!_isModelLoaded || _isRunning)">
+                @(_isRunning ? "Generating..." : "Generate")
+            </button>
+        </div>
+
+        <div class="gen-settings">
+            <div class="gen-setting">
+                <label>Steps:</label>
+                <input type="number" min="1" max="50" @bind="_numSteps" class="gen-setting-input" />
+            </div>
+            <div class="gen-setting">
+                <label>Guidance:</label>
+                <input type="number" min="0" max="20" step="0.5" @bind="_guidanceScale" class="gen-setting-input" />
+            </div>
+            <div class="gen-setting">
+                <label>Seed:</label>
+                <input type="number" @bind="_seed" class="gen-setting-input" placeholder="random" />
+            </div>
+            <div class="gen-setting">
+                <label>Size:</label>
+                <select @bind="_imageSize" class="gen-setting-select">
+                    <option value="256">256x256</option>
+                    <option value="512">512x512</option>
+                </select>
+            </div>
+        </div>
+
+        @if (!string.IsNullOrEmpty(_negativePrompt) || _showNegative)
+        {
+            <div class="gen-negative">
+                <label class="gen-label">Negative prompt:</label>
+                <input type="text" class="gen-prompt-input" @bind="_negativePrompt"
+                       placeholder="blurry, low quality, distorted" />
+            </div>
+        }
+        else
+        {
+            <button class="gen-toggle-neg" @onclick="() => _showNegative = true">+ Negative prompt</button>
+        }
+    </div>
+
+    @if (_isRunning && _currentStep > 0)
+    {
+        <div class="gen-progress">
+            <div class="gen-progress-bar">
+                <div class="gen-progress-fill" style="width: @(_currentStep * 100.0 / _numSteps)%;"></div>
+            </div>
+            <span class="gen-progress-text">Step @_currentStep / @_numSteps</span>
+        </div>
+    }
+
+    @if (_generatedImageUrl != null)
+    {
+        <div class="gen-result">
+            <img src="@_generatedImageUrl" alt="Generated image" class="gen-result-img" />
+            <div class="gen-result-info">
+                <span class="gen-info-item">@_inferenceMs.ToString("F0")ms</span>
+                <span class="gen-info-item">@_imageSize x @_imageSize</span>
+                <span class="gen-info-item">@_numSteps steps</span>
+                <span class="gen-info-item">Seed: @_usedSeed</span>
+            </div>
+            <div class="result-actions">
+                <button class="action-btn download-btn" @onclick="DownloadResult">Download</button>
+                <button class="action-btn clear-btn" @onclick="ClearResult">New Generation</button>
+            </div>
+        </div>
+    }
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            Image generation requires Stable Diffusion Turbo (~250MB). This demo will be enabled once the model pipeline is integrated. The diffusion scheduler (DDIM + Euler) and noise generation are already built.
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .gen-prompt-section { margin-bottom: 1rem; }
+    .gen-label { color: #94a3b8; font-size: 0.85rem; display: block; margin-bottom: 0.4rem; }
+    .gen-prompt-row { display: flex; gap: 0.5rem; }
+    .gen-prompt-input {
+        flex: 1;
+        padding: 0.6rem 0.75rem;
+        border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+        color: #e2e8f0;
+        font-size: 0.95rem;
+    }
+    .gen-prompt-input::placeholder { color: #475569; }
+    .gen-prompt-input:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .gen-btn {
+        padding: 0.6rem 1.5rem;
+        border-radius: 8px;
+        border: none;
+        background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        color: white;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s;
+        white-space: nowrap;
+    }
+    .gen-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+    .gen-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .gen-settings { display: flex; gap: 1rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .gen-setting { display: flex; align-items: center; gap: 0.3rem; }
+    .gen-setting label { color: #64748b; font-size: 0.8rem; }
+    .gen-setting-input {
+        width: 70px;
+        padding: 0.3rem 0.5rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+        color: #e2e8f0;
+        font-size: 0.8rem;
+        text-align: center;
+    }
+    .gen-setting-select {
+        padding: 0.3rem 0.5rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+        color: #e2e8f0;
+        font-size: 0.8rem;
+    }
+    .gen-setting-select option { background: #1e293b; }
+
+    .gen-negative { margin-top: 0.75rem; }
+    .gen-toggle-neg {
+        margin-top: 0.5rem;
+        background: none;
+        border: none;
+        color: #64748b;
+        font-size: 0.8rem;
+        cursor: pointer;
+        padding: 0;
+    }
+    .gen-toggle-neg:hover { color: #94a3b8; }
+
+    .gen-progress { margin: 1rem 0; }
+    .gen-progress-bar { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
+    .gen-progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); border-radius: 4px; transition: width 0.3s; }
+    .gen-progress-text { color: #94a3b8; font-size: 0.8rem; margin-top: 0.25rem; display: block; }
+
+    .gen-result { text-align: center; margin: 1.5rem 0; }
+    .gen-result-img { max-width: 100%; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); }
+    .gen-result-info { display: flex; gap: 1rem; justify-content: center; margin-top: 0.75rem; flex-wrap: wrap; }
+    .gen-info-item { color: #64748b; font-size: 0.8rem; font-family: monospace; }
+
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: center; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .download-btn { border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; }
+    .download-btn:hover { background: rgba(52,211,153,0.2); }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _prompt = "";
+    private string _negativePrompt = "";
+    private bool _showNegative;
+    private int _numSteps = 4;
+    private float _guidanceScale = 0;
+    private int? _seed;
+    private int _usedSeed;
+    private int _imageSize = 512;
+    private int _currentStep;
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+    private string? _generatedImageUrl;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task GenerateImage() => Task.CompletedTask;
+    private void DownloadResult() { }
+    private void ClearResult() { _generatedImageUrl = null; _currentStep = 0; StateHasChanged(); }
+}

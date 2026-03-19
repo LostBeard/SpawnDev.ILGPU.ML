@@ -391,6 +391,69 @@ public class ElementWiseKernels
     }
 
     /// <summary>
+    /// Nearest-neighbor upsample for 4D NCHW tensors. Pure GPU — no CPU readback.
+    /// Each output element copies from the nearest input element based on scale ratios.
+    /// params: [inC, inH, inW, outH, outW]
+    /// </summary>
+    private static void NearestUpsample4DImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int inC = p[0]; int inH = p[1]; int inW = p[2];
+        int outH = p[3]; int outW = p[4];
+
+        int outHW = outH * outW;
+        int c = idx / outHW;
+        int rem = idx % outHW;
+        int oy = rem / outW;
+        int ox = rem % outW;
+
+        // Nearest-neighbor mapping (floor of scaled coordinate)
+        int iy = oy * inH / outH;
+        int ix = ox * inW / outW;
+        if (iy >= inH) iy = inH - 1;
+        if (ix >= inW) ix = inW - 1;
+
+        output[idx] = input[c * inH * inW + iy * inW + ix];
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _nearestUpsampleKernel;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _nearestParamsBuf;
+
+    /// <summary>
+    /// Nearest-neighbor upsample: maps each output element to the nearest input element.
+    /// Handles 4D NCHW tensors. Pure GPU kernel — no CPU readback, works on all backends.
+    /// </summary>
+    public void NearestUpsample(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int[] inputShape, int[] outputShape)
+    {
+        EnsureLoaded();
+        _nearestUpsampleKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(NearestUpsample4DImpl);
+
+        // For 4D NCHW: C = product of all dims except last 2
+        int rank = inputShape.Length;
+        int inH = rank >= 2 ? inputShape[rank - 2] : 1;
+        int inW = rank >= 1 ? inputShape[rank - 1] : 1;
+        int outH = rank >= 2 ? outputShape[rank - 2] : 1;
+        int outW = rank >= 1 ? outputShape[rank - 1] : 1;
+        int inC = 1;
+        for (int i = 0; i < rank - 2; i++) inC *= inputShape[i];
+
+        int totalOut = inC * outH * outW;
+
+        _nearestParamsBuf ??= _accelerator.Allocate1D<int>(5);
+        _nearestParamsBuf.CopyFromCPU(new int[] { inC, inH, inW, outH, outW });
+
+        _nearestUpsampleKernel(totalOut, input, output, _nearestParamsBuf.View);
+    }
+
+    /// <summary>
     /// Bilinear upsample [C, inH, inW] → [C, outH, outW]. Align-corners=true.
     /// Matches ONNX Resize with coordinate_transformation_mode=align_corners.
     /// </summary>

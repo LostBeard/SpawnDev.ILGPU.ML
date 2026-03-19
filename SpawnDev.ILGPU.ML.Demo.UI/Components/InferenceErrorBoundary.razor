@@ -1,0 +1,191 @@
+@using Microsoft.AspNetCore.Components.Web
+
+<CascadingValue Value="this">
+    @if (_error != null)
+    {
+        <div class="inference-error">
+            <div class="error-header">
+                <span class="error-icon">&#x26A0;</span>
+                <span class="error-title">Inference Error</span>
+                <button class="error-dismiss" @onclick="Dismiss">&#x2715;</button>
+            </div>
+            <div class="error-message">@_error.Message</div>
+            @if (_showDetails)
+            {
+                <div class="error-details">
+                    <div class="error-type">@_error.GetType().Name</div>
+                    @if (!string.IsNullOrEmpty(_error.StackTrace))
+                    {
+                        <pre class="error-stack">@_error.StackTrace</pre>
+                    }
+                </div>
+            }
+            <div class="error-actions">
+                <button class="error-btn" @onclick="() => _showDetails = !_showDetails">
+                    @(_showDetails ? "Hide Details" : "Show Details")
+                </button>
+                <button class="error-btn error-btn-retry" @onclick="Retry">Retry</button>
+            </div>
+            @if (_suggestion != null)
+            {
+                <div class="error-suggestion">@_suggestion</div>
+            }
+        </div>
+    }
+    else
+    {
+        @ChildContent
+    }
+</CascadingValue>
+
+@code {
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+    [Parameter] public EventCallback OnRetry { get; set; }
+
+    private Exception? _error;
+    private bool _showDetails;
+    private string? _suggestion;
+
+    /// <summary>Call this from child components to report an error.</summary>
+    public void ReportError(Exception ex)
+    {
+        _error = ex;
+        _suggestion = GetSuggestion(ex);
+        _showDetails = false;
+        StateHasChanged();
+    }
+
+    private void Dismiss()
+    {
+        _error = null;
+        _suggestion = null;
+        StateHasChanged();
+    }
+
+    private async Task Retry()
+    {
+        _error = null;
+        _suggestion = null;
+        StateHasChanged();
+        await OnRetry.InvokeAsync();
+    }
+
+    private static string? GetSuggestion(Exception ex)
+    {
+        var msg = ex.Message.ToLowerInvariant();
+
+        if (msg.Contains("operator") && msg.Contains("not supported"))
+            return "This model uses an ONNX operator that isn't implemented yet. Check the Model Inspector (/inspector) to see which operators are needed.";
+
+        if (msg.Contains("out of memory") || msg.Contains("allocation"))
+            return "The model may be too large for your GPU. Try a smaller model variant or close other browser tabs to free memory.";
+
+        if (msg.Contains("shape") || msg.Contains("dimension"))
+            return "The model has a shape mismatch. This may be due to dynamic shapes not being fully supported yet.";
+
+        if (msg.Contains("webgpu") || msg.Contains("device lost"))
+            return "The GPU device was lost. This can happen with large models. Try refreshing the page.";
+
+        if (msg.Contains("network") || msg.Contains("fetch") || msg.Contains("404"))
+            return "Could not load the model. Check your internet connection and verify the model files exist.";
+
+        return null;
+    }
+}
+
+<style>
+    .inference-error {
+        background: rgba(239, 68, 68, 0.08);
+        border: 1px solid rgba(239, 68, 68, 0.25);
+        border-radius: 10px;
+        padding: 1.25rem;
+        margin: 1rem 0;
+    }
+
+    .error-header {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
+    }
+
+    .error-icon { font-size: 1.3rem; }
+    .error-title { color: #fca5a5; font-weight: 700; font-size: 1rem; flex: 1; }
+
+    .error-dismiss {
+        background: none;
+        border: none;
+        color: #94a3b8;
+        cursor: pointer;
+        font-size: 1rem;
+        padding: 0.2rem;
+    }
+
+    .error-message {
+        color: #fca5a5;
+        font-size: 0.9rem;
+        margin-bottom: 0.75rem;
+        line-height: 1.5;
+    }
+
+    .error-details {
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 6px;
+        padding: 0.75rem;
+        margin-bottom: 0.75rem;
+    }
+
+    .error-type {
+        color: #f87171;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+    }
+
+    .error-stack {
+        color: #94a3b8;
+        font-size: 0.7rem;
+        font-family: 'JetBrains Mono', 'Consolas', monospace;
+        max-height: 200px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+        margin: 0;
+    }
+
+    .error-actions {
+        display: flex;
+        gap: 0.5rem;
+    }
+
+    .error-btn {
+        padding: 0.3rem 0.7rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: #94a3b8;
+        font-size: 0.8rem;
+        cursor: pointer;
+    }
+
+    .error-btn:hover { background: rgba(255, 255, 255, 0.1); }
+
+    .error-btn-retry {
+        background: rgba(59, 130, 246, 0.15);
+        border-color: rgba(59, 130, 246, 0.3);
+        color: #93c5fd;
+    }
+
+    .error-btn-retry:hover { background: rgba(59, 130, 246, 0.25); }
+
+    .error-suggestion {
+        margin-top: 0.75rem;
+        padding: 0.5rem 0.75rem;
+        background: rgba(245, 158, 11, 0.08);
+        border: 1px solid rgba(245, 158, 11, 0.2);
+        border-radius: 6px;
+        color: #fbbf24;
+        font-size: 0.82rem;
+        line-height: 1.4;
+    }
+</style>

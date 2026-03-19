@@ -1,0 +1,151 @@
+@page "/image-to-3d"
+
+<PageTitle>Image to 3D — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Image to 3D"
+            Description="Generate a 3D model from a single image. Uses TripoSR or LGM to produce 3D meshes or Gaussian splats directly in the browser."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="TripoSR"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="300">
+
+    <div class="output-format-toggle">
+        <label class="format-label">Output format:</label>
+        <button class="format-btn @(_outputFormat == "mesh" ? "active" : "")" @onclick='() => _outputFormat = "mesh"'>Mesh (OBJ)</button>
+        <button class="format-btn @(_outputFormat == "splats" ? "active" : "")" @onclick='() => _outputFormat = "splats"'>Gaussian Splats</button>
+        <button class="format-btn @(_outputFormat == "pointcloud" ? "active" : "")" @onclick='() => _outputFormat = "pointcloud"'>Point Cloud</button>
+    </div>
+
+    @if (_resultReady)
+    {
+        <div class="result-3d">
+            <div class="viewer-placeholder">
+                <div class="viewer-icon">&#x1F4A0;</div>
+                <p class="viewer-text">3D viewer — rotate with mouse, scroll to zoom</p>
+                <p class="viewer-info">@_vertexCount vertices, @_faceCount faces</p>
+            </div>
+            <div class="result-actions">
+                <button class="action-btn download-btn" @onclick="DownloadMesh">Download @(_outputFormat == "splats" ? ".ply" : ".obj")</button>
+                @if (_outputFormat == "splats")
+                {
+                    <button class="action-btn spawnscene-btn" @onclick="OpenInSpawnScene">Open in SpawnScene</button>
+                }
+                <button class="action-btn clear-btn" @onclick="ClearResult">Try Another Image</button>
+            </div>
+        </div>
+    }
+    else
+    {
+        <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                       OnImageLoaded="@HandleImageLoaded"
+                       SampleImages="@_samples" />
+    }
+
+    @if (_imageDataUrl != null && !_resultReady && _isModelLoaded && !_isRunning)
+    {
+        <button class="run-btn" @onclick="GenerateModel">Generate 3D</button>
+    }
+
+    @if (_isRunning)
+    {
+        <div class="gen-progress">
+            <div class="gen-progress-text">@_statusMessage</div>
+        </div>
+    }
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            <p>Image-to-3D generation requires a 3D reconstruction model (TripoSR ~300MB or LGM ~200MB).</p>
+            <p style="margin-top: 0.5rem;">
+                <strong>Gaussian Splat output</strong> connects directly to
+                <a href="https://github.com/LostBeard/SpawnScene" target="_blank">SpawnScene</a> for browser-based 3D rendering — the full pipeline from photo to interactive 3D scene, powered entirely by SpawnDev libraries.
+            </p>
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .output-format-toggle { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; }
+    .format-label { color: #64748b; font-size: 0.85rem; }
+    .format-btn { padding: 0.3rem 0.7rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: #94a3b8; font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .format-btn.active { background: rgba(139,92,246,0.2); border-color: rgba(139,92,246,0.4); color: #e2e8f0; }
+    .format-btn:hover:not(.active) { background: rgba(255,255,255,0.08); }
+
+    .result-3d { margin: 1rem 0; }
+    .viewer-placeholder {
+        width: 100%;
+        height: 400px;
+        background: rgba(0,0,0,0.3);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 10px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+    }
+    .viewer-icon { font-size: 4rem; opacity: 0.3; margin-bottom: 0.5rem; }
+    .viewer-text { color: #64748b; font-size: 0.9rem; }
+    .viewer-info { color: #475569; font-size: 0.8rem; font-family: monospace; margin-top: 0.25rem; }
+
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; justify-content: center; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .download-btn { border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; }
+    .download-btn:hover { background: rgba(52,211,153,0.2); }
+    .spawnscene-btn { border: 1px solid rgba(139,92,246,0.3); background: rgba(139,92,246,0.1); color: #c4b5fd; }
+    .spawnscene-btn:hover { background: rgba(139,92,246,0.2); }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
+
+    .run-btn { margin-top: 1rem; padding: 0.6rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .run-btn:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+
+    .gen-progress { text-align: center; padding: 1.5rem; }
+    .gen-progress-text { color: #38bdf8; animation: pulse 1.5s ease-in-out infinite; }
+
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; line-height: 1.5; }
+    .model-needed a { color: #38bdf8; text-decoration: none; }
+    .model-needed a:hover { text-decoration: underline; }
+
+    @@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string? _imageDataUrl;
+    private string _outputFormat = "mesh";
+    private bool _resultReady;
+    private int _vertexCount, _faceCount;
+    private string? _statusMessage;
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+    };
+
+    private List<ImageDropZone.SampleImage> _samples = new()
+    {
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Portrait", Url = "samples/portrait.jpg" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task HandleImageLoaded(byte[] imageBytes) { _resultReady = false; return Task.CompletedTask; }
+    private Task GenerateModel() => Task.CompletedTask;
+    private void DownloadMesh() { }
+    private void OpenInSpawnScene() { }
+    private void ClearResult() { _resultReady = false; _imageDataUrl = null; StateHasChanged(); }
+}

@@ -1,0 +1,224 @@
+@using SpawnDev.BlazorJS
+@inject BlazorJSRuntime JS
+
+@if (_isVisible)
+{
+    <div class="share-overlay" @onclick="Close">
+        <div class="share-card" @onclick:stopPropagation @ref="_cardRef">
+            <div class="card-header">
+                <span class="card-logo">SpawnDev.ILGPU.ML</span>
+                <span class="card-backend">@BackendName</span>
+            </div>
+
+            <div class="card-body">
+                @if (!string.IsNullOrEmpty(ImageUrl))
+                {
+                    <img src="@ImageUrl" alt="Result" class="card-image" />
+                }
+
+                <div class="card-result">
+                    @if (!string.IsNullOrEmpty(Title))
+                    {
+                        <div class="card-title">@Title</div>
+                    }
+                    @if (!string.IsNullOrEmpty(ResultText))
+                    {
+                        <div class="card-result-text">@ResultText</div>
+                    }
+                </div>
+            </div>
+
+            <div class="card-footer">
+                <span class="card-time">@InferenceMs.ToString("F1")ms</span>
+                <span class="card-separator">&middot;</span>
+                <span class="card-label">100% in-browser</span>
+                <span class="card-separator">&middot;</span>
+                <span class="card-label">No server</span>
+            </div>
+
+            <div class="card-actions">
+                <button class="share-btn" @onclick="CopyShareText">&#x1F4CB; Copy Text</button>
+                <button class="share-btn" @onclick="Close">Close</button>
+            </div>
+
+            @if (_copied)
+            {
+                <div class="copied-badge">Copied!</div>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    private ElementReference _cardRef;
+    private bool _isVisible;
+    private bool _copied;
+
+    [Parameter] public string? Title { get; set; }
+    [Parameter] public string? ResultText { get; set; }
+    [Parameter] public string? ImageUrl { get; set; }
+    [Parameter] public string BackendName { get; set; } = "WebGPU";
+    [Parameter] public double InferenceMs { get; set; }
+    [Parameter] public string DemoName { get; set; } = "";
+
+    public void Show()
+    {
+        _isVisible = true;
+        _copied = false;
+        StateHasChanged();
+    }
+
+    private void Close()
+    {
+        _isVisible = false;
+        StateHasChanged();
+    }
+
+    private async Task CopyShareText()
+    {
+        var text = $"{DemoName} — {ResultText}\n" +
+                   $"{InferenceMs:F1}ms on {BackendName}\n" +
+                   $"100% in-browser, no server, no cloud\n" +
+                   $"Powered by SpawnDev.ILGPU.ML\n" +
+                   $"https://github.com/LostBeard/SpawnDev.ILGPU.ML";
+
+        try
+        {
+            using var navigator = JS.Get<SpawnDev.BlazorJS.JSObjects.Navigator>("navigator");
+            using var clipboard = navigator.Clipboard;
+            await clipboard.WriteText(text);
+            _copied = true;
+            StateHasChanged();
+        }
+        catch { }
+    }
+}
+
+<style>
+    .share-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.7);
+        backdrop-filter: blur(4px);
+        z-index: 200;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .share-card {
+        width: 400px;
+        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+        border: 1px solid rgba(139, 92, 246, 0.3);
+        border-radius: 16px;
+        overflow: hidden;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    }
+
+    .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .card-logo {
+        color: #c4b5fd;
+        font-size: 0.85rem;
+        font-weight: 700;
+    }
+
+    .card-backend {
+        color: #38bdf8;
+        font-size: 0.75rem;
+        font-weight: 600;
+        padding: 0.15rem 0.5rem;
+        background: rgba(56, 189, 248, 0.1);
+        border-radius: 4px;
+    }
+
+    .card-body {
+        padding: 1rem;
+    }
+
+    .card-image {
+        width: 100%;
+        border-radius: 8px;
+        margin-bottom: 0.75rem;
+    }
+
+    .card-title {
+        color: #f1f5f9;
+        font-size: 1.1rem;
+        font-weight: 700;
+        margin-bottom: 0.3rem;
+    }
+
+    .card-result-text {
+        color: #94a3b8;
+        font-size: 0.9rem;
+        line-height: 1.5;
+    }
+
+    .card-footer {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        padding: 0.6rem 1rem;
+        background: rgba(0, 0, 0, 0.2);
+    }
+
+    .card-time {
+        color: #34d399;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.85rem;
+        font-weight: 700;
+    }
+
+    .card-separator { color: #334155; }
+
+    .card-label {
+        color: #64748b;
+        font-size: 0.78rem;
+    }
+
+    .card-actions {
+        display: flex;
+        gap: 0.5rem;
+        padding: 0.75rem 1rem;
+        justify-content: center;
+    }
+
+    .share-btn {
+        padding: 0.4rem 0.8rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.05);
+        color: #94a3b8;
+        font-size: 0.82rem;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+
+    .share-btn:hover {
+        background: rgba(139, 92, 246, 0.15);
+        border-color: rgba(139, 92, 246, 0.3);
+        color: #e2e8f0;
+    }
+
+    .copied-badge {
+        text-align: center;
+        padding: 0.3rem;
+        color: #34d399;
+        font-size: 0.8rem;
+        animation: fadeout 2s forwards;
+    }
+
+    @@keyframes fadeout {
+        0% { opacity: 1; }
+        80% { opacity: 1; }
+        100% { opacity: 0; }
+    }
+</style>

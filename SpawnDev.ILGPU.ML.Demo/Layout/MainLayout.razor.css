@@ -77,3 +77,52 @@ main {
         padding-right: 1.5rem !important;
     }
 }
+
+.global-footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    padding-bottom: 1rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    text-align: center;
+    font-size: 0.8rem;
+}
+
+.footer-ecosystem {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    margin-bottom: 0.3rem;
+    flex-wrap: wrap;
+}
+
+.footer-label {
+    color: #475569;
+}
+
+.footer-ecosystem a {
+    color: #64748b;
+    text-decoration: none;
+}
+
+.footer-ecosystem a:hover {
+    color: #94a3b8;
+    text-decoration: underline;
+}
+
+.footer-dot {
+    color: #334155;
+}
+
+.footer-credit {
+    color: #334155;
+}
+
+.footer-credit a {
+    color: #475569;
+    text-decoration: none;
+}
+
+.footer-credit a:hover {
+    text-decoration: underline;
+}

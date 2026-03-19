@@ -1,0 +1,137 @@
+@page "/text-gen"
+
+<PageTitle>Text Generation — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Text Generation"
+            Description="Generate text with GPT-2 or other language models. Runs entirely in your browser — your text never leaves your device."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="GPT-2 Small"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="240">
+
+    <div class="textgen-input">
+        <label class="textgen-label">Prompt:</label>
+        <textarea class="textgen-textarea" @bind="_prompt" rows="3"
+                  placeholder="Once upon a time, in a land far away..."></textarea>
+    </div>
+
+    <div class="textgen-settings">
+        <div class="setting">
+            <label>Max tokens:</label>
+            <input type="number" min="10" max="500" @bind="_maxTokens" class="setting-input" />
+        </div>
+        <div class="setting">
+            <label>Temperature:</label>
+            <input type="number" min="0.1" max="2.0" step="0.1" @bind="_temperature" class="setting-input" />
+        </div>
+        <div class="setting">
+            <label>Strategy:</label>
+            <select @bind="_strategy" class="setting-select">
+                <option value="greedy">Greedy</option>
+                <option value="top_k">Top-K</option>
+                <option value="top_p">Top-P</option>
+            </select>
+        </div>
+        @if (_strategy == "top_k")
+        {
+            <div class="setting">
+                <label>K:</label>
+                <input type="number" min="1" max="100" @bind="_topK" class="setting-input" />
+            </div>
+        }
+        @if (_strategy == "top_p")
+        {
+            <div class="setting">
+                <label>P:</label>
+                <input type="number" min="0.1" max="1.0" step="0.05" @bind="_topP" class="setting-input" />
+            </div>
+        }
+    </div>
+
+    <button class="run-btn" @onclick="Generate" disabled="@(!_isModelLoaded || _isRunning || string.IsNullOrWhiteSpace(_prompt))">
+        @(_isRunning ? $"Generating ({_tokensGenerated} tokens)..." : "Generate")
+    </button>
+
+    @if (!string.IsNullOrEmpty(_output))
+    {
+        <div class="textgen-output">
+            <div class="output-header">
+                <span class="output-label">Generated Text</span>
+                <span class="output-stats">@_tokensGenerated tokens, @_inferenceMs.ToString("F0")ms (@((_tokensGenerated / (_inferenceMs / 1000.0)).ToString("F1")) tok/s)</span>
+            </div>
+            <div class="output-text">
+                <span class="output-prompt">@_prompt</span><span class="output-generated">@_generatedText</span>
+            </div>
+        </div>
+    }
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            Text generation requires a language model (GPT-2 Small ~240MB). This demo will be enabled once the KV cache and autoregressive generation pipeline are integrated. Tokenizer and sampling strategies (greedy, top-K, top-P) are already built.
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .textgen-input { margin-bottom: 0.75rem; }
+    .textgen-label { color: #94a3b8; font-size: 0.85rem; display: block; margin-bottom: 0.4rem; }
+    .textgen-textarea { width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.95rem; font-family: inherit; resize: vertical; }
+    .textgen-textarea:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .textgen-textarea::placeholder { color: #475569; }
+
+    .textgen-settings { display: flex; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .setting { display: flex; align-items: center; gap: 0.3rem; }
+    .setting label { color: #64748b; font-size: 0.8rem; }
+    .setting-input { width: 65px; padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.8rem; text-align: center; }
+    .setting-select { padding: 0.3rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.8rem; }
+    .setting-select option { background: #1e293b; }
+
+    .run-btn { padding: 0.6rem 1.5rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .run-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59,130,246,0.3); }
+    .run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .textgen-output { margin-top: 1.5rem; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 1.25rem; }
+    .output-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem; }
+    .output-label { color: #94a3b8; font-size: 0.85rem; font-weight: 600; }
+    .output-stats { color: #64748b; font-size: 0.8rem; font-family: monospace; }
+    .output-text { color: #e2e8f0; font-size: 1rem; line-height: 1.7; white-space: pre-wrap; }
+    .output-prompt { color: #94a3b8; }
+    .output-generated { color: #38bdf8; }
+
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _prompt = "";
+    private string _output = "";
+    private string _generatedText = "";
+    private int _maxTokens = 100;
+    private float _temperature = 0.7f;
+    private string _strategy = "top_p";
+    private int _topK = 50;
+    private float _topP = 0.9f;
+    private int _tokensGenerated;
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task Generate() => Task.CompletedTask;
+}

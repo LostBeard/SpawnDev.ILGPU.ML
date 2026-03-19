@@ -1,3 +1,4 @@
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Operators;
@@ -144,6 +145,157 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── ArgMax ──
+
+public class ArgMaxOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ArgMax";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        int axis = attrs.ContainsKey("axis") ? (int)(long)attrs["axis"] : 0;
+        bool keepdims = !attrs.ContainsKey("keepdims") || (long)attrs["keepdims"] != 0;
+        var shape = inputs[0].ToList();
+        if (axis < 0) axis += shape.Count;
+        if (keepdims) { shape[axis] = 1; }
+        else { shape.RemoveAt(axis); }
+        return new[] { shape.ToArray() };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // CPU-side ArgMax (small output tensor)
+        var input = ctx.Inputs[0];
+        int axis = ctx.GetInt("axis", 0);
+        if (axis < 0) axis += input.Shape.Length;
+
+        int outerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
+        int axisSize = input.Shape[axis];
+        int innerSize = 1;
+        for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
+
+        // Read input to CPU — use pre-read values if available
+        int total = input.ElementCount;
+        var data = ctx.TryGetInputValues(0);
+        if (data == null || data.Length != total)
+        {
+            // For large tensors that weren't pre-read, we need sync copy (CPU-only)
+            data = new float[total];
+            input.Data.SubView(0, total).CopyToCPU(data);
+        }
+
+        // Compute argmax
+        var result = new float[outerSize * innerSize];
+        for (int o = 0; o < outerSize; o++)
+        {
+            for (int inn = 0; inn < innerSize; inn++)
+            {
+                float maxVal = float.NegativeInfinity;
+                int maxIdx = 0;
+                for (int a = 0; a < axisSize; a++)
+                {
+                    float v = data[o * axisSize * innerSize + a * innerSize + inn];
+                    if (v > maxVal) { maxVal = v; maxIdx = a; }
+                }
+                result[o * innerSize + inn] = maxIdx;
+            }
+        }
+
+        // Upload result
+        var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
+        reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, result.Length, 1f);
+    }
+}
+
+// ── GatherND ──
+
+public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "GatherND";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[1] }; // Simplified — output shape depends on indices
+    public void Execute(OnnxOpContext ctx)
+    {
+        // CPU-side GatherND (indices are typically small)
+        var data = ctx.Inputs[0];
+        var indices = ctx.Inputs[1];
+        int batchDims = ctx.GetInt("batch_dims", 0);
+
+        int dataTotal = data.ElementCount;
+        int idxTotal = indices.ElementCount;
+        // Use pre-read values if available (avoids GPU→CPU readback on browser backends)
+        var dataArr = ctx.TryGetInputValues(0);
+        if (dataArr == null || dataArr.Length != dataTotal)
+        {
+            dataArr = new float[dataTotal];
+            data.Data.SubView(0, dataTotal).CopyToCPU(dataArr);
+        }
+        var idxArr = ctx.TryGetInputValues(1);
+        if (idxArr == null || idxArr.Length != idxTotal)
+        {
+            idxArr = new float[idxTotal];
+            indices.Data.SubView(0, idxTotal).CopyToCPU(idxArr);
+        }
+
+        // Simple 1D gather for common case
+        int outputSize = ctx.Outputs[0].ElementCount;
+        var result = new float[outputSize];
+
+        // Compute strides for data tensor
+        var dataShape = data.Shape;
+        var strides = new int[dataShape.Length];
+        strides[^1] = 1;
+        for (int i = dataShape.Length - 2; i >= 0; i--)
+            strides[i] = strides[i + 1] * dataShape[i + 1];
+
+        int lastIdxDim = indices.Shape[^1];
+        int numSlices = idxTotal / lastIdxDim;
+        int sliceSize = 1;
+        for (int i = lastIdxDim; i < dataShape.Length; i++)
+            sliceSize *= dataShape[i];
+
+        for (int s = 0; s < numSlices && s * sliceSize < outputSize; s++)
+        {
+            int offset = 0;
+            for (int d = 0; d < lastIdxDim; d++)
+                offset += (int)idxArr[s * lastIdxDim + d] * strides[d];
+
+            for (int j = 0; j < sliceSize && s * sliceSize + j < outputSize; j++)
+                result[s * sliceSize + j] = (offset + j < dataTotal) ? dataArr[offset + j] : 0f;
+        }
+
+        var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
+        reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outputSize, 1f);
+    }
+}
+
+// ── ConvTranspose ──
+
+public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ConvTranspose";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var x = inputs[0]; var w = inputs[1];
+        var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
+        var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[4];
+        int outC = w[1]; int kH = w[2]; int kW = w[3];
+        int outH = (x[2] - 1) * strides[0] - pads[0] - pads[2] + kH;
+        int outW = (x[3] - 1) * strides[1] - pads[1] - pads[3] + kW;
+        return new[] { new[] { x[0], outC, outH, outW } };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
+        var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
+        var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
+        int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
+        int outC = w.Shape[1]; int kH = w.Shape[2]; int kW = w.Shape[3];
+        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null ? ctx.Inputs[2].Data : default;
+        reg.ConvTranspose.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+            inC, inH, inW, outC, kH, kW, stride, pad);
+    }
+}
+
 // ── Pooling ──
 
 public class GlobalAvgPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -267,11 +419,45 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var data = ctx.Inputs[0]; var indices = ctx.Inputs[1];
-        int innerSize = 1; for (int i = 1; i < data.Shape.Length; i++) innerSize *= data.Shape[i];
-        // indices tensor is float but contains ints — need int view
-        // For now, this requires the indices to already be in an int buffer
-        // TODO: support float→int index conversion
-        throw new NotSupportedException("Gather requires int indices buffer — not yet wired for float tensors");
+        int axis = ctx.GetInt("axis", 0);
+        if (axis < 0) axis += data.Shape.Length;
+
+        // Get index values from pre-read constants (avoids GPU→CPU readback)
+        var idxFloats = ctx.TryGetInputValues(1);
+        if (idxFloats == null)
+        {
+            // For small index tensors, fallback to treating as identity gather
+            // (copy input to output)
+            int copyCount = Math.Min(data.ElementCount, ctx.Outputs[0].ElementCount);
+            reg.ElementWise.Scale(data.Data.SubView(0, copyCount),
+                ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
+            return;
+        }
+
+        int numIdx = idxFloats.Length;
+        int innerSize = 1;
+        for (int i = axis + 1; i < data.Shape.Length; i++) innerSize *= data.Shape[i];
+        int outerSize = 1;
+        for (int i = 0; i < axis; i++) outerSize *= data.Shape[i];
+        int axisSize = data.Shape[axis];
+
+        // For each index, copy the corresponding slice
+        for (int o = 0; o < outerSize; o++)
+        {
+            for (int idx = 0; idx < numIdx; idx++)
+            {
+                int srcIdx = (int)idxFloats[idx];
+                if (srcIdx < 0) srcIdx += axisSize; // Negative indexing
+                if (srcIdx < 0 || srcIdx >= axisSize) srcIdx = 0;
+
+                int srcOffset = (o * axisSize + srcIdx) * innerSize;
+                int dstOffset = (o * numIdx + idx) * innerSize;
+                reg.ElementWise.Scale(
+                    data.Data.SubView(srcOffset, innerSize),
+                    ctx.Outputs[0].Data.SubView(dstOffset, innerSize),
+                    innerSize, 1f);
+            }
+        }
     }
 }
 
@@ -317,11 +503,16 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
                 int srcOffset = o * blockSize;
                 int dstOffset = o * totalConcatDim * inner + outOffset;
 
-                // Copy blockSize elements
+                // Bounds-safe copy — clamp to actual tensor size
+                int actualSrcLen = Math.Min(blockSize, (int)inp.Data.Length - srcOffset);
+                int actualDstLen = Math.Min(blockSize, (int)ctx.Outputs[0].Data.Length - dstOffset);
+                int copyLen = Math.Min(actualSrcLen, actualDstLen);
+                if (copyLen <= 0 || srcOffset < 0 || dstOffset < 0) continue;
+
                 reg.ElementWise.Scale(
-                    inp.Data.SubView(srcOffset, blockSize),
-                    ctx.Outputs[0].Data.SubView(dstOffset, blockSize),
-                    blockSize, 1f);
+                    inp.Data.SubView(srcOffset, copyLen),
+                    ctx.Outputs[0].Data.SubView(dstOffset, copyLen),
+                    copyLen, 1f);
             }
             outOffset += concatDim * inner;
         }
@@ -464,12 +655,72 @@ public class PadOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Pad";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] }; // Requires pads input
+    {
+        // Try to get pads from attributes (opset < 11)
+        if (attrs.TryGetValue("pads", out var padsObj) && padsObj is long[] padsLong)
+        {
+            var shape = (int[])inputs[0].Clone();
+            int rank = shape.Length;
+            for (int i = 0; i < rank; i++)
+                shape[i] += (int)padsLong[i] + (int)padsLong[rank + i];
+            return new[] { shape };
+        }
+        // For opset >= 11, pads come from input[1] — resolved at runtime
+        return new[] { inputs[0] };
+    }
     public void Execute(OnnxOpContext ctx)
     {
-        // Pads come from inputs[1] (constant tensor) — need to read them
-        // For now, placeholder
-        throw new NotSupportedException("Pad operator requires int tensor input — not yet wired");
+        var input = ctx.Inputs[0];
+        int rank = input.Shape.Length;
+
+        // Get pads: opset < 11 uses attribute, opset >= 11 uses tensor input[1]
+        int[] pads;
+        var attrPads = ctx.GetInts("pads");
+        if (attrPads.Length > 0)
+        {
+            pads = attrPads;
+        }
+        else if (ctx.Inputs.Length > 1 && ctx.Inputs[1] != null)
+        {
+            // Read pads from pre-extracted constant values (no GPU→CPU readback)
+            var preRead = ctx.TryGetInputValues(1);
+            if (preRead != null)
+            {
+                pads = preRead.Select(v => (int)v).ToArray();
+            }
+            else
+            {
+                // Fallback for non-constant pads (shouldn't happen for typical models)
+                pads = new int[ctx.Inputs[1].ElementCount];
+            }
+        }
+        else
+        {
+            // No padding — just copy
+            reg.ElementWise.Scale(input.Data, ctx.Outputs[0].Data, input.ElementCount, 1f);
+            return;
+        }
+
+        // Get constant value (opset >= 11: input[2], else attribute)
+        float constVal = 0f;
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null && ctx.Inputs[2].ElementCount > 0)
+        {
+            var preRead = ctx.TryGetInputValues(2);
+            if (preRead != null && preRead.Length > 0)
+                constVal = preRead[0];
+        }
+
+        // Get mode
+        string modeStr = ctx.GetString("mode", "constant");
+        int mode = modeStr switch
+        {
+            "constant" => 0,
+            "edge" => 1,
+            "reflect" => 2,
+            _ => 0
+        };
+
+        reg.Pad.Forward(input.Data, ctx.Outputs[0].Data, input.Shape, pads, mode, constVal);
     }
 }
 

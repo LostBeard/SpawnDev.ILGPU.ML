@@ -1,0 +1,174 @@
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@inject BlazorJSRuntime JS
+@implements IDisposable
+
+@* Invisible component — handles keyboard shortcuts globally *@
+
+@if (_showHelp)
+{
+    <div class="shortcuts-overlay" @onclick="() => _showHelp = false">
+        <div class="shortcuts-modal" @onclick:stopPropagation>
+            <div class="shortcuts-header">
+                <h3>Keyboard Shortcuts</h3>
+                <button class="shortcuts-close" @onclick="() => _showHelp = false">&times;</button>
+            </div>
+            <div class="shortcuts-list">
+                <div class="shortcut-row"><kbd>?</kbd><span>Show this help</span></div>
+                <div class="shortcut-row"><kbd>V</kbd><span>Toggle voice commands</span></div>
+                <div class="shortcut-row"><kbd>Esc</kbd><span>Close dialogs / clear results</span></div>
+            </div>
+            <div class="shortcuts-hint">Press <kbd>?</kbd> anywhere to see shortcuts</div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public EventCallback OnVoiceToggle { get; set; }
+    [Parameter] public EventCallback OnEscape { get; set; }
+
+    private bool _showHelp;
+    private Action<KeyboardEvent>? _keyHandler;
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender)
+        {
+            // Listen for keydown on document
+            try
+            {
+                using var document = JS.Get<Document>("document");
+                _keyHandler = HandleKeyDown;
+                document.OnKeyDown += _keyHandler;
+            }
+            catch { }
+        }
+    }
+
+    private void HandleKeyDown(KeyboardEvent e)
+    {
+        // Don't trigger shortcuts when typing in inputs
+        var tagName = e.Target?.JSRef?.Get<string>("tagName") ?? "";
+        if (tagName == "INPUT" || tagName == "TEXTAREA" || tagName == "SELECT")
+        {
+            e.Dispose();
+            return;
+        }
+
+        var key = e.Key;
+
+        switch (key)
+        {
+            case "?":
+                _showHelp = !_showHelp;
+                InvokeAsync(StateHasChanged);
+                break;
+            case "v":
+            case "V":
+                OnVoiceToggle.InvokeAsync();
+                break;
+            case "Escape":
+                _showHelp = false;
+                OnEscape.InvokeAsync();
+                InvokeAsync(StateHasChanged);
+                break;
+        }
+
+        e.Dispose();
+    }
+
+    public void Dispose()
+    {
+        if (_keyHandler != null)
+        {
+            try
+            {
+                using var document = JS.Get<Document>("document");
+                document.OnKeyDown -= _keyHandler;
+            }
+            catch { }
+        }
+    }
+}
+
+<style>
+    .shortcuts-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.6);
+        backdrop-filter: blur(4px);
+        z-index: 200;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .shortcuts-modal {
+        background: #1e293b;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 12px;
+        padding: 1.5rem;
+        min-width: 320px;
+        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    .shortcuts-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 1rem;
+    }
+
+    .shortcuts-header h3 {
+        color: #f1f5f9;
+        font-size: 1.1rem;
+        margin: 0;
+    }
+
+    .shortcuts-close {
+        background: none;
+        border: none;
+        color: #64748b;
+        font-size: 1.3rem;
+        cursor: pointer;
+    }
+
+    .shortcuts-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+    }
+
+    .shortcut-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+    }
+
+    kbd {
+        display: inline-block;
+        padding: 0.2rem 0.5rem;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 4px;
+        color: #e2e8f0;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.8rem;
+        min-width: 28px;
+        text-align: center;
+    }
+
+    .shortcut-row span {
+        color: #94a3b8;
+        font-size: 0.85rem;
+    }
+
+    .shortcuts-hint {
+        margin-top: 1rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid rgba(255, 255, 255, 0.06);
+        color: #475569;
+        font-size: 0.78rem;
+        text-align: center;
+    }
+</style>

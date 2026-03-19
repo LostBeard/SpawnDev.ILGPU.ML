@@ -114,27 +114,56 @@ public class MaxOnnxOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-/// <summary>Upsample: resize using nearest or linear mode.</summary>
+/// <summary>Upsample: resize using nearest or linear mode. Scales from second input.</summary>
 public class UpsampleOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Upsample";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] };
+        => new[] { inputs[0] }; // Actual shape depends on scales tensor — resolved at runtime
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Upsample not yet implemented — need scales tensor readback");
+        var input = ctx.Inputs[0];
+        var output = ctx.Outputs[0];
+        string mode = ctx.GetString("mode", "nearest");
+
+        // For nearest mode: each output element copies from the nearest input element
+        // Output shape should already be allocated by the executor based on compiled shapes
+        if (mode == "nearest")
+        {
+            // Use the Resize operator's nearest-neighbor implementation
+            reg.ElementWise.NearestUpsample(input.Data, output.Data,
+                input.Shape, output.Shape);
+        }
+        else
+        {
+            // Linear mode — use bilinear upsample
+            int inH = input.Shape.Length >= 4 ? input.Shape[2] : input.Shape[0];
+            int inW = input.Shape.Length >= 4 ? input.Shape[3] : input.Shape[1];
+            int outH = output.Shape.Length >= 4 ? output.Shape[2] : output.Shape[0];
+            int outW = output.Shape.Length >= 4 ? output.Shape[3] : output.Shape[1];
+            int channels = input.ElementCount / (inH * inW);
+            reg.ElementWise.BilinearUpsample(input.Data, output.Data,
+                channels, inH, inW, outH, outW);
+        }
     }
 }
 
-/// <summary>Shape: outputs the shape of the input as a 1D int64 tensor. TODO: needs int64 support.</summary>
-public class ShapeOperator : IOnnxOperator
+/// <summary>Shape: outputs the shape of the input as a 1D tensor of dimension values (stored as float).</summary>
+public class ShapeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Shape";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { new[] { inputs[0].Length } };
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Shape operator requires int64 tensor output — not yet implemented");
+        // Output the input's shape dimensions as float values via a temporary GPU buffer
+        var shape = ctx.Inputs[0].Shape;
+        var shapeData = new float[shape.Length];
+        for (int i = 0; i < shape.Length; i++)
+            shapeData[i] = shape[i];
+        // Upload via pool
+        var temp = ctx.Pool.AllocatePermanent(shapeData, new[] { shape.Length });
+        reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, shape.Length, 1f);
     }
 }
 

@@ -27,12 +27,27 @@
         <div class="classify-results">
             <ConfidenceBars Predictions="@_predictions" MaxItems="5" />
 
+            @if (_predictions?.Any() == true)
+            {
+                <div class="result-actions">
+                    <button class="action-btn share-action-btn" @onclick="ShowShare">&#x1F4E4; Share Result</button>
+                </div>
+            }
+
             @if (_isModelLoaded && _predictions?.Any() != true && _imageDataUrl != null)
             {
                 <button class="run-btn" @onclick="RunInference">Classify</button>
             }
         </div>
     </div>
+
+    <ShareCard @ref="_shareCard"
+               DemoName="Image Classification"
+               Title="@(_predictions?.FirstOrDefault()?.Label ?? "")"
+               ResultText="@GetShareResultText()"
+               BackendName="@_selectedBackend"
+               InferenceTimeMs="@_inferenceMs"
+               ImageUrl="@_imageDataUrl" />
 
     @if (_isModelLoaded && _raceResults?.Any() == true)
     {
@@ -53,6 +68,8 @@
             <button class="copy-results-btn" @onclick="CopyRaceResults">Copy Results</button>
         </div>
     }
+
+    <PrivacyBadge />
 
 </DemoLayout>
 
@@ -158,6 +175,11 @@
         color: #e2e8f0;
     }
 
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
+    .action-btn { padding: 0.4rem 0.8rem; border-radius: 6px; font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .share-action-btn { border: 1px solid rgba(139,92,246,0.3); background: rgba(139,92,246,0.1); color: #c4b5fd; }
+    .share-action-btn:hover { background: rgba(139,92,246,0.2); }
+
     @@media (max-width: 640px) {
         .classify-layout {
             grid-template-columns: 1fr;
@@ -190,6 +212,16 @@
         new() { Label = "Dog", Url = "samples/dog.jpg" },
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
+
+    private ShareCard? _shareCard;
+
+    private void ShowShare() => _shareCard?.Show();
+
+    private string GetShareResultText()
+    {
+        if (_predictions == null || _predictions.Count == 0) return "";
+        return string.Join(", ", _predictions.Take(3).Select(p => $"{p.Label} ({p.Confidence:P0})"));
+    }
 
     private class RaceResult
     {

@@ -21,6 +21,15 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense>,
         int, float>? _rmsNormKernel;
 
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, float>? _instanceNormMeanVarKernel;
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _instanceNormApplyKernel;
+
     private MemoryBuffer1D<int, Stride1D.Dense>? _bnParams;
 
     public NormalizationKernels(Accelerator accelerator) => _accelerator = accelerator;
@@ -74,31 +83,23 @@ public class NormalizationKernels
             output[offset + i] = input[offset + i] * invRms * weight[i];
     }
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _instanceNormKernel;
-
     /// <summary>
-    /// InstanceNorm: normalize each (N, C) slice independently over spatial dims.
-    /// One thread per element. params: [N, C, spatial]
+    /// InstanceNorm Pass 1: compute mean and invStd per (N,C) slice.
+    /// One thread per slice. Each thread loops over spatial once for mean, once for variance.
+    /// Output: means[N*C] and invStds[N*C].
     /// </summary>
-    private static void InstanceNormImpl(Index1D idx,
+    private static void InstanceNormMeanVarImpl(Index1D sliceIdx,
         ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<float, Stride1D.Dense> scale,
-        ArrayView1D<float, Stride1D.Dense> bias,
-        ArrayView1D<int, Stride1D.Dense> p)
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int spatial, float eps)
     {
-        int C = p[1]; int spatial = p[2];
-        float eps = 1e-5f;
-        int c = (idx / spatial) % C;
-        int ncBase = (idx / spatial / C) * C * spatial + c * spatial;
-
-        // Compute mean and variance for this (n, c) slice
+        int ncBase = sliceIdx * spatial;
         float sum = 0f;
         for (int i = 0; i < spatial; i++)
             sum += input[ncBase + i];
         float mean = sum / spatial;
+        means[sliceIdx] = mean;
 
         float varSum = 0f;
         for (int i = 0; i < spatial; i++)
@@ -106,9 +107,26 @@ public class NormalizationKernels
             float d = input[ncBase + i] - mean;
             varSum += d * d;
         }
-        float invStd = 1f / MathF.Sqrt(varSum / spatial + eps);
+        invStds[sliceIdx] = 1f / MathF.Sqrt(varSum / spatial + eps);
+    }
 
-        output[idx] = scale[c] * (input[idx] - mean) * invStd + bias[c];
+    /// <summary>
+    /// InstanceNorm Pass 2: apply normalization using pre-computed mean/invStd.
+    /// One thread per element. No loops — O(1) per thread.
+    /// </summary>
+    private static void InstanceNormApplyImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> scale,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int C = p[1]; int spatial = p[2];
+        int c = (idx / spatial) % C;
+        int sliceIdx = idx / spatial;
+        output[idx] = scale[c] * (input[idx] - means[sliceIdx]) * invStds[sliceIdx] + bias[c];
     }
 
     // ── Public API ──
@@ -147,6 +165,11 @@ public class NormalizationKernels
     /// InstanceNorm: normalize each (N, C) slice over spatial dims.
     /// Input: [N, C, H, W]. scale, bias: [C].
     /// </summary>
+    /// <summary>
+    /// InstanceNorm: two-pass approach (O(N) instead of O(N²)).
+    /// Pass 1: compute mean + invStd per (N,C) slice (N*C threads, each loops spatial).
+    /// Pass 2: normalize each element (N*C*spatial threads, no loops).
+    /// </summary>
     public void InstanceNorm(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> scale,
@@ -154,10 +177,31 @@ public class NormalizationKernels
         int N, int C, int spatial)
     {
         EnsureLoaded();
+        int numSlices = N * C;
+
+        // Allocate temp buffers for means and invStds
+        if (_inMeans == null || _inMeans.Length < numSlices)
+        {
+            _inMeans?.Dispose();
+            _inMeans = _accelerator.Allocate1D<float>(numSlices);
+        }
+        if (_inInvStds == null || _inInvStds.Length < numSlices)
+        {
+            _inInvStds?.Dispose();
+            _inInvStds = _accelerator.Allocate1D<float>(numSlices);
+        }
+
+        // Pass 1: compute mean + invStd per slice
+        _instanceNormMeanVarKernel!(numSlices, input, _inMeans.View, _inInvStds.View, spatial, 1e-5f);
+
+        // Pass 2: apply normalization
         _bnParams ??= _accelerator.Allocate1D<int>(3);
         _bnParams.CopyFromCPU(new int[] { N, C, spatial });
-        _instanceNormKernel!(N * C * spatial, input, output, scale, bias, _bnParams.View);
+        _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, _inMeans.View, _inInvStds.View, _bnParams.View);
     }
+
+    private MemoryBuffer1D<float, Stride1D.Dense>? _inMeans;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _inInvStds;
 
     private void EnsureLoaded()
     {
@@ -167,10 +211,15 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(BatchNormImpl);
-        _instanceNormKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+        _instanceNormMeanVarKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int, float>(InstanceNormMeanVarImpl);
+        _instanceNormApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(InstanceNormImpl);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(InstanceNormApplyImpl);
         _rmsNormKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

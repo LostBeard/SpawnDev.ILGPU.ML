@@ -14,7 +14,16 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
     /// </summary>
     public class WebGLTests : MLTestBase
     {
+        private readonly System.Net.Http.HttpClient _http;
+
+        public WebGLTests(System.Net.Http.HttpClient http)
+        {
+            _http = http;
+        }
+
         protected override string BackendName => "WebGL";
+
+        protected override System.Net.Http.HttpClient? GetHttpClient() => _http;
 
         protected override async Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
         {

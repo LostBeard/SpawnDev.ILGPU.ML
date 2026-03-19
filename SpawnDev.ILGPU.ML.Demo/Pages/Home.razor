@@ -15,16 +15,20 @@
             No ONNX Runtime, no JavaScript, no native binaries.
         </p>
         <div class="hero-buttons">
-            <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML" target="_blank" class="btn btn-primary btn-lg">
+            <a href="getting-started" class="btn btn-primary btn-lg">
+                Get Started
+            </a>
+            <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML" target="_blank" class="btn btn-secondary btn-lg">
                 GitHub
             </a>
-            <a href="https://www.nuget.org/packages/SpawnDev.ILGPU.ML" target="_blank" class="btn btn-secondary btn-lg">
-                NuGet
+            <a href="benchmark" class="btn btn-secondary btn-lg">
+                Benchmark
             </a>
-            <a href="tests" class="btn btn-secondary btn-lg">
-                Run Tests
+            <a href="inspector" class="btn btn-secondary btn-lg">
+                Inspect Model
             </a>
         </div>
+        <p class="hero-voice-hint">Try saying "Computer, classify this image" on any demo page &#x1F3A4;</p>
     </div>
 </div>
 
@@ -111,15 +115,15 @@
         </div>
         <div class="feature-card">
             <h3>Activations</h3>
-            <p>GELU (erf-based with overflow clamping) and ReLU. Both standard and in-place variants to minimize buffer allocations.</p>
+            <p>GELU, ReLU, Sigmoid, Tanh, SiLU, LeakyReLU, HardSigmoid, HardSwish, ELU — with in-place variants to minimize allocations.</p>
         </div>
         <div class="feature-card">
-            <h3>Multi-Head Attention</h3>
-            <p>Full MHSA pipeline: QKV split, batched Q*K^T, softmax, attention*V, head merge. Configurable head count and dimension.</p>
+            <h3>69 ONNX Operators</h3>
+            <p>Full operator registry supporting classification, depth estimation, style transfer, super resolution, and more. Direct .onnx file loading with zero-dependency protobuf parser.</p>
         </div>
         <div class="feature-card">
-            <h3>Transformer Block</h3>
-            <p>Complete Vision Transformer block with pre-LayerNorm, multi-head self-attention, MLP, residual connections, and LayerScale.</p>
+            <h3>Preprocessing Toolkit</h3>
+            <p>Image decode, color conversion, EXIF orientation, audio FFT + mel spectrogram, BPE tokenizer, YOLO NMS, depth colormaps — all built in.</p>
         </div>
     </div>
 </div>
@@ -132,35 +136,47 @@
     <div class="roadmap-grid">
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
-            <div class="roadmap-label">Cross-backend kernel migration</div>
+            <div class="roadmap-label">Cross-backend migration (all 6 backends)</div>
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
-            <div class="roadmap-label">PlaywrightMultiTest infrastructure</div>
+            <div class="roadmap-label">PlaywrightMultiTest (356 tests across 6 backends)</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">Tensor abstraction, buffer pool, graph compiler</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">69 ONNX operators + InferenceSession API</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">Direct .onnx loading (zero-dependency parser)</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">Classification, Style Transfer, Super Resolution pipelines</div>
         </div>
         <div class="roadmap-item active">
             <div class="roadmap-status">Active</div>
-            <div class="roadmap-label">Tensor abstraction and buffer pool</div>
+            <div class="roadmap-label">Depth estimation, object detection, pose estimation</div>
+        </div>
+        <div class="roadmap-item active">
+            <div class="roadmap-status">Active</div>
+            <div class="roadmap-label">HuggingFace Hub integration + OPFS caching</div>
         </div>
         <div class="roadmap-item planned">
             <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">Expanded kernel library (~40 new operations)</div>
+            <div class="roadmap-label">NLP pipelines (text classification, embeddings, generation)</div>
         </div>
         <div class="roadmap-item planned">
             <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">ONNX operator registry (~55 ops)</div>
+            <div class="roadmap-label">Audio pipelines (Whisper speech-to-text)</div>
         </div>
         <div class="roadmap-item planned">
             <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">ONNX model loading and graph execution</div>
-        </div>
-        <div class="roadmap-item planned">
-            <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">InferenceSession API</div>
-        </div>
-        <div class="roadmap-item planned">
-            <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">Pipeline abstractions (depth, classification, detection)</div>
+            <div class="roadmap-label">Image generation (Stable Diffusion in-browser)</div>
         </div>
     </div>
 </div>
@@ -225,6 +241,12 @@
         margin: 0 auto 2rem auto;
         color: #64748b;
         line-height: 1.7;
+    }
+
+    .hero-voice-hint {
+        color: #475569;
+        font-size: 0.85rem;
+        margin-top: 1rem;
     }
 
     .hero-description a {

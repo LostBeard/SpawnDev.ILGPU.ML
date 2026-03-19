@@ -29,6 +29,15 @@
                            AfterImageUrl="@_enhancedImageUrl"
                            BeforeLabel="Original"
                            AfterLabel="@($"Enhanced ({_scaleMode})")" />
+
+        <div class="result-actions">
+            <button class="action-btn download-btn" @onclick="DownloadResult">
+                Download Enhanced Image
+            </button>
+            <button class="action-btn clear-btn" @onclick="ClearResult">
+                Try Another Image
+            </button>
+        </div>
     }
     else
     {
@@ -41,6 +50,8 @@
     {
         <button class="run-btn" @onclick="RunSuperRes">Enhance</button>
     }
+
+    <PrivacyBadge />
 
 </DemoLayout>
 
@@ -96,6 +107,13 @@
         transform: translateY(-2px);
         box-shadow: 0 6px 16px rgba(59, 130, 246, 0.3);
     }
+
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease; }
+    .download-btn { border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; }
+    .download-btn:hover { background: rgba(52,211,153,0.2); transform: translateY(-1px); }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
 </style>
 
 @code {

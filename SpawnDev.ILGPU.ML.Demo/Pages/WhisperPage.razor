@@ -1,0 +1,152 @@
+@page "/whisper"
+
+<PageTitle>Speech to Text — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Speech to Text"
+            Description="Transcribe audio using Whisper. Upload an audio file or use your microphone — all processing happens in your browser."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="Whisper Tiny"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="75">
+
+    <div class="whisper-mode-toggle">
+        <button class="mode-btn @(_mode == "file" ? "active" : "")" @onclick='() => _mode = "file"'>Upload Audio</button>
+        <button class="mode-btn @(_mode == "mic" ? "active" : "")" @onclick='() => _mode = "mic"'>Microphone</button>
+    </div>
+
+    @if (_mode == "file")
+    {
+        <div class="audio-upload">
+            <div class="upload-zone">
+                <div class="upload-icon">&#x1F3A4;</div>
+                <p>Drop an audio file (WAV, MP3, OGG)</p>
+                <p class="upload-hint">or click to browse</p>
+                <InputFile OnChange="HandleAudioFile" accept="audio/*" class="file-input" />
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="mic-section">
+            @if (!_isRecording)
+            {
+                <button class="mic-btn" @onclick="StartRecording">
+                    <span class="mic-icon">&#x1F3A4;</span> Start Recording
+                </button>
+            }
+            else
+            {
+                <button class="mic-btn recording" @onclick="StopRecording">
+                    <span class="mic-icon">&#x23F9;</span> Stop Recording (@_recordingSeconds.ToString("F1")s)
+                </button>
+            }
+        </div>
+    }
+
+    @if (_isRunning)
+    {
+        <div class="transcribing">
+            <span class="transcribing-text">Transcribing...</span>
+        </div>
+    }
+
+    @if (!string.IsNullOrEmpty(_transcription))
+    {
+        <div class="transcription-result">
+            <div class="transcription-header">
+                <span class="transcription-label">Transcription</span>
+                @if (!string.IsNullOrEmpty(_detectedLanguage))
+                {
+                    <span class="transcription-lang">@_detectedLanguage</span>
+                }
+                <button class="copy-btn" @onclick="CopyTranscription">Copy</button>
+            </div>
+            <div class="transcription-text">@_transcription</div>
+            <div class="transcription-stats">
+                <span class="stat">@_inferenceMs.ToString("F0")ms</span>
+                <span class="stat">@_audioDurationSeconds.ToString("F1")s audio</span>
+                <span class="stat">@(_audioDurationSeconds / (_inferenceMs / 1000.0)):F1x realtime</span>
+            </div>
+        </div>
+    }
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            Whisper Tiny model (~75MB) not yet deployed. Speech-to-text will be enabled once the encoder-decoder pipeline is integrated. Audio preprocessing (mel spectrogram, FFT) is already built.
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .whisper-mode-toggle { display: flex; border-radius: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 1rem; width: fit-content; }
+    .mode-btn { padding: 0.35rem 0.85rem; border: none; background: rgba(255,255,255,0.04); color: #64748b; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .mode-btn.active { background: rgba(139,92,246,0.2); color: #e2e8f0; }
+
+    .audio-upload { margin-bottom: 1rem; }
+    .upload-zone { position: relative; border: 2px dashed rgba(255,255,255,0.15); border-radius: 12px; padding: 2rem; text-align: center; transition: all 0.2s; }
+    .upload-zone:hover { border-color: rgba(139,92,246,0.4); background: rgba(139,92,246,0.05); }
+    .upload-icon { font-size: 3rem; margin-bottom: 0.5rem; opacity: 0.5; }
+    .upload-zone p { color: #94a3b8; margin: 0.25rem 0; }
+    .upload-hint { font-size: 0.8rem; color: #475569; }
+    .file-input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+
+    .mic-section { text-align: center; padding: 2rem; }
+    .mic-btn { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1.5rem; border-radius: 50px; border: 2px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: #e2e8f0; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+    .mic-btn:hover { border-color: rgba(139,92,246,0.4); }
+    .mic-btn.recording { border-color: #ef4444; background: rgba(239,68,68,0.1); animation: pulse-border 1.5s ease-in-out infinite; }
+    .mic-icon { font-size: 1.2rem; }
+
+    .transcribing { text-align: center; padding: 1.5rem; }
+    .transcribing-text { color: #38bdf8; font-size: 1rem; animation: pulse 1.5s ease-in-out infinite; }
+
+    .transcription-result { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 1.25rem; margin-top: 1rem; }
+    .transcription-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .transcription-label { color: #94a3b8; font-size: 0.85rem; font-weight: 600; flex: 1; }
+    .transcription-lang { color: #38bdf8; font-size: 0.75rem; background: rgba(56,189,248,0.1); padding: 0.15rem 0.5rem; border-radius: 4px; }
+    .copy-btn { padding: 0.25rem 0.6rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; font-size: 0.8rem; cursor: pointer; }
+    .copy-btn:hover { background: rgba(255,255,255,0.1); }
+    .transcription-text { color: #e2e8f0; font-size: 1rem; line-height: 1.6; }
+    .transcription-stats { display: flex; gap: 1rem; margin-top: 0.75rem; }
+    .stat { color: #64748b; font-size: 0.8rem; font-family: monospace; }
+
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+
+    @@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @@keyframes pulse-border { 0%,100% { border-color: #ef4444; } 50% { border-color: rgba(239,68,68,0.3); } }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _mode = "file";
+    private bool _isRecording;
+    private double _recordingSeconds;
+    private string? _transcription;
+    private string? _detectedLanguage;
+    private double _audioDurationSeconds;
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task HandleAudioFile(InputFileChangeEventArgs e) => Task.CompletedTask;
+    private Task StartRecording() => Task.CompletedTask;
+    private Task StopRecording() => Task.CompletedTask;
+    private Task CopyTranscription() => Task.CompletedTask;
+}

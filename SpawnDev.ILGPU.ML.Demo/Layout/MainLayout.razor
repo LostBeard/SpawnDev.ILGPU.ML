@@ -13,5 +13,33 @@
         <article class="content px-4">
             @Body
         </article>
+
+        <footer class="global-footer px-4">
+            <div class="footer-ecosystem">
+                <span class="footer-label">SpawnDev Ecosystem:</span>
+                <a href="https://github.com/LostBeard/SpawnDev.BlazorJS" target="_blank">BlazorJS</a>
+                <span class="footer-dot">&middot;</span>
+                <a href="https://github.com/LostBeard/SpawnDev.ILGPU" target="_blank">ILGPU</a>
+                <span class="footer-dot">&middot;</span>
+                <a href="https://github.com/LostBeard/SpawnDev.ILGPU.ML" target="_blank">ILGPU.ML</a>
+            </div>
+            <div class="footer-credit">
+                Built upon <a href="https://github.com/m4rs-mt/ILGPU" target="_blank">ILGPU</a>
+                by <a href="https://github.com/m4rs-mt" target="_blank">Marcel Koester</a> and contributors.
+            </div>
+        </footer>
     </main>
+
+    <VoiceCommand OnCommand="@HandleGlobalVoiceCommand" WakeWord="computer" />
+    <KeyboardShortcuts />
+    <WelcomeToast />
 </div>
+
+@code {
+    private void HandleGlobalVoiceCommand(string command)
+    {
+        if (VerboseLogging) Console.WriteLine($"[Voice] Command: {command}");
+    }
+
+    private bool VerboseLogging { get; set; }
+}

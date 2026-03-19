@@ -29,6 +29,15 @@ public class ModelGraph
     [JsonPropertyName("initializers")]
     public Dictionary<string, int[]> Initializers { get; set; } = new();
 
+    /// <summary>
+    /// Constant data values for small tensors (e.g., Reshape target shapes).
+    /// Maps tensor name → integer values. Populated from weights during
+    /// InferenceSession creation for use in shape inference.
+    /// Not serialized — populated at runtime.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<string, int[]>? ConstantData { get; set; }
+
     public static ModelGraph FromJson(string json)
         => JsonSerializer.Deserialize<ModelGraph>(json) ?? throw new InvalidOperationException("Failed to parse model graph JSON");
 

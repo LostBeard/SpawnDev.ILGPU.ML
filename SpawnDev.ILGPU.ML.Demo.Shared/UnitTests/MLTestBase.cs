@@ -16,10 +16,30 @@ public abstract partial class MLTestBase : IDisposable
     protected abstract string BackendName { get; }
 
     /// <summary>
-    /// HttpClient for loading models via HTTP. Browser subclasses inject from DI.
-    /// Desktop subclasses can provide a file-based HttpClient or leave null.
+    /// HttpClient for loading models and test data via HTTP.
+    /// Browser subclasses inject from DI. Desktop subclasses get it automatically
+    /// from the TEST_SERVER_URL environment variable set by PlaywrightMultiTest.
     /// </summary>
-    protected virtual System.Net.Http.HttpClient? GetHttpClient() => null;
+    protected virtual System.Net.Http.HttpClient? GetHttpClient() => GetEnvHttpClient();
+
+    private static System.Net.Http.HttpClient? _envHttpClient;
+    private static bool _envHttpClientChecked;
+
+    private static System.Net.Http.HttpClient? GetEnvHttpClient()
+    {
+        if (_envHttpClientChecked) return _envHttpClient;
+        _envHttpClientChecked = true;
+        var serverUrl = Environment.GetEnvironmentVariable("TEST_SERVER_URL");
+        if (!string.IsNullOrEmpty(serverUrl))
+        {
+            var handler = new System.Net.Http.HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+            };
+            _envHttpClient = new System.Net.Http.HttpClient(handler) { BaseAddress = new Uri(serverUrl) };
+        }
+        return _envHttpClient;
+    }
 
     private Context? _cachedContext;
     private Accelerator? _cachedAccelerator;

@@ -70,20 +70,33 @@ Auto-selection picks the best available backend: WebGPU > WebGL > Wasm (browser)
 | **TransformerBlock** | Full Vision Transformer block (pre-LayerNorm, MHSA, MLP, residual connections, LayerScale) |
 | **DPT Head** | Dense Prediction Transformer head (multi-scale feature refinement, RefineNet fusion) |
 
+## What's Built
+
+SpawnDev.ILGPU.ML has grown into a substantial inference engine:
+
+- **69 ONNX operators** — covers classification, depth estimation, style transfer, super resolution, and more
+- **InferenceSession API** — load models via pre-extracted format, programmatic creation, or **direct .onnx loading** with our zero-dependency protobuf parser (~700 lines of C#, no Google.Protobuf)
+- **Graph execution engine** — topological ordering, shape inference, automatic buffer management
+- **Tensor abstraction** with shape tracking and buffer pooling
+- **19 GPU kernel files** — color conversion, image transforms, tensor layout, audio processing, postprocessing, all on GPU
+- **Preprocessing toolkit** — image decode (JPEG/PNG/WebP with EXIF), color spaces, mel spectrogram, BPE tokenizer, YOLO NMS, depth colormaps
+- **13 pipeline classes** — classification, depth, style transfer, super resolution, detection, segmentation, pose, CLIP, embeddings, text generation, speech recognition, audio classification, image generation
+- **KV cache** for autoregressive text generation (GPT-2, Whisper, Qwen configs)
+- **Diffusion scheduler** (DDIM + Euler) for Stable Diffusion image generation
+- **HuggingFace Hub integration** — download models with OPFS browser caching
+- **Model auto-detection** — reads HuggingFace config.json to infer task, preprocessing, and architecture
+- **356 tests** across all 6 backends via PlaywrightMultiTest
+- **18 interactive demo pages** with dark theme, privacy badges, and model inspector
+
 ## Planned Features
 
-SpawnDev.ILGPU.ML is being developed toward a complete inference engine. Planned additions include:
-
-- **Tensor abstraction** with shape tracking and buffer pooling
-- **ONNX model loading** for standard model interchange
-- **Graph execution engine** with topological ordering and automatic buffer management
-- **Expanded operator library** covering the most common ONNX operators (~55 ops across 3 tiers)
-- **Additional kernels:** BatchNorm, GroupNorm, RMSNorm, Sigmoid, Tanh, SiLU, pooling, reductions, gather/scatter, general transpose, padding, resize
-- **Graph optimizations:** constant folding, dead node elimination, operator fusion, in-place optimization
-- **Pipeline abstractions** for common tasks (depth estimation, image classification, object detection)
+- **Graph optimizations** — constant folding, dead node elimination, operator fusion
 - **Quantization support** (INT8/INT4) for reduced memory and faster inference
-- **KV cache** for autoregressive text generation
-- **InferenceSession API** similar to ONNX Runtime's familiar interface
+- **Encoder-decoder architecture** for translation, summarization, and Whisper ASR
+- **Beam search** for sequence generation tasks
+- **Image generation** (Stable Diffusion in-browser via WebGPU)
+- **Image-to-3D** generation with Gaussian splat output for SpawnScene
+- **In-browser GPU training** (Draw-to-Learn demo)
 
 See [Plans/full-inference-engine-plan.md](Plans/full-inference-engine-plan.md) for the detailed roadmap.
 

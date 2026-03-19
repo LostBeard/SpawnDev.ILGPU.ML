@@ -1,0 +1,228 @@
+@page "/inspector"
+@using SpawnDev.ILGPU.ML.Onnx
+@using Microsoft.AspNetCore.Components.Forms
+
+<PageTitle>Model Inspector — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="inspector-page">
+    <div class="inspector-header">
+        <h1 class="inspector-title">Model Inspector</h1>
+        <p class="inspector-desc">Drop any .onnx file to inspect its architecture, operators, and weights. Parsed entirely in the browser using our zero-dependency ONNX parser.</p>
+    </div>
+
+    <div class="inspector-dropzone @(_isDragOver ? "drag-over" : "")">
+        @if (_result != null)
+        {
+            <button class="clear-btn" @onclick="Clear">Drop another model</button>
+        }
+        else if (_isLoading)
+        {
+            <div class="loading-text">Parsing model...</div>
+        }
+        else
+        {
+            <div class="drop-prompt">
+                <div class="drop-icon">&#x1F4E6;</div>
+                <p>Drop an .onnx file here</p>
+                <p class="drop-hint">or click to browse</p>
+                <InputFile OnChange="HandleFileSelected" accept=".onnx" class="file-input" />
+            </div>
+        }
+    </div>
+
+    @if (_result != null)
+    {
+        <div class="result-grid">
+            <div class="result-card">
+                <h3>Overview</h3>
+                <div class="stat-row"><span class="stat-label">Graph</span><span class="stat-value">@_result.GraphName</span></div>
+                <div class="stat-row"><span class="stat-label">Producer</span><span class="stat-value">@_result.ProducerName @_result.ProducerVersion</span></div>
+                <div class="stat-row"><span class="stat-label">Opset</span><span class="stat-value">@_result.OpsetVersion</span></div>
+                <div class="stat-row"><span class="stat-label">IR Version</span><span class="stat-value">@_result.IrVersion</span></div>
+                <div class="stat-row"><span class="stat-label">Nodes</span><span class="stat-value">@_result.NodeCount</span></div>
+                <div class="stat-row"><span class="stat-label">Parameters</span><span class="stat-value">@_result.TotalParametersFormatted</span></div>
+                <div class="stat-row"><span class="stat-label">Weight Data</span><span class="stat-value">@_result.TotalWeightMB</span></div>
+                <div class="stat-row"><span class="stat-label">File Size</span><span class="stat-value">@_result.FileSizeMB</span></div>
+            </div>
+
+            <div class="result-card">
+                <h3>Inputs</h3>
+                @foreach (var input in _result.Inputs)
+                {
+                    <div class="tensor-row">
+                        <span class="tensor-name">@input.Name</span>
+                        <span class="tensor-shape">@input.ShapeStr</span>
+                        <span class="tensor-type">@input.DataType</span>
+                    </div>
+                }
+                <h3 style="margin-top: 1rem;">Outputs</h3>
+                @foreach (var output in _result.Outputs)
+                {
+                    <div class="tensor-row">
+                        <span class="tensor-name">@output.Name</span>
+                        <span class="tensor-shape">@output.ShapeStr</span>
+                        <span class="tensor-type">@output.DataType</span>
+                    </div>
+                }
+            </div>
+
+            <div class="result-card">
+                <h3>Operators (@_result.Operators.Length types)</h3>
+                <div class="op-list">
+                    @foreach (var op in _result.Operators)
+                    {
+                        <div class="op-row">
+                            <span class="op-name">@op.OpType</span>
+                            <span class="op-count">@op.Count</span>
+                        </div>
+                    }
+                </div>
+            </div>
+
+            <div class="result-card result-card-wide">
+                <h3>Largest Weights (top 20)</h3>
+                <div class="weight-table">
+                    @foreach (var w in _result.LargestWeights)
+                    {
+                        <div class="weight-row">
+                            <span class="weight-name" title="@w.Name">@TruncateName(w.Name)</span>
+                            <span class="weight-shape">@w.ShapeStr</span>
+                            <span class="weight-type">@w.DataType</span>
+                            <span class="weight-size">@w.SizeFormatted</span>
+                        </div>
+                    }
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (_compatibility != null)
+    {
+        <div class="compat-box @(_compatibility.IsFullySupported ? "compat-ok" : "compat-warn")">
+            <span class="compat-icon">@(_compatibility.IsFullySupported ? "&#x2705;" : "&#x26A0;")</span>
+            <span class="compat-text">@_compatibility.Summary</span>
+        </div>
+    }
+
+    @if (_error != null)
+    {
+        <div class="error-box">@_error</div>
+    }
+
+    <PrivacyBadge />
+</div>
+
+<style>
+    .inspector-page { max-width: 960px; margin: 0 auto; }
+    .inspector-header { margin-bottom: 1.25rem; }
+    .inspector-title { font-size: 1.6rem; font-weight: 700; color: #f1f5f9; margin-bottom: 0.25rem; }
+    .inspector-desc { color: #64748b; font-size: 0.95rem; }
+
+    .inspector-dropzone {
+        border: 2px dashed rgba(255,255,255,0.15);
+        border-radius: 12px;
+        min-height: 150px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.2s;
+        background: rgba(255,255,255,0.02);
+        margin-bottom: 1.5rem;
+        position: relative;
+    }
+    .inspector-dropzone:hover, .inspector-dropzone.drag-over {
+        border-color: rgba(139,92,246,0.4);
+        background: rgba(139,92,246,0.05);
+    }
+    .drop-prompt { text-align: center; padding: 2rem; }
+    .drop-icon { font-size: 3rem; margin-bottom: 0.5rem; opacity: 0.5; }
+    .drop-prompt p { color: #94a3b8; margin: 0.25rem 0; }
+    .drop-hint { font-size: 0.8rem; color: #475569; }
+    .file-input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+    .loading-text { color: #38bdf8; font-size: 1.1rem; animation: pulse 1.5s ease-in-out infinite; }
+    .clear-btn { padding: 0.5rem 1.2rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: #94a3b8; cursor: pointer; }
+    .clear-btn:hover { background: rgba(139,92,246,0.15); color: #e2e8f0; }
+
+    .result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .result-card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 1.25rem; }
+    .result-card-wide { grid-column: span 2; }
+    .result-card h3 { color: #f1f5f9; font-size: 1rem; margin-bottom: 0.75rem; font-weight: 600; }
+
+    .stat-row { display: flex; justify-content: space-between; padding: 0.3rem 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .stat-label { color: #64748b; font-size: 0.85rem; }
+    .stat-value { color: #cbd5e1; font-size: 0.85rem; font-family: 'JetBrains Mono','Consolas',monospace; }
+
+    .tensor-row { display: flex; gap: 0.5rem; padding: 0.25rem 0; align-items: baseline; }
+    .tensor-name { color: #38bdf8; font-size: 0.85rem; font-weight: 600; }
+    .tensor-shape { color: #94a3b8; font-size: 0.8rem; font-family: monospace; }
+    .tensor-type { color: #64748b; font-size: 0.75rem; }
+
+    .op-list { max-height: 300px; overflow-y: auto; }
+    .op-row { display: flex; justify-content: space-between; padding: 0.2rem 0; }
+    .op-name { color: #cbd5e1; font-size: 0.85rem; }
+    .op-count { color: #94a3b8; font-size: 0.8rem; font-family: monospace; min-width: 30px; text-align: right; }
+
+    .weight-row { display: grid; grid-template-columns: 1fr auto auto auto; gap: 0.75rem; padding: 0.25rem 0; border-bottom: 1px solid rgba(255,255,255,0.03); align-items: baseline; }
+    .weight-name { color: #cbd5e1; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .weight-shape { color: #94a3b8; font-size: 0.75rem; font-family: monospace; }
+    .weight-type { color: #64748b; font-size: 0.75rem; }
+    .weight-size { color: #34d399; font-size: 0.8rem; font-family: monospace; text-align: right; min-width: 60px; }
+
+    .compat-box { display: flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem; }
+    .compat-ok { background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.25); color: #6ee7b7; }
+    .compat-warn { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.25); color: #fbbf24; }
+    .compat-icon { font-size: 1.1rem; }
+    .compat-text { flex: 1; }
+
+    .error-box { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; padding: 1rem; color: #fca5a5; margin-top: 1rem; }
+
+    @@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @@media (max-width: 640px) { .result-grid { grid-template-columns: 1fr; } .result-card-wide { grid-column: span 1; } }
+</style>
+
+@code {
+    private InspectionResult? _result;
+    private CompatibilityResult? _compatibility;
+    private bool _isLoading;
+    private bool _isDragOver;
+    private string? _error;
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null || !file.Name.EndsWith(".onnx")) return;
+
+        _isLoading = true;
+        _error = null;
+        _result = null;
+        StateHasChanged();
+
+        try
+        {
+            using var stream = file.OpenReadStream(maxAllowedSize: 500 * 1024 * 1024); // 500MB max
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+            var bytes = ms.ToArray();
+
+            _result = ModelInspectorHelper.Inspect(bytes);
+            _compatibility = ModelInspectorHelper.CheckCompatibility(bytes);
+        }
+        catch (Exception ex)
+        {
+            _error = $"Failed to parse model: {ex.Message}";
+        }
+
+        _isLoading = false;
+        StateHasChanged();
+    }
+
+    private void Clear()
+    {
+        _result = null;
+        _compatibility = null;
+        _error = null;
+    }
+
+    private string TruncateName(string name) =>
+        name.Length > 50 ? "..." + name[^47..] : name;
+}

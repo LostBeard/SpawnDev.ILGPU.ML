@@ -1,0 +1,157 @@
+@using SpawnDev.BlazorJS
+@inject BlazorJSRuntime JS
+
+@if (_isVisible)
+{
+    <div class="welcome-toast @(_isDismissing ? "dismissing" : "")">
+        <div class="toast-icon">&#x1F44B;</div>
+        <div class="toast-content">
+            <div class="toast-title">Welcome to SpawnDev.ILGPU.ML</div>
+            <div class="toast-text">
+                Everything here runs on YOUR GPU, in YOUR browser. No server, no uploads.
+                Try dropping an image on any demo, or say <strong>"Computer"</strong> to use voice commands.
+                Press <kbd>?</kbd> for keyboard shortcuts.
+            </div>
+        </div>
+        <button class="toast-dismiss" @onclick="Dismiss">&times;</button>
+    </div>
+}
+
+@code {
+    private bool _isVisible;
+    private bool _isDismissing;
+    private const string StorageKey = "spawndev_ilgpu_ml_welcomed";
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender)
+        {
+            try
+            {
+                using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+                using var storage = window.LocalStorage;
+                var welcomed = storage.GetItem(StorageKey);
+                if (string.IsNullOrEmpty(welcomed))
+                {
+                    _isVisible = true;
+                    storage.SetItem(StorageKey, "true");
+                    StateHasChanged();
+
+                    // Auto-dismiss after 15 seconds
+                    _ = AutoDismiss();
+                }
+            }
+            catch
+            {
+                // localStorage not available — show anyway
+                _isVisible = true;
+                StateHasChanged();
+                _ = AutoDismiss();
+            }
+        }
+    }
+
+    private async Task AutoDismiss()
+    {
+        await Task.Delay(15000);
+        if (_isVisible) Dismiss();
+    }
+
+    private void Dismiss()
+    {
+        _isDismissing = true;
+        StateHasChanged();
+        _ = FinishDismiss();
+    }
+
+    private async Task FinishDismiss()
+    {
+        await Task.Delay(300); // Match animation
+        _isVisible = false;
+        StateHasChanged();
+    }
+}
+
+<style>
+    .welcome-toast {
+        position: fixed;
+        bottom: 5rem;
+        right: 1.5rem;
+        max-width: 380px;
+        background: rgba(15, 23, 42, 0.95);
+        backdrop-filter: blur(12px);
+        border: 1px solid rgba(139, 92, 246, 0.25);
+        border-radius: 12px;
+        padding: 1rem;
+        display: flex;
+        gap: 0.75rem;
+        z-index: 150;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+        animation: slideIn 0.4s ease-out;
+    }
+
+    .welcome-toast.dismissing {
+        animation: slideOut 0.3s ease-in forwards;
+    }
+
+    .toast-icon {
+        font-size: 1.5rem;
+        flex-shrink: 0;
+    }
+
+    .toast-content {
+        flex: 1;
+    }
+
+    .toast-title {
+        color: #f1f5f9;
+        font-size: 0.9rem;
+        font-weight: 700;
+        margin-bottom: 0.3rem;
+    }
+
+    .toast-text {
+        color: #94a3b8;
+        font-size: 0.8rem;
+        line-height: 1.5;
+    }
+
+    .toast-text strong {
+        color: #c4b5fd;
+    }
+
+    .toast-text kbd {
+        display: inline-block;
+        padding: 0.1rem 0.3rem;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 3px;
+        font-family: monospace;
+        font-size: 0.75rem;
+        color: #e2e8f0;
+    }
+
+    .toast-dismiss {
+        background: none;
+        border: none;
+        color: #475569;
+        font-size: 1.1rem;
+        cursor: pointer;
+        padding: 0;
+        align-self: flex-start;
+    }
+
+    .toast-dismiss:hover {
+        color: #94a3b8;
+    }
+
+    @@keyframes slideIn {
+        from { opacity: 0; transform: translateY(20px) translateX(20px); }
+        to { opacity: 1; transform: translateY(0) translateX(0); }
+    }
+
+    @@keyframes slideOut {
+        from { opacity: 1; transform: translateY(0); }
+        to { opacity: 0; transform: translateY(20px); }
+    }
+</style>

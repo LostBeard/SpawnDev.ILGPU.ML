@@ -27,6 +27,7 @@ public class OperatorRegistry
     public TransposeKernel Transpose { get; }
     public GatherKernel Gather { get; }
     public PadKernel Pad { get; }
+    public ConvTranspose2DKernel ConvTranspose { get; }
 
     public OperatorRegistry(Accelerator accelerator)
     {
@@ -45,6 +46,7 @@ public class OperatorRegistry
         Transpose = new TransposeKernel(accelerator);
         Gather = new GatherKernel(accelerator);
         Pad = new PadKernel(accelerator);
+        ConvTranspose = new ConvTranspose2DKernel(accelerator);
 
         // Register built-in operators
         RegisterBuiltins();
@@ -100,6 +102,9 @@ public class OperatorRegistry
         Register(new AveragePoolOperator(this));
         Register(new ResizeOperator(this));
         Register(new PadOperator(this));
+        Register(new ConvTransposeOperator(this));
+        Register(new ArgMaxOperator(this));
+        Register(new GatherNDOperator(this));
         Register(new ConvOperator(this));
         Register(new SplitOperator(this));
         Register(new SliceOperator(this));
@@ -116,7 +121,7 @@ public class OperatorRegistry
         Register(new CastOperator(this));
         Register(new FloorOperator(this));
         Register(new UpsampleOperator(this));
-        Register(new ShapeOperator());
+        Register(new ShapeOperator(this));
         Register(new SiLUOperator(this));
         Register(new LeakyReluOperator(this));
         Register(new ExpandOperator(this));
@@ -128,5 +133,10 @@ public class OperatorRegistry
         Register(new RangeOperator());
         Register(new HardSigmoidOperator(this));
         Register(new HardSwishOperator(this));
+
+        // Operators from #2
+        Register(new DepthToSpaceOperator(_accelerator));
+        Register(new TopKOperator(_accelerator));
+        Register(new SignOperator(_accelerator));
     }
 }

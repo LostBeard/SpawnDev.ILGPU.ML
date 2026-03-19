@@ -66,9 +66,28 @@
         </div>
     }
 
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-info-box">
+            MoveNet Lightning model (9MB) is available. Pipeline wiring in progress.
+        </div>
+    }
+
+    <PrivacyBadge />
+
 </DemoLayout>
 
 <style>
+    .model-info-box {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        background: rgba(56, 189, 248, 0.08);
+        border: 1px solid rgba(56, 189, 248, 0.2);
+        border-radius: 8px;
+        color: #7dd3fc;
+        font-size: 0.85rem;
+    }
+
     .pose-controls {
         display: flex;
         align-items: center;

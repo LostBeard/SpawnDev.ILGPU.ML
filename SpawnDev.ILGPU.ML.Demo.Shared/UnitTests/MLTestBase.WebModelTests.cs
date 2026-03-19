@@ -15,7 +15,7 @@ public abstract partial class MLTestBase
     /// run ClassificationPipeline, verify non-uniform output.
     /// Requires HttpClient from subclass (browser: DI, desktop: file server).
     /// </summary>
-    [TestMethod]
+    [TestMethod(Timeout = 120000)]
     public async Task WebModel_SqueezeNet_FullPipeline() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

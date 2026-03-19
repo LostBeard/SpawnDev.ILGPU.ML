@@ -12,7 +12,16 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
     /// </summary>
     public class WasmTests : MLTestBase
     {
+        private readonly System.Net.Http.HttpClient _http;
+
+        public WasmTests(System.Net.Http.HttpClient http)
+        {
+            _http = http;
+        }
+
         protected override string BackendName => "Wasm";
+
+        protected override System.Net.Http.HttpClient? GetHttpClient() => _http;
 
         protected override async Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
         {

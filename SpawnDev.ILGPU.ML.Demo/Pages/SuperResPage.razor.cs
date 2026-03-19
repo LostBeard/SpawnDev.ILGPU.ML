@@ -110,6 +110,31 @@ public partial class SuperResPage : IDisposable
 
     private async Task HandleBackendChange(string backend) => _selectedBackend = backend;
 
+    private void DownloadResult()
+    {
+        if (_enhancedImageUrl == null) return;
+        try
+        {
+            using var document = JS.Get<SpawnDev.BlazorJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.BlazorJS.JSObjects.HTMLAnchorElement>("a");
+            link.Href = _enhancedImageUrl;
+            link.Download = "enhanced-3x.png";
+            using var body = document.Body!;
+            body.AppendChild(link);
+            link.Click();
+            body.RemoveChild(link);
+        }
+        catch { }
+    }
+
+    private void ClearResult()
+    {
+        _enhancedImageUrl = null;
+        _imageDataUrl = null;
+        _rgbaPixels = null;
+        StateHasChanged();
+    }
+
     public void Dispose()
     {
         _pipeline?.Dispose();

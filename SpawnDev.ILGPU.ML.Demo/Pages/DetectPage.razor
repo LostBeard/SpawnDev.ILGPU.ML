@@ -63,6 +63,15 @@
         </div>
     }
 
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            YOLOv8-Nano model not yet available. Detection will be enabled once the model is extracted and deployed.
+        </div>
+    }
+
+    <PrivacyBadge />
+
 </DemoLayout>
 
 <style>
@@ -134,6 +143,16 @@
         color: #c4b5fd;
         font-size: 0.78rem;
         font-weight: 600;
+    }
+
+    .model-needed {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        background: rgba(245, 158, 11, 0.08);
+        border: 1px solid rgba(245, 158, 11, 0.2);
+        border-radius: 8px;
+        color: #fbbf24;
+        font-size: 0.85rem;
     }
 </style>
 

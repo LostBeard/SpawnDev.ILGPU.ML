@@ -1,0 +1,213 @@
+@page "/models"
+@using SpawnDev.ILGPU.ML.Onnx
+
+<PageTitle>Models — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="models-page">
+    <div class="models-header">
+        <h1 class="models-title">Available Models</h1>
+        <p class="models-desc">
+            Models available for inference demos. Drop your own .onnx file on the
+            <a href="inspector">Model Inspector</a> to check compatibility.
+        </p>
+    </div>
+
+    <div class="models-grid">
+        @foreach (var group in _models.GroupBy(m => m.Task))
+        {
+            <div class="task-group">
+                <h2 class="task-title">@FormatTaskName(group.Key)</h2>
+                <div class="model-cards">
+                    @foreach (var model in group)
+                    {
+                        <div class="model-card">
+                            <div class="model-info">
+                                <span class="model-name">@model.Name</span>
+                                <span class="model-size">@model.SizeMB.ToString("F1") MB</span>
+                            </div>
+                            <p class="model-desc">@model.Description</p>
+                            @if (model.InputWidth > 0)
+                            {
+                                <span class="model-input">Input: @(model.InputWidth)x@(model.InputHeight)</span>
+                            }
+                            <div class="model-formats">
+                                @if (model.HasOnnxFormat)
+                                {
+                                    <span class="format-badge format-onnx">ONNX</span>
+                                }
+                                @if (model.HasExtractedFormat)
+                                {
+                                    <span class="format-badge format-extracted">Extracted</span>
+                                }
+                            </div>
+                        </div>
+                    }
+                </div>
+            </div>
+        }
+    </div>
+
+    <div class="custom-model-section">
+        <h2 class="section-title">Load Custom Model</h2>
+        <p class="section-desc">
+            Enter a HuggingFace model URL or repo ID to load any ONNX model directly.
+            Uses our zero-dependency ONNX parser — no server needed.
+        </p>
+        <div class="custom-input-row">
+            <input type="text" class="custom-input" placeholder="e.g., onnx-community/mobilenetv2-12"
+                   @bind="_customRepoId" />
+            <input type="text" class="custom-input custom-input-file" placeholder="onnx/model.onnx"
+                   @bind="_customFilename" />
+            <button class="load-btn" @onclick="LoadCustomModel" disabled="@_isLoading">
+                @(_isLoading ? "Loading..." : "Load")
+            </button>
+        </div>
+        @if (_customResult != null)
+        {
+            <div class="custom-result">
+                <span class="result-icon">&#x2705;</span>
+                <span>@_customResult</span>
+            </div>
+        }
+        @if (_customError != null)
+        {
+            <div class="custom-error">@_customError</div>
+        }
+    </div>
+
+    <PrivacyBadge />
+</div>
+
+<style>
+    .models-page { max-width: 960px; margin: 0 auto; }
+    .models-header { margin-bottom: 1.5rem; }
+    .models-title { font-size: 1.6rem; font-weight: 700; color: #f1f5f9; margin-bottom: 0.25rem; }
+    .models-desc { color: #64748b; font-size: 0.95rem; }
+    .models-desc a { color: #3b82f6; text-decoration: none; }
+    .models-desc a:hover { text-decoration: underline; }
+
+    .task-group { margin-bottom: 2rem; }
+    .task-title { font-size: 1.15rem; font-weight: 600; color: #cbd5e1; margin-bottom: 0.75rem; }
+
+    .model-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 1rem; }
+    .model-card {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 1rem;
+        transition: all 0.15s;
+    }
+    .model-card:hover { border-color: rgba(139,92,246,0.25); background: rgba(255,255,255,0.05); }
+
+    .model-info { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.4rem; }
+    .model-name { color: #f1f5f9; font-weight: 600; font-size: 0.95rem; }
+    .model-size { color: #64748b; font-size: 0.8rem; font-family: monospace; }
+    .model-desc { color: #94a3b8; font-size: 0.82rem; margin: 0 0 0.5rem 0; line-height: 1.4; }
+    .model-input { color: #475569; font-size: 0.75rem; font-family: monospace; }
+
+    .model-formats { display: flex; gap: 0.3rem; margin-top: 0.5rem; }
+    .format-badge { font-size: 0.68rem; font-weight: 700; padding: 0.15rem 0.4rem; border-radius: 4px; text-transform: uppercase; }
+    .format-onnx { background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.25); color: #38bdf8; }
+    .format-extracted { background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.25); color: #34d399; }
+
+    .custom-model-section { margin-top: 2rem; padding: 1.5rem; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; }
+    .section-title { font-size: 1.1rem; font-weight: 600; color: #f1f5f9; margin-bottom: 0.3rem; }
+    .section-desc { color: #64748b; font-size: 0.9rem; margin-bottom: 1rem; }
+
+    .custom-input-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .custom-input {
+        flex: 1;
+        min-width: 200px;
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+        color: #e2e8f0;
+        font-size: 0.9rem;
+    }
+    .custom-input-file { flex: 0.6; min-width: 150px; }
+    .custom-input::placeholder { color: #475569; }
+    .custom-input:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+
+    .load-btn {
+        padding: 0.5rem 1.2rem;
+        border-radius: 6px;
+        border: none;
+        background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        color: white;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s;
+    }
+    .load-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(59,130,246,0.3); }
+    .load-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    .custom-result { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; color: #6ee7b7; font-size: 0.9rem; }
+    .custom-error { margin-top: 0.75rem; color: #fca5a5; font-size: 0.9rem; }
+</style>
+
+@code {
+    private List<ModelEntry> _models = new();
+    private string _customRepoId = "";
+    private string _customFilename = "onnx/model.onnx";
+    private bool _isLoading;
+    private string? _customResult;
+    private string? _customError;
+
+    protected override void OnInitialized()
+    {
+        // Use the model registry from the RCL (or inline the data)
+        _models = new List<ModelEntry>
+        {
+            new() { Id = "squeezenet", Name = "SqueezeNet 1.1", Task = "Classification", Path = "models/squeezenet", OnnxPath = "models/squeezenet/model.onnx", SizeMB = 4.8, Description = "Fast 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224 },
+            new() { Id = "mobilenetv2", Name = "MobileNetV2", Task = "Classification", Path = "models/mobilenetv2", OnnxPath = "models/mobilenetv2/model.onnx", SizeMB = 14, Description = "Accurate 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224 },
+            new() { Id = "depth-anything-v2", Name = "Depth Anything V2 Small", Task = "Depth Estimation", OnnxPath = "models/depth-anything-v2-small/model.onnx", SizeMB = 95, Description = "Monocular depth estimation (26M params)", InputWidth = 518, InputHeight = 518 },
+            new() { Id = "style-mosaic", Name = "Mosaic", Task = "Style Transfer", Path = "models/style-mosaic", OnnxPath = "models/style-mosaic/model.onnx", SizeMB = 6.5, Description = "Mosaic tile artistic style" },
+            new() { Id = "style-candy", Name = "Candy", Task = "Style Transfer", Path = "models/style-candy", OnnxPath = "models/style-candy/model.onnx", SizeMB = 6.5, Description = "Bright candy-colored artistic style" },
+            new() { Id = "style-rain-princess", Name = "Rain Princess", Task = "Style Transfer", Path = "models/style-rain-princess", OnnxPath = "models/style-rain-princess/model.onnx", SizeMB = 6.5, Description = "Impressionist rain scene style" },
+            new() { Id = "style-udnie", Name = "Udnie", Task = "Style Transfer", Path = "models/style-udnie", OnnxPath = "models/style-udnie/model.onnx", SizeMB = 6.5, Description = "Abstract cubist style" },
+            new() { Id = "style-pointilism", Name = "Pointilism", Task = "Style Transfer", Path = "models/style-pointilism", OnnxPath = "models/style-pointilism/model.onnx", SizeMB = 6.5, Description = "Pointillist dot painting style" },
+            new() { Id = "super-resolution", Name = "ESPCN (3x)", Task = "Super Resolution", Path = "models/super-resolution", OnnxPath = "models/super-resolution/model.onnx", SizeMB = 0.2, Description = "3x upscaling (224→672)", InputWidth = 224, InputHeight = 224 },
+            new() { Id = "movenet-lightning", Name = "MoveNet Lightning", Task = "Pose Estimation", OnnxPath = "models/movenet-lightning/model.onnx", SizeMB = 9, Description = "Fast 17-keypoint pose detection", InputWidth = 192, InputHeight = 192 },
+        };
+    }
+
+    private async Task LoadCustomModel()
+    {
+        if (string.IsNullOrWhiteSpace(_customRepoId)) return;
+        _isLoading = true;
+        _customResult = null;
+        _customError = null;
+        StateHasChanged();
+
+        try
+        {
+            var url = $"https://huggingface.co/{_customRepoId}/resolve/main/{_customFilename}";
+            _customResult = $"Model URL ready: {url} — use InferenceSession.CreateFromOnnxAsync() to load";
+        }
+        catch (Exception ex)
+        {
+            _customError = ex.Message;
+        }
+
+        _isLoading = false;
+        StateHasChanged();
+    }
+
+    private string FormatTaskName(string task) => task;
+
+    private class ModelEntry
+    {
+        public string Id { get; init; } = "";
+        public string Name { get; init; } = "";
+        public string Task { get; init; } = "";
+        public string? Path { get; init; }
+        public string? OnnxPath { get; init; }
+        public double SizeMB { get; init; }
+        public string Description { get; init; } = "";
+        public int InputWidth { get; init; }
+        public int InputHeight { get; init; }
+        public bool HasExtractedFormat => Path != null;
+        public bool HasOnnxFormat => OnnxPath != null;
+    }
+}

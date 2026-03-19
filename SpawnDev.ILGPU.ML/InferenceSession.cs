@@ -28,6 +28,9 @@ public class InferenceSession : IDisposable
     private readonly BufferPool _pool;
     private readonly Dictionary<string, Tensor> _weights;
 
+    /// <summary>Enable diagnostic logging to Console.</summary>
+    public static bool VerboseLogging { get; set; }
+
     /// <summary>Model input names and shapes.</summary>
     public string[] InputNames => _compiled.InputNames;
     public Dictionary<string, int[]> InputShapes => _compiled.InputShapes;
@@ -85,6 +88,43 @@ public class InferenceSession : IDisposable
         await weightLoader.LoadAsync(basePath);
         onProgress?.Invoke("weights", 100);
 
+        // Extract small constant values for shape inference AND runtime operator use.
+        // Use ONE shared read buffer to avoid allocating hundreds of tiny GPU buffers.
+        modelGraph.ConstantData = new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        {
+            // Find max small tensor size, allocate one shared readback buffer
+            int maxSmallElems = 0;
+            foreach (var (name, shape) in modelGraph.Initializers)
+            {
+                int elems = shape.Aggregate(1, (a, b) => a * b);
+                if (elems > 0 && elems <= 64 && weightLoader.TryGetView(name) != null)
+                    maxSmallElems = Math.Max(maxSmallElems, elems);
+            }
+
+            if (maxSmallElems > 0)
+            {
+                using var readBuf = accelerator.Allocate1D<float>(maxSmallElems);
+                foreach (var (name, shape) in modelGraph.Initializers)
+                {
+                    int elems = shape.Aggregate(1, (a, b) => a * b);
+                    if (elems > 0 && elems <= 64)
+                    {
+                        var view = weightLoader.TryGetView(name);
+                        if (view != null)
+                        {
+                            readBuf.View.SubView(0, elems).CopyFrom(view.Value.SubView(0, elems));
+                            await accelerator.SynchronizeAsync();
+                            var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
+                            constantFloatValues[name] = hostBuf;
+                            if (elems <= 16)
+                                modelGraph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                        }
+                    }
+                }
+            }
+        }
+
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
@@ -137,8 +177,8 @@ public class InferenceSession : IDisposable
             Console.WriteLine($"[InferenceSession] First weight '{firstWeight.Name}': shape=[{string.Join(",", firstWeight.Shape)}], elements={firstWeight.ElementCount}");
         }
 
-        // Create executor
-        var executor = new GraphExecutor(accelerator, compiled, weights);
+        // Create executor with pre-read constant values (avoids GPU→CPU readback during inference)
+        var executor = new GraphExecutor(accelerator, compiled, weights, constantFloatValues);
         onProgress?.Invoke("ready", 100);
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
@@ -154,20 +194,189 @@ public class InferenceSession : IDisposable
     public static InferenceSession Create(
         Accelerator accelerator, ModelGraph graph, Dictionary<string, Tensor> weights)
     {
+        // Extract small constant values for shape inference (Reshape targets, etc.)
+        // Only do sync CPU readback on desktop backends — browser backends require async.
+        // Browser callers should use CreateAsync or CreateFromOnnxAsync instead.
+        var constantFloatValues = new Dictionary<string, float[]>();
+        bool canSyncCopy = accelerator.AcceleratorType != AcceleratorType.WebGPU
+                        && accelerator.AcceleratorType != AcceleratorType.WebGL
+                        && accelerator.AcceleratorType != AcceleratorType.Wasm;
+        if (graph.ConstantData == null)
+        {
+            graph.ConstantData = new Dictionary<string, int[]>();
+        }
+        if (canSyncCopy)
+        {
+            foreach (var (name, shape) in graph.Initializers)
+            {
+                int elems = shape.Aggregate(1, (a, b) => a * b);
+                if (elems > 0 && elems <= 64 && weights.TryGetValue(name, out var tensor))
+                {
+                    var hostBuf = new float[elems];
+                    tensor.Data.SubView(0, elems).CopyToCPU(hostBuf);
+                    accelerator.Synchronize();
+                    constantFloatValues[name] = hostBuf;
+                    if (elems <= 16)
+                        graph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                }
+            }
+        }
+
         var registry = new OperatorRegistry(accelerator);
         var compiler = new GraphCompiler(registry);
         var compiled = compiler.Compile(graph);
         var pool = new BufferPool(accelerator);
-        var executor = new GraphExecutor(accelerator, compiled, weights);
+        var executor = new GraphExecutor(accelerator, compiled, weights, constantFloatValues);
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
         {
             ModelName = graph.Name
         };
     }
 
+    /// <summary>
+    /// Create an InferenceSession directly from a .onnx file loaded via HTTP.
+    /// No Python extraction step needed — uses the native ONNX protobuf parser.
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromOnnxAsync(
+        Accelerator accelerator, HttpClient http, string onnxUrl,
+        Action<string, int>? onProgress = null)
+    {
+        // Download .onnx file
+        onProgress?.Invoke("download", 0);
+        var onnxBytes = await http.GetByteArrayAsync(onnxUrl);
+        onProgress?.Invoke("download", 100);
+
+        return CreateFromOnnx(accelerator, onnxBytes, onProgress);
+    }
+
+    /// <summary>
+    /// Create an InferenceSession directly from raw .onnx bytes.
+    /// No Python extraction step needed — uses the native ONNX protobuf parser.
+    /// </summary>
+    public static InferenceSession CreateFromOnnx(
+        Accelerator accelerator, byte[] onnxBytes,
+        Action<string, int>? onProgress = null)
+    {
+        // Parse ONNX protobuf
+        onProgress?.Invoke("parse", 0);
+        var (modelInfo, cpuWeights) = Onnx.OnnxLoader.LoadModel(onnxBytes);
+        onProgress?.Invoke("parse", 100);
+
+        // Convert OnnxModelInfo → ModelGraph
+        var graph = ConvertToModelGraph(modelInfo);
+
+        // Extract small constant values — data is already on CPU (from ONNX parser), no readback needed
+        graph.ConstantData = new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        foreach (var (name, shape) in graph.Initializers)
+        {
+            int elems = shape.Aggregate(1, (a, b) => a * b);
+            if (elems > 0 && elems <= 64 && cpuWeights.TryGetValue(name, out var data))
+            {
+                constantFloatValues[name] = data;
+                if (elems <= 16)
+                    graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+            }
+        }
+
+        // Compile graph
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+        onProgress?.Invoke("compile", 100);
+
+        // Upload weights to GPU
+        onProgress?.Invoke("upload", 0);
+        var pool = new BufferPool(accelerator);
+        var gpuWeights = new Dictionary<string, Tensor>();
+        int loaded = 0;
+        foreach (var (name, data) in cpuWeights)
+        {
+            if (graph.Initializers.TryGetValue(name, out var shape))
+            {
+                gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                loaded++;
+            }
+        }
+        onProgress?.Invoke("upload", 100);
+
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX: {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
+
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        onProgress?.Invoke("ready", 100);
+
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        {
+            ModelName = modelInfo.Name
+        };
+    }
+
+    /// <summary>
+    /// Convert OnnxModelInfo (from native parser) to ModelGraph (used by GraphCompiler).
+    /// </summary>
+    public static ModelGraph ConvertToModelGraph(Onnx.OnnxModelInfo info)
+    {
+        var graph = new ModelGraph
+        {
+            Name = info.Name,
+            Inputs = info.InputNames.Select(name => new GraphValueInfo
+            {
+                Name = name,
+                Shape = info.ValueShapes.TryGetValue(name, out var s) ? s : Array.Empty<int>()
+            }).ToList(),
+            Outputs = info.OutputNames.Select(name => new GraphValueInfo
+            {
+                Name = name,
+                Shape = info.ValueShapes.TryGetValue(name, out var s) ? s : Array.Empty<int>()
+            }).ToList(),
+            Initializers = new Dictionary<string, int[]>(),
+        };
+
+        // Register initializer shapes
+        foreach (var initName in info.InitializerNames)
+        {
+            if (info.ValueShapes.TryGetValue(initName, out var shape))
+                graph.Initializers[initName] = shape;
+        }
+
+        // Convert nodes
+        foreach (var node in info.Nodes)
+        {
+            var graphNode = new GraphNode
+            {
+                OpType = node.OpType,
+                Inputs = node.Inputs.ToList(),
+                Outputs = node.Outputs.ToList(),
+            };
+
+            // Convert typed attributes to JsonElement-backed attributes
+            // The GraphNode uses JsonElement for serialization compatibility,
+            // but we have typed objects from the ONNX parser. Serialize and re-parse.
+            if (node.Attributes.Count > 0)
+            {
+                var jsonDict = new Dictionary<string, System.Text.Json.JsonElement>();
+                foreach (var (key, value) in node.Attributes)
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize(value);
+                    jsonDict[key] = System.Text.Json.JsonDocument.Parse(json).RootElement.Clone();
+                }
+                graphNode.Attributes = jsonDict;
+            }
+
+            graph.Nodes.Add(graphNode);
+        }
+
+        return graph;
+    }
+
     /// <summary>Run inference with named input tensors. Returns named output tensors.</summary>
     public Dictionary<string, Tensor> Run(Dictionary<string, Tensor> inputs)
         => _executor.Run(inputs);
+
+    /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm)
+    /// which deadlock on synchronous Synchronize(). Periodically flushes GPU commands.</summary>
+    public Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
+        => _executor.RunAsync(inputs);
 
     /// <summary>Run inference with a single input. Returns the first output tensor.</summary>
     public Tensor Run(string inputName, Tensor input)

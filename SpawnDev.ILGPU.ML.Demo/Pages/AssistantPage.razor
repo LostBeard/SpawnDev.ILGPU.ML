@@ -1,0 +1,314 @@
+@page "/assistant"
+
+<PageTitle>AI Assistant — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="assistant-page">
+    <div class="assistant-header">
+        <h1 class="assistant-title">
+            <span class="assistant-icon">&#x1F9D9;</span> AI Assistant
+        </h1>
+        <p class="assistant-desc">
+            Remember Clippy, Merlin, and Robby? They're back — but now they actually think.
+            Choose a character, talk to them, and they respond with AI-generated text.
+            Speech recognition + text generation + text-to-speech, all running locally on your GPU.
+        </p>
+    </div>
+
+    <div class="assistant-layout">
+        <div class="character-picker">
+            @foreach (var c in _assistants)
+            {
+                <button class="picker-btn @(c.Id == _selectedAssistant ? "selected" : "")"
+                        @onclick="() => SelectAssistant(c.Id)">
+                    <span class="picker-emoji">@c.Emoji</span>
+                    <span class="picker-name">@c.Name</span>
+                </button>
+            }
+        </div>
+
+        <div class="assistant-main">
+            <div class="assistant-character">
+                <div class="character-display">
+                    <div class="character-body" style="background: @CurrentAssistant.Color;">
+                        <span class="character-emoji">@CurrentAssistant.Emoji</span>
+                    </div>
+
+                    @if (_currentAnimation != null)
+                    {
+                        <div class="animation-indicator">@_currentAnimation</div>
+                    }
+
+                    @if (_isThinking)
+                    {
+                        <div class="thought-bubble">
+                            <span class="thought-dots">...</span>
+                        </div>
+                    }
+
+                    @if (!string.IsNullOrEmpty(_currentResponse))
+                    {
+                        <div class="speech-bubble-large">
+                            <div class="bubble-content">@_currentResponse</div>
+                            <div class="bubble-tail-large"></div>
+                        </div>
+                    }
+                </div>
+
+                <div class="character-nameplate">
+                    <span class="nameplate-name">@CurrentAssistant.Name</span>
+                    <span class="nameplate-role">@CurrentAssistant.Role</span>
+                </div>
+            </div>
+
+            <div class="chat-history">
+                @foreach (var msg in _messages)
+                {
+                    <div class="chat-msg @(msg.IsUser ? "user-msg" : "assistant-msg")">
+                        <span class="msg-sender">@(msg.IsUser ? "You" : CurrentAssistant.Name):</span>
+                        <span class="msg-text">@msg.Text</span>
+                        @if (msg.InferenceMs > 0)
+                        {
+                            <span class="msg-timing">@msg.InferenceMs.ToString("F0")ms</span>
+                        }
+                    </div>
+                }
+            </div>
+
+            <div class="input-section">
+                <div class="input-mode-toggle">
+                    <button class="mode-btn @(_inputMode == "text" ? "active" : "")" @onclick='() => _inputMode = "text"'>
+                        &#x2328; Type
+                    </button>
+                    <button class="mode-btn @(_inputMode == "voice" ? "active" : "")" @onclick='() => _inputMode = "voice"'>
+                        &#x1F3A4; Talk
+                    </button>
+                </div>
+
+                @if (_inputMode == "text")
+                {
+                    <div class="text-input-row">
+                        <input type="text" class="text-input" @bind="_userInput"
+                               @onkeypress="HandleKeyPress"
+                               placeholder="@($"Ask {CurrentAssistant.Name} anything...")" />
+                        <button class="send-btn" @onclick="SendMessage" disabled="@(_isThinking || string.IsNullOrWhiteSpace(_userInput))">
+                            Send
+                        </button>
+                    </div>
+                }
+                else
+                {
+                    <div class="voice-input">
+                        @if (!_isListening)
+                        {
+                            <button class="voice-btn" @onclick="StartListening">
+                                <span class="voice-icon">&#x1F3A4;</span>
+                                Push to Talk
+                            </button>
+                        }
+                        else
+                        {
+                            <button class="voice-btn listening" @onclick="StopListening">
+                                <span class="voice-icon pulse-icon">&#x1F534;</span>
+                                Listening... (click to stop)
+                            </button>
+                        }
+                        @if (!string.IsNullOrEmpty(_transcribedText))
+                        {
+                            <div class="transcribed">"@_transcribedText"</div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+
+        <div class="assistant-settings">
+            <h3>Personality</h3>
+            <p class="personality-desc">@CurrentAssistant.PersonalityDescription</p>
+
+            <h3>Capabilities</h3>
+            <div class="capability-list">
+                <div class="capability @(_hasTextGen ? "enabled" : "disabled")">
+                    <span class="cap-icon">@(_hasTextGen ? "&#x2705;" : "&#x23F3;")</span>
+                    <span>Text Generation</span>
+                </div>
+                <div class="capability @(_hasSpeechToText ? "enabled" : "disabled")">
+                    <span class="cap-icon">@(_hasSpeechToText ? "&#x2705;" : "&#x23F3;")</span>
+                    <span>Speech to Text (Whisper)</span>
+                </div>
+                <div class="capability @(_hasTextToSpeech ? "enabled" : "disabled")">
+                    <span class="cap-icon">@(_hasTextToSpeech ? "&#x2705;" : "&#x23F3;")</span>
+                    <span>Text to Speech</span>
+                </div>
+                <div class="capability @(_hasEmotionDetect ? "enabled" : "disabled")">
+                    <span class="cap-icon">@(_hasEmotionDetect ? "&#x2705;" : "&#x23F3;")</span>
+                    <span>Emotion-Based Animation</span>
+                </div>
+            </div>
+
+            <h3>Stats</h3>
+            <div class="stat-row"><span>Messages:</span><span>@_messages.Count</span></div>
+            <div class="stat-row"><span>Tokens generated:</span><span>@_totalTokens</span></div>
+            <div class="stat-row"><span>Avg response:</span><span>@(_messages.Count > 0 ? (_totalInferenceMs / Math.Max(1, _messages.Count(m => !m.IsUser))).ToString("F0") : "0")ms</span></div>
+        </div>
+    </div>
+
+    @if (!_hasTextGen)
+    {
+        <div class="model-needed">
+            <p><strong>Bringing back the classics, with real AI.</strong></p>
+            <p>Remember Microsoft's animated assistants — Clippy, Merlin, Robby? They had personality but no intelligence. Now imagine them powered by a local LLM running on your GPU, with speech recognition (Whisper) and text-to-speech — all in the browser, all private.</p>
+            <p style="margin-top: 0.5rem;">Requires: GPT-2 or SmolLM for text generation, Whisper for speech input. All models run locally via SpawnDev.ILGPU.ML.</p>
+        </div>
+    }
+
+    <PrivacyBadge />
+</div>
+
+<style>
+    .assistant-page { max-width: 1100px; margin: 0 auto; }
+    .assistant-header { margin-bottom: 1.5rem; }
+    .assistant-title { font-size: 1.6rem; font-weight: 800; color: #f1f5f9; display: flex; align-items: center; gap: 0.5rem; }
+    .assistant-icon { font-size: 1.4rem; }
+    .assistant-desc { color: #64748b; font-size: 0.9rem; line-height: 1.6; }
+
+    .assistant-layout { display: grid; grid-template-columns: 1fr 500px 200px; gap: 1.5rem; }
+
+    .character-picker { display: flex; gap: 0.5rem; grid-column: span 3; margin-bottom: 0.5rem; flex-wrap: wrap; }
+    .picker-btn { display: flex; align-items: center; gap: 0.4rem; padding: 0.4rem 0.8rem; border-radius: 20px; border: 2px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.03); color: #94a3b8; font-size: 0.85rem; cursor: pointer; transition: all 0.15s; }
+    .picker-btn.selected { border-color: #8b5cf6; background: rgba(139,92,246,0.1); color: #e2e8f0; }
+    .picker-btn:hover:not(.selected) { border-color: rgba(139,92,246,0.3); }
+    .picker-emoji { font-size: 1.2rem; }
+    .picker-name { font-weight: 600; }
+
+    .assistant-main { display: flex; flex-direction: column; }
+
+    .assistant-character { text-align: center; margin-bottom: 1rem; }
+    .character-display { position: relative; display: inline-block; }
+    .character-body { width: 120px; height: 120px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
+    .character-emoji { font-size: 3.5rem; }
+
+    .thought-bubble { position: absolute; top: -30px; right: -40px; background: rgba(255,255,255,0.1); border-radius: 12px; padding: 0.3rem 0.6rem; }
+    .thought-dots { color: #38bdf8; font-size: 1.5rem; animation: pulse 1s ease-in-out infinite; }
+
+    .speech-bubble-large { position: absolute; top: -80px; left: 50%; transform: translateX(-50%); min-width: 200px; max-width: 350px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); border-radius: 14px; padding: 0.75rem 1rem; }
+    .bubble-content { color: #e2e8f0; font-size: 0.9rem; line-height: 1.5; }
+    .bubble-tail-large { position: absolute; bottom: -8px; left: 50%; transform: translateX(-50%); width: 16px; height: 16px; background: rgba(255,255,255,0.08); border-right: 1px solid rgba(255,255,255,0.15); border-bottom: 1px solid rgba(255,255,255,0.15); transform: translateX(-50%) rotate(45deg); }
+
+    .animation-indicator { color: #475569; font-size: 0.75rem; font-style: italic; margin-top: 0.3rem; }
+
+    .character-nameplate { margin-top: 0.5rem; }
+    .nameplate-name { display: block; color: #f1f5f9; font-size: 1.1rem; font-weight: 700; }
+    .nameplate-role { display: block; color: #64748b; font-size: 0.8rem; }
+
+    .chat-history { flex: 1; overflow-y: auto; max-height: 250px; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 8px; margin-bottom: 0.75rem; display: flex; flex-direction: column; gap: 0.4rem; }
+    .chat-msg { padding: 0.3rem 0; }
+    .msg-sender { color: #94a3b8; font-size: 0.8rem; font-weight: 600; }
+    .user-msg .msg-sender { color: #3b82f6; }
+    .assistant-msg .msg-sender { color: #8b5cf6; }
+    .msg-text { color: #cbd5e1; font-size: 0.85rem; margin-left: 0.3rem; }
+    .msg-timing { color: #475569; font-size: 0.65rem; font-family: monospace; margin-left: 0.3rem; }
+
+    .input-section { }
+    .input-mode-toggle { display: flex; border-radius: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 0.5rem; width: fit-content; }
+    .mode-btn { padding: 0.3rem 0.75rem; border: none; background: rgba(255,255,255,0.04); color: #64748b; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
+    .mode-btn.active { background: rgba(139,92,246,0.2); color: #e2e8f0; }
+
+    .text-input-row { display: flex; gap: 0.5rem; }
+    .text-input { flex: 1; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.9rem; }
+    .text-input:focus { border-color: rgba(139,92,246,0.5); outline: none; }
+    .send-btn { padding: 0.6rem 1rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #3b82f6, #8b5cf6); color: white; font-weight: 600; cursor: pointer; }
+    .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .voice-input { text-align: center; padding: 1rem; }
+    .voice-btn { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.75rem 1.5rem; border-radius: 50px; border: 2px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: #e2e8f0; font-size: 0.95rem; font-weight: 600; cursor: pointer; }
+    .voice-btn.listening { border-color: #ef4444; background: rgba(239,68,68,0.1); }
+    .voice-icon { font-size: 1.2rem; }
+    .pulse-icon { animation: pulse 1s ease-in-out infinite; }
+    .transcribed { color: #94a3b8; font-size: 0.85rem; font-style: italic; margin-top: 0.5rem; }
+
+    .assistant-settings { }
+    .assistant-settings h3 { color: #94a3b8; font-size: 0.85rem; font-weight: 600; margin: 0.75rem 0 0.3rem 0; }
+    .personality-desc { color: #64748b; font-size: 0.8rem; line-height: 1.4; }
+    .capability-list { display: flex; flex-direction: column; gap: 0.3rem; }
+    .capability { display: flex; align-items: center; gap: 0.3rem; font-size: 0.8rem; }
+    .capability.enabled { color: #6ee7b7; }
+    .capability.disabled { color: #475569; }
+    .cap-icon { font-size: 0.85rem; }
+    .stat-row { display: flex; justify-content: space-between; color: #64748b; font-size: 0.78rem; padding: 0.15rem 0; }
+    .stat-row span:last-child { font-family: monospace; color: #94a3b8; }
+
+    .model-needed { margin-top: 1.5rem; padding: 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; line-height: 1.5; }
+
+    @@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @@media (max-width: 768px) { .assistant-layout { grid-template-columns: 1fr; } .character-picker { grid-column: span 1; } }
+</style>
+
+@code {
+    private List<AssistantCharacter> _assistants = new()
+    {
+        new() { Id = "merlin", Name = "Merlin", Emoji = "&#x1F9D9;", Role = "The Wise Wizard", Color = "#7c3aed", PersonalityDescription = "A mystical wizard who speaks with ancient wisdom and occasional dry humor. Loves to explain things through magical metaphors." },
+        new() { Id = "robby", Name = "Robby", Emoji = "&#x1F916;", Role = "The Friendly Robot", Color = "#3b82f6", PersonalityDescription = "A cheerful robot who's fascinated by human behavior. Speaks precisely but with genuine warmth. Occasionally glitches endearingly." },
+        new() { Id = "clippy", Name = "Clippy", Emoji = "&#x1F4CE;", Role = "The Helpful Paperclip", Color = "#f59e0b", PersonalityDescription = "It looks like you're trying to chat! The iconic office assistant, now with actual intelligence. Still eager to help, still slightly annoying." },
+        new() { Id = "peedy", Name = "Peedy", Emoji = "&#x1F99C;", Role = "The Chatty Parrot", Color = "#22c55e", PersonalityDescription = "A colorful parrot who loves to repeat wisdom (and nonsense) in creative ways. Speaks with tropical flair." },
+        new() { Id = "rocky", Name = "Rocky", Emoji = "&#x1F436;", Role = "The Loyal Dog", Color = "#f97316", PersonalityDescription = "A loyal golden retriever who's always excited to help. Everything is the BEST THING EVER. Easily distracted by squirrels." },
+        new() { Id = "links", Name = "Links", Emoji = "&#x1F431;", Role = "The Independent Cat", Color = "#8b5cf6", PersonalityDescription = "A sophisticated cat who helps... when they feel like it. Aloof but secretly knowledgeable. Judges your questions silently." },
+    };
+
+    private string _selectedAssistant = "merlin";
+    private AssistantCharacter CurrentAssistant => _assistants.First(a => a.Id == _selectedAssistant);
+    private string _inputMode = "text";
+    private string _userInput = "";
+    private string? _currentResponse;
+    private string? _currentAnimation;
+    private string? _transcribedText;
+    private bool _isThinking, _isListening;
+    private bool _hasTextGen, _hasSpeechToText, _hasTextToSpeech, _hasEmotionDetect;
+    private int _totalTokens;
+    private double _totalInferenceMs;
+    private List<ChatMessage> _messages = new();
+
+    private void SelectAssistant(string id) { _selectedAssistant = id; _messages.Clear(); _currentResponse = null; }
+
+    private async Task SendMessage()
+    {
+        if (string.IsNullOrWhiteSpace(_userInput)) return;
+        _messages.Add(new ChatMessage { Text = _userInput, IsUser = true });
+        var input = _userInput;
+        _userInput = "";
+        _isThinking = true;
+        _currentAnimation = "thinking...";
+        StateHasChanged();
+
+        // TODO: Run text generation with personality prompt
+        await Task.Delay(100); // Simulate thinking
+
+        _isThinking = false;
+        _currentAnimation = null;
+        StateHasChanged();
+    }
+
+    private void HandleKeyPress(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") _ = SendMessage();
+    }
+
+    private Task StartListening() { _isListening = true; StateHasChanged(); return Task.CompletedTask; }
+    private Task StopListening() { _isListening = false; StateHasChanged(); return Task.CompletedTask; }
+
+    private class AssistantCharacter
+    {
+        public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public string Emoji { get; set; } = "";
+        public string Role { get; set; } = "";
+        public string Color { get; set; } = "";
+        public string PersonalityDescription { get; set; } = "";
+    }
+
+    private class ChatMessage
+    {
+        public string Text { get; set; } = "";
+        public bool IsUser { get; set; }
+        public double InferenceMs { get; set; }
+    }
+}

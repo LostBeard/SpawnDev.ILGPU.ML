@@ -1,0 +1,304 @@
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@inject BlazorJSRuntime JS
+@implements IDisposable
+
+<div class="voice-command @(_isListening ? "listening" : "") @(_isVisible ? "" : "hidden")">
+    <button class="voice-toggle" @onclick="ToggleListening" title="Voice commands (say 'Computer' to activate)">
+        <span class="voice-mic">@(_isListening ? "&#x1F534;" : "&#x1F3A4;")</span>
+    </button>
+
+    @if (_isListening && !string.IsNullOrEmpty(_lastTranscript))
+    {
+        <div class="voice-transcript">"@_lastTranscript"</div>
+    }
+
+    @if (_isListening && _isProcessing)
+    {
+        <div class="voice-processing">Processing...</div>
+    }
+
+    @if (!string.IsNullOrEmpty(_responseText))
+    {
+        <div class="voice-response">@_responseText</div>
+    }
+</div>
+
+@code {
+    /// <summary>Fired when a voice command is recognized. Parameter is the command text (after wake word).</summary>
+    [Parameter] public EventCallback<string> OnCommand { get; set; }
+
+    /// <summary>Wake word to activate commands. Default: "computer".</summary>
+    [Parameter] public string WakeWord { get; set; } = "computer";
+
+    /// <summary>Whether to play a sound on activation.</summary>
+    [Parameter] public bool PlayActivationSound { get; set; } = true;
+
+    /// <summary>Whether the voice button is visible.</summary>
+    [Parameter] public bool IsVisible { get; set; } = true;
+
+    /// <summary>Whether to speak responses.</summary>
+    [Parameter] public bool SpeakResponses { get; set; } = true;
+
+    private SpeechRecognition? _recognition;
+    private bool _isListening;
+    private bool _isProcessing;
+    private bool _isVisible = true;
+    private string? _lastTranscript;
+    private string? _responseText;
+    private bool _wakeWordDetected;
+
+    protected override void OnParametersSet()
+    {
+        _isVisible = IsVisible;
+    }
+
+    private async Task ToggleListening()
+    {
+        if (_isListening)
+        {
+            StopListening();
+        }
+        else
+        {
+            await StartListening();
+        }
+    }
+
+    private async Task StartListening()
+    {
+        try
+        {
+            // Check if SpeechRecognition is supported
+            _recognition = new SpeechRecognition();
+            _recognition.Continuous = true;
+            _recognition.InterimResults = true;
+            _recognition.Lang = "en-US";
+
+            _recognition.OnResult += HandleResult;
+            _recognition.OnEnd += HandleEnd;
+            _recognition.OnError += HandleError;
+
+            _recognition.Start();
+            _isListening = true;
+            StateHasChanged();
+        }
+        catch
+        {
+            _isListening = false;
+        }
+    }
+
+    private void StopListening()
+    {
+        _recognition?.Stop();
+        _isListening = false;
+        _wakeWordDetected = false;
+        StateHasChanged();
+    }
+
+    private void HandleResult(SpeechRecognitionEvent e)
+    {
+        using var results = e.Results;
+        if (results == null) return;
+
+        // Get the latest result
+        var lastResult = results[(int)results.Length - 1];
+        if (lastResult == null) return;
+
+        using var alternative = lastResult[0];
+        if (alternative == null) return;
+
+        string transcript = alternative.Transcript?.Trim().ToLowerInvariant() ?? "";
+        _lastTranscript = transcript;
+
+        if (!lastResult.IsFinal)
+        {
+            StateHasChanged();
+            return;
+        }
+
+        // Check for wake word
+        if (transcript.StartsWith(WakeWord.ToLowerInvariant()))
+        {
+            string command = transcript.Substring(WakeWord.Length).Trim();
+            if (!string.IsNullOrEmpty(command))
+            {
+                _isProcessing = true;
+                StateHasChanged();
+
+                // Play activation sound (Star Trek style!)
+                if (PlayActivationSound)
+                    PlayTrekSound();
+
+                OnCommand.InvokeAsync(command);
+                _isProcessing = false;
+                StateHasChanged();
+            }
+        }
+
+        lastResult.Dispose();
+    }
+
+    private void HandleEnd(Event e)
+    {
+        // Auto-restart if still in listening mode
+        if (_isListening && _recognition != null)
+        {
+            try { _recognition.Start(); } catch { }
+        }
+        e.Dispose();
+    }
+
+    private void HandleError(SpeechRecognitionErrorEvent e)
+    {
+        _lastTranscript = $"Error: {e.Error}";
+        StateHasChanged();
+        e.Dispose();
+    }
+
+    /// <summary>
+    /// Speak a response using the browser's text-to-speech.
+    /// Call this from the parent page after processing a command.
+    /// </summary>
+    public void Speak(string text)
+    {
+        _responseText = text;
+        StateHasChanged();
+
+        if (SpeakResponses)
+        {
+            try
+            {
+                using var speechSynthesis = JS.Get<SpeechSynthesis>("speechSynthesis");
+                using var utterance = new SpeechSynthesisUtterance(text);
+                utterance.Rate = 1.0f;
+                utterance.Pitch = 1.0f;
+                speechSynthesis.Speak(utterance);
+            }
+            catch { }
+        }
+
+        // Clear response after a few seconds
+        _ = ClearResponseAfterDelay();
+    }
+
+    private async Task ClearResponseAfterDelay()
+    {
+        await Task.Delay(5000);
+        _responseText = null;
+        StateHasChanged();
+    }
+
+    private void PlayTrekSound()
+    {
+        // Play a short beep using Web Audio API as a Star Trek communicator chirp
+        try
+        {
+            using var audioCtx = new AudioContext();
+            using var oscillator = audioCtx.CreateOscillator();
+            using var gain = audioCtx.CreateGain();
+            oscillator.Frequency.Value = 1200;
+            gain.Gain.Value = 0.3f;
+            oscillator.Connect(gain);
+            gain.Connect(audioCtx.Destination);
+            oscillator.Start();
+            // Quick chirp: stop after 150ms
+            // Note: would need setTimeout via JS — simplified here
+        }
+        catch { }
+    }
+
+    public void Dispose()
+    {
+        if (_recognition != null)
+        {
+            try { _recognition.Stop(); } catch { }
+            _recognition.Dispose();
+        }
+    }
+}
+
+<style>
+    .voice-command {
+        position: fixed;
+        bottom: 1.5rem;
+        right: 1.5rem;
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 0.4rem;
+    }
+
+    .voice-command.hidden { display: none; }
+
+    .voice-toggle {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        border: 2px solid rgba(255, 255, 255, 0.15);
+        background: rgba(15, 23, 42, 0.9);
+        backdrop-filter: blur(8px);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.2s;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    }
+
+    .voice-toggle:hover {
+        border-color: rgba(139, 92, 246, 0.5);
+        transform: scale(1.1);
+    }
+
+    .voice-command.listening .voice-toggle {
+        border-color: #ef4444;
+        box-shadow: 0 0 20px rgba(239, 68, 68, 0.3);
+        animation: pulse-glow 2s ease-in-out infinite;
+    }
+
+    .voice-mic { font-size: 1.3rem; }
+
+    .voice-transcript {
+        background: rgba(15, 23, 42, 0.9);
+        backdrop-filter: blur(8px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        padding: 0.4rem 0.75rem;
+        color: #94a3b8;
+        font-size: 0.8rem;
+        font-style: italic;
+        max-width: 250px;
+    }
+
+    .voice-processing {
+        background: rgba(56, 189, 248, 0.1);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 8px;
+        padding: 0.3rem 0.6rem;
+        color: #38bdf8;
+        font-size: 0.8rem;
+        animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .voice-response {
+        background: rgba(139, 92, 246, 0.1);
+        border: 1px solid rgba(139, 92, 246, 0.25);
+        border-radius: 8px;
+        padding: 0.4rem 0.75rem;
+        color: #c4b5fd;
+        font-size: 0.82rem;
+        max-width: 300px;
+        animation: fadeIn 0.3s ease;
+    }
+
+    @@keyframes pulse-glow {
+        0%, 100% { box-shadow: 0 0 10px rgba(239, 68, 68, 0.2); }
+        50% { box-shadow: 0 0 25px rgba(239, 68, 68, 0.4); }
+    }
+
+    @@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    @@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+</style>

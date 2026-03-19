@@ -51,12 +51,11 @@ public class ClassificationPipeline : IDisposable
         // Create input tensor
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
 
-        // Run inference
-        var outputs = _session.Run(new Dictionary<string, Tensor>
+        // Run inference (async for browser backends)
+        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
         });
-        await _accelerator.SynchronizeAsync();
 
         // Read logits
         var output = outputs[_session.OutputNames[0]];

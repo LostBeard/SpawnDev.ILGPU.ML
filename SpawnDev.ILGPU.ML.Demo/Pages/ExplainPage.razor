@@ -1,0 +1,177 @@
+@page "/explain"
+
+<PageTitle>What Does the GPU See? — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="explain-page">
+    <div class="explain-header">
+        <h1 class="explain-title">
+            <span class="explain-icon">&#x1F441;</span> What Does the GPU See?
+        </h1>
+        <p class="explain-desc">
+            Peek inside the neural network. See feature maps, attention patterns, and activation heatmaps
+            as the model processes your image — layer by layer.
+        </p>
+    </div>
+
+    <div class="explain-layout">
+        <div class="explain-input">
+            <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                           OnImageLoaded="@HandleImageLoaded"
+                           SampleImages="@_samples" />
+        </div>
+
+        <div class="explain-controls">
+            <div class="control-group">
+                <label>Model:</label>
+                <select @bind="_selectedModel" class="explain-select">
+                    <option value="squeezenet">SqueezeNet</option>
+                    <option value="mobilenetv2">MobileNetV2</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Visualization:</label>
+                <select @bind="_vizMode" class="explain-select">
+                    <option value="features">Feature Maps</option>
+                    <option value="attention">Attention Heatmap</option>
+                    <option value="activations">Activation Distribution</option>
+                    <option value="gradcam">Grad-CAM (Class Activation)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>Layer:</label>
+                <input type="range" min="0" max="@_maxLayer" @bind="_selectedLayer" class="layer-slider" />
+                <span class="layer-label">@_selectedLayer / @_maxLayer</span>
+            </div>
+        </div>
+    </div>
+
+    @if (_featureMaps != null && _featureMaps.Count > 0)
+    {
+        <div class="feature-grid-section">
+            <h2 class="section-title">Layer @_selectedLayer — @_layerName (@_featureMaps.Count channels)</h2>
+            <div class="feature-grid">
+                @foreach (var (mapUrl, channelIdx) in _featureMaps.Select((url, i) => (url, i)))
+                {
+                    <div class="feature-tile" @onclick="() => _selectedChannel = channelIdx">
+                        <img src="@mapUrl" alt="@($"Channel {channelIdx}")" class="feature-img @(channelIdx == _selectedChannel ? "selected" : "")" />
+                        <span class="feature-label">Ch @channelIdx</span>
+                    </div>
+                }
+            </div>
+        </div>
+
+        @if (_selectedChannel >= 0 && _selectedChannel < _featureMaps.Count)
+        {
+            <div class="feature-detail">
+                <div class="detail-image">
+                    <img src="@_featureMaps[_selectedChannel]" alt="Feature map detail" />
+                </div>
+                <div class="detail-stats">
+                    <h3>Channel @_selectedChannel Statistics</h3>
+                    <div class="stat-row"><span>Min:</span><span>@_channelMin.ToString("F4")</span></div>
+                    <div class="stat-row"><span>Max:</span><span>@_channelMax.ToString("F4")</span></div>
+                    <div class="stat-row"><span>Mean:</span><span>@_channelMean.ToString("F4")</span></div>
+                    <div class="stat-row"><span>Active %:</span><span>@_activationPercent.ToString("F1")%</span></div>
+                </div>
+            </div>
+        }
+    }
+
+    @if (_attentionMapUrl != null)
+    {
+        <div class="attention-section">
+            <h2 class="section-title">Attention Heatmap</h2>
+            <div class="attention-overlay">
+                <img src="@_imageDataUrl" alt="Original" class="attention-base" />
+                <img src="@_attentionMapUrl" alt="Attention" class="attention-heat" style="opacity: @(_heatmapOpacity / 100.0);" />
+            </div>
+            <div class="attention-controls">
+                <label>Opacity:</label>
+                <input type="range" min="0" max="100" @bind="_heatmapOpacity" class="opacity-slider" />
+                <span>@_heatmapOpacity%</span>
+            </div>
+        </div>
+    }
+
+    @if (!_isModelLoaded)
+    {
+        <div class="explain-note">
+            <p><strong>How this works:</strong> We intercept the graph executor between nodes, extract intermediate tensor values, and visualize them as images. Each "feature map" is one channel of a convolutional layer's output — showing what pattern that channel detected.</p>
+            <p style="margin-top: 0.5rem;">This is only possible because SpawnDev.ILGPU.ML runs the graph natively — we have direct access to every intermediate tensor on the GPU.</p>
+        </div>
+    }
+
+    <PrivacyBadge />
+</div>
+
+<style>
+    .explain-page { max-width: 1000px; margin: 0 auto; }
+    .explain-header { margin-bottom: 1.5rem; }
+    .explain-title { font-size: 1.6rem; font-weight: 800; color: #f1f5f9; display: flex; align-items: center; gap: 0.5rem; }
+    .explain-icon { font-size: 1.4rem; }
+    .explain-desc { color: #64748b; font-size: 0.95rem; line-height: 1.6; }
+
+    .explain-layout { display: flex; gap: 1.5rem; margin-bottom: 1.5rem; }
+    .explain-input { flex: 1; }
+    .explain-controls { flex: 0 0 250px; display: flex; flex-direction: column; gap: 0.75rem; }
+    .control-group { display: flex; flex-direction: column; gap: 0.25rem; }
+    .control-group label { color: #64748b; font-size: 0.82rem; }
+    .explain-select { padding: 0.4rem 0.5rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.85rem; }
+    .explain-select option { background: #1e293b; }
+    .layer-slider { width: 100%; accent-color: #8b5cf6; }
+    .layer-label { color: #94a3b8; font-size: 0.8rem; font-family: monospace; }
+
+    .feature-grid-section { margin-bottom: 1.5rem; }
+    .section-title { color: #f1f5f9; font-size: 1rem; font-weight: 600; margin-bottom: 0.75rem; }
+    .feature-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 0.4rem; }
+    .feature-tile { text-align: center; cursor: pointer; transition: all 0.15s; }
+    .feature-img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 4px; border: 2px solid transparent; transition: border-color 0.15s; }
+    .feature-img.selected { border-color: #8b5cf6; }
+    .feature-img:hover { border-color: rgba(139,92,246,0.5); }
+    .feature-label { color: #475569; font-size: 0.65rem; }
+
+    .feature-detail { display: flex; gap: 1.5rem; margin-top: 1rem; padding: 1rem; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; }
+    .detail-image img { width: 200px; height: 200px; border-radius: 8px; image-rendering: pixelated; }
+    .detail-stats { flex: 1; }
+    .detail-stats h3 { color: #f1f5f9; font-size: 0.95rem; margin-bottom: 0.5rem; }
+    .stat-row { display: flex; justify-content: space-between; padding: 0.2rem 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .stat-row span:first-child { color: #64748b; font-size: 0.82rem; }
+    .stat-row span:last-child { color: #cbd5e1; font-size: 0.82rem; font-family: monospace; }
+
+    .attention-section { margin: 1.5rem 0; }
+    .attention-overlay { position: relative; display: inline-block; border-radius: 10px; overflow: hidden; }
+    .attention-base { width: 100%; display: block; }
+    .attention-heat { position: absolute; inset: 0; width: 100%; height: 100%; mix-blend-mode: screen; }
+    .attention-controls { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+    .attention-controls label { color: #64748b; font-size: 0.82rem; }
+    .opacity-slider { width: 150px; accent-color: #8b5cf6; }
+    .attention-controls span { color: #94a3b8; font-size: 0.8rem; font-family: monospace; }
+
+    .explain-note { margin-top: 1.5rem; padding: 1rem; background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.15); border-radius: 8px; color: #7dd3fc; font-size: 0.85rem; line-height: 1.5; }
+
+    @@media (max-width: 640px) { .explain-layout { flex-direction: column; } .explain-controls { flex: none; } }
+</style>
+
+@code {
+    private string? _imageDataUrl;
+    private string _selectedModel = "squeezenet";
+    private string _vizMode = "features";
+    private int _selectedLayer = 0;
+    private int _maxLayer = 12;
+    private string _layerName = "conv1";
+    private int _selectedChannel = 0;
+    private int _heatmapOpacity = 60;
+    private float _channelMin, _channelMax, _channelMean, _activationPercent;
+    private bool _isModelLoaded;
+    private List<string>? _featureMaps;
+    private string? _attentionMapUrl;
+
+    private List<ImageDropZone.SampleImage> _samples = new()
+    {
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Dog", Url = "samples/dog.jpg" },
+        new() { Label = "Landscape", Url = "samples/landscape.jpg" },
+    };
+
+    private Task HandleImageLoaded(byte[] imageBytes) => Task.CompletedTask;
+}

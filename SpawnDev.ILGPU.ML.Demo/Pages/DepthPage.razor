@@ -3,7 +3,7 @@
 <PageTitle>Depth Estimation — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Depth Estimation"
-            Description="Estimate monocular depth using Depth Anything. Upload an image to generate a color-mapped depth map."
+            Description="Estimate monocular depth using Depth Anything V2 Small (26M params). Upload an image to generate a color-mapped depth map."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -15,11 +15,11 @@
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="50">
+            ModelSizeMB="95">
 
     <div class="depth-controls">
         <label class="palette-label">Color palette:</label>
-        <select class="palette-select" @bind="_colorPalette">
+        <select class="palette-select" @bind="_colorPalette" @bind:after="RecolorDepth">
             <option value="plasma">Plasma</option>
             <option value="viridis">Viridis</option>
             <option value="inferno">Inferno</option>
@@ -32,7 +32,22 @@
         <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
                            AfterImageUrl="@_depthImageUrl"
                            BeforeLabel="Original"
-                           AfterLabel="Depth" />
+                           AfterLabel="@($"Depth ({_colorPalette})")" />
+
+        <div class="depth-stats">
+            <span class="depth-stat">Min depth: @_minDepth.ToString("F3")</span>
+            <span class="depth-stat">Max depth: @_maxDepth.ToString("F3")</span>
+            <span class="depth-stat">Range: @((_maxDepth - _minDepth).ToString("F3"))</span>
+        </div>
+
+        <div class="result-actions">
+            <button class="action-btn download-btn" @onclick="DownloadResult">
+                Download Depth Map
+            </button>
+            <button class="action-btn clear-btn" @onclick="ClearResult">
+                Try Another Image
+            </button>
+        </div>
     }
     else
     {
@@ -41,10 +56,17 @@
                        SampleImages="@_samples" />
     }
 
-    @if (_imageDataUrl != null && _depthImageUrl == null && _isModelLoaded)
+    @if (_imageDataUrl != null && _depthImageUrl == null && _isModelLoaded && !_isRunning)
     {
         <button class="run-btn" @onclick="RunDepthEstimation">Estimate Depth</button>
     }
+
+    @if (!string.IsNullOrEmpty(_statusMessage))
+    {
+        <div class="status-message">@_statusMessage</div>
+    }
+
+    <PrivacyBadge />
 
 </DemoLayout>
 
@@ -74,6 +96,18 @@
         background: #1e293b;
     }
 
+    .depth-stats {
+        display: flex;
+        gap: 1.5rem;
+        margin-top: 0.75rem;
+    }
+
+    .depth-stat {
+        color: #94a3b8;
+        font-size: 0.8rem;
+        font-family: 'JetBrains Mono', 'Consolas', monospace;
+    }
+
     .run-btn {
         margin-top: 1rem;
         padding: 0.6rem 1.5rem;
@@ -91,9 +125,24 @@
         transform: translateY(-2px);
         box-shadow: 0 6px 16px rgba(59, 130, 246, 0.3);
     }
+
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease; }
+    .download-btn { border: 1px solid rgba(52,211,153,0.3); background: rgba(52,211,153,0.1); color: #6ee7b7; }
+    .download-btn:hover { background: rgba(52,211,153,0.2); transform: translateY(-1px); }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
+
+    .status-message {
+        margin-top: 0.75rem;
+        color: #94a3b8;
+        font-size: 0.85rem;
+        font-style: italic;
+    }
 </style>
 
 @code {
+    // UI state — methods in DepthPage.razor.cs
     private string _selectedBackend = "WebGPU";
     private string? _imageDataUrl;
     private string? _depthImageUrl;
@@ -103,6 +152,12 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
+    private float _minDepth;
+    private float _maxDepth;
+    private float[]? _depthMap;
+    private int _depthWidth;
+    private int _depthHeight;
+    private string? _statusMessage;
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
@@ -118,18 +173,12 @@
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
 
-    private Task HandleBackendChange(string backend) => Task.CompletedTask;
-
-    private Task HandleImageLoaded(byte[] imageBytes)
+    private void RecolorDepth()
     {
-        _depthImageUrl = null;
-        // TODO: Preprocess image
-        return Task.CompletedTask;
-    }
-
-    private Task RunDepthEstimation()
-    {
-        // TODO: Run depth estimation through InferenceSession
-        return Task.CompletedTask;
+        if (_depthMap == null) return;
+        var rgba = SpawnDev.ILGPU.ML.Preprocessing.DepthColorMaps.ApplyColorMap(_depthMap, _depthWidth, _depthHeight, _colorPalette);
+        var pngBytes = SpawnDev.ILGPU.ML.Preprocessing.PngEncoder.Encode(rgba, _depthWidth, _depthHeight);
+        _depthImageUrl = $"data:image/png;base64,{Convert.ToBase64String(pngBytes)}";
+        StateHasChanged();
     }
 }

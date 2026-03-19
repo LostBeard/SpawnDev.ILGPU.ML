@@ -23,12 +23,21 @@ public class SuperResolutionPipeline : IDisposable
     private readonly Accelerator _accelerator;
     private readonly int _upscaleFactor;
 
+    private readonly int _modelH;
+    private readonly int _modelW;
+
     public SuperResolutionPipeline(InferenceSession session, Accelerator accelerator,
         int upscaleFactor = 3)
     {
         _session = session;
         _accelerator = accelerator;
         _upscaleFactor = upscaleFactor;
+        // Use model's declared input size (graph compiler uses static shapes)
+        var inputShape = session.InputShapes.Values.FirstOrDefault() ?? new[] { 1, 1, 224, 224 };
+        _modelH = inputShape.Length >= 4 ? inputShape[2] : (inputShape.Length >= 2 ? inputShape[^2] : 224);
+        _modelW = inputShape.Length >= 4 ? inputShape[3] : (inputShape.Length >= 1 ? inputShape[^1] : 224);
+        if (_modelH <= 0) _modelH = 224;
+        if (_modelW <= 0) _modelW = 224;
     }
 
     /// <summary>
@@ -36,24 +45,30 @@ public class SuperResolutionPipeline : IDisposable
     /// </summary>
     public async Task<SuperResResult> UpscaleAsync(int[] rgbaPixels, int width, int height)
     {
-        // Extract Y luminance channel from RGBA
-        // Y = 0.299R + 0.587G + 0.114B (BT.601)
-        var yChannel = new float[height * width];
-        for (int i = 0; i < width * height; i++)
-        {
-            int pixel = rgbaPixels[i];
-            float r = (pixel & 0xFF) / 255f;
-            float g = ((pixel >> 8) & 0xFF) / 255f;
-            float b = ((pixel >> 16) & 0xFF) / 255f;
-            yChannel[i] = 0.299f * r + 0.587f * g + 0.114f * b;
-        }
+        int modelH = _modelH, modelW = _modelW;
 
-        // Upload as [1, 1, H, W]
+        // Extract Y luminance channel and resize to model dimensions
+        var yChannel = new float[modelH * modelW];
+        for (int y = 0; y < modelH; y++)
+            for (int x = 0; x < modelW; x++)
+            {
+                int sy = y * height / modelH;
+                int sx = x * width / modelW;
+                if (sy >= height) sy = height - 1;
+                if (sx >= width) sx = width - 1;
+                int pixel = rgbaPixels[sy * width + sx];
+                float r = (pixel & 0xFF) / 255f;
+                float g = ((pixel >> 8) & 0xFF) / 255f;
+                float b = ((pixel >> 16) & 0xFF) / 255f;
+                yChannel[y * modelW + x] = 0.299f * r + 0.587f * g + 0.114f * b;
+            }
+
+        // Upload as [1, 1, modelH, modelW]
         using var inputBuf = _accelerator.Allocate1D(yChannel);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, height, width });
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, modelH, modelW });
 
         // Run inference
-        var outputs = _session.Run(new Dictionary<string, Tensor>
+        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
         });
@@ -61,8 +76,8 @@ public class SuperResolutionPipeline : IDisposable
 
         // Read upscaled Y channel
         var output = outputs[_session.OutputNames[0]];
-        int outH = height * _upscaleFactor;
-        int outW = width * _upscaleFactor;
+        int outH = modelH * _upscaleFactor;
+        int outW = modelW * _upscaleFactor;
         int outSize = outH * outW;
 
         using var readBuf = _accelerator.Allocate1D<float>(outSize);

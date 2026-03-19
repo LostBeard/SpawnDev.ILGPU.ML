@@ -47,6 +47,15 @@
         <button class="run-btn" @onclick="RunRemoval">Remove Background</button>
     }
 
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            RMBG-1.4 model (~88MB) not yet deployed. Background removal will be enabled once the model is available.
+        </div>
+    }
+
+    <PrivacyBadge />
+
 </DemoLayout>
 
 <style>
@@ -119,6 +128,16 @@
         font-size: 0.95rem;
         cursor: pointer;
         transition: all 0.2s ease;
+    }
+
+    .model-needed {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        background: rgba(245, 158, 11, 0.08);
+        border: 1px solid rgba(245, 158, 11, 0.2);
+        border-radius: 8px;
+        color: #fbbf24;
+        font-size: 0.85rem;
     }
 
     .run-btn:hover {

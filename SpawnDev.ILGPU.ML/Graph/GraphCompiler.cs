@@ -57,9 +57,11 @@ public class GraphCompiler
             var op = _registry.Resolve(node.OpType);
             var attrs = node.GetTypedAttributes();
 
-            // Gather input shapes
+            // Gather input shapes (empty string = optional ONNX input, use empty shape)
             var inputShapes = node.Inputs
-                .Select(name => knownShapes.TryGetValue(name, out var s) ? s : throw new InvalidOperationException($"Unknown shape for '{name}' (needed by {node.OpType})"))
+                .Select(name => string.IsNullOrEmpty(name) ? Array.Empty<int>()
+                    : knownShapes.TryGetValue(name, out var s) ? s
+                    : throw new InvalidOperationException($"Unknown shape for '{name}' (needed by {node.OpType})"))
                 .ToArray();
 
             // Infer output shapes
@@ -72,6 +74,38 @@ public class GraphCompiler
             {
                 // Fallback: output shape = first input shape (common for element-wise)
                 outputShapes = new[] { inputShapes[0] };
+            }
+
+            // Special-case: Reshape needs the actual shape tensor values.
+            // If the second input is a known initializer with shape [N], the output
+            // has N dimensions. The Transpose perm length must match this rank.
+            // We can infer the output shape from the initializer's known data
+            // by reading it from the graph's initializer constants.
+            if (node.OpType == "Reshape" && node.Inputs.Count >= 2)
+            {
+                var shapeTensorName = node.Inputs[1];
+                if (knownShapes.TryGetValue(shapeTensorName, out var shapeTensorShape)
+                    && shapeTensorShape.Length == 1)
+                {
+                    int outRank = shapeTensorShape[0];
+                    // We don't have the actual values here, but we know the output rank.
+                    // If the graph provides initializer values via the ConstantData dict, use them.
+                    if (graph.ConstantData != null && graph.ConstantData.TryGetValue(shapeTensorName, out var targetDims))
+                    {
+                        // targetDims contains the actual reshape target values (may have -1)
+                        int inputElems = inputShapes[0].Aggregate(1, (a, b) => a * b);
+                        var outShape = targetDims.ToArray();
+                        int negIdx = Array.IndexOf(outShape, -1);
+                        if (negIdx >= 0)
+                        {
+                            int knownProduct = 1;
+                            for (int j = 0; j < outShape.Length; j++)
+                                if (j != negIdx) knownProduct *= outShape[j];
+                            outShape[negIdx] = knownProduct > 0 ? inputElems / knownProduct : 1;
+                        }
+                        outputShapes = new[] { outShape };
+                    }
+                }
             }
 
             // Register output shapes (override with graph output shapes if known)

@@ -17,10 +17,21 @@ public class BufferPool : IDisposable
     private readonly Accelerator _accelerator;
     private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allBuffers = new();
+    // Maps tensor data pointer → parent buffer for proper return-to-pool
+    private readonly Dictionary<long, MemoryBuffer1D<float, Stride1D.Dense>> _tensorBufferMap = new();
+
+    /// <summary>Total number of GPU buffers allocated by this pool.</summary>
+    public int AllocatedBufferCount => _allBuffers.Count;
+    /// <summary>Number of buffers available for reuse.</summary>
+    public int AvailableBufferCount => _buckets.Values.Sum(s => s.Count);
 
     public BufferPool(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
+    // Track latest buffer for each bucket size for Return
+    private MemoryBuffer1D<float, Stride1D.Dense>? _lastRentedBuffer;
+    private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _namedBuffers = new();
+
     public Tensor Rent(int[] shape, string? name = null)
     {
         int count = TensorHelpers.ElementCount(shape);
@@ -29,26 +40,35 @@ public class BufferPool : IDisposable
         if (_buckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
         {
             var buffer = stack.Pop();
-            return new Tensor(buffer.View, shape, name);
+            var tensor = new Tensor(buffer.View, shape, name);
+            if (name != null) _namedBuffers[name] = buffer;
+            _lastRentedBuffer = buffer;
+            return tensor;
         }
 
         var newBuffer = _accelerator.Allocate1D<float>(bucketSize);
         _allBuffers.Add(newBuffer);
-        return new Tensor(newBuffer.View, shape, name);
+        var newTensor = new Tensor(newBuffer.View, shape, name);
+        if (name != null) _namedBuffers[name] = newBuffer;
+        _lastRentedBuffer = newBuffer;
+        return newTensor;
     }
 
-    /// <summary>Return a tensor to the pool for reuse.</summary>
+    /// <summary>Return a tensor's buffer to the pool for reuse by name.</summary>
     public void Return(Tensor tensor)
     {
-        int bucketSize = NextPowerOf2(tensor.ElementCount);
-        if (!_buckets.TryGetValue(bucketSize, out var stack))
+        var name = tensor.Name;
+        if (name != null && _namedBuffers.TryGetValue(name, out var buffer))
         {
-            stack = new Stack<MemoryBuffer1D<float, Stride1D.Dense>>();
-            _buckets[bucketSize] = stack;
+            _namedBuffers.Remove(name);
+            int bucketSize = (int)buffer.Length;
+            if (!_buckets.TryGetValue(bucketSize, out var stack))
+            {
+                stack = new Stack<MemoryBuffer1D<float, Stride1D.Dense>>();
+                _buckets[bucketSize] = stack;
+            }
+            stack.Push(buffer);
         }
-        // We need to find the parent buffer — for now, we can't easily do this
-        // since Tensor holds a View, not a Buffer. This is a simplified pool.
-        // TODO: Track buffer→tensor mapping for proper pooling.
     }
 
     /// <summary>Allocate a permanent tensor (not pooled). For weights.</summary>
@@ -66,6 +86,28 @@ public class BufferPool : IDisposable
         var buffer = _accelerator.Allocate1D<float>(count);
         _allBuffers.Add(buffer);
         return new Tensor(buffer.View, shape, name);
+    }
+
+    /// <summary>Force-dispose the GPU buffer backing a tensor. Removes from tracking.</summary>
+    public void ForceDispose(Tensor tensor)
+    {
+        // Find and dispose the buffer that contains this tensor's view
+        for (int i = _allBuffers.Count - 1; i >= 0; i--)
+        {
+            var buf = _allBuffers[i];
+            // Match by checking if the tensor's element count fits in this buffer's size
+            // and the buffer isn't already disposed
+            if (buf.Length >= tensor.ElementCount)
+            {
+                try
+                {
+                    buf.Dispose();
+                    _allBuffers.RemoveAt(i);
+                    return;
+                }
+                catch { }
+            }
+        }
     }
 
     public void Dispose()

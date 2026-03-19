@@ -1,0 +1,152 @@
+@page "/depth-voxel"
+
+<PageTitle>Depth to 3D — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Live Depth to 3D"
+            Description="Real-time webcam depth estimation rendered as a 3D voxel bust. Connects depth estimation to 3D visualization — all on GPU."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowFps="true"
+            ShowModelProgress="true"
+            ModelName="Depth Anything V2 Small"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="95">
+
+    <div class="voxel-controls">
+        <div class="control-group">
+            <label>View:</label>
+            <button class="view-btn @(_viewMode == "side-by-side" ? "active" : "")" @onclick='() => _viewMode = "side-by-side"'>Side by Side</button>
+            <button class="view-btn @(_viewMode == "3d-only" ? "active" : "")" @onclick='() => _viewMode = "3d-only"'>3D Only</button>
+            <button class="view-btn @(_viewMode == "overlay" ? "active" : "")" @onclick='() => _viewMode = "overlay"'>Overlay</button>
+        </div>
+        <div class="control-group">
+            <label>Depth scale:</label>
+            <input type="range" min="1" max="10" step="0.5" @bind="_depthScale" class="depth-slider" />
+            <span class="depth-value">@_depthScale.ToString("F1")x</span>
+        </div>
+        <div class="control-group">
+            <label>Color:</label>
+            <select @bind="_colorMode" class="color-select">
+                <option value="rgb">Original RGB</option>
+                <option value="plasma">Plasma Depth</option>
+                <option value="viridis">Viridis Depth</option>
+                <option value="normals">Surface Normals</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="voxel-viewport @(_viewMode == "side-by-side" ? "viewport-split" : "")">
+        @if (_viewMode == "side-by-side" || _viewMode == "overlay")
+        {
+            <div class="viewport-webcam">
+                <WebcamCapture OnFrameCaptured="@HandleFrame"
+                               AutoCapture="@_isModelLoaded"
+                               CaptureIntervalMs="100"
+                               ShowCaptureButton="false"
+                               Width="320" Height="240" />
+            </div>
+        }
+
+        <div class="viewport-3d">
+            <div class="viewer-3d-placeholder">
+                <div class="viewer-icon">&#x1F4A0;</div>
+                <p>3D depth visualization</p>
+                <p class="viewer-hint">Depth map extruded as 3D mesh — rotate with mouse</p>
+                @if (_isRunning)
+                {
+                    <div class="fps-badge">@((1000.0 / Math.Max(1, _inferenceMs)).ToString("F0")) FPS</div>
+                }
+            </div>
+        </div>
+    </div>
+
+    @if (!_isModelLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            <p>Depth-to-3D requires Depth Anything V2 Small (95MB) for real-time depth estimation.</p>
+            <p style="margin-top: 0.5rem;">This demo takes webcam depth maps and renders them as displaced 3D meshes in real-time — showing the bridge between ML inference and 3D rendering, all running on GPU in the browser.</p>
+        </div>
+    }
+
+    <PrivacyBadge />
+
+</DemoLayout>
+
+<style>
+    .voxel-controls { display: flex; gap: 1.5rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: center; }
+    .control-group { display: flex; align-items: center; gap: 0.4rem; }
+    .control-group label { color: #64748b; font-size: 0.82rem; }
+    .view-btn { padding: 0.25rem 0.6rem; border-radius: 5px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); color: #94a3b8; font-size: 0.78rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .view-btn.active { background: rgba(139,92,246,0.2); border-color: rgba(139,92,246,0.4); color: #e2e8f0; }
+    .depth-slider { width: 80px; accent-color: #8b5cf6; }
+    .depth-value { color: #94a3b8; font-size: 0.8rem; font-family: monospace; min-width: 30px; }
+    .color-select { padding: 0.25rem 0.4rem; border-radius: 5px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.78rem; }
+    .color-select option { background: #1e293b; }
+
+    .voxel-viewport { display: flex; gap: 1rem; min-height: 350px; }
+    .viewport-split { }
+    .viewport-webcam { flex: 0 0 320px; border-radius: 10px; overflow: hidden; }
+    .viewport-3d { flex: 1; }
+
+    .viewer-3d-placeholder {
+        width: 100%;
+        height: 100%;
+        min-height: 350px;
+        background: rgba(0,0,0,0.4);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+    }
+    .viewer-icon { font-size: 3rem; opacity: 0.3; margin-bottom: 0.5rem; }
+    .viewer-3d-placeholder p { color: #64748b; font-size: 0.9rem; margin: 0.2rem 0; }
+    .viewer-hint { font-size: 0.8rem !important; color: #475569 !important; }
+
+    .fps-badge {
+        margin-top: 0.75rem;
+        padding: 0.3rem 0.7rem;
+        border-radius: 6px;
+        background: rgba(52,211,153,0.15);
+        border: 1px solid rgba(52,211,153,0.3);
+        color: #34d399;
+        font-size: 0.85rem;
+        font-weight: 700;
+        font-family: monospace;
+    }
+
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; line-height: 1.5; }
+
+    @@media (max-width: 640px) {
+        .voxel-viewport { flex-direction: column; }
+        .viewport-webcam { flex: none; }
+    }
+</style>
+
+@code {
+    private string _selectedBackend = "WebGPU";
+    private string _viewMode = "side-by-side";
+    private float _depthScale = 3.0f;
+    private string _colorMode = "rgb";
+    private bool _isRunning, _isModelLoading, _isModelLoaded;
+    private double _modelProgress, _inferenceMs;
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+    };
+
+    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
+    private Task HandleFrame(byte[] frameBytes)
+    {
+        // TODO: Run depth estimation on frame → render as 3D mesh
+        return Task.CompletedTask;
+    }
+}

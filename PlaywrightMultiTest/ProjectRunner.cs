@@ -157,6 +157,8 @@ namespace PlaywrightMultiTest
                         testableProject.Server = new StaticFileServer(testableProject.ProjectDetails.WwwRoot, baseUrl);
                         // start https server to serve the Blazor WASM app
                         testableProject.Server.Start();
+                        // Make server URL available to console test processes (they inherit env vars)
+                        Environment.SetEnvironmentVariable("TEST_SERVER_URL", baseUrl);
 
                         // create a playwright browser, navigate to the app, and enumerate the tests
                         LogStatus("Creating Playwright instance...");
