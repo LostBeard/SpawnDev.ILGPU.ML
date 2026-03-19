@@ -6,7 +6,7 @@
 
 **Hardware-agnostic neural network inference for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
 
-SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a `.onnx` file and run it on any of six backends.
+SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a model file — ONNX, TFLite, GGUF, or any of 7 supported formats — and run it on any of six backends.
 
 > **Active development.** API is stabilizing but may change. Contributions and feedback welcome.
 
@@ -19,7 +19,30 @@ SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kern
 - **7 model formats** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, and CoreML. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **10+ models compile** — SqueezeNet, MobileNetV2, 5 style transfer models, ESPCN, Depth Anything V2 (823 nodes!), MoveNet Lightning
-- **Model Inspector** — drop any `.onnx` file for instant architecture analysis and compatibility check. No other browser ML library has this.
+- **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
+
+## Universal Model Loading
+
+One API loads models from any ML ecosystem. Format is auto-detected from magic bytes — no configuration needed.
+
+| Format | Ecosystem | What It Opens |
+|--------|-----------|--------------|
+| **ONNX** (.onnx) | PyTorch, ONNX Model Zoo | Industry standard. Most exported models. |
+| **TFLite** (.tflite) | TensorFlow, MediaPipe, Google | Mobile/edge models. Face detection, pose, classification. |
+| **GGUF** (.gguf) | llama.cpp, HuggingFace | Quantized LLMs. Llama, Mistral, Phi, SmolLM. |
+| **SafeTensors** (.safetensors) | HuggingFace | Safe weight format. Nearly every HF model. |
+| **TF GraphDef** (.pb) | TensorFlow 1.x/2.x | Frozen graphs, TF Hub models. |
+| **PyTorch** (.pt/.pth) | PyTorch research | Weight extraction from checkpoints. |
+| **Core ML** (.mlmodel) | Apple, iOS/macOS | Apple's Neural Engine models. |
+
+```csharp
+// All of these work — format detected automatically
+var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
+var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
+var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");
+```
+
+Every format produces the same `ModelGraph` intermediate representation. All 71 operators, all 30 GPU kernels, all 6 backends, and the full graph optimizer work identically regardless of source format. **Write one pipeline, load from any ecosystem.**
 
 ## How It Works
 
@@ -102,11 +125,19 @@ Auto-selection: WebGPU > WebGL > Wasm (browser) or CUDA > OpenCL > CPU (desktop)
 | **SqueezeNet** | Classification (1000 classes) | 5 MB | **Working** — tiger cat 51.97% on WebGPU |
 | **MobileNetV2** | Classification (1000 classes) | 13 MB | Compiles, graph runs |
 | **ESPCN** | Super Resolution (3x) | 100 KB | **Working** on WebGPU |
-| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** on WebGPU — 112 nodes, ~19s inference |
+| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** on WebGPU — 112 nodes, 3.9s inference |
 | **Depth Anything V2 Small** | Monocular depth estimation | 95 MB | Compiles (823 nodes, 25 op types) |
 | **MoveNet Lightning** | Pose estimation (17 keypoints) | 9 MB | Compiles (21 op types) |
 
 Style models: mosaic, candy, rain princess, udnie, pointilism.
+
+**TFLite models:**
+
+| Model | Task | Size | Format |
+|-------|------|------|--------|
+| **BlazeFace** | Face detection | 229 KB | TFLite (MediaPipe) |
+| **EfficientNet-Lite0** | Classification (1000 classes) | 17.7 MB | TFLite (MediaPipe) |
+| **YOLOv8 Nano** | Object detection (80 classes) | 12.2 MB | ONNX |
 
 ## Architecture
 
@@ -207,7 +238,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | **Image Classification** | Drop a photo, get top-5 ImageNet predictions with confidence bars. Race Mode compares inference speed across WebGPU/WebGL/Wasm side-by-side. | **Live** |
 | **Neural Style Transfer** | Turn your photo into a Van Gogh, Monet, or Picasso. 5 style models, instant gallery switching. Before/after slider. | **Live** |
 | **Super Resolution** | Upload a small image, get 3x upscale. Before/after comparison with download. | **Live** |
-| **Model Inspector** | Drop any `.onnx` file for instant architecture analysis — node count, parameters, operators, compatibility check. | **Live** |
+| **Model Inspector** | Drop any model file (ONNX, TFLite, GGUF, SafeTensors...) for instant architecture analysis — node count, parameters, operators, compatibility check. | **Live** |
 
 ### Vision Demos
 
@@ -250,7 +281,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | Demo | What It Does |
 |------|-------------|
 | **Backend Showdown** | Run the same model on all available backends simultaneously. Leaderboard of inference times. Copy-paste shareable results. |
-| **Model Inspector** | Drop any `.onnx` file for instant architecture analysis and compatibility check. |
+| **Model Inspector** | Drop any model file for instant architecture analysis and compatibility check. All 7 formats supported. |
 | **Model Gallery** | Browse all available demo models. Load custom models from HuggingFace. |
 | **Getting Started** | 5-step interactive tutorial with code examples. |
 
@@ -287,15 +318,17 @@ Format is auto-detected from magic bytes. All parsing happens in-browser with ze
 
 ## Weight Loading
 
-Two weight formats supported:
+Weights are extracted automatically from any supported format:
 
-**Direct `.onnx`** — the parser extracts weights directly from the protobuf. Simplest path — no preprocessing step needed.
+| Format | Weight Types | Notes |
+|--------|-------------|-------|
+| **ONNX** | F32, F16 | Extracted from protobuf |
+| **TFLite** | F32, F16, INT8, UINT8 | Auto-dequantized with quantization params |
+| **GGUF** | F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 | Block dequantization for quantized LLMs |
+| **SafeTensors** | F32, F16, BF16, F64, I32, I16, I8, U8 | Zero-copy JSON header + raw data |
+| **Pre-extracted FP16** | F16 → F32 | `weights_fp16.bin` + `manifest_fp16.json` (optimized web delivery) |
 
-**Pre-extracted FP16** — for optimized delivery:
-- `weights_fp16.bin` — flat FP16 values, 256-byte aligned per tensor
-- `manifest_fp16.json` — tensor metadata (names, shapes, offsets)
-
-FP16 weights are converted to FP32 on GPU upload. Individual tensors are accessed via SubView with 256-byte alignment for WebGPU buffer binding.
+All weight types are converted to F32 on GPU upload. Pre-extracted FP16 uses 256-byte alignment for WebGPU buffer binding requirements.
 
 ## Blazor WebAssembly Configuration
 
