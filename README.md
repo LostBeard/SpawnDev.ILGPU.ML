@@ -10,12 +10,14 @@ SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kern
 
 ## Highlights
 
-- **71 ONNX operators** — classification, depth estimation, style transfer, super resolution, pose estimation, and more
+- **Neural style transfer runs in the browser** — 112-node pipeline, 5 styles, entirely on WebGPU. Turn your photo into a Van Gogh, Monet, or Picasso — no server, no upload, no cloud.
+- **Image classification in-browser** — SqueezeNet identifies "tiger cat" at 51.97% confidence on WebGPU. Drop any photo.
+- **Image super resolution** — ESPCN 3x upscale running on WebGPU. The "enhance!" button is real.
+- **71 ONNX operators** — enough to run classification, style transfer, super resolution, depth estimation, pose estimation, and more
 - **Direct .onnx loading** — zero-dependency protobuf parser (~700 lines C#, no Google.Protobuf). Just point at a `.onnx` file.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
-- **Browser-verified** — SqueezeNet classifies a cat photo as "tiger cat" at 51.97% confidence, running entirely in the browser via WebGPU
-- **10+ models compile** — SqueezeNet, MobileNetV2, 5 style transfer models, ESPCN super-resolution, Depth Anything V2, MoveNet Lightning
-- **60/62 WebGPU tests passing**
+- **10+ models compile** — SqueezeNet, MobileNetV2, 5 style transfer models, ESPCN, Depth Anything V2 (823 nodes!), MoveNet Lightning
+- **Model Inspector** — drop any `.onnx` file for instant architecture analysis and compatibility check. No other browser ML library has this.
 
 ## How It Works
 
@@ -94,9 +96,11 @@ Auto-selection: WebGPU > WebGL > Wasm (browser) or CUDA > OpenCL > CPU (desktop)
 | **SqueezeNet** | Classification (1000 classes) | 5 MB | **Working** — tiger cat 51.97% on WebGPU |
 | **MobileNetV2** | Classification (1000 classes) | 13 MB | Compiles, graph runs |
 | **ESPCN** | Super Resolution (3x) | 100 KB | **Working** on WebGPU |
-| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | Runs, output pending InstanceNorm fix |
+| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** on WebGPU — 112 nodes, ~19s inference |
 | **Depth Anything V2 Small** | Monocular depth estimation | 95 MB | Compiles (823 nodes, 25 op types) |
 | **MoveNet Lightning** | Pose estimation (17 keypoints) | 9 MB | Compiles (21 op types) |
+
+Style models: mosaic, candy, rain princess, udnie, pointilism.
 
 ## Architecture
 
@@ -160,17 +164,41 @@ Additional pipeline scaffolds: detection, segmentation, pose, CLIP, embeddings, 
 
 ## Demo App
 
-The demo is a Blazor WebAssembly app with interactive pages for each pipeline:
+The demo is a Blazor WebAssembly app showcasing what's possible when GPU inference runs entirely in the browser — no server, no uploads, no cloud. Everything stays on the user's device.
 
-- **/classify** — Image classification with backend selector and race mode (**working**)
-- **/super-res** — Image super resolution with before/after slider (**working**)
-- **/style** — Neural style transfer with 6 style gallery (pending InstanceNorm fix)
-- **/depth** — Monocular depth estimation with color palettes (pending full pipeline test)
-- **/inspector** — Drop any `.onnx` file for instant architecture analysis and compatibility check (**working**)
-- **/models** — Browse available demo models
-- **/tests** — Run unit tests in-browser across WebGPU, WebGL, and Wasm
+### Working Now
 
-26 demo pages total, with shared components: BackendSelector, ConfidenceBars, BeforeAfterSlider, ImageDropZone, InferenceTimer, ModelLoadProgress, PrivacyBadge, and more.
+| Demo | What It Does | Status |
+|------|-------------|--------|
+| **Image Classification** | Drop a photo, get top-5 ImageNet predictions with confidence bars. Race Mode compares inference speed across WebGPU/WebGL/Wasm side-by-side. | **Live** |
+| **Neural Style Transfer** | Turn your photo into a Van Gogh, Monet, or Picasso. 5 style models, instant gallery switching. Before/after slider. | **Live** |
+| **Super Resolution** | Upload a small image, get 3x upscale. Before/after comparison with download. | **Live** |
+| **Model Inspector** | Drop any `.onnx` file for instant architecture analysis — node count, parameters, operators, compatibility check. | **Live** |
+
+### Coming Next
+
+| Demo | What It Does | Why It's Cool |
+|------|-------------|---------------|
+| **Depth Estimation** | Generate depth maps from any photo with selectable color palettes (plasma, viridis, inferno). Before/after slider. | Depth Anything V2 (823 nodes) already compiles. Visually stunning output. |
+| **Real-Time Object Detection** | Live webcam with bounding boxes. 80 COCO classes, confidence slider, FPS counter. | YOLOv8-nano at 15-30+ FPS on WebGPU would outperform most JS implementations. GPU-accelerated NMS keeps everything on-device. |
+| **Background Removal** | One-click background removal. Transparent PNG download. Replace background with custom image or blur. | Universal use case. The "no upload" privacy angle is a strong selling point. |
+| **Pose Estimation** | Live webcam with skeleton overlay. 17 keypoints, joint angles, movement trails. | MoveNet Lightning already compiles. Skeleton overlay is inherently fun. |
+| **Zero-Shot Classification (CLIP)** | Type ANY text description. Classify images by it. No fixed categories. | Feels like magic — the user defines what to look for. |
+| **Live Webcam Style Transfer** | Real-time styled video feed. Your webcam as a living painting. | With optimized WebGPU kernels, this could run at high FPS — noticeably smoother than JS alternatives. |
+
+### The Big Vision
+
+| Demo | Description |
+|------|-------------|
+| **Backend Showdown** | Run the same model on all available backends simultaneously. Leaderboard of inference times. Copy-paste results for social media. |
+| **Depth → 3D** | Live webcam depth estimation → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
+| **Spatial Intelligence** | YOLO (find a person) + MoveNet (extract skeleton) + Depth Anything (place in 3D space). Composable AI pipelines understanding the physical world. |
+| **In-Browser GPU Training** | Draw 10-20 custom gestures → train a classifier entirely in the browser. Most browser ML can only run inference — training proves this is a complete GPU compute platform. |
+| **Image-to-3D** | Generate 3D meshes or Gaussian splats from a single photo. Open directly in [SpawnScene](https://github.com/LostBeard/SpawnScene). |
+
+All demos include backend selection, inference timing, "100% client-side" privacy badges, and the voice command system ("Computer, classify this image").
+
+26 demo pages total.
 
 ## Model Inspector
 
@@ -225,10 +253,16 @@ dotnet run --project DemoConsole/SpawnDev.ILGPU.ML.DemoConsole.csproj
 
 Every kernel validates against CPU reference implementations. 60/62 WebGPU tests passing (2 skipped pending InstanceNorm correctness fix).
 
+## Recent Breakthroughs
+
+- **WGSL PHI codegen bug fixed** — `WGSLKernelFunctionGenerator.cs` was generating incorrect continuation code after loop-break patterns. Fix: post-loop continuation now uses `headerExitTarget` instead of `loopNode.Exits[0]`. This unblocked the Pad kernel (and any kernel with early-exit loop patterns) on WebGPU.
+- **Style transfer end-to-end** — 112-node pipeline with 16 InstanceNorm layers, 16 Conv layers, Pad, Upsample — all running correctly on WebGPU.
+- **InstanceNorm 50,000x speedup** — Rewrote from O(N*spatial) per thread to two-pass O(N): Pass 1 computes mean+variance (N*C threads), Pass 2 normalizes (N*C*spatial threads, no loops).
+
 ## Known Issues
 
-1. **InstanceNorm correctness** — Two-pass kernel runs (50,000x faster than original) but produces uniform output on WebGPU due to shared buffer race condition. Fix identified: switch to scalar kernel parameters.
-2. **Style transfer** — Blocked by InstanceNorm. All other operators work correctly.
+1. **Secondary WGSL codegen bug** — Missing continuation code after if-else with break in certain patterns. Tracked, workaround in place for affected kernels.
+2. **Depth Anything V2** — 823 nodes compile but full GPU execution not yet tested (95 MB model).
 
 ## Credits
 
