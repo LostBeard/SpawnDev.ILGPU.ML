@@ -11,6 +11,10 @@
     </script>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="GPU-accelerated neural network inference for .NET. 71 ONNX operators, 6 backends (WebGPU, CUDA, OpenCL, WebGL, Wasm, CPU), runs entirely in your browser. No server, no cloud." />
+    <meta property="og:title" content="SpawnDev.ILGPU.ML — Neural Network Inference for .NET" />
+    <meta property="og:description" content="GPU-accelerated ML inference in C#. Style transfer, image classification, super resolution — all running in your browser via WebGPU. No server needed." />
+    <meta property="og:type" content="website" />
     <title>SpawnDev.ILGPU.ML</title>
     <link rel="preload" id="webassembly" />
     <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
@@ -22,11 +26,15 @@
 
 <body>
     <div id="app">
-        <svg class="loading-progress">
-            <circle r="40%" cx="50%" cy="50%" />
-            <circle r="40%" cx="50%" cy="50%" />
-        </svg>
-        <div class="loading-progress-text"></div>
+        <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;">
+            <svg class="loading-progress">
+                <circle r="40%" cx="50%" cy="50%" />
+                <circle r="40%" cx="50%" cy="50%" />
+            </svg>
+            <div class="loading-progress-text"></div>
+            <div style="color:#64748b;font-size:0.85rem;margin-top:0.5rem;">SpawnDev.ILGPU.ML</div>
+            <div style="color:#475569;font-size:0.75rem;">GPU-accelerated ML inference for .NET</div>
+        </div>
     </div>
 
     <div id="blazor-error-ui">

@@ -1,0 +1,59 @@
+<div class="coming-soon">
+    <div class="coming-soon-icon">@Icon</div>
+    <h2 class="coming-soon-title">@Title</h2>
+    <p class="coming-soon-desc">@Description</p>
+    @if (RequiredOperators?.Any() == true)
+    {
+        <div class="coming-soon-ops">
+            <span class="ops-label">Needs:</span>
+            @foreach (var op in RequiredOperators)
+            {
+                <span class="ops-badge">@op</span>
+            }
+        </div>
+    }
+    @if (!string.IsNullOrEmpty(ModelName))
+    {
+        <div class="coming-soon-model">
+            <span>Model: <strong>@ModelName</strong></span>
+            @if (ModelSizeMB > 0) { <span class="model-size">(@ModelSizeMB.ToString("F1") MB)</span> }
+        </div>
+    }
+    <div class="coming-soon-links">
+        <a href="inspector" class="cs-link">Check model compatibility</a>
+        <a href="models" class="cs-link">Browse available models</a>
+    </div>
+</div>
+
+@code {
+    [Parameter] public string Icon { get; set; } = "&#x1F6A7;";
+    [Parameter] public string Title { get; set; } = "Coming Soon";
+    [Parameter] public string Description { get; set; } = "This demo is under development.";
+    [Parameter] public string? ModelName { get; set; }
+    [Parameter] public double ModelSizeMB { get; set; }
+    [Parameter] public List<string>? RequiredOperators { get; set; }
+}
+
+<style>
+    .coming-soon {
+        text-align: center;
+        padding: 3rem 2rem;
+        max-width: 500px;
+        margin: 2rem auto;
+    }
+
+    .coming-soon-icon { font-size: 4rem; margin-bottom: 1rem; opacity: 0.7; }
+    .coming-soon-title { font-size: 1.5rem; font-weight: 700; color: #f1f5f9; margin-bottom: 0.5rem; }
+    .coming-soon-desc { color: #64748b; font-size: 0.95rem; line-height: 1.6; margin-bottom: 1.5rem; }
+
+    .coming-soon-ops { display: flex; align-items: center; gap: 0.4rem; justify-content: center; flex-wrap: wrap; margin-bottom: 1rem; }
+    .ops-label { color: #64748b; font-size: 0.8rem; }
+    .ops-badge { font-size: 0.72rem; font-weight: 600; padding: 0.15rem 0.4rem; border-radius: 4px; background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.2); color: #38bdf8; }
+
+    .coming-soon-model { color: #94a3b8; font-size: 0.85rem; margin-bottom: 1rem; }
+    .model-size { color: #64748b; }
+
+    .coming-soon-links { display: flex; gap: 1rem; justify-content: center; }
+    .cs-link { color: #3b82f6; font-size: 0.85rem; text-decoration: none; }
+    .cs-link:hover { text-decoration: underline; }
+</style>

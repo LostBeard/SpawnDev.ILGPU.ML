@@ -31,8 +31,8 @@
         <span class="sample-label">Or try a sample:</span>
         @foreach (var sample in SampleImages)
         {
-            <button class="sample-btn" @onclick="() => LoadSampleImage(sample.Url)">
-                @sample.Label
+            <button class="sample-btn" @onclick="() => LoadSampleImage(sample.Url)" disabled="@_isLoadingSample">
+                @((_isLoadingSample && _loadingSampleUrl == sample.Url) ? "Loading..." : sample.Label)
             </button>
         }
     </div>
@@ -40,6 +40,8 @@
 
 @code {
     private bool _isDragOver;
+    private bool _isLoadingSample;
+    private string? _loadingSampleUrl;
 
     [Parameter] public string? ImageDataUrl { get; set; }
     [Parameter] public EventCallback<string> ImageDataUrlChanged { get; set; }
@@ -80,11 +82,25 @@
 
     private async Task LoadSampleImage(string url)
     {
-        var bytes = await Http.GetByteArrayAsync(url);
-        var dataUrl = $"data:image/jpeg;base64,{Convert.ToBase64String(bytes)}";
-        ImageDataUrl = dataUrl;
-        await ImageDataUrlChanged.InvokeAsync(dataUrl);
-        await OnImageLoaded.InvokeAsync(bytes);
+        _isLoadingSample = true;
+        _loadingSampleUrl = url;
+        StateHasChanged();
+        try
+        {
+            var bytes = await Http.GetByteArrayAsync(url);
+            var mime = url.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? "image/png"
+                     : url.EndsWith(".webp", StringComparison.OrdinalIgnoreCase) ? "image/webp"
+                     : "image/jpeg";
+            var dataUrl = $"data:{mime};base64,{Convert.ToBase64String(bytes)}";
+            ImageDataUrl = dataUrl;
+            await ImageDataUrlChanged.InvokeAsync(dataUrl);
+            await OnImageLoaded.InvokeAsync(bytes);
+        }
+        finally
+        {
+            _isLoadingSample = false;
+            _loadingSampleUrl = null;
+        }
     }
 
     private async Task ClearImage()

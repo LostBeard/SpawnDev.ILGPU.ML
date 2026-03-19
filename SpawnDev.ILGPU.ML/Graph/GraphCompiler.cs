@@ -17,8 +17,15 @@ public class GraphCompiler
     /// Compile a model graph for execution.
     /// Resolves operators, topologically sorts nodes, infers output shapes.
     /// </summary>
+    /// <summary>Enable graph optimization (operator fusion) before compilation.</summary>
+    public bool EnableOptimization { get; set; } = true;
+
     public CompiledGraph Compile(ModelGraph graph)
     {
+        // Apply graph optimizations (operator fusion) before compilation
+        if (EnableOptimization)
+            graph = GraphOptimizer.Optimize(graph);
+
         // Validate all ops are supported
         foreach (var node in graph.Nodes)
         {

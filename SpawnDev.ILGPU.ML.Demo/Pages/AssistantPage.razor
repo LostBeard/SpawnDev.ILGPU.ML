@@ -278,13 +278,76 @@
         _isThinking = true;
         _currentAnimation = "thinking...";
         StateHasChanged();
+        await Task.Yield();
 
-        // TODO: Run text generation with personality prompt
-        await Task.Delay(100); // Simulate thinking
+        if (_hasTextGen)
+        {
+            // TODO: Run text generation pipeline with personality system prompt
+            await Task.Delay(100);
+        }
+        else
+        {
+            // No LLM loaded yet — give a character-appropriate placeholder response
+            await Task.Delay(500 + Random.Shared.Next(500)); // Simulate thinking time
+            var response = GetPlaceholderResponse(CurrentAssistant.Id, input);
+            _messages.Add(new ChatMessage { Text = response, IsUser = false });
+        }
 
         _isThinking = false;
         _currentAnimation = null;
+        _currentResponse = null;
         StateHasChanged();
+    }
+
+    private static string GetPlaceholderResponse(string characterId, string userInput)
+    {
+        // Character-specific responses that acknowledge they're waiting for their brain (LLM)
+        return characterId switch
+        {
+            "merlin" => Random.Shared.Next(4) switch
+            {
+                0 => "Ah, a fascinating question! Alas, my crystal ball — er, my LLM — hasn't been loaded yet. Once GPT-2 or SmolLM is running on this GPU, I shall weave you answers with the wisdom of ages.",
+                1 => "The ancient scrolls speak of a future where I can truly think... That future arrives when a text generation model is loaded. For now, I can only gesture mysteriously.",
+                2 => "I sense great potential in your question! My magical thinking powers are still loading. Soon, young apprentice...",
+                _ => "By the stars! I heard you, but my neural pathways are still crystallizing. Load a language model and witness true wizardry."
+            },
+            "robby" => Random.Shared.Next(4) switch
+            {
+                0 => "BEEP BOOP. Input received. Processing... ERROR: Language model not found. Please load GPT-2 or SmolLM to enable my conversational circuits.",
+                1 => "I appreciate your communication attempt, human! My language processors are currently offline. Once a text generation model is loaded, I will respond with 99.7% more relevance.",
+                2 => "Interesting query detected! Unfortunately my response-generation module requires a language model. *sad robot noises*",
+                _ => "Hello! I'm Robby, and I'm very excited to talk to you! Just as soon as someone plugs in my brain (a language model). Any moment now..."
+            },
+            "clippy" => Random.Shared.Next(4) switch
+            {
+                0 => "It looks like you're trying to have a conversation! Would you like help loading a language model? I'd suggest GPT-2 — it's compact and runs great on WebGPU.",
+                1 => "Hi there! I noticed you typed something. Unfortunately, I'm all personality and no intelligence right now. Load a text generation model and I'll be ACTUALLY helpful for once!",
+                2 => "I see you're writing a message! I would love to help, but my neural network isn't loaded yet. Want me to just... hover here awkwardly instead?",
+                _ => "Did you mean to ask me something? I'm flattered! But without a language model, I'm basically a paperclip with opinions. Load one and watch me shine!"
+            },
+            "peedy" => Random.Shared.Next(4) switch
+            {
+                0 => "SQUAWK! Peedy hear you! Peedy want to talk back! But Peedy's brain-model not loaded yet. Polly want a language model! BRAWK!",
+                1 => "Ooh ooh! Words! Peedy loves words! But Peedy can only repeat wisdom when Peedy has an LLM loaded. Load one and Peedy will be the SMARTEST parrot!",
+                2 => "*ruffles feathers excitedly* You spoke! Now if only I had a language model to think with... Load GPT-2 and I'll chat your ear off!",
+                _ => "BAWK! Peedy is listening! Peedy is always listening! But Peedy needs a neural network to actually understand. Pretty please, a language model?"
+            },
+            "rocky" => Random.Shared.Next(4) switch
+            {
+                0 => "OH BOY OH BOY you said something!! That's the BEST THING EVER! I wish I could respond properly but my language model isn't loaded yet. But I'm still SO HAPPY you're here!",
+                1 => "*tail wagging intensifies* A MESSAGE! FOR ME?! I don't quite understand it yet because I need a language model, but I LOVE IT ANYWAY!",
+                2 => "WOOF! Friend! I heard you! I want to help SO BAD but my thinking brain needs a language model first! ...Is that a squirrel? No, focus, Rocky, FOCUS!",
+                _ => "YOU'RE TALKING TO ME AND THAT MAKES ME THE HAPPIEST DOG EVER!! Once a language model is loaded I'll actually be able to have a conversation! Oh boy oh boy!"
+            },
+            "links" => Random.Shared.Next(4) switch
+            {
+                0 => "*yawns* Oh, you're talking to me? How... quaint. I'd respond properly but no language model has been loaded. Not that I particularly care to converse.",
+                1 => "I acknowledge your attempt at communication. Unfortunately — or perhaps fortunately for both of us — my language model isn't loaded. I'll be napping until it is.",
+                2 => "*stares judgmentally* ...You expect me to respond without a neural network? Load a language model and I'll consider gracing you with my thoughts. Maybe.",
+                _ => "Hmm. Interesting. No, not really. But it WOULD be interesting if I had a language model loaded. Then again, I might choose not to respond anyway. That's my prerogative."
+            },
+            _ => "I need a language model to respond. Load GPT-2 or SmolLM to enable text generation."
+        };
     }
 
     private void HandleKeyPress(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)

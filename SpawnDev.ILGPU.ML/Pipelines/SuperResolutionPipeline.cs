@@ -25,6 +25,7 @@ public class SuperResolutionPipeline : IDisposable
 
     private readonly int _modelH;
     private readonly int _modelW;
+    private Kernels.ImagePreprocessKernel? _preprocess;
 
     public SuperResolutionPipeline(InferenceSession session, Accelerator accelerator,
         int upscaleFactor = 3)
@@ -47,24 +48,12 @@ public class SuperResolutionPipeline : IDisposable
     {
         int modelH = _modelH, modelW = _modelW;
 
-        // Extract Y luminance channel and resize to model dimensions
-        var yChannel = new float[modelH * modelW];
-        for (int y = 0; y < modelH; y++)
-            for (int x = 0; x < modelW; x++)
-            {
-                int sy = y * height / modelH;
-                int sx = x * width / modelW;
-                if (sy >= height) sy = height - 1;
-                if (sx >= width) sx = width - 1;
-                int pixel = rgbaPixels[sy * width + sx];
-                float r = (pixel & 0xFF) / 255f;
-                float g = ((pixel >> 8) & 0xFF) / 255f;
-                float b = ((pixel >> 16) & 0xFF) / 255f;
-                yChannel[y * modelW + x] = 0.299f * r + 0.587f * g + 0.114f * b;
-            }
-
-        // Upload as [1, 1, modelH, modelW]
-        using var inputBuf = _accelerator.Allocate1D(yChannel);
+        // GPU preprocessing: RGBA → bilinear resize → Y luminance channel
+        // BT.601: Y = 0.299*R + 0.587*G + 0.114*B — all on GPU, no CPU loops
+        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
+        using var inputBuf = _accelerator.Allocate1D<float>(modelH * modelW);
+        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
+        _preprocess.ForwardYChannel(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, modelH, modelW });
 
         // Run inference

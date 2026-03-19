@@ -250,9 +250,67 @@
     {
         if (string.IsNullOrWhiteSpace(_userMessage)) return;
         _panels.Add(new ComicPanel { CharacterName = "You", CharacterColor = "#3b82f6", Text = _userMessage, IsUser = true });
+        var input = _userMessage;
         _userMessage = "";
+        _isGenerating = true;
         StateHasChanged();
-        // TODO: Generate AI responses from each character
+
+        if (_isModelLoaded)
+        {
+            // TODO: Generate AI responses from each character using LLM
+        }
+        else
+        {
+            // Placeholder: each character responds in their personality style
+            foreach (var character in _characters)
+            {
+                await Task.Delay(300 + Random.Shared.Next(400));
+                var response = GetPlaceholderComicResponse(character.Personality, character.Name, input);
+                _panels.Add(new ComicPanel
+                {
+                    CharacterName = character.Name,
+                    CharacterColor = character.Color,
+                    Text = response,
+                    IsUser = false
+                });
+                StateHasChanged();
+            }
+        }
+
+        _isGenerating = false;
+        StateHasChanged();
+    }
+
+    private static string GetPlaceholderComicResponse(string personality, string name, string userInput)
+    {
+        return personality.ToLowerInvariant() switch
+        {
+            "sarcastic" => Random.Shared.Next(3) switch
+            {
+                0 => "Oh, fascinating. I'd love to respond properly but SOMEONE hasn't loaded a language model yet.",
+                1 => $"Wow, '{userInput[..Math.Min(20, userInput.Length)]}...' — groundbreaking stuff. Load an LLM and I'll give you the sarcasm you deserve.",
+                _ => "*slow clap* Great conversation. Really. My neural network will be SO impressed when it finally loads."
+            },
+            "enthusiastic" => Random.Shared.Next(3) switch
+            {
+                0 => "OMG that's SO COOL!! I wish I could give you a REAL response but I need a language model! This is going to be AMAZING when it works!!",
+                1 => "YES! TALKING! I LOVE TALKING! Can't wait for a language model so I can actually contribute something meaningful! WOOHOO!",
+                _ => $"You said something and I am SO HERE FOR IT!! Load a language model and watch me GO!!"
+            },
+            "philosophical" => Random.Shared.Next(3) switch
+            {
+                0 => "Your words echo through the void of uninitialized neural weights... What IS a response, really, without a language model to generate it?",
+                1 => "To speak, or not to speak — that depends on whether a text generation model has been loaded. For now, I contemplate in silence.",
+                _ => "I ponder your input deeply. But true wisdom requires a neural network, and mine awaits initialization."
+            },
+            "dramatic" => Random.Shared.Next(3) switch
+            {
+                0 => "*GASP* You SPOKE! The tension builds! Will I respond? CAN I respond?! Not without a language model, I'm afraid! THE SUSPENSE!!",
+                1 => "In a world... where language models haven't been loaded yet... one character DARES to have no response. Coming soon to a GPU near you.",
+                _ => "*stares intensely into the middle distance* If only I had the words... literally. Load an LLM. Please. This silence is KILLING me."
+            },
+            _ => $"[{name} wants to respond but needs a language model loaded first. The chat will come alive once GPT-2 or SmolLM is running on your GPU!]"
+        };
     }
 
     private void HandleKeyPress(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)

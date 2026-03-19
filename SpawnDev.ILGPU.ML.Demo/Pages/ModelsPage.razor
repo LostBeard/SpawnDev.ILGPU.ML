@@ -30,14 +30,20 @@
                             {
                                 <span class="model-input">Input: @(model.InputWidth)x@(model.InputHeight)</span>
                             }
-                            <div class="model-formats">
-                                @if (model.HasOnnxFormat)
+                            <div class="model-footer">
+                                <div class="model-formats">
+                                    @if (model.HasOnnxFormat)
+                                    {
+                                        <span class="format-badge format-onnx">ONNX</span>
+                                    }
+                                    @if (model.HasExtractedFormat)
+                                    {
+                                        <span class="format-badge format-extracted">Extracted</span>
+                                    }
+                                </div>
+                                @if (!string.IsNullOrEmpty(model.DemoUrl))
                                 {
-                                    <span class="format-badge format-onnx">ONNX</span>
-                                }
-                                @if (model.HasExtractedFormat)
-                                {
-                                    <span class="format-badge format-extracted">Extracted</span>
+                                    <a href="@model.DemoUrl" class="model-try-link">Try it</a>
                                 }
                             </div>
                         </div>
@@ -65,8 +71,20 @@
         @if (_customResult != null)
         {
             <div class="custom-result">
-                <span class="result-icon">&#x2705;</span>
+                <span class="result-icon">@(_compatResult?.IsFullySupported == true ? "&#x2705;" : _compatResult != null ? "&#x26A0;" : "&#x23F3;")</span>
                 <span>@_customResult</span>
+            </div>
+        }
+        @if (_inspectionResult != null)
+        {
+            <div class="inspect-summary">
+                <div class="inspect-row"><span>Inputs:</span><span>@string.Join(", ", _inspectionResult.Inputs.Select(i => $"{i.Name} [{string.Join(",", i.Shape)}]"))</span></div>
+                <div class="inspect-row"><span>Outputs:</span><span>@string.Join(", ", _inspectionResult.Outputs.Select(o => $"{o.Name} [{string.Join(",", o.Shape)}]"))</span></div>
+                <div class="inspect-row"><span>Operators:</span><span>@string.Join(", ", _inspectionResult.Operators.OrderByDescending(o => o.Count).Take(10).Select(o => $"{o.OpType}({o.Count})"))</span></div>
+                @if (_compatResult?.IsFullySupported == true)
+                {
+                    <div class="inspect-compatible">This model can run on SpawnDev.ILGPU.ML</div>
+                }
             </div>
         }
         @if (_customError != null)
@@ -105,7 +123,10 @@
     .model-desc { color: #94a3b8; font-size: 0.82rem; margin: 0 0 0.5rem 0; line-height: 1.4; }
     .model-input { color: #475569; font-size: 0.75rem; font-family: monospace; }
 
-    .model-formats { display: flex; gap: 0.3rem; margin-top: 0.5rem; }
+    .model-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 0.5rem; }
+    .model-formats { display: flex; gap: 0.3rem; }
+    .model-try-link { color: #3b82f6; font-size: 0.8rem; font-weight: 600; text-decoration: none; }
+    .model-try-link:hover { color: #60a5fa; text-decoration: underline; }
     .format-badge { font-size: 0.68rem; font-weight: 700; padding: 0.15rem 0.4rem; border-radius: 4px; text-transform: uppercase; }
     .format-onnx { background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.25); color: #38bdf8; }
     .format-extracted { background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.25); color: #34d399; }
@@ -143,6 +164,11 @@
     .load-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 
     .custom-result { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; color: #6ee7b7; font-size: 0.9rem; }
+    .inspect-summary { margin-top: 0.75rem; padding: 0.75rem; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; }
+    .inspect-row { display: flex; gap: 0.5rem; padding: 0.2rem 0; font-size: 0.82rem; }
+    .inspect-row span:first-child { color: #64748b; min-width: 70px; }
+    .inspect-row span:last-child { color: #cbd5e1; font-family: monospace; font-size: 0.78rem; word-break: break-all; }
+    .inspect-compatible { margin-top: 0.5rem; color: #34d399; font-size: 0.85rem; font-weight: 600; }
     .custom-error { margin-top: 0.75rem; color: #fca5a5; font-size: 0.9rem; }
 </style>
 
@@ -159,18 +185,26 @@
         // Use the model registry from the RCL (or inline the data)
         _models = new List<ModelEntry>
         {
-            new() { Id = "squeezenet", Name = "SqueezeNet 1.1", Task = "Classification", Path = "models/squeezenet", OnnxPath = "models/squeezenet/model.onnx", SizeMB = 4.8, Description = "Fast 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224 },
-            new() { Id = "mobilenetv2", Name = "MobileNetV2", Task = "Classification", Path = "models/mobilenetv2", OnnxPath = "models/mobilenetv2/model.onnx", SizeMB = 14, Description = "Accurate 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224 },
-            new() { Id = "depth-anything-v2", Name = "Depth Anything V2 Small", Task = "Depth Estimation", OnnxPath = "models/depth-anything-v2-small/model.onnx", SizeMB = 95, Description = "Monocular depth estimation (26M params)", InputWidth = 518, InputHeight = 518 },
-            new() { Id = "style-mosaic", Name = "Mosaic", Task = "Style Transfer", Path = "models/style-mosaic", OnnxPath = "models/style-mosaic/model.onnx", SizeMB = 6.5, Description = "Mosaic tile artistic style" },
-            new() { Id = "style-candy", Name = "Candy", Task = "Style Transfer", Path = "models/style-candy", OnnxPath = "models/style-candy/model.onnx", SizeMB = 6.5, Description = "Bright candy-colored artistic style" },
-            new() { Id = "style-rain-princess", Name = "Rain Princess", Task = "Style Transfer", Path = "models/style-rain-princess", OnnxPath = "models/style-rain-princess/model.onnx", SizeMB = 6.5, Description = "Impressionist rain scene style" },
-            new() { Id = "style-udnie", Name = "Udnie", Task = "Style Transfer", Path = "models/style-udnie", OnnxPath = "models/style-udnie/model.onnx", SizeMB = 6.5, Description = "Abstract cubist style" },
-            new() { Id = "style-pointilism", Name = "Pointilism", Task = "Style Transfer", Path = "models/style-pointilism", OnnxPath = "models/style-pointilism/model.onnx", SizeMB = 6.5, Description = "Pointillist dot painting style" },
-            new() { Id = "super-resolution", Name = "ESPCN (3x)", Task = "Super Resolution", Path = "models/super-resolution", OnnxPath = "models/super-resolution/model.onnx", SizeMB = 0.2, Description = "3x upscaling (224→672)", InputWidth = 224, InputHeight = 224 },
-            new() { Id = "movenet-lightning", Name = "MoveNet Lightning", Task = "Pose Estimation", OnnxPath = "models/movenet-lightning/model.onnx", SizeMB = 9, Description = "Fast 17-keypoint pose detection", InputWidth = 192, InputHeight = 192 },
+            new() { Id = "squeezenet", Name = "SqueezeNet 1.1", Task = "Classification", Path = "models/squeezenet", OnnxPath = "models/squeezenet/model.onnx", SizeMB = 4.8, Description = "Fast 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
+            new() { Id = "mobilenetv2", Name = "MobileNetV2", Task = "Classification", Path = "models/mobilenetv2", OnnxPath = "models/mobilenetv2/model.onnx", SizeMB = 14, Description = "Accurate 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
+            new() { Id = "depth-anything-v2", Name = "Depth Anything V2 Small", Task = "Depth Estimation", OnnxPath = "models/depth-anything-v2-small/model.onnx", SizeMB = 95, Description = "Monocular depth estimation (26M params)", InputWidth = 518, InputHeight = 518, DemoUrl = "depth" },
+            new() { Id = "style-mosaic", Name = "Mosaic", Task = "Style Transfer", Path = "models/style-mosaic", OnnxPath = "models/style-mosaic/model.onnx", SizeMB = 6.5, Description = "Mosaic tile artistic style", DemoUrl = "style" },
+            new() { Id = "style-candy", Name = "Candy", Task = "Style Transfer", Path = "models/style-candy", OnnxPath = "models/style-candy/model.onnx", SizeMB = 6.5, Description = "Bright candy-colored artistic style", DemoUrl = "style" },
+            new() { Id = "style-rain-princess", Name = "Rain Princess", Task = "Style Transfer", Path = "models/style-rain-princess", OnnxPath = "models/style-rain-princess/model.onnx", SizeMB = 6.5, Description = "Impressionist rain scene style", DemoUrl = "style" },
+            new() { Id = "style-udnie", Name = "Udnie", Task = "Style Transfer", Path = "models/style-udnie", OnnxPath = "models/style-udnie/model.onnx", SizeMB = 6.5, Description = "Abstract cubist style", DemoUrl = "style" },
+            new() { Id = "style-pointilism", Name = "Pointilism", Task = "Style Transfer", Path = "models/style-pointilism", OnnxPath = "models/style-pointilism/model.onnx", SizeMB = 6.5, Description = "Pointillist dot painting style", DemoUrl = "style" },
+            new() { Id = "super-resolution", Name = "ESPCN (3x)", Task = "Super Resolution", Path = "models/super-resolution", OnnxPath = "models/super-resolution/model.onnx", SizeMB = 0.2, Description = "3x upscaling (224→672)", InputWidth = 224, InputHeight = 224, DemoUrl = "super-res" },
+            new() { Id = "movenet-lightning", Name = "MoveNet Lightning", Task = "Pose Estimation", OnnxPath = "models/movenet-lightning/model.onnx", SizeMB = 9, Description = "Fast 17-keypoint pose detection", InputWidth = 192, InputHeight = 192, DemoUrl = "pose" },
+            new() { Id = "yolov8n", Name = "YOLOv8 Nano", Task = "Object Detection", OnnxPath = "models/yolov8n/model.onnx", SizeMB = 12.2, Description = "80-class COCO detection (person, car, dog, ...)", InputWidth = 640, InputHeight = 640, DemoUrl = "detect" },
+            new() { Id = "blaze-face", Name = "BlazeFace", Task = "Face Detection", OnnxPath = "models/blaze-face/model.tflite", SizeMB = 0.2, Description = "MediaPipe face detector (TFLite format)", InputWidth = 128, InputHeight = 128, DemoUrl = "face" },
+            new() { Id = "efficientnet-lite0", Name = "EfficientNet-Lite0", Task = "Classification", OnnxPath = "models/efficientnet-lite0/model.tflite", SizeMB = 17.7, Description = "1000-class classifier (TFLite format)", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
         };
     }
+
+    [Inject] HttpClient Http { get; set; } = default!;
+
+    private InspectionResult? _inspectionResult;
+    private CompatibilityResult? _compatResult;
 
     private async Task LoadCustomModel()
     {
@@ -178,16 +212,38 @@
         _isLoading = true;
         _customResult = null;
         _customError = null;
+        _inspectionResult = null;
+        _compatResult = null;
         StateHasChanged();
 
         try
         {
             var url = $"https://huggingface.co/{_customRepoId}/resolve/main/{_customFilename}";
-            _customResult = $"Model URL ready: {url} — use InferenceSession.CreateFromOnnxAsync() to load";
+            _customResult = $"Downloading from {url}...";
+            StateHasChanged();
+
+            var bytes = await Http.GetByteArrayAsync(url);
+            _customResult = $"Downloaded {(bytes.Length / 1024.0 / 1024.0):F1} MB. Inspecting...";
+            StateHasChanged();
+
+            _inspectionResult = ModelInspectorHelper.Inspect(bytes);
+            _compatResult = ModelInspectorHelper.CheckCompatibility(bytes);
+
+            _customResult = $"{_inspectionResult.GraphName}: {_inspectionResult.NodeCount} nodes, " +
+                $"{_inspectionResult.TotalParameters:N0} params, " +
+                $"{_inspectionResult.Operators.Length} op types — " +
+                $"{(_compatResult.IsFullySupported ? "Fully compatible" : $"{_compatResult.CompatibilityPercent:F0}% compatible")}";
+
+            if (_compatResult.UnsupportedOps.Length > 0)
+                _customResult += $" (unsupported: {string.Join(", ", _compatResult.UnsupportedOps)})";
+        }
+        catch (HttpRequestException ex)
+        {
+            _customError = $"Download failed: {ex.Message}. Check the repo ID and filename.";
         }
         catch (Exception ex)
         {
-            _customError = ex.Message;
+            _customError = $"Error: {ex.Message}";
         }
 
         _isLoading = false;
@@ -207,6 +263,7 @@
         public string Description { get; init; } = "";
         public int InputWidth { get; init; }
         public int InputHeight { get; init; }
+        public string? DemoUrl { get; init; }
         public bool HasExtractedFormat => Path != null;
         public bool HasOnnxFormat => OnnxPath != null;
     }

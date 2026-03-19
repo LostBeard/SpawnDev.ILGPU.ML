@@ -1,5 +1,6 @@
-@using Microsoft.JSInterop
-@inject IJSRuntime JS
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@inject BlazorJSRuntime JS
 @implements IAsyncDisposable
 
 <div class="webcam-container">
@@ -24,14 +25,12 @@
             </button>
         </div>
     }
-    <canvas @ref="_canvasRef" style="display: none;"></canvas>
 </div>
 
 @code {
     private ElementReference _videoRef;
-    private ElementReference _canvasRef;
-    private IJSObjectReference? _module;
     private bool _isStreaming;
+    private MediaStream? _stream;
 
     [Parameter] public EventCallback<byte[]> OnFrameCaptured { get; set; }
     [Parameter] public EventCallback<string> OnFrameDataUrl { get; set; }
@@ -41,53 +40,88 @@
     [Parameter] public int Width { get; set; } = 640;
     [Parameter] public int Height { get; set; } = 480;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-        {
-            _module = await JS.InvokeAsync<IJSObjectReference>("import",
-                "./Components/WebcamCapture.razor.js");
-        }
-    }
-
     private async Task StartCamera()
     {
-        if (_module == null) return;
-        var success = await _module.InvokeAsync<bool>("startCamera", _videoRef, Width, Height);
-        if (success)
+        try
         {
+            using var navigator = JS.Get<Navigator>("navigator");
+            using var mediaDevices = navigator.MediaDevices;
+            _stream = await mediaDevices.GetUserMedia(new MediaStreamConstraints
+            {
+                Video = new MediaTrackConstraints
+                {
+                    Width = new ConstrainULongRange { Ideal = (uint)Width },
+                    Height = new ConstrainULongRange { Ideal = (uint)Height }
+                },
+                Audio = false
+            });
+
+            // Attach stream to video element
+            using var videoEl = new HTMLVideoElement(_videoRef);
+            videoEl.SrcObject = _stream;
+
             _isStreaming = true;
             StateHasChanged();
 
             if (AutoCapture)
-            {
                 _ = AutoCaptureLoop();
-            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WebcamCapture] Camera error: {ex.Message}");
         }
     }
 
     private async Task StopCamera()
     {
-        if (_module == null) return;
-        await _module.InvokeVoidAsync("stopCamera", _videoRef);
         _isStreaming = false;
+        if (_stream != null)
+        {
+            var tracks = _stream.GetTracks();
+            foreach (var track in tracks)
+            {
+                track.Stop();
+                track.Dispose();
+            }
+            _stream.Dispose();
+            _stream = null;
+        }
     }
 
     public async Task CaptureFrame()
     {
-        if (_module == null || !_isStreaming) return;
-        var dataUrl = await _module.InvokeAsync<string>("captureFrame", _videoRef, _canvasRef, Width, Height);
-        if (!string.IsNullOrEmpty(dataUrl))
-        {
-            await OnFrameDataUrl.InvokeAsync(dataUrl);
+        if (!_isStreaming) return;
 
-            // Convert data URL to bytes if handler is attached
+        try
+        {
+            using var videoEl = new HTMLVideoElement(_videoRef);
+            int w = (int)videoEl.VideoWidth;
+            int h = (int)videoEl.VideoHeight;
+            if (w == 0 || h == 0) return;
+
+            using var canvas = new HTMLCanvasElement();
+            canvas.Width = w;
+            canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(videoEl, 0, 0, w, h);
+
+            // Get data URL for display
+            var dataUrl = canvas.ToDataURL("image/jpeg", 0.85f);
+            if (OnFrameDataUrl.HasDelegate)
+                await OnFrameDataUrl.InvokeAsync(dataUrl);
+
+            // Get raw bytes for inference
             if (OnFrameCaptured.HasDelegate)
             {
-                var base64 = dataUrl.Substring(dataUrl.IndexOf(',') + 1);
-                var bytes = Convert.FromBase64String(base64);
-                await OnFrameCaptured.InvokeAsync(bytes);
+                using var imageData = ctx.GetImageData(0, 0, w, h);
+                using var data = imageData.Data;
+                var rgbaBytes = data.ReadBytes();
+                await OnFrameCaptured.InvokeAsync(rgbaBytes);
             }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WebcamCapture] Capture error: {ex.Message}");
         }
     }
 
@@ -103,11 +137,7 @@
     public async ValueTask DisposeAsync()
     {
         _isStreaming = false;
-        if (_module != null)
-        {
-            try { await _module.InvokeVoidAsync("stopCamera", _videoRef); } catch { }
-            await _module.DisposeAsync();
-        }
+        await StopCamera();
     }
 }
 
@@ -143,20 +173,11 @@
         border-color: rgba(139, 92, 246, 0.3);
     }
 
-    .webcam-btn-icon {
-        font-size: 1.2rem;
-    }
+    .webcam-btn-icon { font-size: 1.2rem; }
 
-    .webcam-live {
-        position: relative;
-        width: 100%;
-    }
+    .webcam-live { position: relative; width: 100%; }
 
-    .webcam-video {
-        width: 100%;
-        display: block;
-        border-radius: 10px;
-    }
+    .webcam-video { width: 100%; display: block; border-radius: 10px; }
 
     .webcam-capture-btn,
     .webcam-stop-btn {
@@ -175,23 +196,9 @@
         transition: all 0.15s ease;
     }
 
-    .webcam-capture-btn {
-        right: 3.5rem;
-        background: rgba(59, 130, 246, 0.8);
-    }
+    .webcam-capture-btn { right: 3.5rem; background: rgba(59, 130, 246, 0.8); }
+    .webcam-capture-btn:hover { background: #3b82f6; transform: scale(1.1); }
 
-    .webcam-capture-btn:hover {
-        background: #3b82f6;
-        transform: scale(1.1);
-    }
-
-    .webcam-stop-btn {
-        right: 0.75rem;
-        background: rgba(239, 68, 68, 0.8);
-    }
-
-    .webcam-stop-btn:hover {
-        background: #ef4444;
-        transform: scale(1.1);
-    }
+    .webcam-stop-btn { right: 0.75rem; background: rgba(239, 68, 68, 0.8); }
+    .webcam-stop-btn:hover { background: #ef4444; transform: scale(1.1); }
 </style>

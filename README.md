@@ -2,6 +2,8 @@
 
 [![NuGet](https://img.shields.io/nuget/v/SpawnDev.ILGPU.ML.svg?)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
 
+[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — Try image classification, style transfer, and super resolution in your browser right now.
+
 **Hardware-agnostic neural network inference for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
 
 SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a `.onnx` file and run it on any of six backends.
@@ -14,7 +16,7 @@ SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kern
 - **Image classification in-browser** — SqueezeNet identifies "tiger cat" at 51.97% confidence on WebGPU. Drop any photo.
 - **Image super resolution** — ESPCN 3x upscale running on WebGPU. The "enhance!" button is real.
 - **71 ONNX operators** — enough to run classification, style transfer, super resolution, depth estimation, pose estimation, and more
-- **Direct .onnx loading** — zero-dependency protobuf parser (~700 lines C#, no Google.Protobuf). Just point at a `.onnx` file.
+- **7 model formats** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, and CoreML. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **10+ models compile** — SqueezeNet, MobileNetV2, 5 style transfer models, ESPCN, Depth Anything V2 (823 nodes!), MoveNet Lightning
 - **Model Inspector** — drop any `.onnx` file for instant architecture analysis and compatibility check. No other browser ML library has this.
@@ -104,31 +106,55 @@ Style models: mosaic, candy, rain princess, udnie, pointilism.
 
 ## Architecture
 
-### ONNX Inference Engine
+### Multi-Format Inference Engine
 
 ```
-.onnx file
+Any model file (.onnx, .tflite, .gguf, .safetensors, .pb, .pt, .mlmodel)
     |
     v
-OnnxParser (zero-dependency protobuf)
+Format auto-detection (magic bytes) → appropriate parser
     |
     v
-ModelGraph (nodes, weights, shapes)
+ModelGraph (shared IR — nodes, weights, shapes)
     |
     v
-GraphCompiler (71 operators → execution plan)
+GraphOptimizer (6 passes: constant fold, identity elim, linear fusion,
+                scaled matmul fusion, strength reduction, dead node elim)
     |
     v
-GraphExecutor (topological dispatch, buffer pooling, periodic flush)
+GraphCompiler (71 operators + fused ops → execution plan)
     |
     v
-InferenceSession (public API: CreateFromOnnxAsync / CreateAsync / Run / RunAsync)
+GraphExecutor (topological dispatch, buffer recycling, periodic flush)
+    |
+    v
+InferenceSession (public API: CreateFromFileAsync / Run / RunAsync)
 ```
 
-Three model loading paths:
-1. **Direct `.onnx`** — `CreateFromOnnxAsync(accelerator, http, url)` — simplest, no preprocessing
-2. **Pre-extracted** — `CreateAsync(accelerator, http, basePath)` — loads `model_graph.json` + `weights_fp16.bin` (smaller download, faster load)
-3. **Programmatic** — `Create(accelerator, graph, weights)` — full control
+**Model loading** — one API, any format:
+```csharp
+// Auto-detect format from magic bytes
+var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
+var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
+var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");
+```
+
+Or use format-specific methods: `CreateFromOnnxAsync`, `CreateFromTFLiteAsync`, `CreateFromGGUFAsync`, `CreateAsync` (pre-extracted), `Create` (programmatic).
+
+All formats produce the same `ModelGraph` IR — every operator, kernel, optimizer pass, and backend works identically regardless of source format.
+
+### Graph Optimizer (automatic, 6 passes)
+
+Every model is automatically optimized during compilation:
+
+| Pass | What It Does | Impact |
+|------|-------------|--------|
+| **Constant folding** | Evaluates Shape→Gather→Cast→Floor chains at compile time | ~30% fewer nodes for style transfer |
+| **Identity elimination** | Removes Identity/Dropout no-ops | 10 fewer nodes for SqueezeNet |
+| **Linear fusion** | MatMul + Add + Activation → single FusedLinear dispatch | 2/3 less memory bandwidth |
+| **Scaled MatMul fusion** | MatMul + Scale → FusedScaledMatMul | Attention optimization |
+| **Strength reduction** | Div→Mul, eliminate Mul×1 and Add+0 | Cheaper operations |
+| **Dead node elimination** | Removes orphaned nodes after fusion | Clean graph |
 
 ### GPU Kernels
 

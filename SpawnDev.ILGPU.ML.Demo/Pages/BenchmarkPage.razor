@@ -18,6 +18,7 @@
         <div class="bench-start-section">
             <div class="bench-test-selector">
                 <h3>Select Tests</h3>
+                <label class="bench-check"><input type="checkbox" @bind="_runMatMul" /> MatMul GFLOPS (no download needed)</label>
                 <label class="bench-check"><input type="checkbox" @bind="_runClassification" /> Image Classification (SqueezeNet, 4.8MB)</label>
                 <label class="bench-check"><input type="checkbox" @bind="_runStyleTransfer" /> Style Transfer (Mosaic, 6.5MB)</label>
                 <label class="bench-check"><input type="checkbox" @bind="_runSuperRes" /> Super Resolution (ESPCN, 0.2MB)</label>
@@ -181,7 +182,7 @@
 </style>
 
 @code {
-    private bool _runClassification = true, _runStyleTransfer = true, _runSuperRes = true;
+    private bool _runMatMul = true, _runClassification = true, _runStyleTransfer = true, _runSuperRes = true;
     private bool _benchWebGPU = true, _benchWebGL, _benchWasm;
     private bool _isRunning, _copied;
     private string _currentTest = "";
@@ -190,42 +191,5 @@
     private string? _userAgent, _gpuName;
     private List<BenchResult> _results = new();
 
-    private Task RunBenchmarks()
-    {
-        // TODO: Wire to actual benchmark runner
-        _isRunning = true;
-        _currentTest = "Initializing...";
-        StateHasChanged();
-        return Task.CompletedTask;
-    }
-
-    private Task CopyResults()
-    {
-        _copied = true;
-        StateHasChanged();
-        return Task.CompletedTask;
-    }
-
-    private Task CopyOneLiner()
-    {
-        _copied = true;
-        StateHasChanged();
-        return Task.CompletedTask;
-    }
-
-    private void ClearResults()
-    {
-        _results.Clear();
-        _completedTests = 0;
-        _copied = false;
-        StateHasChanged();
-    }
-
-    private class BenchResult
-    {
-        public string TestName { get; set; } = "";
-        public string BackendName { get; set; } = "";
-        public double InferenceMs { get; set; }
-        public double ModelLoadMs { get; set; }
-    }
+    // Methods and BenchResult class are in BenchmarkPage.razor.cs
 }

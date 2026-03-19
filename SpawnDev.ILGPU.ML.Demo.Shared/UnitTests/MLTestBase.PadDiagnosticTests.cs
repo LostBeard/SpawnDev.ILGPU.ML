@@ -1,7 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
-using SpawnDev.ILGPU.WebGPU.Backend;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -165,41 +164,7 @@ public abstract partial class MLTestBase
         output[idx] = broken ? -sum : sum;
     }
 
-    /// <summary>
-    /// Dump the WGSL source for PadImpl kernel.
-    /// This test loads the kernel, triggers compilation, and prints the generated WGSL.
-    /// </summary>
-    [TestMethod]
-    public async Task PadDiag_DumpWGSL() => await RunTest(async accelerator =>
-    {
-        // Load the PadKernel to trigger WGSL compilation
-        var pad = new PadKernel(accelerator);
-        // Run a trivial pad to force kernel compilation
-        var input = new float[] { 1f };
-        using var inBuf = accelerator.Allocate1D(input);
-        using var outBuf = accelerator.Allocate1D<float>(3);
-        pad.Forward(inBuf.View, outBuf.View, new[] { 1 }, new[] { 1, 1 }, mode: 0, constantValue: 0f);
-        await accelerator.SynchronizeAsync();
-
-        // Collect WGSL for Pad kernel — extract just the main function body
-        string? padWgsl = null;
-        foreach (var kvp in WebGPUBackend.WGSLRegistry)
-        {
-            if (kvp.Key.Contains("Pad", StringComparison.OrdinalIgnoreCase))
-                padWgsl = kvp.Value.Source;
-        }
-        if (padWgsl == null)
-            throw new Exception("No Pad WGSL found");
-
-        // Find "fn main" and dump from there
-        int mainIdx = padWgsl.IndexOf("fn main(");
-        if (mainIdx >= 0)
-            padWgsl = padWgsl.Substring(mainIdx);
-
-        // Split into chunks and throw each as a separate line
-        // to avoid truncation
-        throw new Exception($"WGSL_MAIN ({padWgsl.Length} chars):\n{padWgsl}");
-    });
+    // PadDiag_DumpWGSL removed — diagnostic test used to debug bugs #3/#4 which are now fixed.
 
     /// <summary>
     /// Test ternary with bool: output = boolVar ? A : B.

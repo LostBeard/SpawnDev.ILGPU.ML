@@ -8,10 +8,23 @@ namespace SpawnDev.ILGPU.ML.Onnx;
 public static class ModelInspectorHelper
 {
     /// <summary>
-    /// Inspect an ONNX model and return a structured summary.
-    /// Uses our zero-dependency ONNX parser.
+    /// Inspect a model file and return a structured summary.
+    /// Auto-detects format (ONNX or TFLite) from magic bytes.
     /// </summary>
-    public static InspectionResult Inspect(byte[] onnxBytes)
+    public static InspectionResult Inspect(byte[] modelBytes)
+    {
+        var format = InferenceSession.DetectModelFormat(modelBytes);
+        return format switch
+        {
+            ModelFormat.TFLite => InspectTFLite(modelBytes),
+            ModelFormat.GGUF => InspectGGUF(modelBytes),
+            ModelFormat.SafeTensors => InspectSafeTensors(modelBytes),
+            _ => InspectOnnx(modelBytes),
+        };
+    }
+
+    /// <summary>Inspect an ONNX model.</summary>
+    public static InspectionResult InspectOnnx(byte[] onnxBytes)
     {
         var model = OnnxParser.Parse(onnxBytes);
         var graph = model.Graph;
@@ -85,8 +98,194 @@ public static class ModelInspectorHelper
         };
     }
 
+    /// <summary>Inspect a TFLite model.</summary>
+    public static InspectionResult InspectTFLite(byte[] tfliteBytes)
+    {
+        var model = TFLite.TFLiteParser.Parse(tfliteBytes);
+        if (model.Subgraphs.Length == 0)
+            return new InspectionResult { GraphName = "Empty TFLite model", FileSizeBytes = tfliteBytes.Length };
+
+        var sg = model.Subgraphs[0];
+
+        // Operator usage
+        var opCounts = sg.Operators
+            .Select(o => model.GetOperatorName(o.OpcodeIndex))
+            .GroupBy(n => n)
+            .OrderByDescending(g => g.Count())
+            .Select(g => new OpUsage { OpType = g.Key, Count = g.Count() })
+            .ToArray();
+
+        // Weight statistics
+        long totalParams = 0;
+        long totalBytes = 0;
+        var largestWeights = new List<WeightInfo>();
+        for (int i = 0; i < sg.Tensors.Length; i++)
+        {
+            var tensor = sg.Tensors[i];
+            var buffer = model.Buffers[tensor.BufferIndex];
+            if (buffer.DataLength == 0) continue;
+
+            long elems = 1;
+            foreach (var d in tensor.Shape) elems *= d;
+            totalParams += elems;
+            totalBytes += buffer.DataLength;
+
+            largestWeights.Add(new WeightInfo
+            {
+                Name = tensor.Name,
+                Shape = tensor.Shape,
+                Elements = elems,
+                SizeBytes = buffer.DataLength,
+                DataType = tensor.Type.ToString()
+            });
+        }
+        largestWeights.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
+
+        // Inputs/outputs
+        var inputs = sg.Inputs.Where(i => model.Buffers[sg.Tensors[i].BufferIndex].DataLength == 0)
+            .Select(i => new TensorInfo
+            {
+                Name = sg.Tensors[i].Name,
+                Shape = sg.Tensors[i].Shape.Select(d => d.ToString()).ToArray(),
+                DataType = sg.Tensors[i].Type.ToString()
+            }).ToArray();
+
+        var outputs = sg.Outputs.Select(i => new TensorInfo
+        {
+            Name = sg.Tensors[i].Name,
+            Shape = sg.Tensors[i].Shape.Select(d => d.ToString()).ToArray(),
+            DataType = sg.Tensors[i].Type.ToString()
+        }).ToArray();
+
+        return new InspectionResult
+        {
+            GraphName = model.Description.Length > 0 ? model.Description : "TFLite Model",
+            ProducerName = "TensorFlow Lite",
+            ProducerVersion = $"v{model.Version}",
+            IrVersion = model.Version,
+            NodeCount = sg.Operators.Length,
+            InitializerCount = largestWeights.Count,
+            TotalParameters = totalParams,
+            TotalWeightBytes = totalBytes,
+            Operators = opCounts,
+            Inputs = inputs,
+            Outputs = outputs,
+            LargestWeights = largestWeights.Take(20).ToArray(),
+            FileSizeBytes = tfliteBytes.Length,
+        };
+    }
+
+    /// <summary>Inspect a GGUF model (LLM weights).</summary>
+    public static InspectionResult InspectGGUF(byte[] ggufBytes)
+    {
+        var model = GGUF.GGUFParser.Parse(ggufBytes);
+
+        // Count tensor types as "operators"
+        var typeCounts = model.Tensors
+            .GroupBy(t => t.Type.ToString())
+            .OrderByDescending(g => g.Count())
+            .Select(g => new OpUsage { OpType = g.Key, Count = g.Count() })
+            .ToArray();
+
+        long totalParams = 0;
+        long totalBytes = 0;
+        var largestWeights = new List<WeightInfo>();
+
+        foreach (var tensor in model.Tensors)
+        {
+            long elems = model.GetTensorElementCount(tensor);
+            long bytes = GGUF.GGMLTypes.TypeSize(tensor.Type, elems);
+            totalParams += elems;
+            totalBytes += bytes;
+
+            largestWeights.Add(new WeightInfo
+            {
+                Name = tensor.Name,
+                Shape = tensor.Shape,
+                Elements = elems,
+                SizeBytes = bytes,
+                DataType = tensor.Type.ToString()
+            });
+        }
+        largestWeights.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
+
+        return new InspectionResult
+        {
+            GraphName = $"{model.Name} ({model.Architecture})",
+            ProducerName = "GGUF / llama.cpp",
+            ProducerVersion = $"v{model.Version}",
+            IrVersion = model.Version,
+            OpsetVersion = model.ContextLength,
+            NodeCount = model.Tensors.Length,
+            InitializerCount = model.Tensors.Length,
+            TotalParameters = totalParams,
+            TotalWeightBytes = totalBytes,
+            Operators = typeCounts,
+            Inputs = new[] { new TensorInfo
+            {
+                Name = "Architecture",
+                Shape = new[] { model.Architecture, $"{model.BlockCount} layers", $"{model.EmbeddingLength}d", $"{model.AttentionHeadCount} heads" },
+                DataType = $"ctx={model.ContextLength}"
+            }},
+            Outputs = new[] { new TensorInfo
+            {
+                Name = "Vocab",
+                Shape = new[] { $"{model.VocabSize} tokens" },
+                DataType = "text"
+            }},
+            LargestWeights = largestWeights.Take(20).ToArray(),
+            FileSizeBytes = ggufBytes.Length,
+        };
+    }
+
     /// <summary>
     /// Check which operators the model needs that we support vs don't support.
+    /// <summary>Inspect a SafeTensors file (weights only, no graph).</summary>
+    public static InspectionResult InspectSafeTensors(byte[] stBytes)
+    {
+        var file = SafeTensors.SafeTensorsParser.Parse(stBytes);
+
+        long totalParams = 0;
+        long totalBytes = 0;
+        var dtypeCounts = file.Tensors
+            .GroupBy(t => t.DType)
+            .OrderByDescending(g => g.Count())
+            .Select(g => new OpUsage { OpType = g.Key, Count = g.Count() })
+            .ToArray();
+
+        var largestWeights = new List<WeightInfo>();
+        foreach (var tensor in file.Tensors)
+        {
+            long elems = tensor.Shape.Aggregate(1L, (a, b) => a * b);
+            totalParams += elems;
+            totalBytes += tensor.DataLength;
+            largestWeights.Add(new WeightInfo
+            {
+                Name = tensor.Name,
+                Shape = tensor.Shape,
+                Elements = elems,
+                SizeBytes = tensor.DataLength,
+                DataType = tensor.DType
+            });
+        }
+        largestWeights.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
+
+        return new InspectionResult
+        {
+            GraphName = "SafeTensors (weights only)",
+            ProducerName = "HuggingFace SafeTensors",
+            NodeCount = 0, // no graph
+            InitializerCount = file.Tensors.Length,
+            TotalParameters = totalParams,
+            TotalWeightBytes = totalBytes,
+            Operators = dtypeCounts,
+            Inputs = Array.Empty<TensorInfo>(),
+            Outputs = Array.Empty<TensorInfo>(),
+            LargestWeights = largestWeights.Take(20).ToArray(),
+            FileSizeBytes = stBytes.Length,
+        };
+    }
+
     /// Answers "Can I run this model?" instantly.
     /// </summary>
     public static CompatibilityResult CheckCompatibility(byte[] onnxBytes, Operators.OperatorRegistry? registry = null)
@@ -99,10 +298,10 @@ public static class ModelInspectorHelper
         // Known supported operators (hardcoded fallback if no registry provided)
         var knownSupported = new HashSet<string>
         {
-            "Abs", "Add", "AveragePool", "BatchNormalization", "Cast", "Ceil", "Clip",
+            "Abs", "Add", "ArgMax", "AveragePool", "BatchNormalization", "Cast", "Ceil", "Clip",
             "Concat", "Constant", "ConstantOfShape", "Conv", "ConvTranspose",
             "DepthToSpace", "Div", "Dropout", "Equal", "Erf", "Exp", "Expand",
-            "Flatten", "Floor", "Gather", "Gelu", "Gemm", "GlobalAveragePool",
+            "Flatten", "Floor", "Gather", "GatherND", "Gelu", "Gemm", "GlobalAveragePool",
             "Greater", "HardSigmoid", "HardSwish", "Identity", "InstanceNormalization",
             "LayerNormalization", "LeakyRelu", "Less", "Log", "MatMul", "Max", "MaxPool",
             "Min", "Mul", "Neg", "Not", "Pad", "Pow", "Range", "Reciprocal",

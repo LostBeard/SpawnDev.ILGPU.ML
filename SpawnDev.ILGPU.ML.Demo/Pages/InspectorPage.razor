@@ -7,7 +7,7 @@
 <div class="inspector-page">
     <div class="inspector-header">
         <h1 class="inspector-title">Model Inspector</h1>
-        <p class="inspector-desc">Drop any .onnx file to inspect its architecture, operators, and weights. Parsed entirely in the browser using our zero-dependency ONNX parser.</p>
+        <p class="inspector-desc">Drop any model file to inspect its architecture, operators, and weights. Supports ONNX, TFLite, GGUF, and SafeTensors — all parsed in-browser with zero dependencies.</p>
     </div>
 
     <div class="inspector-dropzone @(_isDragOver ? "drag-over" : "")">
@@ -23,9 +23,9 @@
         {
             <div class="drop-prompt">
                 <div class="drop-icon">&#x1F4E6;</div>
-                <p>Drop an .onnx file here</p>
-                <p class="drop-hint">or click to browse</p>
-                <InputFile OnChange="HandleFileSelected" accept=".onnx" class="file-input" />
+                <p>Drop a model file here</p>
+                <p class="drop-hint">.onnx, .tflite, .gguf, .safetensors — or click to browse</p>
+                <InputFile OnChange="HandleFileSelected" accept=".onnx,.tflite,.gguf,.safetensors" class="file-input" />
             </div>
         }
     </div>
@@ -190,7 +190,8 @@
     private async Task HandleFileSelected(InputFileChangeEventArgs e)
     {
         var file = e.File;
-        if (file == null || !file.Name.EndsWith(".onnx")) return;
+        var ext = Path.GetExtension(file?.Name ?? "").ToLowerInvariant();
+        if (file == null || ext is not (".onnx" or ".tflite" or ".gguf" or ".safetensors")) return;
 
         _isLoading = true;
         _error = null;

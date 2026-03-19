@@ -163,18 +163,14 @@ public class InferenceSession : IDisposable
 
         // Log weight loading stats
         int missingCount = allInitNames.Count - loadedCount;
-        if (missingCount > 0)
+        if (VerboseLogging)
         {
-            var missing = allInitNames.Where(n => !weights.ContainsKey(n)).Take(5);
-            Console.WriteLine($"[InferenceSession] WARNING: {missingCount} initializers not found in weights. First few: {string.Join(", ", missing)}");
-        }
-        Console.WriteLine($"[InferenceSession] Loaded {loadedCount}/{allInitNames.Count} weights, {compiled.Nodes.Length} nodes compiled");
-
-        // Diagnostic: check first weight tensor has non-zero values
-        if (weights.Count > 0)
-        {
-            var firstWeight = weights.Values.First();
-            Console.WriteLine($"[InferenceSession] First weight '{firstWeight.Name}': shape=[{string.Join(",", firstWeight.Shape)}], elements={firstWeight.ElementCount}");
+            if (missingCount > 0)
+            {
+                var missing = allInitNames.Where(n => !weights.ContainsKey(n)).Take(5);
+                Console.WriteLine($"[InferenceSession] WARNING: {missingCount} initializers not found in weights. First few: {string.Join(", ", missing)}");
+            }
+            Console.WriteLine($"[InferenceSession] Loaded {loadedCount}/{allInitNames.Count} weights, {compiled.Nodes.Length} nodes compiled");
         }
 
         // Create executor with pre-read constant values (avoids GPU→CPU readback during inference)
@@ -231,6 +227,78 @@ public class InferenceSession : IDisposable
         {
             ModelName = graph.Name
         };
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from any supported model file via HTTP.
+    /// Auto-detects format from file extension (.onnx, .tflite) or magic bytes.
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromFileAsync(
+        Accelerator accelerator, HttpClient http, string modelUrl,
+        Action<string, int>? onProgress = null)
+    {
+        onProgress?.Invoke("download", 0);
+        var bytes = await http.GetByteArrayAsync(modelUrl);
+        onProgress?.Invoke("download", 100);
+
+        return CreateFromFile(accelerator, bytes, onProgress);
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from raw model bytes.
+    /// Auto-detects format from magic bytes: ONNX (protobuf) or TFLite (FlatBuffers).
+    /// </summary>
+    public static InferenceSession CreateFromFile(
+        Accelerator accelerator, byte[] modelBytes,
+        Action<string, int>? onProgress = null)
+    {
+        var format = DetectModelFormat(modelBytes);
+        return format switch
+        {
+            ModelFormat.ONNX => CreateFromOnnx(accelerator, modelBytes, onProgress),
+            ModelFormat.TFLite => CreateFromTFLite(accelerator, modelBytes, onProgress),
+            ModelFormat.GGUF => CreateFromGGUF(accelerator, modelBytes, onProgress),
+            _ => throw new NotSupportedException($"Unknown model format. Expected ONNX (.onnx), TFLite (.tflite), or GGUF (.gguf).")
+        };
+    }
+
+    /// <summary>Detect model format from magic bytes.</summary>
+    public static ModelFormat DetectModelFormat(byte[] data)
+    {
+        if (data.Length < 8) return ModelFormat.Unknown;
+
+        // GGUF: bytes 0-3 = "GGUF"
+        if (data[0] == 'G' && data[1] == 'G' && data[2] == 'U' && data[3] == 'F')
+            return ModelFormat.GGUF;
+
+        // TFLite: bytes 4-7 = "TFL3" (FlatBuffers file identifier)
+        if (data.Length > 7 && data[4] == 'T' && data[5] == 'F' && data[6] == 'L' && data[7] == '3')
+            return ModelFormat.TFLite;
+
+        // ONNX: starts with protobuf varint field tag (typically 0x08 for field 1, varint type)
+        // More reliable: check for the "onnx" or "pytorch" producer string within first 64 bytes
+        for (int i = 0; i < Math.Min(64, data.Length - 4); i++)
+        {
+            if (data[i] == 'o' && data[i + 1] == 'n' && data[i + 2] == 'n' && data[i + 3] == 'x')
+                return ModelFormat.ONNX;
+            if (data[i] == 'p' && data[i + 1] == 'y' && data[i + 2] == 't' && data[i + 3] == 'o')
+                return ModelFormat.ONNX; // pytorch producer
+        }
+
+        // PyTorch: ZIP archive (PK header)
+        if (PyTorch.PyTorchLoader.IsPyTorchCheckpoint(data))
+            return ModelFormat.PyTorch;
+
+        // SafeTensors: starts with uint64 header size, then '{'
+        if (SafeTensors.SafeTensorsParser.IsSafeTensors(data))
+            return ModelFormat.SafeTensors;
+
+        // Fallback: if first byte is a protobuf field tag (0x08, 0x0A, etc.)
+        // Could be ONNX, TF GraphDef, or CoreML — check for ONNX/pytorch strings first
+        if (data[0] == 0x08 || data[0] == 0x0A)
+            return ModelFormat.ONNX;
+
+        return ModelFormat.Unknown;
     }
 
     /// <summary>
@@ -369,6 +437,160 @@ public class InferenceSession : IDisposable
         return graph;
     }
 
+    /// <summary>
+    /// Create an InferenceSession from a .tflite file loaded via HTTP.
+    /// No Python extraction step needed — uses the native TFLite FlatBuffers parser.
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromTFLiteAsync(
+        Accelerator accelerator, HttpClient http, string tfliteUrl,
+        Action<string, int>? onProgress = null)
+    {
+        onProgress?.Invoke("download", 0);
+        var tfliteBytes = await http.GetByteArrayAsync(tfliteUrl);
+        onProgress?.Invoke("download", 100);
+
+        return CreateFromTFLite(accelerator, tfliteBytes, onProgress);
+    }
+
+    /// <summary>
+    /// Create an InferenceSession directly from raw .tflite bytes.
+    /// Uses the native TFLite FlatBuffers parser — zero dependencies.
+    /// </summary>
+    public static InferenceSession CreateFromTFLite(
+        Accelerator accelerator, byte[] tfliteBytes,
+        Action<string, int>? onProgress = null)
+    {
+        // Parse TFLite FlatBuffers
+        onProgress?.Invoke("parse", 0);
+        var (graph, cpuWeights) = TFLite.TFLiteLoader.LoadModel(tfliteBytes);
+        onProgress?.Invoke("parse", 100);
+
+        // Extract small constant values for shape inference
+        graph.ConstantData = new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        foreach (var (name, shape) in graph.Initializers)
+        {
+            int elems = shape.Aggregate(1, (a, b) => a * b);
+            if (elems > 0 && elems <= 64 && cpuWeights.TryGetValue(name, out var data))
+            {
+                constantFloatValues[name] = data;
+                if (elems <= 16)
+                    graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+            }
+        }
+
+        // Compile graph
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+        onProgress?.Invoke("compile", 100);
+
+        // Upload weights to GPU
+        onProgress?.Invoke("upload", 0);
+        var pool = new BufferPool(accelerator);
+        var gpuWeights = new Dictionary<string, Tensor>();
+        int loaded = 0;
+        foreach (var (name, data) in cpuWeights)
+        {
+            if (graph.Initializers.TryGetValue(name, out var shape))
+            {
+                gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                loaded++;
+            }
+        }
+        onProgress?.Invoke("upload", 100);
+
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] TFLite: {graph.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
+
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        onProgress?.Invoke("ready", 100);
+
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        {
+            ModelName = graph.Name
+        };
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from a .gguf file loaded via HTTP.
+    /// Parses GGUF metadata, constructs transformer graph, uploads weights.
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromGGUFAsync(
+        Accelerator accelerator, HttpClient http, string ggufUrl,
+        Action<string, int>? onProgress = null)
+    {
+        onProgress?.Invoke("download", 0);
+        var ggufBytes = await http.GetByteArrayAsync(ggufUrl);
+        onProgress?.Invoke("download", 100);
+
+        return CreateFromGGUF(accelerator, ggufBytes, onProgress);
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from raw .gguf bytes.
+    /// Constructs the transformer graph from architecture metadata.
+    /// Note: currently only supports F32/F16 weights. Quantized (Q4/Q8) requires dequantization kernels.
+    /// </summary>
+    public static InferenceSession CreateFromGGUF(
+        Accelerator accelerator, byte[] ggufBytes,
+        Action<string, int>? onProgress = null)
+    {
+        // Parse GGUF
+        onProgress?.Invoke("parse", 0);
+        var ggufModel = GGUF.GGUFParser.Parse(ggufBytes);
+        onProgress?.Invoke("parse", 100);
+
+        // Build transformer graph from architecture metadata
+        onProgress?.Invoke("build_graph", 0);
+        var (graph, cpuWeights) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        onProgress?.Invoke("build_graph", 100);
+
+        // Extract small constant values
+        graph.ConstantData = new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        foreach (var (name, shape) in graph.Initializers)
+        {
+            int elems = shape.Aggregate(1, (a, b) => a * b);
+            if (elems > 0 && elems <= 64 && cpuWeights.TryGetValue(name, out var data))
+            {
+                constantFloatValues[name] = data;
+                if (elems <= 16)
+                    graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+            }
+        }
+
+        // Compile graph
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry).Compile(graph);
+        onProgress?.Invoke("compile", 100);
+
+        // Upload weights to GPU
+        onProgress?.Invoke("upload", 0);
+        var pool = new BufferPool(accelerator);
+        var gpuWeights = new Dictionary<string, Tensor>();
+        int loaded = 0;
+        foreach (var (name, data) in cpuWeights)
+        {
+            if (graph.Initializers.TryGetValue(name, out var shape))
+            {
+                gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                loaded++;
+            }
+        }
+        onProgress?.Invoke("upload", 100);
+
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] GGUF: {ggufModel.Name} ({ggufModel.Architecture}), {compiled.Nodes.Length} nodes, {loaded} weights, {ggufModel.BlockCount} layers");
+
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        onProgress?.Invoke("ready", 100);
+
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        {
+            ModelName = graph.Name
+        };
+    }
+
     /// <summary>Run inference with named input tensors. Returns named output tensors.</summary>
     public Dictionary<string, Tensor> Run(Dictionary<string, Tensor> inputs)
         => _executor.Run(inputs);
@@ -398,4 +620,17 @@ public class InferenceSession : IDisposable
         _executor.Dispose();
         _pool.Dispose();
     }
+}
+
+/// <summary>Supported model file formats.</summary>
+public enum ModelFormat
+{
+    Unknown,
+    ONNX,
+    TFLite,
+    GGUF,
+    SafeTensors,
+    TFGraphDef,
+    PyTorch,
+    CoreML,
 }

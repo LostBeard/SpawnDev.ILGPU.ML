@@ -19,8 +19,6 @@ public class GraphExecutor : IDisposable
 
     /// <summary>When true, logs each node execution to Console.</summary>
     public static bool VerboseLogging { get; set; }
-    /// <summary>Stop execution after this many nodes (0 = no limit). For debugging.</summary>
-    public static int MaxNodeCount { get; set; }
 
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null)
@@ -139,13 +137,6 @@ public class GraphExecutor : IDisposable
             if (nodeIdx > 0 && nodeIdx % 16 == 0)
                 _accelerator.Synchronize();
 
-            // DEBUG: Stop early to find which operator breaks MapAsync
-            if (MaxNodeCount > 0 && nodeIdx >= MaxNodeCount)
-            {
-                _accelerator.Synchronize();
-                break;
-            }
-
             // Register outputs
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
@@ -190,6 +181,17 @@ public class GraphExecutor : IDisposable
         var tensors = new Dictionary<string, Tensor>();
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
+
+        // Reference counting for buffer recycling (same as Run)
+        var refCounts = new Dictionary<string, int>();
+        var outputNameSet = new HashSet<string>(_graph.OutputNames);
+        foreach (var node in _graph.Nodes)
+            foreach (var inputName in node.InputNames)
+                if (!string.IsNullOrEmpty(inputName))
+                    refCounts[inputName] = refCounts.GetValueOrDefault(inputName, 0) + 1;
+        foreach (var name in outputNameSet) refCounts[name] = int.MaxValue;
+        foreach (var name in _weights.Keys) refCounts[name] = int.MaxValue;
+        foreach (var name in inputs.Keys) refCounts[name] = int.MaxValue;
 
         int nodeIdx = 0;
         foreach (var node in _graph.Nodes)
@@ -244,12 +246,22 @@ public class GraphExecutor : IDisposable
 
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
+
+            // Release input tensors whose ref count reached 0 — recycle GPU memory
+            foreach (var inputName in node.InputNames)
+            {
+                if (string.IsNullOrEmpty(inputName)) continue;
+                if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
+                {
+                    refCounts[inputName] = rc - 1;
+                    if (rc - 1 <= 0 && tensors.TryGetValue(inputName, out var releaseTensor))
+                        _pool.Return(releaseTensor);
+                }
+            }
+
             nodeIdx++;
 
             // Flush GPU command buffer periodically to prevent massive single submissions.
-            // WebGPU batches compute passes into one command encoder; too many passes in one
-            // submission can cause Chrome's GPU watchdog to timeout. Synchronize() = Flush()
-            // on WebGPU — it submits the current batch without waiting for completion.
             if (nodeIdx % 16 == 0)
                 _accelerator.Synchronize();
         }

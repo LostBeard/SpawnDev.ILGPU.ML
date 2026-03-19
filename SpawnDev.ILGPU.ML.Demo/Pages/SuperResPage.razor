@@ -11,16 +11,16 @@
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
             ShowModelProgress="true"
-            ModelName="@(_scaleMode == "2x" ? "ESPCN (2x)" : "Real-ESRGAN (4x)")"
+            ModelName="ESPCN (3x)"
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="@(_scaleMode == "2x" ? 0.1 : 17)">
+            ModelSizeMB="0.2">
 
     <div class="sr-controls">
         <label class="sr-label">Scale:</label>
-        <button class="sr-scale-btn @(_scaleMode == "2x" ? "active" : "")" @onclick='() => _scaleMode = "2x"'>2x (ESPCN, ~100KB)</button>
-        <button class="sr-scale-btn @(_scaleMode == "4x" ? "active" : "")" @onclick='() => _scaleMode = "4x"'>4x (Real-ESRGAN, ~17MB)</button>
+        <button class="sr-scale-btn active">3x (ESPCN, ~100KB)</button>
+        <button class="sr-scale-btn" disabled title="Coming soon — model not yet available">4x (Real-ESRGAN, ~17MB)</button>
     </div>
 
     @if (_enhancedImageUrl != null && _imageDataUrl != null)
@@ -28,7 +28,7 @@
         <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
                            AfterImageUrl="@_enhancedImageUrl"
                            BeforeLabel="Original"
-                           AfterLabel="@($"Enhanced ({_scaleMode})")" />
+                           AfterLabel="Enhanced (3x)" />
 
         <div class="result-actions">
             <button class="action-btn download-btn" @onclick="DownloadResult">

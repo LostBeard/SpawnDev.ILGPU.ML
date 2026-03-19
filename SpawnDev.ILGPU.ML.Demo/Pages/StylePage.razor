@@ -185,9 +185,17 @@
     private List<StyleOption> _styles = new()
     {
         new("Mosaic"), new("Candy"), new("Rain Princess"),
-        new("Udnie"), new("Pointilism"), new("Starry Night")
+        new("Udnie"), new("Pointilism")
     };
 
-    private async void SelectStyle(string name) { _selectedStyle = name; _styledImageUrl = null; await LoadStyle(name); }
+    private async void SelectStyle(string name)
+    {
+        _selectedStyle = name;
+        _styledImageUrl = null;
+        await LoadStyle(name);
+        // Auto-re-run if image already loaded
+        if (_isModelLoaded && _rgbaPixels != null)
+            await RunStyleTransfer();
+    }
     private Task HandleFrame(byte[] frameBytes) => Task.CompletedTask;
 }

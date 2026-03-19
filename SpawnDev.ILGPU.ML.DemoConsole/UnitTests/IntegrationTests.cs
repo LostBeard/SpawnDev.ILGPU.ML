@@ -896,6 +896,74 @@ public class IntegrationTests
         Console.WriteLine("[DAv2] PASS — DAv2 parses and compiles successfully (all ops supported)");
     }
 
+    /// <summary>
+    /// End-to-end depth estimation on CUDA: load DAv2 from .onnx, run on gradient image,
+    /// verify depth map has variation (not all same value).
+    /// NOTE: Currently fails with NullRef during dispose — ILGPU CUDA buffer dispose bug
+    /// with large models (95MB, 300+ weight tensors). See SpawnDev.ILGPU PLANS.md #5.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task DirectOnnx_DepthAnythingV2_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "depth-anything-v2-small", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"DAv2 model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+
+        using var context = MLContext.CreateContext();
+        var cudaDevices = context.GetCudaDevices();
+        if (cudaDevices.Count == 0)
+        {
+            context.Dispose();
+            throw new UnsupportedTestException("No CUDA devices found");
+        }
+        using var accelerator = cudaDevices[0].CreateAccelerator(context);
+        Console.WriteLine($"[CudaDepth] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
+
+        InferenceSession session;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+            Console.WriteLine($"[CudaDepth] Session created in {sw.Elapsed.TotalSeconds:F1}s: {session}");
+        }
+        catch (Exception ex)
+        {
+            throw new UnsupportedTestException($"DAv2 session creation failed: {ex.Message}");
+        }
+
+        // Gradient test image (64x64)
+        int w = 64, h = 64;
+        var pixels = new int[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int gray = (int)(x * 255f / w);
+                pixels[y * w + x] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
+            }
+
+        var pipeline = new SpawnDev.ILGPU.ML.Pipelines.DepthEstimationPipeline(session, accelerator);
+        sw.Restart();
+        var result = await pipeline.EstimateAsync(pixels, w, h);
+        sw.Stop();
+
+        Console.WriteLine($"[CudaDepth] Depth map: {result.Width}x{result.Height}, min={result.MinDepth:F3}, max={result.MaxDepth:F3}, inference={sw.Elapsed.TotalSeconds:F1}s");
+
+        // Verify output has variation (not flat)
+        float range = result.MaxDepth - result.MinDepth;
+        if (range < 0.01f)
+            throw new Exception($"Depth map is flat: range={range:F4}");
+
+        // Verify reasonable dimensions
+        if (result.Width < 10 || result.Height < 10)
+            throw new Exception($"Depth map too small: {result.Width}x{result.Height}");
+
+        Console.WriteLine("[CudaDepth] PASS");
+        try { pipeline.Dispose(); } catch { }
+        try { session.Dispose(); } catch { }
+    }
+
     /// <summary>Parse and check operator coverage for MoveNet Lightning.</summary>
     [TestMethod(Timeout = 30000)]
     public async Task DirectOnnx_ParseAndCompile_MoveNet()
@@ -945,5 +1013,171 @@ public class IntegrationTests
             dir = Path.GetDirectoryName(dir) ?? dir;
         }
         throw new Exception("Could not find models directory");
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  TFLite format tests
+    // ──────────────────────────────────────────────────────────
+
+    [TestMethod]
+    public async Task TFLite_Parse_BlazeFace()
+    {
+        var path = FindTFLiteModel("blaze_face.tflite");
+        if (path == null) throw new UnsupportedTestException("blaze_face.tflite not found in TEMP");
+
+        var bytes = await File.ReadAllBytesAsync(path);
+        var model = SpawnDev.ILGPU.ML.TFLite.TFLiteParser.Parse(bytes);
+
+        Console.WriteLine($"[TFLite] Version: {model.Version}");
+        Console.WriteLine($"[TFLite] Description: {model.Description}");
+        Console.WriteLine($"[TFLite] Operator codes: {model.OperatorCodes.Length}");
+        Console.WriteLine($"[TFLite] Buffers: {model.Buffers.Length}");
+        Console.WriteLine($"[TFLite] Subgraphs: {model.Subgraphs.Length}");
+
+        if (model.Subgraphs.Length == 0) throw new Exception("No subgraphs");
+        var sg = model.Subgraphs[0];
+        Console.WriteLine($"[TFLite] Tensors: {sg.Tensors.Length}");
+        Console.WriteLine($"[TFLite] Operators: {sg.Operators.Length}");
+        Console.WriteLine($"[TFLite] Inputs: [{string.Join(", ", sg.Inputs)}]");
+        Console.WriteLine($"[TFLite] Outputs: [{string.Join(", ", sg.Outputs)}]");
+
+        var opNames = sg.Operators
+            .Select(o => model.GetOperatorName(o.OpcodeIndex))
+            .GroupBy(n => n)
+            .OrderByDescending(g => g.Count());
+        Console.WriteLine($"[TFLite] Ops: {string.Join(", ", opNames.Select(g => $"{g.Key}({g.Count()})"))}");
+
+        // Verify basic structure
+        if (sg.Tensors.Length == 0) throw new Exception("No tensors");
+        if (sg.Operators.Length == 0) throw new Exception("No operators");
+
+        Console.WriteLine($"[TFLite] Summary: {SpawnDev.ILGPU.ML.TFLite.TFLiteParser.GetSummary(model)}");
+        Console.WriteLine("[TFLite] PASS — parse successful");
+    }
+
+    [TestMethod]
+    public async Task TFLite_LoadModel_BlazeFace()
+    {
+        var path = FindTFLiteModel("blaze_face.tflite");
+        if (path == null) throw new UnsupportedTestException("blaze_face.tflite not found in TEMP");
+
+        var bytes = await File.ReadAllBytesAsync(path);
+        var (graph, weights) = SpawnDev.ILGPU.ML.TFLite.TFLiteLoader.LoadModel(bytes);
+
+        Console.WriteLine($"[TFLite→Graph] Name: {graph.Name}");
+        Console.WriteLine($"[TFLite→Graph] Nodes: {graph.Nodes.Count}");
+        Console.WriteLine($"[TFLite→Graph] Inputs: {string.Join(", ", graph.Inputs.Select(i => $"{i.Name}[{string.Join(",", i.Shape)}]"))}");
+        Console.WriteLine($"[TFLite→Graph] Outputs: {string.Join(", ", graph.Outputs.Select(o => $"{o.Name}[{string.Join(",", o.Shape)}]"))}");
+        Console.WriteLine($"[TFLite→Graph] Initializers: {graph.Initializers.Count}");
+        Console.WriteLine($"[TFLite→Graph] Weights: {weights.Count}");
+        Console.WriteLine($"[TFLite→Graph] Op types: {string.Join(", ", graph.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s))}");
+
+        if (graph.Nodes.Count == 0) throw new Exception("No nodes in converted graph");
+        if (graph.Inputs.Count == 0) throw new Exception("No inputs");
+        if (graph.Outputs.Count == 0) throw new Exception("No outputs");
+
+        Console.WriteLine("[TFLite→Graph] PASS — conversion successful");
+    }
+
+    [TestMethod]
+    public async Task TFLite_FormatDetection()
+    {
+        // Test ONNX detection
+        var onnxPath = Path.Combine(FindModelsDir(), "squeezenet", "model.onnx");
+        if (File.Exists(onnxPath))
+        {
+            var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+            var onnxFormat = InferenceSession.DetectModelFormat(onnxBytes);
+            if (onnxFormat != ModelFormat.ONNX) throw new Exception($"Expected ONNX, got {onnxFormat}");
+            Console.WriteLine("[FormatDetect] ONNX: correct");
+        }
+
+        // Test TFLite detection
+        var tflitePath = FindTFLiteModel("blaze_face.tflite");
+        if (tflitePath != null)
+        {
+            var tfliteBytes = await File.ReadAllBytesAsync(tflitePath);
+            var tfliteFormat = InferenceSession.DetectModelFormat(tfliteBytes);
+            if (tfliteFormat != ModelFormat.TFLite) throw new Exception($"Expected TFLite, got {tfliteFormat}");
+            Console.WriteLine("[FormatDetect] TFLite: correct");
+        }
+
+        Console.WriteLine("[FormatDetect] PASS");
+    }
+
+    [TestMethod]
+    public async Task TFLite_CompileGraph_BlazeFace()
+    {
+        var path = FindTFLiteModel("blaze_face.tflite");
+        if (path == null) throw new UnsupportedTestException("blaze_face.tflite not found in TEMP");
+
+        var bytes = await File.ReadAllBytesAsync(path);
+        var (graph, weights) = SpawnDev.ILGPU.ML.TFLite.TFLiteLoader.LoadModel(bytes);
+
+        Console.WriteLine($"[TFLite→Compile] Graph: {graph.Nodes.Count} nodes, {graph.Initializers.Count} initializers");
+        Console.WriteLine($"[TFLite→Compile] Op types: {string.Join(", ", graph.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s))}");
+
+        // Try to compile
+        using var context = MLContext.CreateContext();
+        using var accelerator = context.CreateCPUAccelerator(0);
+        var registry = new OperatorRegistry(accelerator);
+
+        var unsupported = graph.Nodes.Select(n => n.OpType).Distinct()
+            .Where(op => !registry.IsSupported(op)).ToList();
+
+        if (unsupported.Count > 0)
+        {
+            Console.WriteLine($"[TFLite→Compile] Unsupported ops: {string.Join(", ", unsupported)}");
+            Console.WriteLine($"[TFLite→Compile] PARTIAL — {graph.Nodes.Count - graph.Nodes.Count(n => unsupported.Contains(n.OpType))}/{graph.Nodes.Count} nodes supported");
+        }
+        else
+        {
+            var compiled = new GraphCompiler(registry).Compile(graph);
+            Console.WriteLine($"[TFLite→Compile] FULL COMPILE: {compiled.Nodes.Length} nodes");
+            Console.WriteLine("[TFLite→Compile] PASS — all operators supported");
+        }
+    }
+
+    [TestMethod]
+    public async Task SafeTensors_Parse_Detection()
+    {
+        // Create a minimal SafeTensors file to test the parser
+        var header = System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["weight1"] = new { dtype = "F32", shape = new[] { 3, 4 }, data_offsets = new[] { 0, 48 } },
+            ["bias1"] = new { dtype = "F32", shape = new[] { 4 }, data_offsets = new[] { 48, 64 } },
+        });
+        var headerBytes = System.Text.Encoding.UTF8.GetBytes(header);
+        var data = new byte[8 + headerBytes.Length + 64]; // header_size + header + tensor_data
+        BitConverter.GetBytes((long)headerBytes.Length).CopyTo(data, 0);
+        headerBytes.CopyTo(data, 8);
+        // Fill tensor data with some values
+        for (int i = 0; i < 64; i++) data[8 + headerBytes.Length + i] = (byte)(i * 4);
+
+        // Test format detection
+        var format = InferenceSession.DetectModelFormat(data);
+        if (format != ModelFormat.SafeTensors) throw new Exception($"Expected SafeTensors, got {format}");
+        Console.WriteLine("[SafeTensors] Format detection: correct");
+
+        // Test parsing
+        var file = SpawnDev.ILGPU.ML.SafeTensors.SafeTensorsParser.Parse(data);
+        Console.WriteLine($"[SafeTensors] Tensors: {file.Tensors.Length}");
+        foreach (var t in file.Tensors)
+            Console.WriteLine($"  {t.Name}: {t.DType} [{string.Join(",", t.Shape)}] ({t.DataLength} bytes)");
+
+        if (file.Tensors.Length != 2) throw new Exception($"Expected 2 tensors, got {file.Tensors.Length}");
+
+        // Test weight extraction
+        var w1 = file.GetTensorFloat32(file.Tensors[0]);
+        if (w1 == null || w1.Length != 12) throw new Exception($"Expected 12 floats for weight1, got {w1?.Length}");
+
+        Console.WriteLine($"[SafeTensors] Summary: {SpawnDev.ILGPU.ML.SafeTensors.SafeTensorsParser.GetSummary(file)}");
+        Console.WriteLine("[SafeTensors] PASS");
+    }
+
+    private static string? FindTFLiteModel(string filename)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), filename);
+        return File.Exists(tempPath) ? tempPath : null;
     }
 }

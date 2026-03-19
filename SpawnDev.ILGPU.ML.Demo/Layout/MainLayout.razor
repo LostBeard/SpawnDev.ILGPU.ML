@@ -35,7 +35,20 @@
     <WelcomeToast />
 </div>
 
+@inject SpawnDev.BlazorJS.BlazorJSRuntime JS
+
 @code {
+    private static bool _buildTracked;
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (firstRender && !_buildTracked)
+        {
+            _buildTracked = true;
+            BuildChangeTracker.PrintDiff(JS);
+        }
+    }
+
     private void HandleGlobalVoiceCommand(string command)
     {
         if (VerboseLogging) Console.WriteLine($"[Voice] Command: {command}");

@@ -13,6 +13,7 @@ public class OperatorRegistry
 {
     private readonly Dictionary<string, IOnnxOperator> _ops = new(StringComparer.OrdinalIgnoreCase);
     private readonly Accelerator _accelerator;
+    public Accelerator Accelerator => _accelerator;
 
     // Kernel instances (shared across operators)
     public MatMulKernel MatMul { get; }
@@ -138,5 +139,9 @@ public class OperatorRegistry
         Register(new DepthToSpaceOperator(_accelerator));
         Register(new TopKOperator(_accelerator));
         Register(new SignOperator(_accelerator));
+
+        // Fused operators (created by GraphOptimizer)
+        Register(new FusedLinearOperator(this));
+        Register(new FusedScaledMatMulOperator(this));
     }
 }

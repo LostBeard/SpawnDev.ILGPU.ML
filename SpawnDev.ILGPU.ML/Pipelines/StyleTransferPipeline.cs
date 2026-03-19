@@ -26,6 +26,8 @@ public class StyleTransferPipeline : IDisposable
     private readonly Accelerator _accelerator;
     private readonly int _modelH;
     private readonly int _modelW;
+    private Kernels.ImagePreprocessKernel? _preprocess;
+    private Kernels.ImagePostprocessKernel? _postprocess;
 
     public StyleTransferPipeline(InferenceSession session, Accelerator accelerator)
     {
@@ -48,79 +50,34 @@ public class StyleTransferPipeline : IDisposable
         // Use model's declared input size to match compiled graph shapes
         int modelH = _modelH, modelW = _modelW;
 
-        // Convert RGBA int[] to [1, 3, modelH, modelW] float tensor in [0, 255] range
-        // Style models use RGB [0,255] WITHOUT ImageNet normalization
-        // Simple nearest-neighbor resize from source to model dimensions
-        var inputData = new float[3 * modelH * modelW];
-        for (int y = 0; y < modelH; y++)
-            for (int x = 0; x < modelW; x++)
-            {
-                int sy = y * height / modelH;
-                int sx = x * width / modelW;
-                if (sy >= height) sy = height - 1;
-                if (sx >= width) sx = width - 1;
-                int pixel = rgbaPixels[sy * width + sx];
-                int r = pixel & 0xFF;
-                int g = (pixel >> 8) & 0xFF;
-                int b = (pixel >> 16) & 0xFF;
-                inputData[0 * modelH * modelW + y * modelW + x] = r;
-                inputData[1 * modelH * modelW + y * modelW + x] = g;
-                inputData[2 * modelH * modelW + y * modelW + x] = b;
-            }
-
-        using var inputBuf = _accelerator.Allocate1D(inputData);
+        // GPU preprocessing: RGBA → bilinear resize → NCHW [0, 255]
+        // Uses ImagePreprocessKernel.ForwardRaw — all on GPU, no CPU loops
+        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
+        using var inputBuf = _accelerator.Allocate1D<float>(3 * modelH * modelW);
+        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
+        _preprocess.ForwardRaw(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, modelH, modelW });
 
         // Use RunAsync — includes periodic flush + final SynchronizeAsync
-        Console.WriteLine("[StylePipeline] Running inference via RunAsync...");
-        Graph.GraphExecutor.MaxNodeCount = 0; // Full run
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
         });
-        // Check if GPU device survived the inference workload
-        if (_accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator webGpu)
-            Console.WriteLine($"[StylePipeline] Device lost: {webGpu.IsDeviceLost}");
-        Console.WriteLine("[StylePipeline] Inference done, reading output...");
 
         var output = outputs[_session.OutputNames[0]];
         int outH = output.Shape.Length >= 4 ? output.Shape[2] : modelH;
         int outW = output.Shape.Length >= 4 ? output.Shape[3] : modelW;
-        int outSize = 3 * outH * outW;
-        int actualRead = Math.Min(outSize, (int)output.Data.Length);
 
-        using var readBuf = _accelerator.Allocate1D<float>(actualRead);
-        var ew = new ElementWiseKernels(_accelerator);
-        ew.Scale(output.Data.SubView(0, actualRead), readBuf.View, actualRead, 1f);
-        _accelerator.Synchronize();
-        Console.WriteLine("[StylePipeline] Scale done, reading back...");
-        var raw2 = await readBuf.CopyToHostAsync<float>(0, actualRead);
-        Console.WriteLine($"[StylePipeline] Read {raw2.Length} floats");
+        // GPU postprocessing: NCHW float [0,255] → packed RGBA int on GPU
+        _postprocess ??= new Kernels.ImagePostprocessKernel(_accelerator);
+        using var rgbaOutBuf = _accelerator.Allocate1D<int>(outH * outW);
+        _postprocess.NCHWToRGBA(output.Data, rgbaOutBuf.View, outH, outW);
+        await _accelerator.SynchronizeAsync();
 
-        // Pack NCHW float [0,255] → RGBA int[]
-        var result = new int[outH * outW];
-        for (int y = 0; y < outH; y++)
-            for (int x = 0; x < outW; x++)
-            {
-                int idx = y * outW + x;
-                if (idx < raw2.Length / 3)
-                {
-                    int r = Clamp255(raw2[0 * outH * outW + idx]);
-                    int g = Clamp255(raw2[1 * outH * outW + idx]);
-                    int b = Clamp255(raw2[2 * outH * outW + idx]);
-                    result[idx] = r | (g << 8) | (b << 16) | (0xFF << 24);
-                }
-            }
+        // Single GPU→CPU copy of the final packed RGBA pixels
+        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, outH * outW);
 
-        Graph.GraphExecutor.MaxNodeCount = 0; // Reset
-        // For partial runs (debugging), just return what we have
         return new StyleResult(result, outW, outH);
-    }
-
-    private static int Clamp255(float v)
-    {
-        int i = (int)(v + 0.5f);
-        return i < 0 ? 0 : (i > 255 ? 255 : i);
     }
 
     public void Dispose() { }
