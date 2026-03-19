@@ -41,7 +41,7 @@ SpawnDev.ILGPU (transpilation)
 
 ## Quick Start
 
-### Load and Run an ONNX Model
+### Load and Run Any Model
 
 ```csharp
 using SpawnDev.ILGPU;
@@ -54,9 +54,13 @@ await builder.AllAcceleratorsAsync();
 var context = builder.ToContext();
 var accelerator = await context.CreatePreferredAcceleratorAsync();
 
-// Load model directly from .onnx — no extraction step needed
-var session = await InferenceSession.CreateFromOnnxAsync(
+// Load any model from any URL — format auto-detected from magic bytes
+var session = await InferenceSession.CreateFromFileAsync(
     accelerator, httpClient, "models/squeezenet/model.onnx");
+// Works with any URL and any supported format:
+//   "models/blaze-face/model.tflite"                                    — local TFLite
+//   "https://huggingface.co/org/repo/resolve/main/model.onnx"          — HuggingFace
+//   "https://storage.googleapis.com/mediapipe-models/.../model.tflite"  — Google CDN
 
 // Classify an image
 var pipeline = new ClassificationPipeline(session, accelerator);
