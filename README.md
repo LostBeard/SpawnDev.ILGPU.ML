@@ -363,7 +363,7 @@ Tests run across all 6 backends via **PlaywrightMultiTest**:
 dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj
 ```
 
-**SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends.
+**SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends. Wasm backend: **179 pass / 0 fail / 55 skip** (fiber refactor complete — all RadixSort, scan, barrier, and sort tests pass).
 **SpawnDev.ILGPU.ML: 78/78 WebGPU, 70/70 CUDA, 70/70 OpenCL.**
 
 Every kernel validates against CPU reference implementations.
