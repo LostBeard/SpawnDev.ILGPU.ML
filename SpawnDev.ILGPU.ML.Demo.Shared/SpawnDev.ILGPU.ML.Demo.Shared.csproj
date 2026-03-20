@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
@@ -9,7 +9,7 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
-		<PackageReference Include="SpawnDev.UnitTesting.Blazor" Version="2.3.1" />
+		<PackageReference Include="SpawnDev.UnitTesting.Blazor" Version="2.4.0" />
 	</ItemGroup>
 
 </Project>

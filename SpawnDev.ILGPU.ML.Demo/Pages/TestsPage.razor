@@ -8,8 +8,33 @@
 
 <h3>Unit Tests</h3>
 
-<UnitTestsView TypeInstanceResolver="TestTypeResolver" TestAssemblies="Assemblies" TestTypes="Types"></UnitTestsView>
 
+<hr />
+<h4>Shader Debug Output</h4>
+<div style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.5rem;">
+    @if (_shaderDebug.HasDebugFolder && _shaderDebug.HasWritePermission)
+    {
+        <span style="color:green;">Auto-dumping to: <strong>@_shaderDebug.FolderName</strong></span>
+        <button @onclick="() => { _shaderDebug.ClearAsync(); StateHasChanged(); }">Clear</button>
+    }
+    else if (_shaderDebug.NeedsPermissionGrant)
+    {
+        <span style="color:orange;">Debug folder: <strong>@_shaderDebug.FolderName</strong> (needs write access)</span>
+        <button @onclick="GrantWriteAccess">Grant Write Access</button>
+        <button @onclick="() => { _shaderDebug.ClearAsync(); StateHasChanged(); }">Clear</button>
+    }
+    else
+    {
+        <button @onclick="PickDebugFolder">Set Debug Folder</button>
+        <span style="color:gray;font-size:0.85rem;">Pick folder to write WGSL/GLSL/Wasm to disk</span>
+    }
+</div>
+<hr />
+
+<UnitTestsView TypeInstanceResolver="TestTypeResolver" TestAssemblies="Assemblies" TestTypes="Types" ResultsDirectory="_shaderDebug.DebugDirectory"></UnitTestsView>
+
+@* 
+@if (_dumpStatus != null) { <span style="color:green;">@_dumpStatus</span> }
 <hr />
 <h4>Generated WGSL Sources</h4>
 <button @onclick="RefreshWGSL">Refresh WGSL</button>
@@ -44,14 +69,19 @@ else
 else
 {
     <p><em>No GLSL generated yet. Run a WebGL test first, then click Refresh.</em></p>
-}
+} *@
 
 @inject SpawnDev.BlazorJS.BlazorJSRuntime JS
+@inject SpawnDev.ILGPU.Services.ShaderDebugService _shaderDebug
 
 @code {
     [Inject]
     IServiceCollection ServiceDescriptors { get; set; } = default!;
     string? _copyStatus;
+    string? _dumpStatus;
+
+    async Task PickDebugFolder() { if (await _shaderDebug.PickFolderAsync()) StateHasChanged(); }
+    async Task GrantWriteAccess() { await _shaderDebug.RequestWritePermissionAsync(); StateHasChanged(); }
     List<Assembly>? Assemblies = new List<Assembly>();
     List<Type>? Types = new List<Type>();
     object? TestTypeResolver(Type testType)
@@ -81,7 +111,6 @@ else
             return;
         }
         var sb = new System.Text.StringBuilder();
-        // Use registry for named entries if available
         var registry = WebGPUBackend.WGSLRegistry;
         if (registry.Count > 0)
         {
@@ -106,7 +135,7 @@ else
             using var navigator = JS.Get<SpawnDev.BlazorJS.JSObjects.Navigator>("navigator");
             using var clipboard = navigator.Clipboard;
             await clipboard.WriteText(sb.ToString());
-            _copyStatus = $"Copied {(registry.Count > 0 ? registry.Count : _allWGSL.Count)} shaders to clipboard!";
+            _copyStatus = $"Copied {(registry.Count > 0 ? registry.Count : _allWGSL.Count)} shaders!";
         }
         catch (Exception ex)
         {

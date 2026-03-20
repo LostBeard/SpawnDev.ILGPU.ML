@@ -152,36 +152,38 @@ namespace PlaywrightMultiTest
                         }
 
                         // start a static file server to serve the published output
-                        var _port = new Random().Next(5000, 9000);
+                        // Fixed port so IndexedDB persists across runs
+                        var _port = 5551;
                         var baseUrl = $"https://localhost:{_port}/";
                         testableProject.Server = new StaticFileServer(testableProject.ProjectDetails.WwwRoot, baseUrl);
                         // start https server to serve the Blazor WASM app
                         testableProject.Server.Start();
-                        // Make server URL available to console test processes (they inherit env vars)
-                        Environment.SetEnvironmentVariable("TEST_SERVER_URL", baseUrl);
 
                         // create a playwright browser, navigate to the app, and enumerate the tests
                         LogStatus("Creating Playwright instance...");
                         testableProject.Playwright = await Playwright.CreateAsync().ConfigureAwait(false);
                         // launch browser
-                        LogStatus("Launching Chromium...");
-                        testableProject.Browser = await testableProject.Playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
-                        {
-                            Headless = false,
-                            Args = new[]
+                        // Use persistent context so IndexedDB, localStorage, and
+                        // File System Access permissions survive across test runs.
+                        // This enables ShaderDebugService's debug folder persistence.
+                        var userDataDir = Path.Combine(Path.GetTempPath(), "SpawnDev.ILGPU.PlaywrightProfile");
+                        Directory.CreateDirectory(userDataDir);
+                        LogStatus($"Launching Chromium (persistent profile: {userDataDir})...");
+                        testableProject.BrowserContext = await testableProject.Playwright.Chromium.LaunchPersistentContextAsync(
+                            userDataDir,
+                            new BrowserTypeLaunchPersistentContextOptions
                             {
-                                "--enable-unsafe-webgpu",
-                                // Force D3D12 (Native Windows WebGPU backend)
-                                "--enable-features=Vulkan,WebGPUService,SkiaGraphite",
-                                // DO NOT use --disable-vulkan-surface on Windows; it kills hardware compositing
-                                "--ignore-gpu-blocklist",
-                                //"--use-angle=d3d12", // Much more stable on Windows than Vulkan
-                                "--no-sandbox"
-                            }
-                            //SlowMo = 500 // Slows down operations by 500ms so you can follow along
-                        }).ConfigureAwait(false);
-                        // new browser context
-                        testableProject.BrowserContext = await testableProject.Browser.NewContextAsync().ConfigureAwait(false);
+                                Headless = false,
+                                Args = new[]
+                                {
+                                    "--enable-unsafe-webgpu",
+                                    "--enable-features=Vulkan,WebGPUService,SkiaGraphite",
+                                    "--ignore-gpu-blocklist",
+                                    "--no-sandbox",
+                                    "--enable-features=FileSystemAccessPersistentPermission"
+                                }
+                            }).ConfigureAwait(false);
+                        testableProject.Browser = testableProject.BrowserContext.Browser;
                         // new page
                         testableProject.Page = await testableProject.BrowserContext.NewPageAsync().ConfigureAwait(false);
 
@@ -194,7 +196,7 @@ namespace PlaywrightMultiTest
                         {
                             var text = msg.Text;
                             // Only log messages related to WGSL dumps or errors
-                            if (text.Contains("WGSL") || text.Contains("@compute") || text.Contains("@workgroup_size") || msg.Type == "error")
+                            if (text.Contains("WGSL") || text.Contains("@compute") || text.Contains("@workgroup_size") || text.Contains("WGSL_DUMP") || text.Contains("GLSL_DUMP") || msg.Type == "error")
                             {
                                 try
                                 {

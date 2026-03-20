@@ -267,6 +267,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | **Comic Chat AI** | A comic strip chat room where every character is an AI running locally. Add characters, give them personalities, and watch them converse in comic panel format. Inspired by Microsoft Comic Chat (1996), reimagined with local AI. | Multiple AI characters chatting with each other, each with distinct personality, rendered as a comic strip — all on your GPU. Pure nostalgia meets cutting-edge tech. |
 | **Inside the Network** | Peek inside the neural network. See feature maps, attention patterns, and activation heatmaps as the model processes your image — layer by layer. Scrub through layers to see what the GPU "sees." | Educational and mesmerizing. Shows that neural networks aren't magic — they're math running on your GPU, and you can watch it happen. |
 | **Draw to Train** | Draw 10-20 custom gestures → train a classifier entirely in the browser. | Most browser ML can only do inference. Training proves this is a complete GPU compute platform. |
+| **Voice Collaboration** | Talk to your AI dev team. Speech-to-text (Whisper on GPU or Web Speech API) transcribes your voice, routes to AI agents with distinct personas, agents respond via text-to-speech. Full transcript with speaker labels. Hybrid: Claude API for reasoning now, local GGUF model on WebGPU later. | Multi-agent voice chat in a browser tab. Whisper STT running on your GPU, multiple AI agents with distinct voices, real-time conversation. The future of AI-assisted development — no install, no server (except LLM API). |
 
 ### Generative & 3D Demos
 
@@ -287,7 +288,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 All demos include backend selection, inference timing, "100% client-side" privacy badges, keyboard shortcuts (`?` for help, `Space` = run, `D` = download), and the voice command system ("Computer, classify this image").
 
-26 demo pages. Everything runs on YOUR GPU, in YOUR browser.
+27 demo pages. Everything runs on YOUR GPU, in YOUR browser.
 
 ### The Wow Factor
 
