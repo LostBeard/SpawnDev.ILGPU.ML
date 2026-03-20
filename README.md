@@ -388,7 +388,8 @@ SpawnDev.ILGPU.ML would not be possible without:
 
 Licensed under the same terms as ILGPU. See [LICENSE](LICENSE.txt) for details.
 
-### Why this exists
+## Why this exists
+
 This project was born out of 72 hours of "Architectural Vengeance" because the industry standard has a fundamental WebGPU device-sharing bug that has gone ignored for over 6 months:  
 
 **See: microsoft/onnxruntime#26107**
