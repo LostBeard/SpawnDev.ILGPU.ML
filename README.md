@@ -387,3 +387,8 @@ SpawnDev.ILGPU.ML would not be possible without:
 ## License
 
 Licensed under the same terms as ILGPU. See [LICENSE](LICENSE.txt) for details.
+
+## Funny Note
+This project was started because of a bug in the Onnx Web Runtime that has gone ignored for months:  
+[onnxruntime/issues/26107](https://github.com/microsoft/onnxruntime/issues/26107)
+
