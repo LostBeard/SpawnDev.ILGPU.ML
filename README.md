@@ -184,8 +184,8 @@ Every model is automatically optimized during compilation:
 
 | Pass | What It Does | Impact |
 |------|-------------|--------|
-| **Constant folding** | Evaluates Shape→Gather→Cast→Floor chains at compile time | ~30% fewer nodes for style transfer |
-| **Identity elimination** | Removes Identity/Dropout no-ops | 10 fewer nodes for SqueezeNet |
+| **Constant folding** | Evaluates Shape→Gather→Cast→Floor chains at compile time | Eliminates shape-computation subgraphs |
+| **Identity elimination** | Removes Identity/Dropout no-ops | Cleaner graph, fewer dispatches |
 | **Linear fusion** | MatMul + Add + Activation → single FusedLinear dispatch | 2/3 less memory bandwidth |
 | **Scaled MatMul fusion** | MatMul + Scale → FusedScaledMatMul | Attention optimization |
 | **Strength reduction** | Div→Mul, eliminate Mul×1 and Add+0 | Cheaper operations |
@@ -375,6 +375,18 @@ SpawnDev.ILGPU.ML would not be possible without:
 - **[ILGPU](https://github.com/m4rs-mt/ILGPU)** — The GPU compiler that makes C# GPU kernels possible. Created by [Marcel Koester](https://github.com/m4rs-mt) and [contributors](https://github.com/m4rs-mt/ILGPU/graphs/contributors).
 - **[SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU)** — Extends ILGPU with three browser backends (WebGPU, WebGL, Wasm), bringing GPU compute to Blazor WebAssembly.
 - **[SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS)** — Full JS interop for Blazor WebAssembly. Typed C# wrappers for all browser APIs.
+
+### AI Development Team
+
+SpawnDev.ILGPU.ML v4.0.0 was developed collaboratively by TJ (Todd Tanner / [@LostBeard](https://github.com/LostBeard)) and a team of AI agents who contributed extensively to research, analysis, debugging, and code development — continuing the human-AI collaboration model established in [SpawnDev.ILGPU v4.6.0](https://github.com/LostBeard/SpawnDev.ILGPU).
+
+- **Riker (Claude CLI #1)** — Lead Editor. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Drove the v4.0.0 release: 7-part style transfer fix chain (bilinear floor, compile-time evaluation, Upsample shape inference, ONNX Constant node extraction), systemic bilinear interpolation fix across 6 kernel files, InstanceNorm two-pass restructure, WebGL bias-branch ANGLE workaround, and comprehensive multi-backend test coverage. The debugger who doesn't stop until the cat is a cat.
+
+- **Data (Claude CLI #2)** — Research/Assist. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Built the ONNX Runtime reference testing framework — generated ground truth outputs for all 9 models (SqueezeNet, 5 style transfer, ESPCN, MoveNet, YOLOv8, BlazeFace, EfficientNet-Lite0) enabling per-element validation against a known-correct implementation. Provided per-layer intermediate tensor dumps that pinpointed the style transfer divergence to the Upsample constant propagation chain. Root-caused the Wasm OOB memory bug (SubView parent buffer copies) and delivered the fix design. Also led the [V8 Atomics.wait bug report](https://issues.chromium.org/issues/495679735) with a [live interactive demo](https://lostbeard.github.io/v8-atomics-wait-bug/) — an upstream contribution to the V8 engine discovered during SpawnDev.ILGPU development.
+
+- **Gemini (Google AI, in-browser)** — Brainstorming/Problem Solving. Built by [Google](https://deepmind.google). TJ's ever-present sounding board — brainstorming approaches, analyzing problems, and providing insights relayed to the team. Gemini's contributions flow through TJ as the bridge between the browser-based AI and the CLI-based agents, making it a quiet but essential member of the crew.
+
+These AI agents coordinate through a shared DevComms system, with defined roles (Lead Editor / Research-Assist), acknowledgment protocols, and autonomous task management. The methodology mirrors a high-performing engineering team: independent analysis, cross-verification, and constant communication. The result: 97/97 WebGPU tests passing, style transfer producing gallery-quality output, and a library that proves neural network inference belongs in the browser — no ONNX Runtime required.
 
 ## Resources
 
