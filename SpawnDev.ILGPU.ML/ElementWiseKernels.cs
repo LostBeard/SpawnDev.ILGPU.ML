@@ -233,9 +233,10 @@ public class ElementWiseKernels
         float fy = ((oy + 0.5f) * inH / outH) - 0.5f;
         float fx = ((ox + 0.5f) * inW / outW) - 0.5f;
 
-        int y0 = (int)fy; int y1 = y0 + 1;
-        int x0 = (int)fx; int x1 = x0 + 1;
-        float ty = fy - y0; float tx = fx - x0;
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
         if (y0 < 0) y0 = 0; if (y1 >= inH) y1 = inH - 1;
         if (x0 < 0) x0 = 0; if (x1 >= inW) x1 = inW - 1;
 
@@ -263,9 +264,10 @@ public class ElementWiseKernels
         float fy = (outH > 1) ? (float)oy * (inH - 1) / (outH - 1) : 0f;
         float fx = (outW > 1) ? (float)ox * (inW - 1) / (outW - 1) : 0f;
 
-        int y0 = (int)fy; int y1 = y0 + 1;
-        int x0 = (int)fx; int x1 = x0 + 1;
-        float ty = fy - y0; float tx = fx - x0;
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
         if (y1 >= inH) y1 = inH - 1;
         if (x1 >= inW) x1 = inW - 1;
 
@@ -292,6 +294,33 @@ public class ElementWiseKernels
     {
         EnsureLoaded();
         _reluKernel!(count, input, output);
+    }
+
+    /// <summary>Element-wise subtract: output = a - b</summary>
+    public void Sub(ArrayView1D<float, Stride1D.Dense> a,
+        ArrayView1D<float, Stride1D.Dense> b,
+        ArrayView1D<float, Stride1D.Dense> output, int count)
+    {
+        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(
+            (Index1D idx, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> y,
+             ArrayView1D<float, Stride1D.Dense> o) => { o[idx] = x[idx] - y[idx]; });
+        kernel(count, a, b, output);
+    }
+
+    /// <summary>LeakyReLU: output = x >= 0 ? x : alpha * x</summary>
+    public void LeakyReLU(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, int count, float alpha)
+    {
+        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(
+            (Index1D idx, ArrayView1D<float, Stride1D.Dense> inp, ArrayView1D<float, Stride1D.Dense> outp, float a) =>
+            {
+                float x = inp[idx];
+                outp[idx] = x >= 0f ? x : a * x;
+            });
+        kernel(count, input, output, alpha);
     }
 
     public void Add(ArrayView1D<float, Stride1D.Dense> a,

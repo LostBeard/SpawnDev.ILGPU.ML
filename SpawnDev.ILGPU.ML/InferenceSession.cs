@@ -396,7 +396,11 @@ public class InferenceSession : IDisposable
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
+                {
                     graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                    graph.FloatConstantData[name] = data.ToArray();
+                }
             }
         }
 
@@ -423,6 +427,31 @@ public class InferenceSession : IDisposable
                     weightData = new float[expectedElems];
                 }
                 gpuWeights[name] = pool.AllocatePermanent(weightData, shape, name);
+                loaded++;
+            }
+        }
+        // Create tensors for optimizer-folded constants that aren't in the weight dictionary.
+        // The optimizer adds these as initializers but they have no weight data — fill from ConstantData/FloatConstantData.
+        foreach (var name in compiled.InitializerNames)
+        {
+            if (gpuWeights.ContainsKey(name)) continue;
+            if (constantFloatValues.TryGetValue(name, out var fData))
+            {
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fData.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fData, shape, name);
+                loaded++;
+            }
+            else if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var fcdData))
+            {
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fcdData.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fcdData, shape, name);
+                loaded++;
+            }
+            else if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var iData))
+            {
+                var fVals = iData.Select(v => (float)v).ToArray();
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fVals.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fVals, shape, name);
                 loaded++;
             }
         }
@@ -465,6 +494,25 @@ public class InferenceSession : IDisposable
         {
             if (info.ValueShapes.TryGetValue(initName, out var shape))
                 graph.Initializers[initName] = shape;
+        }
+
+        // Register Constant node outputs as initializers so their weight data gets uploaded to GPU.
+        // OnnxLoader.ExtractWeights() already extracted the tensor data into cpuWeightsAll,
+        // but without registering them here, the weight upload loop skips them.
+        foreach (var node in info.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Length > 0)
+            {
+                var outputName = node.Outputs[0];
+                if (!graph.Initializers.ContainsKey(outputName))
+                {
+                    // Get shape from ValueShapes if available, otherwise from the weight data size
+                    if (info.ValueShapes.TryGetValue(outputName, out var constShape))
+                        graph.Initializers[outputName] = constShape;
+                    else
+                        graph.Initializers[outputName] = new[] { 1 }; // Fallback — will be overridden by actual data
+                }
+            }
         }
 
         // Convert nodes
@@ -535,7 +583,11 @@ public class InferenceSession : IDisposable
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
+                {
                     graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                    graph.FloatConstantData[name] = data.ToArray();
+                }
             }
         }
 
@@ -615,7 +667,11 @@ public class InferenceSession : IDisposable
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
+                {
                     graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                    graph.FloatConstantData[name] = data.ToArray();
+                }
             }
         }
 

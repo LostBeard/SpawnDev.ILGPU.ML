@@ -213,8 +213,8 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task CreateFromFile_DepthAnything_Inference() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
-            throw new UnsupportedTestException("Depth Anything too large for CPU backend — skipped");
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
+            throw new UnsupportedTestException("Depth Anything inference requires too much GPU memory for browser/CPU — skipped");
 
         var http = GetHttpClient();
         if (http == null)
@@ -267,8 +267,8 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task CreateFromFile_DepthAnything_CatImage() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
-            throw new UnsupportedTestException("Depth Anything too large for CPU backend — skipped");
+        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
+            throw new UnsupportedTestException("Depth Anything inference requires too much GPU memory for browser/CPU — skipped");
 
         var http = GetHttpClient();
         if (http == null)
@@ -325,4 +325,62 @@ public abstract partial class MLTestBase
         Buffer.BlockCopy(binData, 8, pixels, 0, width * height * 4);
         return (pixels, width, height);
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // README model claims — compile/load verification
+    // ──────────────────────────────────────────────────────────────
+
+    /// <summary>MoveNet Lightning (ONNX) — README claims "Compiles (21 op types)".</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task CreateFromFile_MoveNet_Compiles() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var session = await InferenceSession.CreateFromFileAsync(
+            accelerator, http, "models/movenet-lightning/model.onnx");
+        Console.WriteLine($"[MoveNet] {session}");
+
+        if (session.NodeCount < 10)
+            throw new Exception($"Expected many nodes, got {session.NodeCount}");
+
+        Console.WriteLine($"[MoveNet] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
+        session.Dispose();
+    });
+
+    /// <summary>EfficientNet-Lite0 (TFLite) — README claims it loads.</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task CreateFromFile_EfficientNetLite0_TFLite() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var session = await InferenceSession.CreateFromFileAsync(
+            accelerator, http, "models/efficientnet-lite0/model.tflite");
+        Console.WriteLine($"[EfficientNet] {session}");
+
+        if (session.NodeCount < 10)
+            throw new Exception($"Expected many nodes, got {session.NodeCount}");
+
+        Console.WriteLine($"[EfficientNet] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
+        session.Dispose();
+    });
+
+    /// <summary>YOLOv8 Nano (ONNX) — README claims it loads.</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task CreateFromFile_YOLOv8Nano_ONNX() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var session = await InferenceSession.CreateFromFileAsync(
+            accelerator, http, "models/yolov8n/model.onnx");
+        Console.WriteLine($"[YOLOv8n] {session}");
+
+        if (session.NodeCount < 10)
+            throw new Exception($"Expected many nodes, got {session.NodeCount}");
+
+        Console.WriteLine($"[YOLOv8n] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
+        session.Dispose();
+    });
 }

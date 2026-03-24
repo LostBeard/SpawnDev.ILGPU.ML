@@ -51,9 +51,12 @@ public class ImagePreprocessKernel
         float fy = ((dy + 0.5f) * srcH / dstH) - 0.5f;
         float fx = ((dx + 0.5f) * srcW / dstW) - 0.5f;
 
-        int y0 = (int)fy; int y1 = y0 + 1;
-        int x0 = (int)fx; int x1 = x0 + 1;
-        float ty = fy - y0; float tx = fx - x0;
+        // Two-statement floor: prevents ILGPU optimizer from eliding floor() before int cast.
+        // (int)x truncates toward zero — wrong for negative values (e.g., -0.357 → 0, should be -1).
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
 
         // Clamp to source bounds
         if (y0 < 0) y0 = 0; if (y1 >= srcH) y1 = srcH - 1;
@@ -179,9 +182,10 @@ public class ImagePreprocessKernel
         float fy = ((dy + 0.5f) * srcH / dstH) - 0.5f;
         float fx = ((dx + 0.5f) * srcW / dstW) - 0.5f;
 
-        int y0 = (int)fy; int y1 = y0 + 1;
-        int x0 = (int)fx; int x1 = x0 + 1;
-        float ty = fy - y0; float tx = fx - x0;
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
 
         if (y0 < 0) y0 = 0; if (y1 >= srcH) y1 = srcH - 1;
         if (x0 < 0) x0 = 0; if (x1 >= srcW) x1 = srcW - 1;

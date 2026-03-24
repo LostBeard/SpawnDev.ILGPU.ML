@@ -38,6 +38,15 @@ public class ModelGraph
     [JsonIgnore]
     public Dictionary<string, int[]>? ConstantData { get; set; }
 
+    /// <summary>
+    /// Float-precision constant data for compile-time arithmetic.
+    /// Unlike ConstantData (int), this preserves fractional values like 0.5
+    /// needed for Upsample scale factor computation (Mul, Div chains).
+    /// Not serialized — populated at runtime.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<string, float[]>? FloatConstantData { get; set; }
+
     public static ModelGraph FromJson(string json)
         => JsonSerializer.Deserialize<ModelGraph>(json) ?? throw new InvalidOperationException("Failed to parse model graph JSON");
 

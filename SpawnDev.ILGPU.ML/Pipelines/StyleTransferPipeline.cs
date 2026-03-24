@@ -28,6 +28,7 @@ public class StyleTransferPipeline : IDisposable
     private readonly int _modelW;
     private Kernels.ImagePreprocessKernel? _preprocess;
     private Kernels.ImagePostprocessKernel? _postprocess;
+    private Kernels.ImageTransformKernel? _resize;
 
     public StyleTransferPipeline(InferenceSession session, Accelerator accelerator)
     {
@@ -72,12 +73,22 @@ public class StyleTransferPipeline : IDisposable
         _postprocess ??= new Kernels.ImagePostprocessKernel(_accelerator);
         using var rgbaOutBuf = _accelerator.Allocate1D<int>(outH * outW);
         _postprocess.NCHWToRGBA(output.Data, rgbaOutBuf.View, outH, outW);
+
+        // Resize styled output back to original dimensions if different
+        int finalW = width, finalH = height;
+        if (outW != width || outH != height)
+        {
+            _resize ??= new Kernels.ImageTransformKernel(_accelerator);
+            using var resizedBuf = _accelerator.Allocate1D<int>(finalW * finalH);
+            _resize.Resize(rgbaOutBuf.View, resizedBuf.View, outW, outH, finalW, finalH);
+            await _accelerator.SynchronizeAsync();
+            var result = await resizedBuf.CopyToHostAsync<int>(0, finalW * finalH);
+            return new StyleResult(result, finalW, finalH);
+        }
+
         await _accelerator.SynchronizeAsync();
-
-        // Single GPU→CPU copy of the final packed RGBA pixels
-        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, outH * outW);
-
-        return new StyleResult(result, outW, outH);
+        var resultDirect = await rgbaOutBuf.CopyToHostAsync<int>(0, outH * outW);
+        return new StyleResult(resultDirect, outW, outH);
     }
 
     public void Dispose() { }

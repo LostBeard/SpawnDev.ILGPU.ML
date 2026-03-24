@@ -354,7 +354,22 @@ public static class GraphOptimizer
                         continue;
                     }
 
-                    // Generic folding: mark as constant but register with correct shape
+                    // Generic folding: only fold small shape-computation nodes.
+                    // Don't fold nodes that consume large constant tensors (anchor grids,
+                    // stride multipliers) — we can't evaluate them at compile time, and
+                    // registering outputs as shape [1] with no data produces zeros at runtime.
+                    bool hasLargeInput = false;
+                    foreach (var inp in node.Inputs)
+                    {
+                        if (string.IsNullOrEmpty(inp)) continue;
+                        if (graph.Initializers.TryGetValue(inp, out var inpShape))
+                        {
+                            int inpSize = inpShape.Aggregate(1, (a, b) => a * b);
+                            if (inpSize > 64) { hasLargeInput = true; break; }
+                        }
+                    }
+                    if (hasLargeInput) continue; // Don't fold — large tensor inputs can't be evaluated
+
                     foreach (var output in node.Outputs)
                     {
                         constants.Add(output);
@@ -482,25 +497,11 @@ public static class GraphOptimizer
         {
             var node = graph.Nodes[i];
 
-            // Div by constant → Mul by reciprocal
-            if (node.OpType == "Div" && node.Inputs.Count == 2)
-            {
-                string divisor = node.Inputs[1];
-                if (graph.Initializers.ContainsKey(divisor))
-                {
-                    var shape = graph.Initializers[divisor];
-                    int elems = shape.Aggregate(1, (a, b) => a * b);
-                    if (elems == 1) // scalar constant
-                    {
-                        node.OpType = "Mul";
-                        // The actual reciprocal computation happens at runtime
-                        // since we can't modify the weight data here.
-                        // But Mul is still faster than Div on most GPUs.
-                        // TODO: when we have CPU constant evaluation, compute 1/x here
-                        reduced++;
-                    }
-                }
-            }
+            // NOTE: Div→Mul strength reduction disabled.
+            // The optimizer creates a copy of the graph, so new initializers added here
+            // don't reach the InferenceSession's weight upload path. Div executes correctly
+            // at runtime on all GPU backends. When CPU constant evaluation is implemented
+            // in the optimizer, this can be re-enabled properly.
 
             // Mul by 1.0 or Add by 0.0 → convert to Identity (eliminated by pass 2)
             if ((node.OpType == "Mul" || node.OpType == "Add") && node.Inputs.Count == 2)
@@ -552,6 +553,9 @@ public static class GraphOptimizer
             Initializers = new Dictionary<string, int[]>(src.Initializers),
             ConstantData = src.ConstantData != null
                 ? new Dictionary<string, int[]>(src.ConstantData)
+                : null,
+            FloatConstantData = src.FloatConstantData != null
+                ? new Dictionary<string, float[]>(src.FloatConstantData)
                 : null,
         };
     }

@@ -1,0 +1,4 @@
+model: movenet-lightning
+input: input [1, 192, 192, 3] int32 [0,255] NHWC
+output: output_0 [1, 1, 17, 3] float32 [y,x,conf] per keypoint
+onnxruntime: 1.24.3

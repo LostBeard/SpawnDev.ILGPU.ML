@@ -80,25 +80,40 @@ public static class PyTorchLoader
         if (checkpoint.PickleData == null) return;
         var data = checkpoint.PickleData;
 
-        // Scan for short strings (pickle BINUNICODE opcode = 0x8C, followed by length byte, then UTF8)
+        // Scan for strings in the pickle stream.
+        // SHORT_BINUNICODE (0x8C) = 1-byte length + UTF8 (pickle protocol 4+)
+        // BINUNICODE (0x58) = 4-byte length + UTF8 (pickle protocol 2+)
+        // Look for tensor-like names: contain dots, or end with weight/bias/etc.
         for (int i = 0; i < data.Length - 3; i++)
         {
+            int len = 0;
+            int strStart = 0;
+
             if (data[i] == 0x8C) // SHORT_BINUNICODE
             {
-                int len = data[i + 1];
-                if (len > 2 && len < 200 && i + 2 + len <= data.Length)
-                {
-                    var str = System.Text.Encoding.UTF8.GetString(data, i + 2, len);
-                    // Tensor names typically contain dots and end with .weight or .bias
-                    if (str.Contains('.') && (str.EndsWith(".weight") || str.EndsWith(".bias")
+                len = data[i + 1];
+                strStart = i + 2;
+            }
+            else if (data[i] == 0x58 && i + 5 < data.Length) // BINUNICODE
+            {
+                len = BitConverter.ToInt32(data, i + 1);
+                strStart = i + 5;
+            }
+
+            if (len > 1 && len < 200 && strStart + len <= data.Length)
+            {
+                var str = System.Text.Encoding.UTF8.GetString(data, strStart, len);
+                // Accept tensor names: contain dots (module.weight), or common suffixes
+                bool isTensorName =
+                    (str.Contains('.') && (str.EndsWith(".weight") || str.EndsWith(".bias")
                         || str.EndsWith(".running_mean") || str.EndsWith(".running_var")
                         || str.EndsWith(".num_batches_tracked") || str.EndsWith(".scale")
                         || str.Contains("embed") || str.Contains("norm")))
-                    {
-                        if (!checkpoint.TensorNames.Contains(str))
-                            checkpoint.TensorNames.Add(str);
-                    }
-                }
+                    // Also accept simple names like "weight", "bias" (flat state dicts)
+                    || str is "weight" or "bias" or "running_mean" or "running_var";
+
+                if (isTensorName && !checkpoint.TensorNames.Contains(str))
+                    checkpoint.TensorNames.Add(str);
             }
         }
     }

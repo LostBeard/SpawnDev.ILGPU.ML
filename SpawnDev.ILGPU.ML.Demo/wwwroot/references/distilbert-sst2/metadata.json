@@ -1,0 +1,93 @@
+{
+  "model": "distilbert-base-uncased-finetuned-sst-2-english",
+  "params": 66955010,
+  "labels": {
+    "0": "NEGATIVE",
+    "1": "POSITIVE"
+  },
+  "vocab_size": 30522,
+  "test_cases": [
+    {
+      "text": "I love this movie, it is absolutely fantastic!",
+      "expected": "POSITIVE",
+      "predicted": "POSITIVE",
+      "confidence": 0.9998784065246582,
+      "logits": [
+        -4.330832004547119,
+        4.684447765350342
+      ],
+      "probs": [
+        0.00012152368435636163,
+        0.9998784065246582
+      ],
+      "token_ids": [
+        101,
+        1045,
+        2293,
+        2023,
+        3185,
+        1010,
+        2009,
+        2003,
+        7078,
+        10392,
+        999,
+        102
+      ],
+      "file_prefix": "i_love_this_movie_i"
+    },
+    {
+      "text": "This is terrible, worst experience ever.",
+      "expected": "NEGATIVE",
+      "predicted": "NEGATIVE",
+      "confidence": 0.999792754650116,
+      "logits": [
+        4.698798656463623,
+        -3.7824041843414307
+      ],
+      "probs": [
+        0.999792754650116,
+        0.00020728613890241832
+      ],
+      "token_ids": [
+        101,
+        2023,
+        2003,
+        6659,
+        1010,
+        5409,
+        3325,
+        2412,
+        1012,
+        102
+      ],
+      "file_prefix": "this_is_terrible_wo"
+    },
+    {
+      "text": "The cat sat on the mat.",
+      "expected": "NEUTRAL",
+      "predicted": "NEGATIVE",
+      "confidence": 0.9765388369560242,
+      "logits": [
+        2.0654942989349365,
+        -1.663170337677002
+      ],
+      "probs": [
+        0.9765388369560242,
+        0.023461245000362396
+      ],
+      "token_ids": [
+        101,
+        1996,
+        4937,
+        2938,
+        2006,
+        1996,
+        13523,
+        1012,
+        102
+      ],
+      "file_prefix": "the_cat_sat_on_the_m"
+    }
+  ]
+}

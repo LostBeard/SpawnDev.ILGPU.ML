@@ -40,9 +40,12 @@ public class ImageOpsKernel
                 float srcX = (dx + 0.5f) * srcW / dstW - 0.5f;
                 float srcY = (dy + 0.5f) * srcH / dstH - 0.5f;
 
-                int x0 = (int)srcX; int x1 = x0 + 1;
-                int y0 = (int)srcY; int y1 = y0 + 1;
-                float fx = srcX - x0; float fy = srcY - y0;
+                // Two-statement floor: prevents ILGPU optimizer from eliding floor() before int cast.
+                // (int)x truncates toward zero — wrong for negative values (e.g., -0.25 → 0, should be -1).
+                float floorX = MathF.Floor(srcX); float floorY = MathF.Floor(srcY);
+                int x0 = (int)floorX; int x1 = x0 + 1;
+                int y0 = (int)floorY; int y1 = y0 + 1;
+                float fx = srcX - floorX; float fy = srcY - floorY;
 
                 x0 = x0 < 0 ? 0 : (x0 >= srcW ? srcW - 1 : x0);
                 x1 = x1 < 0 ? 0 : (x1 >= srcW ? srcW - 1 : x1);

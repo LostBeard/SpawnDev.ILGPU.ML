@@ -26,6 +26,21 @@ public class GraphCompiler
         if (EnableOptimization)
             graph = GraphOptimizer.Optimize(graph);
 
+        // Initialize float constant data for precise compile-time arithmetic.
+        // ConstantData uses int (fine for shapes/indices) but Upsample scale chains
+        // need float precision (e.g., Mul(dim, 0.5) must give 0.5, not 0).
+        graph.FloatConstantData ??= new Dictionary<string, float[]>();
+        // Seed from existing FloatConstantData (populated by InferenceSession)
+        // and from ConstantData (int→float promotion)
+        if (graph.ConstantData != null)
+        {
+            foreach (var (name, intVals) in graph.ConstantData)
+            {
+                if (!graph.FloatConstantData.ContainsKey(name))
+                    graph.FloatConstantData[name] = intVals.Select(v => (float)v).ToArray();
+            }
+        }
+
         // Validate all ops are supported
         foreach (var node in graph.Nodes)
         {
@@ -92,7 +107,10 @@ public class GraphCompiler
                 // Store computed values so downstream Reshape/Gather can use them
                 graph.ConstantData ??= new Dictionary<string, int[]>();
                 if (node.Outputs.Count > 0)
+                {
                     graph.ConstantData[node.Outputs[0]] = shapeValues;
+                    graph.FloatConstantData![node.Outputs[0]] = shapeValues.Select(v => (float)v).ToArray();
+                }
             }
 
             // Compile-time evaluation of Gather on known constant data
@@ -108,7 +126,14 @@ public class GraphCompiler
                 {
                     outputShapes = new[] { new[] { 1 } }; // scalar as 1D
                     if (node.Outputs.Count > 0)
+                    {
                         graph.ConstantData[node.Outputs[0]] = new[] { gatherSrc[gIdx] };
+                        // Float: use float source if available (preserves fractional values)
+                        if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fSrc))
+                            graph.FloatConstantData[node.Outputs[0]] = new[] { fSrc[gIdx] };
+                        else
+                            graph.FloatConstantData[node.Outputs[0]] = new[] { (float)gatherSrc[gIdx] };
+                    }
                 }
             }
 
@@ -120,7 +145,12 @@ public class GraphCompiler
                 var concatVals = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
                 outputShapes = new[] { new[] { concatVals.Length } };
                 if (node.Outputs.Count > 0)
+                {
                     graph.ConstantData[node.Outputs[0]] = concatVals;
+                    // Float: concat float arrays if all available
+                    if (graph.FloatConstantData != null && node.Inputs.All(inp => graph.FloatConstantData.ContainsKey(inp)))
+                        graph.FloatConstantData[node.Outputs[0]] = node.Inputs.SelectMany(inp => graph.FloatConstantData[inp]).ToArray();
+                }
             }
 
             // Unsqueeze on known constants
@@ -129,37 +159,135 @@ public class GraphCompiler
                 && graph.ConstantData.TryGetValue(node.Inputs[0], out var unsqData))
             {
                 if (node.Outputs.Count > 0)
-                    graph.ConstantData[node.Outputs[0]] = unsqData;
-            }
-
-            // Compile-time Slice on known constants: Slice(data, starts, ends[, axes, steps])
-            if (node.OpType == "Slice" && node.Inputs.Count >= 3
-                && graph.ConstantData != null
-                && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceData)
-                && graph.ConstantData.TryGetValue(node.Inputs[1], out var sliceStarts)
-                && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds))
-            {
-                int start = sliceStarts[0];
-                int end = sliceEnds[0];
-                if (start < 0) start += sliceData.Length;
-                if (end < 0) end += sliceData.Length;
-                end = Math.Min(end, sliceData.Length);
-                if (start >= 0 && end > start)
                 {
-                    var sliced = sliceData.Skip(start).Take(end - start).ToArray();
-                    outputShapes = new[] { new[] { sliced.Length } };
-                    if (node.Outputs.Count > 0)
-                        graph.ConstantData[node.Outputs[0]] = sliced;
+                    graph.ConstantData[node.Outputs[0]] = unsqData;
+                    if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fUnsq))
+                        graph.FloatConstantData[node.Outputs[0]] = fUnsq;
                 }
             }
 
-            // Compile-time scalar/element-wise arithmetic on known constants
+            // Compile-time Slice on known constants: Slice(data, starts, ends[, axes, steps])
+            // Handles both opset >= 11 (starts/ends as tensor inputs) and opset < 11 (as attributes)
+            if (node.OpType == "Slice" && graph.ConstantData != null)
+            {
+                // Try opset >= 11: starts/ends from inputs[1], inputs[2]
+                if (node.Inputs.Count >= 3
+                    && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceData)
+                    && graph.ConstantData.TryGetValue(node.Inputs[1], out var sliceStarts)
+                    && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds))
+                {
+                    int start = sliceStarts[0];
+                    int end = sliceEnds[0];
+                    if (start < 0) start += sliceData.Length;
+                    if (end < 0) end += sliceData.Length;
+                    end = Math.Min(end, sliceData.Length);
+                    if (start >= 0 && end > start)
+                    {
+                        var sliced = sliceData.Skip(start).Take(end - start).ToArray();
+                        outputShapes = new[] { new[] { sliced.Length } };
+                        if (node.Outputs.Count > 0)
+                        {
+                            graph.ConstantData[node.Outputs[0]] = sliced;
+                            if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fSlice))
+                                graph.FloatConstantData[node.Outputs[0]] = fSlice.Skip(start).Take(end - start).ToArray();
+                        }
+                    }
+                }
+                // Shape-only inference (opset >= 11): data is NOT constant but starts/ends ARE
+                else if (node.Inputs.Count >= 3
+                    && !graph.ConstantData.ContainsKey(node.Inputs[0]) // data is runtime
+                    && graph.ConstantData.TryGetValue(node.Inputs[1], out var shapeStarts)
+                    && graph.ConstantData.TryGetValue(node.Inputs[2], out var shapeEnds))
+                {
+                    var shapeAxes = node.Inputs.Count > 3 && graph.ConstantData.TryGetValue(node.Inputs[3], out var sa)
+                        ? sa : Enumerable.Range(0, shapeStarts.Length).ToArray();
+                    var shapeSteps = node.Inputs.Count > 4 && graph.ConstantData.TryGetValue(node.Inputs[4], out var ss)
+                        ? ss : Enumerable.Repeat(1, shapeStarts.Length).ToArray();
+                    var outShape = (int[])inputShapes[0].Clone();
+                    for (int si = 0; si < shapeAxes.Length; si++)
+                    {
+                        int ax = shapeAxes[si] < 0 ? shapeAxes[si] + outShape.Length : shapeAxes[si];
+                        int s = shapeStarts[si]; int e = shapeEnds[si]; int step = Math.Abs(shapeSteps[si]);
+                        if (step == 0) step = 1;
+                        if (s < 0) s += outShape[ax];
+                        if (e < 0) e += outShape[ax];
+                        s = Math.Clamp(s, 0, outShape[ax]);
+                        e = Math.Clamp(e, 0, outShape[ax]);
+                        outShape[ax] = Math.Max(0, (e - s + step - 1) / step);
+                    }
+                    outputShapes = new[] { outShape };
+
+                    // Store resolved slice params in the typed attrs dict so the executor
+                    // can read them at runtime via GetInts("_resolved_starts") etc.
+                    attrs["_resolved_starts"] = shapeStarts.Select(v => (long)v).ToArray();
+                    attrs["_resolved_ends"] = shapeEnds.Select(v => (long)v).ToArray();
+                    attrs["_resolved_axes"] = shapeAxes.Select(v => (long)v).ToArray();
+                    attrs["_resolved_steps"] = shapeSteps.Select(v => (long)v).ToArray();
+                }
+                // Try opset < 11: starts/ends from attributes
+                else if (node.Inputs.Count >= 1
+                    && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceDataAttr)
+                    && attrs.TryGetValue("starts", out var startsObj) && startsObj is long[] startsArr
+                    && attrs.TryGetValue("ends", out var endsObj) && endsObj is long[] endsArr)
+                {
+                    int start = (int)startsArr[0];
+                    int end = (int)endsArr[0];
+                    if (start < 0) start += sliceDataAttr.Length;
+                    if (end < 0) end += sliceDataAttr.Length;
+                    end = Math.Min(end, sliceDataAttr.Length);
+                    if (start >= 0 && end > start)
+                    {
+                        var sliced = sliceDataAttr.Skip(start).Take(end - start).ToArray();
+                        outputShapes = new[] { new[] { sliced.Length } };
+                        if (node.Outputs.Count > 0)
+                        {
+                            graph.ConstantData[node.Outputs[0]] = sliced;
+                            if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fSlice))
+                                graph.FloatConstantData[node.Outputs[0]] = fSlice.Skip(start).Take(end - start).ToArray();
+                        }
+                    }
+                }
+            }
+
+            // Compile-time scalar/element-wise arithmetic on known constants.
+            // Uses FloatConstantData for precise arithmetic (0.5 * dim must not truncate to 0).
+            // Falls back to int ConstantData if float not available.
             if (node.OpType is "Mul" or "Add" or "Sub" or "Div"
+                && node.Inputs.Count >= 2 && graph.FloatConstantData != null
+                && graph.FloatConstantData.TryGetValue(node.Inputs[0], out var fArithA)
+                && graph.FloatConstantData.TryGetValue(node.Inputs[1], out var fArithB))
+            {
+                int len = Math.Max(fArithA.Length, fArithB.Length);
+                var fResult = new float[len];
+                var iResult = new int[len];
+                for (int j = 0; j < len; j++)
+                {
+                    float a = fArithA[j % fArithA.Length];
+                    float b = fArithB[j % fArithB.Length];
+                    fResult[j] = node.OpType switch
+                    {
+                        "Mul" => a * b,
+                        "Add" => a + b,
+                        "Sub" => a - b,
+                        "Div" => b != 0 ? a / b : 0,
+                        _ => a
+                    };
+                    iResult[j] = (int)fResult[j];
+                }
+                outputShapes = new[] { fArithA.Length >= fArithB.Length ? inputShapes[0] : inputShapes[1] };
+                if (node.Outputs.Count > 0)
+                {
+                    graph.ConstantData![node.Outputs[0]] = iResult;
+                    graph.FloatConstantData[node.Outputs[0]] = fResult;
+                }
+            }
+            else if (node.OpType is "Mul" or "Add" or "Sub" or "Div"
                 && node.Inputs.Count >= 2
                 && graph.ConstantData != null
                 && graph.ConstantData.TryGetValue(node.Inputs[0], out var arithA)
                 && graph.ConstantData.TryGetValue(node.Inputs[1], out var arithB))
             {
+                // Int-only fallback (no float data available)
                 int len = Math.Max(arithA.Length, arithB.Length);
                 var result = new int[len];
                 for (int j = 0; j < len; j++)
@@ -180,13 +308,38 @@ public class GraphCompiler
                     graph.ConstantData[node.Outputs[0]] = result;
             }
 
-            // Compile-time Cast on known constants (int values stay the same)
+            // Compile-time Cast on known constants
             if (node.OpType == "Cast" && node.Inputs.Count >= 1
                 && graph.ConstantData != null
                 && graph.ConstantData.TryGetValue(node.Inputs[0], out var castData))
             {
                 if (node.Outputs.Count > 0)
+                {
                     graph.ConstantData[node.Outputs[0]] = castData;
+                    // Float: Cast may truncate (e.g., float→int64), apply Floor for int casts
+                    if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fCast))
+                        graph.FloatConstantData[node.Outputs[0]] = fCast; // preserve float through cast
+                }
+            }
+
+            // Compile-time Floor/Ceil on known constants
+            if (node.OpType is "Floor" or "Ceil" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var floorData))
+            {
+                if (node.Outputs.Count > 0)
+                {
+                    graph.ConstantData[node.Outputs[0]] = floorData;
+                    // Float: apply actual floor/ceil
+                    if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fFloor))
+                    {
+                        var fResult = node.OpType == "Floor"
+                            ? fFloor.Select(v => MathF.Floor(v)).ToArray()
+                            : fFloor.Select(v => MathF.Ceiling(v)).ToArray();
+                        graph.FloatConstantData[node.Outputs[0]] = fResult;
+                        graph.ConstantData[node.Outputs[0]] = fResult.Select(v => (int)v).ToArray();
+                    }
+                }
             }
 
             // Compile-time Squeeze on known constants
@@ -235,6 +388,85 @@ public class GraphCompiler
                         outputShapes = new[] { outShape };
                     }
                 }
+            }
+
+            // Special-case: Upsample/Resize need scales or sizes to compute output shape.
+            // Scales tensor is the second input for Upsample, or third/fourth for Resize.
+            if (node.OpType is "Upsample" or "Resize" && graph.ConstantData != null)
+            {
+                // Try scales from input[1] (Upsample) or input[2] (Resize)
+                int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
+                // Resize also has optional sizes at input[3]
+                int sizesIdx = 3;
+
+                bool resolved = false;
+
+                // Try sizes first (Resize input[3]) — absolute output dimensions
+                if (!resolved && node.OpType == "Resize" && node.Inputs.Count > sizesIdx
+                    && !string.IsNullOrEmpty(node.Inputs[sizesIdx])
+                    && graph.ConstantData.TryGetValue(node.Inputs[sizesIdx], out var sizesData)
+                    && sizesData.Length == inputShapes[0].Length)
+                {
+                    var outShape = sizesData.ToArray();
+                    // Replace 0s with input dims
+                    for (int j = 0; j < outShape.Length; j++)
+                        if (outShape[j] <= 0) outShape[j] = inputShapes[0][j];
+                    outputShapes = new[] { outShape };
+                    resolved = true;
+                }
+
+                // Try scales — multiply input dimensions by scale factors.
+                // MUST use FloatConstantData: scale factors like [1.0, 1.0, 2.0, 2.0] truncate
+                // to [1, 1, 2, 2] in int ConstantData (OK), but the computation chain that
+                // PRODUCES them goes through Mul(dim, 0.5) where 0.5→0 in int kills the chain.
+                if (!resolved && node.Inputs.Count > scalesIdx
+                    && !string.IsNullOrEmpty(node.Inputs[scalesIdx])
+                    && graph.FloatConstantData != null
+                    && graph.FloatConstantData.TryGetValue(node.Inputs[scalesIdx], out var fScalesData)
+                    && fScalesData.Length == inputShapes[0].Length)
+                {
+                    var outShape = new int[inputShapes[0].Length];
+                    for (int j = 0; j < outShape.Length; j++)
+                        outShape[j] = (int)MathF.Floor(inputShapes[0][j] * fScalesData[j]);
+                    outputShapes = new[] { outShape };
+                    resolved = true;
+                }
+
+                // Fallback: try int scales
+                if (!resolved && node.Inputs.Count > scalesIdx
+                    && !string.IsNullOrEmpty(node.Inputs[scalesIdx])
+                    && graph.ConstantData!.TryGetValue(node.Inputs[scalesIdx], out var scalesData)
+                    && scalesData.Length == inputShapes[0].Length)
+                {
+                    var outShape = new int[inputShapes[0].Length];
+                    for (int j = 0; j < outShape.Length; j++)
+                        outShape[j] = inputShapes[0][j] * scalesData[j];
+                    outputShapes = new[] { outShape };
+                    resolved = true;
+                }
+
+                // Log resolution result (verbose only)
+                if (InferenceSession.VerboseLogging)
+                {
+                    var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
+                    var resolvedShape = resolved ? $"[{string.Join(",", outputShapes[0])}]" : "FALLBACK";
+                    Console.WriteLine($"[GraphCompiler] {node.OpType} '{outName}': resolved={resolved} shape={resolvedShape} input=[{string.Join(",", inputShapes[0])}]");
+                }
+                if (!resolved)
+                {
+                    var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
+                    Console.WriteLine($"[SHAPE_WARN] {node.OpType} '{outName}': scales/sizes not in ConstantData — using input shape as fallback");
+                }
+            }
+
+            // If the operator returned fewer shapes than outputs (e.g., Split returning
+            // equal splits without knowing exact output count), extend to match.
+            if (outputShapes.Length < node.Outputs.Count && outputShapes.Length > 0)
+            {
+                var extended = new int[node.Outputs.Count][];
+                for (int i = 0; i < node.Outputs.Count; i++)
+                    extended[i] = i < outputShapes.Length ? outputShapes[i] : (int[])outputShapes[^1].Clone();
+                outputShapes = extended;
             }
 
             // Register output shapes (override with graph output shapes if known)

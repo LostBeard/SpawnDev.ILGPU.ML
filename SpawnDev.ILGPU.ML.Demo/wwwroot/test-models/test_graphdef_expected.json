@@ -1,0 +1,29 @@
+{
+  "format": "tf_graphdef",
+  "node_count": 2,
+  "nodes": [
+    "weight (Const)",
+    "output (Identity)"
+  ],
+  "tensors": {
+    "weight": {
+      "shape": [
+        2,
+        3
+      ],
+      "dtype": "float32",
+      "values": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          4,
+          5,
+          6
+        ]
+      ]
+    }
+  }
+}

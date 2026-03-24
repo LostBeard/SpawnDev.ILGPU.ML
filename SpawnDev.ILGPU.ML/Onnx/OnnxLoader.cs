@@ -144,6 +144,25 @@ public static class OnnxLoader
             shapes[init.Name] = init.Dims.Select(d => (int)d).ToArray();
         }
 
+        // Register Constant node outputs as initializers (with shapes from their tensor data).
+        // This ensures constant extraction picks them up for ConstantData propagation.
+        foreach (var node in graph.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Count > 0)
+            {
+                var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr?.T != null)
+                {
+                    var outputName = node.Outputs[0];
+                    var tensorShape = valueAttr.T.Dims.Select(d => (int)d).ToArray();
+                    if (!shapes.ContainsKey(outputName))
+                        shapes[outputName] = tensorShape;
+                    if (!initNames.Contains(outputName))
+                        initNames.Add(outputName);
+                }
+            }
+        }
+
         var opset = model.OpsetImports.FirstOrDefault(o => o.Domain == "")?.Version ?? 0;
 
         return new OnnxModelInfo
@@ -154,7 +173,7 @@ public static class OnnxLoader
             OutputNames = outputNames,
             ValueShapes = shapes,
             OpsetVersion = (int)opset,
-            InitializerNames = graph.Initializers.Select(i => i.Name).ToArray(),
+            InitializerNames = initNames.ToArray(),
         };
     }
 
@@ -166,6 +185,26 @@ public static class OnnxLoader
             if (init.DataLocation == 1) continue; // External data — skip for now
             weights[init.Name] = init.ToFloatArray();
         }
+
+        // Extract Constant node tensor data into weights.
+        // ONNX Constant nodes store data as a 'value' attribute (TensorProto).
+        // Without this, Constant node outputs are missing from the weight dictionary
+        // and ConstantData, breaking compile-time constant propagation chains
+        // (e.g., Upsample scale factor computation: Shape→Gather→Mul→Floor→Concat).
+        foreach (var node in graph.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Count > 0)
+            {
+                var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr?.T != null)
+                {
+                    var outputName = node.Outputs[0];
+                    if (!weights.ContainsKey(outputName))
+                        weights[outputName] = valueAttr.T.ToFloatArray();
+                }
+            }
+        }
+
         return weights;
     }
 

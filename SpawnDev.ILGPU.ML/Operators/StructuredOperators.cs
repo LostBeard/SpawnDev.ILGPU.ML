@@ -1,3 +1,4 @@
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
@@ -53,11 +54,43 @@ public class SoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         int axis = ctx.GetInt("axis", -1);
         var shape = ctx.Inputs[0].Shape;
         if (axis < 0) axis += shape.Length;
-        int rows = 1; for (int i = 0; i < axis; i++) rows *= shape[i];
-        int cols = 1; for (int i = axis; i < shape.Length; i++) cols *= shape[i];
-        // Copy to output then in-place softmax
+
+        // Copy input to output first
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.Softmax.Forward(ctx.Outputs[0].Data, rows, cols);
+
+        // ONNX opset 13+: Softmax operates on a SINGLE axis.
+        // For shape [A, B, C, D] with axis=2: softmax over C for each (A*B) × D combination.
+        // We reshape to [outer, axisDim, inner] and run softmax on rows of size axisDim.
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
+        int axisDim = shape[axis];
+        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+
+        if (inner == 1)
+        {
+            // Simple case: softmax over the last dim — standard row softmax
+            reg.Softmax.Forward(ctx.Outputs[0].Data, outer, axisDim);
+        }
+        else
+        {
+            // General case: axis is not the last dim.
+            // Transpose so axis becomes last: [outer, axisDim, inner] → [outer, inner, axisDim]
+            // Then softmax over rows of axisDim, then transpose back.
+            int totalElems = ctx.Inputs[0].ElementCount;
+            var transposed = ctx.Pool.Rent(new[] { totalElems });
+
+            // Transpose [outer, axisDim, inner] → [outer, inner, axisDim]
+            // Input layout:  [o][a][i] at offset o*(axisDim*inner) + a*inner + i
+            // Output layout: [o][i][a] at offset o*(inner*axisDim) + i*axisDim + a
+            reg.Transpose.Transpose(ctx.Outputs[0].Data, transposed.Data,
+                new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+
+            // Softmax over rows of axisDim (now contiguous)
+            reg.Softmax.Forward(transposed.Data, outer * inner, axisDim);
+
+            // Transpose back: [outer, inner, axisDim] → [outer, axisDim, inner]
+            reg.Transpose.Transpose(transposed.Data, ctx.Outputs[0].Data,
+                new[] { outer, inner, axisDim }, new[] { 0, 2, 1 });
+        }
     }
 }
 
@@ -107,14 +140,28 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "Conv";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
-        // Simplified: 2D conv only
         var x = inputs[0]; var w = inputs[1];
-        var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[4];
+        var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[x.Length == 3 ? 2 : 4];
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
-        int outC = w[0]; int kH = w[2]; int kW = w[3];
-        int outH = (x[2] + pads[0] + pads[2] - kH) / strides[0] + 1;
-        int outW = (x[3] + pads[1] + pads[3] - kW) / strides[1] + 1;
-        return new[] { new[] { x[0], outC, outH, outW } };
+        int outC = w[0];
+
+        if (x.Length == 3)
+        {
+            // Conv1D: [N, C, L]
+            int kL = w[2];
+            var dilations = attrs.ContainsKey("dilations") ? ((long[])attrs["dilations"]).Select(d => (int)d).ToArray() : new[] { 1 };
+            int dilation = dilations.Length > 0 ? dilations[0] : 1;
+            int outL = (x[2] + (pads.Length >= 2 ? pads[0] + pads[1] : 0) - dilation * (kL - 1) - 1) / strides[0] + 1;
+            return new[] { new[] { x[0], outC, outL } };
+        }
+        else
+        {
+            // Conv2D: [N, C, H, W]
+            int kH = w[2]; int kW = w[3];
+            int outH = (x[2] + pads[0] + (pads.Length > 2 ? pads[2] : 0) - kH) / strides[0] + 1;
+            int outW = (x[3] + (pads.Length > 1 ? pads[1] : 0) + (pads.Length > 3 ? pads[3] : 0) - kW) / (strides.Length > 1 ? strides[1] : 1) + 1;
+            return new[] { new[] { x[0], outC, outH, outW } };
+        }
     }
     public void Execute(OnnxOpContext ctx)
     {
@@ -122,30 +169,42 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
         int group = ctx.GetInt("group", 1);
-        int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
-        int outC = w.Shape[0]; int kH = w.Shape[2]; int kW = w.Shape[3];
-        // Always provide a valid bias buffer — no conditional branch in kernel.
-        // ANGLE's HLSL optimizer changes FP evaluation when a branch precedes
-        // the accumulation loop, causing 0.009 error on WebGL.
+        int outC = w.Shape[0];
+
+        // Always provide a valid bias buffer
         var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
             ? ctx.Inputs[2].Data
             : ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias").Data;
 
-        if (group == inC && group == outC)
+        if (x.Shape.Length == 3)
         {
-            // Depthwise convolution: each channel convolved independently
-            reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                inC, inH, inW, kH, kW, stride, pad);
-        }
-        else if (group == 1)
-        {
-            // Standard convolution
-            reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                inC, inH, inW, outC, kH, kW, stride, pad);
+            // Conv1D: [N, C, L]
+            int inC = x.Shape[1]; int inL = x.Shape[2];
+            int kL = w.Shape[2];
+            var dilations = ctx.GetInts("dilations"); int dilation = dilations.Length > 0 ? dilations[0] : 1;
+            reg.Conv1D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                inC, inL, outC, kL, stride, pad, dilation, group);
         }
         else
         {
-            throw new NotSupportedException($"Conv with group={group} (inC={inC}, outC={outC}) not yet implemented — only group=1 and depthwise (group=inC=outC) supported");
+            // Conv2D: [N, C, H, W]
+            int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
+            int kH = w.Shape[2]; int kW = w.Shape[3];
+
+            if (group == inC && group == outC)
+            {
+                reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                    inC, inH, inW, kH, kW, stride, pad);
+            }
+            else if (group == 1)
+            {
+                reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                    inC, inH, inW, outC, kH, kW, stride, pad);
+            }
+            else
+            {
+                throw new NotSupportedException($"Conv with group={group} (inC={inC}, outC={outC}) not yet implemented");
+            }
         }
     }
 }
@@ -746,13 +805,70 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Split";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] }; // Multiple outputs — simplified
+    {
+        int axis = attrs.ContainsKey("axis") ? Convert.ToInt32(attrs["axis"]) : 0;
+        if (axis < 0) axis += inputs[0].Length;
+        var inShape = inputs[0];
+
+        // Get split sizes from attribute (opset < 13) or default to equal splits
+        int[] splitSizes;
+        if (attrs.TryGetValue("split", out var splitObj) && splitObj is long[] splitLongs)
+        {
+            splitSizes = splitLongs.Select(s => (int)s).ToArray();
+        }
+        else
+        {
+            // Default: split into equal parts. Use num_outputs attr or input[1] length.
+            int numOutputs = attrs.ContainsKey("num_outputs") ? Convert.ToInt32(attrs["num_outputs"]) : 2;
+            int dimSize = inShape[axis];
+            int partSize = dimSize / numOutputs;
+            splitSizes = Enumerable.Repeat(partSize, numOutputs).ToArray();
+            // Handle remainder
+            if (dimSize % numOutputs != 0)
+                splitSizes[numOutputs - 1] = dimSize - partSize * (numOutputs - 1);
+        }
+
+        var result = new int[splitSizes.Length][];
+        for (int i = 0; i < splitSizes.Length; i++)
+        {
+            result[i] = (int[])inShape.Clone();
+            result[i][axis] = splitSizes[i];
+        }
+        return result;
+    }
     public void Execute(OnnxOpContext ctx)
     {
-        // Simplified: copy input to first output
-        int copyCount = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, copyCount),
-            ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
+        int axis = ctx.GetInt("axis", 0);
+        if (axis < 0) axis += ctx.Inputs[0].Shape.Length;
+        var inShape = ctx.Inputs[0].Shape;
+
+        // Compute strides for the split
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= inShape[i];
+        int inner = 1; for (int i = axis + 1; i < inShape.Length; i++) inner *= inShape[i];
+        int axisDim = inShape[axis];
+
+        // Split into each output
+        int axisOffset = 0;
+        for (int outIdx = 0; outIdx < ctx.Outputs.Length; outIdx++)
+        {
+            if (ctx.Outputs[outIdx] == null) continue;
+            int splitSize = ctx.Outputs[outIdx].Shape[axis];
+            int blockSize = splitSize * inner;
+
+            for (int o = 0; o < outer; o++)
+            {
+                int srcOffset = o * axisDim * inner + axisOffset * inner;
+                int dstOffset = o * blockSize;
+                int copyLen = Math.Min(blockSize, ctx.Outputs[outIdx].ElementCount - dstOffset);
+                if (copyLen <= 0) continue;
+
+                reg.ElementWise.Scale(
+                    ctx.Inputs[0].Data.SubView(srcOffset, copyLen),
+                    ctx.Outputs[outIdx].Data.SubView(dstOffset, copyLen),
+                    copyLen, 1f);
+            }
+            axisOffset += splitSize;
+        }
     }
 }
 
@@ -762,13 +878,180 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Slice";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] }; // Dynamic — depends on starts/ends inputs
+    {
+        // Try to compute output shape from attributes (opset < 10)
+        if (attrs.TryGetValue("starts", out var startsObj) && startsObj is long[] starts
+            && attrs.TryGetValue("ends", out var endsObj) && endsObj is long[] ends)
+        {
+            var axes = attrs.TryGetValue("axes", out var axObj) && axObj is long[] ax
+                ? ax.Select(a => (int)a).ToArray()
+                : Enumerable.Range(0, starts.Length).ToArray();
+            var steps = attrs.TryGetValue("steps", out var stObj) && stObj is long[] st
+                ? st.Select(s => (int)s).ToArray()
+                : Enumerable.Repeat(1, starts.Length).ToArray();
+
+            var outShape = (int[])inputs[0].Clone();
+            for (int idx = 0; idx < axes.Length; idx++)
+            {
+                int dim = axes[idx] < 0 ? axes[idx] + outShape.Length : axes[idx];
+                int s2 = (int)starts[idx]; int e2 = (int)ends[idx]; int st2 = steps[idx];
+                if (s2 < 0) s2 += outShape[dim];
+                if (e2 < 0) e2 += outShape[dim];
+                s2 = Math.Clamp(s2, 0, outShape[dim]);
+                e2 = Math.Clamp(e2, 0, outShape[dim]);
+                outShape[dim] = (e2 - s2 + st2 - 1) / st2;
+            }
+            return new[] { outShape };
+        }
+        return new[] { inputs[0] }; // Dynamic — resolved at runtime
+    }
     public void Execute(OnnxOpContext ctx)
     {
-        // Simplified: contiguous slice — copy the matching portion
-        int copyCount = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, copyCount),
-            ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
+        var input = ctx.Inputs[0];
+        var inShape = input.Shape;
+        int rank = inShape.Length;
+
+        // Resolve starts, ends, axes, steps — priority order:
+        // 1. Compiler-resolved attributes (_resolved_starts etc.) — most reliable
+        // 2. Pre-read constant values from tensor inputs (opset >= 10)
+        // 3. Attributes (opset < 10)
+        // 4. Full copy fallback
+        int[] starts, ends, axes, steps;
+
+        var resolvedStarts = ctx.GetInts("_resolved_starts");
+        var resolvedEnds = ctx.GetInts("_resolved_ends");
+
+        if (resolvedStarts.Length > 0 && resolvedEnds.Length > 0)
+        {
+            // Path 1: compiler resolved at compile time — handles opset >= 10 with constant params
+            starts = new int[rank]; ends = new int[rank]; steps = new int[rank];
+            for (int d = 0; d < rank; d++) { starts[d] = 0; ends[d] = inShape[d]; steps[d] = 1; }
+            var rAxes = ctx.GetInts("_resolved_axes");
+            var rSteps = ctx.GetInts("_resolved_steps");
+            for (int ri = 0; ri < rAxes.Length; ri++)
+            {
+                int rax = rAxes[ri] < 0 ? rAxes[ri] + rank : rAxes[ri];
+                starts[rax] = resolvedStarts[ri];
+                ends[rax] = resolvedEnds[ri];
+                if (ri < rSteps.Length) steps[rax] = rSteps[ri];
+            }
+            axes = Enumerable.Range(0, rank).ToArray();
+        }
+        else if (ctx.Inputs.Length >= 3 && ctx.Inputs[1] != null
+            && ctx.TryGetInputValues(1) is float[] startsF && ctx.TryGetInputValues(2) is float[] endsF)
+        {
+            // Path 2: runtime constant values from tensor inputs
+            starts = startsF.Select(v => (int)v).ToArray();
+            ends = endsF.Select(v => (int)v).ToArray();
+            axes = ctx.Inputs.Length > 3 && ctx.TryGetInputValues(3) is float[] axF
+                ? axF.Select(v => (int)v).ToArray() : Enumerable.Range(0, starts.Length).ToArray();
+            steps = ctx.Inputs.Length > 4 && ctx.TryGetInputValues(4) is float[] stF
+                ? stF.Select(v => (int)v).ToArray() : Enumerable.Repeat(1, starts.Length).ToArray();
+        }
+        else
+        {
+            // Path 3: attributes (opset < 10)
+            var attrStarts = ctx.GetInts("starts");
+            var attrEnds = ctx.GetInts("ends");
+            var attrAxes = ctx.GetInts("axes");
+            var attrSteps = ctx.GetInts("steps");
+            starts = attrStarts.Length > 0 ? attrStarts : new int[rank];
+            ends = attrEnds.Length > 0 ? attrEnds : inShape.ToArray();
+            axes = attrAxes.Length > 0 ? attrAxes : Enumerable.Range(0, starts.Length).ToArray();
+            steps = attrSteps.Length > 0 ? attrSteps : Enumerable.Repeat(1, starts.Length).ToArray();
+        }
+
+        // Normalize negative indices and clamp
+        var sliceStarts = new int[rank];
+        var sliceEnds = new int[rank];
+        var sliceSteps = new int[rank];
+        for (int i = 0; i < rank; i++) { sliceStarts[i] = 0; sliceEnds[i] = inShape[i]; sliceSteps[i] = 1; }
+        for (int i = 0; i < axes.Length; i++)
+        {
+            int ax = axes[i] < 0 ? axes[i] + rank : axes[i];
+            int s = starts[i]; int e = ends[i]; int st = steps[i];
+            if (s < 0) s += inShape[ax];
+            if (e < 0) e += inShape[ax];
+            s = Math.Clamp(s, 0, inShape[ax]);
+            e = Math.Clamp(e, 0, inShape[ax]);
+            sliceStarts[ax] = s;
+            sliceEnds[ax] = e;
+            sliceSteps[ax] = st;
+        }
+
+        // Compute output shape and strides
+        var outShape = ctx.Outputs[0].Shape;
+        var inStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * inShape[i + 1];
+
+        // CPU-side index computation, GPU copy per contiguous block
+        // For simplicity with small tensors, compute full index mapping on CPU
+        int outCount = ctx.Outputs[0].ElementCount;
+        if (outCount <= 65536)
+        {
+            // Small tensor: compute on CPU via pre-read values
+            var inVals = ctx.TryGetInputValues(0);
+            if (inVals != null)
+            {
+                var result = new float[outCount];
+                int outIdx = 0;
+                SliceCPU(inVals, result, inShape, sliceStarts, sliceEnds, sliceSteps, inStrides, rank, 0, 0, ref outIdx);
+                var temp = ctx.Pool.AllocatePermanent(result, outShape);
+                reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+                return;
+            }
+        }
+
+        // Fallback for large tensors: copy contiguous slices along last axis
+        int outIdx2 = 0;
+        SliceGPU(input.Data, ctx.Outputs[0].Data, inShape, sliceStarts, sliceEnds, sliceSteps, inStrides, rank, 0, 0, ref outIdx2, reg);
+    }
+
+    private static void SliceCPU(float[] input, float[] output, int[] shape,
+        int[] starts, int[] ends, int[] steps, int[] strides, int rank, int dim, int inOffset, ref int outIdx)
+    {
+        if (dim == rank)
+        {
+            if (outIdx < output.Length && inOffset < input.Length)
+                output[outIdx++] = input[inOffset];
+            return;
+        }
+        for (int i = starts[dim]; i < ends[dim]; i += steps[dim])
+            SliceCPU(input, output, shape, starts, ends, steps, strides, rank, dim + 1, inOffset + i * strides[dim], ref outIdx);
+    }
+
+    private void SliceGPU(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, int[] shape,
+        int[] starts, int[] ends, int[] steps, int[] strides, int rank, int dim, int inOffset, ref int outIdx,
+        OperatorRegistry reg2)
+    {
+        if (dim == rank - 1)
+        {
+            // Copy contiguous run along last axis
+            int start = starts[dim]; int end = ends[dim]; int step = steps[dim];
+            if (step == 1)
+            {
+                int len = end - start;
+                if (len > 0 && outIdx + len <= (int)output.Length)
+                {
+                    reg2.ElementWise.Scale(input.SubView(inOffset + start, len), output.SubView(outIdx, len), len, 1f);
+                    outIdx += len;
+                }
+            }
+            else
+            {
+                for (int i = start; i < end; i += step)
+                {
+                    if (outIdx < (int)output.Length)
+                        reg2.ElementWise.Scale(input.SubView(inOffset + i, 1), output.SubView(outIdx, 1), 1, 1f);
+                    outIdx++;
+                }
+            }
+            return;
+        }
+        for (int i = starts[dim]; i < ends[dim]; i += steps[dim])
+            SliceGPU(input, output, shape, starts, ends, steps, strides, rank, dim + 1, inOffset + i * strides[dim], ref outIdx, reg2);
     }
 }
 

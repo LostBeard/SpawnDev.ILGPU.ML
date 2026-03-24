@@ -1,0 +1,19 @@
+{
+  "format": "pytorch",
+  "tensor_count": 2,
+  "tensors": {
+    "linear.weight": {
+      "shape": [
+        2,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "linear.bias": {
+      "shape": [
+        3
+      ],
+      "dtype": "float32"
+    }
+  }
+}

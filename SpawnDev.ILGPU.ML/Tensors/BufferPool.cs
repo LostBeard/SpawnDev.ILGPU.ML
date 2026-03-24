@@ -113,7 +113,10 @@ public class BufferPool : IDisposable
     public void Dispose()
     {
         foreach (var buffer in _allBuffers)
-            buffer.Dispose();
+        {
+            try { buffer.Dispose(); }
+            catch { /* Buffer may already be disposed by executor ref-counting or external code */ }
+        }
         _allBuffers.Clear();
         _buckets.Clear();
     }

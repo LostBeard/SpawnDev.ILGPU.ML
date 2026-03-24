@@ -1,0 +1,22 @@
+{
+  "format": "gguf",
+  "tensor_count": 2,
+  "metadata": {
+    "name": "test-model"
+  },
+  "tensors": {
+    "weight": {
+      "shape": [
+        2,
+        3
+      ],
+      "dtype": "F32"
+    },
+    "bias": {
+      "shape": [
+        3
+      ],
+      "dtype": "F32"
+    }
+  }
+}

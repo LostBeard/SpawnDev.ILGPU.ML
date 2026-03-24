@@ -147,9 +147,8 @@ public class LeakyReluOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // LeakyRelu: max(alpha*x, x). For now, use ReLU (alpha=0).
-        // TODO: proper LeakyReLU with alpha parameter
-        reg.ElementWise.ReLU(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        float alpha = ctx.GetFloat("alpha", 0.01f);
+        reg.ElementWise.LeakyReLU(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, alpha);
     }
 }
 
@@ -301,23 +300,28 @@ public class SubOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
-            // Negate b into output, then add a
-            reg.ElementWise.Neg(b.Data, ctx.Outputs[0].Data, b.ElementCount);
-            reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
+            // Single-dispatch subtract — safe, no aliasing risk
+            reg.ElementWise.Sub(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        }
+        else if (a.ElementCount == b.ElementCount)
+        {
+            // Size mismatch with output — use min count
+            int count = Math.Min(a.ElementCount, ctx.Outputs[0].ElementCount);
+            reg.ElementWise.Sub(a.Data.SubView(0, count), b.Data.SubView(0, count),
+                ctx.Outputs[0].Data.SubView(0, count), count);
         }
         else if (b.ElementCount == 1)
         {
-            // Scalar: a - scalar → copy a, then subtract (negate scalar + add)
-            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
-            // TODO: scalar subtract kernel
+            // Scalar: a - scalar → negate scalar, then add
+            reg.ElementWise.Neg(b.Data, ctx.Outputs[0].Data, 1);
+            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Outputs[0].Data, a.ElementCount, 1);
+            reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
         }
         else
         {
-            // General: negate b, then use Add broadcast logic
-            reg.ElementWise.Neg(b.Data, ctx.Outputs[0].Data, b.ElementCount);
-            reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x - y);
         }
     }
 }
@@ -336,12 +340,10 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else if (b.ElementCount == 1)
         {
-            // Scalar div: compute reciprocal of scalar, then scale
-            // For now, use Div with broadcast (repeat scalar)
-            reg.ElementWise.BroadcastMul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount, 1);
-            // This is actually Mul not Div — need reciprocal first
-            // TODO: proper scalar div
-            throw new NotSupportedException("Scalar Div needs reciprocal kernel integration");
+            // Scalar div: compute reciprocal of scalar, then multiply
+            var recip = ctx.Pool.Rent(b.Shape, "div_recip");
+            reg.ElementWise.Reciprocal(b.Data, recip.Data, 1);
+            reg.ElementWise.BroadcastMul(a.Data, recip.Data, ctx.Outputs[0].Data, a.ElementCount, 1);
         }
         else if (b.ElementCount == a.Shape[^1])
         {

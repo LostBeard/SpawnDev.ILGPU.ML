@@ -1,0 +1,5 @@
+model: efficientnet-lite0
+format: tflite
+input: shape=[np.int32(1), np.int32(224), np.int32(224), np.int32(3)] float32 NHWC
+output: shape=[1, 1000] float32
+top1: class 285 prob 0.0016

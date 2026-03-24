@@ -20,6 +20,12 @@ public class GraphExecutor : IDisposable
     /// <summary>When true, logs each node execution to Console.</summary>
     public static bool VerboseLogging { get; set; }
 
+    /// <summary>
+    /// When non-null, captures first 10 values of each node's output for debugging.
+    /// Performance cost: GPU sync + readback per node. Only use for diagnostics.
+    /// </summary>
+    public static Dictionary<string, float[]>? CapturedOutputs { get; set; }
+
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null)
     {
@@ -194,6 +200,7 @@ public class GraphExecutor : IDisposable
         foreach (var name in inputs.Keys) refCounts[name] = int.MaxValue;
 
         int nodeIdx = 0;
+        var pendingReleases = new List<Tensor>();
         foreach (var node in _graph.Nodes)
         {
             if (VerboseLogging)
@@ -260,7 +267,29 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
 
-            // Release input tensors whose ref count reached 0 — recycle GPU memory
+            // Capture intermediate values for debugging (when enabled)
+            if (CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
+            {
+                var captureOutput = nodeOutputs[0];
+                int captureCount = Math.Min(10, captureOutput.ElementCount);
+                if (captureCount > 0)
+                {
+                    try
+                    {
+                        await _accelerator.SynchronizeAsync();
+                        using var capBuf = _accelerator.Allocate1D<float>(captureCount);
+                        new ElementWiseKernels(_accelerator).Scale(
+                            captureOutput.Data.SubView(0, captureCount), capBuf.View, captureCount, 1f);
+                        await _accelerator.SynchronizeAsync();
+                        var vals = await capBuf.CopyToHostAsync<float>(0, captureCount);
+                        var key = $"{nodeIdx:D3}_{node.OpType}_{node.OutputNames[0]}";
+                        CapturedOutputs[key] = vals;
+                    }
+                    catch { /* Don't crash on capture failure */ }
+                }
+            }
+
+            // Defer buffer release to sync points to prevent reuse while GPU is in-flight
             foreach (var inputName in node.InputNames)
             {
                 if (string.IsNullOrEmpty(inputName)) continue;
@@ -268,7 +297,7 @@ public class GraphExecutor : IDisposable
                 {
                     refCounts[inputName] = rc - 1;
                     if (rc - 1 <= 0 && tensors.TryGetValue(inputName, out var releaseTensor))
-                        _pool.Return(releaseTensor);
+                        pendingReleases.Add(releaseTensor);
                 }
             }
 
@@ -276,12 +305,22 @@ public class GraphExecutor : IDisposable
 
             // Flush GPU command buffer periodically to prevent massive single submissions.
             if (nodeIdx % 16 == 0)
+            {
                 _accelerator.Synchronize();
+                // Now safe to return deferred buffers — GPU has finished reading them
+                foreach (var t in pendingReleases)
+                    _pool.Return(t);
+                pendingReleases.Clear();
+            }
         }
 
         // Final yield + sync
         await Task.Yield();
         await _accelerator.SynchronizeAsync();
+        // Release any remaining deferred buffers
+        foreach (var t in pendingReleases)
+            _pool.Return(t);
+        pendingReleases.Clear();
 
         var results = new Dictionary<string, Tensor>();
         foreach (var name in _graph.OutputNames)

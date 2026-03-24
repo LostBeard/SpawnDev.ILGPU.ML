@@ -1,0 +1,12 @@
+{
+  "format": "coreml",
+  "layer_count": 1,
+  "layers": [
+    {
+      "name": "linear",
+      "type": "innerProduct",
+      "input_channels": 3,
+      "output_channels": 2
+    }
+  ]
+}

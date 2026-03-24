@@ -1,0 +1,5 @@
+model: blaze-face
+format: tflite
+input: shape=[np.int32(1), np.int32(128), np.int32(128), np.int32(3)] float32 [-1,1] NHWC
+output: regressors shape=[1, 896, 16] range=[-39.5725,124.7741]
+output: classificators shape=[1, 896, 1] range=[-50.6697,-1.8106]

@@ -21,6 +21,7 @@ public class OperatorRegistry
     public SoftmaxKernel Softmax { get; }
     public ElementWiseKernels ElementWise { get; }
     public Conv2DKernel Conv2D { get; }
+    public Conv1DKernel Conv1D { get; }
     public ActivationKernels Activations { get; }
     public ReductionKernels Reductions { get; }
     public PoolingKernels Pooling { get; }
@@ -40,6 +41,7 @@ public class OperatorRegistry
         Softmax = new SoftmaxKernel(accelerator);
         ElementWise = new ElementWiseKernels(accelerator);
         Conv2D = new Conv2DKernel(accelerator);
+        Conv1D = new Conv1DKernel(accelerator);
         Activations = new ActivationKernels(accelerator);
         Reductions = new ReductionKernels(accelerator);
         Pooling = new PoolingKernels(accelerator);
