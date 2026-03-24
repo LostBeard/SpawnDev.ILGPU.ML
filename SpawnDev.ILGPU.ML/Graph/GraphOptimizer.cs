@@ -40,7 +40,10 @@ public static class GraphOptimizer
         // Pass 5: Strength reduction (Div by const → Mul, eliminate Mul by 1, Add by 0)
         int reduced = StrengthReduce(optimized);
 
-        // Pass 6: Remove dead nodes (outputs never consumed)
+        // Pass 6: Re-run identity elimination (strength reduction may create new Identity nodes)
+        eliminated += EliminateIdentityNodes(optimized);
+
+        // Pass 7: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
         int totalOpt = fusedLinear + fusedScaled + eliminated + dead + folded + reduced;
@@ -83,6 +86,19 @@ public static class GraphOptimizer
             if (nodesToRemove.Contains(i)) continue;
             var matmulNode = graph.Nodes[i];
             if (matmulNode.OpType != "MatMul" && matmulNode.OpType != "Gemm") continue;
+
+            // Don't fuse Gemm nodes with transB=1 or non-default alpha/beta —
+            // FusedLinearKernel assumes [K,N] weight layout, but transB=1 stores as [N,K]
+            if (matmulNode.OpType == "Gemm" && matmulNode.Attributes != null)
+            {
+                bool hasTransB = matmulNode.Attributes.TryGetValue("transB", out var transB)
+                    && transB.ValueKind == System.Text.Json.JsonValueKind.Number && transB.GetInt32() != 0;
+                bool hasAlpha = matmulNode.Attributes.TryGetValue("alpha", out var alpha)
+                    && alpha.ValueKind == System.Text.Json.JsonValueKind.Number && alpha.GetSingle() != 1.0f;
+                bool hasBeta = matmulNode.Attributes.TryGetValue("beta", out var beta)
+                    && beta.ValueKind == System.Text.Json.JsonValueKind.Number && beta.GetSingle() != 1.0f;
+                if (hasTransB || hasAlpha || hasBeta) continue;
+            }
 
             string matmulOutput = matmulNode.Outputs[0];
 
@@ -244,6 +260,15 @@ public static class GraphOptimizer
     {
         // Set of tensor names that are constants (initializers + Constant node outputs)
         var constants = new HashSet<string>(graph.Initializers.Keys);
+        // Track known shapes for Shape node evaluation
+        var knownShapes = new Dictionary<string, int[]>();
+        foreach (var (name, shape) in graph.Initializers)
+            knownShapes[name] = shape;
+        foreach (var input in graph.Inputs)
+            if (input.Shape != null && input.Shape.Length > 0)
+                knownShapes[input.Name] = input.Shape;
+        // Track known constant values (for Shape→Gather→Concat evaluation)
+        graph.ConstantData ??= new Dictionary<string, int[]>();
 
         // Constant node outputs are also constants
         foreach (var node in graph.Nodes)
@@ -267,23 +292,72 @@ public static class GraphOptimizer
             for (int i = 0; i < graph.Nodes.Count; i++)
             {
                 var node = graph.Nodes[i];
-                if (node.OpType == "Constant") continue; // Already handled
-
-                // Skip nodes that have side effects or produce large outputs
-                // Only fold shape-manipulation ops that produce small constant results
+                if (node.OpType == "Constant") continue;
                 if (!IsConstantFoldable(node.OpType)) continue;
 
-                // Check if ALL inputs are constants
                 bool allConstant = node.Inputs.Count > 0 &&
                     node.Inputs.All(inp => string.IsNullOrEmpty(inp) || constants.Contains(inp));
 
                 if (allConstant)
                 {
-                    // Mark all outputs as constants
+                    // Try to evaluate Shape nodes to produce actual constant values
+                    if (node.OpType == "Shape" && node.Inputs.Count >= 1
+                        && knownShapes.TryGetValue(node.Inputs[0], out var inputShape))
+                    {
+                        var outputName = node.Outputs[0];
+                        var shapeValues = inputShape;
+                        graph.ConstantData[outputName] = shapeValues;
+                        graph.Initializers[outputName] = new[] { shapeValues.Length };
+                        knownShapes[outputName] = new[] { shapeValues.Length };
+                        constants.Add(outputName);
+                        nodesToRemove.Add(i);
+                        folded++;
+                        changed = true;
+                        continue;
+                    }
+
+                    // Try to evaluate Gather(axis=0) on known constant data
+                    if (node.OpType == "Gather" && node.Inputs.Count >= 2
+                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var gatherData)
+                        && graph.ConstantData.TryGetValue(node.Inputs[1], out var gatherIdx)
+                        && gatherIdx.Length == 1)
+                    {
+                        var outputName = node.Outputs[0];
+                        int idx = gatherIdx[0];
+                        if (idx < 0) idx += gatherData.Length;
+                        if (idx >= 0 && idx < gatherData.Length)
+                        {
+                            graph.ConstantData[outputName] = new[] { gatherData[idx] };
+                            graph.Initializers[outputName] = new[] { 1 };
+                            knownShapes[outputName] = new[] { 1 };
+                            constants.Add(outputName);
+                            nodesToRemove.Add(i);
+                            folded++;
+                            changed = true;
+                            continue;
+                        }
+                    }
+
+                    // Try to evaluate Concat on known constant data
+                    if (node.OpType == "Concat" && node.Inputs.Count >= 1
+                        && node.Inputs.All(inp => graph.ConstantData.ContainsKey(inp)))
+                    {
+                        var outputName = node.Outputs[0];
+                        var concatValues = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
+                        graph.ConstantData[outputName] = concatValues;
+                        graph.Initializers[outputName] = new[] { concatValues.Length };
+                        knownShapes[outputName] = new[] { concatValues.Length };
+                        constants.Add(outputName);
+                        nodesToRemove.Add(i);
+                        folded++;
+                        changed = true;
+                        continue;
+                    }
+
+                    // Generic folding: mark as constant but register with correct shape
                     foreach (var output in node.Outputs)
                     {
                         constants.Add(output);
-                        // Register as a scalar initializer if not already present
                         if (!graph.Initializers.ContainsKey(output))
                             graph.Initializers[output] = new[] { 1 };
                     }

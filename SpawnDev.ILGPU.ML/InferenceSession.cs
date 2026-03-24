@@ -88,6 +88,17 @@ public class InferenceSession : IDisposable
         await weightLoader.LoadAsync(basePath);
         onProgress?.Invoke("weights", 100);
 
+        // For Wasm/WebGL, pre-fetch master weight buffer to CPU once.
+        // Avoids GPU→GPU SubView copies that cause Wasm OOB and WebGL peer-to-peer issues.
+        bool useCpuStaging = accelerator.AcceleratorType == AcceleratorType.Wasm ||
+                             accelerator.AcceleratorType == AcceleratorType.WebGL;
+        float[]? cpuWeightsAll = null;
+        if (useCpuStaging)
+        {
+            await accelerator.SynchronizeAsync();
+            cpuWeightsAll = await weightLoader.CopyAllToHostAsync();
+        }
+
         // Extract small constant values for shape inference AND runtime operator use.
         // Use ONE shared read buffer to avoid allocating hundreds of tiny GPU buffers.
         modelGraph.ConstantData = new Dictionary<string, int[]>();
@@ -113,12 +124,27 @@ public class InferenceSession : IDisposable
                         var view = weightLoader.TryGetView(name);
                         if (view != null)
                         {
-                            readBuf.View.SubView(0, elems).CopyFrom(view.Value.SubView(0, elems));
-                            await accelerator.SynchronizeAsync();
-                            var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
-                            constantFloatValues[name] = hostBuf;
-                            if (elems <= 16)
-                                modelGraph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                            if (useCpuStaging && cpuWeightsAll != null)
+                            {
+                                var slice = weightLoader.GetSlice(name);
+                                if (slice != null)
+                                {
+                                    var hostBuf = new float[elems];
+                                    Array.Copy(cpuWeightsAll, slice.Value.offset, hostBuf, 0, elems);
+                                    constantFloatValues[name] = hostBuf;
+                                    if (elems <= 16)
+                                        modelGraph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                                }
+                            }
+                            else
+                            {
+                                readBuf.View.SubView(0, elems).CopyFrom(view.Value.SubView(0, elems));
+                                await accelerator.SynchronizeAsync();
+                                var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
+                                constantFloatValues[name] = hostBuf;
+                                if (elems <= 16)
+                                    modelGraph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                            }
                         }
                     }
                 }
@@ -141,6 +167,8 @@ public class InferenceSession : IDisposable
         foreach (var name in modelGraph.Initializers.Keys)
             allInitNames.Add(name);
 
+        // Reuse pre-fetched CPU weights (already fetched before constant extraction)
+
         int loadedCount = 0;
         foreach (var name in allInitNames)
         {
@@ -150,12 +178,24 @@ public class InferenceSession : IDisposable
                 // Copy each weight into its OWN buffer. WeightLoader uses a single
                 // shared buffer with SubViews, but WebGPU doesn't allow binding the
                 // same GPUBuffer to multiple storage slots in one kernel dispatch.
-                // Without separate buffers, Conv2D (weight + bias from same buffer)
-                // produces silent zeros on WebGPU.
                 int count = Tensors.TensorHelpers.ElementCount(shape);
                 var ownBuf = accelerator.Allocate1D<float>(count);
-                // Use Scale kernel (GPU→GPU copy) instead of CopyTo (sync, fails on WebGPU)
-                registry.ElementWise.Scale(view.Value.SubView(0, count), ownBuf.View, count, 1f);
+                if (useCpuStaging && cpuWeightsAll != null)
+                {
+                    // CPU staging: slice from the pre-fetched master buffer
+                    var slice = weightLoader.GetSlice(name);
+                    if (slice != null)
+                    {
+                        var weightSlice = new float[count];
+                        Array.Copy(cpuWeightsAll, slice.Value.offset, weightSlice, 0, count);
+                        ownBuf.CopyFromCPU(weightSlice);
+                    }
+                }
+                else
+                {
+                    // GPU→GPU copy via Scale kernel
+                    registry.ElementWise.Scale(view.Value.SubView(0, count), ownBuf.View, count, 1f);
+                }
                 weights[name] = new Tensor(ownBuf.View, shape, name);
                 loadedCount++;
             }
@@ -233,15 +273,18 @@ public class InferenceSession : IDisposable
     /// Create an InferenceSession from any supported model file via HTTP.
     /// Auto-detects format from file extension (.onnx, .tflite) or magic bytes.
     /// </summary>
+    /// <param name="inputShapes">Optional: override input shapes for models with dynamic dimensions.
+    /// e.g. new Dictionary&lt;string, int[]&gt; { ["pixel_values"] = new[] { 1, 3, 518, 518 } }</param>
     public static async Task<InferenceSession> CreateFromFileAsync(
         Accelerator accelerator, HttpClient http, string modelUrl,
-        Action<string, int>? onProgress = null)
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null)
     {
         onProgress?.Invoke("download", 0);
         var bytes = await http.GetByteArrayAsync(modelUrl);
         onProgress?.Invoke("download", 100);
 
-        return CreateFromFile(accelerator, bytes, onProgress);
+        return CreateFromFile(accelerator, bytes, onProgress, inputShapes);
     }
 
     /// <summary>
@@ -250,12 +293,13 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static InferenceSession CreateFromFile(
         Accelerator accelerator, byte[] modelBytes,
-        Action<string, int>? onProgress = null)
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null)
     {
         var format = DetectModelFormat(modelBytes);
         return format switch
         {
-            ModelFormat.ONNX => CreateFromOnnx(accelerator, modelBytes, onProgress),
+            ModelFormat.ONNX => CreateFromOnnx(accelerator, modelBytes, onProgress, inputShapes),
             ModelFormat.TFLite => CreateFromTFLite(accelerator, modelBytes, onProgress),
             ModelFormat.GGUF => CreateFromGGUF(accelerator, modelBytes, onProgress),
             _ => throw new NotSupportedException($"Unknown model format. Expected ONNX (.onnx), TFLite (.tflite), or GGUF (.gguf).")
@@ -321,14 +365,23 @@ public class InferenceSession : IDisposable
     /// Create an InferenceSession directly from raw .onnx bytes.
     /// No Python extraction step needed — uses the native ONNX protobuf parser.
     /// </summary>
+    /// <param name="inputShapes">Optional: override input shapes for models with dynamic dimensions.</param>
     public static InferenceSession CreateFromOnnx(
         Accelerator accelerator, byte[] onnxBytes,
-        Action<string, int>? onProgress = null)
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null)
     {
         // Parse ONNX protobuf
         onProgress?.Invoke("parse", 0);
-        var (modelInfo, cpuWeights) = Onnx.OnnxLoader.LoadModel(onnxBytes);
+        var (modelInfo, cpuWeightsAll) = Onnx.OnnxLoader.LoadModel(onnxBytes);
         onProgress?.Invoke("parse", 100);
+
+        // Apply input shape overrides (for models with dynamic dimensions)
+        if (inputShapes != null)
+        {
+            foreach (var (name, shape) in inputShapes)
+                modelInfo.ValueShapes[name] = shape;
+        }
 
         // Convert OnnxModelInfo → ModelGraph
         var graph = ConvertToModelGraph(modelInfo);
@@ -339,7 +392,7 @@ public class InferenceSession : IDisposable
         foreach (var (name, shape) in graph.Initializers)
         {
             int elems = shape.Aggregate(1, (a, b) => a * b);
-            if (elems > 0 && elems <= 64 && cpuWeights.TryGetValue(name, out var data))
+            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
@@ -358,11 +411,18 @@ public class InferenceSession : IDisposable
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
-        foreach (var (name, data) in cpuWeights)
+        foreach (var (name, data) in cpuWeightsAll)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
-                gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                var weightData = data;
+                int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+                if (weightData.Length == 0 && expectedElems > 0)
+                {
+                    // Missing data — zero-fill to match declared shape
+                    weightData = new float[expectedElems];
+                }
+                gpuWeights[name] = pool.AllocatePermanent(weightData, shape, name);
                 loaded++;
             }
         }
@@ -462,7 +522,7 @@ public class InferenceSession : IDisposable
     {
         // Parse TFLite FlatBuffers
         onProgress?.Invoke("parse", 0);
-        var (graph, cpuWeights) = TFLite.TFLiteLoader.LoadModel(tfliteBytes);
+        var (graph, cpuWeightsAll) = TFLite.TFLiteLoader.LoadModel(tfliteBytes);
         onProgress?.Invoke("parse", 100);
 
         // Extract small constant values for shape inference
@@ -471,7 +531,7 @@ public class InferenceSession : IDisposable
         foreach (var (name, shape) in graph.Initializers)
         {
             int elems = shape.Aggregate(1, (a, b) => a * b);
-            if (elems > 0 && elems <= 64 && cpuWeights.TryGetValue(name, out var data))
+            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
@@ -490,7 +550,7 @@ public class InferenceSession : IDisposable
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
-        foreach (var (name, data) in cpuWeights)
+        foreach (var (name, data) in cpuWeightsAll)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
@@ -542,7 +602,7 @@ public class InferenceSession : IDisposable
 
         // Build transformer graph from architecture metadata
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeights) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        var (graph, cpuWeightsAll) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values
@@ -551,7 +611,7 @@ public class InferenceSession : IDisposable
         foreach (var (name, shape) in graph.Initializers)
         {
             int elems = shape.Aggregate(1, (a, b) => a * b);
-            if (elems > 0 && elems <= 64 && cpuWeights.TryGetValue(name, out var data))
+            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
@@ -570,7 +630,7 @@ public class InferenceSession : IDisposable
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
-        foreach (var (name, data) in cpuWeights)
+        foreach (var (name, data) in cpuWeightsAll)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {

@@ -33,7 +33,7 @@ public abstract partial class MLTestBase
             }
         };
 
-        var compiler = new GraphCompiler(registry);
+        var compiler = new GraphCompiler(registry) { EnableOptimization = false };
         var compiled = compiler.Compile(graph);
 
         if (compiled.Nodes.Length != 3) throw new Exception($"Expected 3 nodes, got {compiled.Nodes.Length}");

@@ -101,7 +101,7 @@ public class TransposeKernel
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = perm[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = inStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 3 * rank + i] = outStrides[i];
-        _paramsBuf.CopyFromCPU(paramsData);
+        _paramsBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
 
         _transposeKernel!(totalElements, input, output, _paramsBuf.View);
     }

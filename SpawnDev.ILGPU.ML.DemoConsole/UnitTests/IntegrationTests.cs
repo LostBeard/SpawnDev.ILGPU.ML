@@ -51,8 +51,10 @@ public class IntegrationTests
         Console.WriteLine($"[Integration] Compiled: {compiled.Nodes.Length} nodes");
         Console.WriteLine($"[Integration] Operators used: {string.Join(", ", compiled.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s))}");
 
-        if (compiled.Nodes.Length != graph.Nodes.Count)
-            throw new Exception($"Node count mismatch: compiled={compiled.Nodes.Length}, graph={graph.Nodes.Count}");
+        if (compiled.Nodes.Length > graph.Nodes.Count)
+            throw new Exception($"Compiled has MORE nodes than input: {compiled.Nodes.Length} > {graph.Nodes.Count}");
+        if (compiled.Nodes.Length == 0)
+            throw new Exception("Compiled graph has zero nodes");
 
         // Verify output shape
         if (compiled.OutputShapes.TryGetValue(graph.Outputs[0].Name, out var outShape))
@@ -76,9 +78,11 @@ public class IntegrationTests
         var registry = new OperatorRegistry(accelerator);
         var compiled = new GraphCompiler(registry).Compile(graph);
 
-        Console.WriteLine($"[Integration] Compiled: {compiled.Nodes.Length} nodes");
-        if (compiled.Nodes.Length != graph.Nodes.Count)
-            throw new Exception($"Node count mismatch");
+        Console.WriteLine($"[Integration] Compiled: {compiled.Nodes.Length} nodes (from {graph.Nodes.Count} original, optimizer enabled)");
+        if (compiled.Nodes.Length > graph.Nodes.Count)
+            throw new Exception($"Compiled has MORE nodes than input: {compiled.Nodes.Length} > {graph.Nodes.Count}");
+        if (compiled.Nodes.Length == 0)
+            throw new Exception("Compiled graph has zero nodes");
     }
 
     [TestMethod]

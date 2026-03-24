@@ -32,6 +32,8 @@ public class MissingElementWiseKernels
     // TopK
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _topKKernel;
 
+    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+
     public MissingElementWiseKernels(Accelerator accelerator) => _accelerator = accelerator;
 
     // ──────────────────────────────────────────────
@@ -124,14 +126,16 @@ public class MissingElementWiseKernels
         int outC, int inH, int inW, int blockSize)
     {
         int totalOutput = outC * inH * blockSize * inW * blockSize;
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
         var paramsData = new int[] { outC, inH, inW, blockSize };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        EnsureParamsBuf(paramsData.Length);
+        _paramsBuf!.CopyFromCPU(paramsData);
 
         _depthToSpaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(DepthToSpaceImpl);
-        _depthToSpaceKernel(totalOutput, input, output, paramsBuf.View);
+        _depthToSpaceKernel(totalOutput, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -205,13 +209,15 @@ public class MissingElementWiseKernels
             paramsData[1 + rank + i] = outputShape[i];
             paramsData[1 + 2 * rank + i] = inputStrides[i];
         }
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        EnsureParamsBuf(paramsData.Length);
+        _paramsBuf!.CopyFromCPU(paramsData);
 
         _expandKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ExpandImpl);
-        _expandKernel(totalOutput, input, output, paramsBuf.View);
+        _expandKernel(totalOutput, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -278,5 +284,18 @@ public class MissingElementWiseKernels
             ArrayView1D<int, Stride1D.Dense>,
             int, int>(TopKImpl);
         _topKKernel(rows, input, outputValues, outputIndices, cols, k);
+    }
+
+    /// <summary>
+    /// Ensures the persistent params buffer is at least the requested size.
+    /// Grows the buffer if needed (Expand params vary with tensor rank).
+    /// </summary>
+    private void EnsureParamsBuf(int minSize)
+    {
+        if (_paramsBuf == null || _paramsBuf.Length < minSize)
+        {
+            _paramsBuf?.Dispose();
+            _paramsBuf = _accelerator.Allocate1D<int>(minSize);
+        }
     }
 }

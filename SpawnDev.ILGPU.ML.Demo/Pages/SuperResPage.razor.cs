@@ -55,7 +55,7 @@ public partial class SuperResPage : IDisposable
                 return;
             }
 
-            _session = await InferenceSession.CreateAsync(_accelerator, Http, "models/super-resolution");
+            _session = await InferenceSession.CreateFromFileAsync(_accelerator, Http, "models/super-resolution/model.onnx");
             _pipeline = new SuperResolutionPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

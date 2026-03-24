@@ -17,6 +17,8 @@ public class TensorLayoutKernel
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _interleavedToPlanarKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _planarToInterleavedKernel;
 
+    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+
     public TensorLayoutKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     // ──────────────────────────────────────────────
@@ -51,14 +53,16 @@ public class TensorLayoutKernel
         ArrayView1D<float, Stride1D.Dense> nhwc,
         int channels, int height, int width)
     {
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        _paramsBuf ??= _accelerator.Allocate1D<int>(3);
         var paramsData = new int[] { channels, height, width };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf.CopyFromCPU(paramsData);
 
         _nchwToNhwcKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(NCHWToNHWCImpl);
-        _nchwToNhwcKernel(channels * height * width, nchw, nhwc, paramsBuf.View);
+        _nchwToNhwcKernel(channels * height * width, nchw, nhwc, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -87,14 +91,16 @@ public class TensorLayoutKernel
         ArrayView1D<float, Stride1D.Dense> nchw,
         int channels, int height, int width)
     {
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        _paramsBuf ??= _accelerator.Allocate1D<int>(3);
         var paramsData = new int[] { channels, height, width };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf.CopyFromCPU(paramsData);
 
         _nhwcToNchwKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(NHWCToNCHWImpl);
-        _nhwcToNchwKernel(channels * height * width, nhwc, nchw, paramsBuf.View);
+        _nhwcToNchwKernel(channels * height * width, nhwc, nchw, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -128,14 +134,16 @@ public class TensorLayoutKernel
         ArrayView1D<float, Stride1D.Dense> planar,
         int width, int height)
     {
-        var paramsData = new int[] { width, height };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        _paramsBuf ??= _accelerator.Allocate1D<int>(3);
+        var paramsData = new int[] { width, height, 0 };
+        _paramsBuf.CopyFromCPU(paramsData);
 
         _interleavedToPlanarKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(InterleavedToPlanarImpl);
-        _interleavedToPlanarKernel(3 * width * height, rgba, planar, paramsBuf.View);
+        _interleavedToPlanarKernel(3 * width * height, rgba, planar, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -174,13 +182,15 @@ public class TensorLayoutKernel
         ArrayView1D<int, Stride1D.Dense> rgba,
         int width, int height)
     {
-        var paramsData = new int[] { width, height };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        _paramsBuf ??= _accelerator.Allocate1D<int>(3);
+        var paramsData = new int[] { width, height, 0 };
+        _paramsBuf.CopyFromCPU(paramsData);
 
         _planarToInterleavedKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(PlanarToInterleavedImpl);
-        _planarToInterleavedKernel(width * height, planar, rgba, paramsBuf.View);
+        _planarToInterleavedKernel(width * height, planar, rgba, _paramsBuf.View);
     }
 }

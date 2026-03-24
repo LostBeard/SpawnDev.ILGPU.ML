@@ -195,7 +195,7 @@ public partial class BenchmarkPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var session = await InferenceSession.CreateAsync(accelerator, Http, "models/squeezenet");
+            var session = await InferenceSession.CreateFromFileAsync(accelerator, Http, "models/squeezenet/model.onnx");
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new ClassificationPipeline(session, accelerator);
@@ -242,7 +242,7 @@ public partial class BenchmarkPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var session = await InferenceSession.CreateAsync(accelerator, Http, "models/super-resolution");
+            var session = await InferenceSession.CreateFromFileAsync(accelerator, Http, "models/super-resolution/model.onnx");
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new SuperResolutionPipeline(session, accelerator);
@@ -288,7 +288,7 @@ public partial class BenchmarkPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var session = await InferenceSession.CreateAsync(accelerator, Http, "models/style-mosaic");
+            var session = await InferenceSession.CreateFromFileAsync(accelerator, Http, "models/style-mosaic/model.onnx");
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new StyleTransferPipeline(session, accelerator);

@@ -242,7 +242,20 @@ public class GraphExecutor : IDisposable
                 InputNames = node.InputNames,
                 ConstantValues = _constantValues,
             };
-            node.Operator.Execute(ctx);
+            try
+            {
+                node.Operator.Execute(ctx);
+            }
+            catch (Exception ex)
+            {
+                var inputInfo = string.Join(", ", nodeInputs.Where(t => t != null).Select(t => $"[{string.Join(",", t.Shape)}]({t.ElementCount})"));
+                var outputInfo = string.Join(", ", node.OutputShapes.Select(s => $"[{string.Join(",", s)}]"));
+                var msg = $"Node {nodeIdx}/{_graph.Nodes.Length} '{node.OpType}' failed: {ex.Message} | " +
+                    $"Inputs: [{string.Join(",", node.InputNames)}] shapes=({inputInfo}), " +
+                    $"Outputs: [{string.Join(",", node.OutputNames)}] shapes=({outputInfo})";
+                Console.WriteLine($"[GraphExecutor] ERROR: {msg}");
+                throw new InvalidOperationException(msg, ex);
+            }
 
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];

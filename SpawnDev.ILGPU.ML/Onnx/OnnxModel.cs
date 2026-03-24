@@ -65,8 +65,8 @@ public class OnnxTensorProto
     /// <summary>0=DEFAULT (data in this message), 1=EXTERNAL (data in separate file).</summary>
     public int DataLocation { get; set; }
 
-    /// <summary>Total number of elements (product of dims).</summary>
-    public long ElementCount => Dims.Length > 0 ? Dims.Aggregate(1L, (a, b) => a * b) : 0;
+    /// <summary>Total number of elements (product of dims). Scalar (Dims=[]) = 1 element per ONNX spec.</summary>
+    public long ElementCount => Dims.Aggregate(1L, (a, b) => a * b);
 
     /// <summary>
     /// Get the tensor data as a float array, converting from the stored format.

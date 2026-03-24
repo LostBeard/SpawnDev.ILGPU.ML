@@ -52,7 +52,7 @@ public class ConvTranspose2DKernel
         int oy = rem % outH;
         int oc = rem / outH;
 
-        float sum = (bias.Length > 0) ? bias[oc] : 0f;
+        double sum = (double)bias[oc]; // Always read — no branch (ANGLE optimizer workaround)
 
         for (int ic = 0; ic < inC; ic++)
         {
@@ -70,13 +70,12 @@ public class ConvTranspose2DKernel
                     int ix = diffX / stride;
                     if (ix >= inW) continue;
 
-                    float w = weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
-                    sum += input[ic * inH * inW + iy * inW + ix] * w;
+                    sum += (double)input[ic * inH * inW + iy * inW + ix] * (double)weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
                 }
             }
         }
 
-        output[idx] = sum;
+        output[idx] = (float)sum;
     }
 
     public void Forward(

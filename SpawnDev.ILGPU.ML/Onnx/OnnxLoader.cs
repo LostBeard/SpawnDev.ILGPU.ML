@@ -119,7 +119,18 @@ public static class OnnxLoader
 
         // Known shapes from value_info + inputs + outputs
         var shapes = new Dictionary<string, int[]>();
-        foreach (var vi in graph.Inputs.Concat(graph.Outputs).Concat(graph.ValueInfo))
+        // Model inputs: default dynamic dims to 1 (batch=1 is standard)
+        foreach (var vi in graph.Inputs)
+        {
+            if (vi.Shape.Count > 0)
+            {
+                shapes[vi.Name] = vi.Shape.Select(d =>
+                    d.DimValue.HasValue ? (int)d.DimValue.Value : 1).ToArray();
+            }
+        }
+        // Outputs and intermediates: only include fully-resolved shapes
+        // (let the compiler infer shapes for tensors with dynamic dims)
+        foreach (var vi in graph.Outputs.Concat(graph.ValueInfo))
         {
             if (vi.Shape.Count > 0 && vi.Shape.All(d => d.DimValue.HasValue))
             {

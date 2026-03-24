@@ -127,6 +127,17 @@ public class WeightLoader
         return null;
     }
 
+    /// <summary>Get the slice info (offset, length) for a named tensor.</summary>
+    public (long offset, long length)? GetSlice(string name)
+        => _tensorSlices.TryGetValue(name, out var slice) ? (slice.offset, slice.length) : null;
+
+    /// <summary>Copy the entire master weight buffer to CPU. One-time operation for bulk weight extraction.</summary>
+    public async Task<float[]> CopyAllToHostAsync()
+    {
+        if (_weightBuffer == null) throw new InvalidOperationException("Weights not loaded.");
+        return await _weightBuffer.CopyToHostAsync<float>();
+    }
+
     /// <summary>Get shape of a tensor.</summary>
     public int[] GetShape(string name) => Shapes[name];
 

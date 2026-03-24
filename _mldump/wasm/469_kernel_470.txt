@@ -1,0 +1,1 @@
+Kernel params=18 (userParams=2), locals=49, code=421b, helpers=0, sharedMem=0, barriers=0, hasBarriers=False, dynSharedElemSize=0, scratchPerThread=0

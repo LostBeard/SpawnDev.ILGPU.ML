@@ -62,7 +62,7 @@ public partial class StylePage : IDisposable
             _pipeline?.Dispose();
 
             var modelName = styleName.ToLowerInvariant().Replace(" ", "-");
-            _session = await InferenceSession.CreateAsync(_accelerator, Http, $"models/style-{modelName}");
+            _session = await InferenceSession.CreateFromFileAsync(_accelerator, Http, $"models/style-{modelName}/model.onnx");
             _pipeline = new StyleTransferPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

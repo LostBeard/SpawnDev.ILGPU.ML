@@ -152,7 +152,7 @@ namespace PlaywrightMultiTest
                         }
 
                         // start a static file server to serve the published output
-                        // Fixed port so IndexedDB persists across runs
+                        // Fixed port so IndexedDB persists across runs (same origin = same IDB)
                         var _port = 5551;
                         var baseUrl = $"https://localhost:{_port}/";
                         testableProject.Server = new StaticFileServer(testableProject.ProjectDetails.WwwRoot, baseUrl);
@@ -166,7 +166,7 @@ namespace PlaywrightMultiTest
                         // Use persistent context so IndexedDB, localStorage, and
                         // File System Access permissions survive across test runs.
                         // This enables ShaderDebugService's debug folder persistence.
-                        var userDataDir = Path.Combine(Path.GetTempPath(), "SpawnDev.ILGPU.PlaywrightProfile");
+                        var userDataDir = Path.Combine(Path.GetTempPath(), "SpawnDev.ILGPU.ML.PlaywrightProfile");
                         Directory.CreateDirectory(userDataDir);
                         LogStatus($"Launching Chromium (persistent profile: {userDataDir})...");
                         testableProject.BrowserContext = await testableProject.Playwright.Chromium.LaunchPersistentContextAsync(
@@ -177,13 +177,18 @@ namespace PlaywrightMultiTest
                                 Args = new[]
                                 {
                                     "--enable-unsafe-webgpu",
-                                    "--enable-features=Vulkan,WebGPUService,SkiaGraphite",
+                                    "--enable-features=Vulkan,WebGPUService,SkiaGraphite,FileSystemAccessPersistentPermission",
                                     "--ignore-gpu-blocklist",
                                     "--no-sandbox",
-                                    "--enable-features=FileSystemAccessPersistentPermission"
+                                    // Auto-grant file system write permission (no prompt)
+                                    "--disable-features=FileSystemAccessPermissionPrompt",
+                                    "--allow-file-access-from-files"
                                 }
                             }).ConfigureAwait(false);
                         testableProject.Browser = testableProject.BrowserContext.Browser;
+                        // Grant all available permissions to avoid prompts
+                        await testableProject.BrowserContext.GrantPermissionsAsync(
+                            new[] { "clipboard-read", "clipboard-write" }).ConfigureAwait(false);
                         // new page
                         testableProject.Page = await testableProject.BrowserContext.NewPageAsync().ConfigureAwait(false);
 
@@ -192,11 +197,34 @@ namespace PlaywrightMultiTest
                         Directory.CreateDirectory(wgslDumpDir);
                         var consoleLogPath = Path.Combine(wgslDumpDir, "browser_console.log");
                         File.WriteAllText(consoleLogPath, ""); // clear previous log
+                        var wasmDumpChunks = new System.Collections.Generic.List<string>();
                         testableProject.Page.Console += (_, msg) =>
                         {
                             var text = msg.Text;
-                            // Only log messages related to WGSL dumps or errors
-                            if (text.Contains("WGSL") || text.Contains("@compute") || text.Contains("@workgroup_size") || text.Contains("WGSL_DUMP") || text.Contains("GLSL_DUMP") || msg.Type == "error")
+                            // Capture Wasm binary dumps: collect base64 chunks and write to disk
+                            if (text.StartsWith("[Wasm_DUMP]"))
+                            {
+                                wasmDumpChunks.Add(text.Substring("[Wasm_DUMP]".Length));
+                            }
+                            else if (text.StartsWith("[Wasm_DUMP_END]") && wasmDumpChunks.Count > 0)
+                            {
+                                try
+                                {
+                                    var b64 = string.Join("", wasmDumpChunks);
+                                    var bytes = Convert.FromBase64String(b64);
+                                    var wasmPath = Path.Combine(wgslDumpDir, $"wasm_dump_{DateTime.Now:HHmmss}.wasm");
+                                    File.WriteAllBytes(wasmPath, bytes);
+                                    LogStatus($"Wasm binary dumped: {wasmPath} ({bytes.Length} bytes)");
+                                }
+                                catch (Exception ex) { LogStatus($"Wasm dump failed: {ex.Message}"); }
+                                wasmDumpChunks.Clear();
+                            }
+                            else if (text.StartsWith("[Wasm_DUMP_START]"))
+                            {
+                                wasmDumpChunks.Clear();
+                            }
+                            // Only log messages related to WGSL dumps, Wasm worker traces, or errors
+                            if (text.Contains("WGSL") || text.Contains("@compute") || text.Contains("@workgroup_size") || text.Contains("WGSL_DUMP") || text.Contains("GLSL_DUMP") || text.Contains("[WasmWorker]") || text.Contains("[Wasm") || text.Contains("CONV2D_TRACE") || text.Contains("TEX_UNIT") || text.Contains("PREPROCESS_TRACE") || text.Contains("LAYER_TRACE") || text.Contains("LOGITS_TRACE") || text.Contains("CPU_LOGITS") || text.Contains("DISP_TRACE") || text.Contains("TF_OFFSET") || msg.Type == "error")
                             {
                                 try
                                 {

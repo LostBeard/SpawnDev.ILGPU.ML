@@ -27,12 +27,13 @@ public abstract partial class MLTestBase
         {
             float srcX = (dx + 0.5f) * srcW / dstW - 0.5f;
             float srcY = (dy + 0.5f) * srcH / dstH - 0.5f;
-            int x0 = Math.Clamp((int)srcX, 0, srcW - 1);
-            int x1 = Math.Clamp(x0 + 1, 0, srcW - 1);
-            int y0 = Math.Clamp((int)srcY, 0, srcH - 1);
-            int y1 = Math.Clamp(y0 + 1, 0, srcH - 1);
-            float fx = srcX - (int)srcX; float fy = srcY - (int)srcY;
-            if (fx < 0) fx = 0; if (fy < 0) fy = 0;
+            int x0f = (int)MathF.Floor(srcX);
+            int y0f = (int)MathF.Floor(srcY);
+            float fx = srcX - x0f; float fy = srcY - y0f;
+            int x0 = Math.Clamp(x0f, 0, srcW - 1);
+            int x1 = Math.Clamp(x0f + 1, 0, srcW - 1);
+            int y0 = Math.Clamp(y0f, 0, srcH - 1);
+            int y1 = Math.Clamp(y0f + 1, 0, srcH - 1);
 
             int p00 = input[y0 * srcW + x0], p10 = input[y0 * srcW + x1];
             int p01 = input[y1 * srcW + x0], p11 = input[y1 * srcW + x1];

@@ -43,6 +43,17 @@ public class FusedLinearOperator : IOnnxOperator
         int K = input.Shape[^1];
         int N = weights.Shape[^1];
 
+        // Bounds validation with diagnostic info
+        if (M * K > input.ElementCount || K * N > weights.ElementCount || N > bias.ElementCount || M * N > output.ElementCount)
+        {
+            throw new InvalidOperationException(
+                $"FusedLinear bounds mismatch: M={M} K={K} N={N}, " +
+                $"input=[{string.Join(",", input.Shape)}] buf={input.ElementCount}, " +
+                $"weights=[{string.Join(",", weights.Shape)}] buf={weights.ElementCount}, " +
+                $"bias=[{string.Join(",", bias.Shape)}] buf={bias.ElementCount}, " +
+                $"output=[{string.Join(",", output.Shape)}] buf={output.ElementCount}");
+        }
+
         // Determine activation type
         var actStr = ctx.GetString("activation", "none").ToLowerInvariant();
         var activation = actStr switch

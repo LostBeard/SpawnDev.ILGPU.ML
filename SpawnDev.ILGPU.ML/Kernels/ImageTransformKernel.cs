@@ -19,6 +19,10 @@ public class ImageTransformKernel
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _padKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _resizeFloatKernel;
 
+    // Persistent params buffer — reused across calls. Must NOT use 'using var' because
+    // WebGPU/Wasm dispatch is async and the GPU reads the buffer after the method returns.
+    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+
     public ImageTransformKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     // ──────────────────────────────────────────────
@@ -43,9 +47,13 @@ public class ImageTransformKernel
         float srcX = (dx + 0.5f) * srcW / dstW - 0.5f;
         float srcY = (dy + 0.5f) * srcH / dstH - 0.5f;
 
-        int x0 = (int)srcX; int x1 = x0 + 1;
-        int y0 = (int)srcY; int y1 = y0 + 1;
-        float fx = srcX - x0; float fy = srcY - y0;
+        // Two-statement floor: prevents ILGPU optimizer from eliding floor() before int cast.
+        // `(int)MathF.Floor(x)` gets optimized to `(int)x` (wrong for negative values).
+        // Storing the float result first blocks the optimization pattern.
+        float floorX = MathF.Floor(srcX); float floorY = MathF.Floor(srcY);
+        int x0 = (int)floorX; int y0 = (int)floorY;
+        int x1 = x0 + 1; int y1 = y0 + 1;
+        float fx = srcX - floorX; float fy = srcY - floorY;
 
         x0 = x0 < 0 ? 0 : (x0 >= srcW ? srcW - 1 : x0);
         x1 = x1 < 0 ? 0 : (x1 >= srcW ? srcW - 1 : x1);
@@ -72,14 +80,14 @@ public class ImageTransformKernel
         ArrayView1D<int, Stride1D.Dense> output,
         int srcW, int srcH, int dstW, int dstH)
     {
-        var paramsData = new int[] { srcW, srcH, dstW, dstH };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { srcW, srcH, dstW, dstH, 0, 0, 0, 0 });
 
         _resizeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ResizeImpl);
-        _resizeKernel(dstW * dstH, input, output, paramsBuf.View);
+        _resizeKernel(dstW * dstH, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -107,9 +115,10 @@ public class ImageTransformKernel
         float srcX = (dx + 0.5f) * srcW / dstW - 0.5f;
         float srcY = (dy + 0.5f) * srcH / dstH - 0.5f;
 
-        int x0 = (int)srcX; int x1 = x0 + 1;
-        int y0 = (int)srcY; int y1 = y0 + 1;
-        float fx = srcX - x0; float fy = srcY - y0;
+        float floorX = MathF.Floor(srcX); float floorY = MathF.Floor(srcY);
+        int x0 = (int)floorX; int y0 = (int)floorY;
+        int x1 = x0 + 1; int y1 = y0 + 1;
+        float fx = srcX - floorX; float fy = srcY - floorY;
 
         x0 = x0 < 0 ? 0 : (x0 >= srcW ? srcW - 1 : x0);
         x1 = x1 < 0 ? 0 : (x1 >= srcW ? srcW - 1 : x1);
@@ -131,14 +140,14 @@ public class ImageTransformKernel
         ArrayView1D<float, Stride1D.Dense> output,
         int channels, int srcH, int srcW, int dstH, int dstW)
     {
-        var paramsData = new int[] { channels, srcH, srcW, dstH, dstW };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { channels, srcH, srcW, dstH, dstW, 0, 0, 0 });
 
         _resizeFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ResizeFloatImpl);
-        _resizeFloatKernel(channels * dstH * dstW, input, output, paramsBuf.View);
+        _resizeFloatKernel(channels * dstH * dstW, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -174,14 +183,14 @@ public class ImageTransformKernel
         ArrayView1D<int, Stride1D.Dense> output,
         int srcW, int srcH, int cropW, int cropH)
     {
-        var paramsData = new int[] { srcW, srcH, cropW, cropH };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { srcW, srcH, cropW, cropH, 0, 0, 0, 0 });
 
         _centerCropKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(CenterCropImpl);
-        _centerCropKernel(cropW * cropH, input, output, paramsBuf.View);
+        _centerCropKernel(cropW * cropH, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -204,14 +213,14 @@ public class ImageTransformKernel
         ArrayView1D<int, Stride1D.Dense> output,
         int width, int height)
     {
-        var paramsData = new int[] { width };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { width, 0, 0, 0, 0, 0, 0, 0 });
 
         _flipHKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlipHImpl);
-        _flipHKernel(width * height, input, output, paramsBuf.View);
+        _flipHKernel(width * height, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -234,14 +243,14 @@ public class ImageTransformKernel
         ArrayView1D<int, Stride1D.Dense> output,
         int width, int height)
     {
-        var paramsData = new int[] { width, height };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { width, height, 0, 0, 0, 0, 0, 0 });
 
         _flipVKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlipVImpl);
-        _flipVKernel(width * height, input, output, paramsBuf.View);
+        _flipVKernel(width * height, input, output, _paramsBuf.View);
     }
 
     // ──────────────────────────────────────────────
@@ -282,13 +291,13 @@ public class ImageTransformKernel
         int dstW = srcW + padLeft + padRight;
         int dstH = srcH + padTop + padBottom;
 
-        var paramsData = new int[] { srcW, srcH, padTop, padLeft, dstW, dstH, padColor };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { srcW, srcH, padTop, padLeft, dstW, dstH, padColor, 0 });
 
         _padKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(PadConstantImpl);
-        _padKernel(dstW * dstH, input, output, paramsBuf.View);
+        _padKernel(dstW * dstH, input, output, _paramsBuf.View);
     }
 }

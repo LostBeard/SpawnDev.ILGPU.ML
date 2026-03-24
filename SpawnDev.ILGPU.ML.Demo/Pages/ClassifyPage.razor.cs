@@ -64,7 +64,7 @@ public partial class ClassifyPage : IDisposable
             _modelProgress = 50;
             StateHasChanged();
             _classService = new ClassificationService(Http);
-            await _classService.LoadModelAsync("models/squeezenet", _accelerator);
+            await _classService.LoadModelAsync("models/squeezenet/model.onnx", _accelerator);
 
             _isModelLoaded = true;
             _modelProgress = 100;

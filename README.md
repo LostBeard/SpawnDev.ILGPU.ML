@@ -114,7 +114,7 @@ var result = await c.CopyToHostAsync<float>();
 | **Runs on** | GPU | GPU | Workers | NVIDIA GPU | Any GPU | CPU cores |
 | **Transpiles to** | WGSL | GLSL ES 3.0 | Wasm binary | PTX | OpenCL C | Threads |
 | **Shared memory** | Yes | No | Yes | Yes | Yes | Yes |
-| **Environment** | Browser | Browser | Browser | Desktop | Desktop | Both |
+| **Environment** | Browser | Browser | Browser | Desktop | Desktop | Desktop |
 
 Auto-selection: WebGPU > WebGL > Wasm (browser) or CUDA > OpenCL > CPU (desktop).
 

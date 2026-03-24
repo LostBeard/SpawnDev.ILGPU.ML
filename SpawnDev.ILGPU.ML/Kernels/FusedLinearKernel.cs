@@ -139,11 +139,26 @@ public class FusedLinearKernel
             sum += input[row * K + k] * weights[k * N + col];
 
         float x = sum + bias[col];
-        // Fast GELU approximation with clamping for numerical stability
+        // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))) — must match ElementWiseKernels.GELUImpl
         if (x > 10f) { output[idx] = x; return; }
         if (x < -10f) { output[idx] = 0f; return; }
-        float e2x = MathF.Exp(2f * x);
-        output[idx] = x * e2x / (1f + e2x);
+        const float INV_SQRT2 = 0.7071067811865475f;
+        float z = x * INV_SQRT2;
+        float az = z < 0f ? -z : z;
+        const float p = 0.3275911f;
+        const float a1 = 0.254829592f;
+        const float a2 = -0.284496736f;
+        const float a3 = 1.421413741f;
+        const float a4 = -1.453152027f;
+        const float a5 = 1.061405429f;
+        float t = 1f / (1f + p * az);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        float t4 = t3 * t;
+        float t5 = t4 * t;
+        float erfAbs = 1f - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * MathF.Exp(-az * az);
+        float erf = z < 0f ? -erfAbs : erfAbs;
+        output[idx] = 0.5f * x * (1f + erf);
     }
 
     private static void FusedLinearSiluImpl(Index1D idx,

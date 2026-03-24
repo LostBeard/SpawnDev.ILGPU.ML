@@ -66,7 +66,13 @@ public class Conv2DKernel
         int oy = rem % outH;
         int oc = rem / outH;
 
-        float sum = (bias.Length > 0) ? bias[oc] : 0f;
+        // Double accumulation: eliminates precision errors across all backends.
+        // Dekker f64 emulation on WebGPU/WebGL is fast (90 FPS proven).
+        // Always read bias — no conditional branch. ANGLE's HLSL optimizer changes
+        // FP evaluation of the accumulation loop when a branch precedes it, causing
+        // 0.009 error on WebGL. Callers must always provide a valid bias buffer
+        // (zero-filled if no bias). See data-FINAL-ROOT-CAUSE-bias-branch.
+        double sum = (double)bias[oc];
 
         // Triple-nested convolution loop. Requires SpawnDev.ILGPU with the
         // PushPhiValuesTransitive fix (commit 2b6b314) for correct WGSL codegen.
@@ -84,12 +90,12 @@ public class Conv2DKernel
                     int ix = ox * stride + kx - padding;
                     if (ix < 0 || ix >= inW) continue;
 
-                    sum += input[icBase + iy * inW + ix] * weight[wcBase + ky * kW + kx];
+                    sum += (double)input[icBase + iy * inW + ix] * (double)weight[wcBase + ky * kW + kx];
                 }
             }
         }
 
-        output[idx] = sum;
+        output[idx] = (float)sum;
     }
 
     /// <summary>
@@ -143,7 +149,7 @@ public class Conv2DKernel
         int oy = rem % outH;
         int c = rem / outH;
 
-        float sum = (bias.Length > 0) ? bias[c] : 0f;
+        double sum = (double)bias[c]; // Always read — no branch (ANGLE optimizer workaround)
 
         int inBase = c * inH * inW;
         int wBase = c * kH * kW; // weight [C, 1, kH, kW] = [C, kH*kW]
@@ -157,11 +163,11 @@ public class Conv2DKernel
                 int ix = ox * stride + kx - padding;
                 if (ix < 0 || ix >= inW) continue;
 
-                sum += input[inBase + iy * inW + ix] * weight[wBase + ky * kW + kx];
+                sum += (double)input[inBase + iy * inW + ix] * (double)weight[wBase + ky * kW + kx];
             }
         }
 
-        output[idx] = sum;
+        output[idx] = (float)sum;
     }
 
     /// <summary>

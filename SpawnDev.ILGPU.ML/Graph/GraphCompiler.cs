@@ -83,33 +83,155 @@ public class GraphCompiler
                 outputShapes = new[] { inputShapes[0] };
             }
 
+            // Compile-time evaluation of Shape nodes: output = input's known shape as a 1D tensor
+            if (node.OpType == "Shape" && node.Inputs.Count >= 1
+                && knownShapes.TryGetValue(node.Inputs[0], out var shapeInputShape))
+            {
+                var shapeValues = shapeInputShape;
+                outputShapes = new[] { new[] { shapeValues.Length } };
+                // Store computed values so downstream Reshape/Gather can use them
+                graph.ConstantData ??= new Dictionary<string, int[]>();
+                if (node.Outputs.Count > 0)
+                    graph.ConstantData[node.Outputs[0]] = shapeValues;
+            }
+
+            // Compile-time evaluation of Gather on known constant data
+            if (node.OpType == "Gather" && node.Inputs.Count >= 2
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var gatherSrc)
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var gatherIdxData)
+                && gatherIdxData.Length == 1)
+            {
+                int gIdx = gatherIdxData[0];
+                if (gIdx < 0) gIdx += gatherSrc.Length;
+                if (gIdx >= 0 && gIdx < gatherSrc.Length)
+                {
+                    outputShapes = new[] { new[] { 1 } }; // scalar as 1D
+                    if (node.Outputs.Count > 0)
+                        graph.ConstantData[node.Outputs[0]] = new[] { gatherSrc[gIdx] };
+                }
+            }
+
+            // Compile-time Concat evaluation on known constants
+            if (node.OpType == "Concat" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && node.Inputs.All(inp => !string.IsNullOrEmpty(inp) && graph.ConstantData.ContainsKey(inp)))
+            {
+                var concatVals = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
+                outputShapes = new[] { new[] { concatVals.Length } };
+                if (node.Outputs.Count > 0)
+                    graph.ConstantData[node.Outputs[0]] = concatVals;
+            }
+
+            // Unsqueeze on known constants
+            if (node.OpType == "Unsqueeze" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var unsqData))
+            {
+                if (node.Outputs.Count > 0)
+                    graph.ConstantData[node.Outputs[0]] = unsqData;
+            }
+
+            // Compile-time Slice on known constants: Slice(data, starts, ends[, axes, steps])
+            if (node.OpType == "Slice" && node.Inputs.Count >= 3
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceData)
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var sliceStarts)
+                && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds))
+            {
+                int start = sliceStarts[0];
+                int end = sliceEnds[0];
+                if (start < 0) start += sliceData.Length;
+                if (end < 0) end += sliceData.Length;
+                end = Math.Min(end, sliceData.Length);
+                if (start >= 0 && end > start)
+                {
+                    var sliced = sliceData.Skip(start).Take(end - start).ToArray();
+                    outputShapes = new[] { new[] { sliced.Length } };
+                    if (node.Outputs.Count > 0)
+                        graph.ConstantData[node.Outputs[0]] = sliced;
+                }
+            }
+
+            // Compile-time scalar/element-wise arithmetic on known constants
+            if (node.OpType is "Mul" or "Add" or "Sub" or "Div"
+                && node.Inputs.Count >= 2
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var arithA)
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var arithB))
+            {
+                int len = Math.Max(arithA.Length, arithB.Length);
+                var result = new int[len];
+                for (int j = 0; j < len; j++)
+                {
+                    int a = arithA[j % arithA.Length];
+                    int b = arithB[j % arithB.Length];
+                    result[j] = node.OpType switch
+                    {
+                        "Mul" => a * b,
+                        "Add" => a + b,
+                        "Sub" => a - b,
+                        "Div" => b != 0 ? a / b : 0,
+                        _ => a
+                    };
+                }
+                outputShapes = new[] { arithA.Length >= arithB.Length ? inputShapes[0] : inputShapes[1] };
+                if (node.Outputs.Count > 0)
+                    graph.ConstantData[node.Outputs[0]] = result;
+            }
+
+            // Compile-time Cast on known constants (int values stay the same)
+            if (node.OpType == "Cast" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var castData))
+            {
+                if (node.Outputs.Count > 0)
+                    graph.ConstantData[node.Outputs[0]] = castData;
+            }
+
+            // Compile-time Squeeze on known constants
+            if (node.OpType == "Squeeze" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var sqData))
+            {
+                if (node.Outputs.Count > 0)
+                    graph.ConstantData[node.Outputs[0]] = sqData;
+            }
+
             // Special-case: Reshape needs the actual shape tensor values.
-            // If the second input is a known initializer with shape [N], the output
-            // has N dimensions. The Transpose perm length must match this rank.
-            // We can infer the output shape from the initializer's known data
-            // by reading it from the graph's initializer constants.
             if (node.OpType == "Reshape" && node.Inputs.Count >= 2)
             {
                 var shapeTensorName = node.Inputs[1];
-                if (knownShapes.TryGetValue(shapeTensorName, out var shapeTensorShape)
-                    && shapeTensorShape.Length == 1)
+                if (graph.ConstantData != null && graph.ConstantData.TryGetValue(shapeTensorName, out var targetDims))
                 {
-                    int outRank = shapeTensorShape[0];
-                    // We don't have the actual values here, but we know the output rank.
-                    // If the graph provides initializer values via the ConstantData dict, use them.
-                    if (graph.ConstantData != null && graph.ConstantData.TryGetValue(shapeTensorName, out var targetDims))
+                    int inputElems = inputShapes[0].Aggregate(1, (a, b) => a * b);
+                    var outShape = targetDims.ToArray();
+                    // Handle 0 dims (copy from input shape)
+                    for (int j = 0; j < outShape.Length; j++)
+                        if (outShape[j] == 0 && j < inputShapes[0].Length) outShape[j] = inputShapes[0][j];
+                    int negIdx = Array.IndexOf(outShape, -1);
+                    if (negIdx >= 0)
                     {
-                        // targetDims contains the actual reshape target values (may have -1)
+                        int knownProduct = 1;
+                        for (int j = 0; j < outShape.Length; j++)
+                            if (j != negIdx) knownProduct *= outShape[j];
+                        outShape[negIdx] = knownProduct > 0 ? inputElems / knownProduct : 1;
+                    }
+                    outputShapes = new[] { outShape };
+                }
+                else
+                {
+                    // Shape tensor not resolved — log warning for debugging
+                    var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
+                    Console.WriteLine($"[SHAPE_WARN] Reshape '{outName}': shape tensor '{shapeTensorName}' not in ConstantData — using fallback");
+                    if (knownShapes.TryGetValue(shapeTensorName, out var shapeTensorShape)
+                        && shapeTensorShape.Length == 1)
+                    {
+                        int outRank = shapeTensorShape[0];
+                        var outShape = new int[outRank];
                         int inputElems = inputShapes[0].Aggregate(1, (a, b) => a * b);
-                        var outShape = targetDims.ToArray();
-                        int negIdx = Array.IndexOf(outShape, -1);
-                        if (negIdx >= 0)
-                        {
-                            int knownProduct = 1;
-                            for (int j = 0; j < outShape.Length; j++)
-                                if (j != negIdx) knownProduct *= outShape[j];
-                            outShape[negIdx] = knownProduct > 0 ? inputElems / knownProduct : 1;
-                        }
+                        outShape[0] = inputElems;
+                        for (int j = 1; j < outRank; j++) outShape[j] = 1;
                         outputShapes = new[] { outShape };
                     }
                 }
@@ -134,6 +256,10 @@ public class GraphCompiler
                 OutputShapes = outputShapes,
             });
         }
+
+        // Log compile-time evaluation stats
+        if (graph.ConstantData != null && graph.ConstantData.Count > 0)
+            Console.WriteLine($"[GraphCompiler] Compile-time constants: {graph.ConstantData.Count} tensors evaluated");
 
         return new CompiledGraph
         {

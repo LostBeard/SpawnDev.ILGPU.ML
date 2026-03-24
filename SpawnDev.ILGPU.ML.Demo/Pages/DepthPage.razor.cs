@@ -56,17 +56,12 @@ public partial class DepthPage : IDisposable
                 return;
             }
 
-            // Try direct .onnx loading first, fall back to extracted format
-            try
-            {
-                _session = await InferenceSession.CreateFromOnnxAsync(
-                    _accelerator, Http, "models/depth-anything-v2-small/model.onnx");
-            }
-            catch
-            {
-                _session = await InferenceSession.CreateAsync(
-                    _accelerator, Http, "models/depth-anything-v2-small");
-            }
+            _session = await InferenceSession.CreateFromFileAsync(
+                _accelerator, Http, "models/depth-anything-v2-small/model.onnx",
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["pixel_values"] = new[] { 1, 3, 518, 518 }
+                });
 
             _pipeline = new DepthEstimationPipeline(_session, _accelerator);
 

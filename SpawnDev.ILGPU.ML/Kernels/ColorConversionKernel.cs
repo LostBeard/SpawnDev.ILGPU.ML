@@ -20,6 +20,8 @@ public class ColorConversionKernel
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _flipVerticalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _depthToColormapKernel;
 
+    private MemoryBuffer1D<float, Stride1D.Dense>? _paramsBuf;
+
     public ColorConversionKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     // ──────────────────────────────────────────────
@@ -265,13 +267,15 @@ public class ColorConversionKernel
         int pixelCount,
         float minDepth, float maxDepth, int paletteId = 0)
     {
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        _paramsBuf ??= _accelerator.Allocate1D<float>(3);
         var paramsData = new float[] { minDepth, maxDepth, paletteId };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf.CopyFromCPU(paramsData);
 
         _depthToColormapKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(DepthToColormapImpl);
-        _depthToColormapKernel(pixelCount, depth, rgba, paramsBuf.View);
+        _depthToColormapKernel(pixelCount, depth, rgba, _paramsBuf.View);
     }
 }

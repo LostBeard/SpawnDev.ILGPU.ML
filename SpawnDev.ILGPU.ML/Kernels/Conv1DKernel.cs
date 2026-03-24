@@ -31,6 +31,8 @@ public class Conv1DKernel
         ArrayView1D<int, Stride1D.Dense>>?   // params packed as ints
         _conv1dFlatKernel;
 
+    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+
     public Conv1DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -55,10 +57,12 @@ public class Conv1DKernel
         EnsureLoaded();
 
         // Pack params into int array to avoid exceeding scalar parameter limits
+        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+        _paramsBuf ??= _accelerator.Allocate1D<int>(12);
         var paramsData = new int[] { inC, inL, outC, outL, kL, stride, padding, dilation, groups, inCPerGroup, outCPerGroup, kernelLoopSize };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _paramsBuf.CopyFromCPU(paramsData);
 
-        _conv1dFlatKernel!(totalOutput, input, weight, bias, output, paramsBuf.View);
+        _conv1dFlatKernel!(totalOutput, input, weight, bias, output, _paramsBuf.View);
     }
 
     /// <summary>

@@ -66,6 +66,7 @@ public class ClassificationPipeline : IDisposable
         await _accelerator.SynchronizeAsync();
         var logits = await readBuf.CopyToHostAsync<float>(0, numClasses);
 
+
         // Check if output is already softmax'd (values sum to ~1.0)
         // If so, skip softmax to avoid double-softmax flattening
         float outputSum = logits.Sum();

@@ -8,11 +8,9 @@ namespace SpawnDev.ILGPU.ML;
 /// Uses auto-grouped kernels (no shared memory) to avoid WGSL variable redeclaration bug
 /// with multiple LoadStreamKernel calls on the same accelerator.
 ///
-/// Two-pass approach:
-///   Pass 1: Each thread handles one row — computes mean, variance, and normalizes in one pass.
-///   (C=384 is small enough for sequential processing per row.)
-///
-/// Future home: SpawnDev.ILGPU.ML
+/// Two-pass approach (WebGL TF compatible — each thread writes at most one output element):
+///   Pass 1: One thread per row — compute mean and invStd via Welford. Write to temp buffers.
+///   Pass 2: One thread per element — apply normalization using pre-computed stats.
 /// </summary>
 public class LayerNormKernel
 {
@@ -20,46 +18,71 @@ public class LayerNormKernel
 
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,  // input [rows*C]
+        ArrayView1D<float, Stride1D.Dense>,  // means [rows]
+        ArrayView1D<float, Stride1D.Dense>,  // invStds [rows]
+        int, float>?                          // C, epsilon
+        _meanVarKernel;
+
+    private Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,  // input [rows*C]
         ArrayView1D<float, Stride1D.Dense>,  // output [rows*C]
         ArrayView1D<float, Stride1D.Dense>,  // gamma [C]
         ArrayView1D<float, Stride1D.Dense>,  // beta [C]
-        int, float>?                          // C, epsilon
-        _kernel;
+        ArrayView1D<float, Stride1D.Dense>,  // means [rows]
+        ArrayView1D<float, Stride1D.Dense>,  // invStds [rows]
+        int>?                                 // C
+        _applyKernel;
+
+    private MemoryBuffer1D<float, Stride1D.Dense>? _means;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _invStds;
 
     public LayerNormKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
-    /// One thread per row. Sequential mean/var/normalize over C elements.
-    /// For C=384, this is ~1200 FLOPs per thread — trivial.
+    /// Pass 1: One thread per row. Compute mean and invStd via double-precision Welford.
+    /// Writes exactly 2 values per thread (means[row], invStds[row]) — TF compatible.
     /// </summary>
-    private static void LayerNormRowImpl(
+    private static void LayerNormMeanVarImpl(
         Index1D row,
         ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<float, Stride1D.Dense> gamma,
-        ArrayView1D<float, Stride1D.Dense> beta,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
         int C, float epsilon)
     {
         int offset = row * C;
 
-        // Mean
-        float sum = 0f;
-        for (int i = 0; i < C; i++)
-            sum += input[offset + i];
-        float mean = sum / C;
-
-        // Variance
-        float varSum = 0f;
+        // Double-precision Welford: numerically stable single-pass mean + variance.
+        double mean = 0.0;
+        double m2 = 0.0;
         for (int i = 0; i < C; i++)
         {
-            float diff = input[offset + i] - mean;
-            varSum += diff * diff;
+            double x = (double)input[offset + i];
+            double delta = x - mean;
+            mean += delta / (i + 1);
+            double delta2 = x - mean;
+            m2 += delta * delta2;
         }
-        float invStd = 1f / MathF.Sqrt(varSum / C + epsilon);
+        means[row] = (float)mean;
+        invStds[row] = 1f / MathF.Sqrt((float)(m2 / C) + epsilon);
+    }
 
-        // Normalize + scale + bias
-        for (int i = 0; i < C; i++)
-            output[offset + i] = gamma[i] * ((input[offset + i] - mean) * invStd) + beta[i];
+    /// <summary>
+    /// Pass 2: One thread per element. Apply normalization using pre-computed stats.
+    /// Writes exactly 1 value per thread — TF compatible.
+    /// </summary>
+    private static void LayerNormApplyImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> gamma,
+        ArrayView1D<float, Stride1D.Dense> beta,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int C)
+    {
+        int row = idx / C;
+        int col = idx % C;
+        output[idx] = gamma[col] * ((input[idx] - means[row]) * invStds[row]) + beta[col];
     }
 
     public void Forward(
@@ -71,17 +94,41 @@ public class LayerNormKernel
     {
         var accelerator = _accelerator;
         EnsureLoaded(accelerator);
-        _kernel!(rows, input, output, gamma, beta, C, epsilon);
+
+        // Allocate/resize persistent temp buffers
+        if (_means == null || _means.Length < rows)
+        {
+            _means?.Dispose();
+            _means = accelerator.Allocate1D<float>(rows);
+        }
+        if (_invStds == null || _invStds.Length < rows)
+        {
+            _invStds?.Dispose();
+            _invStds = accelerator.Allocate1D<float>(rows);
+        }
+
+        // Pass 1: compute mean + invStd per row
+        _meanVarKernel!(rows, input, _means.View, _invStds.View, C, epsilon);
+
+        // Pass 2: apply normalization per element
+        _applyKernel!(rows * C, input, output, gamma, beta, _means.View, _invStds.View, C);
     }
 
     private void EnsureLoaded(Accelerator accelerator)
     {
-        _kernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        _meanVarKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int, float>(LayerNormMeanVarImpl);
+        _applyKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int, float>(LayerNormRowImpl);
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int>(LayerNormApplyImpl);
     }
 
     public async Task DiagnosticAsync()

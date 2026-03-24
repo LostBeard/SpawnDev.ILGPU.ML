@@ -18,32 +18,38 @@ public class SoftmaxKernel
 {
     private readonly Accelerator _accelerator;
 
-    // Pass 1: compute per-row max and sum(exp), store exp values in-place
+    // Pass 1: compute per-row max and sum(exp) — no in-place data writes (TF compatible)
     private Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int>?
-        _softmaxExpKernel;
+        _softmaxStatsKernel;
 
-    // Pass 2: normalize each element by row sum (with row offset for batching)
+    // Pass 2: compute exp(x-max)/sum per element — one write per thread (TF compatible)
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
         int, int>?
-        _softmaxNormKernel;
+        _softmaxApplyKernel;
 
-    // Persistent temp buffer for row sums (reused across calls, resized as needed)
+    // Persistent temp buffers (reused across calls, resized as needed)
+    private MemoryBuffer1D<float, Stride1D.Dense>? _rowMaxesBuf;
     private MemoryBuffer1D<float, Stride1D.Dense>? _rowSumsBuf;
-    private int _rowSumsCapacity;
+    private int _rowStatsCapacity;
 
     public SoftmaxKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
-    /// Pass 1: One thread per row. Find max, compute exp(x-max), accumulate sum.
+    /// Pass 1: One thread per row. Find max and compute sum(exp(x-max)).
+    /// Writes exactly 2 values per thread (rowMaxes[row], rowSums[row]) — TF compatible.
+    /// Does NOT write exp values to data (avoids multi-write-in-loop TF bug).
     /// </summary>
-    private static void SoftmaxExpImpl(
+    private static void SoftmaxStatsImpl(
         Index1D row,
         ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> rowMaxes,
         ArrayView1D<float, Stride1D.Dense> rowSums,
         int cols)
     {
@@ -56,31 +62,31 @@ public class SoftmaxKernel
             float v = data[offset + i];
             if (v > max) max = v;
         }
+        rowMaxes[row] = max;
 
-        // Compute exp(x - max) in-place + accumulate sum
-        float sum = 0f;
+        // Double-precision accumulation for exp sum
+        double sum = 0.0;
         for (int i = 0; i < cols; i++)
-        {
-            float e = MathF.Exp(data[offset + i] - max);
-            data[offset + i] = e;
-            sum += e;
-        }
+            sum += (double)MathF.Exp(data[offset + i] - max);
 
-        rowSums[row] = sum;
+        rowSums[row] = (float)sum;
     }
 
     /// <summary>
-    /// Pass 2: One thread per element. Divide by row sum.
-    /// rowOffset allows batching rows to stay within WebGPU dispatch limits.
+    /// Pass 2: One thread per element. Compute exp(x-max)/sum in-place.
+    /// Writes exactly 1 value per thread — TF compatible.
+    /// Recomputes exp per element (cheap, avoids pass 1 multi-write).
     /// </summary>
-    private static void SoftmaxNormImpl(
+    private static void SoftmaxApplyImpl(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> rowMaxes,
         ArrayView1D<float, Stride1D.Dense> rowSums,
         int cols, int rowOffset)
     {
         int localRow = idx / cols;
-        data[idx] *= 1f / rowSums[localRow + rowOffset];
+        int globalRow = localRow + rowOffset;
+        data[idx] = MathF.Exp(data[idx] - rowMaxes[globalRow]) / rowSums[globalRow];
     }
 
     /// <summary>
@@ -97,39 +103,43 @@ public class SoftmaxKernel
         var accelerator = _accelerator;
         EnsureLoaded(accelerator);
 
-        // Reuse persistent temp buffer (don't allocate+dispose per call — GPU is async)
-        if (_rowSumsBuf == null || _rowSumsCapacity < rows)
+        // Reuse persistent temp buffers (don't allocate+dispose per call — GPU is async)
+        if (_rowSumsBuf == null || _rowStatsCapacity < rows)
         {
+            _rowMaxesBuf?.Dispose();
             _rowSumsBuf?.Dispose();
+            _rowMaxesBuf = accelerator.Allocate1D<float>(rows);
             _rowSumsBuf = accelerator.Allocate1D<float>(rows);
-            _rowSumsCapacity = rows;
+            _rowStatsCapacity = rows;
         }
 
-        // Pass 1: one thread per row — always within limits for reasonable row counts
-        _softmaxExpKernel!(rows, data, _rowSumsBuf.View, cols);
+        // Pass 1: one thread per row — compute max and sum(exp) without modifying data
+        _softmaxStatsKernel!(rows, data, _rowMaxesBuf.View, _rowSumsBuf.View, cols);
 
-        // Pass 2: one thread per element — batch by rows to stay within WebGPU dispatch limit
+        // Pass 2: one thread per element — compute exp(x-max)/sum in-place
         int rowsPerBatch = MAX_DISPATCH / cols;
         if (rowsPerBatch < 1) rowsPerBatch = 1;
         for (int rowStart = 0; rowStart < rows; rowStart += rowsPerBatch)
         {
             int batchRows = Math.Min(rowsPerBatch, rows - rowStart);
             int count = batchRows * cols;
-            _softmaxNormKernel!(count, data.SubView(rowStart * cols, count), _rowSumsBuf.View, cols, rowStart);
+            _softmaxApplyKernel!(count, data.SubView(rowStart * cols, count), _rowMaxesBuf.View, _rowSumsBuf.View, cols, rowStart);
         }
     }
 
     private void EnsureLoaded(Accelerator accelerator)
     {
-        _softmaxExpKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        _softmaxStatsKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int>(SoftmaxExpImpl);
+            ArrayView1D<float, Stride1D.Dense>,
+            int>(SoftmaxStatsImpl);
 
-        _softmaxNormKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        _softmaxApplyKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int, int>(SoftmaxNormImpl);
+            ArrayView1D<float, Stride1D.Dense>,
+            int, int>(SoftmaxApplyImpl);
     }
 
     public async Task DiagnosticAsync()

@@ -20,7 +20,7 @@ public abstract partial class MLTestBase
             {
                 for (int ox = 0; ox < outW; ox++)
                 {
-                    float sum = bias.Length > 0 ? bias[oc] : 0f;
+                    double sum = bias.Length > 0 ? (double)bias[oc] : 0.0;
                     for (int ic = 0; ic < inC; ic++)
                         for (int ky = 0; ky < kH; ky++)
                             for (int kx = 0; kx < kW; kx++)
@@ -28,10 +28,10 @@ public abstract partial class MLTestBase
                                 int iy = oy * stride + ky - padding;
                                 int ix = ox * stride + kx - padding;
                                 if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
-                                    sum += input[ic * inH * inW + iy * inW + ix]
-                                         * weight[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx];
+                                    sum += (double)input[ic * inH * inW + iy * inW + ix]
+                                         * (double)weight[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx];
                             }
-                    output[oc * outH * outW + oy * outW + ox] = sum;
+                    output[oc * outH * outW + oy * outW + ox] = (float)sum;
                 }
             }
         }
@@ -175,16 +175,16 @@ public abstract partial class MLTestBase
             for (int oy = 0; oy < outH; oy++)
                 for (int ox = 0; ox < outW; ox++)
                 {
-                    float sum = bias[c];
+                    double sum = (double)bias[c];
                     for (int ky = 0; ky < kH; ky++)
                         for (int kx = 0; kx < kW; kx++)
                         {
                             int iy = oy * stride + ky - padding;
                             int ix = ox * stride + kx - padding;
                             if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
-                                sum += input[c * inH * inW + iy * inW + ix] * weight[c * kH * kW + ky * kW + kx];
+                                sum += (double)input[c * inH * inW + iy * inW + ix] * (double)weight[c * kH * kW + ky * kW + kx];
                         }
-                    expected[c * outH * outW + oy * outW + ox] = sum;
+                    expected[c * outH * outW + oy * outW + ox] = (float)sum;
                 }
 
         using var inBuf = accelerator.Allocate1D(input);
@@ -217,7 +217,7 @@ public abstract partial class MLTestBase
             for (int oy = 0; oy < outH; oy++)
                 for (int ox = 0; ox < outW; ox++)
                 {
-                    float sum = bias[oc];
+                    double sum = (double)bias[oc];
                     for (int ic = 0; ic < inC; ic++)
                         for (int ky = 0; ky < kH; ky++)
                         {
@@ -231,11 +231,11 @@ public abstract partial class MLTestBase
                                 if (diffX < 0 || diffX % stride != 0) continue;
                                 int ix = diffX / stride;
                                 if (ix >= inW) continue;
-                                sum += input[ic * inH * inW + iy * inW + ix]
-                                     * weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
+                                sum += (double)input[ic * inH * inW + iy * inW + ix]
+                                     * (double)weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
                             }
                         }
-                    expected[oc * outH * outW + oy * outW + ox] = sum;
+                    expected[oc * outH * outW + oy * outW + ox] = (float)sum;
                 }
 
         using var inBuf = accelerator.Allocate1D(input);

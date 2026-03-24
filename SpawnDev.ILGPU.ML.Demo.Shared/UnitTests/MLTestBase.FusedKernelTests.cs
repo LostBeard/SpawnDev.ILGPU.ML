@@ -63,14 +63,10 @@ public abstract partial class MLTestBase
             for (int k = 0; k < K; k++)
                 sum += input[r * K + k] * weights[k * N + c];
             float x = sum + bias[c];
-            // Fast GELU
+            // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
             if (x > 10f) expected[r * N + c] = x;
             else if (x < -10f) expected[r * N + c] = 0f;
-            else
-            {
-                float e2x = MathF.Exp(2f * x);
-                expected[r * N + c] = x * e2x / (1f + e2x);
-            }
+            else expected[r * N + c] = 0.5f * x * (1f + ErfApprox(x * 0.7071067811865475f));
         }
 
         using var inBuf = accelerator.Allocate1D(input);

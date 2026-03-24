@@ -127,6 +127,18 @@ public abstract partial class MLTestBase : IDisposable
         return output;
     }
 
+    /// <summary>Abramowitz & Stegun erf approximation (max error ~1.5e-7). Matches ElementWiseKernels.GELUImpl.</summary>
+    protected static float ErfApprox(float z)
+    {
+        float az = z < 0 ? -z : z;
+        const float p = 0.3275911f;
+        const float a1 = 0.254829592f, a2 = -0.284496736f, a3 = 1.421413741f, a4 = -1.453152027f, a5 = 1.061405429f;
+        float t = 1f / (1f + p * az);
+        float t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+        float erfAbs = 1f - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * MathF.Exp(-az * az);
+        return z < 0 ? -erfAbs : erfAbs;
+    }
+
     protected static void AssertClose(float[] expected, float[] actual, float tolerance, string label = "")
     {
         if (expected.Length != actual.Length)

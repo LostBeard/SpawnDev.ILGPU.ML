@@ -23,13 +23,13 @@ public class ClassificationService : IDisposable
     public ClassificationService(HttpClient http) => _http = http;
 
     /// <summary>Load model for the given accelerator.</summary>
-    public async Task LoadModelAsync(string modelPath, Accelerator accelerator)
+    public async Task LoadModelAsync(string modelUrl, Accelerator accelerator)
     {
         _session?.Dispose();
         _pipeline?.Dispose();
         _accelerator = accelerator;
 
-        _session = await InferenceSession.CreateAsync(accelerator, _http, modelPath);
+        _session = await InferenceSession.CreateFromFileAsync(accelerator, _http, modelUrl);
         _pipeline = new ClassificationPipeline(_session, accelerator);
     }
 

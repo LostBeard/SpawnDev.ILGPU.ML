@@ -124,7 +124,12 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         int group = ctx.GetInt("group", 1);
         int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
         int outC = w.Shape[0]; int kH = w.Shape[2]; int kW = w.Shape[3];
-        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null ? ctx.Inputs[2].Data : default;
+        // Always provide a valid bias buffer — no conditional branch in kernel.
+        // ANGLE's HLSL optimizer changes FP evaluation when a branch precedes
+        // the accumulation loop, causing 0.009 error on WebGL.
+        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
+            ? ctx.Inputs[2].Data
+            : ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias").Data;
 
         if (group == inC && group == outC)
         {
@@ -290,7 +295,12 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
         var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
         int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
         int outC = w.Shape[1]; int kH = w.Shape[2]; int kW = w.Shape[3];
-        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null ? ctx.Inputs[2].Data : default;
+        // Always provide a valid bias buffer — no conditional branch in kernel.
+        // ANGLE's HLSL optimizer changes FP evaluation when a branch precedes
+        // the accumulation loop, causing 0.009 error on WebGL.
+        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
+            ? ctx.Inputs[2].Data
+            : ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias").Data;
         reg.ConvTranspose.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
             inC, inH, inW, outC, kH, kW, stride, pad);
     }
@@ -489,7 +499,13 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
         int outOffset = 0;
         int totalConcatDim = 0;
         for (int n = 0; n < ctx.Inputs.Length; n++)
+        {
+            if (axis >= ctx.Inputs[n].Shape.Length)
+                throw new InvalidOperationException(
+                    $"Concat axis={axis} out of range for input[{n}] shape=[{string.Join(",", ctx.Inputs[n].Shape)}] (rank={ctx.Inputs[n].Shape.Length}). " +
+                    $"All inputs: [{string.Join("; ", ctx.Inputs.Select(t => $"[{string.Join(",", t.Shape)}]"))}]");
             totalConcatDim += ctx.Inputs[n].Shape[axis];
+        }
 
         // For each outer block, copy each input's slice
         for (int n = 0; n < ctx.Inputs.Length; n++)
@@ -774,6 +790,13 @@ public class TransposeOperator(OperatorRegistry reg) : IOnnxOperator
         var perm = ctx.GetInts("perm");
         if (perm.Length == 0)
             perm = Enumerable.Range(0, ctx.Inputs[0].Rank).Reverse().ToArray();
+        // Guard: perm length must match input rank — if not, fall back to reverse
+        if (perm.Length != ctx.Inputs[0].Rank)
+        {
+            if (InferenceSession.VerboseLogging)
+                Console.WriteLine($"[Transpose] WARN: perm[{perm.Length}] != rank[{ctx.Inputs[0].Rank}], shape=[{string.Join(",", ctx.Inputs[0].Shape)}], attrs={string.Join(",", ctx.Attributes.Select(kv => $"{kv.Key}={kv.Value}"))}");
+            perm = Enumerable.Range(0, ctx.Inputs[0].Rank).Reverse().ToArray();
+        }
         reg.Transpose.Transpose(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[0].Shape, perm);
     }

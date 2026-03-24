@@ -17,9 +17,13 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _batchNormKernel;
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
-        int, float>? _rmsNormKernel;
+        int, float>? _rmsNormStatsKernel;
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int>? _rmsNormApplyKernel;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
@@ -60,27 +64,38 @@ public class NormalizationKernels
     }
 
     /// <summary>
-    /// RMSNorm: output = input / RMS(input) * weight, where RMS = sqrt(mean(x^2) + eps).
-    /// One thread per row. Sequential over C elements per row.
-    /// Used by LLaMA, Mistral, etc.
+    /// RMSNorm Pass 1: compute invRms per row. One thread per row.
+    /// Writes exactly 1 value per thread (invRms[row]) — TF compatible.
     /// </summary>
-    private static void RMSNormImpl(Index1D row,
+    private static void RMSNormStatsImpl(Index1D row,
         ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> invRms,
         int C, float epsilon)
     {
         int offset = row * C;
-        float sumSq = 0f;
+        double sumSq = 0.0;
         for (int i = 0; i < C; i++)
         {
-            float v = input[offset + i];
+            double v = (double)input[offset + i];
             sumSq += v * v;
         }
-        float rms = MathF.Sqrt(sumSq / C + epsilon);
-        float invRms = 1f / rms;
-        for (int i = 0; i < C; i++)
-            output[offset + i] = input[offset + i] * invRms * weight[i];
+        invRms[row] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
+    }
+
+    /// <summary>
+    /// RMSNorm Pass 2: apply normalization per element. One thread per element.
+    /// Writes exactly 1 value per thread — TF compatible.
+    /// </summary>
+    private static void RMSNormApplyImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> invRms,
+        int C)
+    {
+        int row = idx / C;
+        int col = idx % C;
+        output[idx] = input[idx] * invRms[row] * weight[col];
     }
 
     /// <summary>
@@ -151,6 +166,7 @@ public class NormalizationKernels
 
     /// <summary>
     /// RMSNorm: input [rows, C] → output [rows, C]. weight: [C].
+    /// Two-pass for WebGL TF compatibility.
     /// </summary>
     public void RMSNorm(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
@@ -158,7 +174,19 @@ public class NormalizationKernels
         int rows, int C, float epsilon = 1e-6f)
     {
         EnsureLoaded();
-        _rmsNormKernel!(rows, input, output, weight, C, epsilon);
+
+        // Allocate/resize persistent temp buffer
+        if (_rmsInvRms == null || _rmsInvRms.Length < rows)
+        {
+            _rmsInvRms?.Dispose();
+            _rmsInvRms = _accelerator.Allocate1D<float>(rows);
+        }
+
+        // Pass 1: compute invRms per row
+        _rmsNormStatsKernel!(rows, input, _rmsInvRms.View, C, epsilon);
+
+        // Pass 2: apply normalization per element
+        _rmsNormApplyKernel!(rows * C, input, output, weight, _rmsInvRms.View, C);
     }
 
     /// <summary>
@@ -202,6 +230,7 @@ public class NormalizationKernels
 
     private MemoryBuffer1D<float, Stride1D.Dense>? _inMeans;
     private MemoryBuffer1D<float, Stride1D.Dense>? _inInvStds;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _rmsInvRms;
 
     private void EnsureLoaded()
     {
@@ -220,9 +249,13 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(InstanceNormApplyImpl);
-        _rmsNormKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        _rmsNormStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
-            int, float>(RMSNormImpl);
+            ArrayView1D<float, Stride1D.Dense>,
+            int, float>(RMSNormStatsImpl);
+        _rmsNormApplyKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int>(RMSNormApplyImpl);
     }
 }
