@@ -45,80 +45,23 @@ internal static class BroadcastHelper
         else if (bVals != null && a.ElementCount > b.ElementCount)
         {
             // b is a small runtime constant, a is a large GPU tensor.
-            // This handles [N,T,C] op [N,T,1] (decomposed LayerNorm Div/Mul).
-            // Strategy: upload b values to GPU, then use per-row GPU operations.
-            int bCount = bVals.Length;
-            int innerSize = a.Shape[^1]; // last dim of a
-            int bDimSize = b.Shape.Length > 0 ? b.Shape.Aggregate(1, (x, y) => x * y) : 1;
-
-            // Apply the binary op by computing result of op on bVals first, then use GPU broadcast
-            var bResult = new float[bCount];
-            for (int i = 0; i < bCount; i++)
-                bResult[i] = bVals[i];
-
-            // Upload processed b to GPU
-            var bTemp = ctx.Pool.AllocatePermanent(bResult, b.Shape);
-
-            // Copy a to output first
-            reg.ElementWise.Scale(a.Data.SubView(0, outCount), ctx.Outputs[0].Data.SubView(0, outCount), outCount, 1f);
-
-            // Apply b broadcast using AddBias pattern (per-channel operation)
-            // AddBias does: data[i] += bias[i % C] where C = innerSize
-            // For Div, we need: data[i] = data[i] op b[broadcast_idx]
-            // If b broadcasts along a middle dimension, we need row-wise operation
-            if (b.ElementCount == 1)
+            // Expand b to full output shape on CPU, upload, then GPU element-wise op.
+            // Uses Rent (not AllocatePermanent) to avoid buffer leaks through 748-node models.
+            var bExpanded = new float[outCount];
+            var bStrides = ComputeStrides(b.Shape, outShape);
+            var outStrides = ComputeStrides(outShape, outShape);
+            for (int i = 0; i < outCount; i++)
             {
-                // Scalar broadcast
-                float scalar = bResult[0];
-                float scaleVal = op(1f, scalar); // For Div: 1/scalar, for Mul: scalar
-                reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, outCount, scaleVal);
+                int bIdx = MapIndex(i, outStrides, bStrides, outShape.Length);
+                bExpanded[i] = bIdx < bVals.Length ? bVals[bIdx] : 0f;
             }
-            else
-            {
-                // General case: compute op results on CPU for small b, broadcast via GPU
-                // For now, use per-row approach for the common [N,T,C] op [N,T,1] pattern
-                // Expand b to match inner dim, then use element-wise op
-                var bExpanded = new float[outCount];
-                var bStrides = ComputeStrides(b.Shape, outShape);
-                var outStrides = ComputeStrides(outShape, outShape);
-                for (int i = 0; i < outCount; i++)
-                {
-                    int bIdx = MapIndex(i, outStrides, bStrides, outShape.Length);
-                    bExpanded[i] = bIdx < bResult.Length ? bResult[bIdx] : 1f;
-                }
-                // Upload expanded b and apply element-wise on GPU
-                var bExpandedTensor = ctx.Pool.AllocatePermanent(bExpanded, outShape);
-                // Now apply the op: for Div, compute a/b element-wise
-                // Since we already copied a to output, compute output = op(output, bExpanded) element-wise
-                // This requires knowing which op we're doing... Use a general approach:
-                // Upload the fully expanded b, then do element-wise op on GPU
-                // For Div: output[i] = a[i] / bExpanded[i]
-                // For Mul: output[i] = a[i] * bExpanded[i]
-                // etc.
-                // Use the Div/Mul/Add/Sub kernel directly
-                // Since we don't know which op at this level, apply via Scale:
-                // Compute reciprocal/identity of bExpanded for each op type...
-                // Actually, we can't determine the op type here.
-                // Better approach: apply on CPU and upload result.
-                var aValsLazy = ctx.TryGetInputValues(0);
-                if (aValsLazy != null)
-                {
-                    // a is also available as constant (rare but possible)
-                    var result = new float[outCount];
-                    for (int i = 0; i < outCount; i++)
-                        result[i] = op(aValsLazy[i], bExpanded[i]);
-                    var resultTensor = ctx.Pool.AllocatePermanent(result, outShape);
-                    reg.ElementWise.Scale(resultTensor.Data, ctx.Outputs[0].Data, outCount, 1f);
-                }
-                else
-                {
-                    // a is not available as constant — use GPU N-D broadcast kernel
-                    // (element-wise with expanded b can cause aliasing if pool reuses buffers)
-                    reg.ElementWise.BroadcastBinaryOpND(
-                        a.Data, bExpandedTensor.Data, ctx.Outputs[0].Data,
-                        a.Shape, outShape, outShape, gpuOp);
-                }
-            }
+            var bExpandedTensor = ctx.Pool.Rent(outShape, "_broadcast_b_expanded");
+            bExpandedTensor.Data.SubView(0, outCount).CopyFromCPU(bExpanded);
+            // Use GPU N-D broadcast kernel (a and bExpanded are same shape → element-wise)
+            reg.ElementWise.BroadcastBinaryOpND(
+                a.Data, bExpandedTensor.Data, ctx.Outputs[0].Data,
+                a.Shape, outShape, outShape, gpuOp);
+            ctx.Pool.Return(bExpandedTensor);
         }
         else
         {
