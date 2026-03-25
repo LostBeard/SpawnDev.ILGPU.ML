@@ -20,6 +20,8 @@ SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kern
 - **7 model formats** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, and CoreML. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **HuggingFace CDN** — Models load directly from HuggingFace with OPFS caching. No bundling, no local storage limits. Search, browse, and load any public model.
+- **Single image to 3D** — TripoSR generates exportable 3D meshes (glTF/OBJ for Blender/Unity). LGM generates 65K Gaussian splats (SPZ/PLY for SpawnScene). Both from a single photo.
+- **3D format export & import** — glTF, OBJ, PLY, SPZ. Full round-trip: generate → export → load → render. First pure C# SPZ parser.
 - **96 numpy-verified operator tests** — every operator validated against known-correct reference data
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 
@@ -283,7 +285,8 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | Demo | What It Does |
 |------|-------------|
 | **Image Generation** | Stable Diffusion-style image generation. Prompt, negative prompt, steps, guidance scale, seed, resolution — all running on WebGPU. |
-| **Image to 3D** | Generate 3D meshes, Gaussian splats, or point clouds from a single photo. Open directly in [SpawnScene](https://github.com/LostBeard/SpawnScene). |
+| **Image to 3D (TripoSR)** | Drop a photo, get a full 3D textured mesh in seconds. Export as glTF/OBJ for Blender, Unity, game engines, or 3D printing. Feed-forward (no diffusion) — DINOv1 encoder + Triplane transformer + Marching Cubes. |
+| **Image to Gaussian Splats (LGM)** | Drop a photo, generate 65,536 photorealistic Gaussian splats. Fly through the 3D scene in [SpawnScene](https://github.com/LostBeard/SpawnScene). Export as SPZ (15-20x compressed) or PLY. |
 | **Depth Voxel** | Live webcam depth → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
 
 ### Infrastructure Demos
@@ -375,6 +378,8 @@ SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML researc
 | **Depth Anything V3** | Multi-view depth + ray maps with temporal consistency | Eliminates depth flicker in video. Treats video as multi-view sequence, not isolated frames. Critical for 2D-to-3D conversion. |
 | **AsyncMDE** | Asynchronous Spatial Memory decouples depth from render loop | Real-time depth estimation at video framerate on standard hardware. No UI lockup during GPU computation. |
 | **Mamba-3** | Linear-scaling State Space Models with MIMO arithmetic intensity | Constant-memory decoding — LLM conversations don't slow down or eat more RAM over time. Closes gap with Transformers while keeping O(n) scaling. |
+| **TripoSR** | Single photo → full 3D textured mesh via DINOv1 + Triplane transformer + Marching Cubes | Export as glTF/OBJ — use in Blender, Unity, game engines, 3D printing. ~840MB FP16, feed-forward (no diffusion). |
+| **LGM** | Single photo → 65,536 photorealistic Gaussian splats | Fly through 3D scenes in SpawnScene. Export as SPZ (15-20x compressed) or PLY. Integrates with the emerging Khronos glTF Gaussian Splatting standard. |
 
 These aren't future plans — they're v4.0.0 features. Because every release is the last release.
 
