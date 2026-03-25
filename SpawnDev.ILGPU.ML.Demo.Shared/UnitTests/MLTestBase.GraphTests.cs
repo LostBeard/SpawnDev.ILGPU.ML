@@ -96,7 +96,7 @@ public abstract partial class MLTestBase
         // Execute
         using var executor = new GraphExecutor(accelerator, compiled, weights);
         var inputTensor = pool.AllocatePermanent(inputData, new[] { M, K });
-        var outputs = executor.Run(new Dictionary<string, Tensor> { ["input"] = inputTensor });
+        var outputs = await executor.RunAsync(new Dictionary<string, Tensor> { ["input"] = inputTensor });
 
         await accelerator.SynchronizeAsync();
 

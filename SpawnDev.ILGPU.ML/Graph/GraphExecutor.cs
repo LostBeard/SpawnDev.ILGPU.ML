@@ -167,13 +167,19 @@ public class GraphExecutor : IDisposable
                     var outName = i < node.OutputNames.Length ? node.OutputNames[i] : null;
                     if (outName != null && !runtimeConstants.ContainsKey(outName))
                     {
-                        _accelerator.Synchronize();
-                        int elCount = outTensor.ElementCount;
-                        using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
-                        tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
-                        _accelerator.Synchronize();
-                        var vals = tmpBuf.GetAsArray1D();
-                        runtimeConstants[outName] = vals;
+                        // Skip runtime constant capture in sync Run() — WebGPU/WebGL/Wasm
+                        // don't support synchronous GPU→CPU copies. NLP models that need
+                        // runtime constants (Shape→Slice chains) should use RunAsync().
+                        // Desktop backends (CPU/CUDA/OpenCL) can use sync copies.
+                        try
+                        {
+                            int elCount = outTensor.ElementCount;
+                            using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
+                            tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
+                            _accelerator.Synchronize();
+                            runtimeConstants[outName] = tmpBuf.GetAsArray1D();
+                        }
+                        catch (NotSupportedException) { /* Browser/WASM backend — skip sync copy */ }
                     }
                 }
             }

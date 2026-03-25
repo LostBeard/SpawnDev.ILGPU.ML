@@ -54,7 +54,8 @@ public abstract partial class MLTestBase
         if (session.SupportedOpCount < 20) throw new Exception($"Too few ops: {session.SupportedOpCount}");
 
         var inputTensor = pool.AllocatePermanent(inputData, new[] { M, K });
-        var output = session.Run("input", inputTensor);
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor> { ["input"] = inputTensor });
+        var output = outputs[session.OutputNames[0]];
 
         await accelerator.SynchronizeAsync();
 

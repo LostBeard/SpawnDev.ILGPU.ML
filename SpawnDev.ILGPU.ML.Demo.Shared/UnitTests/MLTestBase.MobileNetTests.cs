@@ -71,7 +71,7 @@ public abstract partial class MLTestBase
         // Run
         using var executor = new GraphExecutor(accelerator, compiled, weights);
         var inputTensor = pool.AllocatePermanent(RandomFloats(1 * 3 * 8 * 8, seed: 304), new[] { 1, 3, 8, 8 });
-        var outputs = executor.Run(new Dictionary<string, Tensor> { ["input"] = inputTensor });
+        var outputs = await executor.RunAsync(new Dictionary<string, Tensor> { ["input"] = inputTensor });
 
         await accelerator.SynchronizeAsync();
 
@@ -143,7 +143,7 @@ public abstract partial class MLTestBase
 
         using var executor = new GraphExecutor(accelerator, compiled, weights);
         var input = pool.AllocatePermanent(RandomFloats(192, seed:404), new[]{1,3,8,8});
-        var outputs = executor.Run(new Dictionary<string, Tensor> { ["data"] = input });
+        var outputs = await executor.RunAsync(new Dictionary<string, Tensor> { ["data"] = input });
         await accelerator.SynchronizeAsync();
 
         var output = outputs["output"];
