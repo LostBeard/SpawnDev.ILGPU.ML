@@ -510,11 +510,19 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
         int axis = attrs.ContainsKey("axis") ? Convert.ToInt32(attrs["axis"]) : 0;
         if (axis < 0) axis += dataShape.Length;
 
+        // For multi-dimensional data with single-element [1] indices, treat the index
+        // as scalar [] to avoid adding an extra dimension. This is critical for:
+        // - Token extraction: Gather(data=[1,seq,hidden], idx=[0], axis=1) → [1,hidden] not [1,1,hidden]
+        // - Attention reshaping: prevents 5D shapes like [1,1,257,257,0] from cascading
+        // Shape extraction on 1D vectors (axis=0 on [N]) keeps [1] for Concat compatibility.
+        var effectiveIdxShape = (dataShape.Length > 1 && idxShape.Length == 1 && idxShape[0] == 1)
+            ? Array.Empty<int>() : idxShape;
+
         var outShape = new List<int>();
         // Dims before axis
         for (int i = 0; i < axis; i++) outShape.Add(dataShape[i]);
         // Index shape dims (replaces the gathered axis)
-        foreach (var d in idxShape) outShape.Add(d);
+        foreach (var d in effectiveIdxShape) outShape.Add(d);
         // Dims after axis
         for (int i = axis + 1; i < dataShape.Length; i++) outShape.Add(dataShape[i]);
 
