@@ -65,6 +65,10 @@ public class SoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         int axisDim = shape[axis];
         int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
 
+        if (axisDim <= 0)
+            throw new InvalidOperationException($"Softmax axis {axis} has dimension {axisDim} in shape [{string.Join(",", shape)}]. " +
+                $"This indicates a shape inference bug upstream — a 0-dimension tensor should not reach Softmax.");
+
         if (inner == 1)
         {
             // Simple case: softmax over the last dim — standard row softmax

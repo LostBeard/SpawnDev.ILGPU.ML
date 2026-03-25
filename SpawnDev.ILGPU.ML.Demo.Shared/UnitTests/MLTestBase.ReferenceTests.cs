@@ -365,8 +365,12 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         // Depth Anything has dynamic dims — override to 224x224 for browser-safe testing
-        var session = await InferenceSession.CreateFromOnnxAsync(accelerator, http,
-            "models/depth-anything-v2-small/model.onnx");
+        var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
+        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]>
+            {
+                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+            });
 
         var inputBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_input_224_nchw.bin");
         var inputFloats = new float[inputBytes.Length / 4];
