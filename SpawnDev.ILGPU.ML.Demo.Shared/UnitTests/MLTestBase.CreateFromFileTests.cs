@@ -213,19 +213,17 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task CreateFromFile_DepthAnything_Inference() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
-            throw new UnsupportedTestException("Depth Anything inference requires too much GPU memory for browser/CPU — skipped");
-
         var http = GetHttpClient();
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         Console.WriteLine("[DepthInference] Loading model...");
-        var session = await InferenceSession.CreateFromFileAsync(
-            accelerator, http, "models/depth-anything-v2-small/model.onnx",
+        var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
+        var session = InferenceSession.CreateFromOnnx(
+            accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["pixel_values"] = new[] { 1, 3, 518, 518 }
+                ["pixel_values"] = new[] { 1, 3, 224, 224 }
             });
         Console.WriteLine($"[DepthInference] {session}");
 
@@ -267,9 +265,6 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task CreateFromFile_DepthAnything_CatImage() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType is AcceleratorType.CPU or AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
-            throw new UnsupportedTestException("Depth Anything inference requires too much GPU memory for browser/CPU — skipped");
-
         var http = GetHttpClient();
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
@@ -277,11 +272,12 @@ public abstract partial class MLTestBase
         var (pixels, width, height) = await LoadCatImage(http);
         Console.WriteLine($"[DepthCat] Cat image: {width}x{height}");
 
-        var session = await InferenceSession.CreateFromFileAsync(
-            accelerator, http, "models/depth-anything-v2-small/model.onnx",
+        var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
+        var session = InferenceSession.CreateFromOnnx(
+            accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["pixel_values"] = new[] { 1, 3, 518, 518 }
+                ["pixel_values"] = new[] { 1, 3, 224, 224 }
             });
         var pipeline = new DepthEstimationPipeline(session, accelerator);
 
