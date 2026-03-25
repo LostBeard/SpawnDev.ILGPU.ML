@@ -1,5 +1,6 @@
-﻿using Microsoft.Playwright;
+using Microsoft.Playwright;
 using SpawnDev.UnitTesting;
+using System.Diagnostics;
 
 namespace PlaywrightMultiTest
 {
@@ -18,41 +19,44 @@ namespace PlaywrightMultiTest
         [Test, TestCaseSource(nameof(TestCases))]
         public async Task RunTest(ProjectTest test)
         {
-            if (test.Project is TestableBlazorWasm blazorProj)
+            var sw = Stopwatch.StartNew();
+            try
             {
-                try
+                if (test.Project is TestableBlazorWasm blazorProj)
                 {
                     await test.TestFunc(blazorProj.Page);
                     if (test.Result == TestResult.Unsupported)
                     {
+                        sw.Stop();
+                        TestResultsWriter.RecordResult(test.Name, "Skip", test.ResultMessage, sw.Elapsed.TotalMilliseconds);
                         Assert.Ignore(test.ResultMessage!);
                     }
                 }
-                catch (Exception ex)
-                {
-                    throw;
-                }
-            }
-            else if (test.Project is TestableConsole consoleProj)
-            {
-                try
+                else if (test.Project is TestableConsole)
                 {
                     await test.TestFunc(null!);
                     if (test.Result == TestResult.Unsupported)
                     {
+                        sw.Stop();
+                        TestResultsWriter.RecordResult(test.Name, "Skip", test.ResultMessage, sw.Elapsed.TotalMilliseconds);
                         Assert.Ignore(test.ResultMessage!);
                     }
                 }
-                catch (Exception ex)
-                {
-                    throw;
-                }
+                sw.Stop();
+                TestResultsWriter.RecordResult(test.Name, "Pass", null, sw.Elapsed.TotalMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                TestResultsWriter.RecordResult(test.Name, "Fail", ex.Message, sw.Elapsed.TotalMilliseconds);
+                throw;
             }
         }
 
         [OneTimeTearDown]
         public async Task StopApp()
         {
+            TestResultsWriter.WriteFinalSummary();
             await ProjectRunner.Instance.Shutdown();
         }
     }
