@@ -112,10 +112,11 @@ internal static class BroadcastHelper
                 }
                 else
                 {
-                    // a is not available as constant — use the expanded b for GPU element-wise
-                    // Apply: Div → use element-wise div kernel with expanded b
-                    reg.ElementWise.Div(a.Data.SubView(0, outCount), bExpandedTensor.Data.SubView(0, outCount),
-                        ctx.Outputs[0].Data.SubView(0, outCount), outCount);
+                    // a is not available as constant — use GPU N-D broadcast kernel
+                    // (element-wise with expanded b can cause aliasing if pool reuses buffers)
+                    reg.ElementWise.BroadcastBinaryOpND(
+                        a.Data, bExpandedTensor.Data, ctx.Outputs[0].Data,
+                        a.Shape, outShape, outShape, gpuOp);
                 }
             }
         }

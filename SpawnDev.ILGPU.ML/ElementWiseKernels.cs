@@ -475,18 +475,18 @@ public class ElementWiseKernels
         var outStrides = Operators.BroadcastHelper.ComputeStrides(outShape, outShape);
 
         // Pack strides: [rank, aStrides[0..rank], bStrides[0..rank], outStrides[0..rank]]
+        // CRITICAL: Allocate a new buffer per call — WebGPU dispatch is async,
+        // and reusing a shared buffer causes race conditions when multiple
+        // BroadcastBinaryOpND calls are queued (e.g., decomposed LayerNorm:
+        // Sub, Pow, Div, Mul all dispatch in sequence without sync).
         int paramsSize = 1 + 3 * rank;
-        if (_broadcastStridesBuf == null || _broadcastStridesBuf.Length < paramsSize)
-        {
-            _broadcastStridesBuf?.Dispose();
-            _broadcastStridesBuf = _accelerator.Allocate1D<int>(paramsSize);
-        }
+        using var stridesBuf = _accelerator.Allocate1D<int>(paramsSize);
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
         for (int i = 0; i < rank; i++) paramsData[1 + i] = aStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = bStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = outStrides[i];
-        _broadcastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+        stridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
 
         var opSpec = op switch
         {
@@ -496,7 +496,9 @@ public class ElementWiseKernels
             BroadcastOp.Div => new DelegateSpecialization<Func<float, float, float>>(BroadcastDivOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
-        _broadcastBinaryKernel!(outCount, a, b, output, _broadcastStridesBuf.View, opSpec);
+        _broadcastBinaryKernel!(outCount, a, b, output, stridesBuf.View, opSpec);
+        // Synchronize to ensure the kernel reads strides before the buffer is disposed
+        _accelerator.Synchronize();
     }
 
     /// <summary>Fill every element with a constant value. Handles -Infinity, Infinity, NaN.</summary>
