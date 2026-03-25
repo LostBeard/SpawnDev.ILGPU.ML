@@ -55,6 +55,42 @@ public class BPETokenizer
     }
 
     /// <summary>
+    /// Load tokenizer from the unified HuggingFace tokenizer.json format.
+    /// This single file contains both vocabulary and merge rules.
+    /// All HuggingFace models use this format.
+    /// </summary>
+    public static BPETokenizer LoadFromTokenizerJson(string tokenizerJson)
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(tokenizerJson);
+        var model = doc.RootElement.GetProperty("model");
+
+        // Extract vocab: {"token": id, ...}
+        var vocab = new Dictionary<string, int>();
+        foreach (var prop in model.GetProperty("vocab").EnumerateObject())
+            vocab[prop.Name] = prop.Value.GetInt32();
+
+        // Extract merges: can be ["pair1 pair2", ...] (strings) or [["a","b"], ...] (arrays)
+        var mergesArray = model.GetProperty("merges").EnumerateArray().ToArray();
+        string[] merges;
+        if (mergesArray.Length > 0 && mergesArray[0].ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            // Array format: [["Ġ","t"], ["Ġ","a"], ...] → "Ġ t", "Ġ a"
+            merges = mergesArray.Select(e =>
+            {
+                var parts = e.EnumerateArray().ToArray();
+                return $"{parts[0].GetString()} {parts[1].GetString()}";
+            }).ToArray();
+        }
+        else
+        {
+            // String format: ["Ġ t", "Ġ a", ...]
+            merges = mergesArray.Select(e => e.GetString()!).ToArray();
+        }
+
+        return new BPETokenizer(vocab, merges);
+    }
+
+    /// <summary>
     /// Encode text to token IDs.
     /// </summary>
     public int[] Encode(string text)

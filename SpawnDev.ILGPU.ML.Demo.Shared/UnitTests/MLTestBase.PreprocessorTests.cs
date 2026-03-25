@@ -211,27 +211,18 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // Load GPT-2 tokenizer files (try multiple locations)
-        string vocabJson, mergesText;
+        // Load GPT-2 tokenizer from unified tokenizer.json (HuggingFace standard)
+        string tokenizerJson;
         try
         {
-            vocabJson = await http.GetStringAsync("models/gpt2/vocab.json");
-            mergesText = await http.GetStringAsync("models/gpt2/merges.txt");
+            tokenizerJson = await http.GetStringAsync("references/gpt2/tokenizer.json");
         }
         catch
         {
-            try
-            {
-                vocabJson = await http.GetStringAsync("references/gpt2/vocab.json");
-                mergesText = await http.GetStringAsync("references/gpt2/merges.txt");
-            }
-            catch
-            {
-                throw new UnsupportedTestException("GPT-2 tokenizer files not available");
-            }
+            throw new UnsupportedTestException("GPT-2 tokenizer.json not available");
         }
 
-        var tokenizer = BPETokenizer.Load(vocabJson, mergesText);
+        var tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
         if (tokenizer.VocabSize < 50000)
             throw new Exception($"GPT-2 vocab size={tokenizer.VocabSize}, expected ~50257");
 
