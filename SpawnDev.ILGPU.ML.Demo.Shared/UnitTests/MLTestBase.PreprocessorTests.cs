@@ -211,16 +211,24 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // Load GPT-2 tokenizer files
+        // Load GPT-2 tokenizer files (try multiple locations)
         string vocabJson, mergesText;
         try
         {
-            vocabJson = await http.GetStringAsync("references/gpt2/vocab.json");
-            mergesText = await http.GetStringAsync("references/gpt2/merges.txt");
+            vocabJson = await http.GetStringAsync("models/gpt2/vocab.json");
+            mergesText = await http.GetStringAsync("models/gpt2/merges.txt");
         }
         catch
         {
-            throw new UnsupportedTestException("GPT-2 tokenizer files not available locally");
+            try
+            {
+                vocabJson = await http.GetStringAsync("references/gpt2/vocab.json");
+                mergesText = await http.GetStringAsync("references/gpt2/merges.txt");
+            }
+            catch
+            {
+                throw new UnsupportedTestException("GPT-2 tokenizer files not available");
+            }
         }
 
         var tokenizer = BPETokenizer.Load(vocabJson, mergesText);
