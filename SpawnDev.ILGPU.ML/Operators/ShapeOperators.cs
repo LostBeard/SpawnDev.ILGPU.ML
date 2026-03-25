@@ -22,20 +22,84 @@ public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class UnsqueezeOperator : IOnnxOperator
+public class UnsqueezeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Unsqueeze";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] };
-    public void Execute(OnnxOpContext ctx) { }
+    {
+        // Unsqueeze inserts size-1 dimensions at the specified axes
+        if (attrs.TryGetValue("axes", out var axesObj) && axesObj is long[] axes)
+        {
+            var inShape = inputs[0];
+            int outRank = inShape.Length + axes.Length;
+            var outShape = new int[outRank];
+
+            // Normalize negative axes
+            var normalizedAxes = new HashSet<int>();
+            foreach (var ax in axes)
+            {
+                int a = (int)ax;
+                if (a < 0) a += outRank;
+                normalizedAxes.Add(a);
+            }
+
+            int inIdx = 0;
+            for (int i = 0; i < outRank; i++)
+            {
+                if (normalizedAxes.Contains(i))
+                    outShape[i] = 1;
+                else
+                    outShape[i] = inIdx < inShape.Length ? inShape[inIdx++] : 1;
+            }
+            return new[] { outShape };
+        }
+        // If axes come from input[1] (opset >= 13), shape resolved at runtime
+        return new[] { inputs[0] };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Unsqueeze changes shape but data is identical — copy input to output
+        int count = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+        if (count > 0)
+            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count),
+                ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+    }
 }
 
-public class SqueezeOperator : IOnnxOperator
+public class SqueezeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Squeeze";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] };
-    public void Execute(OnnxOpContext ctx) { }
+    {
+        // Squeeze removes size-1 dimensions at the specified axes
+        if (attrs.TryGetValue("axes", out var axesObj) && axesObj is long[] axes)
+        {
+            var inShape = inputs[0];
+            var normalizedAxes = new HashSet<int>();
+            foreach (var ax in axes)
+            {
+                int a = (int)ax;
+                if (a < 0) a += inShape.Length;
+                normalizedAxes.Add(a);
+            }
+            var outShape = new List<int>();
+            for (int i = 0; i < inShape.Length; i++)
+            {
+                if (!normalizedAxes.Contains(i))
+                    outShape.Add(inShape[i]);
+            }
+            return new[] { outShape.ToArray() };
+        }
+        // No axes specified: remove all size-1 dims
+        return new[] { inputs[0].Where(d => d != 1).ToArray() };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        int count = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+        if (count > 0)
+            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count),
+                ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+    }
 }
 
 /// <summary>Constant: output is a constant value (stored as initializer). No-op at runtime.</summary>
@@ -47,7 +111,8 @@ public class ConstantOperator : IOnnxOperator
     public void Execute(OnnxOpContext ctx) { }
 }
 
-/// <summary>Cast: type conversion. For float→float, this is a copy.</summary>
+/// <summary>Cast: type conversion. For float→float, this is a copy.
+/// For float→int, truncates toward zero (matching numpy/ONNX behavior).</summary>
 public class CastOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Cast";
@@ -55,7 +120,36 @@ public class CastOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        // ONNX 'to' attribute: 1=float, 6=int32, 7=int64, 9=bool, 11=double
+        int targetType = ctx.GetInt("to", 1);
+        int count = ctx.Inputs[0].ElementCount;
+
+        // For small tensors (shape vectors, scalars), use pre-read constant values.
+        // Shape tensors may only exist in ConstantData/runtime constants — their GPU buffers
+        // can be empty if they were produced by folded/eliminated nodes.
+        var inVals = ctx.TryGetInputValues(0);
+        if (inVals != null && count <= 64)
+        {
+            float[] result;
+            if (targetType == 6 || targetType == 7 || targetType == 12 || targetType == 5 || targetType == 3 || targetType == 2)
+                result = inVals.Select(v => (float)Math.Truncate(v)).ToArray();
+            else
+                result = inVals.ToArray();
+            var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
+            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, count, 1f);
+            return;
+        }
+
+        if (targetType == 6 || targetType == 7 || targetType == 12 || targetType == 5 || targetType == 3 || targetType == 2)
+        {
+            // Cast to integer type: truncate toward zero (like C-style cast)
+            reg.ElementWise.Truncate(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count);
+        }
+        else
+        {
+            // Float-to-float or other: just copy
+            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+        }
     }
 }
 
@@ -167,7 +261,7 @@ public class ShapeOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class FlattenOperator : IOnnxOperator
+public class FlattenOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Flatten";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
@@ -178,5 +272,12 @@ public class FlattenOperator : IOnnxOperator
         int dim1 = 1; for (int i = axis; i < inputs[0].Length; i++) dim1 *= inputs[0][i];
         return new[] { new[] { dim0, dim1 } };
     }
-    public void Execute(OnnxOpContext ctx) { }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Flatten is just a reshape — data layout doesn't change, just copy input to output
+        int count = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+        if (count > 0)
+            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count),
+                ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+    }
 }

@@ -75,6 +75,14 @@ public class GraphExecutor : IDisposable
         foreach (var name in inputs.Keys)
             refCounts[name] = int.MaxValue;
 
+        // Runtime constant values: starts with initializer constants, grows as small
+        // intermediate tensors (shape vectors, scalars) are captured back to CPU.
+        // This enables operators like Slice, Reshape, Expand to resolve their parameters
+        // from runtime-computed shape tensors (Shape→Gather→Concat chains in transformers).
+        var runtimeConstants = _constantValues != null
+            ? new Dictionary<string, float[]>(_constantValues)
+            : new Dictionary<string, float[]>();
+
         // Execute each node in topological order
         int nodeIdx = 0;
         foreach (var node in _graph.Nodes)
@@ -127,7 +135,7 @@ public class GraphExecutor : IDisposable
                 Attributes = node.Attributes,
                 Pool = _pool,
                 InputNames = node.InputNames,
-                ConstantValues = _constantValues,
+                ConstantValues = runtimeConstants,
             };
             var nodeSw = VerboseLogging ? System.Diagnostics.Stopwatch.StartNew() : null;
             node.Operator.Execute(ctx);
@@ -146,6 +154,29 @@ public class GraphExecutor : IDisposable
             // Register outputs
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
+
+            // Capture small intermediate outputs as runtime constants.
+            // Shape tensors, scalars, and small 1D vectors (≤64 elements) are read back
+            // to CPU so downstream operators (Slice, Reshape, Gather, Expand) can resolve
+            // their parameters from runtime-computed values (e.g., Shape→Concat→Slice chains).
+            for (int i = 0; i < nodeOutputs.Length; i++)
+            {
+                var outTensor = nodeOutputs[i];
+                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
+                {
+                    var outName = i < node.OutputNames.Length ? node.OutputNames[i] : null;
+                    if (outName != null && !runtimeConstants.ContainsKey(outName))
+                    {
+                        _accelerator.Synchronize();
+                        int elCount = outTensor.ElementCount;
+                        using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
+                        tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
+                        _accelerator.Synchronize();
+                        var vals = tmpBuf.GetAsArray1D();
+                        runtimeConstants[outName] = vals;
+                    }
+                }
+            }
 
             // Release input tensors whose ref count reached 0
             foreach (var inputName in node.InputNames)
@@ -199,6 +230,11 @@ public class GraphExecutor : IDisposable
         foreach (var name in _weights.Keys) refCounts[name] = int.MaxValue;
         foreach (var name in inputs.Keys) refCounts[name] = int.MaxValue;
 
+        // Runtime constant capture (same as Run — see comments there)
+        var runtimeConstants = _constantValues != null
+            ? new Dictionary<string, float[]>(_constantValues)
+            : new Dictionary<string, float[]>();
+
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
         foreach (var node in _graph.Nodes)
@@ -247,7 +283,7 @@ public class GraphExecutor : IDisposable
                 Attributes = node.Attributes,
                 Pool = _pool,
                 InputNames = node.InputNames,
-                ConstantValues = _constantValues,
+                ConstantValues = runtimeConstants,
             };
             try
             {
@@ -266,6 +302,25 @@ public class GraphExecutor : IDisposable
 
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
+
+            // Capture small intermediate outputs as runtime constants (same as sync Run)
+            for (int oi = 0; oi < nodeOutputs.Length; oi++)
+            {
+                var outTensor = nodeOutputs[oi];
+                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
+                {
+                    var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
+                    if (outName != null && !runtimeConstants.ContainsKey(outName))
+                    {
+                        await _accelerator.SynchronizeAsync();
+                        int elCount = outTensor.ElementCount;
+                        using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
+                        tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
+                        await _accelerator.SynchronizeAsync();
+                        runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
+                    }
+                }
+            }
 
             // Capture intermediate values for debugging (when enabled)
             if (CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)

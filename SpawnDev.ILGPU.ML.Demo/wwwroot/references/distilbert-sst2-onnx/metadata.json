@@ -1,0 +1,238 @@
+{
+  "model": "distilbert-base-uncased-finetuned-sst-2-english",
+  "task": "text-classification",
+  "labels": [
+    "NEGATIVE",
+    "POSITIVE"
+  ],
+  "input_names": [
+    "input_ids",
+    "attention_mask"
+  ],
+  "output_names": [
+    "logits"
+  ],
+  "test_cases": [
+    {
+      "text": "I love this movie, it is absolutely fantastic!",
+      "expected_sentiment": "positive",
+      "input_ids": [
+        101,
+        1045,
+        2293,
+        2023,
+        3185,
+        1010,
+        2009,
+        2003,
+        7078,
+        10392,
+        999,
+        102
+      ],
+      "attention_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "seq_length": 12,
+      "logits": [
+        -4.330832004547119,
+        4.684447288513184
+      ],
+      "probabilities": [
+        0.00012152369163231924,
+        0.9998784065246582
+      ],
+      "predicted_class": 1,
+      "predicted_label": "POSITIVE",
+      "confidence": 0.9998784065246582,
+      "file_prefix": "i_love_this_movie_i"
+    },
+    {
+      "text": "This is terrible, worst experience ever.",
+      "expected_sentiment": "negative",
+      "input_ids": [
+        101,
+        2023,
+        2003,
+        6659,
+        1010,
+        5409,
+        3325,
+        2412,
+        1012,
+        102
+      ],
+      "attention_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "seq_length": 10,
+      "logits": [
+        4.698798656463623,
+        -3.7824044227600098
+      ],
+      "probabilities": [
+        0.999792754650116,
+        0.00020728615345433354
+      ],
+      "predicted_class": 0,
+      "predicted_label": "NEGATIVE",
+      "confidence": 0.999792754650116,
+      "file_prefix": "this_is_terrible_wo"
+    },
+    {
+      "text": "The cat sat on the mat.",
+      "expected_sentiment": "neutral",
+      "input_ids": [
+        101,
+        1996,
+        4937,
+        2938,
+        2006,
+        1996,
+        13523,
+        1012,
+        102
+      ],
+      "attention_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "seq_length": 9,
+      "logits": [
+        2.0654940605163574,
+        -1.6631702184677124
+      ],
+      "probabilities": [
+        0.9765388369560242,
+        0.023461248725652695
+      ],
+      "predicted_class": 0,
+      "predicted_label": "NEGATIVE",
+      "confidence": 0.9765388369560242,
+      "file_prefix": "the_cat_sat_on_the_m"
+    },
+    {
+      "text": "SpawnDev.ILGPU makes GPU computing accessible to everyone.",
+      "expected_sentiment": "positive",
+      "input_ids": [
+        101,
+        25645,
+        24844,
+        1012,
+        6335,
+        21600,
+        2226,
+        3084,
+        14246,
+        2226,
+        9798,
+        7801,
+        2000,
+        3071,
+        1012,
+        102
+      ],
+      "attention_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "seq_length": 16,
+      "logits": [
+        -3.0775270462036133,
+        3.095189094543457
+      ],
+      "probabilities": [
+        0.0020812232978641987,
+        0.9979187846183777
+      ],
+      "predicted_class": 1,
+      "predicted_label": "POSITIVE",
+      "confidence": 0.9979187846183777,
+      "file_prefix": "spawndevilgpu_makes"
+    },
+    {
+      "text": "The food was okay, nothing special.",
+      "expected_sentiment": "neutral",
+      "input_ids": [
+        101,
+        1996,
+        2833,
+        2001,
+        3100,
+        1010,
+        2498,
+        2569,
+        1012,
+        102
+      ],
+      "attention_mask": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "seq_length": 10,
+      "logits": [
+        2.189868927001953,
+        -1.8941775560379028
+      ],
+      "probabilities": [
+        0.9834397435188293,
+        0.016560329124331474
+      ],
+      "predicted_class": 0,
+      "predicted_label": "NEGATIVE",
+      "confidence": 0.9834397435188293,
+      "file_prefix": "the_food_was_okay_n"
+    }
+  ],
+  "onnxruntime_version": "1.24.3",
+  "numpy_version": "2.4.3"
+}

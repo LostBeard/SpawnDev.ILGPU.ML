@@ -365,3 +365,8 @@ FodyWeavers.xsd
 # Debug dump files
 _debugdump/
 _mldump/
+
+# ML model files — all loaded from HuggingFace CDN at runtime.
+# No models are bundled in the repo. To populate locally for
+# development/testing: run HuggingFaceModelDownloader or download manually.
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/

@@ -78,9 +78,9 @@ public class OperatorRegistry
         Register(new TransposeOperator(this));
         Register(new SoftmaxOperator(this));
         Register(new LayerNormOperator(this));
-        Register(new UnsqueezeOperator());
-        Register(new SqueezeOperator());
-        Register(new FlattenOperator());
+        Register(new UnsqueezeOperator(this));
+        Register(new SqueezeOperator(this));
+        Register(new FlattenOperator(this));
         Register(new ConcatOperator(this));
         Register(new GatherOperator(this));
         Register(new ClipOperator(this));
@@ -131,6 +131,9 @@ public class OperatorRegistry
         Register(new EqualOperator(this));
         Register(new GreaterOperator(this));
         Register(new LessOperator(this));
+        Register(new LessOrEqualOperator(this));
+        Register(new AndOperator(this));
+        Register(new IsNaNOperator(this));
         Register(new NotOperator(this));
         Register(new ConstantOfShapeOperator(this));
         Register(new RangeOperator());

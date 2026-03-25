@@ -17,6 +17,7 @@ public class ActivationKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _leakyReluInPlace;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _clipInPlace;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _hardSigmoidInPlace;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float>? _hardSigmoidParamsInPlace;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _hardSwishInPlace;
 
     public ActivationKernels(Accelerator accelerator) => _accelerator = accelerator;
@@ -72,11 +73,21 @@ public class ActivationKernels
         else if (x > maxVal) data[idx] = maxVal;
     }
 
-    /// <summary>HardSigmoid: max(0, min(1, alpha*x + beta)). Default alpha=1/6, beta=0.5.</summary>
+    /// <summary>HardSigmoid: max(0, min(1, alpha*x + beta)). Uses alpha=1/6, beta=0.5 (HardSwish default).</summary>
     private static void HardSigmoidInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
     {
         float x = data[idx];
         float y = x / 6f + 0.5f;
+        if (y < 0f) y = 0f;
+        if (y > 1f) y = 1f;
+        data[idx] = y;
+    }
+
+    /// <summary>HardSigmoid with configurable alpha/beta: max(0, min(1, alpha*x + beta)).</summary>
+    private static void HardSigmoidParamsInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data, float alpha, float beta)
+    {
+        float x = data[idx];
+        float y = alpha * x + beta;
         if (y < 0f) y = 0f;
         if (y > 1f) y = 1f;
         data[idx] = y;
@@ -106,6 +117,10 @@ public class ActivationKernels
     public void HardSigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     { EnsureLoaded(); _hardSigmoidInPlace!(count, data); }
 
+    /// <summary>HardSigmoid with configurable alpha/beta: max(0, min(1, alpha*x + beta)).</summary>
+    public void HardSigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count, float alpha, float beta)
+    { EnsureLoaded(); _hardSigmoidParamsInPlace!(count, data, alpha, beta); }
+
     public void HardSwishInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     { EnsureLoaded(); _hardSwishInPlace!(count, data); }
 
@@ -116,6 +131,7 @@ public class ActivationKernels
         _tanhInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(TanhInPlaceImpl);
         _siluInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(SiLUInPlaceImpl);
         _hardSigmoidInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidInPlaceImpl);
+        _hardSigmoidParamsInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsInPlaceImpl);
         _hardSwishInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSwishInPlaceImpl);
     }
 }

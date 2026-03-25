@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
 using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
@@ -62,7 +63,18 @@ public partial class StylePage : IDisposable
             _pipeline?.Dispose();
 
             var modelName = styleName.ToLowerInvariant().Replace(" ", "-");
-            _session = await InferenceSession.CreateFromFileAsync(_accelerator, Http, $"models/style-{modelName}/model.onnx");
+            var styleRepo = modelName switch
+            {
+                "mosaic" => ModelHub.KnownModels.StyleMosaic,
+                "candy" => ModelHub.KnownModels.StyleCandy,
+                "rain-princess" => ModelHub.KnownModels.StyleRainPrincess,
+                "udnie" => ModelHub.KnownModels.StyleUdnie,
+                "pointilism" => ModelHub.KnownModels.StylePointilism,
+                _ => throw new ArgumentException($"Unknown style: {modelName}")
+            };
+            using var hub = new ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(styleRepo, $"{modelName}-9.onnx");
+            _session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
             _pipeline = new StyleTransferPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

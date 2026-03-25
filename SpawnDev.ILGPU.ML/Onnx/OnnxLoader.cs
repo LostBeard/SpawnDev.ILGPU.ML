@@ -215,11 +215,24 @@ public static class OnnxLoader
             OnnxAttributeType.FLOAT => attr.F,
             OnnxAttributeType.INT => attr.I,
             OnnxAttributeType.STRING => attr.StringValue,
+            OnnxAttributeType.TENSOR => ExtractTensorScalar(attr.T),
             OnnxAttributeType.FLOATS => attr.Floats ?? Array.Empty<float>(),
             OnnxAttributeType.INTS => attr.Ints ?? Array.Empty<long>(),
             OnnxAttributeType.STRINGS => attr.Strings?.Select(s => System.Text.Encoding.UTF8.GetString(s)).ToArray() ?? Array.Empty<string>(),
             _ => attr.I, // Default to int for unknown types
         };
+    }
+
+    /// <summary>
+    /// Extract a scalar value from a TensorProto attribute.
+    /// Used by ConstantOfShape (value attribute is a TensorProto containing a single scalar).
+    /// </summary>
+    private static object ExtractTensorScalar(OnnxTensorProto? tensor)
+    {
+        if (tensor == null) return 0.0;
+        var floats = tensor.ToFloatArray();
+        if (floats.Length > 0) return (double)floats[0];
+        return 0.0;
     }
 
     private static string FormatValueInfo(OnnxValueInfoProto vi)

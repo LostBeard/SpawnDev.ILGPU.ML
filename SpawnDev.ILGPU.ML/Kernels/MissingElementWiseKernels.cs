@@ -93,14 +93,15 @@ public class MissingElementWiseKernels
     /// <summary>
     /// DepthToSpace: [N, C*r*r, H, W] → [N, C, H*r, W*r]
     /// Rearranges depth data into spatial blocks.
-    /// params: [C, H, W, r] (output channels, input height, input width, blocksize)
+    /// params: [C, H, W, r, mode] (output channels, input height, input width, blocksize, mode)
+    /// mode: 0=DCR (default), 1=CRD
     /// </summary>
     private static void DepthToSpaceImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<int, Stride1D.Dense> p)
     {
-        int outC = p[0]; int inH = p[1]; int inW = p[2]; int r = p[3];
+        int outC = p[0]; int inH = p[1]; int inW = p[2]; int r = p[3]; int mode = p[4];
         int outH = inH * r;
         int outW = inW * r;
         int outHW = outH * outW;
@@ -115,7 +116,11 @@ public class MissingElementWiseKernels
         int ix = ox / r;
         int by = oy % r;
         int bx = ox % r;
-        int ic = oc * r * r + by * r + bx;
+        // DCR: ic = oc * r² + by * r + bx
+        // CRD: ic = oc * r² + bx * r + by  (column-row-depth ordering)
+        int ic = mode == 0
+            ? oc * r * r + by * r + bx
+            : oc * r * r + bx * r + by;
 
         output[idx] = input[ic * inH * inW + iy * inW + ix];
     }
@@ -123,11 +128,11 @@ public class MissingElementWiseKernels
     public void DepthToSpace(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        int outC, int inH, int inW, int blockSize)
+        int outC, int inH, int inW, int blockSize, int mode = 0)
     {
         int totalOutput = outC * inH * blockSize * inW * blockSize;
         // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
-        var paramsData = new int[] { outC, inH, inW, blockSize };
+        var paramsData = new int[] { outC, inH, inW, blockSize, mode };
         EnsureParamsBuf(paramsData.Length);
         _paramsBuf!.CopyFromCPU(paramsData);
 

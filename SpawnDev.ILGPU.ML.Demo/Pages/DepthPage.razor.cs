@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
 using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.WebGPU;
@@ -56,8 +57,10 @@ public partial class DepthPage : IDisposable
                 return;
             }
 
-            _session = await InferenceSession.CreateFromFileAsync(
-                _accelerator, Http, "models/depth-anything-v2-small/model.onnx",
+            using var hub = new ModelHub(JS);
+            _session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub,
+                ModelHub.KnownModels.DepthAnythingV2Small, ModelHub.KnownFiles.OnnxModel,
                 inputShapes: new Dictionary<string, int[]>
                 {
                     ["pixel_values"] = new[] { 1, 3, 518, 518 }

@@ -25,6 +25,32 @@ public static class GraphOptimizer
     {
         var optimized = CloneGraph(graph);
 
+        // Normalize scalar initializer shapes: ONNX allows shape [] for scalars, but
+        // weight loading and buffer allocation require at least [1].
+        // NOTE: This does NOT affect Gather output shape inference — Gather's InferOutputShapes
+        // handles single-element [1] indices as scalar (squeezes the extra dimension).
+        foreach (var key in optimized.Initializers.Keys.ToList())
+        {
+            if (optimized.Initializers[key].Length == 0)
+                optimized.Initializers[key] = new[] { 1 };
+        }
+        if (optimized.ConstantData != null)
+        {
+            foreach (var key in optimized.ConstantData.Keys.ToList())
+            {
+                if (optimized.ConstantData[key].Length == 0)
+                    optimized.ConstantData[key] = new[] { 0 };
+            }
+        }
+        if (optimized.FloatConstantData != null)
+        {
+            foreach (var key in optimized.FloatConstantData.Keys.ToList())
+            {
+                if (optimized.FloatConstantData[key].Length == 0)
+                    optimized.FloatConstantData[key] = new[] { 0f };
+            }
+        }
+
         // Pass 1: Fold constant subgraphs (Shape → Gather → Cast chains become constants)
         int folded = FoldConstants(optimized);
 
@@ -307,6 +333,8 @@ public static class GraphOptimizer
                         var outputName = node.Outputs[0];
                         var shapeValues = inputShape;
                         graph.ConstantData[outputName] = shapeValues;
+                        graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                        graph.FloatConstantData[outputName] = shapeValues.Select(v => (float)v).ToArray();
                         graph.Initializers[outputName] = new[] { shapeValues.Length };
                         knownShapes[outputName] = new[] { shapeValues.Length };
                         constants.Add(outputName);
@@ -328,6 +356,8 @@ public static class GraphOptimizer
                         if (idx >= 0 && idx < gatherData.Length)
                         {
                             graph.ConstantData[outputName] = new[] { gatherData[idx] };
+                            graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                            graph.FloatConstantData[outputName] = new[] { (float)gatherData[idx] };
                             graph.Initializers[outputName] = new[] { 1 };
                             knownShapes[outputName] = new[] { 1 };
                             constants.Add(outputName);
@@ -345,6 +375,8 @@ public static class GraphOptimizer
                         var outputName = node.Outputs[0];
                         var concatValues = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
                         graph.ConstantData[outputName] = concatValues;
+                        graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                        graph.FloatConstantData[outputName] = concatValues.Select(v => (float)v).ToArray();
                         graph.Initializers[outputName] = new[] { concatValues.Length };
                         knownShapes[outputName] = new[] { concatValues.Length };
                         constants.Add(outputName);
@@ -354,31 +386,111 @@ public static class GraphOptimizer
                         continue;
                     }
 
-                    // Generic folding: only fold small shape-computation nodes.
-                    // Don't fold nodes that consume large constant tensors (anchor grids,
-                    // stride multipliers) — we can't evaluate them at compile time, and
-                    // registering outputs as shape [1] with no data produces zeros at runtime.
-                    bool hasLargeInput = false;
-                    foreach (var inp in node.Inputs)
+                    // Try to evaluate Cast on known constant data (identity for shape tensors)
+                    if (node.OpType == "Cast" && node.Inputs.Count >= 1
+                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var castData))
                     {
-                        if (string.IsNullOrEmpty(inp)) continue;
-                        if (graph.Initializers.TryGetValue(inp, out var inpShape))
+                        var outputName = node.Outputs[0];
+                        // Cast preserves values for shape tensors (int→float or float→int is identity for small ints)
+                        graph.ConstantData[outputName] = castData.ToArray();
+                        graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                        graph.FloatConstantData[outputName] = castData.Select(v => (float)v).ToArray();
+                        graph.Initializers[outputName] = new[] { castData.Length };
+                        knownShapes[outputName] = new[] { castData.Length };
+                        constants.Add(outputName);
+                        nodesToRemove.Add(i);
+                        folded++;
+                        changed = true;
+                        continue;
+                    }
+
+                    // Try to evaluate Sqrt on known constant data
+                    if (node.OpType == "Sqrt" && node.Inputs.Count >= 1
+                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var sqrtData))
+                    {
+                        var outputName = node.Outputs[0];
+                        var result = sqrtData.Select(v => (int)MathF.Sqrt(v)).ToArray();
+                        graph.ConstantData[outputName] = result;
+                        graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                        graph.FloatConstantData[outputName] = sqrtData.Select(v => MathF.Sqrt(v)).ToArray();
+                        graph.Initializers[outputName] = new[] { result.Length };
+                        knownShapes[outputName] = new[] { result.Length };
+                        constants.Add(outputName);
+                        nodesToRemove.Add(i);
+                        folded++;
+                        changed = true;
+                        continue;
+                    }
+
+                    // Try to evaluate Slice on known constant data
+                    if (node.OpType == "Slice" && node.Inputs.Count >= 3
+                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceData)
+                        && graph.ConstantData.TryGetValue(node.Inputs[1], out var sliceStarts)
+                        && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds))
+                    {
+                        var outputName = node.Outputs[0];
+                        int[] axes = node.Inputs.Count > 3 && graph.ConstantData.TryGetValue(node.Inputs[3], out var sa)
+                            ? sa : Enumerable.Range(0, sliceStarts.Length).ToArray();
+                        int[] steps = node.Inputs.Count > 4 && graph.ConstantData.TryGetValue(node.Inputs[4], out var ss)
+                            ? ss : Enumerable.Repeat(1, sliceStarts.Length).ToArray();
+
+                        // Compute sliced result (1D case — typical for shape tensors)
+                        if (axes.Length == 1)
                         {
-                            int inpSize = inpShape.Aggregate(1, (a, b) => a * b);
-                            if (inpSize > 64) { hasLargeInput = true; break; }
+                            int ax = axes[0] < 0 ? axes[0] + 1 : axes[0]; // 1D → axis always 0
+                            int s = sliceStarts[0]; int e = sliceEnds[0]; int st = Math.Max(1, Math.Abs(steps[0]));
+                            if (s < 0) s += sliceData.Length;
+                            if (e < 0) e += sliceData.Length;
+                            // Clamp ends to INT_MAX → data length
+                            if (e > sliceData.Length) e = sliceData.Length;
+                            s = Math.Clamp(s, 0, sliceData.Length);
+                            e = Math.Clamp(e, 0, sliceData.Length);
+                            var sliced = new List<int>();
+                            for (int si = s; si < e; si += st)
+                                sliced.Add(sliceData[si]);
+                            graph.ConstantData[outputName] = sliced.ToArray();
+                            graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                            graph.FloatConstantData[outputName] = sliced.Select(v => (float)v).ToArray();
+                            graph.Initializers[outputName] = new[] { sliced.Count };
+                            knownShapes[outputName] = new[] { sliced.Count };
+                            constants.Add(outputName);
+                            nodesToRemove.Add(i);
+                            folded++;
+                            changed = true;
+                            continue;
                         }
                     }
-                    if (hasLargeInput) continue; // Don't fold — large tensor inputs can't be evaluated
 
-                    foreach (var output in node.Outputs)
+                    // Generic folding: for ops without explicit handlers, only fold
+                    // if we can propagate constant data from the first input.
+                    // Unary ops (Unsqueeze, Squeeze, Reshape, Floor, Ceil, Neg, Abs, Identity)
+                    // pass through or reshape the data — propagate ConstantData from input.
+                    if (node.Inputs.Count >= 1 && graph.ConstantData.TryGetValue(node.Inputs[0], out var genData))
                     {
-                        constants.Add(output);
-                        if (!graph.Initializers.ContainsKey(output))
-                            graph.Initializers[output] = new[] { 1 };
+                        bool hasLargeInput = genData.Length > 64;
+                        if (hasLargeInput) continue; // Don't fold large tensors
+
+                        var outputName = node.Outputs.Count > 0 ? node.Outputs[0] : null;
+                        if (outputName != null)
+                        {
+                            // Propagate constant data. Preserve existing initializer shapes
+                            // (don't override scalar [] with [1] — breaks Gather index dimensions).
+                            graph.ConstantData[outputName] = genData.ToArray();
+                            graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                            graph.FloatConstantData[outputName] = genData.Select(v => (float)v).ToArray();
+                            if (!graph.Initializers.ContainsKey(outputName))
+                                graph.Initializers[outputName] = new[] { genData.Length };
+                            // Don't override known shapes — preserve scalar [] vs [1] distinction
+                            if (!knownShapes.ContainsKey(outputName))
+                                knownShapes[outputName] = new[] { genData.Length };
+                        }
+                        foreach (var output in node.Outputs)
+                            constants.Add(output);
+                        nodesToRemove.Add(i);
+                        folded++;
+                        changed = true;
                     }
-                    nodesToRemove.Add(i);
-                    folded++;
-                    changed = true;
+                    // If no constant data available, don't fold — leave for runtime execution
                 }
             }
 
@@ -394,11 +506,17 @@ public static class GraphOptimizer
     /// Only shape-manipulation and simple math ops that produce small outputs.
     /// </summary>
     private static bool IsConstantFoldable(string opType) => opType is
+        // Shape-manipulation ops that produce small int tensors — safe to fold.
+        // Ops with explicit handlers (Shape, Gather, Concat, Slice) compute results correctly.
+        // Generic folding handles the rest (Cast, Floor, Ceil, etc. — identity for shape tensors).
         "Shape" or "Gather" or "GatherND" or "Cast" or "Floor" or "Ceil" or
         "Unsqueeze" or "Squeeze" or "Concat" or "Reshape" or "Slice" or
         "Add" or "Sub" or "Mul" or "Div" or "Neg" or "Abs" or "Sqrt" or
-        "Range" or "ConstantOfShape" or "Expand" or "Identity" or
-        "Equal" or "Greater" or "Less" or "Not" or "Where";
+        "Identity";
+        // NOT foldable: Range, ConstantOfShape, Expand, Equal, Greater, Less, Not, Where
+        // These produce large runtime tensors (attention masks, fill tensors, boolean masks)
+        // that generic folding can't evaluate — it registers them as shape [1], destroying
+        // downstream shape inference. NLP models (DistilBERT, GPT-2) crash without this fix.
 
     /// <summary>
     /// Eliminate Identity and Dropout (inference mode) nodes.

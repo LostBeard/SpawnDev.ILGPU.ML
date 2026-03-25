@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
 using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
@@ -55,7 +56,9 @@ public partial class SuperResPage : IDisposable
                 return;
             }
 
-            _session = await InferenceSession.CreateFromFileAsync(_accelerator, Http, "models/super-resolution/model.onnx");
+            using var hub = new ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx");
+            _session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
             _pipeline = new SuperResolutionPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

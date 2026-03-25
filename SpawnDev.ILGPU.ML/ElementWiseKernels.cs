@@ -24,6 +24,7 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _geluInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _reluInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scaleInPlaceKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _fillKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
@@ -164,6 +165,14 @@ public class ElementWiseKernels
         float erfAbs = 1f - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * MathF.Exp(-az * az);
         float erf = z < 0f ? -erfAbs : erfAbs;
         data[idx] = 0.5f * x * (1f + erf);
+    }
+
+    /// <summary>Fill: data[i] = value. Sets every element to a constant.</summary>
+    private static void FillImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        float value)
+    {
+        data[idx] = value;
     }
 
     /// <summary>In-place scale: data[i] *= scalar. Single binding, no aliasing.</summary>
@@ -400,6 +409,13 @@ public class ElementWiseKernels
         _concatLastDimKernel!(T * 2 * C, a, b, output, T, C);
     }
 
+    /// <summary>Fill every element with a constant value. Handles -Infinity, Infinity, NaN.</summary>
+    public void Fill(ArrayView1D<float, Stride1D.Dense> data, int count, float value)
+    {
+        EnsureLoaded();
+        _fillKernel!(count, data, value);
+    }
+
     /// <summary>In-place scale: data[i] *= scalar. No aliasing (single buffer binding).</summary>
     public void ScaleInPlace(ArrayView1D<float, Stride1D.Dense> data, int count, float scalar)
     {
@@ -557,6 +573,10 @@ public class ElementWiseKernels
     private static void RoundImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = MathF.Round(input[idx]); }
 
+    /// <summary>Truncate: round toward zero (C-style cast from float to int).</summary>
+    private static void TruncateImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    { output[idx] = MathF.Truncate(input[idx]); }
+
     private static void MinImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = a[idx] < b[idx] ? a[idx] : b[idx]; }
 
@@ -606,6 +626,7 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _equalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _greaterKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _lessKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _truncateKernel;
 
     public void Sqrt(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _sqrtKernel!(count, input, output); }
@@ -648,6 +669,10 @@ public class ElementWiseKernels
     public void Less(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _lessKernel!(count, a, b, output); }
 
+    /// <summary>Truncate: round toward zero. output[i] = MathF.Truncate(input[i]).</summary>
+    public void Truncate(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded2(); _truncateKernel!(count, input, output); }
+
     private void EnsureLoaded2()
     {
         var a = _accelerator;
@@ -671,6 +696,7 @@ public class ElementWiseKernels
         _equalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
         _greaterKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
         _lessKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);
+        _truncateKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TruncateImpl);
     }
 
     private void EnsureLoaded()
@@ -704,6 +730,8 @@ public class ElementWiseKernels
             ArrayView1D<float, Stride1D.Dense>>(ReLUInPlaceImpl);
         _scaleInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+        _fillKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, float>(FillImpl);
         _addInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddInPlaceImpl);
         _concatLastDimKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,

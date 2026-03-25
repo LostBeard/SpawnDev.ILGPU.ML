@@ -22,9 +22,21 @@ public class GraphCompiler
 
     public CompiledGraph Compile(ModelGraph graph)
     {
+      try
+      {
         // Apply graph optimizations (operator fusion) before compilation
         if (EnableOptimization)
-            graph = GraphOptimizer.Optimize(graph);
+        {
+            try { graph = GraphOptimizer.Optimize(graph); }
+            catch (IndexOutOfRangeException optEx)
+            {
+                throw new InvalidOperationException(
+                    $"[GraphCompiler] Optimizer crashed (IndexOutOfRange) on graph with {graph.Nodes.Count} nodes, " +
+                    $"{graph.Initializers.Count} initializers, {graph.Inputs.Count} inputs. " +
+                    $"Inputs: [{string.Join(", ", graph.Inputs.Select(i => $"{i.Name}:[{string.Join(",", i.Shape)}]"))}]",
+                    optEx);
+            }
+        }
 
         // Initialize float constant data for precise compile-time arithmetic.
         // ConstantData uses int (fine for shapes/indices) but Upsample scale chains
@@ -49,18 +61,21 @@ public class GraphCompiler
         }
 
         // Topological sort
-        var sorted = TopologicalSort(graph.Nodes);
+        List<GraphNode> sorted;
+        try { sorted = TopologicalSort(graph.Nodes); }
+        catch (Exception ex) { throw new InvalidOperationException($"TopologicalSort failed on {graph.Nodes.Count} nodes: {ex.Message}", ex); }
 
         // Shape inference: track known shapes from inputs, initializers, and outputs
         var knownShapes = new Dictionary<string, int[]>();
         foreach (var input in graph.Inputs)
         {
-            // Replace dynamic dimensions (-1) with 1 (default batch size)
             var shape = input.Shape.Select(d => d <= 0 ? 1 : d).ToArray();
             knownShapes[input.Name] = shape;
         }
         foreach (var (name, shape) in graph.Initializers)
-            knownShapes[name] = shape;
+        {
+            if (shape != null) knownShapes[name] = shape;
+        }
         // Pre-register graph output shapes (overrides inferred shapes for Reshape etc.)
         var graphOutputShapes = new Dictionary<string, int[]>();
         foreach (var output in graph.Outputs)
@@ -74,10 +89,17 @@ public class GraphCompiler
 
         // Compile each node
         var compiledNodes = new List<CompiledNode>();
+        int nodeCompileIdx = 0;
         foreach (var node in sorted)
         {
-            var op = _registry.Resolve(node.OpType);
-            var attrs = node.GetTypedAttributes();
+          try
+          {
+            IOnnxOperator op;
+            try { op = _registry.Resolve(node.OpType); }
+            catch (Exception ex) { throw new InvalidOperationException($"Node {nodeCompileIdx} '{node.OpType}': operator not registered — {ex.Message}"); }
+            Dictionary<string, object> attrs;
+            try { attrs = node.GetTypedAttributes(); }
+            catch (Exception ex) { throw new InvalidOperationException($"Node {nodeCompileIdx} '{node.OpType}': attribute parse failed — {ex.Message}"); }
 
             // Gather input shapes (empty string = optional ONNX input, use empty shape)
             var inputShapes = node.Inputs
@@ -92,10 +114,18 @@ public class GraphCompiler
             {
                 outputShapes = op.InferOutputShapes(inputShapes, attrs);
             }
-            catch
+            catch (Exception shapeEx)
             {
-                // Fallback: output shape = first input shape (common for element-wise)
-                outputShapes = new[] { inputShapes[0] };
+                if (InferenceSession.VerboseLogging)
+                    Console.WriteLine($"[GraphCompiler] Shape inference failed at node {nodeCompileIdx} '{node.OpType}' " +
+                        $"inputs=[{string.Join("; ", inputShapes.Select(s => $"[{string.Join(",", s)}]"))}]: {shapeEx.Message}");
+                // Fallback: try known output shape (from Initializers), then first input shape
+                if (node.Outputs.Count > 0 && knownShapes.TryGetValue(node.Outputs[0], out var fallbackShape))
+                    outputShapes = new[] { fallbackShape };
+                else if (inputShapes.Length > 0 && inputShapes[0].Length > 0)
+                    outputShapes = new[] { inputShapes[0] };
+                else
+                    outputShapes = new[] { new[] { 1 } };
             }
 
             // Compile-time evaluation of Shape nodes: output = input's known shape as a 1D tensor
@@ -170,11 +200,20 @@ public class GraphCompiler
             // Handles both opset >= 11 (starts/ends as tensor inputs) and opset < 11 (as attributes)
             if (node.OpType == "Slice" && graph.ConstantData != null)
             {
+                // DEBUG: Log Slice resolution for attention scaling diagnosis
+                if (node.Inputs.Count >= 3)
+                {
+                    bool in0 = graph.ConstantData.ContainsKey(node.Inputs[0]);
+                    bool in1 = node.Inputs.Count > 1 && graph.ConstantData.ContainsKey(node.Inputs[1]);
+                    bool in2 = node.Inputs.Count > 2 && graph.ConstantData.ContainsKey(node.Inputs[2]);
+                    Console.WriteLine($"[GraphCompiler] Slice: in0={node.Inputs[0]}(const={in0}) in1={(node.Inputs.Count > 1 ? node.Inputs[1] : "?")}(const={in1}) in2={(node.Inputs.Count > 2 ? node.Inputs[2] : "?")}(const={in2})");
+                }
                 // Try opset >= 11: starts/ends from inputs[1], inputs[2]
                 if (node.Inputs.Count >= 3
                     && graph.ConstantData.TryGetValue(node.Inputs[0], out var sliceData)
                     && graph.ConstantData.TryGetValue(node.Inputs[1], out var sliceStarts)
-                    && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds))
+                    && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds)
+                    && sliceData.Length > 0 && sliceStarts.Length > 0 && sliceEnds.Length > 0)
                 {
                     int start = sliceStarts[0];
                     int end = sliceEnds[0];
@@ -469,10 +508,14 @@ public class GraphCompiler
                 outputShapes = extended;
             }
 
-            // Register output shapes (override with graph output shapes if known)
+            // Register output shapes. Priority: graph output override > initializer shape > inferred shape
             for (int i = 0; i < node.Outputs.Count && i < outputShapes.Length; i++)
             {
                 var outName = node.Outputs[i];
+                // Don't overwrite a known Initializer shape with a weaker inference (e.g., Constant returns [1])
+                if (knownShapes.TryGetValue(outName, out var existingShape)
+                    && existingShape.Length > 1 && outputShapes[i].Length <= 1)
+                    outputShapes[i] = existingShape;
                 if (graphOutputShapes.TryGetValue(outName, out var knownOutShape))
                     outputShapes[i] = knownOutShape; // Use known graph output shape
                 knownShapes[outName] = outputShapes[i];
@@ -487,6 +530,18 @@ public class GraphCompiler
                 Attributes = attrs,
                 OutputShapes = outputShapes,
             });
+          }
+          catch (Exception nodeEx)
+          {
+            var outNames = string.Join(",", node.Outputs);
+            var inNames = string.Join(",", node.Inputs.Take(3));
+            var inShapes = string.Join("; ", node.Inputs.Take(3).Select(n =>
+                knownShapes.TryGetValue(n ?? "", out var s) ? $"[{string.Join(",", s)}]" : "?"));
+            throw new IndexOutOfRangeException(
+                $"Node {nodeCompileIdx}/{sorted.Count} '{node.OpType}' crashed. " +
+                $"Inputs=[{inNames}] shapes=({inShapes}) Outputs=[{outNames}]", nodeEx);
+          }
+            nodeCompileIdx++;
         }
 
         // Log compile-time evaluation stats
@@ -502,6 +557,14 @@ public class GraphCompiler
             OutputShapes = graph.Outputs.ToDictionary(o => o.Name, o => knownShapes.TryGetValue(o.Name, out var s) ? s : Array.Empty<int>()),
             InitializerNames = graph.Initializers.Keys.ToHashSet(),
         };
+      }
+      catch (Exception compileEx)
+      {
+        throw new InvalidOperationException(
+            $"[GraphCompiler] Compile crashed: {compileEx.GetType().Name}: {compileEx.Message} " +
+            $"(graph: {graph.Nodes.Count} nodes, {graph.Initializers.Count} initializers, " +
+            $"optimization={EnableOptimization})", compileEx);
+      }
     }
 
     /// <summary>Topological sort using Kahn's algorithm.</summary>

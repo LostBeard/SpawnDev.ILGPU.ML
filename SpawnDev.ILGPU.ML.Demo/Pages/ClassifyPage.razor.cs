@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
 using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML.Demo.Services;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
 
@@ -63,8 +64,10 @@ public partial class ClassifyPage : IDisposable
             // Load SqueezeNet model
             _modelProgress = 50;
             StateHasChanged();
+            using var hub = new ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
             _classService = new ClassificationService(Http);
-            await _classService.LoadModelAsync("models/squeezenet/model.onnx", _accelerator);
+            await _classService.LoadModelAsync(modelBytes, _accelerator);
 
             _isModelLoaded = true;
             _modelProgress = 100;

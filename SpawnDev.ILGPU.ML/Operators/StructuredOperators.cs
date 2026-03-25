@@ -407,10 +407,17 @@ public class ReduceMeanOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var shape = ctx.Inputs[0].Shape;
         var axes = ctx.GetLongs("axes");
-        int axis = axes.Length > 0 ? (int)(axes[0] < 0 ? axes[0] + shape.Length : axes[0]) : shape.Length - 1;
-        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
-        int reduce = shape[axis];
-        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        var normalizedAxes = axes.Length > 0
+            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
+            : new[] { shape.Length - 1 };
+
+        // Compute outer (dims before first axis), reduce (product of all axes dims), inner (dims after last axis)
+        // This works correctly when axes are contiguous (e.g., [2,3] for spatial reduction)
+        int firstAxis = normalizedAxes[0];
+        int lastAxis = normalizedAxes[^1];
+        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
+        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
+        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         reg.Reductions.ReduceMean(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
     }
 }
@@ -427,10 +434,15 @@ public class ReduceSumOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var shape = ctx.Inputs[0].Shape;
         var axes = ctx.GetLongs("axes");
-        int axis = axes.Length > 0 ? (int)(axes[0] < 0 ? axes[0] + shape.Length : axes[0]) : shape.Length - 1;
-        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
-        int reduce = shape[axis];
-        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        var normalizedAxes = axes.Length > 0
+            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
+            : new[] { shape.Length - 1 };
+
+        int firstAxis = normalizedAxes[0];
+        int lastAxis = normalizedAxes[^1];
+        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
+        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
+        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         reg.Reductions.ReduceSum(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
     }
 }
@@ -446,10 +458,15 @@ public class ReduceMaxOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var shape = ctx.Inputs[0].Shape;
         var axes = ctx.GetLongs("axes");
-        int axis = axes.Length > 0 ? (int)(axes[0] < 0 ? axes[0] + shape.Length : axes[0]) : shape.Length - 1;
-        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
-        int reduce = shape[axis];
-        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        var normalizedAxes = axes.Length > 0
+            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
+            : new[] { shape.Length - 1 };
+
+        int firstAxis = normalizedAxes[0];
+        int lastAxis = normalizedAxes[^1];
+        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
+        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
+        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         reg.Reductions.ReduceMax(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
     }
 }
@@ -463,10 +480,15 @@ public class ReduceMinOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var shape = ctx.Inputs[0].Shape;
         var axes = ctx.GetLongs("axes");
-        int axis = axes.Length > 0 ? (int)(axes[0] < 0 ? axes[0] + shape.Length : axes[0]) : shape.Length - 1;
-        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
-        int reduce = shape[axis];
-        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+        var normalizedAxes = axes.Length > 0
+            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
+            : new[] { shape.Length - 1 };
+
+        int firstAxis = normalizedAxes[0];
+        int lastAxis = normalizedAxes[^1];
+        int outer = 1; for (int i = 0; i < firstAxis; i++) outer *= shape[i];
+        int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
+        int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         reg.Reductions.ReduceMin(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, reduce, inner);
     }
 }
@@ -478,12 +500,21 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "Gather";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
-        // Simplified: axis=0, indices is 1D
+        // ONNX Gather spec: output shape = data.shape[:axis] + indices.shape + data.shape[axis+1:]
         var dataShape = inputs[0];
         var idxShape = inputs[1];
-        int innerSize = 1; for (int i = 1; i < dataShape.Length; i++) innerSize *= dataShape[i];
-        int numIdx = TensorHelpers.ElementCount(idxShape);
-        return new[] { new[] { numIdx, innerSize } };
+        int axis = attrs.ContainsKey("axis") ? Convert.ToInt32(attrs["axis"]) : 0;
+        if (axis < 0) axis += dataShape.Length;
+
+        var outShape = new List<int>();
+        // Dims before axis
+        for (int i = 0; i < axis; i++) outShape.Add(dataShape[i]);
+        // Index shape dims (replaces the gathered axis)
+        foreach (var d in idxShape) outShape.Add(d);
+        // Dims after axis
+        for (int i = axis + 1; i < dataShape.Length; i++) outShape.Add(dataShape[i]);
+
+        return new[] { outShape.ToArray() };
     }
     public void Execute(OnnxOpContext ctx)
     {
@@ -493,38 +524,46 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
 
         // Get index values from pre-read constants (avoids GPU→CPU readback)
         var idxFloats = ctx.TryGetInputValues(1);
-        if (idxFloats == null)
+        if (idxFloats == null && axis == 0)
         {
-            // For small index tensors, fallback to treating as identity gather
-            // (copy input to output)
-            int copyCount = Math.Min(data.ElementCount, ctx.Outputs[0].ElementCount);
-            reg.ElementWise.Scale(data.Data.SubView(0, copyCount),
-                ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
+            // GPU-side Gather: indices are runtime tensors on GPU (e.g., NLP token IDs).
+            // Use float-index kernel that casts to int inside the GPU kernel.
+            int numIdx = indices.ElementCount;
+            int innerSize = 1;
+            for (int i = 1; i < data.Shape.Length; i++) innerSize *= data.Shape[i];
+            int dataRows = data.Shape[0];
+            reg.Gather.GatherAxis0Float(data.Data, indices.Data, ctx.Outputs[0].Data,
+                numIdx, innerSize, dataRows);
             return;
         }
+        else if (idxFloats == null)
+        {
+            // Non-axis-0 gather without pre-read indices — not yet supported on GPU
+            throw new NotSupportedException($"GPU Gather on axis {axis} with runtime indices not yet implemented");
+        }
 
-        int numIdx = idxFloats.Length;
-        int innerSize = 1;
-        for (int i = axis + 1; i < data.Shape.Length; i++) innerSize *= data.Shape[i];
+        int numIdx2 = idxFloats.Length;
+        int innerSize2 = 1;
+        for (int i = axis + 1; i < data.Shape.Length; i++) innerSize2 *= data.Shape[i];
         int outerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= data.Shape[i];
         int axisSize = data.Shape[axis];
 
-        // For each index, copy the corresponding slice
+        // CPU-side Gather with pre-read indices (for constant/small index tensors)
         for (int o = 0; o < outerSize; o++)
         {
-            for (int idx = 0; idx < numIdx; idx++)
+            for (int idx = 0; idx < numIdx2; idx++)
             {
                 int srcIdx = (int)idxFloats[idx];
-                if (srcIdx < 0) srcIdx += axisSize; // Negative indexing
+                if (srcIdx < 0) srcIdx += axisSize;
                 if (srcIdx < 0 || srcIdx >= axisSize) srcIdx = 0;
 
-                int srcOffset = (o * axisSize + srcIdx) * innerSize;
-                int dstOffset = (o * numIdx + idx) * innerSize;
+                int srcOffset = (o * axisSize + srcIdx) * innerSize2;
+                int dstOffset = (o * numIdx2 + idx) * innerSize2;
                 reg.ElementWise.Scale(
-                    data.Data.SubView(srcOffset, innerSize),
-                    ctx.Outputs[0].Data.SubView(dstOffset, innerSize),
-                    innerSize, 1f);
+                    data.Data.SubView(srcOffset, innerSize2),
+                    ctx.Outputs[0].Data.SubView(dstOffset, innerSize2),
+                    innerSize2, 1f);
             }
         }
     }
@@ -635,7 +674,19 @@ public class GemmOperator(OperatorRegistry reg) : IOnnxOperator
         if (transA != 0)
             throw new NotSupportedException("Gemm with transA=1 not yet implemented");
 
-        int M = a.Shape[0]; int K = a.Shape[1];
+        // Handle higher-rank inputs (e.g., [1,1,768] from Gather with axis > 0).
+        // Flatten to 2D by treating all dims except last as batch/M, last dim as K.
+        int M, K;
+        if (a.Shape.Length > 2)
+        {
+            K = a.Shape[^1];
+            M = a.ElementCount / K;
+        }
+        else
+        {
+            M = a.Shape[0]; K = a.Shape[1];
+        }
+
         int N = transB != 0 ? b.Shape[0] : b.Shape[1];
 
         if (transB != 0)
@@ -941,8 +992,9 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             && ctx.TryGetInputValues(1) is float[] startsF && ctx.TryGetInputValues(2) is float[] endsF)
         {
             // Path 2: runtime constant values from tensor inputs
-            starts = startsF.Select(v => (int)v).ToArray();
-            ends = endsF.Select(v => (int)v).ToArray();
+            // Clamp to int range — ONNX uses INT64_MAX (9.2e18) as "to end" sentinel
+            starts = startsF.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+            ends = endsF.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
             axes = ctx.Inputs.Length > 3 && ctx.TryGetInputValues(3) is float[] axF
                 ? axF.Select(v => (int)v).ToArray() : Enumerable.Range(0, starts.Length).ToArray();
             steps = ctx.Inputs.Length > 4 && ctx.TryGetInputValues(4) is float[] stF

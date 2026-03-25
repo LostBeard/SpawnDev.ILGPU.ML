@@ -13,6 +13,8 @@ var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddBlazorJSRuntime();
 
 // Register test types as singletons for UnitTestsView discovery
+// HuggingFace CDN tests run first — no GPU needed, validates API + downloads
+builder.Services.AddSingleton<HuggingFaceTests>();
 builder.Services.AddSingleton<WebGPUTests>();
 builder.Services.AddSingleton<WasmTests>();
 builder.Services.AddSingleton<WebGLTests>();

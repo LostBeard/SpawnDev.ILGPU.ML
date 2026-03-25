@@ -48,6 +48,10 @@ public class InferenceSession : IDisposable
     /// <summary>Number of weight tensors loaded.</summary>
     public int WeightCount => _weights.Count;
 
+    /// <summary>Try to get a weight tensor by name (for diagnostics).</summary>
+    public Tensor? TryGetWeight(string name)
+        => _weights.TryGetValue(name, out var t) ? t : null;
+
     /// <summary>Distinct operator types used in this model.</summary>
     public string[] OperatorTypes => _compiled.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s).ToArray();
 
@@ -101,7 +105,7 @@ public class InferenceSession : IDisposable
 
         // Extract small constant values for shape inference AND runtime operator use.
         // Use ONE shared read buffer to avoid allocating hundreds of tiny GPU buffers.
-        modelGraph.ConstantData = new Dictionary<string, int[]>();
+        modelGraph.ConstantData ??= new Dictionary<string, int[]>();
         var constantFloatValues = new Dictionary<string, float[]>();
         {
             // Find max small tensor size, allocate one shared readback buffer
@@ -133,7 +137,7 @@ public class InferenceSession : IDisposable
                                     Array.Copy(cpuWeightsAll, slice.Value.offset, hostBuf, 0, elems);
                                     constantFloatValues[name] = hostBuf;
                                     if (elems <= 16)
-                                        modelGraph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                                        modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                                 }
                             }
                             else
@@ -143,7 +147,7 @@ public class InferenceSession : IDisposable
                                 var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
                                 constantFloatValues[name] = hostBuf;
                                 if (elems <= 16)
-                                    modelGraph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                                    modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                             }
                         }
                     }
@@ -239,7 +243,7 @@ public class InferenceSession : IDisposable
                         && accelerator.AcceleratorType != AcceleratorType.Wasm;
         if (graph.ConstantData == null)
         {
-            graph.ConstantData = new Dictionary<string, int[]>();
+            graph.ConstantData ??= new Dictionary<string, int[]>();
         }
         if (canSyncCopy)
         {
@@ -253,7 +257,7 @@ public class InferenceSession : IDisposable
                     accelerator.Synchronize();
                     constantFloatValues[name] = hostBuf;
                     if (elems <= 16)
-                        graph.ConstantData[name] = hostBuf.Select(v => (int)v).ToArray();
+                        graph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                 }
             }
         }
@@ -346,6 +350,35 @@ public class InferenceSession : IDisposable
     }
 
     /// <summary>
+    /// Create an InferenceSession from a HuggingFace Hub model with OPFS caching.
+    /// Downloads the model on first call; subsequent calls load instantly from cache.
+    /// <code>
+    /// var hub = new ModelHub(js);
+    /// var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    ///     accelerator, hub, "onnx-community/squeezenet1.1-7", "model.onnx");
+    /// </code>
+    /// </summary>
+    /// <param name="accelerator">GPU accelerator to compile kernels on</param>
+    /// <param name="hub">ModelHub instance (provides OPFS caching)</param>
+    /// <param name="repoId">HuggingFace repository ID (e.g., "onnx-community/squeezenet1.1-7")</param>
+    /// <param name="filename">File path within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
+    /// <param name="revision">Git revision (default: "main")</param>
+    /// <param name="onProgress">Progress callback: (stage, percent)</param>
+    /// <param name="inputShapes">Optional: override input shapes for models with dynamic dimensions</param>
+    public static async Task<InferenceSession> CreateFromHuggingFaceAsync(
+        Accelerator accelerator, Hub.ModelHub hub,
+        string repoId, string filename, string revision = "main",
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null)
+    {
+        onProgress?.Invoke("download", 0);
+        var bytes = await hub.LoadAsync(repoId, filename, revision);
+        onProgress?.Invoke("download", 100);
+
+        return CreateFromFile(accelerator, bytes, onProgress, inputShapes);
+    }
+
+    /// <summary>
     /// Create an InferenceSession directly from a .onnx file loaded via HTTP.
     /// No Python extraction step needed — uses the native ONNX protobuf parser.
     /// </summary>
@@ -369,7 +402,8 @@ public class InferenceSession : IDisposable
     public static InferenceSession CreateFromOnnx(
         Accelerator accelerator, byte[] onnxBytes,
         Action<string, int>? onProgress = null,
-        Dictionary<string, int[]>? inputShapes = null)
+        Dictionary<string, int[]>? inputShapes = null,
+        bool enableOptimization = true)
     {
         // Parse ONNX protobuf
         onProgress?.Invoke("parse", 0);
@@ -384,10 +418,12 @@ public class InferenceSession : IDisposable
         }
 
         // Convert OnnxModelInfo → ModelGraph
-        var graph = ConvertToModelGraph(modelInfo);
+        ModelGraph graph;
+        try { graph = ConvertToModelGraph(modelInfo); }
+        catch (Exception ex) { throw new InvalidOperationException($"ConvertToModelGraph failed: {ex.GetType().Name}: {ex.Message}", ex); }
 
         // Extract small constant values — data is already on CPU (from ONNX parser), no readback needed
-        graph.ConstantData = new Dictionary<string, int[]>();
+        graph.ConstantData ??= new Dictionary<string, int[]>();
         var constantFloatValues = new Dictionary<string, float[]>();
         foreach (var (name, shape) in graph.Initializers)
         {
@@ -397,7 +433,7 @@ public class InferenceSession : IDisposable
                 constantFloatValues[name] = data;
                 if (elems <= 16)
                 {
-                    graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+                    graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                     graph.FloatConstantData ??= new Dictionary<string, float[]>();
                     graph.FloatConstantData[name] = data.ToArray();
                 }
@@ -407,7 +443,7 @@ public class InferenceSession : IDisposable
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
-        var compiled = new GraphCompiler(registry).Compile(graph);
+        var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
         // Upload weights to GPU
@@ -574,7 +610,7 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("parse", 100);
 
         // Extract small constant values for shape inference
-        graph.ConstantData = new Dictionary<string, int[]>();
+        graph.ConstantData ??= new Dictionary<string, int[]>();
         var constantFloatValues = new Dictionary<string, float[]>();
         foreach (var (name, shape) in graph.Initializers)
         {
@@ -584,7 +620,7 @@ public class InferenceSession : IDisposable
                 constantFloatValues[name] = data;
                 if (elems <= 16)
                 {
-                    graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+                    graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                     graph.FloatConstantData ??= new Dictionary<string, float[]>();
                     graph.FloatConstantData[name] = data.ToArray();
                 }
@@ -594,7 +630,7 @@ public class InferenceSession : IDisposable
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
-        var compiled = new GraphCompiler(registry).Compile(graph);
+        var compiled = new GraphCompiler(registry) { EnableOptimization = true }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
         // Upload weights to GPU
@@ -658,7 +694,7 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values
-        graph.ConstantData = new Dictionary<string, int[]>();
+        graph.ConstantData ??= new Dictionary<string, int[]>();
         var constantFloatValues = new Dictionary<string, float[]>();
         foreach (var (name, shape) in graph.Initializers)
         {
@@ -668,7 +704,7 @@ public class InferenceSession : IDisposable
                 constantFloatValues[name] = data;
                 if (elems <= 16)
                 {
-                    graph.ConstantData[name] = data.Select(v => (int)v).ToArray();
+                    graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                     graph.FloatConstantData ??= new Dictionary<string, float[]>();
                     graph.FloatConstantData[name] = data.ToArray();
                 }
@@ -678,7 +714,7 @@ public class InferenceSession : IDisposable
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
-        var compiled = new GraphCompiler(registry).Compile(graph);
+        var compiled = new GraphCompiler(registry) { EnableOptimization = true }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
         // Upload weights to GPU

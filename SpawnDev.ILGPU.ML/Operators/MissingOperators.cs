@@ -33,7 +33,10 @@ public class DepthToSpaceOperator : IOnnxOperator
         int inH = input.Shape[2];
         int inW = input.Shape[3];
         int outC = input.Shape[1] / (blockSize * blockSize);
-        _kernels.DepthToSpace(input.Data, output.Data, outC, inH, inW, blockSize);
+        // ONNX mode: "DCR" (default) or "CRD"
+        var modeStr = ctx.GetString("mode", "DCR");
+        int mode = modeStr.Equals("CRD", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+        _kernels.DepthToSpace(input.Data, output.Data, outC, inH, inW, blockSize, mode);
     }
 }
 

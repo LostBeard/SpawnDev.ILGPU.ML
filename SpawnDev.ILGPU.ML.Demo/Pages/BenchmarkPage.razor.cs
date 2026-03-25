@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Components;
 using SpawnDev.BlazorJS;
 using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.WebGPU;
 using System.Diagnostics;
@@ -195,7 +196,9 @@ public partial class BenchmarkPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var session = await InferenceSession.CreateFromFileAsync(accelerator, Http, "models/squeezenet/model.onnx");
+            using var hub1 = new ModelHub(JS);
+            var sqBytes = await hub1.LoadAsync(ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
+            var session = InferenceSession.CreateFromFile(accelerator, sqBytes);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new ClassificationPipeline(session, accelerator);
@@ -242,7 +245,9 @@ public partial class BenchmarkPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var session = await InferenceSession.CreateFromFileAsync(accelerator, Http, "models/super-resolution/model.onnx");
+            using var hub2 = new ModelHub(JS);
+            var srBytes = await hub2.LoadAsync(ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx");
+            var session = InferenceSession.CreateFromFile(accelerator, srBytes);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new SuperResolutionPipeline(session, accelerator);
@@ -288,7 +293,9 @@ public partial class BenchmarkPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var session = await InferenceSession.CreateFromFileAsync(accelerator, Http, "models/style-mosaic/model.onnx");
+            using var hub3 = new ModelHub(JS);
+            var stBytes = await hub3.LoadAsync(ModelHub.KnownModels.StyleMosaic, "mosaic-9.onnx");
+            var session = InferenceSession.CreateFromFile(accelerator, stBytes);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new StyleTransferPipeline(session, accelerator);

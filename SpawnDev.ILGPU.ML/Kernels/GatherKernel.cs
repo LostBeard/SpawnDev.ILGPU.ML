@@ -49,10 +49,50 @@ public class GatherKernel
         _gatherAxis0Kernel!(numIndices * innerSize, data, indices, output, innerSize, 0);
     }
 
+    // ── Float-index variant for NLP models (token IDs stored as float) ──
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int>? _gatherAxis0FloatKernel;
+
+    /// <summary>
+    /// Gather along axis 0 with float indices (cast to int internally).
+    /// Used for embedding lookups where token IDs are stored as float32.
+    /// data: [dataRows, innerSize], indices: [numIndices] (float), output: [numIndices, innerSize].
+    /// </summary>
+    private static void GatherAxis0FloatImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int innerSize, int dataRows)
+    {
+        int outRow = idx / innerSize;
+        int col = idx % innerSize;
+        int srcRow = (int)indices[outRow];
+        if (srcRow < 0) srcRow += dataRows;
+        output[idx] = data[srcRow * innerSize + col];
+    }
+
+    /// <summary>
+    /// Gather along axis 0 with float indices.
+    /// data: [dataRows, innerSize], indices: [numIndices] (float token IDs).
+    /// Output: [numIndices, innerSize].
+    /// </summary>
+    public void GatherAxis0Float(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numIndices, int innerSize, int dataRows)
+    {
+        EnsureLoaded();
+        _gatherAxis0FloatKernel!(numIndices * innerSize, data, indices, output, innerSize, dataRows);
+    }
+
     private void EnsureLoaded()
     {
         _gatherAxis0Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0Impl);
+        _gatherAxis0FloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0FloatImpl);
     }
 }

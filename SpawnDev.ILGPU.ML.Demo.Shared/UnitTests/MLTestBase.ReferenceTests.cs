@@ -173,33 +173,233 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 120000)]
     public async Task Reference_YOLOv8_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        // Enable per-node capture to trace the detection head
+        var (actual, expected) = await RunReferenceComparison(accelerator,
+            "models/yolov8n/model.onnx",
+            "references/yolov8n/cat_input_nchw.bin",
+            "references/yolov8n/cat_output.bin",
+            new[] { 1, 3, 640, 640 });
+        AssertReferenceMatch(actual, expected, 1.0f, "YOLOv8");
+    });
+
+    // ── Text Classification Reference Test (256MB model — may OOM in browser) ──
+
+    [TestMethod(Timeout = 120000)]
+    public async Task Reference_DistilBERT_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // DistilBERT takes INT64 inputs (token IDs + attention mask).
+        // Our engine uses float32 tensors — token IDs are passed as float and
+        // the model's Gather (embedding lookup) works with float indices.
+        // DistilBERT has dynamic batch_size + sequence_length dims.
+        // Override to match our test input (1 batch, 6 tokens).
+        var shapes = new Dictionary<string, int[]>
+        {
+            ["input_ids"] = new[] { 1, 6 },
+            ["attention_mask"] = new[] { 1, 6 },
+        };
+
+        var onnxBytes = await http.GetByteArrayAsync("models/distilbert-sst2/model.onnx");
+
+        // Capture per-node outputs to find where values diverge
         Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
         try
         {
-            var (actual, expected) = await RunReferenceComparison(accelerator,
-                "models/yolov8n/model.onnx",
-                "references/yolov8n/cat_input_nchw.bin",
-                "references/yolov8n/cat_output.bin",
-                new[] { 1, 3, 640, 640 });
+            var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes, inputShapes: shapes);
 
-            // Dump captured DFL/decode head values for debugging
+            // "I love this movie" tokenized: [CLS]=101 I=1045 love=2293 this=2023 movie=3185 [SEP]=102
+            var tokenIds = new float[] { 101, 1045, 2293, 2023, 3185, 102 };
+            var attentionMask = new float[] { 1, 1, 1, 1, 1, 1 };
+
+            using var idsBuf = accelerator.Allocate1D(tokenIds);
+            using var maskBuf = accelerator.Allocate1D(attentionMask);
+
+            var inputs = new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 6 }),
+                [session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 6 }),
+            };
+
+            var outputs = await session.RunAsync(inputs);
+            var output = outputs[session.OutputNames[0]];
+
+            using var readBuf = accelerator.Allocate1D<float>(2);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, 2), readBuf.View, 2, 1f);
+            await accelerator.SynchronizeAsync();
+            var logits = await readBuf.CopyToHostAsync<float>(0, 2);
+
+            // Dump ALL captured node outputs for debugging — find where values diverge
             var captured = Graph.GraphExecutor.CapturedOutputs;
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"Captured {captured.Count} nodes. Last 30:");
-            foreach (var (key, vals) in captured.OrderBy(kv => kv.Key).TakeLast(30))
+            sb.AppendLine($"Captured {captured.Count} nodes:");
+            foreach (var (key, vals) in captured.OrderBy(kv => kv.Key))
             {
+                float absMax = vals.Length > 0 ? vals.Max(v => MathF.Abs(v)) : 0;
                 var vStr = string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")));
-                sb.AppendLine($"  {key}: [{vStr}]");
+                sb.AppendLine($"  {key}: absMax={absMax:F4} [{vStr}]");
             }
-            sb.AppendLine($"FINAL actual[0..5]: [{string.Join(", ", actual.Take(5).Select(v => v.ToString("F4")))}]");
-            sb.AppendLine($"FINAL expected[0..5]: [{string.Join(", ", expected.Take(5).Select(v => v.ToString("F4")))}]");
+            sb.AppendLine($"FINAL logits: [{logits[0]:F4}, {logits[1]:F4}]");
+            sb.AppendLine($"EXPECTED:     [-4.3237, 4.6761]");
 
-            AssertReferenceMatch(actual, expected, 1.0f, $"YOLOv8\n{sb}");
+            // Compare against ONNX Runtime reference
+            var refBytes = await http.GetByteArrayAsync("references/distilbert-sst2-onnx/i_love_this_movie_i_logits.bin");
+            var refLogits = new float[refBytes.Length / 4];
+            Buffer.BlockCopy(refBytes, 0, refLogits, 0, refBytes.Length);
+            AssertReferenceMatch(logits, refLogits, 0.5f, $"DistilBERT\n{sb}");
+
+            session.Dispose();
         }
         finally
         {
             Graph.GraphExecutor.CapturedOutputs = null;
         }
+    });
+
+    // ── Text Generation Reference Test ──
+
+    [TestMethod(Timeout = 120000)]
+    public async Task Reference_GPT2_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // GPT-2 has dynamic dims and int64 inputs. Optimizer crashes on NLP models.
+        var onnxBytes = await http.GetByteArrayAsync("models/gpt2/model.onnx");
+        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]>
+            {
+                ["input_ids"] = new[] { 1, 5 },
+                ["attention_mask"] = new[] { 1, 5 },
+                ["position_ids"] = new[] { 1, 5 },
+            },
+            enableOptimization: false);
+
+        // "The cat sat on the" = [464, 3797, 3332, 319, 262]
+        var tokenIds = new float[] { 464, 3797, 3332, 319, 262 };
+        var attentionMask = new float[] { 1, 1, 1, 1, 1 };
+        var positionIds = new float[] { 0, 1, 2, 3, 4 };
+
+        using var idsBuf = accelerator.Allocate1D(tokenIds);
+        using var maskBuf = accelerator.Allocate1D(attentionMask);
+        using var posBuf = accelerator.Allocate1D(positionIds);
+
+        var inputs = new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 }),
+            [session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 }),
+            [session.InputNames[2]] = new Tensor(posBuf.View, new[] { 1, 5 }),
+        };
+
+        var outputs = await session.RunAsync(inputs);
+        var output = outputs[session.OutputNames[0]];
+
+        // GPT-2 output: [1, 5, 50257] — get last token's logits
+        int vocabSize = 50257;
+        int lastTokenOffset = 4 * vocabSize; // token index 4 (last)
+        using var readBuf = accelerator.Allocate1D<float>(vocabSize);
+        new ElementWiseKernels(accelerator).Scale(
+            output.Data.SubView(lastTokenOffset, vocabSize), readBuf.View, vocabSize, 1f);
+        await accelerator.SynchronizeAsync();
+        var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
+
+        // Verify: next token should be 4314 (" floor")
+        int nextToken = 0;
+        float maxLogit = float.MinValue;
+        for (int i = 0; i < logits.Length; i++)
+            if (logits[i] > maxLogit) { maxLogit = logits[i]; nextToken = i; }
+
+        if (nextToken != 4314)
+            throw new Exception($"[GPT-2] Expected next token 4314 (floor), got {nextToken}");
+
+        session.Dispose();
+    });
+
+    // ── Whisper Encoder Reference Test ──
+
+    [TestMethod(Timeout = 120000)]
+    public async Task Reference_WhisperEncoder_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var session = await InferenceSession.CreateFromFileAsync(accelerator, http,
+            "models/whisper-tiny/encoder_model.onnx");
+
+        // Load mel spectrogram reference
+        var melBytes = await http.GetByteArrayAsync("references/whisper-tiny-onnx/tone_mel.bin");
+        var melFloats = new float[melBytes.Length / 4];
+        Buffer.BlockCopy(melBytes, 0, melFloats, 0, melBytes.Length);
+
+        using var melBuf = accelerator.Allocate1D(melFloats);
+        var inputs = new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = new Tensor(melBuf.View, new[] { 1, 80, 3000 }),
+        };
+
+        var outputs = await session.RunAsync(inputs);
+        var output = outputs[session.OutputNames[0]];
+        int elems = Math.Min(output.ElementCount, 100); // Compare first 100 values
+
+        using var readBuf = accelerator.Allocate1D<float>(elems);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        await accelerator.SynchronizeAsync();
+        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+
+        // Load reference
+        var refBytes = await http.GetByteArrayAsync("references/whisper-tiny-onnx/tone_encoder_output.bin");
+        var refAll = new float[refBytes.Length / 4];
+        Buffer.BlockCopy(refBytes, 0, refAll, 0, refBytes.Length);
+        var expected = refAll.Take(elems).ToArray();
+
+        AssertReferenceMatch(actual, expected, 0.5f, "WhisperEncoder");
+        session.Dispose();
+    });
+
+    // ── Depth Estimation Reference Test ──
+
+    [TestMethod(Timeout = 120000)]
+    public async Task Reference_DepthAnything_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // Depth Anything has dynamic dims — override to 224x224 for browser-safe testing
+        var session = await InferenceSession.CreateFromOnnxAsync(accelerator, http,
+            "models/depth-anything-v2-small/model.onnx");
+
+        var inputBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_input_224_nchw.bin");
+        var inputFloats = new float[inputBytes.Length / 4];
+        Buffer.BlockCopy(inputBytes, 0, inputFloats, 0, inputBytes.Length);
+
+        using var inputBuf = accelerator.Allocate1D(inputFloats);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = inputTensor
+        });
+
+        var output = outputs[session.OutputNames[0]];
+        int elems = output.ElementCount;
+
+        // Depth output should be [1, 224, 224] = 50176 elements
+        // If only 1 element, the model's dynamic shape wasn't resolved
+        if (elems < 100)
+            throw new Exception($"[DepthAnything] Output has only {elems} elements (shape={string.Join(",", output.Shape)}). Dynamic shape not resolved. Expected ~50176.");
+
+        using var readBuf = accelerator.Allocate1D<float>(elems);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        await accelerator.SynchronizeAsync();
+        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+
+        var refBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_output_224.bin");
+        var expected = new float[refBytes.Length / 4];
+        Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
+
+        // Compare only up to what we got
+        var cmpLen = Math.Min(actual.Length, expected.Length);
+        AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 0.5f, "DepthAnything");
+        session.Dispose();
     });
 }

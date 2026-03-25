@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ONNX Runtime Web vs SpawnDev.ILGPU.ML — Browser Comparison</title>
+    <style>
+        body { font-family: monospace; background: #1a1a2e; color: #eee; padding: 20px; }
+        .result { margin: 10px 0; padding: 10px; border: 1px solid #333; border-radius: 4px; }
+        .pass { border-color: #3fb950; }
+        .fail { border-color: #f85149; }
+        .running { border-color: #58a6ff; }
+        button { padding: 8px 16px; margin: 5px; cursor: pointer; font-size: 14px; }
+        h2 { color: #58a6ff; }
+        pre { background: #0d1117; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+<h1>ONNX Runtime Web — Browser Baseline Test</h1>
+<p>Tests if ONNX Runtime Web can load and run models in THIS browser. If ORT Web succeeds but our engine fails, the issue is in our implementation.</p>
+
+<h2>DistilBERT-SST2 (256MB)</h2>
+<button onclick="runDistilBERT()">Run DistilBERT</button>
+<div id="distilbert-result" class="result">Waiting...</div>
+
+<h2>Whisper Tiny Encoder (75MB)</h2>
+<button onclick="runWhisperEncoder()">Run Whisper Encoder</button>
+<div id="whisper-result" class="result">Waiting...</div>
+
+<h2>SqueezeNet (5MB)</h2>
+<button onclick="runSqueezeNet()">Run SqueezeNet</button>
+<div id="squeezenet-result" class="result">Waiting...</div>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.21.0/dist/ort.min.js"></script>
+<script>
+function log(id, msg, cls) {
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.className = 'result ' + (cls || '');
+}
+
+async function runDistilBERT() {
+    log('distilbert-result', 'Loading DistilBERT-SST2 (256MB)...', 'running');
+    try {
+        const startLoad = performance.now();
+        const session = await ort.InferenceSession.create('models/distilbert-sst2/model.onnx', {
+            executionProviders: ['webgpu', 'wasm']
+        });
+        const loadTime = ((performance.now() - startLoad) / 1000).toFixed(1);
+
+        // "I love this movie" tokenized
+        const inputIds = new BigInt64Array([101n, 1045n, 2293n, 2023n, 3185n, 102n]);
+        const attentionMask = new BigInt64Array([1n, 1n, 1n, 1n, 1n, 1n]);
+
+        const feeds = {
+            'input_ids': new ort.Tensor('int64', inputIds, [1, 6]),
+            'attention_mask': new ort.Tensor('int64', attentionMask, [1, 6]),
+        };
+
+        const startInfer = performance.now();
+        const results = await session.run(feeds);
+        const inferTime = ((performance.now() - startInfer) / 1000).toFixed(2);
+
+        const logits = results.logits.data;
+        const prediction = logits[1] > logits[0] ? 'POSITIVE' : 'NEGATIVE';
+        const expMax = Math.max(logits[0], logits[1]);
+        const prob0 = Math.exp(logits[0] - expMax);
+        const prob1 = Math.exp(logits[1] - expMax);
+        const confidence = (Math.max(prob0, prob1) / (prob0 + prob1) * 100).toFixed(2);
+
+        log('distilbert-result',
+            `PASS — DistilBERT loaded in ${loadTime}s, inference in ${inferTime}s\n` +
+            `Input: "I love this movie"\n` +
+            `Logits: [${logits[0].toFixed(4)}, ${logits[1].toFixed(4)}]\n` +
+            `Prediction: ${prediction} (${confidence}%)`,
+            'pass');
+
+        session.release();
+    } catch (e) {
+        log('distilbert-result', `FAIL — ${e.message}`, 'fail');
+    }
+}
+
+async function runWhisperEncoder() {
+    log('whisper-result', 'Loading Whisper Tiny Encoder (75MB)...', 'running');
+    try {
+        const startLoad = performance.now();
+        const session = await ort.InferenceSession.create('models/whisper-tiny/encoder_model.onnx', {
+            executionProviders: ['webgpu', 'wasm']
+        });
+        const loadTime = ((performance.now() - startLoad) / 1000).toFixed(1);
+
+        // Random mel spectrogram [1, 80, 3000]
+        const mel = new Float32Array(80 * 3000);
+        for (let i = 0; i < mel.length; i++) mel[i] = Math.random() * 2 - 1;
+
+        const feeds = {
+            'input_features': new ort.Tensor('float32', mel, [1, 80, 3000]),
+        };
+
+        const startInfer = performance.now();
+        const results = await session.run(feeds);
+        const inferTime = ((performance.now() - startInfer) / 1000).toFixed(2);
+
+        const output = results.last_hidden_state;
+        const first5 = Array.from(output.data.slice(0, 5)).map(v => v.toFixed(4));
+
+        log('whisper-result',
+            `PASS — Whisper Encoder loaded in ${loadTime}s, inference in ${inferTime}s\n` +
+            `Output shape: [${output.dims.join(', ')}]\n` +
+            `First 5 values: [${first5.join(', ')}]`,
+            'pass');
+
+        session.release();
+    } catch (e) {
+        log('whisper-result', `FAIL — ${e.message}`, 'fail');
+    }
+}
+
+async function runSqueezeNet() {
+    log('squeezenet-result', 'Loading SqueezeNet (5MB)...', 'running');
+    try {
+        const startLoad = performance.now();
+        const session = await ort.InferenceSession.create('models/squeezenet/model.onnx', {
+            executionProviders: ['webgpu', 'wasm']
+        });
+        const loadTime = ((performance.now() - startLoad) / 1000).toFixed(1);
+
+        // Random image [1, 3, 224, 224]
+        const input = new Float32Array(3 * 224 * 224);
+        for (let i = 0; i < input.length; i++) input[i] = Math.random() * 255;
+
+        const inputName = session.inputNames[0];
+        const feeds = {};
+        feeds[inputName] = new ort.Tensor('float32', input, [1, 3, 224, 224]);
+
+        const startInfer = performance.now();
+        const results = await session.run(feeds);
+        const inferTime = ((performance.now() - startInfer) / 1000).toFixed(2);
+
+        const outputName = session.outputNames[0];
+        const output = results[outputName];
+        const first5 = Array.from(output.data.slice(0, 5)).map(v => v.toFixed(4));
+
+        log('squeezenet-result',
+            `PASS — SqueezeNet loaded in ${loadTime}s, inference in ${inferTime}s\n` +
+            `Output shape: [${output.dims.join(', ')}]\n` +
+            `First 5 logits: [${first5.join(', ')}]`,
+            'pass');
+
+        session.release();
+    } catch (e) {
+        log('squeezenet-result', `FAIL — ${e.message}`, 'fail');
+    }
+}
+</script>
+</body>
+</html>

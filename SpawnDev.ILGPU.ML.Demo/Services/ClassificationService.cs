@@ -22,7 +22,7 @@ public class ClassificationService : IDisposable
 
     public ClassificationService(HttpClient http) => _http = http;
 
-    /// <summary>Load model for the given accelerator.</summary>
+    /// <summary>Load model from a URL for the given accelerator.</summary>
     public async Task LoadModelAsync(string modelUrl, Accelerator accelerator)
     {
         _session?.Dispose();
@@ -31,6 +31,18 @@ public class ClassificationService : IDisposable
 
         _session = await InferenceSession.CreateFromFileAsync(accelerator, _http, modelUrl);
         _pipeline = new ClassificationPipeline(_session, accelerator);
+    }
+
+    /// <summary>Load model from raw bytes for the given accelerator.</summary>
+    public Task LoadModelAsync(byte[] modelBytes, Accelerator accelerator)
+    {
+        _session?.Dispose();
+        _pipeline?.Dispose();
+        _accelerator = accelerator;
+
+        _session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+        _pipeline = new ClassificationPipeline(_session, accelerator);
+        return Task.CompletedTask;
     }
 
     /// <summary>Classify an RGBA image. Returns results + inference time.</summary>
