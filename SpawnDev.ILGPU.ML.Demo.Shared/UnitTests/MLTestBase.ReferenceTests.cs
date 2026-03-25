@@ -366,44 +366,67 @@ public abstract partial class MLTestBase
 
         // Depth Anything has dynamic dims — override to 224x224 for browser-safe testing
         var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
+
+        Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+        try
+        {
+            var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                });
+
+            var inputBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_input_224_nchw.bin");
+            var inputFloats = new float[inputBytes.Length / 4];
+            Buffer.BlockCopy(inputBytes, 0, inputFloats, 0, inputBytes.Length);
+
+            using var inputBuf = accelerator.Allocate1D(inputFloats);
+            var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+
+            var outputs = await session.RunAsync(new Dictionary<string, Tensor>
             {
-                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                [session.InputNames[0]] = inputTensor
             });
 
-        var inputBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_input_224_nchw.bin");
-        var inputFloats = new float[inputBytes.Length / 4];
-        Buffer.BlockCopy(inputBytes, 0, inputFloats, 0, inputBytes.Length);
+            var output = outputs[session.OutputNames[0]];
+            int elems = output.ElementCount;
 
-        using var inputBuf = accelerator.Allocate1D(inputFloats);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+            if (elems < 100)
+                throw new Exception($"[DepthAnything] Output has only {elems} elements (shape={string.Join(",", output.Shape)}). Dynamic shape not resolved.");
 
-        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+            using var readBuf = accelerator.Allocate1D<float>(elems);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+            await accelerator.SynchronizeAsync();
+            var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+
+            var refBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_output_224.bin");
+            var expected = new float[refBytes.Length / 4];
+            Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
+
+            // Dump key nodes to find where signal dies
+            var captured = Graph.GraphExecutor.CapturedOutputs;
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"Captured {captured.Count} nodes. Key nodes:");
+            // Show every 20th node + all nodes with zero absMax
+            int idx = 0;
+            foreach (var (key, vals) in captured.OrderBy(kv => kv.Key))
+            {
+                float absMax = vals.Length > 0 ? vals.Max(v => MathF.Abs(v)) : 0;
+                if (idx >= 735 || idx % 50 == 0 || key.Contains("Softmax") || key.Contains("attn"))
+                {
+                    var vStr = string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")));
+                    sb.AppendLine($"  {key}: absMax={absMax:F4} [{vStr}]");
+                }
+                idx++;
+            }
+
+            var cmpLen = Math.Min(actual.Length, expected.Length);
+            AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 0.5f, $"DepthAnything\n{sb}");
+            session.Dispose();
+        }
+        finally
         {
-            [session.InputNames[0]] = inputTensor
-        });
-
-        var output = outputs[session.OutputNames[0]];
-        int elems = output.ElementCount;
-
-        // Depth output should be [1, 224, 224] = 50176 elements
-        // If only 1 element, the model's dynamic shape wasn't resolved
-        if (elems < 100)
-            throw new Exception($"[DepthAnything] Output has only {elems} elements (shape={string.Join(",", output.Shape)}). Dynamic shape not resolved. Expected ~50176.");
-
-        using var readBuf = accelerator.Allocate1D<float>(elems);
-        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await accelerator.SynchronizeAsync();
-        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
-
-        var refBytes = await http.GetByteArrayAsync("references/depth-anything-v2-small/cat_output_224.bin");
-        var expected = new float[refBytes.Length / 4];
-        Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
-
-        // Compare only up to what we got
-        var cmpLen = Math.Min(actual.Length, expected.Length);
-        AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 0.5f, "DepthAnything");
-        session.Dispose();
+            Graph.GraphExecutor.CapturedOutputs = null;
+        }
     });
 }
