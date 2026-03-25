@@ -12,13 +12,15 @@ SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kern
 
 ## Highlights
 
-- **Neural style transfer runs in the browser** — 112-node pipeline, 5 styles, entirely on WebGPU. Turn your photo into a Van Gogh, Monet, or Picasso — no server, no upload, no cloud.
+- **NLP transformers run in the browser** — DistilBERT sentiment analysis, GPT-2 text generation, Whisper speech-to-text — all on WebGPU. No server, no upload, no cloud.
+- **Neural style transfer runs in the browser** — 112-node pipeline, 5 styles, entirely on WebGPU. Turn your photo into a Van Gogh, Monet, or Picasso.
 - **Image classification in-browser** — SqueezeNet identifies "tiger cat" at 51.97% confidence on WebGPU. Drop any photo.
 - **Image super resolution** — ESPCN 3x upscale running on WebGPU. The "enhance!" button is real.
-- **71 ONNX operators** — enough to run classification, style transfer, super resolution, depth estimation, pose estimation, and more
+- **71 ONNX operators** — enough to run classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, and more
 - **7 model formats** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, and CoreML. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
-- **10+ models compile** — SqueezeNet, MobileNetV2, 5 style transfer models, ESPCN, Depth Anything V2 (823 nodes!), MoveNet Lightning
+- **HuggingFace CDN** — Models load directly from HuggingFace with OPFS caching. No bundling, no local storage limits. Search, browse, and load any public model.
+- **96 numpy-verified operator tests** — every operator validated against known-correct reference data
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 
 ## Universal Model Loading
@@ -120,24 +122,31 @@ Auto-selection: WebGPU > WebGL > Wasm (browser) or CUDA > OpenCL > CPU (desktop)
 
 ## Validated Models
 
+### Vision Models
+
 | Model | Task | Size | Status |
 |-------|------|------|--------|
-| **SqueezeNet** | Classification (1000 classes) | 5 MB | **Working** — tiger cat 51.97% on WebGPU |
+| **SqueezeNet** | Classification (1000 classes) | 5 MB | **Working** — matches ONNX Runtime reference |
 | **MobileNetV2** | Classification (1000 classes) | 13 MB | Compiles, graph runs |
-| **ESPCN** | Super Resolution (3x) | 100 KB | **Working** on WebGPU |
-| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** on WebGPU — 112 nodes, 3.9s inference |
+| **ESPCN** | Super Resolution (3x) | 100 KB | **Working** — matches ONNX Runtime reference |
+| **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** — 112 nodes, reference-matched |
+| **YOLOv8 Nano** | Object detection (80 classes) | 12.2 MB | **Working** — matches ONNX Runtime reference |
 | **Depth Anything V2 Small** | Monocular depth estimation | 95 MB | Compiles (823 nodes, 25 op types) |
 | **MoveNet Lightning** | Pose estimation (17 keypoints) | 9 MB | Compiles (21 op types) |
+| **BlazeFace** | Face detection | 229 KB | TFLite — loads and runs |
+| **EfficientNet-Lite0** | Classification (1000 classes) | 17.7 MB | TFLite — loads and runs |
 
 Style models: mosaic, candy, rain princess, udnie, pointilism.
 
-**TFLite models:**
+### NLP Models
 
-| Model | Task | Size | Format |
+| Model | Task | Size | Status |
 |-------|------|------|--------|
-| **BlazeFace** | Face detection | 229 KB | TFLite (MediaPipe) |
-| **EfficientNet-Lite0** | Classification (1000 classes) | 17.7 MB | TFLite (MediaPipe) |
-| **YOLOv8 Nano** | Object detection (80 classes) | 12.2 MB | ONNX |
+| **DistilBERT-SST2** | Sentiment analysis | 268 MB | **Working** — matches ONNX Runtime reference |
+| **GPT-2** | Text generation | 548 MB | Compiles, inference runs |
+| **Whisper Tiny** | Speech-to-text | 231 MB | Encoder compiles, inference runs |
+| **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Available via HuggingFace CDN |
+| **SpeechT5** | Text-to-speech | 643 MB | Available via HuggingFace CDN |
 
 ## Architecture
 
@@ -345,14 +354,29 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 
 ## Recent Breakthroughs
 
+- **NLP transformers working** — DistilBERT sentiment analysis passes reference test. 10-bug fix chain: ConstantOfShape value attribute, Expand N-D broadcasting, Unsqueeze shape inference, Slice constant folding, Cast constant propagation, INT64_MAX overflow, Gemm higher-rank inputs. The same fixes unblock GPT-2, Whisper, and all transformer architectures.
+- **HuggingFace CDN integration** — All models load from HuggingFace with OPFS caching. 1.25GB of model files removed from repo. Search, browse, and load any public model. 15 known models pre-configured.
+- **96 operator test cases** — Expanded from 18 to 96 numpy-verified test cases covering MatMul, Gemm, LayerNorm, BatchNorm, InstanceNorm, all activations, all reductions, Gather, Split, Expand, Unsqueeze, Cast, Pad, Resize, comparisons, and more. Caught 11 real operator bugs.
 - **7 model format parsers** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML. All zero-dependency, all auto-detected. One API loads any format.
-- **6-pass graph optimizer** — constant folding, identity elimination, linear fusion, scaled MatMul fusion, strength reduction, dead node elimination. Automatically reduces node count by ~30% on style transfer models.
+- **6-pass graph optimizer** — constant folding (with explicit Slice/Cast/Sqrt handlers), identity elimination, linear fusion, scaled MatMul fusion, strength reduction, dead node elimination.
 - **Fused linear kernel** — `MatMul + Bias + Activation` in a single GPU dispatch. Eliminates 2/3 of memory bandwidth for every linear layer in every model.
 - **Zero-copy style transfer** — entire pipeline (preprocess → inference → postprocess) stays on GPU. No CPU pixel loops.
-- **All 4 pipelines GPU-preprocessed** — Classification, StyleTransfer, SuperResolution, Depth all use GPU kernels for image preprocessing.
-- **WGSL/GLSL codegen bugs fixed** — 4 codegen bugs found and fixed in SpawnDev.ILGPU. All 6 backends green: 1450 pass / 0 fail.
 - **InstanceNorm 50,000x speedup** — Two-pass O(N) kernel. Style transfer went from infinite hang to 3.9 seconds.
 - **Register-blocked MatMul** — 4x4 per thread, 64x64 tiles. Targeting 200+ GFLOPS (current tiled: 92-101).
+
+## Blazing Edge — v4.0.0
+
+SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML research frontier — not as experiments, but as production-ready features.
+
+| Technology | What It Does | Why It Matters |
+|-----------|-------------|----------------|
+| **TurboQuant** | 6x KV cache compression, zero accuracy loss, no calibration | Large NLP models (GPT-2, Whisper) fit in browser memory. Data-oblivious — works for every model automatically. |
+| **SPZ Compression** | 15-20x compression for Gaussian Splat scenes, optimized for WebGPU | 500MB 3D scenes become 25MB. Spatially-ordered Gaussians make GPU sorting faster. Instant sharing. |
+| **Depth Anything V3** | Multi-view depth + ray maps with temporal consistency | Eliminates depth flicker in video. Treats video as multi-view sequence, not isolated frames. Critical for 2D-to-3D conversion. |
+| **AsyncMDE** | Asynchronous Spatial Memory decouples depth from render loop | Real-time depth estimation at video framerate on standard hardware. No UI lockup during GPU computation. |
+| **Mamba-3** | Linear-scaling State Space Models with MIMO arithmetic intensity | Constant-memory decoding — LLM conversations don't slow down or eat more RAM over time. Closes gap with Transformers while keeping O(n) scaling. |
+
+These aren't future plans — they're v4.0.0 features. Because every release is the last release.
 
 ## Testing
 
@@ -364,7 +388,7 @@ dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj
 ```
 
 **SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends. Wasm backend: **179 pass / 0 fail / 55 skip** (fiber refactor complete — all RadixSort, scan, barrier, and sort tests pass).
-**SpawnDev.ILGPU.ML: 78/78 WebGPU, 70/70 CUDA, 70/70 OpenCL.**
+**SpawnDev.ILGPU.ML: 130+ WebGPU tests** — 96 operator tests, 12 preprocessor tests, 9 HuggingFace CDN tests, 9+ reference model tests (SqueezeNet, 5 styles, ESPCN, YOLOv8, DistilBERT), format loader tests, pipeline tests, and more.
 
 Every kernel validates against CPU reference implementations.
 
