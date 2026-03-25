@@ -461,11 +461,14 @@ public static class GraphOptimizer
                         }
                     }
 
-                    // Generic folding: for ops without explicit handlers, only fold
-                    // if we can propagate constant data from the first input.
-                    // Unary ops (Unsqueeze, Squeeze, Reshape, Floor, Ceil, Neg, Abs, Identity)
-                    // pass through or reshape the data — propagate ConstantData from input.
-                    if (node.Inputs.Count >= 1 && graph.ConstantData.TryGetValue(node.Inputs[0], out var genData))
+                    // Generic folding: ONLY for identity-like ops that pass through data unchanged.
+                    // Arithmetic ops (Add, Sub, Mul, Div, Sqrt, etc.) MUST NOT blindly propagate
+                    // input data — they transform values. Wrong constants cascade through shape
+                    // inference chains and cause DivideByZero (e.g., DepthAnything Softmax).
+                    bool isIdentityLike = node.OpType is "Unsqueeze" or "Squeeze" or "Reshape"
+                        or "Identity" or "Flatten" or "Dropout";
+                    if (isIdentityLike && node.Inputs.Count >= 1
+                        && graph.ConstantData.TryGetValue(node.Inputs[0], out var genData))
                     {
                         bool hasLargeInput = genData.Length > 64;
                         if (hasLargeInput) continue; // Don't fold large tensors
