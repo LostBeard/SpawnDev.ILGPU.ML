@@ -28,10 +28,7 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _reluInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scaleInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _fillKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _broadcastDivKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _broadcastMulNDKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _broadcastAddNDKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _broadcastSubNDKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>>? _broadcastBinaryKernel;
     private MemoryBuffer1D<int, Stride1D.Dense>? _broadcastStridesBuf;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
@@ -176,91 +173,41 @@ public class ElementWiseKernels
     }
 
     // ═══════════════════════════════════════════════════════════
-    //  Broadcast Binary Kernels (N-D stride-based)
+    //  Broadcast Binary Kernel (N-D stride-based, DelegateSpecialization)
     //  Supports arbitrary broadcast shapes up to 5D.
     //  Strides encode how each output index maps to input indices.
+    //  Operation selected at dispatch time via DelegateSpecialization.
     // ═══════════════════════════════════════════════════════════
 
-    /// <summary>Broadcast Div: output[i] = a[mapA(i)] / b[mapB(i)]</summary>
-    private static void BroadcastDivImpl(Index1D idx,
-        ArrayView1D<float, Stride1D.Dense> a,
-        ArrayView1D<float, Stride1D.Dense> b,
-        ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> strides)
-    {
-        // strides layout: [rank, outShape[0..rank], aStrides[0..rank], bStrides[0..rank], outStrides[0..rank]]
-        int rank = strides[0];
-        int aIdx = 0, bIdx = 0, remaining = idx;
-        for (int d = 0; d < rank; d++)
-        {
-            int outStride = strides[1 + 3 * rank + d];
-            int coord = outStride > 0 ? remaining / outStride : 0;
-            remaining = outStride > 0 ? remaining % outStride : remaining;
-            aIdx += coord * strides[1 + rank + d];
-            bIdx += coord * strides[1 + 2 * rank + d];
-        }
-        float bv = b[bIdx];
-        output[idx] = bv != 0f ? a[aIdx] / bv : 0f;
-    }
+    static float BroadcastAddOp(float a, float b) => a + b;
+    static float BroadcastSubOp(float a, float b) => a - b;
+    static float BroadcastMulOp(float a, float b) => a * b;
+    static float BroadcastDivOp(float a, float b) => b != 0f ? a / b : 0f;
 
-    /// <summary>Broadcast Mul: output[i] = a[mapA(i)] * b[mapB(i)]</summary>
-    private static void BroadcastMulNDImpl(Index1D idx,
+    /// <summary>
+    /// Unified broadcast binary kernel: output[i] = op(a[mapA(i)], b[mapB(i)]).
+    /// The operation is selected at dispatch time via DelegateSpecialization —
+    /// Add, Sub, Mul, or Div are inlined into the kernel at compile time.
+    /// </summary>
+    private static void BroadcastBinaryKernel(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> a,
         ArrayView1D<float, Stride1D.Dense> b,
         ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> strides)
+        ArrayView1D<int, Stride1D.Dense> strides,
+        DelegateSpecialization<Func<float, float, float>> op)
     {
+        // strides layout: [rank, aStrides[0..rank], bStrides[0..rank], outStrides[0..rank]]
         int rank = strides[0];
         int aIdx = 0, bIdx = 0, remaining = idx;
         for (int d = 0; d < rank; d++)
         {
-            int outStride = strides[1 + 3 * rank + d];
+            int outStride = strides[1 + 2 * rank + d];
             int coord = outStride > 0 ? remaining / outStride : 0;
             remaining = outStride > 0 ? remaining % outStride : remaining;
-            aIdx += coord * strides[1 + rank + d];
-            bIdx += coord * strides[1 + 2 * rank + d];
+            aIdx += coord * strides[1 + d];
+            bIdx += coord * strides[1 + rank + d];
         }
-        output[idx] = a[aIdx] * b[bIdx];
-    }
-
-    /// <summary>Broadcast Add: output[i] = a[mapA(i)] + b[mapB(i)]</summary>
-    private static void BroadcastAddNDImpl(Index1D idx,
-        ArrayView1D<float, Stride1D.Dense> a,
-        ArrayView1D<float, Stride1D.Dense> b,
-        ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> strides)
-    {
-        int rank = strides[0];
-        int aIdx = 0, bIdx = 0, remaining = idx;
-        for (int d = 0; d < rank; d++)
-        {
-            int outStride = strides[1 + 3 * rank + d];
-            int coord = outStride > 0 ? remaining / outStride : 0;
-            remaining = outStride > 0 ? remaining % outStride : remaining;
-            aIdx += coord * strides[1 + rank + d];
-            bIdx += coord * strides[1 + 2 * rank + d];
-        }
-        output[idx] = a[aIdx] + b[bIdx];
-    }
-
-    /// <summary>Broadcast Sub: output[i] = a[mapA(i)] - b[mapB(i)]</summary>
-    private static void BroadcastSubNDImpl(Index1D idx,
-        ArrayView1D<float, Stride1D.Dense> a,
-        ArrayView1D<float, Stride1D.Dense> b,
-        ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> strides)
-    {
-        int rank = strides[0];
-        int aIdx = 0, bIdx = 0, remaining = idx;
-        for (int d = 0; d < rank; d++)
-        {
-            int outStride = strides[1 + 3 * rank + d];
-            int coord = outStride > 0 ? remaining / outStride : 0;
-            remaining = outStride > 0 ? remaining % outStride : remaining;
-            aIdx += coord * strides[1 + rank + d];
-            bIdx += coord * strides[1 + 2 * rank + d];
-        }
-        output[idx] = a[aIdx] - b[bIdx];
+        output[idx] = op.Value(a[aIdx], b[bIdx]);
     }
 
     /// <summary>Fill: data[i] = value. Sets every element to a constant.</summary>
@@ -541,15 +488,15 @@ public class ElementWiseKernels
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = outStrides[i];
         _broadcastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
 
-        var kernel = op switch
+        var opSpec = op switch
         {
-            BroadcastOp.Add => _broadcastAddNDKernel!,
-            BroadcastOp.Sub => _broadcastSubNDKernel!,
-            BroadcastOp.Mul => _broadcastMulNDKernel!,
-            BroadcastOp.Div => _broadcastDivKernel!,
+            BroadcastOp.Add => new DelegateSpecialization<Func<float, float, float>>(BroadcastAddOp),
+            BroadcastOp.Sub => new DelegateSpecialization<Func<float, float, float>>(BroadcastSubOp),
+            BroadcastOp.Mul => new DelegateSpecialization<Func<float, float, float>>(BroadcastMulOp),
+            BroadcastOp.Div => new DelegateSpecialization<Func<float, float, float>>(BroadcastDivOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
-        kernel(outCount, a, b, output, _broadcastStridesBuf.View);
+        _broadcastBinaryKernel!(outCount, a, b, output, _broadcastStridesBuf.View, opSpec);
     }
 
     /// <summary>Fill every element with a constant value. Handles -Infinity, Infinity, NaN.</summary>
@@ -875,18 +822,10 @@ public class ElementWiseKernels
             ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
         _fillKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, float>(FillImpl);
-        _broadcastDivKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        _broadcastBinaryKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(BroadcastDivImpl);
-        _broadcastMulNDKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(BroadcastMulNDImpl);
-        _broadcastAddNDKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(BroadcastAddNDImpl);
-        _broadcastSubNDKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(BroadcastSubNDImpl);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            DelegateSpecialization<Func<float, float, float>>>(BroadcastBinaryKernel);
         _addInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddInPlaceImpl);
         _concatLastDimKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
