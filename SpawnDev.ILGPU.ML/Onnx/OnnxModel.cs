@@ -90,6 +90,7 @@ public class OnnxTensorProto
                 2 => ReadRawUint8sAsFloats(RawData, count),   // UINT8
                 3 => ReadRawInt8sAsFloats(RawData, count),    // INT8
                 16 => ReadRawBFloat16sAsFloats(RawData, count), // BFLOAT16
+                9 => ReadRawBoolsAsFloats(RawData, count),     // BOOL
                 _ => throw new NotSupportedException($"Unsupported tensor data type: {DataType}")
             };
         }
@@ -173,6 +174,14 @@ public class OnnxTensorProto
         var result = new float[count];
         for (int i = 0; i < count; i++)
             result[i] = (sbyte)raw[i];
+        return result;
+    }
+
+    private static float[] ReadRawBoolsAsFloats(byte[] raw, int count)
+    {
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = raw[i] != 0 ? 1f : 0f;
         return result;
     }
 
