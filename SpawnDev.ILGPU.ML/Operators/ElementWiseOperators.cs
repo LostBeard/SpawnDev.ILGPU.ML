@@ -11,7 +11,8 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// </summary>
 internal static class BroadcastHelper
 {
-    public static void BroadcastBinaryOp(OnnxOpContext ctx, OperatorRegistry reg, Func<float, float, float> op)
+    public static void BroadcastBinaryOp(OnnxOpContext ctx, OperatorRegistry reg, Func<float, float, float> op,
+        BroadcastOp gpuOp = BroadcastOp.Add)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         var outShape = ctx.Outputs[0].Shape;
@@ -120,21 +121,11 @@ internal static class BroadcastHelper
         }
         else
         {
-            // Large tensors, no constants — element-wise if shapes match
-            if (a.ElementCount == outCount && b.ElementCount == outCount)
-            {
-                // Same size — apply element-wise on GPU
-                // (This path shouldn't be reached for broadcast cases, but handles same-shape fallback)
-                reg.ElementWise.Scale(a.Data.SubView(0, outCount),
-                    ctx.Outputs[0].Data.SubView(0, outCount), outCount, 1f);
-            }
-            else
-            {
-                // True fallback — copy a and log warning
-                int copyCount = Math.Min(a.ElementCount, outCount);
-                reg.ElementWise.Scale(a.Data.SubView(0, copyCount),
-                    ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
-            }
+            // General N-D broadcast on GPU — handles arbitrary shape combinations.
+            // Uses stride-based index mapping kernels (BroadcastDivImpl, etc.)
+            reg.ElementWise.BroadcastBinaryOpND(
+                a.Data, b.Data, ctx.Outputs[0].Data,
+                a.Shape, b.Shape, outShape, gpuOp);
         }
     }
 
@@ -326,7 +317,7 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator
         else
         {
             // General broadcast: try CPU fallback for small tensors (shape computation)
-            BroadcastBinaryOp(ctx, reg, (x, y) => x + y);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x + y, BroadcastOp.Add);
         }
     }
 }
@@ -371,7 +362,7 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            BroadcastBinaryOp(ctx, reg, (x, y) => x * y);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x * y, BroadcastOp.Mul);
         }
     }
 }
@@ -405,7 +396,7 @@ public class SubOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            BroadcastBinaryOp(ctx, reg, (x, y) => x - y);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x - y, BroadcastOp.Sub);
         }
     }
 }
@@ -440,11 +431,11 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
         {
             // General broadcast: compute reciprocal of b, then use BroadcastBinaryOp for multiply
             // This handles cases like a=[1,257,384] / b=[1,257,1] (per-row scalar division)
-            BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x / y : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x / y : 0f, BroadcastOp.Div);
         }
         else
         {
-            BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x / y : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x / y : 0f, BroadcastOp.Div);
         }
     }
 }
