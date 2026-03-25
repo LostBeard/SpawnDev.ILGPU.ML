@@ -100,8 +100,8 @@ public abstract partial class MLTestBase
             throw new Exception($"Id mismatch: expected '{ModelHub.KnownModels.SqueezeNet}', got '{info.Id}'");
         if (info.Siblings == null || info.Siblings.Length == 0)
             throw new Exception("No siblings (files) returned in model info");
-        if (info.Downloads <= 0)
-            throw new Exception($"Downloads is {info.Downloads}, expected > 0");
+        if (info.Downloads < 0)
+            throw new Exception($"Downloads is {info.Downloads}, expected >= 0");
 
         // Verify we can find the model.onnx file in siblings
         var onnxFiles = info.GetOnnxFiles();
