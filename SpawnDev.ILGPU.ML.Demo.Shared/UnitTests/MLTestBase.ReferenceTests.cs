@@ -403,9 +403,9 @@ public abstract partial class MLTestBase
             var expected = new float[refBytes.Length / 4];
             Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
 
-            // Check LayerNorm gamma weights — try both name patterns
-            var normWeightNames = new[] { "blocks.0.norm1.weight", "pretrained.blocks.0.norm1.weight",
-                "blocks.0.norm2.weight", "pretrained.blocks.0.norm2.weight" };
+            // Check patch embedding bias + LayerNorm gamma weights
+            var normWeightNames = new[] { "pretrained.patch_embed.proj.bias", "pretrained.patch_embed.proj.weight",
+                "pretrained.blocks.0.norm1.weight", "pretrained.blocks.0.norm2.weight" };
             foreach (var wn in normWeightNames)
             {
                 if (session.TryGetWeight(wn) is { } wt)
@@ -448,7 +448,7 @@ public abstract partial class MLTestBase
             foreach (var (key, vals) in captured.OrderBy(kv => kv.Key))
             {
                 float absMax = vals.Length > 0 ? vals.Max(v => MathF.Abs(v)) : 0;
-                if (idx >= 735 || idx % 50 == 0 || (idx >= 25 && idx <= 50) || key.Contains("Softmax") || key.Contains("norm1") || key.Contains("Mul") || key.Contains("attn"))
+                if (idx >= 735 || idx % 50 == 0 || idx <= 30 || key.Contains("Conv") || key.Contains("patch") || key.Contains("Softmax"))
                 {
                     var vStr = string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")));
                     sb.AppendLine($"  {key}: absMax={absMax:F4} [{vStr}]");

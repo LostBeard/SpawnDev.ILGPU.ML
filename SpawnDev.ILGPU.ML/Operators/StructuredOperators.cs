@@ -180,6 +180,8 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             ? ctx.Inputs[2].Data
             : ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias").Data;
 
+        // (Debug diagnostics removed)
+
         if (x.Shape.Length == 3)
         {
             // Conv1D: [N, C, L]
