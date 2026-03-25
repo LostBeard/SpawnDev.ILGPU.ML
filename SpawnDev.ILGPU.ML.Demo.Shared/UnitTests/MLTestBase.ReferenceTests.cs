@@ -448,7 +448,7 @@ public abstract partial class MLTestBase
             foreach (var (key, vals) in captured.OrderBy(kv => kv.Key))
             {
                 float absMax = vals.Length > 0 ? vals.Max(v => MathF.Abs(v)) : 0;
-                if (idx >= 735 || idx % 50 == 0 || idx <= 30 || key.Contains("Conv") || key.Contains("patch") || key.Contains("Softmax"))
+                if (idx >= 735 || idx % 50 == 0 || idx <= 30 || key.Contains("Conv") || key.Contains("patch") || key.Contains("blocks.2/") || key.Contains("blocks.5/") || key.Contains("blocks.8/") || key.Contains("blocks.11/"))
                 {
                     var vStr = string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")));
                     sb.AppendLine($"  {key}: absMax={absMax:F4} [{vStr}]");
