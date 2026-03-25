@@ -403,6 +403,42 @@ public abstract partial class MLTestBase
             var expected = new float[refBytes.Length / 4];
             Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
 
+            // Check LayerNorm gamma weights — try both name patterns
+            var normWeightNames = new[] { "blocks.0.norm1.weight", "pretrained.blocks.0.norm1.weight",
+                "blocks.0.norm2.weight", "pretrained.blocks.0.norm2.weight" };
+            foreach (var wn in normWeightNames)
+            {
+                if (session.TryGetWeight(wn) is { } wt)
+                {
+                    int elCount = Math.Min(5, wt.ElementCount);
+                    using var wtBuf = accelerator.Allocate1D<float>(elCount);
+                    wtBuf.View.SubView(0, elCount).CopyFrom(wt.Data.SubView(0, elCount));
+                    await accelerator.SynchronizeAsync();
+                    var wtVals = await wtBuf.CopyToHostAsync<float>(0, elCount);
+                    Console.Error.WriteLine($"[WEIGHT] {wn}: shape=[{string.Join(",", wt.Shape)}] first5=[{string.Join(",", wtVals.Select(v => v.ToString("F4")))}]");
+                }
+                else
+                    Console.Error.WriteLine($"[WEIGHT] {wn}: NOT FOUND");
+            }
+            // Check Constant node outputs for norm1
+            var norm1Weights = session.GetWeightNames().Where(n => n.Contains("norm1")).Take(10);
+            Console.Error.WriteLine($"[WEIGHT_SEARCH] norm1 weights: [{string.Join(", ", norm1Weights)}]");
+            // Check the Constant output that the graph actually uses
+            foreach (var cn in new[] { "/blocks.0/norm1/Constant_output_0", "/blocks.0/norm1/Constant_1_output_0" })
+            {
+                if (session.TryGetWeight(cn) is { } cwt)
+                {
+                    int elCount = Math.Min(5, cwt.ElementCount);
+                    using var cwtBuf = accelerator.Allocate1D<float>(elCount);
+                    cwtBuf.View.SubView(0, elCount).CopyFrom(cwt.Data.SubView(0, elCount));
+                    await accelerator.SynchronizeAsync();
+                    var cwtVals = await cwtBuf.CopyToHostAsync<float>(0, elCount);
+                    Console.Error.WriteLine($"[CONST] {cn}: elems={cwt.ElementCount} first5=[{string.Join(",", cwtVals.Select(v => v.ToString("F4")))}]");
+                }
+                else
+                    Console.Error.WriteLine($"[CONST] {cn}: NOT IN WEIGHTS");
+            }
+
             // Dump key nodes to find where signal dies
             var captured = Graph.GraphExecutor.CapturedOutputs;
             var sb = new System.Text.StringBuilder();
@@ -412,7 +448,7 @@ public abstract partial class MLTestBase
             foreach (var (key, vals) in captured.OrderBy(kv => kv.Key))
             {
                 float absMax = vals.Length > 0 ? vals.Max(v => MathF.Abs(v)) : 0;
-                if (idx >= 735 || idx % 50 == 0 || key.Contains("Softmax") || key.Contains("attn"))
+                if (idx >= 735 || idx % 50 == 0 || (idx >= 25 && idx <= 50) || key.Contains("Softmax") || key.Contains("norm1") || key.Contains("Mul") || key.Contains("attn"))
                 {
                     var vStr = string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")));
                     sb.AppendLine($"  {key}: absMax={absMax:F4} [{vStr}]");

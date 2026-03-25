@@ -162,7 +162,7 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < nodeOutputs.Length; i++)
             {
                 var outTensor = nodeOutputs[i];
-                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
+                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 2048)
                 {
                     var outName = i < node.OutputNames.Length ? node.OutputNames[i] : null;
                     if (outName != null && !runtimeConstants.ContainsKey(outName))
@@ -313,7 +313,7 @@ public class GraphExecutor : IDisposable
             for (int oi = 0; oi < nodeOutputs.Length; oi++)
             {
                 var outTensor = nodeOutputs[oi];
-                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
+                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 2048)
                 {
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
                     if (outName != null && !runtimeConstants.ContainsKey(outName))

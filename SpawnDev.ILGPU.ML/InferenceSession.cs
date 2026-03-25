@@ -52,6 +52,9 @@ public class InferenceSession : IDisposable
     public Tensor? TryGetWeight(string name)
         => _weights.TryGetValue(name, out var t) ? t : null;
 
+    /// <summary>Get all weight tensor names (for diagnostics).</summary>
+    public IEnumerable<string> GetWeightNames() => _weights.Keys;
+
     /// <summary>Distinct operator types used in this model.</summary>
     public string[] OperatorTypes => _compiled.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s).ToArray();
 
