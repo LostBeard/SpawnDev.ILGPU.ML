@@ -332,7 +332,9 @@ public class GraphExecutor : IDisposable
             if (CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
             {
                 var captureOutput = nodeOutputs[0];
-                int captureCount = Math.Min(10, captureOutput.ElementCount);
+                // Capture enough values to get a meaningful absMax (at least one full
+                // channel for Conv outputs). 1024 covers most shape tensors and small features.
+                int captureCount = Math.Min(1024, captureOutput.ElementCount);
                 if (captureCount > 0)
                 {
                     try
