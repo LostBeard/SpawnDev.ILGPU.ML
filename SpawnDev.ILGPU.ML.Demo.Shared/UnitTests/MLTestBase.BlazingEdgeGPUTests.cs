@@ -92,8 +92,7 @@ public abstract partial class MLTestBase
         int B = 1, C = 32, H = 8, W = 8, G = 8;
         int total = B * C * H * W;
 
-        using var inputBuf = accelerator.Allocate1D<float>(total);
-        inputBuf.View.CopyFromCPU(input);
+        using var inputBuf = accelerator.Allocate1D(input);
         using var outputBuf = accelerator.Allocate1D<float>(total);
         var weight = new float[C]; Array.Fill(weight, 1f);
         var bias = new float[C];

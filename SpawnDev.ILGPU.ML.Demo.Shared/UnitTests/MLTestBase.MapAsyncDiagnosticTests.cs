@@ -38,9 +38,8 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[DiagMapAsync] 4 dispatches on {bigSize}-element buffers done, attempting CopyToHostAsync...");
 
         // Now try CopyToHostAsync on a SMALL fresh buffer
-        using var tinyBuf = accelerator.Allocate1D<float>(4);
         var tinyData = new float[] { 1f, 2f, 3f, 4f };
-        tinyBuf.View.CopyFromCPU(tinyData);
+        using var tinyBuf = accelerator.Allocate1D(tinyData);
         accelerator.Synchronize();
         var result = await tinyBuf.CopyToHostAsync<float>(0, 4);
         Console.WriteLine($"[DiagMapAsync] CopyToHostAsync succeeded: {result[0]}, {result[1]}, {result[2]}, {result[3]}");
@@ -61,9 +60,8 @@ public abstract partial class MLTestBase
             inC, inH, inW, outC, kH, kW, 1, pad);
         accelerator.Synchronize();
         Console.WriteLine("[DiagMapAsync] Conv2D dispatched, testing MapAsync...");
-        using var convTestBuf = accelerator.Allocate1D<float>(4);
         var convTestData = new float[] { 99f, 98f, 97f, 96f };
-        convTestBuf.View.CopyFromCPU(convTestData);
+        using var convTestBuf = accelerator.Allocate1D(convTestData);
         accelerator.Synchronize();
         var convResult = await convTestBuf.CopyToHostAsync<float>(0, 4);
         Console.WriteLine($"[DiagMapAsync] Conv2D + MapAsync: {convResult[0]}, {convResult[1]}, {convResult[2]}, {convResult[3]}");
@@ -85,8 +83,7 @@ public abstract partial class MLTestBase
             padInC, padOutH, padOutW, outC, kH, kW, 1, 0); // no padding in conv, pad already applied
         accelerator.Synchronize();
         Console.WriteLine("[DiagMapAsync] Pad→Conv done, testing MapAsync...");
-        using var padConvTestBuf = accelerator.Allocate1D<float>(4);
-        padConvTestBuf.View.CopyFromCPU(new float[] { 77f, 78f, 79f, 80f });
+        using var padConvTestBuf = accelerator.Allocate1D(new float[] { 77f, 78f, 79f, 80f });
         accelerator.Synchronize();
         var padConvResult = await padConvTestBuf.CopyToHostAsync<float>(0, 4);
         Console.WriteLine($"[DiagMapAsync] Pad→Conv + MapAsync: {padConvResult[0]}, {padConvResult[1]}");
