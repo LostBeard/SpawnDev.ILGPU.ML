@@ -409,27 +409,23 @@ public class InferenceSession : IDisposable
         bool enableOptimization = true)
     {
         // Parse ONNX protobuf with streaming weight extraction.
-        // Weights are yielded one at a time — small constants are captured,
-        // large weights are uploaded directly to GPU then released from CPU.
+        // Two-pass approach for low peak CPU memory:
+        //   Pass 1: capture ONLY small constants (≤64 elements) for graph compilation.
+        //   Pass 2: re-stream ALL weights, upload each to GPU then release from CPU.
+        // Peak CPU memory: one tensor at a time (~few MB), not all weights (~548MB for GPT-2).
         onProgress?.Invoke("parse", 0);
         var (modelInfo, weightStream) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
 
-        // First pass: capture only small weights (≤64 elements) for constant folding.
-        // Large weights are skipped — they'll be streamed to GPU during upload phase.
-        var cpuWeightsAll = new Dictionary<string, float[]>();
-        var largeWeightNames = new HashSet<string>();
+        // Pass 1: capture ONLY small weights for constant folding + graph compilation.
+        // Large weights are NOT held in CPU memory — only their names are tracked.
+        var cpuSmallWeights = new Dictionary<string, float[]>();
         foreach (var (name, data) in weightStream)
         {
             if (data.Length <= 64)
             {
-                cpuWeightsAll[name] = data;
+                cpuSmallWeights[name] = data;
             }
-            else
-            {
-                // Store a placeholder — actual data uploaded to GPU later
-                largeWeightNames.Add(name);
-                cpuWeightsAll[name] = data; // Still need it for now — streaming GPU upload is future optimization
-            }
+            // Large weights: data goes out of scope and can be GC'd
         }
         onProgress?.Invoke("parse", 100);
 
@@ -445,13 +441,13 @@ public class InferenceSession : IDisposable
         try { graph = ConvertToModelGraph(modelInfo); }
         catch (Exception ex) { throw new InvalidOperationException($"ConvertToModelGraph failed: {ex.GetType().Name}: {ex.Message}", ex); }
 
-        // Extract small constant values — data is already on CPU (from ONNX parser), no readback needed
+        // Extract small constant values — data is already on CPU (from pass 1), no readback needed
         graph.ConstantData ??= new Dictionary<string, int[]>();
         var constantFloatValues = new Dictionary<string, float[]>();
         foreach (var (name, shape) in graph.Initializers)
         {
             int elems = shape.Aggregate(1, (a, b) => a * b);
-            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
+            if (elems > 0 && elems <= 64 && cpuSmallWeights.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
@@ -469,12 +465,17 @@ public class InferenceSession : IDisposable
         var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
-        // Upload weights to GPU
+        // Pass 2: Stream weights to GPU — one tensor at a time, minimal CPU peak.
+        // Re-enumerate the ONNX weight stream. Each tensor is uploaded to GPU immediately,
+        // then the CPU float[] goes out of scope and can be collected.
         onProgress?.Invoke("upload", 0);
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
-        foreach (var (name, data) in cpuWeightsAll)
+
+        // Re-stream from ONNX bytes (LoadModelStreaming returns a new enumerable each call)
+        var (_, weightStream2) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
+        foreach (var (name, data) in weightStream2)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
@@ -487,6 +488,7 @@ public class InferenceSession : IDisposable
                 }
                 gpuWeights[name] = pool.AllocatePermanent(weightData, shape, name);
                 loaded++;
+                // weightData/data go out of scope — CPU memory freed for next tensor
             }
         }
         // Create tensors for optimizer-folded constants that aren't in the weight dictionary.
