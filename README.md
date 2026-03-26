@@ -17,7 +17,7 @@ SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kern
 - **Image classification in-browser** — SqueezeNet identifies "tiger cat" at 51.97% confidence on WebGPU. Drop any photo.
 - **Image super resolution** — ESPCN 3x upscale running on WebGPU. The "enhance!" button is real.
 - **71 ONNX operators** — enough to run classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, and more
-- **7 model formats** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, and CoreML. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format.
+- **11 format parsers** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format. Full round-trip export for SPZ, PLY, glTF, and OBJ.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **HuggingFace CDN** — Models load directly from HuggingFace with OPFS caching. No bundling, no local storage limits. Search, browse, and load any public model.
 - **Single image to 3D** — TripoSR generates exportable 3D meshes (glTF/OBJ for Blender/Unity). LGM generates 65K Gaussian splats (SPZ/PLY for SpawnScene). Both from a single photo.
@@ -227,16 +227,24 @@ Every model is automatically optimized during compilation:
 
 Abs, Add, ArgMax, AveragePool, BatchNormalization, Cast, Ceil, Clip, Concat, Constant, ConstantOfShape, Conv, ConvTranspose, DepthToSpace, Div, Dropout, Equal, Erf, Exp, Expand, Flatten, Floor, Gather, GatherND, Gelu, Gemm, GlobalAveragePool, Greater, HardSigmoid, HardSwish, Identity, InstanceNormalization, LayerNormalization, LeakyRelu, Less, Log, MatMul, Max, MaxPool, Min, Mul, Neg, Not, Pad, Pow, Range, Reciprocal, ReduceMax, ReduceMean, ReduceMin, ReduceSum, Relu, Reshape, Resize, Shape, Sigmoid, Sign, SiLU, Slice, Softmax, Split, Sqrt, Squeeze, Sub, Tanh, TopK, Transpose, Unsqueeze, Upsample, Where
 
-### Pipeline Classes
+### Pipeline Classes (14 implemented)
 
 | Pipeline | Input | Output |
 |----------|-------|--------|
 | **ClassificationPipeline** | RGBA image | Top-K labels + confidence |
-| **SuperResolutionPipeline** | RGBA image | Upscaled RGBA image |
-| **StyleTransferPipeline** | RGBA image | Stylized RGBA image |
-| **DepthEstimationPipeline** | RGBA image | Normalized depth map |
-
-Additional pipeline scaffolds: detection, segmentation, pose, CLIP, embeddings, text generation, speech recognition, audio classification, image generation.
+| **SuperResolutionPipeline** | RGBA image | Upscaled RGBA image (GPU-direct) |
+| **StyleTransferPipeline** | RGBA image | Stylized RGBA image (GPU-direct via CanvasRendererFactory) |
+| **DepthEstimationPipeline** | RGBA image | Depth map with GPU plasma colormap |
+| **ObjectDetectionPipeline** | RGBA image | Bounding boxes + labels (YOLOv8 + NMS) |
+| **PoseEstimationPipeline** | RGBA image | 17 keypoints with confidence (MoveNet) |
+| **FaceDetectionPipeline** | RGBA image | Face boxes + 6 landmarks (BlazeFace TFLite) |
+| **BackgroundRemovalPipeline** | RGBA image | Foreground with transparent background (RMBG) |
+| **ZeroShotClassificationPipeline** | RGBA image + text labels | Ranked labels by similarity (CLIP dual-encoder) |
+| **TextClassificationPipeline** | Token IDs | Sentiment predictions (DistilBERT) |
+| **FeatureExtractionPipeline** | Token IDs | L2-normalized embedding vector |
+| **TextGenerationPipeline** | Prompt text | Generated text (autoregressive, DistilGPT-2) |
+| **SpeechRecognitionPipeline** | Audio samples | Transcribed text (Whisper encoder+decoder) |
+| **AsyncDepthPipeline** | RGBA frames | Real-time depth with fast/slow path blending |
 
 ## Demo App
 
