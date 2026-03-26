@@ -54,15 +54,11 @@
         }
 
         <div class="viewport-3d">
-            <div class="viewer-3d-placeholder">
-                <div class="viewer-icon">&#x1F4A0;</div>
-                <p>3D depth visualization</p>
-                <p class="viewer-hint">Depth map extruded as 3D mesh — rotate with mouse</p>
-                @if (_isRunning)
-                {
-                    <div class="fps-badge">@((1000.0 / Math.Max(1, _inferenceMs)).ToString("F0")) FPS</div>
-                }
-            </div>
+            <canvas @ref="_depthCanvas" class="depth-canvas" width="518" height="518"></canvas>
+            @if (_isRunning)
+            {
+                <div class="fps-badge">@((1000.0 / Math.Max(1, _inferenceMs)).ToString("F0")) FPS</div>
+            }
         </div>
     </div>
 
@@ -122,6 +118,8 @@
         font-family: monospace;
     }
 
+    .depth-canvas { width: 100%; height: auto; border-radius: 10px; background: #0f172a; }
+
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; line-height: 1.5; }
 
     @@media (max-width: 640px) {
@@ -130,6 +128,12 @@
     }
 </style>
 
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@implements IDisposable
+
 @code {
     private string _selectedBackend = "WebGPU";
     private string _viewMode = "side-by-side";
@@ -137,16 +141,116 @@
     private string _colorMode = "rgb";
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
+    private bool _processingFrame;
+    private ElementReference _depthCanvas;
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
     };
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private Task HandleFrame(byte[] frameBytes)
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private DepthEstimationPipeline? _pipeline;
+    private SpawnDev.ILGPU.Rendering.ICanvasRenderer? _canvasRenderer;
+    private global::ILGPU.Runtime.MemoryBuffer2D<int, global::ILGPU.Stride2D.DenseX>? _lastDepthBuffer;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // TODO: Run depth estimation on frame → render as 3D mesh
-        return Task.CompletedTask;
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DepthAnythingV2Small, ModelHub.KnownFiles.OnnxModel);
+            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["pixel_values"] = new[] { 1, 3, 518, 518 },
+                });
+            _pipeline = new DepthEstimationPipeline(session, _accelerator, inputSize: 518);
+
+            _isModelLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DepthVoxel] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleFrame(byte[] frameBytes)
+    {
+        if (_pipeline == null || _processingFrame || _accelerator == null) return;
+        _processingFrame = true;
+        try
+        {
+            var rgbaPixels = new int[frameBytes.Length / 4];
+            Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
+
+            // Create GPU-direct canvas renderer on first frame
+            if (_canvasRenderer == null)
+            {
+                _canvasRenderer = SpawnDev.ILGPU.Rendering.CanvasRendererFactory.Create(_accelerator);
+                using var canvasEl = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_depthCanvas);
+                _canvasRenderer.AttachCanvas(canvasEl);
+            }
+
+            // Run depth estimation — GPU plasma colormap stays on GPU
+            _lastDepthBuffer?.Dispose();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var (buffer, w, h) = await _pipeline.EstimateGpuAsync(rgbaPixels, 320, 240);
+            sw.Stop();
+            _inferenceMs = sw.Elapsed.TotalMilliseconds;
+            _lastDepthBuffer = buffer;
+
+            // Present GPU depth colormap directly to canvas — zero CPU readback
+            await _canvasRenderer.PresentAsync(buffer);
+
+            _isRunning = true;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DepthVoxel] Frame error: {ex.Message}");
+        }
+        finally
+        {
+            _processingFrame = false;
+        }
+    }
+
+    public void Dispose()
+    {
+        _lastDepthBuffer?.Dispose();
+        _canvasRenderer?.Dispose();
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
     }
 }

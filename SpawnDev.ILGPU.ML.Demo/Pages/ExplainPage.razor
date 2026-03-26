@@ -1,4 +1,7 @@
 @page "/explain"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@implements IDisposable
 
 <PageTitle>What Does the GPU See? — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -173,5 +176,188 @@
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
 
-    private Task HandleImageLoaded(byte[] imageBytes) => Task.CompletedTask;
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private SpawnDev.ILGPU.ML.InferenceSession? _session;
+    private SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline? _pipeline;
+    private int[]? _rgbaPixels;
+    private int _imageWidth, _imageHeight;
+    private Dictionary<string, float[]>? _capturedLayers;
+    private List<string> _layerNames = new();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            if (_context == null)
+            {
+                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) return;
+
+            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
+            _session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            _pipeline = new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(_session, _accelerator);
+            _isModelLoaded = true;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Explain] Error: {ex.Message}");
+        }
+    }
+
+    private async Task HandleImageLoaded(byte[] imageBytes)
+    {
+        if (_session == null || _accelerator == null) return;
+        _featureMaps = null;
+        _attentionMapUrl = null;
+
+        try
+        {
+            // Decode image
+            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width; int h = (int)bitmap.Height;
+            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w; canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            _rgbaPixels = data.Read<int>();
+            _imageWidth = w; _imageHeight = h;
+
+            // Run inference with CapturedOutputs enabled
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+            try
+            {
+                await _pipeline!.ClassifyAsync(_rgbaPixels, _imageWidth, _imageHeight);
+                _capturedLayers = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs;
+
+                // Find Conv/feature layers (they have spatial structure)
+                _layerNames = _capturedLayers
+                    .Where(kv => kv.Value.Length >= 49) // at least 7x7
+                    .OrderBy(kv => kv.Key)
+                    .Select(kv => kv.Key)
+                    .ToList();
+
+                _maxLayer = Math.Max(0, _layerNames.Count - 1);
+                _selectedLayer = 0;
+                UpdateFeatureMaps();
+            }
+            finally
+            {
+                SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Explain] Error: {ex.Message}");
+        }
+
+        StateHasChanged();
+    }
+
+    private void UpdateFeatureMaps()
+    {
+        if (_capturedLayers == null || _selectedLayer >= _layerNames.Count) return;
+
+        var layerKey = _layerNames[_selectedLayer];
+        _layerName = layerKey;
+        var values = _capturedLayers[layerKey];
+
+        // Estimate spatial dimensions (assume square channels)
+        // For a Conv output [C, H, W], total = C*H*W
+        int totalSize = values.Length;
+        int spatialGuess = (int)Math.Sqrt(totalSize);
+        // Try common sizes
+        int channelSize = 0, numChannels = 0, mapW = 0, mapH = 0;
+        foreach (int s in new[] { 7, 14, 28, 56, 112, 224, 13, 27, 55 })
+        {
+            if (totalSize % (s * s) == 0)
+            {
+                mapW = mapH = s;
+                channelSize = s * s;
+                numChannels = totalSize / channelSize;
+                break;
+            }
+        }
+
+        if (channelSize == 0)
+        {
+            // Fallback: treat as single channel
+            mapW = mapH = spatialGuess;
+            channelSize = mapW * mapH;
+            numChannels = 1;
+        }
+
+        // Generate feature map images (limit to first 32 channels)
+        int maxChannels = Math.Min(numChannels, 32);
+        _featureMaps = new List<string>();
+        for (int ch = 0; ch < maxChannels; ch++)
+        {
+            int offset = ch * channelSize;
+            var channelData = values.Skip(offset).Take(channelSize).ToArray();
+            var imgUrl = ChannelToDataUrl(channelData, mapW, mapH);
+            _featureMaps.Add(imgUrl);
+        }
+
+        // Update stats for selected channel
+        if (_selectedChannel < maxChannels)
+            UpdateChannelStats(values, _selectedChannel, channelSize);
+    }
+
+    private void UpdateChannelStats(float[] values, int channel, int channelSize)
+    {
+        int offset = channel * channelSize;
+        var channelData = values.Skip(offset).Take(channelSize).ToArray();
+        _channelMin = channelData.Min();
+        _channelMax = channelData.Max();
+        _channelMean = channelData.Average();
+        _activationPercent = channelData.Count(v => v > 0) * 100f / channelData.Length;
+    }
+
+    private string ChannelToDataUrl(float[] data, int w, int h)
+    {
+        float min = data.Min(), max = data.Max();
+        float range = max - min;
+        var pixels = new int[w * h];
+        for (int i = 0; i < Math.Min(data.Length, w * h); i++)
+        {
+            float t = range > 1e-6f ? (data[i] - min) / range : 0;
+            // Viridis-like colormap
+            int r, g, b;
+            if (t < 0.25f) { float s = t * 4; r = (int)(68 + s * (33 - 68)); g = (int)(1 + s * (144 - 1)); b = (int)(84 + s * (140 - 84)); }
+            else if (t < 0.5f) { float s = (t - 0.25f) * 4; r = (int)(33 + s * (53 - 33)); g = (int)(144 + s * (183 - 144)); b = (int)(140 + s * (121 - 140)); }
+            else if (t < 0.75f) { float s = (t - 0.5f) * 4; r = (int)(53 + s * (163 - 53)); g = (int)(183 + s * (215 - 183)); b = (int)(121 + s * (60 - 121)); }
+            else { float s = (t - 0.75f) * 4; r = (int)(163 + s * (253 - 163)); g = (int)(215 + s * (231 - 215)); b = (int)(60 + s * (37 - 60)); }
+            r = Math.Clamp(r, 0, 255); g = Math.Clamp(g, 0, 255); b = Math.Clamp(b, 0, 255);
+            pixels[i] = r | (g << 8) | (b << 16) | (0xFF << 24);
+        }
+        return Services.ImageDisplayHelper.ToDataUrl(JS, pixels, w, h);
+    }
+
+    public void Dispose()
+    {
+        _session?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 }
