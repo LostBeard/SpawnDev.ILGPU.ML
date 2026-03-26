@@ -142,7 +142,8 @@ public abstract partial class MLTestBase
         }
 
         var cb4bit = cbTests.GetProperty("4bit_d128");
-        var centroids = cb4bit.GetProperty("centroids").EnumerateArray()
+        // codebook_tests.4bit_d128 is a flat array of centroid values, not a nested object
+        var centroids = cb4bit.EnumerateArray()
             .Select(e => (float)e.GetDouble()).ToArray();
 
         // 4-bit → 16 centroids
