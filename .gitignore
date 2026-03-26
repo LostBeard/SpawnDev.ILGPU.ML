@@ -366,9 +366,11 @@ FodyWeavers.xsd
 _debugdump/
 _mldump/
 
-# ML model files — all loaded from HuggingFace CDN at runtime.
-# No models are bundled in the repo. To populate locally for
-# development/testing: run HuggingFaceModelDownloader or download manually.
-SpawnDev.ILGPU.ML.Demo/wwwroot/models/
-models/distilgpt2/
+# ML model files — small models (<100MB) are self-hosted for instant demo loading.
+# Large models (>100MB) load from HuggingFace CDN at runtime.
+# Exclude only models that exceed GitHub's 100MB file size limit:
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/depth-anything-v2-small/
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/distilbert-sst2/
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/gpt2/
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-tiny/
 **/distilgpt2/
