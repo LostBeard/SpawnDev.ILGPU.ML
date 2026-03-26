@@ -83,10 +83,11 @@ public class AsyncDepthPipeline : IDisposable
             ranSlowPath = true;
         }
 
-        // Blend: output = 0.5 * memory + 0.5 * fastPath (equal blend)
-        // Use SMU combine with trust=0.5 for proper blending without aliasing
+        // Blend: output = 0.5 * memory + 0.5 * fastPath via EMA
         _smu.EMAUpdate(_memoryCache!.View, fastPathOutput, pixels, 0.5f);
-        _memoryCache.View.SubView(0, pixels).CopyTo(output.SubView(0, pixels));
+        // Copy memory to output using Scale(1.0) to avoid sync CopyTo on WebGPU
+        var ew = new ElementWiseKernels(_accelerator);
+        ew.Scale(_memoryCache.View.SubView(0, pixels), output.SubView(0, pixels), pixels, 1f);
 
         await _accelerator.SynchronizeAsync();
         sw.Stop();
