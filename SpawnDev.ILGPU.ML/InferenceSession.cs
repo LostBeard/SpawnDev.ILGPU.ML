@@ -485,20 +485,20 @@ public class InferenceSession : IDisposable
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
 
-        // Re-stream from ONNX bytes. Each tensor is converted to float[], uploaded to GPU,
-        // then released. The streaming ensures only one tensor's float[] exists at a time.
-        var (_, weightStream2) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
-        foreach (var (name, data) in weightStream2)
+        // Re-stream from ONNX bytes using raw tensor protos.
+        // Small tensors: standard float[] path. Large tensors (>1M elements): chunked upload
+        // via AllocatePermanentChunked — 1MB chunks, never allocates full float[] (fixes GPT-2 OOM).
+        var (_, tensorStream) = Onnx.OnnxLoader.LoadModelStreamingRaw(onnxBytes);
+        foreach (var (name, tensor) in tensorStream)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
-                var weightData = data;
                 int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
-                if (weightData.Length == 0 && expectedElems > 0)
-                    weightData = new float[expectedElems];
-                gpuWeights[name] = pool.AllocatePermanent(weightData, shape, name);
+                if (tensor.ElementCount == 0 && expectedElems > 0)
+                    gpuWeights[name] = pool.AllocatePermanent(new float[expectedElems], shape, name);
+                else
+                    gpuWeights[name] = pool.AllocatePermanentChunked(tensor, shape, name);
                 loaded++;
-                // weightData goes out of scope — GC can collect before next tensor
             }
         }
         // Create tensors for optimizer-folded constants that aren't in the weight dictionary.

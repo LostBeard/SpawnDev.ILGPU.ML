@@ -79,6 +79,53 @@ public class BufferPool : IDisposable
         return new Tensor(buffer.View, shape, name);
     }
 
+    /// <summary>
+    /// Allocate a permanent tensor from an ONNX tensor proto, uploading in chunks.
+    /// Avoids allocating the full float[] for large tensors (GPT-2 = 154MB).
+    /// Uses a reusable chunk buffer — peak CPU: chunk size (~1MB), not full tensor.
+    /// </summary>
+    public Tensor AllocatePermanentChunked(Onnx.OnnxTensorProto tensor, int[] shape, string? name = null)
+    {
+        int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+
+        // For small tensors, use the standard path (no chunking overhead)
+        if (count <= 262144) // 1MB
+            return AllocatePermanent(tensor.ToFloatArray(), shape, name);
+
+        // Large tensor: allocate empty GPU buffer, then fill in chunks
+        var buffer = _accelerator.Allocate1D<float>(count);
+        _allBuffers.Add(buffer);
+
+        // Use a fixed-size chunk buffer (reusable across calls)
+        const int CHUNK = 262144; // 256K floats = 1MB
+        var chunk = new float[Math.Min(CHUNK, count)];
+
+        // Convert and upload chunk by chunk
+        // For FLOAT raw data (most common large tensor type): direct BlockCopy
+        if (tensor.RawData != null && tensor.RawData.Length > 0 && tensor.DataType == 1)
+        {
+            int offset = 0;
+            while (offset < count)
+            {
+                int n = Math.Min(CHUNK, count - offset);
+                Buffer.BlockCopy(tensor.RawData, offset * 4, chunk, 0, n * 4);
+                // Use Allocate1D(chunk_slice) + CopyTo for SubView upload
+                using var tempBuf = _accelerator.Allocate1D<float>(n);
+                tempBuf.View.CopyFromCPU(chunk);
+                tempBuf.View.CopyTo(buffer.View.SubView(offset, n));
+                offset += n;
+            }
+        }
+        else
+        {
+            // Other formats: convert full tensor (fallback — rare for large tensors)
+            var data = tensor.ToFloatArray();
+            buffer.View.CopyFromCPU(data);
+        }
+
+        return new Tensor(buffer.View, shape, name);
+    }
+
     /// <summary>Allocate a permanent zero-initialized tensor.</summary>
     public Tensor AllocatePermanent(int[] shape, string? name = null)
     {
