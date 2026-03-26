@@ -41,7 +41,7 @@ public static class TestResultsWriter
                 Name = testName,
                 Result = result,
                 Error = error?.Length > 500 ? error[..500] : error,
-                DurationMs = Math.Round(durationMs, 1),
+                DurationMs = double.IsNaN(durationMs) || double.IsInfinity(durationMs) ? -1 : Math.Round(durationMs, 1),
                 Timestamp = DateTime.Now.ToString("HH:mm:ss"),
             });
             WriteJson();
