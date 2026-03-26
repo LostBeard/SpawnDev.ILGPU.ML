@@ -1,0 +1,122 @@
+using ILGPU;
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
+using SpawnDev.UnitTesting;
+
+namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
+
+/// <summary>
+/// Tests for FusedDequantMatMul — Q4_0 weight dequantization inside MatMul.
+/// Validates that dequantize-in-register produces same result as explicit dequant + MatMul.
+/// </summary>
+public abstract partial class MLTestBase
+{
+    [TestMethod]
+    public async Task FusedDequantMatMul_SmallMatrix_MatchesCPU() => await RunTest(async accelerator =>
+    {
+        // 2×32 input × 32×2 Q4_0 weight = 2×2 output
+        // Using block size of 32 (one Q4_0 block per weight row)
+        int M = 2, K = 32, N = 2;
+
+        var rng = new Random(42);
+        var input = new float[M * K];
+        for (int i = 0; i < input.Length; i++)
+            input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Create Q4_0 packed weights for a [K, N] matrix
+        // Q4_0: each block of 32 values = 18 bytes (2 scale FP16 + 16 data)
+        int blocksPerRow = (K + 31) / 32;
+        int bytesPerRow = blocksPerRow * 18;
+        var weightQ4 = new byte[N * bytesPerRow];
+        var weightFloat = new float[K * N]; // CPU reference weights
+
+        for (int n = 0; n < N; n++)
+        {
+            for (int blockIdx = 0; blockIdx < blocksPerRow; blockIdx++)
+            {
+                int blockStart = blockIdx * 32;
+                int blockOffset = n * bytesPerRow + blockIdx * 18;
+
+                // Generate 32 quantized values: nibble ∈ [0,15], dequant = (nibble - 8) * scale
+                float scale = 0.1f + (float)rng.NextDouble() * 0.5f;
+
+                // Write scale as FP16
+                int scaleFP16 = FloatToHalf(scale);
+                weightQ4[blockOffset] = (byte)(scaleFP16 & 0xFF);
+                weightQ4[blockOffset + 1] = (byte)((scaleFP16 >> 8) & 0xFF);
+
+                for (int i = 0; i < 32 && blockStart + i < K; i++)
+                {
+                    int nibble = rng.Next(0, 16);
+                    int byteIdx = blockOffset + 2 + (i / 2);
+                    if (i % 2 == 0)
+                        weightQ4[byteIdx] = (byte)((weightQ4[byteIdx] & 0xF0) | (nibble & 0xF));
+                    else
+                        weightQ4[byteIdx] = (byte)((weightQ4[byteIdx] & 0x0F) | ((nibble & 0xF) << 4));
+
+                    // Store dequantized reference
+                    float readBackScale = HalfToFloatCPU(scaleFP16);
+                    weightFloat[(blockStart + i) * N + n] = (nibble - 8) * readBackScale;
+                }
+            }
+        }
+
+        // CPU reference MatMul: input[M,K] × weightFloat[K,N] = expected[M,N]
+        var expected = new float[M * N];
+        for (int m = 0; m < M; m++)
+            for (int n = 0; n < N; n++)
+            {
+                float sum = 0;
+                for (int k = 0; k < K; k++)
+                    sum += input[m * K + k] * weightFloat[k * N + n];
+                expected[m * N + n] = sum;
+            }
+
+        // GPU fused dequant MatMul
+        using var inputBuf = accelerator.Allocate1D(input);
+        using var weightBuf = accelerator.Allocate1D(weightQ4);
+        using var outputBuf = accelerator.Allocate1D<float>(M * N);
+
+        var fused = new FusedDequantMatMul(accelerator);
+        fused.Forward(inputBuf.View, weightBuf.View, outputBuf.View, M, K, N);
+        await accelerator.SynchronizeAsync();
+        var gpuOut = await outputBuf.CopyToHostAsync<float>(0, M * N);
+
+        float maxErr = 0;
+        for (int i = 0; i < M * N; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(gpuOut[i] - expected[i]));
+
+        Console.WriteLine($"[FusedDequantMatMul] 2×32×2: maxErr={maxErr:E3}");
+        if (maxErr > 0.1f)
+            throw new Exception($"FusedDequantMatMul maxErr={maxErr:E3} exceeds tolerance 0.1");
+    });
+
+    /// <summary>FP32 → FP16 conversion for test data generation.</summary>
+    private static int FloatToHalf(float f)
+    {
+        // Simple conversion: handle normal range only (sufficient for scale factors)
+        if (f == 0) return 0;
+        int sign = f < 0 ? 1 : 0;
+        f = MathF.Abs(f);
+        int exp = (int)MathF.Floor(MathF.Log2(f));
+        float frac = f / MathF.Pow(2, exp) - 1f;
+        int biasedExp = exp + 15;
+        if (biasedExp <= 0) return (sign << 15); // underflow → zero
+        if (biasedExp >= 31) return (sign << 15) | 0x7C00; // overflow → inf
+        int mant = (int)(frac * 1024f + 0.5f);
+        if (mant > 1023) mant = 1023;
+        return (sign << 15) | (biasedExp << 10) | mant;
+    }
+
+    /// <summary>FP16 → FP32 conversion (CPU reference, matches kernel's HalfToFloat).</summary>
+    private static float HalfToFloatCPU(int h)
+    {
+        int sign = (h >> 15) & 1;
+        int exp = (h >> 10) & 0x1F;
+        int mant = h & 0x3FF;
+        if (exp == 0) return mant == 0 ? (sign == 1 ? -0f : 0f) : (sign == 1 ? -1 : 1) * mant / 1024f * (1f / 16384f);
+        if (exp == 31) return mant == 0 ? (sign == 1 ? float.NegativeInfinity : float.PositiveInfinity) : float.NaN;
+        float result = (1f + mant / 1024f) * MathF.Pow(2, exp - 15);
+        return sign == 1 ? -result : result;
+    }
+}

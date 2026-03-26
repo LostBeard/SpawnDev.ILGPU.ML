@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -16,8 +17,11 @@ public class MatMulKernel
 {
     private const int TILE = 16; // 16×16 = 256 threads = WebGPU max workgroup size
 
+    private const int REG_TILE = 64; // RegisterBlockedMatMul uses 64×64 output tiles
+
     private readonly Accelerator _accelerator;
     private readonly bool _useSimpleKernels; // CPU/WebGL can't handle 256-thread groups
+    private RegisterBlockedMatMul? _regBlockedMatMul; // lazy-init, used for large matrices
 
     // LoadStreamKernel returns Action<KernelConfig, ...>
     private Action<KernelConfig,
@@ -216,6 +220,8 @@ public class MatMulKernel
     /// <summary>
     /// Matrix multiply: C = A × B. All buffers are flat row-major.
     /// A[M,K] × B[K,N] → C[M,N].
+    /// Auto-selects register-blocked path (4×4 per thread, 64×64 tiles) for large matrices
+    /// when the hardware supports it (≥256 threads/group). Falls back to 16×16 tiled or simple.
     /// </summary>
     public void MatMul(
         ArrayView1D<float, Stride1D.Dense> A,
@@ -229,6 +235,12 @@ public class MatMulKernel
         if (_useSimpleKernels)
         {
             _simpleMatMulKernel!(M * N, A, B, C, M, K, N);
+        }
+        else if (M >= REG_TILE && N >= REG_TILE)
+        {
+            // Large matrices: use register-blocked path (16 results/thread vs 1)
+            _regBlockedMatMul ??= new RegisterBlockedMatMul(accelerator);
+            _regBlockedMatMul.MatMul(A, B, C, M, K, N);
         }
         else
         {
