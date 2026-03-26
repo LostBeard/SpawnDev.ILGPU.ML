@@ -109,4 +109,100 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[Mamba-3] MIMO matches standard scan: maxDiff={maxDiff:E3}");
     });
+
+    [TestMethod]
+    public async Task Mamba3_ZeroInput_ZeroOutput() => await RunTest(async accelerator =>
+    {
+        var scan = new SelectiveScanKernel(accelerator);
+        int seqLen = 4, dState = 2;
+
+        var x = new float[seqLen]; // all zeros
+        var A = new float[] { 0.9f, 0.8f };
+        var B = new float[seqLen * dState]; // zeros
+        var C = new float[seqLen * dState]; // zeros
+        for (int i = 0; i < seqLen * dState; i++) { B[i] = 0.1f; C[i] = 0.1f; }
+
+        using var xBuf = accelerator.Allocate1D(x);
+        using var aBuf = accelerator.Allocate1D(A);
+        using var bBuf = accelerator.Allocate1D(B);
+        using var cBuf = accelerator.Allocate1D(C);
+        using var outBuf = accelerator.Allocate1D<float>(seqLen);
+        using var stateBuf = accelerator.Allocate1D<float>(dState);
+
+        scan.Forward(xBuf.View, aBuf.View, bBuf.View, cBuf.View, outBuf.View, stateBuf.View, 1, seqLen, dState);
+        await accelerator.SynchronizeAsync();
+        var output = await outBuf.CopyToHostAsync<float>(0, seqLen);
+
+        // h_t = A*h_{t-1} + B*0 = A*h_{t-1}, h_0=0 → h_t=0 for all t → y_t=0
+        for (int i = 0; i < seqLen; i++)
+            if (MathF.Abs(output[i]) > 1e-6f)
+                throw new Exception($"Zero input should give zero output: output[{i}]={output[i]:F6}");
+
+        Console.WriteLine("[Mamba-3] Zero input → zero output: linearity check PASS");
+    });
+
+    [TestMethod]
+    public async Task Mamba3_ConstantMemory_StateSize() => await RunTest(async accelerator =>
+    {
+        // State size should be dState regardless of sequence length
+        var scan = new SelectiveScanKernel(accelerator);
+        int dState = 4;
+
+        // Run with seqLen=10 and seqLen=100 — same state buffer size
+        foreach (int seqLen in new[] { 10, 100 })
+        {
+            var rng = new Random(42);
+            var x = new float[seqLen];
+            var B = new float[seqLen * dState];
+            var C = new float[seqLen * dState];
+            for (int i = 0; i < seqLen; i++) x[i] = (float)rng.NextDouble();
+            for (int i = 0; i < seqLen * dState; i++) { B[i] = 0.1f; C[i] = 0.1f; }
+            var A = new float[] { 0.9f, 0.8f, 0.95f, 0.85f };
+
+            using var xBuf = accelerator.Allocate1D(x);
+            using var aBuf = accelerator.Allocate1D(A);
+            using var bBuf = accelerator.Allocate1D(B);
+            using var cBuf = accelerator.Allocate1D(C);
+            using var outBuf = accelerator.Allocate1D<float>(seqLen);
+            using var stateBuf = accelerator.Allocate1D<float>(dState); // ALWAYS dState, not seqLen
+
+            scan.Forward(xBuf.View, aBuf.View, bBuf.View, cBuf.View, outBuf.View, stateBuf.View,
+                1, seqLen, dState);
+            await accelerator.SynchronizeAsync();
+            var output = await outBuf.CopyToHostAsync<float>(0, seqLen);
+
+            // Should produce valid output without OOM
+            bool hasNonZero = output.Any(v => MathF.Abs(v) > 1e-6f);
+            if (!hasNonZero)
+                throw new Exception($"seqLen={seqLen}: all-zero output");
+        }
+
+        Console.WriteLine("[Mamba-3] Constant memory: state=dState regardless of seqLen PASS");
+    });
+
+    [TestMethod]
+    public async Task AsyncMDE_Pipeline_MemoryWarms() => await RunTest(async accelerator =>
+    {
+        var pipeline = new SpawnDev.ILGPU.ML.Pipelines.AsyncDepthPipeline(
+            accelerator, width: 4, height: 4, slowPathInterval: 2);
+
+        if (pipeline.MemoryWarmed)
+            throw new Exception("Memory should not be warmed before first frame");
+
+        using var fastOutput = accelerator.Allocate1D<float>(16);
+        using var output = accelerator.Allocate1D<float>(16);
+
+        // First frame should warm memory
+        var ew = new ElementWiseKernels(accelerator);
+        ew.Scale(fastOutput.View, fastOutput.View, 16, 0f); // zero
+        var result = await pipeline.ProcessFrameAsync(fastOutput.View, output.View);
+
+        if (!pipeline.MemoryWarmed)
+            throw new Exception("Memory should be warmed after first frame");
+        if (result.FrameIndex != 1)
+            throw new Exception($"FrameIndex should be 1, got {result.FrameIndex}");
+
+        pipeline.Dispose();
+        Console.WriteLine("[AsyncMDE] Pipeline: memory warms on first frame PASS");
+    });
 }
