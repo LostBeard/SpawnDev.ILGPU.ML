@@ -19,11 +19,10 @@ public abstract partial class MLTestBase
         int B = 1, C = 4, H = 2, W = 2, G = 2;
         int total = B * C * H * W;
 
-        // Simple input: channel 0 = [1,1,1,1], channel 1 = [2,2,2,2], etc.
+        // All values constant (5.0) → within each group, mean=5, var=0
+        // normalized = (5-5)/sqrt(0+eps) = 0, output = weight*0 + bias = bias = 1
         var input = new float[total];
-        for (int c = 0; c < C; c++)
-            for (int s = 0; s < H * W; s++)
-                input[c * H * W + s] = c + 1f;
+        Array.Fill(input, 5f);
 
         var weight = new float[C];
         var bias = new float[C];
