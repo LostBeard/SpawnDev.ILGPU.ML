@@ -369,10 +369,33 @@
         if (e.Key == "Enter") _ = SendMessage();
     }
 
-    private Task TriggerAutoChat()
+    private async Task TriggerAutoChat()
     {
-        // TODO: Pick a random character to speak next based on conversation context
-        return Task.CompletedTask;
+        if (_characters.Count == 0 || _panels.Count == 0) return;
+        // Pick a random character and have them respond to the latest message
+        var character = _characters[Random.Shared.Next(_characters.Count)];
+        var lastMessage = _panels.LastOrDefault(p => !p.IsUser)?.Text ?? _panels.Last().Text;
+        _isGenerating = true;
+        StateHasChanged();
+
+        if (_isModelLoaded && _textGenPipeline != null)
+        {
+            var prompt = $"{character.Name} ({character.Personality}). Context: \"{lastMessage}\". {character.Name}:";
+            var result = await _textGenPipeline.GenerateAsync(prompt, maxNewTokens: 30);
+            var response = result.GeneratedText.Split('\n')[0].Trim();
+            if (string.IsNullOrWhiteSpace(response))
+                response = GetPlaceholderComicResponse(character.Personality, character.Name, lastMessage);
+            _panels.Add(new ComicPanel { CharacterName = character.Name, CharacterColor = character.Color, Text = response });
+        }
+        else
+        {
+            await Task.Delay(300);
+            _panels.Add(new ComicPanel { CharacterName = character.Name, CharacterColor = character.Color,
+                Text = GetPlaceholderComicResponse(character.Personality, character.Name, lastMessage) });
+        }
+
+        _isGenerating = false;
+        StateHasChanged();
     }
 
     private class ChatCharacter
