@@ -65,23 +65,24 @@ public class RoPEKernel
     {
         int halfD = D / 2;
         int pos = idx / halfD + startPos;
-        int dimPair = idx % halfD;
+        int dimIdx = idx % halfD;
 
-        // Frequency: θ = pos / base^(2*dimPair/D)
-        float freqExp = 2f * dimPair / (float)D;
+        // Frequency: θ = pos / base^(2*dimIdx/D)
+        float freqExp = 2f * dimIdx / (float)D;
         float invFreq = 1f / MathF.Pow(ropeBase, freqExp);
         float theta = pos * invFreq;
 
         float cosTheta = MathF.Cos(theta);
         float sinTheta = MathF.Sin(theta);
 
-        int baseIdx = (idx / halfD) * D; // row start
-        int i = dimPair;
+        // Half-split layout: pairs at [i] and [i + D/2]
+        // This matches PyTorch's standard apply_rotary_emb
+        int rowStart = (idx / halfD) * D;
 
-        float x0 = input[baseIdx + 2 * i];
-        float x1 = input[baseIdx + 2 * i + 1];
+        float x0 = input[rowStart + dimIdx];           // first half
+        float x1 = input[rowStart + dimIdx + halfD];   // second half
 
-        output[baseIdx + 2 * i]     = x0 * cosTheta - x1 * sinTheta;
-        output[baseIdx + 2 * i + 1] = x0 * sinTheta + x1 * cosTheta;
+        output[rowStart + dimIdx]          = x0 * cosTheta - x1 * sinTheta;
+        output[rowStart + dimIdx + halfD]  = x0 * sinTheta + x1 * cosTheta;
     }
 }
