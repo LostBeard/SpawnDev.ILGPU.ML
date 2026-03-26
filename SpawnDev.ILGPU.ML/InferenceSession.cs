@@ -412,21 +412,15 @@ public class InferenceSession : IDisposable
         // Two-pass approach for low peak CPU memory:
         //   Pass 1: capture ONLY small constants (≤64 elements) for graph compilation.
         //   Pass 2: re-stream ALL weights, upload each to GPU then release from CPU.
-        // Peak CPU memory: one tensor at a time (~few MB), not all weights (~548MB for GPT-2).
+        // Parse ONNX protobuf and extract weights.
+        // LoadModelStreaming yields weights one at a time — each tensor's raw protobuf
+        // bytes are released as soon as ToFloatArray() completes, reducing peak memory
+        // vs the non-streaming path which holds all raw bytes + all float arrays.
         onProgress?.Invoke("parse", 0);
         var (modelInfo, weightStream) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
-
-        // Pass 1: capture ONLY small weights for constant folding + graph compilation.
-        // Large weights are NOT held in CPU memory — only their names are tracked.
-        var cpuSmallWeights = new Dictionary<string, float[]>();
+        var cpuWeightsAll = new Dictionary<string, float[]>();
         foreach (var (name, data) in weightStream)
-        {
-            if (data.Length <= 64)
-            {
-                cpuSmallWeights[name] = data;
-            }
-            // Large weights: data goes out of scope and can be GC'd
-        }
+            cpuWeightsAll[name] = data;
         onProgress?.Invoke("parse", 100);
 
         // Apply input shape overrides (for models with dynamic dimensions)
@@ -447,7 +441,7 @@ public class InferenceSession : IDisposable
         foreach (var (name, shape) in graph.Initializers)
         {
             int elems = shape.Aggregate(1, (a, b) => a * b);
-            if (elems > 0 && elems <= 64 && cpuSmallWeights.TryGetValue(name, out var data))
+            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
