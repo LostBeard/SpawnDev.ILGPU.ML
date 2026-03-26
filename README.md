@@ -222,6 +222,15 @@ Every model is automatically optimized during compilation:
 | **ColorConversion** | RGB↔YCbCr, grayscale, BGR on GPU | — |
 | **ImageTransform** | GPU resize, crop, flip | — |
 | **TensorLayout** | NCHW↔NHWC, interleaved↔planar on GPU | — |
+| **FWHT** | Fast Walsh-Hadamard Transform (TurboQuant core) | O(d log d) |
+| **TurboQuant** | 4-bit KV cache: normalize, sign-flip, quantize, bit-pack, fused attention | 7.9x compression |
+| **RoPE** | Rotary Position Embeddings (DA3, LLaMA, Mistral) | — |
+| **QKNorm** | L2-normalize Q/K per head (DA3) | — |
+| **GroupNorm** | Per-group normalization for U-Net (LGM) | — |
+| **SelectiveScan** | Mamba-3 SSM + MIMO + O(1) decode | Linear scaling |
+| **SpatialMemory** | AsyncMDE convex combination + EMA cache | Real-time depth |
+| **MarchingCubes** | 3D isosurface extraction (TripoSR) | — |
+| **Training** | SoftmaxCE, ReLU/Conv2D/MaxPool backward, SGD, Adam | GPU training |
 
 ### 71 ONNX Operators
 
@@ -369,7 +378,7 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 - **NLP transformers working** — DistilBERT sentiment analysis passes reference test. 10-bug fix chain: ConstantOfShape value attribute, Expand N-D broadcasting, Unsqueeze shape inference, Slice constant folding, Cast constant propagation, INT64_MAX overflow, Gemm higher-rank inputs. The same fixes unblock GPT-2, Whisper, and all transformer architectures.
 - **HuggingFace CDN integration** — All models load from HuggingFace with OPFS caching. 1.25GB of model files removed from repo. Search, browse, and load any public model. 15 known models pre-configured.
 - **96 operator test cases** — Expanded from 18 to 96 numpy-verified test cases covering MatMul, Gemm, LayerNorm, BatchNorm, InstanceNorm, all activations, all reductions, Gather, Split, Expand, Unsqueeze, Cast, Pad, Resize, comparisons, and more. Caught 11 real operator bugs.
-- **7 model format parsers** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML. All zero-dependency, all auto-detected. One API loads any format.
+- **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. All zero-dependency, all auto-detected. SPZ/PLY/glTF/OBJ export for 3D data.
 - **6-pass graph optimizer** — constant folding (with explicit Slice/Cast/Sqrt handlers), identity elimination, linear fusion, scaled MatMul fusion, strength reduction, dead node elimination.
 - **Fused linear kernel** — `MatMul + Bias + Activation` in a single GPU dispatch. Eliminates 2/3 of memory bandwidth for every linear layer in every model.
 - **Zero-copy style transfer** — entire pipeline (preprocess → inference → postprocess) stays on GPU. No CPU pixel loops.
@@ -382,7 +391,7 @@ SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML researc
 
 | Technology | What It Does | Why It Matters |
 |-----------|-------------|----------------|
-| **TurboQuant** | 6x KV cache compression, zero accuracy loss, no calibration | Large NLP models (GPT-2, Whisper) fit in browser memory. Data-oblivious — works for every model automatically. |
+| **TurboQuant** | 7.9x KV cache compression via FWHT + 4-bit quantization, fused attention kernel | Large NLP models (GPT-2, Whisper) fit in browser memory. Data-oblivious — works for every model automatically. Full pipeline: normalize → sign-flip → FWHT → quantize → bit-pack → fused attention. |
 | **SPZ Compression** | 15-20x compression for Gaussian Splat scenes, optimized for WebGPU | 500MB 3D scenes become 25MB. Spatially-ordered Gaussians make GPU sorting faster. Instant sharing. |
 | **Depth Anything V3** | Multi-view depth + ray maps with temporal consistency | Eliminates depth flicker in video. Treats video as multi-view sequence, not isolated frames. Critical for 2D-to-3D conversion. |
 | **AsyncMDE** | Asynchronous Spatial Memory decouples depth from render loop | Real-time depth estimation at video framerate on standard hardware. No UI lockup during GPU computation. |
