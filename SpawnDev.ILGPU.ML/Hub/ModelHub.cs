@@ -205,6 +205,8 @@ public class ModelHub : IDisposable
         // ── Image Generation ──
         /// <summary>DDPM MNIST — tiny unconditional diffusion (1 MB, 28x28 grayscale)</summary>
         public const string DDPMMnist = "local/ddpm-mnist"; // local model, loaded from references/
+        /// <summary>SD-Turbo — ONE-step text-to-image, 512x512, FP16 WebGPU-optimized (~2.5 GB)</summary>
+        public const string SDTurbo = "schmuell/sd-turbo-ort-web";
 
         // ── Background Removal ──
         /// <summary>RMBG 1.4 — Background removal, ONNX export (44 MB)</summary>
