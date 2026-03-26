@@ -1,4 +1,7 @@
 @page "/train"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@implements IDisposable
 
 <PageTitle>Draw to Learn — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -43,11 +46,12 @@
 
         <div class="canvas-panel">
             <div class="drawing-canvas">
-                <canvas width="280" height="280" class="draw-surface"
+                <canvas @ref="_canvasRef" width="280" height="280" class="draw-surface"
                         @onmousedown="StartDrawing"
                         @onmousemove="Draw"
                         @onmouseup="StopDrawing"
-                        @onmouseleave="StopDrawing"></canvas>
+                        @onmouseleave="StopDrawing"
+                        style="background: black; cursor: crosshair;"></canvas>
             </div>
             <div class="canvas-actions">
                 <button class="canvas-btn" @onclick="SaveSample" disabled="@(string.IsNullOrEmpty(_selectedClass))">
@@ -180,15 +184,185 @@
         new() { Id = "CPU", DisplayName = "CPU" },
     };
 
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private SpawnDev.ILGPU.ML.Training.TrainableModel? _model;
+    private ElementReference _canvasRef;
+    private bool _isDrawing;
+    private List<List<float[]>> _trainingSamples = new(); // per-class samples, each 28*28 floats
+    private float _lastX, _lastY;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            if (_context == null)
+            {
+                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            // Initialize per-class sample storage
+            foreach (var _ in _classes)
+                _trainingSamples.Add(new List<float[]>());
+        }
+    }
+
     private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private void AddClass() { if (!string.IsNullOrWhiteSpace(_newClassName)) { _classes.Add(new DrawClass { Name = _newClassName, Color = GetNextColor() }); _newClassName = ""; } }
-    private void RemoveClass(string name) { _classes.RemoveAll(c => c.Name == name); }
-    private void StartDrawing() { }
-    private void Draw() { }
-    private void StopDrawing() { }
-    private void SaveSample() { }
-    private void ClearCanvas() { }
-    private Task StartTraining() { _step = 2; return Task.CompletedTask; }
+    private void AddClass()
+    {
+        if (!string.IsNullOrWhiteSpace(_newClassName))
+        {
+            _classes.Add(new DrawClass { Name = _newClassName, Color = GetNextColor() });
+            _trainingSamples.Add(new List<float[]>());
+            _newClassName = "";
+        }
+    }
+    private void RemoveClass(string name)
+    {
+        int idx = _classes.FindIndex(c => c.Name == name);
+        if (idx >= 0) { _classes.RemoveAt(idx); _trainingSamples.RemoveAt(idx); }
+    }
+
+    private void StartDrawing(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    {
+        _isDrawing = true;
+        _lastX = (float)e.OffsetX;
+        _lastY = (float)e.OffsetY;
+        // Draw a dot at the start position
+        DrawOnCanvas(_lastX, _lastY, _lastX, _lastY);
+    }
+
+    private void Draw(Microsoft.AspNetCore.Components.Web.MouseEventArgs e)
+    {
+        if (!_isDrawing) return;
+        float x = (float)e.OffsetX, y = (float)e.OffsetY;
+        DrawOnCanvas(_lastX, _lastY, x, y);
+        _lastX = x; _lastY = y;
+    }
+
+    private void StopDrawing() { _isDrawing = false; }
+
+    private void DrawOnCanvas(float x1, float y1, float x2, float y2)
+    {
+        using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_canvasRef);
+        using var ctx = canvas.Get2DContext();
+        ctx.StrokeStyle = "white";
+        ctx.LineWidth = 12;
+        ctx.LineCap = "round";
+        ctx.BeginPath();
+        ctx.MoveTo(x1, y1);
+        ctx.LineTo(x2, y2);
+        ctx.Stroke();
+    }
+
+    private void SaveSample()
+    {
+        if (string.IsNullOrEmpty(_selectedClass)) return;
+        int classIdx = _classes.FindIndex(c => c.Name == _selectedClass);
+        if (classIdx < 0) return;
+
+        // Read canvas pixels and downsample to 28x28 grayscale
+        using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_canvasRef);
+        using var ctx = canvas.Get2DContext();
+        using var imageData = ctx.GetImageData(0, 0, 280, 280);
+        using var data = imageData.Data;
+        var pixels = data.ReadBytes();
+
+        // Downsample 280x280 → 28x28 by averaging 10x10 blocks
+        var sample = new float[28 * 28];
+        for (int y = 0; y < 28; y++)
+        {
+            for (int x = 0; x < 28; x++)
+            {
+                float sum = 0;
+                for (int dy = 0; dy < 10; dy++)
+                    for (int dx = 0; dx < 10; dx++)
+                    {
+                        int srcIdx = ((y * 10 + dy) * 280 + (x * 10 + dx)) * 4;
+                        if (srcIdx + 3 < pixels.Length)
+                            sum += pixels[srcIdx]; // R channel (white = 255)
+                    }
+                sample[y * 28 + x] = sum / (10 * 10 * 255f);
+            }
+        }
+
+        _trainingSamples[classIdx].Add(sample);
+        _classes[classIdx].SampleCount++;
+        ClearCanvas();
+        StateHasChanged();
+    }
+
+    private void ClearCanvas()
+    {
+        using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_canvasRef);
+        using var ctx = canvas.Get2DContext();
+        ctx.ClearRect(0, 0, 280, 280);
+    }
+
+    private async Task StartTraining()
+    {
+        if (_accelerator == null || _classes.Count < 2) return;
+        int totalSamples = _trainingSamples.Sum(s => s.Count);
+        if (totalSamples < 4) return; // Need at least a few samples
+
+        _step = 2;
+        _isRunning = true;
+        StateHasChanged();
+        await Task.Yield();
+
+        try
+        {
+            // Build model: 784 → 64 → ReLU → numClasses
+            _model?.Dispose();
+            _model = new SpawnDev.ILGPU.ML.Training.TrainableModel(_accelerator);
+            _model.AddLinear(28 * 28, 64);
+            _model.AddReLU();
+            _model.AddLinear(64, _classes.Count);
+            _model.Build(maxBatchSize: totalSamples);
+
+            // Flatten training data into batch
+            var inputData = new float[totalSamples * 28 * 28];
+            var labels = new int[totalSamples];
+            int idx = 0;
+            for (int c = 0; c < _trainingSamples.Count; c++)
+            {
+                foreach (var sample in _trainingSamples[c])
+                {
+                    Array.Copy(sample, 0, inputData, idx * 28 * 28, 28 * 28);
+                    labels[idx] = c;
+                    idx++;
+                }
+            }
+
+            // Train
+            for (int epoch = 0; epoch < _totalEpochs; epoch++)
+            {
+                _currentEpoch = epoch + 1;
+                _currentLoss = await _model.TrainStepAsync(inputData, labels, totalSamples, learningRate: 0.01f);
+                _trainingProgress = (epoch + 1f) / _totalEpochs * 100f;
+
+                if (epoch % 5 == 0)
+                {
+                    StateHasChanged();
+                    await Task.Yield();
+                }
+            }
+
+            _step = 3;
+            _trainingProgress = 100;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Train] Error: {ex.Message}");
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
 
     private string GetNextColor() => _classes.Count switch
     {
@@ -196,6 +370,13 @@
         4 => "#8b5cf6", 5 => "#ec4899", 6 => "#14b8a6", 7 => "#f97316",
         _ => "#64748b",
     };
+
+    public void Dispose()
+    {
+        _model?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 
     private class DrawClass { public string Name { get; set; } = ""; public string Color { get; set; } = ""; public int SampleCount { get; set; } }
 }
