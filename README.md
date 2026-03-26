@@ -275,7 +275,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does |
 |------|-------------|
-| **Depth Estimation** | Generate depth maps from any photo. Selectable color palettes (plasma, viridis, inferno). Depth Anything V2 (823 nodes) already compiles. |
+| **Depth Estimation** | Generate depth maps from any photo. GPU plasma colormap via CanvasRendererFactory zero-copy rendering. Depth Anything V2 runs on WebGPU. |
 | **Real-Time Object Detection** | Live webcam with bounding boxes. 80 COCO classes, confidence slider, FPS counter. GPU-accelerated NMS. |
 | **Background Removal** | One-click background removal. Transparent PNG download. Replace background with custom image or blur. |
 | **Pose Estimation** | Live webcam with skeleton overlay. 17 keypoints, joint angles, movement trails. MoveNet Lightning already compiles. |
