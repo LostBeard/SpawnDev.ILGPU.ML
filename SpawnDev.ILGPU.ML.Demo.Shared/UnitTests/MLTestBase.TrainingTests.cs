@@ -126,6 +126,73 @@ public abstract partial class MLTestBase
     });
 
     // ═══════════════════════════════════════════════════════════
+    //  Adam Optimizer Tests
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task Training_Adam_UpdatesWeightsAndMoments() => await RunTest(async accelerator =>
+    {
+        var kernels = new TrainingKernels(accelerator);
+
+        var weights = new float[] { 1.0f, 2.0f, 3.0f };
+        var grads = new float[] { 0.1f, -0.2f, 0.3f };
+
+        using var wBuf = accelerator.Allocate1D(weights);
+        using var gBuf = accelerator.Allocate1D(grads);
+        using var mBuf = accelerator.Allocate1D<float>(3); // first moment (zeros)
+        using var vBuf = accelerator.Allocate1D<float>(3); // second moment (zeros)
+
+        // Run 3 Adam steps
+        for (int step = 1; step <= 3; step++)
+            kernels.AdamUpdate(wBuf.View, gBuf.View, mBuf.View, vBuf.View, 3, 0.001f, 0.9f, 0.999f, step);
+
+        await accelerator.SynchronizeAsync();
+        var updated = await wBuf.CopyToHostAsync<float>(0, 3);
+        var m = await mBuf.CopyToHostAsync<float>(0, 3);
+        var v = await vBuf.CopyToHostAsync<float>(0, 3);
+
+        // Moments should be non-zero after updates
+        if (m.All(x => x == 0f))
+            throw new Exception("First moment m should be non-zero after Adam steps");
+        if (v.All(x => x == 0f))
+            throw new Exception("Second moment v should be non-zero after Adam steps");
+
+        // Weights should have changed
+        bool changed = false;
+        for (int i = 0; i < 3; i++)
+            if (MathF.Abs(updated[i] - weights[i]) > 1e-6f) changed = true;
+        if (!changed)
+            throw new Exception("Weights should change after Adam updates");
+
+        Console.WriteLine($"[Training] Adam: weights updated, moments accumulated, 3 steps OK");
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Zero Kernel Tests
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task Training_Zero_ClearsBuffer() => await RunTest(async accelerator =>
+    {
+        var kernels = new TrainingKernels(accelerator);
+
+        var data = new float[] { 1f, 2f, 3f, 4f, 5f };
+        using var buf = accelerator.Allocate1D(data);
+
+        kernels.Zero(buf.View, 5);
+        await accelerator.SynchronizeAsync();
+        var result = await buf.CopyToHostAsync<float>(0, 5);
+
+        for (int i = 0; i < 5; i++)
+        {
+            if (result[i] != 0f)
+                throw new Exception($"Zero: buf[{i}]={result[i]}, expected 0.0");
+        }
+
+        Console.WriteLine("[Training] Zero: buffer cleared to all zeros");
+    });
+
+    // ═══════════════════════════════════════════════════════════
     //  Linear Backward Tests
     // ═══════════════════════════════════════════════════════════
 
