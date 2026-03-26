@@ -46,7 +46,7 @@ public abstract partial class MLTestBase
         using var cBuf = accelerator.Allocate1D<float>(M * N);
 
         var matmul = new MatMulKernel(accelerator);
-        matmul.Forward(aBuf.View, bBuf.View, cBuf.View, M, K, N);
+        matmul.MatMul(aBuf.View, bBuf.View, cBuf.View, M, K, N);
         await accelerator.SynchronizeAsync();
         var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
 

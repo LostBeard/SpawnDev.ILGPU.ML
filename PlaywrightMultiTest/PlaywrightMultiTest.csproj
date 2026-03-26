@@ -24,7 +24,7 @@
 		<PackageReference Include="NUnit.Analyzers" Version="4.7.0" />
 		<PackageReference Include="NUnit3TestAdapter" Version="5.0.0" />
 		<PackageReference Include="Microsoft.CodeAnalysis" Version="4.13.0" PrivateAssets="All" />
-		<PackageReference Include="SpawnDev.UnitTesting.Blazor" Version="2.4.0" />
+		<PackageReference Include="SpawnDev.UnitTesting.Blazor" Version="2.4.1" />
 		<FrameworkReference Include="Microsoft.AspNetCore.App" />
 		
 	</ItemGroup>
