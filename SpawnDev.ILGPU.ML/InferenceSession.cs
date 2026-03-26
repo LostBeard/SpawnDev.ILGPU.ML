@@ -424,19 +424,21 @@ public class InferenceSession : IDisposable
         Dictionary<string, int[]>? inputShapes = null,
         bool enableOptimization = true)
     {
-        // Parse ONNX protobuf with streaming weight extraction.
-        // Two-pass approach for low peak CPU memory:
+        // Two-pass streaming weight loading for low peak CPU memory:
         //   Pass 1: capture ONLY small constants (≤64 elements) for graph compilation.
-        //   Pass 2: re-stream ALL weights, upload each to GPU then release from CPU.
-        // Parse ONNX protobuf and extract weights.
-        // LoadModelStreaming yields weights one at a time — each tensor's raw protobuf
-        // bytes are released as soon as ToFloatArray() completes, reducing peak memory
-        // vs the non-streaming path which holds all raw bytes + all float arrays.
+        //           Large weights are NOT stored — only their names are tracked.
+        //   Pass 2: re-stream ALL weights from onnxBytes, upload each to GPU then release.
+        // Peak CPU memory: one tensor at a time (~few MB) instead of all weights (~548MB for GPT-2).
         onProgress?.Invoke("parse", 0);
         var (modelInfo, weightStream) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
-        var cpuWeightsAll = new Dictionary<string, float[]>();
+        var cpuSmallWeights = new Dictionary<string, float[]>();
         foreach (var (name, data) in weightStream)
-            cpuWeightsAll[name] = data;
+        {
+            // Only keep small constants needed for graph optimization
+            if (data.Length <= 64)
+                cpuSmallWeights[name] = data;
+            // Large weights: data goes out of scope, GC can collect
+        }
         onProgress?.Invoke("parse", 100);
 
         // Apply input shape overrides (for models with dynamic dimensions)
@@ -457,7 +459,7 @@ public class InferenceSession : IDisposable
         foreach (var (name, shape) in graph.Initializers)
         {
             int elems = shape.Aggregate(1, (a, b) => a * b);
-            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
+            if (elems > 0 && elems <= 64 && cpuSmallWeights.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
                 if (elems <= 16)
