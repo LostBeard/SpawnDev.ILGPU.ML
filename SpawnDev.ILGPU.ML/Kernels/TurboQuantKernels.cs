@@ -175,6 +175,199 @@ public class TurboQuantKernels
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  Step 6: Bit-pack (compact storage)
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int>? _bitPack4Kernel;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int>? _bitUnpack4Kernel;
+
+    /// <summary>
+    /// Pack 4-bit indices into 32-bit ints (8 indices per int).
+    /// indices [count] (each 0-15) → packed [count/8]
+    /// </summary>
+    public void BitPack4(
+        ArrayView1D<int, Stride1D.Dense> indices,
+        ArrayView1D<int, Stride1D.Dense> packed,
+        int count)
+    {
+        int packedCount = (count + 7) / 8;
+        _bitPack4Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            int>(BitPack4Impl);
+        _bitPack4Kernel(packedCount, indices, packed, count);
+    }
+
+    private static void BitPack4Impl(Index1D packIdx,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        ArrayView1D<int, Stride1D.Dense> packed,
+        int totalCount)
+    {
+        int result = 0;
+        int baseIdx = packIdx * 8;
+        for (int i = 0; i < 8 && baseIdx + i < totalCount; i++)
+        {
+            int val = indices[baseIdx + i] & 0xF; // mask to 4 bits
+            result |= val << (i * 4);
+        }
+        packed[packIdx] = result;
+    }
+
+    /// <summary>
+    /// Unpack 32-bit ints back to 4-bit indices.
+    /// packed [count/8] → indices [count] (each 0-15)
+    /// </summary>
+    public void BitUnpack4(
+        ArrayView1D<int, Stride1D.Dense> packed,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        int count)
+    {
+        _bitUnpack4Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            int>(BitUnpack4Impl);
+        _bitUnpack4Kernel(count, packed, indices, count);
+    }
+
+    private static void BitUnpack4Impl(Index1D idx,
+        ArrayView1D<int, Stride1D.Dense> packed,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        int totalCount)
+    {
+        int packIdx = idx / 8;
+        int bitOffset = (idx % 8) * 4;
+        indices[idx] = (packed[packIdx] >> bitOffset) & 0xF;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Fused Quantized Attention
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, float>? _fusedAttentionKernel;
+
+    /// <summary>
+    /// Fused attention with quantized KV cache.
+    /// Dequantizes K and V on-the-fly during attention computation.
+    /// Q [numQueries, headDim] (float)
+    /// K_packed [numKV, headDim/8] (4-bit packed int), K_codebook [16] (float)
+    /// V_packed [numKV, headDim/8] (4-bit packed int), V_codebook [16] (float)
+    /// K_norms [numKV], V_norms [numKV] (float)
+    /// → output [numQueries, headDim] (float)
+    /// </summary>
+    public void FusedQuantizedAttention(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<int, Stride1D.Dense> K_packed,
+        ArrayView1D<float, Stride1D.Dense> K_codebook,
+        ArrayView1D<int, Stride1D.Dense> V_packed,
+        ArrayView1D<float, Stride1D.Dense> V_codebook,
+        ArrayView1D<float, Stride1D.Dense> K_norms,
+        ArrayView1D<float, Stride1D.Dense> V_norms,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numQueries, int numKV, int headDim, float scale)
+    {
+        _fusedAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, float>(FusedAttentionImpl);
+        _fusedAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
+            K_norms, V_norms, output, numQueries, numKV, headDim, scale);
+    }
+
+    /// <summary>
+    /// Per-query fused attention: compute QK^T scores, softmax, then weighted sum of V.
+    /// K and V are dequantized on-the-fly from 4-bit packed representation.
+    /// </summary>
+    private static void FusedAttentionImpl(Index1D queryIdx,
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<int, Stride1D.Dense> K_packed,
+        ArrayView1D<float, Stride1D.Dense> K_codebook,
+        ArrayView1D<int, Stride1D.Dense> V_packed,
+        ArrayView1D<float, Stride1D.Dense> V_codebook,
+        ArrayView1D<float, Stride1D.Dense> K_norms,
+        ArrayView1D<float, Stride1D.Dense> V_norms,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numQ, int numKV, int D, float scale)
+    {
+        int packedDim = D / 8; // 4-bit: 8 values per int
+
+        // Step 1: Compute attention scores QK^T (dequantize K on-the-fly)
+        // Use a fixed-size local array for scores (max 1024 KV positions)
+        float maxScore = -1e10f;
+
+        // First pass: compute scores and find max
+        // We'll do two passes to avoid needing a large local array
+        // Pass 1: find max score
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                {
+                    int idx = (packed >> (b * 4)) & 0xF;
+                    float kVal = K_codebook[idx] * kNorm;
+                    dot += Q[queryIdx * D + p * 8 + b] * kVal;
+                }
+            }
+            float score = dot * scale;
+            if (score > maxScore) maxScore = score;
+        }
+
+        // Pass 2: compute exp(score - max) and sum for softmax, and accumulate weighted V
+        float sumExp = 0f;
+        // Zero the output
+        for (int d = 0; d < D; d++)
+            output[queryIdx * D + d] = 0f;
+
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            // Recompute score (trading compute for memory — no local array needed)
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                {
+                    int idx = (packed >> (b * 4)) & 0xF;
+                    float kVal = K_codebook[idx] * kNorm;
+                    dot += Q[queryIdx * D + p * 8 + b] * kVal;
+                }
+            }
+            float weight = MathF.Exp(dot * scale - maxScore);
+            sumExp += weight;
+
+            // Accumulate weighted V (dequantize on-the-fly)
+            float vNorm = V_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = V_packed[kv * packedDim + p];
+                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                {
+                    int idx = (packed >> (b * 4)) & 0xF;
+                    float vVal = V_codebook[idx] * vNorm;
+                    output[queryIdx * D + p * 8 + b] += weight * vVal;
+                }
+            }
+        }
+
+        // Normalize by softmax sum
+        float invSum = 1f / (sumExp + 1e-10f);
+        for (int d = 0; d < D; d++)
+            output[queryIdx * D + d] *= invSum;
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  Denormalize (restore original scale)
     // ═══════════════════════════════════════════════════════════
 
