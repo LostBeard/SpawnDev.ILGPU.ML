@@ -185,8 +185,8 @@ public class QuantizedKVCache : IDisposable
         // Step 2: Sign flip
         _tq.SignFlip(_tempNormalized.View, _tempFlipped.View, _signs.View, _headDim);
 
-        // Step 3: FWHT
-        _tempFlipped.View.SubView(0, _headDim).CopyTo(_tempTransformed.View.SubView(0, _headDim));
+        // Step 3: FWHT — copy via Scale(1.0) to avoid sync CopyTo on WebGPU
+        new ElementWiseKernels(_accelerator).Scale(_tempFlipped.View.SubView(0, _headDim), _tempTransformed.View.SubView(0, _headDim), _headDim, 1f);
         _tq.FWHT.Forward(_tempTransformed.View, _headDim);
 
         // Step 4: Quantize
@@ -195,8 +195,8 @@ public class QuantizedKVCache : IDisposable
         // Step 5: Bit-pack and store at position
         _tq.BitPack4(_tempIndices.View, packedBuf.View.SubView(position * _packedDim, _packedDim), _headDim);
 
-        // Store norm at position
-        _tempNorm.View.SubView(0, 1).CopyTo(normBuf.View.SubView(position, 1));
+        // Store norm at position — Scale(1.0) as async GPU→GPU copy
+        new ElementWiseKernels(_accelerator).Scale(_tempNorm.View.SubView(0, 1), normBuf.View.SubView(position, 1), 1, 1f);
     }
 
     /// <summary>

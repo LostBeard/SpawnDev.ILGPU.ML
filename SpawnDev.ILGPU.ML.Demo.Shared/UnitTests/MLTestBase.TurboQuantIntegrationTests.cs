@@ -95,7 +95,7 @@ public abstract partial class MLTestBase
             tq.Normalize(kVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
             tq.BitPack4(tempIndices.View, kPackedBuf.View.SubView(kv * packedDim, packedDim), headDim);
-            tempNormVal.View.SubView(0, 1).CopyTo(kNormsBuf.View.SubView(kv, 1));
+            new ElementWiseKernels(accelerator).Scale(tempNormVal.View.SubView(0, 1), kNormsBuf.View.SubView(kv, 1), 1, 1f);
 
             // Same for V
             var vSlice = new float[headDim];
@@ -105,7 +105,7 @@ public abstract partial class MLTestBase
             tq.Normalize(vVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
             tq.BitPack4(tempIndices.View, vPackedBuf.View.SubView(kv * packedDim, packedDim), headDim);
-            tempNormVal.View.SubView(0, 1).CopyTo(vNormsBuf.View.SubView(kv, 1));
+            new ElementWiseKernels(accelerator).Scale(tempNormVal.View.SubView(0, 1), vNormsBuf.View.SubView(kv, 1), 1, 1f);
         }
 
         // Run fused quantized attention
