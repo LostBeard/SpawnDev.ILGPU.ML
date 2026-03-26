@@ -84,11 +84,9 @@ public class AsyncDepthPipeline : IDisposable
         }
 
         // Blend: output = 0.5 * memory + 0.5 * fastPath (equal blend)
-        // A trained trust predictor would output per-pixel trust values
-        var ew = new ElementWiseKernels(_accelerator);
-        // Simple average: output = (memory + fastPath) * 0.5
-        ew.Add(_memoryCache!.View.SubView(0, pixels), fastPathOutput.SubView(0, pixels), output.SubView(0, pixels), pixels);
-        ew.Scale(output, output, pixels, 0.5f);
+        // Use SMU combine with trust=0.5 for proper blending without aliasing
+        _smu.EMAUpdate(_memoryCache!.View, fastPathOutput, pixels, 0.5f);
+        _memoryCache.View.SubView(0, pixels).CopyTo(output.SubView(0, pixels));
 
         await _accelerator.SynchronizeAsync();
         sw.Stop();

@@ -193,8 +193,10 @@ public abstract partial class MLTestBase
         using var output = accelerator.Allocate1D<float>(16);
 
         // First frame should warm memory
-        var ew = new ElementWiseKernels(accelerator);
-        ew.Scale(fastOutput.View, fastOutput.View, 16, 0f); // zero
+        // Zero the buffer without aliasing (WebGPU forbids same buffer in/out)
+        var zeros = new float[16];
+        using var zerosBuf = accelerator.Allocate1D(zeros);
+        zerosBuf.View.CopyTo(fastOutput.View);
         var result = await pipeline.ProcessFrameAsync(fastOutput.View, output.View);
 
         if (!pipeline.MemoryWarmed)
