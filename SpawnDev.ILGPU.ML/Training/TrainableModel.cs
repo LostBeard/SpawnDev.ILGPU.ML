@@ -88,7 +88,7 @@ public class TrainableModel : IDisposable
         // ── Loss: Softmax + Cross-Entropy ──
         using var probs = _accelerator.Allocate1D<float>(batchSize * outputClasses);
         using var loss = _accelerator.Allocate1D<float>(batchSize);
-        _kernels.SoftmaxCrossEntropyForward(current, probs.View, loss.View, batchSize, outputClasses);
+        _kernels.SoftmaxCrossEntropyForward(current, probs.View, loss.View, targetBuf.View, batchSize, outputClasses);
 
         // ── Backward Pass ──
         using var gradLogits = _accelerator.Allocate1D<float>(batchSize * outputClasses);

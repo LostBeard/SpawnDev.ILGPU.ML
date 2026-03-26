@@ -12,7 +12,7 @@ public class TrainingKernels
     private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int>? _softmaxCrossEntropyForwardKernel;
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _softmaxCrossEntropyForwardKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int>? _softmaxCrossEntropyBackwardKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -35,25 +35,29 @@ public class TrainingKernels
     // ═══════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Softmax + Cross-Entropy forward: logits [batch, classes] → loss per sample.
+    /// Softmax + Cross-Entropy forward: logits [batch, classes] + targets → loss per sample.
     /// Numerically stable: subtracts max before exp.
+    /// Loss = -log(softmax(logits)[target_class]).
     /// </summary>
     public void SoftmaxCrossEntropyForward(
         ArrayView1D<float, Stride1D.Dense> logits,
         ArrayView1D<float, Stride1D.Dense> probs,
         ArrayView1D<float, Stride1D.Dense> loss,
+        ArrayView1D<int, Stride1D.Dense> targets,
         int batchSize, int numClasses)
     {
         _softmaxCrossEntropyForwardKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int>(SoftmaxCEForwardImpl);
-        _softmaxCrossEntropyForwardKernel(batchSize, logits, probs, loss, batchSize, numClasses);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            int, int>(SoftmaxCEForwardImpl);
+        _softmaxCrossEntropyForwardKernel(batchSize, logits, probs, loss, targets, batchSize, numClasses);
     }
 
     private static void SoftmaxCEForwardImpl(Index1D batch,
         ArrayView1D<float, Stride1D.Dense> logits,
         ArrayView1D<float, Stride1D.Dense> probs,
         ArrayView1D<float, Stride1D.Dense> loss,
+        ArrayView1D<int, Stride1D.Dense> targets,
         int B, int C)
     {
         int offset = batch * C;
@@ -80,9 +84,10 @@ public class TrainingKernels
         for (int c = 0; c < C; c++)
             probs[offset + c] *= invSum;
 
-        // Loss = -log(sum_exp) + max (log-sum-exp trick)
-        // Stored per-sample for reduction later
-        loss[batch] = -(MathF.Log(sumExp) + maxVal - maxVal);
+        // Cross-entropy loss: -log(prob[target])
+        int target = targets[batch];
+        float prob = probs[offset + target];
+        loss[batch] = -MathF.Log(prob + 1e-10f); // epsilon to prevent log(0)
     }
 
     /// <summary>

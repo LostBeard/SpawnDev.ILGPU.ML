@@ -31,7 +31,7 @@ public abstract partial class MLTestBase
         using var targetsBuf = accelerator.Allocate1D(targets);
         using var gradBuf = accelerator.Allocate1D<float>(6);
 
-        kernels.SoftmaxCrossEntropyForward(logitsBuf.View, probsBuf.View, lossBuf.View, 2, 3);
+        kernels.SoftmaxCrossEntropyForward(logitsBuf.View, probsBuf.View, lossBuf.View, targetsBuf.View, 2, 3);
         kernels.SoftmaxCrossEntropyBackward(probsBuf.View, targetsBuf.View, gradBuf.View, 2, 3);
         await accelerator.SynchronizeAsync();
 
