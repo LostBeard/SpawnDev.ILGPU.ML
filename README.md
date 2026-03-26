@@ -305,7 +305,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does |
 |------|-------------|
-| **Image Generation** | Stable Diffusion-style image generation. Prompt, negative prompt, steps, guidance scale, seed, resolution — all running on WebGPU. |
+| **Image Generation** | SD-Turbo: type a text prompt, get a 512x512 image in ONE inference step (~1 second). Real Stable Diffusion running on your GPU in the browser — no server, no API key. 2.5GB model streamed to GPU via HuggingFace CDN. Also includes DDPM MNIST (1MB) as lightweight fallback. |
 | **Image to 3D (TripoSR)** | Drop a photo, get a full 3D textured mesh in seconds. Export as glTF/OBJ for Blender, Unity, game engines, or 3D printing. Feed-forward (no diffusion) — DINOv1 encoder + Triplane transformer + Marching Cubes. |
 | **Image to Gaussian Splats (LGM)** | Drop a photo, generate 65,536 photorealistic Gaussian splats. Fly through the 3D scene in [SpawnScene](https://github.com/LostBeard/SpawnScene). Export as SPZ (15-20x compressed) or PLY. |
 | **Depth Voxel** | Live webcam depth → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
