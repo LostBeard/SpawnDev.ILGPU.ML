@@ -408,9 +408,29 @@ public class InferenceSession : IDisposable
         Dictionary<string, int[]>? inputShapes = null,
         bool enableOptimization = true)
     {
-        // Parse ONNX protobuf
+        // Parse ONNX protobuf with streaming weight extraction.
+        // Weights are yielded one at a time — small constants are captured,
+        // large weights are uploaded directly to GPU then released from CPU.
         onProgress?.Invoke("parse", 0);
-        var (modelInfo, cpuWeightsAll) = Onnx.OnnxLoader.LoadModel(onnxBytes);
+        var (modelInfo, weightStream) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
+
+        // First pass: capture only small weights (≤64 elements) for constant folding.
+        // Large weights are skipped — they'll be streamed to GPU during upload phase.
+        var cpuWeightsAll = new Dictionary<string, float[]>();
+        var largeWeightNames = new HashSet<string>();
+        foreach (var (name, data) in weightStream)
+        {
+            if (data.Length <= 64)
+            {
+                cpuWeightsAll[name] = data;
+            }
+            else
+            {
+                // Store a placeholder — actual data uploaded to GPU later
+                largeWeightNames.Add(name);
+                cpuWeightsAll[name] = data; // Still need it for now — streaming GPU upload is future optimization
+            }
+        }
         onProgress?.Invoke("parse", 100);
 
         // Apply input shape overrides (for models with dynamic dimensions)

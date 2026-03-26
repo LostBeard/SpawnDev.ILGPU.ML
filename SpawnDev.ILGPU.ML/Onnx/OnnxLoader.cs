@@ -40,6 +40,42 @@ public static class OnnxLoader
     }
 
     /// <summary>
+    /// Load model with streaming weight extraction — yields one weight at a time.
+    /// Peak CPU memory: one tensor instead of all weights at once.
+    /// For large models (GPT-2, CLIP) this prevents OOM during weight loading.
+    /// </summary>
+    public static (OnnxModelInfo ModelInfo, IEnumerable<(string Name, float[] Data)> WeightStream)
+        LoadModelStreaming(byte[] onnxBytes)
+    {
+        var model = OnnxParser.Parse(onnxBytes);
+        var modelInfo = ExtractModelInfo(model);
+
+        IEnumerable<(string Name, float[] Data)> StreamWeights()
+        {
+            foreach (var init in model.Graph.Initializers)
+            {
+                if (init.DataLocation == 1) continue;
+                yield return (init.Name, init.ToFloatArray());
+            }
+
+            foreach (var node in model.Graph.Nodes)
+            {
+                if (node.OpType == "Constant" && node.Outputs.Count > 0)
+                {
+                    var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                    if (valueAttr?.T != null)
+                    {
+                        var outputName = node.Outputs[0];
+                        yield return (outputName, valueAttr.T.ToFloatArray());
+                    }
+                }
+            }
+        }
+
+        return (modelInfo, StreamWeights());
+    }
+
+    /// <summary>
     /// Parse an ONNX file and return just the model info (no weights).
     /// Useful for inspecting a model before loading weights to GPU.
     /// </summary>
