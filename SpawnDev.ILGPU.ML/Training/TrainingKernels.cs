@@ -147,6 +147,45 @@ public class TrainingKernels
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  Linear Layer Forward
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _linearForwardKernel;
+
+    /// <summary>
+    /// Linear forward: output = input @ weight^T.
+    /// input [B, inF], weight [outF, inF] → output [B, outF]
+    /// output[b, o] = sum_i(input[b, i] * weight[o, i])
+    /// </summary>
+    public void LinearForward(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int batchSize, int inFeatures, int outFeatures)
+    {
+        _linearForwardKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int>(LinearForwardImpl);
+        _linearForwardKernel(batchSize * outFeatures, input, weight, output,
+            batchSize, inFeatures, outFeatures);
+    }
+
+    private static void LinearForwardImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int B, int I, int O)
+    {
+        int b = idx / O;
+        int o = idx % O;
+        float sum = 0f;
+        for (int i = 0; i < I; i++)
+            sum += input[b * I + i] * weight[o * I + i];
+        output[idx] = sum;
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  Linear Layer Backward (MatMul gradients)
     // ═══════════════════════════════════════════════════════════
 

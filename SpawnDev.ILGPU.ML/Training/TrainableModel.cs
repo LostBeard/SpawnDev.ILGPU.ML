@@ -180,36 +180,8 @@ public class TrainableModel : IDisposable
             ArrayView1D<float, Stride1D.Dense> input, int batch)
         {
             _savedInput = input;
-            // output = input @ weight^T + bias
-            // Simple: one thread per output element
-            var matMul = new MatMulKernel(acc);
-            // input [B, inF] × weight^T [inF, outF] → output [B, outF]
-            // weight stored as [outF, inF], so we need transposed multiply
-            // For simplicity, use element-wise: output[b,o] = sum_i(input[b,i] * weight[o,i]) + bias[o]
-            var ew = new ElementWiseKernels(acc);
-
-            // Zero output, then accumulate
-            k.Zero(_output!.View, batch * _outF);
-
-            // Use LinearBackwardData logic (same pattern) for forward: output = input @ weight^T
-            k.LinearBackwardData(input, _weight!.View, _output!.View, batch, _inF, _outF);
-            // Wait — that's backward. For forward with weight [outF, inF]:
-            // output[b, o] = sum_i(input[b, i] * weight[o, i]) + bias[o]
-            // This is actually the same as LinearBackwardData with swapped dimensions!
-            // Let me just do it directly:
-            // Actually LinearBackwardData does: out[b,i] = sum_o(gradOut[b,o] * weight[o,i])
-            // For forward we need: out[b,o] = sum_i(input[b,i] * weight[o,i])
-            // These are different — forward transposes weight differently.
-            // Let me use LinearBackwardWeight pattern instead... no, let me just implement it inline.
-
-            // Actually, the simplest correct approach: use the MatMul kernel
-            // input [B, inF] × weight^T [inF, outF] = output [B, outF]
-            // weight is [outF, inF], weight^T is [inF, outF]
-            // MatMul(input, weightT, output, B, inF, outF)
-            // But we don't have weight transposed. Let's just compute directly.
-
-            // For now, use a simple approach — upload and compute on CPU, then upload result
-            // TODO: Add a proper forward linear kernel
+            // output[b, o] = sum_i(input[b, i] * weight[o, i])
+            k.LinearForward(input, _weight!.View, _output!.View, batch, _inF, _outF);
             return _output!.View.SubView(0, batch * _outF);
         }
 

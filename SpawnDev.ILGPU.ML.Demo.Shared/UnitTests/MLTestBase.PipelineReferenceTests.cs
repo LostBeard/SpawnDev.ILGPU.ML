@@ -120,21 +120,18 @@ public abstract partial class MLTestBase
         using var doc = JsonDocument.Parse(jsonStr);
         var root = doc.RootElement;
 
-        // Should have multiple test cases
-        int caseCount = 0;
-        foreach (var prop in root.EnumerateObject())
-        {
-            if (!prop.Value.TryGetProperty("expected_label", out var label)) continue;
-            caseCount++;
+        // test_cases is an array
+        var testCases = root.GetProperty("test_cases").EnumerateArray().ToArray();
+        if (testCases.Length < 3)
+            throw new Exception($"Expected at least 3 test cases, got {testCases.Length}");
 
-            var expectedLabel = label.GetString()!;
-            if (expectedLabel != "POSITIVE" && expectedLabel != "NEGATIVE")
-                throw new Exception($"Test case '{prop.Name}': unexpected label '{expectedLabel}'");
+        foreach (var tc in testCases)
+        {
+            var label = tc.GetProperty("label").GetString()!;
+            if (label != "POSITIVE" && label != "NEGATIVE")
+                throw new Exception($"Unexpected label '{label}'");
         }
 
-        if (caseCount < 3)
-            throw new Exception($"Expected at least 3 test cases, got {caseCount}");
-
-        Console.WriteLine($"[Pipeline] Text classification: {caseCount} reference test cases verified");
+        Console.WriteLine($"[Pipeline] Text classification: {testCases.Length} reference test cases verified");
     }
 }
