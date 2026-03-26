@@ -208,7 +208,8 @@ public class OnnxTensorProto
             switch (DataType)
             {
                 case 1: // FLOAT — direct block copy
-                    Buffer.BlockCopy(RawData, 0, target, targetOffset * 4, count * 4);
+                    int bytesToCopy = Math.Min(count * 4, RawData.Length);
+                    Buffer.BlockCopy(RawData, 0, target, targetOffset * 4, bytesToCopy);
                     return;
                 case 10: // FLOAT16
                     for (int i = 0; i < count; i++)
