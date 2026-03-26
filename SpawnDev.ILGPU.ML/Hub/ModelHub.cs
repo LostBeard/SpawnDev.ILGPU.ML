@@ -143,6 +143,8 @@ public class ModelHub : IDisposable
         public const string MobileNetV2 = "onnxmodelzoo/mobilenetv2-12";
         /// <summary>EfficientNet-Lite0 — 1000-class ImageNet, TFLite format (18 MB)</summary>
         public const string EfficientNetLite0 = "litert-community/efficientnet-lite0";
+        /// <summary>MobileNetV3-Small — lightweight 10MB backbone (AsyncMDE fast path)</summary>
+        public const string MobileNetV3Small = "onnx-community/mobilenetv3_small_100.lamb_in1k";
 
         // ── Depth Estimation ──
         /// <summary>Depth Anything V2 Small — Monocular depth estimation, 26M params (95 MB)</summary>
