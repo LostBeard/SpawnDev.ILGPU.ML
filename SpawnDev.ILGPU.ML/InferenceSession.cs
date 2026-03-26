@@ -485,65 +485,22 @@ public class InferenceSession : IDisposable
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
 
-        // Re-stream from ONNX bytes using raw tensor protos.
-        // For large tensors, use ToFloatArrayChunked with a reusable buffer to avoid
-        // allocating the full float[] in managed memory (GPT-2 embedding = 154MB).
-        var (_, tensorStream) = Onnx.OnnxLoader.LoadModelStreamingRaw(onnxBytes);
-        const int CHUNK_THRESHOLD = 1_000_000; // 1M elements = 4MB — above this, use chunked upload
-        float[]? chunkBuffer = null; // Reusable buffer for chunked uploads
-
-        foreach (var (name, tensor) in tensorStream)
+        // Re-stream from ONNX bytes. Each tensor is converted to float[], uploaded to GPU,
+        // then released. The streaming ensures only one tensor's float[] exists at a time.
+        var (_, weightStream2) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
+        foreach (var (name, data) in weightStream2)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
+                var weightData = data;
                 int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
-                int tensorElems = (int)tensor.ElementCount;
-
-                if (tensorElems > CHUNK_THRESHOLD)
-                {
-                    // Large tensor: allocate GPU buffer, then fill via chunked conversion.
-                    // Reuse a single CPU chunk buffer — never allocate the full tensor.
-                    int chunkSize = Math.Min(262144, tensorElems); // 256K floats = 1MB chunks
-                    if (chunkBuffer == null || chunkBuffer.Length < chunkSize)
-                        chunkBuffer = new float[chunkSize];
-
-                    // Allocate empty GPU buffer
-                    var gpuBuf = accelerator.Allocate1D<float>(expectedElems);
-
-                    // Convert and upload in chunks
-                    int offset = 0;
-                    while (offset < tensorElems)
-                    {
-                        int n = Math.Min(chunkSize, tensorElems - offset);
-                        // Convert raw data to float for this chunk
-                        tensor.ToFloatArrayChunked(chunkBuffer, 0);
-                        // For the chunked approach, we need to handle offsets within the raw data.
-                        // Simplest correct approach: use ToFloatArrayChunked to fill the full reusable buffer
-                        // then copy the relevant portion to GPU.
-                        break; // Fall through to simpler approach below
-                    }
-
-                    // Simpler approach for now: allocate the full float[] but immediately upload and release.
-                    // The ToFloatArrayChunked direct-to-target approach works for the common FLOAT case.
-                    var fullData = new float[expectedElems];
-                    tensor.ToFloatArrayChunked(fullData);
-                    gpuBuf.View.CopyFromCPU(fullData);
-                    fullData = null; // Release immediately — GC can collect before next tensor
-                    gpuWeights[name] = new Tensors.Tensor(gpuBuf.View, shape, name);
-                    loaded++;
-                }
-                else
-                {
-                    // Small tensor: use standard path
-                    var data = tensor.ToFloatArray();
-                    if (data.Length == 0 && expectedElems > 0)
-                        data = new float[expectedElems];
-                    gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
-                    loaded++;
-                }
+                if (weightData.Length == 0 && expectedElems > 0)
+                    weightData = new float[expectedElems];
+                gpuWeights[name] = pool.AllocatePermanent(weightData, shape, name);
+                loaded++;
+                // weightData goes out of scope — GC can collect before next tensor
             }
         }
-        chunkBuffer = null; // Release reusable buffer
         // Create tensors for optimizer-folded constants that aren't in the weight dictionary.
         // The optimizer adds these as initializers but they have no weight data — fill from ConstantData/FloatConstantData.
         foreach (var name in compiled.InitializerNames)
