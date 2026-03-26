@@ -303,14 +303,20 @@ public abstract partial class MLTestBase
         await accelerator.SynchronizeAsync();
         var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
 
+        // Check for NaN/Infinity in logits (indicates inference issue)
+        int nanCount = logits.Count(v => float.IsNaN(v) || float.IsInfinity(v));
+        if (nanCount > 0)
+            Console.WriteLine($"[GPT-2] WARNING: {nanCount}/{logits.Length} logits are NaN/Inf");
+
         // Verify: next token should be 4314 (" floor")
         int nextToken = 0;
         float maxLogit = float.MinValue;
         for (int i = 0; i < logits.Length; i++)
-            if (logits[i] > maxLogit) { maxLogit = logits[i]; nextToken = i; }
+            if (!float.IsNaN(logits[i]) && logits[i] > maxLogit) { maxLogit = logits[i]; nextToken = i; }
 
+        Console.WriteLine($"[GPT-2] Next token: {nextToken} (logit={maxLogit:F4}), expected 4314");
         if (nextToken != 4314)
-            throw new Exception($"[GPT-2] Expected next token 4314 (floor), got {nextToken}");
+            throw new Exception($"[GPT-2] Expected next token 4314 (floor), got {nextToken} (logit={maxLogit:F4}, nanCount={nanCount})");
 
         session.Dispose();
     });
