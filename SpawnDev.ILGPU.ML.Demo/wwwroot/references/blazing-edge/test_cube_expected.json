@@ -1,0 +1,17 @@
+{
+  "format": "glTF Binary 2.0",
+  "vertices": 8,
+  "triangles": 12,
+  "indices": 36,
+  "bounds_min": [
+    -1,
+    -1,
+    -1
+  ],
+  "bounds_max": [
+    1,
+    1,
+    1
+  ],
+  "file_size": 732
+}
