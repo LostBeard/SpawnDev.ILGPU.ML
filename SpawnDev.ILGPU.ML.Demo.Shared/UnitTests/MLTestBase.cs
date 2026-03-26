@@ -67,6 +67,14 @@ public abstract partial class MLTestBase : IDisposable
             InvalidateCache();
             throw;
         }
+        finally
+        {
+            // Flush GPU work and help GC reclaim disposed buffer objects
+            // to prevent memory accumulation across test suite
+            try { await accelerator.SynchronizeAsync(); } catch { }
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
     }
 
     private void InvalidateCache()
