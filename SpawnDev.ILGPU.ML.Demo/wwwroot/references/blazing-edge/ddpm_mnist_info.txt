@@ -1,0 +1,4 @@
+Size: 1.0 MB
+Input: sample torch.Size([1, 1, 28, 28]), timestep int64
+Output: (1, 1, 28, 28), absMax=3.7191
+Params: 1,065,153
