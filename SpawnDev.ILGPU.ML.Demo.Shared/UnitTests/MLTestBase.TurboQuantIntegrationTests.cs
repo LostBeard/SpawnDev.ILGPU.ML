@@ -109,10 +109,12 @@ public abstract partial class MLTestBase
         }
 
         // Run fused quantized attention
+        // Separate codebook buffers for K and V to avoid WebGPU aliasing
+        using var vCodebookBuf = accelerator.Allocate1D(codebook);
         using var outputBuf = accelerator.Allocate1D<float>(headDim);
         tq.FusedQuantizedAttention(
             qBuf.View, kPackedBuf.View, codebookBuf.View,
-            vPackedBuf.View, codebookBuf.View,
+            vPackedBuf.View, vCodebookBuf.View,
             kNormsBuf.View, vNormsBuf.View, outputBuf.View,
             1, numKV, headDim, scale);
 
