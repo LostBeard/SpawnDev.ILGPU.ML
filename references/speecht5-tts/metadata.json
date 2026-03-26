@@ -1,0 +1,20 @@
+{
+  "model": "microsoft/speecht5_tts",
+  "vocoder": "microsoft/speecht5_hifigan",
+  "sample_rate": 16000,
+  "speaker_seed": 42,
+  "test_cases": [
+    {
+      "text": "Hello world.",
+      "samples": 8704,
+      "duration_s": 0.54,
+      "file_prefix": "hello_world"
+    },
+    {
+      "text": "The cat sat on the mat.",
+      "samples": 16384,
+      "duration_s": 1.02,
+      "file_prefix": "the_cat_sat_on_"
+    }
+  ]
+}

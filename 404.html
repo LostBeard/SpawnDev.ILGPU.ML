@@ -11,8 +11,12 @@
     </script>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="GPU-accelerated neural network inference for .NET. 71 ONNX operators, 6 backends (WebGPU, CUDA, OpenCL, WebGL, Wasm, CPU), runs entirely in your browser. No server, no cloud." />
+    <meta property="og:title" content="SpawnDev.ILGPU.ML — Neural Network Inference for .NET" />
+    <meta property="og:description" content="GPU-accelerated ML inference in C#. Style transfer, image classification, super resolution — all running in your browser via WebGPU. No server needed." />
+    <meta property="og:type" content="website" />
     <title>SpawnDev.ILGPU.ML</title>
-    <link href="_framework/dotnet.2huj1djn61.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-BgZinMifztJBRFU1ydrj3mVAPDjMgsFmhSZ/7zEw9rA=" />
+    <link href="_framework/dotnet.ep6j59a902.js" rel="preload" as="script" fetchpriority="high" crossorigin="anonymous" integrity="sha256-snEMHLDFP4JxwaMdH7wVBbdFosPAC2AVrW1MDh/lEBY=" />
     <link rel="stylesheet" href="lib/bootstrap/dist/css/bootstrap.min.css" />
     <link rel="stylesheet" href="css/app.css" />
     <link rel="icon" type="image/png" href="favicon.png" />
@@ -20,7 +24,7 @@
     <script type="importmap">{
   "imports": {
     "./_framework/blazor.webassembly.js": "./_framework/blazor.webassembly.66stpp682q.js",
-    "./_framework/dotnet.js": "./_framework/dotnet.2huj1djn61.js",
+    "./_framework/dotnet.js": "./_framework/dotnet.ep6j59a902.js",
     "./_framework/dotnet.native.js": "./_framework/dotnet.native.grzyzroj2h.js",
     "./_framework/dotnet.runtime.js": "./_framework/dotnet.runtime.peu2mfb29t.js"
   },
@@ -28,8 +32,8 @@
   "integrity": {
     "./_framework/blazor.webassembly.66stpp682q.js": "sha256-3lCWrko3zwspV40aQhs2S/IMkRSarnHRKIdkHhuXIBA=",
     "./_framework/blazor.webassembly.js": "sha256-3lCWrko3zwspV40aQhs2S/IMkRSarnHRKIdkHhuXIBA=",
-    "./_framework/dotnet.2huj1djn61.js": "sha256-BgZinMifztJBRFU1ydrj3mVAPDjMgsFmhSZ/7zEw9rA=",
-    "./_framework/dotnet.js": "sha256-BgZinMifztJBRFU1ydrj3mVAPDjMgsFmhSZ/7zEw9rA=",
+    "./_framework/dotnet.ep6j59a902.js": "sha256-snEMHLDFP4JxwaMdH7wVBbdFosPAC2AVrW1MDh/lEBY=",
+    "./_framework/dotnet.js": "sha256-snEMHLDFP4JxwaMdH7wVBbdFosPAC2AVrW1MDh/lEBY=",
     "./_framework/dotnet.native.grzyzroj2h.js": "sha256-jHjXno4gzitnoeWtuzYL/w/n5DQjV9eLAKBC4IxPuHc=",
     "./_framework/dotnet.native.js": "sha256-jHjXno4gzitnoeWtuzYL/w/n5DQjV9eLAKBC4IxPuHc=",
     "./_framework/dotnet.runtime.js": "sha256-cajUr4vA/MpLPWj3omULUOwEQw3i8CE2n8AmDheqWBM=",
@@ -40,11 +44,15 @@
 
 <body>
     <div id="app">
-        <svg class="loading-progress">
-            <circle r="40%" cx="50%" cy="50%" />
-            <circle r="40%" cx="50%" cy="50%" />
-        </svg>
-        <div class="loading-progress-text"></div>
+        <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1rem;">
+            <svg class="loading-progress">
+                <circle r="40%" cx="50%" cy="50%" />
+                <circle r="40%" cx="50%" cy="50%" />
+            </svg>
+            <div class="loading-progress-text"></div>
+            <div style="color:#64748b;font-size:0.85rem;margin-top:0.5rem;">SpawnDev.ILGPU.ML</div>
+            <div style="color:#475569;font-size:0.75rem;">GPU-accelerated ML inference for .NET</div>
+        </div>
     </div>
 
     <div id="blazor-error-ui">

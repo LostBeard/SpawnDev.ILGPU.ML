@@ -1,0 +1,55 @@
+{
+  "model": "distilbert-sst2",
+  "test_cases": [
+    {
+      "text": "I love this movie!",
+      "label": "POSITIVE",
+      "confidence": 0.9999,
+      "logits": [
+        -4.324624061584473,
+        4.683669090270996
+      ],
+      "token_count": 7
+    },
+    {
+      "text": "This is terrible.",
+      "label": "NEGATIVE",
+      "confidence": 0.9996,
+      "logits": [
+        4.353513717651367,
+        -3.5604195594787598
+      ],
+      "token_count": 6
+    },
+    {
+      "text": "The weather is okay.",
+      "label": "POSITIVE",
+      "confidence": 0.9998,
+      "logits": [
+        -4.0322723388671875,
+        4.3806304931640625
+      ],
+      "token_count": 7
+    },
+    {
+      "text": "SpawnDev.ILGPU.ML is amazing!",
+      "label": "POSITIVE",
+      "confidence": 0.9998,
+      "logits": [
+        -4.032570838928223,
+        4.281066417694092
+      ],
+      "token_count": 13
+    },
+    {
+      "text": "I am very disappointed.",
+      "label": "NEGATIVE",
+      "confidence": 0.9998,
+      "logits": [
+        4.663542747497559,
+        -3.735189914703369
+      ],
+      "token_count": 7
+    }
+  ]
+}

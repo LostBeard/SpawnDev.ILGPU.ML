@@ -1,0 +1,11 @@
+model: style-udnie
+input_name: input1
+output_name: output1
+input_shape: [1, 3, 224, 224]
+output_shape: [1, 3, 224, 224]
+input_range: [1.00, 239.00]
+output_range: [-52.23, 284.69]
+output_mean: 100.9375
+output_std: 55.9079
+onnxruntime_version: 1.24.3
+numpy_version: 2.4.3

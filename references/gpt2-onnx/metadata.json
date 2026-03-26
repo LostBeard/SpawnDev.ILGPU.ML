@@ -1,0 +1,216 @@
+{
+  "model": "gpt2",
+  "task": "text-generation",
+  "vocab_size": 50257,
+  "input_names": [
+    "input_ids",
+    "attention_mask",
+    "position_ids"
+  ],
+  "output_names": [
+    "logits"
+  ],
+  "test_cases": [
+    {
+      "prompt": "The cat sat on the",
+      "input_ids": [
+        464,
+        3797,
+        3332,
+        319,
+        262
+      ],
+      "seq_length": 5,
+      "next_token_id": 4314,
+      "next_token": " floor",
+      "top5_ids": [
+        4314,
+        3996,
+        18507,
+        2323,
+        5743
+      ],
+      "top5_tokens": [
+        " floor",
+        " bed",
+        " couch",
+        " ground",
+        " edge"
+      ],
+      "top5_logits": [
+        -80.65415954589844,
+        -80.81095886230469,
+        -80.999267578125,
+        -81.03663635253906,
+        -81.12169647216797
+      ],
+      "logits_shape": [
+        1,
+        5,
+        50257
+      ],
+      "file_prefix": "the_cat_sat_on_the"
+    },
+    {
+      "prompt": "Once upon a time",
+      "input_ids": [
+        7454,
+        2402,
+        257,
+        640
+      ],
+      "seq_length": 4,
+      "next_token_id": 11,
+      "next_token": ",",
+      "top5_ids": [
+        11,
+        262,
+        314,
+        339,
+        612
+      ],
+      "top5_tokens": [
+        ",",
+        " the",
+        " I",
+        " he",
+        " there"
+      ],
+      "top5_logits": [
+        -50.465579986572266,
+        -52.354042053222656,
+        -52.8172721862793,
+        -52.91463088989258,
+        -53.140201568603516
+      ],
+      "logits_shape": [
+        1,
+        4,
+        50257
+      ],
+      "file_prefix": "once_upon_a_time"
+    },
+    {
+      "prompt": "Hello, my name is",
+      "input_ids": [
+        15496,
+        11,
+        616,
+        1438,
+        318
+      ],
+      "seq_length": 5,
+      "next_token_id": 1757,
+      "next_token": " John",
+      "top5_ids": [
+        1757,
+        509,
+        449,
+        3899,
+        406
+      ],
+      "top5_tokens": [
+        " John",
+        " K",
+        " J",
+        " Michael",
+        " L"
+      ],
+      "top5_logits": [
+        -64.44327545166016,
+        -64.63304901123047,
+        -64.70592498779297,
+        -64.8255386352539,
+        -64.85924530029297
+      ],
+      "logits_shape": [
+        1,
+        5,
+        50257
+      ],
+      "file_prefix": "hello_my_name_is"
+    },
+    {
+      "prompt": "The future of AI is",
+      "input_ids": [
+        464,
+        2003,
+        286,
+        9552,
+        318
+      ],
+      "seq_length": 5,
+      "next_token_id": 8627,
+      "next_token": " uncertain",
+      "top5_ids": [
+        8627,
+        287,
+        407,
+        257,
+        991
+      ],
+      "top5_tokens": [
+        " uncertain",
+        " in",
+        " not",
+        " a",
+        " still"
+      ],
+      "top5_logits": [
+        -111.0840835571289,
+        -111.12876892089844,
+        -111.3917236328125,
+        -111.50234985351562,
+        -111.60417175292969
+      ],
+      "logits_shape": [
+        1,
+        5,
+        50257
+      ],
+      "file_prefix": "the_future_of_ai_is"
+    },
+    {
+      "prompt": "In a galaxy far far",
+      "input_ids": [
+        818,
+        257,
+        16161,
+        1290,
+        1290
+      ],
+      "seq_length": 5,
+      "next_token_id": 11,
+      "next_token": ",",
+      "top5_ids": [
+        11,
+        1497,
+        1290,
+        572,
+        3675
+      ],
+      "top5_tokens": [
+        ",",
+        " away",
+        " far",
+        " off",
+        " beyond"
+      ],
+      "top5_logits": [
+        -57.43710708618164,
+        -58.08850860595703,
+        -59.98051834106445,
+        -61.072994232177734,
+        -61.50712585449219
+      ],
+      "logits_shape": [
+        1,
+        5,
+        50257
+      ],
+      "file_prefix": "in_a_galaxy_far_far"
+    }
+  ],
+  "onnxruntime_version": "1.24.3",
+  "numpy_version": "2.4.3"
+}

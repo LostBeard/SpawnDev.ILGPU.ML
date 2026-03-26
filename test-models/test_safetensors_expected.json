@@ -1,0 +1,36 @@
+{
+  "format": "safetensors",
+  "tensor_count": 2,
+  "tensors": {
+    "weight": {
+      "shape": [
+        2,
+        3
+      ],
+      "dtype": "F32",
+      "values": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          4,
+          5,
+          6
+        ]
+      ]
+    },
+    "bias": {
+      "shape": [
+        3
+      ],
+      "dtype": "F32",
+      "values": [
+        0.1,
+        0.2,
+        0.3
+      ]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+model: style-mosaic
+input_name: input1
+output_name: output1
+input_shape: [1, 3, 224, 224]
+output_shape: [1, 3, 224, 224]
+input_range: [1.00, 239.00]
+output_range: [-129.37, 341.10]
+output_mean: 163.0762
+output_std: 60.2240
+onnxruntime_version: 1.24.3
+numpy_version: 2.4.3

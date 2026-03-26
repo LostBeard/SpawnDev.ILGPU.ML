@@ -1,0 +1,94 @@
+{
+  "model": "gpt2",
+  "params": 124439808,
+  "vocab_size": 50257,
+  "n_positions": 1024,
+  "n_embd": 768,
+  "n_layer": 12,
+  "n_head": 12,
+  "test_cases": [
+    {
+      "prompt": "The cat sat on the",
+      "next_token": " floor",
+      "next_token_id": 4314,
+      "top5_tokens": [
+        " floor",
+        " bed",
+        " couch",
+        " ground",
+        " edge"
+      ],
+      "top5_logits": [
+        -80.6541748046875,
+        -80.81094360351562,
+        -80.999267578125,
+        -81.03662109375,
+        -81.12168884277344
+      ],
+      "generated_10": "The cat sat on the floor, and the cat was still asleep.\n",
+      "input_ids": [
+        464,
+        3797,
+        3332,
+        319,
+        262
+      ],
+      "file_prefix": "the_cat_sat_on_"
+    },
+    {
+      "prompt": "Once upon a time",
+      "next_token": ",",
+      "next_token_id": 11,
+      "top5_tokens": [
+        ",",
+        " the",
+        " I",
+        " he",
+        " there"
+      ],
+      "top5_logits": [
+        -50.46564865112305,
+        -52.35407638549805,
+        -52.817325592041016,
+        -52.9146842956543,
+        -53.1402473449707
+      ],
+      "generated_10": "Once upon a time, the world was a place of great beauty and",
+      "input_ids": [
+        7454,
+        2402,
+        257,
+        640
+      ],
+      "file_prefix": "once_upon_a_tim"
+    },
+    {
+      "prompt": "Hello, my name is",
+      "next_token": " John",
+      "next_token_id": 1757,
+      "top5_tokens": [
+        " John",
+        " K",
+        " J",
+        " Michael",
+        " L"
+      ],
+      "top5_logits": [
+        -64.44325256347656,
+        -64.63304901123047,
+        -64.70594024658203,
+        -64.82552337646484,
+        -64.8592529296875
+      ],
+      "generated_10": "Hello, my name is John. I'm a writer, and I'm",
+      "input_ids": [
+        15496,
+        11,
+        616,
+        1438,
+        318
+      ],
+      "file_prefix": "hello_my_name_"
+    }
+  ]
+}

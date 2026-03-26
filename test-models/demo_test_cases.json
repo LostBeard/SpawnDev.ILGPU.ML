@@ -1,0 +1,151 @@
+{
+  "depth_estimation_224": {
+    "demo": "Depth Estimation",
+    "model": "onnx-community/depth-anything-v2-small :: onnx/model.onnx",
+    "input_ref": "references/depth-anything-v2-small/cat_input_224_nchw.bin",
+    "output_ref": "references/depth-anything-v2-small/cat_output_224.bin",
+    "input_shape": [1, 3, 224, 224],
+    "output_shape": [1, 224, 224],
+    "input_name": "pixel_values",
+    "tolerance": 0.5,
+    "checks": [
+      "output_shape matches [1, 224, 224]",
+      "all values finite (no NaN/Inf)",
+      "mean error vs reference < tolerance",
+      "output range is reasonable (not all zeros, not all same value)"
+    ]
+  },
+  "pose_estimation_movenet": {
+    "demo": "Pose Estimation",
+    "model": "Xenova/movenet-singlepose-lightning :: onnx/model.onnx",
+    "input_ref": "references/movenet-lightning/cat_input_nhwc_int32.bin",
+    "output_ref": "references/movenet-lightning/cat_output.bin",
+    "input_shape": [1, 192, 192, 3],
+    "input_dtype": "int32",
+    "output_shape": [1, 1, 17, 3],
+    "input_name": "input",
+    "tolerance": 0.01,
+    "checks": [
+      "output_shape matches [1, 1, 17, 3]",
+      "17 keypoints with [y, x, confidence]",
+      "all coordinates in [0, 1]",
+      "all confidences in [0, 1]",
+      "mean error vs reference < tolerance"
+    ],
+    "note": "MoveNet uses NHWC int32 input — unusual. Pipeline must handle this."
+  },
+  "face_detection_blazeface": {
+    "demo": "Face Detection",
+    "model": "litert-community/blaze-face :: model.tflite",
+    "input_ref": "references/blaze-face/cat_input.bin",
+    "output_refs": {
+      "regressors": "references/blaze-face/cat_output_regressors.bin",
+      "classificators": "references/blaze-face/cat_output_classificators.bin"
+    },
+    "input_shape": [1, 128, 128, 3],
+    "output_shapes": {
+      "regressors": [1, 896, 16],
+      "classificators": [1, 896, 1]
+    },
+    "tolerance": 0.1,
+    "checks": [
+      "two outputs: regressors [1,896,16] + classificators [1,896,1]",
+      "no faces detected on cat image (all classificator scores negative)",
+      "mean error vs reference < tolerance"
+    ]
+  },
+  "object_detection_pipeline": {
+    "demo": "Object Detection (Pipeline)",
+    "model": "salim4n/yolov8n-detect-onnx :: yolov8n-onnx-web/yolov8n.onnx",
+    "note": "Inference already passes reference test. Pipeline needs: transpose [1,84,8400]->[8400,84], decode boxes cx/cy/w/h->x1/y1/x2/y2, filter by confidence>0.5, NMS",
+    "checks": [
+      "at least 1 detection with class=15 (cat) confidence > 0.5",
+      "box coordinates within image bounds [0, 640]",
+      "NMS reduces overlapping boxes"
+    ]
+  },
+  "zero_shot_clip": {
+    "demo": "Zero-Shot CLIP",
+    "note": "Need CLIP ViT-B/32 as ONNX. Reference at references/clip-vit-b32/. Test: cat image + 4 text labels, verify 'a photo of a cat' scores highest (cosine sim 0.2711).",
+    "checks": [
+      "image embedding shape [1, 512]",
+      "text embeddings shape [4, 512]",
+      "cosine similarity: cat > dog > car > landscape",
+      "match reference similarities within tolerance"
+    ]
+  },
+  "speech_to_text": {
+    "demo": "Speech to Text",
+    "note": "Need Whisper tiny as ONNX (encoder + decoder). Reference at references/whisper-tiny/. Test: mel spectrogram from test_tone_440hz.wav, verify encoder output shape [1,1500,384].",
+    "checks": [
+      "mel spectrogram shape [80, 3000]",
+      "encoder output shape [1, 1500, 384]",
+      "encoder output matches reference within tolerance",
+      "full transcription pipeline (when decoder implemented)"
+    ]
+  },
+  "text_generation": {
+    "demo": "Text Generation",
+    "note": "Need GPT-2 as ONNX. Reference at references/gpt2/. Test: 'The cat sat on the' -> greedy next token = ' floor'.",
+    "checks": [
+      "next token logits shape [1, 50257]",
+      "argmax of logits = token for ' floor'",
+      "greedy 10-token generation matches reference",
+      "KV cache produces same output as no-cache (correctness)"
+    ]
+  },
+  "text_classification": {
+    "demo": "Semantic Search / Text Classification",
+    "note": "Need DistilBERT-SST2 as ONNX. Reference at references/distilbert-sst2/. Test: 'I love this movie' -> POSITIVE 99.99%.",
+    "checks": [
+      "output logits shape [1, 2]",
+      "softmax: class 1 (POSITIVE) > 0.99",
+      "logits match reference within tolerance"
+    ]
+  },
+  "model_inspector": {
+    "demo": "Model Inspector",
+    "checks": [
+      "ONNX file: correct node count, input/output names, operator types",
+      "TFLite file: correct tensor count, input/output shapes",
+      "GGUF file: correct metadata, tensor count",
+      "SafeTensors file: correct tensor names and shapes",
+      "PyTorch file: correct state_dict keys",
+      "CoreML file: correct layer info",
+      "Auto-format detection works for all 7 formats"
+    ],
+    "note": "Format parsers already tested via 7/7 format loader tests. Inspector UI needs Captain verification."
+  },
+  "backend_showdown": {
+    "demo": "Backend Showdown",
+    "checks": [
+      "same model on WebGPU produces same output as reference",
+      "inference timing is captured and displayed",
+      "multiple backends can run sequentially without interference"
+    ],
+    "note": "UI demo — needs the 4 working pipelines, which all pass."
+  },
+  "draw_to_train": {
+    "demo": "Draw to Train",
+    "checks": [
+      "create 2-layer network (input -> hidden -> output)",
+      "forward pass produces output of correct shape",
+      "loss computation (cross-entropy) produces finite scalar",
+      "backward pass computes gradients for all weights",
+      "SGD update changes weights in correct direction",
+      "after N epochs on XOR data, loss decreases",
+      "after training, classification accuracy > 90%"
+    ],
+    "note": "Training engine not yet implemented. Need: backprop kernels, loss functions, optimizer."
+  },
+  "tts_speech": {
+    "demo": "TTS / Voice",
+    "note": "Reference at references/speecht5-tts/. Need SpeechT5 ONNX export. Test: 'Hello world' text -> audio output with correct sample rate and duration.",
+    "checks": [
+      "text tokenization produces correct token IDs",
+      "encoder output shape matches reference",
+      "vocoder output is valid audio (finite, correct sample rate)",
+      "mel spectrogram of output matches reference within tolerance"
+    ]
+  }
+}

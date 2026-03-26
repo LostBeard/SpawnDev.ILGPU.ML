@@ -1,0 +1,5 @@
+model: depth-anything-v2-small
+input: pixel_values [1, 3, 518, 518] float32 ImageNet-normalized NCHW
+output: predicted_depth [1, 518, 518] float32
+output_range: [0.0000, 6.2553]
+onnxruntime: 1.24.3
