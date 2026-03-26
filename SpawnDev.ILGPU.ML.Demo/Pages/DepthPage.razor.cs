@@ -7,6 +7,7 @@ using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
+using SpawnDev.ILGPU.Rendering;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
 using System.Diagnostics;
@@ -24,6 +25,9 @@ public partial class DepthPage : IDisposable
     private Accelerator? _accelerator;
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
+
+    // GPU-direct rendering
+    private MemoryBuffer2D<int, Stride2D.DenseX>? _gpuDepthBuffer;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -138,7 +142,7 @@ public partial class DepthPage : IDisposable
 
     private async Task RunDepthEstimation()
     {
-        if (_pipeline == null || _rgbaPixels == null) return;
+        if (_pipeline == null || _rgbaPixels == null || _accelerator == null) return;
         _isRunning = true;
         _statusMessage = "Running depth estimation...";
         StateHasChanged();
@@ -147,18 +151,25 @@ public partial class DepthPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var result = await _pipeline.EstimateAsync(_rgbaPixels, _imageWidth, _imageHeight);
+
+            // GPU-direct: inference + plasma colormap on GPU → read final RGBA to CPU
+            // The GPU colormap kernel replaces the CPU DepthColorMaps.ApplyColorMap + PngEncoder path
+            _gpuDepthBuffer?.Dispose();
+            var (buffer, w, h) = await _pipeline.EstimateGpuAsync(_rgbaPixels, _imageWidth, _imageHeight);
+            _gpuDepthBuffer = buffer;
+            _depthWidth = w;
+            _depthHeight = h;
+
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
 
-            _depthMap = result.DepthMap;
-            _depthWidth = result.Width;
-            _depthHeight = result.Height;
-            _minDepth = result.MinDepth;
-            _maxDepth = result.MaxDepth;
-
-            // Generate colorized depth image
-            RecolorDepth();
+            // Read GPU-colorized RGBA for BeforeAfterSlider display
+            // Use 1D copy from the 2D buffer's underlying linear storage
+            using var readBuf = _accelerator.Allocate1D<int>(w * h);
+            readBuf.View.CopyFrom(buffer.View.BaseView);
+            await _accelerator.SynchronizeAsync();
+            var pixels = await readBuf.CopyToHostAsync<int>(0, w * h);
+            _depthImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, pixels, w, h);
 
             _statusMessage = null;
         }
@@ -217,6 +228,7 @@ public partial class DepthPage : IDisposable
 
     public void Dispose()
     {
+        _gpuDepthBuffer?.Dispose();
         _pipeline?.Dispose();
         _session?.Dispose();
         _accelerator?.Dispose();

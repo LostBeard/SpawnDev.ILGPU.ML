@@ -6,6 +6,7 @@ using SpawnDev.BlazorJS.JSObjects;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
+using SpawnDev.ILGPU.Rendering;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
 using System.Diagnostics;
@@ -23,6 +24,12 @@ public partial class StylePage : IDisposable
     private Accelerator? _accelerator;
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
+
+    // GPU-direct canvas rendering for zero-copy output
+    private ElementReference _outputCanvas;
+    private ICanvasRenderer? _canvasRenderer;
+    private bool _processingFrame;
+    private MemoryBuffer2D<int, Stride2D.DenseX>? _lastFrameBuffer;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -216,6 +223,8 @@ public partial class StylePage : IDisposable
 
     public void Dispose()
     {
+        _lastFrameBuffer?.Dispose();
+        _canvasRenderer?.Dispose();
         _pipeline?.Dispose();
         _session?.Dispose();
         _accelerator?.Dispose();

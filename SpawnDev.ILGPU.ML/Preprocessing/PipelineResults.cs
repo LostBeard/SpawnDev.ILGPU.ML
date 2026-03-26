@@ -116,6 +116,33 @@ public class PoseResult
         Keypoints.FirstOrDefault(k => k.Name == name);
 }
 
+/// <summary>Result from face detection.</summary>
+public class FaceDetectionResult
+{
+    /// <summary>Detected faces.</summary>
+    public DetectedFace[] Faces { get; init; } = Array.Empty<DetectedFace>();
+
+    /// <summary>Inference time in milliseconds.</summary>
+    public double InferenceTimeMs { get; init; }
+
+    /// <summary>Number of faces detected.</summary>
+    public int FaceCount => Faces.Length;
+}
+
+/// <summary>A single detected face with optional landmarks.</summary>
+public class DetectedFace
+{
+    /// <summary>Bounding box in pixel coordinates.</summary>
+    public float X { get; init; }
+    public float Y { get; init; }
+    public float Width { get; init; }
+    public float Height { get; init; }
+    public float Confidence { get; init; }
+
+    /// <summary>Facial landmark points (e.g., eyes, nose, mouth).</summary>
+    public List<(float X, float Y)> Landmarks { get; init; } = new();
+}
+
 /// <summary>Result from segmentation / background removal.</summary>
 public class SegmentationResult
 {

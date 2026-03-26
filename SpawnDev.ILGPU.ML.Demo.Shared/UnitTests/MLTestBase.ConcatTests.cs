@@ -1,6 +1,4 @@
-using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Operators;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;

@@ -63,29 +63,54 @@ public class SuperResolutionPipeline : IDisposable
         });
         await _accelerator.SynchronizeAsync();
 
-        // Read upscaled Y channel
+        // GPU: Y float → grayscale RGBA — stays on GPU, only final result reads to CPU
         var output = outputs[_session.OutputNames[0]];
         int outH = modelH * _upscaleFactor;
         int outW = modelW * _upscaleFactor;
-        int outSize = outH * outW;
+        int outSize = Math.Min(outH * outW, output.ElementCount);
 
-        using var readBuf = _accelerator.Allocate1D<float>(outSize);
-        var ew = new ElementWiseKernels(_accelerator);
-        ew.Scale(output.Data.SubView(0, Math.Min(outSize, output.ElementCount)),
-            readBuf.View.SubView(0, Math.Min(outSize, output.ElementCount)),
-            Math.Min(outSize, output.ElementCount), 1f);
+        using var rgbaOutBuf = _accelerator.Allocate1D<int>(outSize);
+        var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
+        postprocess.GrayscaleToRGBA(output.Data.SubView(0, outSize), rgbaOutBuf.View, outSize);
         await _accelerator.SynchronizeAsync();
-        var upscaledY = await readBuf.CopyToHostAsync<float>(0, outSize);
-
-        // Convert Y back to grayscale RGBA (simple version — full version would merge with bicubic Cb/Cr)
-        var result = new int[outH * outW];
-        for (int i = 0; i < outH * outW; i++)
-        {
-            int gray = Math.Clamp((int)(upscaledY[i] * 255f + 0.5f), 0, 255);
-            result[i] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
-        }
+        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, outSize);
 
         return new SuperResResult(result, outW, outH, _upscaleFactor);
+    }
+
+    /// <summary>
+    /// Upscale an RGBA image and return result as GPU MemoryBuffer2D
+    /// for zero-copy presentation via ICanvasRenderer.
+    /// Caller owns the returned buffer and must dispose it.
+    /// </summary>
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
+        int[] rgbaPixels, int width, int height)
+    {
+        int modelH = _modelH, modelW = _modelW;
+
+        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
+        using var inputBuf = _accelerator.Allocate1D<float>(modelH * modelW);
+        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
+        _preprocess.ForwardYChannel(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, modelH, modelW });
+
+        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [_session.InputNames[0]] = inputTensor
+        });
+
+        var output = outputs[_session.OutputNames[0]];
+        int outH = modelH * _upscaleFactor;
+        int outW = modelW * _upscaleFactor;
+        int outSize = Math.Min(outH * outW, output.ElementCount);
+
+        // GPU: Y → grayscale RGBA, output to 2D buffer for zero-copy rendering
+        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
+        var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
+        postprocess.GrayscaleToRGBA(output.Data.SubView(0, outSize), resultBuf.View.BaseView, outSize);
+        await _accelerator.SynchronizeAsync();
+
+        return (resultBuf, outW, outH);
     }
 
     public void Dispose() { }

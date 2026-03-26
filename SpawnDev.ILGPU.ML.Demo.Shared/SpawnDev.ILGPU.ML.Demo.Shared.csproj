@@ -8,8 +8,11 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
 		<PackageReference Include="SpawnDev.UnitTesting.Blazor" Version="2.4.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
 	</ItemGroup>
 
 </Project>

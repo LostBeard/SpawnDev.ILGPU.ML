@@ -1,7 +1,7 @@
 {
   "depth_estimation_224": {
     "demo": "Depth Estimation",
-    "model": "models/depth-anything-v2-small/model.onnx",
+    "model": "onnx-community/depth-anything-v2-small :: onnx/model.onnx",
     "input_ref": "references/depth-anything-v2-small/cat_input_224_nchw.bin",
     "output_ref": "references/depth-anything-v2-small/cat_output_224.bin",
     "input_shape": [1, 3, 224, 224],
@@ -17,7 +17,7 @@
   },
   "pose_estimation_movenet": {
     "demo": "Pose Estimation",
-    "model": "models/movenet-lightning/model.onnx",
+    "model": "Xenova/movenet-singlepose-lightning :: onnx/model.onnx",
     "input_ref": "references/movenet-lightning/cat_input_nhwc_int32.bin",
     "output_ref": "references/movenet-lightning/cat_output.bin",
     "input_shape": [1, 192, 192, 3],
@@ -36,7 +36,7 @@
   },
   "face_detection_blazeface": {
     "demo": "Face Detection",
-    "model": "models/blaze-face/model.tflite",
+    "model": "litert-community/blaze-face :: model.tflite",
     "input_ref": "references/blaze-face/cat_input.bin",
     "output_refs": {
       "regressors": "references/blaze-face/cat_output_regressors.bin",
@@ -56,7 +56,7 @@
   },
   "object_detection_pipeline": {
     "demo": "Object Detection (Pipeline)",
-    "model": "models/yolov8n/model.onnx",
+    "model": "salim4n/yolov8n-detect-onnx :: yolov8n-onnx-web/yolov8n.onnx",
     "note": "Inference already passes reference test. Pipeline needs: transpose [1,84,8400]->[8400,84], decode boxes cx/cy/w/h->x1/y1/x2/y2, filter by confidence>0.5, NMS",
     "checks": [
       "at least 1 detection with class=15 (cat) confidence > 0.5",

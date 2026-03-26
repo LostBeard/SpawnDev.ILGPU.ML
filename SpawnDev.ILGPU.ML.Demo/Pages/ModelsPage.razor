@@ -36,9 +36,9 @@
                                     {
                                         <span class="format-badge format-onnx">ONNX</span>
                                     }
-                                    @if (model.HasExtractedFormat)
+                                    @if (model.HuggingFaceUrl != null)
                                     {
-                                        <span class="format-badge format-extracted">Extracted</span>
+                                        <a href="@model.HuggingFaceUrl" target="_blank" class="format-badge format-hf">HF</a>
                                     }
                                 </div>
                                 @if (!string.IsNullOrEmpty(model.DemoUrl))
@@ -129,7 +129,8 @@
     .model-try-link:hover { color: #60a5fa; text-decoration: underline; }
     .format-badge { font-size: 0.68rem; font-weight: 700; padding: 0.15rem 0.4rem; border-radius: 4px; text-transform: uppercase; }
     .format-onnx { background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.25); color: #38bdf8; }
-    .format-extracted { background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.25); color: #34d399; }
+    .format-hf { background: rgba(255,216,77,0.1); border: 1px solid rgba(255,216,77,0.25); color: #ffd84d; text-decoration: none; cursor: pointer; }
+    .format-hf:hover { background: rgba(255,216,77,0.2); }
 
     .custom-model-section { margin-top: 2rem; padding: 1.5rem; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; }
     .section-title { font-size: 1.1rem; font-weight: 600; color: #f1f5f9; margin-bottom: 0.3rem; }
@@ -182,22 +183,21 @@
 
     protected override void OnInitialized()
     {
-        // Use the model registry from the RCL (or inline the data)
         _models = new List<ModelEntry>
         {
-            new() { Id = "squeezenet", Name = "SqueezeNet 1.1", Task = "Classification", Path = "models/squeezenet", OnnxPath = "models/squeezenet/model.onnx", SizeMB = 4.8, Description = "Fast 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
-            new() { Id = "mobilenetv2", Name = "MobileNetV2", Task = "Classification", Path = "models/mobilenetv2", OnnxPath = "models/mobilenetv2/model.onnx", SizeMB = 14, Description = "Accurate 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
-            new() { Id = "depth-anything-v2", Name = "Depth Anything V2 Small", Task = "Depth Estimation", OnnxPath = "models/depth-anything-v2-small/model.onnx", SizeMB = 95, Description = "Monocular depth estimation (26M params)", InputWidth = 518, InputHeight = 518, DemoUrl = "depth" },
-            new() { Id = "style-mosaic", Name = "Mosaic", Task = "Style Transfer", Path = "models/style-mosaic", OnnxPath = "models/style-mosaic/model.onnx", SizeMB = 6.5, Description = "Mosaic tile artistic style", DemoUrl = "style" },
-            new() { Id = "style-candy", Name = "Candy", Task = "Style Transfer", Path = "models/style-candy", OnnxPath = "models/style-candy/model.onnx", SizeMB = 6.5, Description = "Bright candy-colored artistic style", DemoUrl = "style" },
-            new() { Id = "style-rain-princess", Name = "Rain Princess", Task = "Style Transfer", Path = "models/style-rain-princess", OnnxPath = "models/style-rain-princess/model.onnx", SizeMB = 6.5, Description = "Impressionist rain scene style", DemoUrl = "style" },
-            new() { Id = "style-udnie", Name = "Udnie", Task = "Style Transfer", Path = "models/style-udnie", OnnxPath = "models/style-udnie/model.onnx", SizeMB = 6.5, Description = "Abstract cubist style", DemoUrl = "style" },
-            new() { Id = "style-pointilism", Name = "Pointilism", Task = "Style Transfer", Path = "models/style-pointilism", OnnxPath = "models/style-pointilism/model.onnx", SizeMB = 6.5, Description = "Pointillist dot painting style", DemoUrl = "style" },
-            new() { Id = "super-resolution", Name = "ESPCN (3x)", Task = "Super Resolution", Path = "models/super-resolution", OnnxPath = "models/super-resolution/model.onnx", SizeMB = 0.2, Description = "3x upscaling (224→672)", InputWidth = 224, InputHeight = 224, DemoUrl = "super-res" },
-            new() { Id = "movenet-lightning", Name = "MoveNet Lightning", Task = "Pose Estimation", OnnxPath = "models/movenet-lightning/model.onnx", SizeMB = 9, Description = "Fast 17-keypoint pose detection", InputWidth = 192, InputHeight = 192, DemoUrl = "pose" },
-            new() { Id = "yolov8n", Name = "YOLOv8 Nano", Task = "Object Detection", OnnxPath = "models/yolov8n/model.onnx", SizeMB = 12.2, Description = "80-class COCO detection (person, car, dog, ...)", InputWidth = 640, InputHeight = 640, DemoUrl = "detect" },
-            new() { Id = "blaze-face", Name = "BlazeFace", Task = "Face Detection", OnnxPath = "models/blaze-face/model.tflite", SizeMB = 0.2, Description = "MediaPipe face detector (TFLite format)", InputWidth = 128, InputHeight = 128, DemoUrl = "face" },
-            new() { Id = "efficientnet-lite0", Name = "EfficientNet-Lite0", Task = "Classification", OnnxPath = "models/efficientnet-lite0/model.tflite", SizeMB = 17.7, Description = "1000-class classifier (TFLite format)", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
+            new() { Id = "squeezenet", Name = "SqueezeNet 1.1", Task = "Classification", HuggingFaceRepo = "onnxmodelzoo/squeezenet1.1-7", OnnxFile = "squeezenet1.1-7.onnx", SizeMB = 4.8, Description = "Fast 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
+            new() { Id = "mobilenetv2", Name = "MobileNetV2", Task = "Classification", HuggingFaceRepo = "onnxmodelzoo/mobilenetv2-12", OnnxFile = "mobilenetv2-12.onnx", SizeMB = 14, Description = "Accurate 1000-class ImageNet classification", InputWidth = 224, InputHeight = 224, DemoUrl = "classify" },
+            new() { Id = "depth-anything-v2", Name = "Depth Anything V2 Small", Task = "Depth Estimation", HuggingFaceRepo = "onnx-community/depth-anything-v2-small", OnnxFile = "onnx/model.onnx", SizeMB = 95, Description = "Monocular depth estimation (26M params)", InputWidth = 518, InputHeight = 518, DemoUrl = "depth" },
+            new() { Id = "style-mosaic", Name = "Mosaic", Task = "Style Transfer", HuggingFaceRepo = "onnxmodelzoo/mosaic-9", OnnxFile = "mosaic-9.onnx", SizeMB = 6.5, Description = "Mosaic tile artistic style", DemoUrl = "style" },
+            new() { Id = "style-candy", Name = "Candy", Task = "Style Transfer", HuggingFaceRepo = "onnxmodelzoo/candy-9", OnnxFile = "candy-9.onnx", SizeMB = 6.5, Description = "Bright candy-colored artistic style", DemoUrl = "style" },
+            new() { Id = "style-rain-princess", Name = "Rain Princess", Task = "Style Transfer", HuggingFaceRepo = "onnxmodelzoo/rain-princess-9", OnnxFile = "rain-princess-9.onnx", SizeMB = 6.5, Description = "Impressionist rain scene style", DemoUrl = "style" },
+            new() { Id = "style-udnie", Name = "Udnie", Task = "Style Transfer", HuggingFaceRepo = "onnxmodelzoo/udnie-9", OnnxFile = "udnie-9.onnx", SizeMB = 6.5, Description = "Abstract cubist style", DemoUrl = "style" },
+            new() { Id = "style-pointilism", Name = "Pointilism", Task = "Style Transfer", HuggingFaceRepo = "onnxmodelzoo/pointilism-9", OnnxFile = "pointilism-9.onnx", SizeMB = 6.5, Description = "Pointillist dot painting style", DemoUrl = "style" },
+            new() { Id = "super-resolution", Name = "ESPCN (3x)", Task = "Super Resolution", HuggingFaceRepo = "onnxmodelzoo/super-resolution-10", OnnxFile = "super-resolution-10.onnx", SizeMB = 0.2, Description = "3x upscaling (224→672)", InputWidth = 224, InputHeight = 224, DemoUrl = "super-res" },
+            new() { Id = "movenet-lightning", Name = "MoveNet Lightning", Task = "Pose Estimation", HuggingFaceRepo = "Xenova/movenet-singlepose-lightning", OnnxFile = "onnx/model.onnx", SizeMB = 9, Description = "Fast 17-keypoint pose detection", InputWidth = 192, InputHeight = 192, DemoUrl = "pose" },
+            new() { Id = "yolov8n", Name = "YOLOv8 Nano", Task = "Object Detection", HuggingFaceRepo = "salim4n/yolov8n-detect-onnx", OnnxFile = "yolov8n-onnx-web/yolov8n.onnx", SizeMB = 12.2, Description = "80-class COCO detection (person, car, dog, ...)", InputWidth = 640, InputHeight = 640, DemoUrl = "detect" },
+            new() { Id = "distilbert-sst2", Name = "DistilBERT SST-2", Task = "Text Classification", HuggingFaceRepo = "Xenova/distilbert-base-uncased-finetuned-sst-2-english", OnnxFile = "onnx/model.onnx", SizeMB = 257, Description = "Sentiment analysis (positive/negative)", DemoUrl = "embeddings" },
+            new() { Id = "whisper-tiny", Name = "Whisper Tiny", Task = "Speech Recognition", HuggingFaceRepo = "onnx-community/whisper-tiny", OnnxFile = "onnx/encoder_model.onnx", SizeMB = 226, Description = "OpenAI Whisper speech-to-text", DemoUrl = "whisper" },
         };
     }
 
@@ -257,14 +257,14 @@
         public string Id { get; init; } = "";
         public string Name { get; init; } = "";
         public string Task { get; init; } = "";
-        public string? Path { get; init; }
-        public string? OnnxPath { get; init; }
+        public string? HuggingFaceRepo { get; init; }
+        public string? OnnxFile { get; init; }
         public double SizeMB { get; init; }
         public string Description { get; init; } = "";
         public int InputWidth { get; init; }
         public int InputHeight { get; init; }
         public string? DemoUrl { get; init; }
-        public bool HasExtractedFormat => Path != null;
-        public bool HasOnnxFormat => OnnxPath != null;
+        public bool HasOnnxFormat => OnnxFile != null;
+        public string? HuggingFaceUrl => HuggingFaceRepo != null ? $"https://huggingface.co/{HuggingFaceRepo}" : null;
     }
 }

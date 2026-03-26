@@ -1,4 +1,9 @@
 @page "/detect"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@implements IDisposable
 
 <PageTitle>Object Detection — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -175,11 +180,139 @@
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    private Task HandleBackendChange(string backend) => Task.CompletedTask;
-    private Task HandleImageLoaded(byte[] imageBytes) => Task.CompletedTask;
-    private Task HandleFrame(byte[] frameBytes)
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private Pipelines.ObjectDetectionPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // TODO: Run YOLO detection on frame
-        return Task.CompletedTask;
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx");
+            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            _pipeline = new Pipelines.ObjectDetectionPipeline(session, _accelerator);
+
+            _isModelLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Detect] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private bool _processingFrame;
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleImageLoaded(byte[] imageBytes)
+    {
+        if (_pipeline == null || _isModelLoading) return;
+        try
+        {
+            // Decode image file bytes to RGBA via browser createImageBitmap
+            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/png" });
+            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width;
+            int h = (int)bitmap.Height;
+            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w;
+            canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            var rgbaPixels = data.Read<int>();
+
+            await RunDetection(rgbaPixels, w, h);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Detect] Image decode error: {ex.Message}");
+        }
+    }
+
+    private async Task HandleFrame(byte[] frameBytes)
+    {
+        if (_pipeline == null || _processingFrame) return;
+        _processingFrame = true;
+        try
+        {
+            // Convert RGBA byte[] to int[] (pack 4 bytes per pixel)
+            var rgbaPixels = new int[frameBytes.Length / 4];
+            Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
+            await RunDetection(rgbaPixels, 640, 480);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Detect] Frame error: {ex.Message}");
+        }
+        finally
+        {
+            _processingFrame = false;
+        }
+    }
+
+    private async Task RunDetection(int[] rgbaPixels, int width, int height)
+    {
+        _isRunning = true;
+        try
+        {
+            var result = await _pipeline!.DetectAsync(
+                rgbaPixels, width, height,
+                confidenceThreshold: _confidenceThreshold / 100f);
+            _inferenceMs = result.InferenceTimeMs;
+            _detections = result.Objects.Select(o => new BoundingBoxOverlay.Detection
+            {
+                X = o.X,
+                Y = o.Y,
+                Width = o.Width,
+                Height = o.Height,
+                Label = o.Label,
+                ClassId = o.ClassId,
+                Confidence = o.Confidence,
+            }).ToList();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Detect] Inference error: {ex.Message}");
+        }
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
     }
 }

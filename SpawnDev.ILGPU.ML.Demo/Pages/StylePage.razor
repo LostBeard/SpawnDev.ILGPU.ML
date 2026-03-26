@@ -35,10 +35,13 @@
 
     @if (_useWebcam)
     {
-        <WebcamCapture OnFrameCaptured="@HandleFrame"
-                       AutoCapture="true"
-                       CaptureIntervalMs="50"
-                       ShowCaptureButton="false" />
+        <div class="webcam-style-grid">
+            <WebcamCapture OnFrameCaptured="@HandleFrame"
+                           AutoCapture="true"
+                           CaptureIntervalMs="50"
+                           ShowCaptureButton="false" />
+            <canvas @ref="_outputCanvas" class="styled-output-canvas" width="640" height="480"></canvas>
+        </div>
     }
     else if (_styledImageUrl != null && _imageDataUrl != null)
     {
@@ -159,6 +162,19 @@
     .clear-btn:hover {
         background: rgba(255, 255, 255, 0.1);
     }
+
+    .webcam-style-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.75rem;
+    }
+
+    .styled-output-canvas {
+        width: 100%;
+        height: auto;
+        border-radius: 10px;
+        background: #0f172a;
+    }
 </style>
 
 @code {
@@ -197,5 +213,44 @@
         if (_isModelLoaded && _rgbaPixels != null)
             await RunStyleTransfer();
     }
-    private Task HandleFrame(byte[] frameBytes) => Task.CompletedTask;
+    private async Task HandleFrame(byte[] frameBytes)
+    {
+        if (_pipeline == null || _processingFrame || _accelerator == null) return;
+        _processingFrame = true;
+        try
+        {
+            var rgbaPixels = new int[frameBytes.Length / 4];
+            Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
+
+            // Create GPU-direct canvas renderer on first frame
+            if (_canvasRenderer == null)
+            {
+                _canvasRenderer = SpawnDev.ILGPU.Rendering.CanvasRendererFactory.Create(_accelerator);
+                using var canvasEl = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_outputCanvas);
+                _canvasRenderer.AttachCanvas(canvasEl);
+            }
+
+            // Run style transfer — result stays on GPU
+            _lastFrameBuffer?.Dispose();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var (buffer, w, h) = await _pipeline.TransferGpuAsync(rgbaPixels, 640, 480);
+            sw.Stop();
+            _inferenceMs = sw.Elapsed.TotalMilliseconds;
+            _lastFrameBuffer = buffer;
+
+            // Present GPU buffer directly to canvas — zero CPU readback
+            await _canvasRenderer.PresentAsync(buffer);
+
+            _isRunning = true;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Style] Frame error: {ex.Message}");
+        }
+        finally
+        {
+            _processingFrame = false;
+        }
+    }
 }

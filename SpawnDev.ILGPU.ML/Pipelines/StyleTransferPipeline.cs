@@ -91,5 +91,51 @@ public class StyleTransferPipeline : IDisposable
         return new StyleResult(resultDirect, outW, outH);
     }
 
+    /// <summary>
+    /// Apply neural style transfer and return result as a GPU MemoryBuffer2D
+    /// for zero-copy presentation via ICanvasRenderer.
+    /// Caller owns the returned buffer and must dispose it.
+    /// </summary>
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> TransferGpuAsync(
+        int[] rgbaPixels, int width, int height)
+    {
+        int modelH = _modelH, modelW = _modelW;
+
+        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
+        using var inputBuf = _accelerator.Allocate1D<float>(3 * modelH * modelW);
+        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
+        _preprocess.ForwardRaw(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, modelH, modelW });
+
+        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [_session.InputNames[0]] = inputTensor
+        });
+
+        var output = outputs[_session.OutputNames[0]];
+        int outH = output.Shape.Length >= 4 ? output.Shape[2] : modelH;
+        int outW = output.Shape.Length >= 4 ? output.Shape[3] : modelW;
+
+        _postprocess ??= new Kernels.ImagePostprocessKernel(_accelerator);
+
+        int finalW = width, finalH = height;
+        if (outW != width || outH != height)
+        {
+            using var rgbaOutBuf = _accelerator.Allocate1D<int>(outH * outW);
+            _postprocess.NCHWToRGBA(output.Data, rgbaOutBuf.View, outH, outW);
+            _resize ??= new Kernels.ImageTransformKernel(_accelerator);
+            // Allocate 2D output (width = X extent, height = Y extent)
+            var result2D = _accelerator.Allocate2DDenseX<int>(new Index2D(finalW, finalH));
+            _resize.Resize(rgbaOutBuf.View, result2D.View.BaseView, outW, outH, finalW, finalH);
+            await _accelerator.SynchronizeAsync();
+            return (result2D, finalW, finalH);
+        }
+
+        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
+        _postprocess.NCHWToRGBA(output.Data, resultBuf.View.BaseView, outH, outW);
+        await _accelerator.SynchronizeAsync();
+        return (resultBuf, outW, outH);
+    }
+
     public void Dispose() { }
 }

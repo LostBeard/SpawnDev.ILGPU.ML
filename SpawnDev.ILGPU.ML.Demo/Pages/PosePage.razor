@@ -1,4 +1,9 @@
 @page "/pose"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@implements IDisposable
 
 <PageTitle>Pose Estimation — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -182,13 +187,101 @@
         (11, 13), (13, 15), (12, 14), (14, 16), // Legs
     };
 
-    private Task HandleBackendChange(string backend) => Task.CompletedTask;
-    private Task HandleFrame(byte[] frameBytes)
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private Pipelines.PoseEstimationPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // TODO: Run MoveNet through InferenceSession, decode heatmaps to keypoints
-        return Task.CompletedTask;
+        if (firstRender)
+            await LoadModelAsync();
     }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.MoveNetLightning, Hub.ModelHub.KnownFiles.OnnxModel);
+            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            _pipeline = new Pipelines.PoseEstimationPipeline(session, _accelerator);
+
+            _isModelLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Pose] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private bool _processingFrame;
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleFrame(byte[] frameBytes)
+    {
+        if (_pipeline == null || _processingFrame) return;
+        _processingFrame = true;
+        try
+        {
+            // Convert RGBA byte[] to int[] (pack 4 bytes per pixel)
+            var rgbaPixels = new int[frameBytes.Length / 4];
+            Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
+
+            _isRunning = true;
+            var result = await _pipeline.EstimateAsync(rgbaPixels, 640, 480);
+            _inferenceMs = result.InferenceTimeMs;
+
+            // Map pipeline keypoints to page keypoints (scaled to viewport)
+            _keypoints = result.Keypoints.Select(kp => new Keypoint
+            {
+                X = kp.X,
+                Y = kp.Y,
+                Confidence = kp.Confidence,
+            }).ToList();
+
+            _isRunning = false;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Pose] Frame error: {ex.Message}");
+            _isRunning = false;
+        }
+        finally
+        {
+            _processingFrame = false;
+        }
+    }
+
     private Task HandleFrameDataUrl(string dataUrl) => Task.CompletedTask;
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 
     private class Keypoint
     {

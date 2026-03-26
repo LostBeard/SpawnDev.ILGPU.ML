@@ -1,4 +1,9 @@
 @page "/face"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@implements IDisposable
 
 <PageTitle>Face Detection — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -93,6 +98,7 @@
     private List<FaceDetection>? _faces;
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
+    private bool _processingFrame;
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
@@ -101,11 +107,98 @@
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private Task HandleFrame(byte[] frameBytes)
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private Pipelines.FaceDetectionPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // TODO: Run BlazeFace detection
-        return Task.CompletedTask;
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.BlazeFace, "model.tflite");
+            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            _pipeline = new Pipelines.FaceDetectionPipeline(session, _accelerator);
+
+            _isModelLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Face] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleFrame(byte[] frameBytes)
+    {
+        if (_pipeline == null || _processingFrame) return;
+        _processingFrame = true;
+        try
+        {
+            var rgbaPixels = new int[frameBytes.Length / 4];
+            Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
+
+            _isRunning = true;
+            var result = await _pipeline.DetectAsync(rgbaPixels, 640, 480);
+            _inferenceMs = result.InferenceTimeMs;
+            _faceCount = result.FaceCount;
+
+            _faces = result.Faces.Select(f => new FaceDetection
+            {
+                X = f.X,
+                Y = f.Y,
+                Width = f.Width,
+                Height = f.Height,
+                Confidence = f.Confidence,
+                Landmarks = f.Landmarks,
+            }).ToList();
+
+            _isRunning = false;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Face] Frame error: {ex.Message}");
+            _isRunning = false;
+        }
+        finally
+        {
+            _processingFrame = false;
+        }
+    }
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
     }
 
     private class FaceDetection

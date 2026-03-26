@@ -38,15 +38,19 @@
             <div class="step-number">3</div>
             <div class="step-content">
                 <h3>Load a Model</h3>
-                <p class="step-desc">Load ONNX models directly — no Python extraction step needed.</p>
+                <p class="step-desc">Load ONNX models from HuggingFace — cached locally via OPFS. No server needed.</p>
                 <div class="code-block">
-<pre><code><span class="cm">// Direct .onnx loading (our zero-dependency parser)</span>
-<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromOnnxAsync</span>(
-    accelerator, httpClient, <span class="st">"models/squeezenet/model.onnx"</span>);
+<pre><code><span class="kw">using</span> <span class="ns">SpawnDev.ILGPU.ML.Hub</span>;
 
-<span class="cm">// Or from pre-extracted format (faster loading)</span>
-<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateAsync</span>(
-    accelerator, httpClient, <span class="st">"models/squeezenet"</span>);</code></pre>
+<span class="cm">// Load via ModelHub (preferred — handles caching, progress, CDN)</span>
+<span class="kw">using var</span> hub = <span class="kw">new</span> <span class="ty">ModelHub</span>(JS);
+<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromHuggingFaceAsync</span>(
+    accelerator, hub, <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.<span class="fn">SqueezeNet</span>);
+
+<span class="cm">// Or direct URL (simpler, still CDN)</span>
+<span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromFileAsync</span>(
+    accelerator, httpClient,
+    <span class="st">"https://huggingface.co/onnxmodelzoo/squeezenet/resolve/main/squeezenet1.1-7.onnx"</span>);</code></pre>
                 </div>
             </div>
         </div>
