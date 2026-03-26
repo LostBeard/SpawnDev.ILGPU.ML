@@ -267,6 +267,49 @@
     private double _totalInferenceMs;
     private List<ChatMessage> _messages = new();
 
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadLLMAsync();
+    }
+
+    private async Task LoadLLMAsync()
+    {
+        try
+        {
+            if (_context == null)
+            {
+                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) return;
+
+            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
+            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+
+            var tokenizerBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
+            _textGenPipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
+            _textGenPipeline.LoadTokenizer(System.Text.Encoding.UTF8.GetString(tokenizerBytes));
+            _hasTextGen = true;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Assistant] LLM load error: {ex.Message}");
+        }
+    }
+
     private void SelectAssistant(string id) { _selectedAssistant = id; _messages.Clear(); _currentResponse = null; }
 
     private async Task SendMessage()
@@ -280,10 +323,16 @@
         StateHasChanged();
         await Task.Yield();
 
-        if (_hasTextGen)
+        if (_hasTextGen && _textGenPipeline != null)
         {
-            // TODO: Run text generation pipeline with personality system prompt
-            await Task.Delay(100);
+            var prompt = $"{CurrentAssistant.PersonalityDescription}\nUser: {input}\n{CurrentAssistant.Name}:";
+            var result = await _textGenPipeline.GenerateAsync(prompt, maxNewTokens: 60);
+            var response = result.GeneratedText.Split('\n')[0].Trim(); // Take first line
+            if (string.IsNullOrWhiteSpace(response))
+                response = GetPlaceholderResponse(CurrentAssistant.Id, input);
+            _messages.Add(new ChatMessage { Text = response, IsUser = false, InferenceMs = result.InferenceTimeMs });
+            _totalTokens += result.GeneratedTokenCount;
+            _totalInferenceMs += result.InferenceTimeMs;
         }
         else
         {

@@ -1,4 +1,7 @@
 @page "/text-gen"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@implements IDisposable
 
 <PageTitle>Text Generation — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -132,6 +135,105 @@
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
     };
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private Task Generate() => Task.CompletedTask;
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            _modelProgress = 5;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+
+            // Use DistilGPT-2 (smaller, fits in browser better)
+            _modelProgress = 20;
+            StateHasChanged();
+            var modelBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
+
+            _modelProgress = 80;
+            StateHasChanged();
+            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+
+            // Load tokenizer
+            _modelProgress = 90;
+            StateHasChanged();
+            var tokenizerBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
+            var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
+
+            _pipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
+            _pipeline.LoadTokenizer(tokenizerJson);
+
+            _isModelLoaded = true;
+            _modelProgress = 100;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[TextGen] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task Generate()
+    {
+        if (_pipeline == null || string.IsNullOrWhiteSpace(_prompt)) return;
+        _isRunning = true;
+        _generatedText = "";
+        StateHasChanged();
+        await Task.Yield();
+
+        try
+        {
+            var result = await _pipeline.GenerateAsync(_prompt, maxNewTokens: _maxTokens);
+            _generatedText = result.Text;
+            _tokensGenerated = result.GeneratedTokenCount;
+            _inferenceMs = result.InferenceTimeMs;
+            Console.WriteLine($"[TextGen] {result.TokensPerSecond:F1} tok/s, {result.GeneratedTokenCount} tokens");
+        }
+        catch (Exception ex)
+        {
+            _generatedText = $"Error: {ex.Message}";
+            Console.WriteLine($"[TextGen] Error: {ex.Message}");
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 }

@@ -244,38 +244,124 @@ public class FeatureExtractionPipeline : IDisposable
 }
 
 /// <summary>
-/// Text Generation: prompt → generated text.
-/// Models: GPT-2, Qwen, SmolLM, LLaMA.
+/// Text Generation pipeline with autoregressive decoding.
+/// Works with any causal LM that outputs [1, seq, vocab] logits.
+///
+/// Usage:
+///   var pipeline = new TextGenerationPipeline(session, accelerator);
+///   pipeline.LoadTokenizer(tokenizerJson);
+///   var result = await pipeline.GenerateAsync("The cat sat on the", maxNewTokens: 20);
+///   Console.WriteLine(result.Text);
 /// </summary>
-public class TextGenerationPipeline : IPipeline<string, TranscriptionResult>
+public class TextGenerationPipeline : IDisposable
 {
     private readonly Accelerator _accelerator;
-    private InferenceSession? _session;
+    private readonly InferenceSession _session;
     private BPETokenizer? _tokenizer;
 
-    public bool IsReady => _session != null;
-    public string ModelName { get; private set; } = "";
-    public string BackendName => _accelerator.AcceleratorType.ToString();
-    public GenerationConfig Config { get; set; } = new();
+    public int MaxNewTokens { get; set; } = 50;
+    public float Temperature { get; set; } = 1.0f;
 
-    private TextGenerationPipeline(Accelerator accelerator) => _accelerator = accelerator;
-
-    public static async Task<TextGenerationPipeline> CreateAsync(
-        Accelerator accelerator, HttpClient http, string? modelId, PipelineOptions options)
+    public TextGenerationPipeline(InferenceSession session, Accelerator accelerator)
     {
-        var pipe = new TextGenerationPipeline(accelerator);
-        var path = modelId ?? options.ModelPath ?? "models/gpt2";
-        pipe.ModelName = path;
-        pipe._session = await InferenceSession.CreateAsync(accelerator, http, path);
-        return pipe;
+        _session = session;
+        _accelerator = accelerator;
     }
 
-    public async Task<TranscriptionResult> RunAsync(string prompt)
+    public void LoadTokenizer(string tokenizerJson)
     {
-        if (_session == null || _tokenizer == null) throw new InvalidOperationException("Model not loaded");
-        // Pipeline: tokenize → autoregressive loop (KV cache + sampling) → decode tokens
-        throw new NotImplementedException("Awaiting KV cache + autoregressive generation support");
+        _tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
+    }
+
+    /// <summary>
+    /// Generate text from a prompt using greedy decoding.
+    /// </summary>
+    public async Task<TextGenerationResult> GenerateAsync(string prompt, int? maxNewTokens = null)
+    {
+        if (_tokenizer == null) throw new InvalidOperationException("Tokenizer not loaded.");
+
+        int maxTokens = maxNewTokens ?? MaxNewTokens;
+        var sw = Stopwatch.StartNew();
+
+        // Tokenize prompt
+        var promptTokens = _tokenizer.Encode(prompt).ToList();
+        var allTokens = new List<int>(promptTokens);
+
+        for (int step = 0; step < maxTokens; step++)
+        {
+            // Create input tensors
+            var idsFloat = allTokens.Select(t => (float)t).ToArray();
+            var maskFloat = Enumerable.Repeat(1f, allTokens.Count).ToArray();
+            var posFloat = Enumerable.Range(0, allTokens.Count).Select(i => (float)i).ToArray();
+
+            using var idsBuf = _accelerator.Allocate1D(idsFloat);
+            using var maskBuf = _accelerator.Allocate1D(maskFloat);
+            using var posBuf = _accelerator.Allocate1D(posFloat);
+
+            var inputs = new Dictionary<string, Tensor>();
+            var inputNames = _session.InputNames;
+            inputs[inputNames[0]] = new Tensor(idsBuf.View, new[] { 1, allTokens.Count });
+            if (inputNames.Length > 1)
+                inputs[inputNames[1]] = new Tensor(maskBuf.View, new[] { 1, allTokens.Count });
+            if (inputNames.Length > 2)
+                inputs[inputNames[2]] = new Tensor(posBuf.View, new[] { 1, allTokens.Count });
+
+            var outputs = await _session.RunAsync(inputs);
+            var output = outputs[_session.OutputNames[0]];
+
+            // Get logits for last position: [1, seq, vocab] → last position
+            int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
+            int lastOffset = (allTokens.Count - 1) * vocabSize;
+
+            using var readBuf = _accelerator.Allocate1D<float>(vocabSize);
+            new ElementWiseKernels(_accelerator).Scale(
+                output.Data.SubView(lastOffset, vocabSize), readBuf.View, vocabSize, 1f);
+            await _accelerator.SynchronizeAsync();
+            var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
+
+            // Greedy argmax
+            int nextToken = 0;
+            float maxVal = float.MinValue;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                if (logits[i] > maxVal) { maxVal = logits[i]; nextToken = i; }
+            }
+
+            // Check for EOS
+            if (nextToken == 50256) break; // GPT-2 EOS token
+
+            allTokens.Add(nextToken);
+        }
+
+        sw.Stop();
+
+        // Decode generated tokens
+        var generatedTokens = allTokens.Skip(promptTokens.Count).ToArray();
+        string generatedText = _tokenizer.Decode(generatedTokens);
+
+        return new TextGenerationResult
+        {
+            Text = prompt + generatedText,
+            GeneratedText = generatedText,
+            PromptTokenCount = promptTokens.Count,
+            GeneratedTokenCount = generatedTokens.Length,
+            TotalTokenCount = allTokens.Count,
+            InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
+            TokensPerSecond = generatedTokens.Length / (sw.Elapsed.TotalSeconds + 1e-9),
+        };
     }
 
     public void Dispose() => _session?.Dispose();
+}
+
+/// <summary>Result from text generation.</summary>
+public class TextGenerationResult
+{
+    public string Text { get; init; } = "";
+    public string GeneratedText { get; init; } = "";
+    public int PromptTokenCount { get; init; }
+    public int GeneratedTokenCount { get; init; }
+    public int TotalTokenCount { get; init; }
+    public double InferenceTimeMs { get; init; }
+    public double TokensPerSecond { get; init; }
 }

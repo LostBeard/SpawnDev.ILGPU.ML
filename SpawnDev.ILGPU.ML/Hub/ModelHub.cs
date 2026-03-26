@@ -181,6 +181,8 @@ public class ModelHub : IDisposable
         public const string DistilBertSST2 = "Xenova/distilbert-base-uncased-finetuned-sst-2-english";
         /// <summary>GPT-2 — Text generation (548 MB)</summary>
         public const string GPT2 = "onnxmodelzoo/gpt2-10";
+        /// <summary>DistilGPT-2 — Smaller text generation (330 MB)</summary>
+        public const string DistilGPT2 = "Xenova/distilgpt2";
 
         // ── Speech ──
         /// <summary>Whisper Tiny — Speech-to-text, encoder+decoder (226 MB)</summary>
