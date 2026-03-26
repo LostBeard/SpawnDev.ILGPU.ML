@@ -306,7 +306,7 @@ public abstract partial class MLTestBase
         // Check for NaN/Infinity in logits (indicates inference issue)
         int nanCount = logits.Count(v => float.IsNaN(v) || float.IsInfinity(v));
         if (nanCount > 0)
-            Console.WriteLine($"[GPT-2] WARNING: {nanCount}/{logits.Length} logits are NaN/Inf");
+            throw new Exception($"[GPT-2] {nanCount}/{logits.Length} logits are NaN/Inf — inference produced invalid output. Chunked weight upload may have corrupted weights.");
 
         // Verify: next token should be 4314 (" floor")
         int nextToken = 0;
