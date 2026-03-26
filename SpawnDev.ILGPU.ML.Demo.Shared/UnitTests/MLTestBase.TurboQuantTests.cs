@@ -1,3 +1,5 @@
+using ILGPU;
+using ILGPU.Runtime;
 using SpawnDev.UnitTesting;
 using System.Text.Json;
 
@@ -161,6 +163,63 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[TurboQuant] 4-bit codebook: {centroids.Length} centroids, symmetric, monotonic PASS");
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  FWHT GPU Kernel Tests
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task TurboQuant_FWHT_GPU_MatchesCPU_d8() => await RunTest(async accelerator =>
+    {
+        var kernel = new Kernels.FWHTKernel(accelerator);
+
+        var input = new float[] { 1f, 0f, 0f, 0f, 0f, 0f, 0f, 0f };
+        var cpuResult = FWHT_CPU(input);
+
+        using var buf = accelerator.Allocate1D(input);
+        kernel.Forward(buf.View, 8);
+        await accelerator.SynchronizeAsync();
+        var gpuResult = await buf.CopyToHostAsync<float>(0, 8);
+
+        float maxErr = 0;
+        for (int i = 0; i < 8; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(gpuResult[i] - cpuResult[i]));
+
+        if (maxErr > 1e-4f)
+            throw new Exception($"FWHT GPU vs CPU: maxErr={maxErr:E3}");
+
+        Console.WriteLine($"[TurboQuant] FWHT GPU d=8: maxErr={maxErr:E3} vs CPU reference PASS");
+    });
+
+    [TestMethod]
+    public async Task TurboQuant_FWHT_GPU_RoundTrip_d64() => await RunTest(async accelerator =>
+    {
+        var kernel = new Kernels.FWHTKernel(accelerator);
+
+        var rng = new Random(42);
+        var input = new float[64];
+        for (int i = 0; i < 64; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        var original = (float[])input.Clone();
+
+        using var buf = accelerator.Allocate1D(input);
+
+        // Forward FWHT
+        kernel.Forward(buf.View, 64);
+        // Inverse FWHT (same transform — it's its own inverse)
+        kernel.Forward(buf.View, 64);
+
+        await accelerator.SynchronizeAsync();
+        var roundTrip = await buf.CopyToHostAsync<float>(0, 64);
+
+        float maxErr = 0;
+        for (int i = 0; i < 64; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(roundTrip[i] - original[i]));
+
+        if (maxErr > 1e-3f)
+            throw new Exception($"FWHT GPU round-trip d=64: maxErr={maxErr:E3}");
+
+        Console.WriteLine($"[TurboQuant] FWHT GPU round-trip d=64: maxErr={maxErr:E3} PASS");
+    });
 
     // ═══════════════════════════════════════════════════════════
     //  CPU FWHT Reference Implementation
