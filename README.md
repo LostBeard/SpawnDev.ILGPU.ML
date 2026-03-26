@@ -147,11 +147,14 @@ Style models: mosaic, candy, rain princess, udnie, pointilism.
 
 | Model | Task | Size | Status |
 |-------|------|------|--------|
+| **Phi-3 Mini 3.8B** | Conversational LLM | ~2.5 GB (Q4 GGUF) | Powers AI Assistant + Comic Chat — real intelligence in the browser |
 | **DistilBERT-SST2** | Sentiment analysis | 268 MB | **Working** — matches ONNX Runtime reference |
-| **GPT-2** | Text generation | 548 MB | Compiles, inference runs |
-| **Whisper Tiny** | Speech-to-text | 231 MB | Encoder compiles, inference runs |
-| **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Available via HuggingFace CDN |
-| **SpeechT5** | Text-to-speech | 643 MB | Available via HuggingFace CDN |
+| **DistilGPT-2** | Text generation | 314 MB | **Working** — streaming weight loader |
+| **Whisper Tiny** | Speech-to-text | 231 MB | **Working** — encoder + decoder autoregressive |
+| **SD-Turbo** | Image generation | ~2.5 GB (FP16) | ONE step, 512x512 from text prompts |
+| **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Zero-shot classification from any text |
+| **SpeechT5** | Text-to-speech | 643 MB | Neural voice synthesis |
+| **DDPM MNIST** | Image generation (lightweight) | 1 MB | Diffusion pipeline proof-of-concept |
 
 ## Architecture
 
@@ -294,12 +297,12 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does | Why It's Special |
 |------|-------------|-----------------|
-| **AI Assistant** | Remember Clippy, Merlin, and Robby? They're back — but now they actually think. Choose from 6 classic MS Agent-style characters (Merlin, Robby, Clippy, Peedy, Rocky, Links), talk to them via voice or text, and they respond with AI-generated text and speech. All local. | Microsoft's animated assistants had personality but no intelligence. Now imagine them powered by a local LLM on your GPU with speech recognition (Whisper) and TTS — all in the browser, all private. |
-| **Comic Chat AI** | A comic strip chat room where every character is an AI running locally. Add characters, give them personalities, and watch them converse in comic panel format. Inspired by Microsoft Comic Chat (1996), reimagined with local AI. | Multiple AI characters chatting with each other, each with distinct personality, rendered as a comic strip — all on your GPU. Pure nostalgia meets cutting-edge tech. |
+| **AI Assistant** | Remember Clippy, Merlin, and Robby? They're back — but now they actually think. Choose from 6 classic MS Agent-style characters, talk to them via voice or text, and they respond with AI-generated text and speech. Powered by Phi-3 Mini 3.8B (Q4, ~2.5GB) running entirely on your GPU. Voice input via Whisper, voice output via SpeechT5 — all local. | A real 3.8B parameter LLM running in your browser. No API key. No server. No internet after model loads. The thing Microsoft dreamed of in 1997 but couldn't build — now running on WebGPU in a browser tab. |
+| **Comic Chat AI** | A comic strip chat room where every character is an AI running locally. Add characters, give them personalities ("sarcastic pirate", "enthusiastic scientist"), and watch them debate in comic panel format. Powered by Phi-3 Mini 3.8B with per-character system prompts — same model, different personalities. Inspired by Microsoft Comic Chat (1996), reimagined with local AI. | Multiple AI characters with genuine personality differences, all powered by the same 3.8B LLM on your GPU, debating and joking in comic panels. Pure nostalgia meets bleeding-edge tech. |
 | **Inside the Network** | Peek inside the neural network. See feature maps, attention patterns, and activation heatmaps as the model processes your image — layer by layer. Scrub through layers to see what the GPU "sees." | Educational and mesmerizing. Shows that neural networks aren't magic — they're math running on your GPU, and you can watch it happen. |
 | **Draw to Train** | Draw custom gestures on an interactive canvas, train a CNN classifier in real-time on your GPU, then watch it classify as you draw. Live loss/accuracy curves during training. The model learns in seconds — and you can test it immediately by drawing new shapes. Export trained models as ONNX. | Most browser ML can only do inference. This is full GPU training: forward pass, backpropagation, gradient descent — all in C# compute shaders on WebGPU. No server, no Python, no CUDA install. Draw → Train → Use, all in one browser tab. |
 | **Pipeline Composer** | Visual drag-and-drop model builder. Compose neural network architectures by wiring blocks: Conv2D → ReLU → MaxPool → Linear. Auto-propagation of tensor shapes through the graph. Dimension mismatch highlighting (orange = warning, red = error). Three-stage workflow: Data → Architecture → Train & Run. Save/load pipeline configurations as JSON. | Build a complete ML pipeline visually — define your data source, compose your model architecture, configure training, watch it learn, run inference. No code required. Inspired by visual ML tools, but running entirely on your GPU in the browser. |
-| **Voice Collaboration** | Talk to your AI dev team. Speech-to-text (Whisper on GPU or Web Speech API) transcribes your voice, routes to AI agents with distinct personas, agents respond via text-to-speech. Full transcript with speaker labels. Hybrid: Claude API for reasoning now, local GGUF model on WebGPU later. | Multi-agent voice chat in a browser tab. Whisper STT running on your GPU, multiple AI agents with distinct voices, real-time conversation. The future of AI-assisted development — no install, no server (except LLM API). |
+| **Voice Collaboration** | Talk to your AI dev team. Whisper STT on your GPU transcribes your voice, Phi-3 Mini reasons locally, SpeechT5 TTS responds with voice — all neural, all GPU, all private. Multiple agents with distinct personas and voices. Full transcript with speaker labels. | The full voice AI pipeline running on YOUR hardware: speech recognition → LLM reasoning → text-to-speech. No cloud. No API key. No data leaves your device. Multi-agent voice conversation in a browser tab. |
 
 ### Generative & 3D Demos
 
