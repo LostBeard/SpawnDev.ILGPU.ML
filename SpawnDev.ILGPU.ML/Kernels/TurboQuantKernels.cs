@@ -248,16 +248,12 @@ public class TurboQuantKernels
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
-        int, int, int, float>? _fusedAttentionKernel;
+        ArrayView1D<int, Stride1D.Dense>>? _fusedAttentionKernel;
 
     /// <summary>
     /// Fused attention with quantized KV cache.
     /// Dequantizes K and V on-the-fly during attention computation.
-    /// Q [numQueries, headDim] (float)
-    /// K_packed [numKV, headDim/8] (4-bit packed int), K_codebook [16] (float)
-    /// V_packed [numKV, headDim/8] (4-bit packed int), V_codebook [16] (float)
-    /// K_norms [numKV], V_norms [numKV] (float)
-    /// → output [numQueries, headDim] (float)
+    /// Scalars packed into params buffer to stay within WebGPU parameter limits.
     /// </summary>
     public void FusedQuantizedAttention(
         ArrayView1D<float, Stride1D.Dense> Q,
@@ -270,20 +266,25 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> output,
         int numQueries, int numKV, int headDim, float scale)
     {
+        // Pack scalars into int buffer to reduce kernel param count
+        // params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*1000 (as int)
+        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f) };
+        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+
         _fusedAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, float>(FusedAttentionImpl);
+            ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
         _fusedAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, numQueries, numKV, headDim, scale);
+            K_norms, V_norms, output, paramsBuf.View);
     }
 
     /// <summary>
-    /// Per-query fused attention: compute QK^T scores, softmax, then weighted sum of V.
-    /// K and V are dequantized on-the-fly from 4-bit packed representation.
+    /// Per-query fused attention with packed params buffer.
+    /// params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*10000
     /// </summary>
     private static void FusedAttentionImpl(Index1D queryIdx,
         ArrayView1D<float, Stride1D.Dense> Q,
@@ -294,8 +295,12 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> K_norms,
         ArrayView1D<float, Stride1D.Dense> V_norms,
         ArrayView1D<float, Stride1D.Dense> output,
-        int numQ, int numKV, int D, float scale)
+        ArrayView1D<int, Stride1D.Dense> paramsArr)
     {
+        int numQ = paramsArr[0];
+        int numKV = paramsArr[1];
+        int D = paramsArr[2];
+        float scale = paramsArr[3] / 10000f;
         int packedDim = D / 8; // 4-bit: 8 values per int
 
         // Step 1: Compute attention scores QK^T (dequantize K on-the-fly)
