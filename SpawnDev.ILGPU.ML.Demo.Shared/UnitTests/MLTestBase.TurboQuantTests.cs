@@ -222,6 +222,48 @@ public abstract partial class MLTestBase
     });
 
     // ═══════════════════════════════════════════════════════════
+    //  QuantizedKVCache Integration Test
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task TurboQuant_KVCache_CompressionRatio() => await RunTest(async accelerator =>
+    {
+        // Create a small KV cache: 1 layer, 1 head, dim=64
+        var cache = new SpawnDev.ILGPU.ML.Training.QuantizedKVCache(
+            accelerator, numLayers: 1, numHeads: 1, headDim: 64, maxSeqLen: 32);
+
+        // Append 16 tokens
+        var rng = new Random(42);
+        for (int t = 0; t < 16; t++)
+        {
+            var kData = new float[64];
+            var vData = new float[64];
+            for (int i = 0; i < 64; i++)
+            {
+                kData[i] = (float)(rng.NextDouble() * 2 - 1);
+                vData[i] = (float)(rng.NextDouble() * 2 - 1);
+            }
+            using var kBuf = accelerator.Allocate1D(kData);
+            using var vBuf = accelerator.Allocate1D(vData);
+            cache.AppendKV(0, 0, kBuf.View, vBuf.View);
+            cache.IncrementSeqLen();
+        }
+
+        float ratio = cache.CompressionRatio;
+        long compressed = cache.CompressedMemoryBytes;
+        long uncompressed = cache.UncompressedMemoryBytes;
+
+        Console.WriteLine($"[TurboQuant] KV cache: {uncompressed} bytes → {compressed} bytes, ratio={ratio:F1}x");
+
+        // 4-bit should give ~4-8x compression depending on overhead
+        if (ratio < 2f)
+            throw new Exception($"Compression ratio {ratio:F1}x too low — expected ≥ 2x");
+
+        cache.Dispose();
+        await Task.CompletedTask;
+    });
+
+    // ═══════════════════════════════════════════════════════════
     //  CPU FWHT Reference Implementation
     // ═══════════════════════════════════════════════════════════
 
