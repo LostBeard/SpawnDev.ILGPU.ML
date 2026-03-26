@@ -16,10 +16,14 @@
         </p>
         <div class="hero-try-now">
             <span class="try-label">Try now:</span>
-            <a href="classify" class="try-link">Classify an Image</a>
+            <a href="classify" class="try-link">Classify</a>
             <a href="style" class="try-link">Style Transfer</a>
-            <a href="super-res" class="try-link">Super Resolution</a>
-            <a href="inspector" class="try-link">Inspect a Model</a>
+            <a href="depth" class="try-link">Depth</a>
+            <a href="detect" class="try-link">Detect Objects</a>
+            <a href="pose" class="try-link">Pose</a>
+            <a href="clip" class="try-link">Zero-Shot</a>
+            <a href="remove-bg" class="try-link">Remove BG</a>
+            <a href="whisper" class="try-link">Speech</a>
         </div>
         <div class="hero-buttons">
             <a href="getting-started" class="btn btn-primary btn-lg">
@@ -174,27 +178,31 @@
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
-            <div class="roadmap-label">Classification, Style Transfer, Super Resolution pipelines</div>
+            <div class="roadmap-label">12 inference pipelines (classification, style, depth, detection, pose, face, CLIP, STT, NLP, segmentation)</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">HuggingFace Hub integration + OPFS browser caching</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">Zero-copy GPU→canvas rendering via CanvasRendererFactory</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">NLP: sentiment analysis, embeddings, zero-shot classification (CLIP)</div>
+        </div>
+        <div class="roadmap-item done">
+            <div class="roadmap-status">Done</div>
+            <div class="roadmap-label">Audio: Whisper speech-to-text (encoder + decoder)</div>
         </div>
         <div class="roadmap-item active">
             <div class="roadmap-status">Active</div>
-            <div class="roadmap-label">Depth estimation, object detection, pose estimation</div>
-        </div>
-        <div class="roadmap-item active">
-            <div class="roadmap-status">Active</div>
-            <div class="roadmap-label">HuggingFace Hub integration + OPFS caching</div>
+            <div class="roadmap-label">Training engine (backpropagation, GPU-side gradient computation)</div>
         </div>
         <div class="roadmap-item planned">
             <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">NLP pipelines (text classification, embeddings, generation)</div>
-        </div>
-        <div class="roadmap-item planned">
-            <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">Audio pipelines (Whisper speech-to-text)</div>
-        </div>
-        <div class="roadmap-item planned">
-            <div class="roadmap-status">Planned</div>
-            <div class="roadmap-label">Image generation (Stable Diffusion in-browser)</div>
+            <div class="roadmap-label">Image generation, 3D reconstruction, linear-scaling LLMs</div>
         </div>
     </div>
 </div>
