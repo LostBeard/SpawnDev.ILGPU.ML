@@ -28,10 +28,11 @@ public class FWHTKernel
     /// In-place FWHT on a single vector of length d (must be power of 2).
     /// Normalized: output = H_d @ input / sqrt(d).
     /// </summary>
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scaleInPlaceKernel;
+
     public void Forward(ArrayView1D<float, Stride1D.Dense> data, int d)
     {
         // FWHT butterfly: log2(d) sequential passes, each parallelizable
-        // Each pass processes d/2 pairs independently
         int numStages = 0;
         for (int s = d; s > 1; s >>= 1) numStages++;
 
@@ -43,10 +44,17 @@ public class FWHTKernel
             _fwhtKernel(d / 2, data, halfSize);
         }
 
-        // Normalize by 1/sqrt(d)
+        // Normalize by 1/sqrt(d) — in-place to avoid WebGPU buffer aliasing
         float scale = 1f / MathF.Sqrt(d);
-        var ew = new ElementWiseKernels(_accelerator);
-        ew.Scale(data, data, d, scale);
+        _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+        _scaleInPlaceKernel(d, data, scale);
+    }
+
+    private static void ScaleInPlaceImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data, float scale)
+    {
+        data[idx] *= scale;
     }
 
     /// <summary>

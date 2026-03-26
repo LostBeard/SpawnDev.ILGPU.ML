@@ -71,8 +71,7 @@ public abstract partial class MLTestBase
         var codebook = new float[] { -1.75f,-1.25f,-0.875f,-0.625f,-0.375f,-0.2f,-0.075f,0f,
             0.075f,0.2f,0.375f,0.625f,0.875f,1.25f,1.75f,2.5f };
 
-        using var qBuf = accelerator.Allocate1D<float>(headDim);
-        qBuf.View.CopyFromCPU(qData);
+        using var qBuf = accelerator.Allocate1D(qData);
 
         // Encode K and V: normalize → quantize → pack
         using var kPackedBuf = accelerator.Allocate1D<int>(numKV * packedDim);
@@ -89,10 +88,9 @@ public abstract partial class MLTestBase
         for (int kv = 0; kv < numKV; kv++)
         {
             // Upload K vector
-            using var kVec = accelerator.Allocate1D<float>(headDim);
             var kSlice = new float[headDim];
             Array.Copy(kData, kv * headDim, kSlice, 0, headDim);
-            kVec.View.CopyFromCPU(kSlice);
+            using var kVec = accelerator.Allocate1D(kSlice);
 
             tq.Normalize(kVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
@@ -100,10 +98,9 @@ public abstract partial class MLTestBase
             tempNormVal.View.SubView(0, 1).CopyTo(kNormsBuf.View.SubView(kv, 1));
 
             // Same for V
-            using var vVec = accelerator.Allocate1D<float>(headDim);
             var vSlice = new float[headDim];
             Array.Copy(vData, kv * headDim, vSlice, 0, headDim);
-            vVec.View.CopyFromCPU(vSlice);
+            using var vVec = accelerator.Allocate1D(vSlice);
 
             tq.Normalize(vVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);

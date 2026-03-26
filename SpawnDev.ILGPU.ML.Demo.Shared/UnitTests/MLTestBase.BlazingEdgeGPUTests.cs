@@ -27,8 +27,7 @@ public abstract partial class MLTestBase
         // [1, 8, 64] = 8 positions, headDim=64
         int numPos = 8, headDim = 64;
 
-        using var inputBuf = accelerator.Allocate1D<float>(input.Length);
-        inputBuf.View.CopyFromCPU(input);
+        using var inputBuf = accelerator.Allocate1D(input);
         using var outputBuf = accelerator.Allocate1D<float>(input.Length);
 
         var rope = new RoPEKernel(accelerator);
@@ -55,8 +54,7 @@ public abstract partial class MLTestBase
         for (int i = 0; i < data.Length; i++)
             data[i] = (float)(rng.NextDouble() * 10 - 5); // large range
 
-        using var inputBuf = accelerator.Allocate1D<float>(data.Length);
-        inputBuf.View.CopyFromCPU(data);
+        using var inputBuf = accelerator.Allocate1D(data);
         using var outputBuf = accelerator.Allocate1D<float>(data.Length);
 
         var qkNorm = new QKNormKernel(accelerator);
@@ -135,14 +133,10 @@ public abstract partial class MLTestBase
             C[i] = (float)(rng.NextDouble() * 0.5);
         }
 
-        using var xBuf = accelerator.Allocate1D<float>(seqLen);
-        xBuf.View.CopyFromCPU(x);
-        using var aBuf = accelerator.Allocate1D<float>(dState);
-        aBuf.View.CopyFromCPU(A);
-        using var bBuf = accelerator.Allocate1D<float>(seqLen * dState);
-        bBuf.View.CopyFromCPU(B);
-        using var cBuf = accelerator.Allocate1D<float>(seqLen * dState);
-        cBuf.View.CopyFromCPU(C);
+        using var xBuf = accelerator.Allocate1D(x);
+        using var aBuf = accelerator.Allocate1D(A);
+        using var bBuf = accelerator.Allocate1D(B);
+        using var cBuf = accelerator.Allocate1D(C);
         using var outBuf = accelerator.Allocate1D<float>(seqLen);
         using var stateBuf = accelerator.Allocate1D<float>(dState);
 
@@ -164,12 +158,9 @@ public abstract partial class MLTestBase
         Array.Copy(B, bShort, 3 * dState);
         Array.Copy(C, cShort, 3 * dState);
 
-        using var xShortBuf = accelerator.Allocate1D<float>(3);
-        xShortBuf.View.CopyFromCPU(xShort);
-        using var bShortBuf = accelerator.Allocate1D<float>(3 * dState);
-        bShortBuf.View.CopyFromCPU(bShort);
-        using var cShortBuf = accelerator.Allocate1D<float>(3 * dState);
-        cShortBuf.View.CopyFromCPU(cShort);
+        using var xShortBuf = accelerator.Allocate1D(xShort);
+        using var bShortBuf = accelerator.Allocate1D(bShort);
+        using var cShortBuf = accelerator.Allocate1D(cShort);
         using var outShortBuf = accelerator.Allocate1D<float>(3);
         using var stateShortBuf = accelerator.Allocate1D<float>(dState);
 
