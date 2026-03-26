@@ -209,8 +209,8 @@ public class ModelHub : IDisposable
         public const string SDTurbo = "schmuell/sd-turbo-ort-web";
 
         // ── Background Removal ──
-        /// <summary>RMBG 1.4 — Background removal, ONNX export (44 MB)</summary>
-        public const string RMBG14 = "Xenova/rmbg-1.4";
+        /// <summary>RMBG 1.4 — Background removal (44 MB, public, no auth)</summary>
+        public const string RMBG14 = "briaai/RMBG-1.4";
     }
 
     /// <summary>
