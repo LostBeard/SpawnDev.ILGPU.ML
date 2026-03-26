@@ -336,6 +336,22 @@ public class InferenceSession : IDisposable
                 return ModelFormat.ONNX; // pytorch producer
         }
 
+        // glTF binary: "glTF" magic (0x46546C67)
+        if (data[0] == 0x67 && data[1] == 0x6C && data[2] == 0x54 && data[3] == 0x46)
+            return ModelFormat.GLTF;
+
+        // SPZ: gzip header (0x1F 0x8B) — decompress and check for SPZ magic
+        if (data[0] == 0x1F && data[1] == 0x8B && Formats.SPZParser.IsValidSPZ(data))
+            return ModelFormat.SPZ;
+
+        // PLY: starts with "ply\n"
+        if (data[0] == 'p' && data[1] == 'l' && data[2] == 'y' && (data[3] == '\n' || data[3] == '\r'))
+            return ModelFormat.PLY;
+
+        // OBJ: starts with "# " (comment) or "v " (vertex) or "o " (object)
+        if ((data[0] == '#' && data[1] == ' ') || (data[0] == 'v' && data[1] == ' ') || (data[0] == 'o' && data[1] == ' '))
+            return ModelFormat.OBJ;
+
         // PyTorch: ZIP archive (PK header)
         if (PyTorch.PyTorchLoader.IsPyTorchCheckpoint(data))
             return ModelFormat.PyTorch;
@@ -804,4 +820,8 @@ public enum ModelFormat
     TFGraphDef,
     PyTorch,
     CoreML,
+    SPZ,
+    PLY,
+    GLTF,
+    OBJ,
 }

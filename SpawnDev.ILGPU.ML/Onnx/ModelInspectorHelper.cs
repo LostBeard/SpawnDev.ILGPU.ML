@@ -19,6 +19,10 @@ public static class ModelInspectorHelper
             ModelFormat.TFLite => InspectTFLite(modelBytes),
             ModelFormat.GGUF => InspectGGUF(modelBytes),
             ModelFormat.SafeTensors => InspectSafeTensors(modelBytes),
+            ModelFormat.SPZ => InspectSPZ(modelBytes),
+            ModelFormat.PLY => InspectPLY(modelBytes),
+            ModelFormat.GLTF => InspectGLTF(modelBytes),
+            ModelFormat.OBJ => InspectOBJ(modelBytes),
             _ => InspectOnnx(modelBytes),
         };
     }
@@ -283,6 +287,83 @@ public static class ModelInspectorHelper
             Outputs = Array.Empty<TensorInfo>(),
             LargestWeights = largestWeights.Take(20).ToArray(),
             FileSizeBytes = stBytes.Length,
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  3D Format Inspectors
+    // ═══════════════════════════════════════════════════════════
+
+    public static InspectionResult InspectSPZ(byte[] spzBytes)
+    {
+        var cloud = Formats.SPZParser.Parse(spzBytes);
+        return new InspectionResult
+        {
+            GraphName = $"SPZ Gaussian Splat ({cloud.NumPoints:N0} points)",
+            ProducerName = $"SPZ v{cloud.Version}",
+            NodeCount = 0,
+            InitializerCount = cloud.NumPoints,
+            TotalParameters = cloud.NumPoints * 14, // pos(3)+alpha(1)+color(3)+scale(3)+rot(4)
+            TotalWeightBytes = spzBytes.Length,
+            Inputs = new[] { new TensorInfo { Name = "gaussians", Shape = new[] { cloud.NumPoints.ToString(), "14" } } },
+            Outputs = Array.Empty<TensorInfo>(),
+            Operators = Array.Empty<OpUsage>(),
+            LargestWeights = Array.Empty<WeightInfo>(),
+        };
+    }
+
+    public static InspectionResult InspectPLY(byte[] plyBytes)
+    {
+        var ply = Formats.PLYParser.Parse(plyBytes);
+        bool isGaussian = ply.Gaussians != null;
+        return new InspectionResult
+        {
+            GraphName = isGaussian ? $"PLY Gaussian Splat ({ply.VertexCount:N0} points)" : $"PLY Mesh ({ply.VertexCount:N0} vertices, {ply.FaceCount} faces)",
+            ProducerName = $"PLY {ply.Format}",
+            NodeCount = 0,
+            InitializerCount = ply.VertexCount,
+            TotalParameters = ply.VertexCount * ply.Properties.Length,
+            TotalWeightBytes = plyBytes.Length,
+            Inputs = new[] { new TensorInfo { Name = "vertices", Shape = new[] { ply.VertexCount.ToString(), ply.Properties.Length.ToString() } } },
+            Outputs = Array.Empty<TensorInfo>(),
+            Operators = ply.Properties.Select(p => new OpUsage { OpType = p, Count = ply.VertexCount }).ToArray(),
+            LargestWeights = Array.Empty<WeightInfo>(),
+        };
+    }
+
+    public static InspectionResult InspectGLTF(byte[] glbBytes)
+    {
+        var mesh = Formats.GLTFLoader.LoadGLB(glbBytes);
+        return new InspectionResult
+        {
+            GraphName = $"glTF Mesh ({mesh.VertexCount:N0} vertices, {mesh.TriangleCount:N0} triangles)",
+            ProducerName = "glTF 2.0",
+            NodeCount = mesh.TriangleCount,
+            InitializerCount = mesh.VertexCount,
+            TotalParameters = mesh.VertexCount * 3,
+            TotalWeightBytes = glbBytes.Length,
+            Inputs = new[] { new TensorInfo { Name = "vertices", Shape = new[] { mesh.VertexCount.ToString(), "3" } } },
+            Outputs = new[] { new TensorInfo { Name = "triangles", Shape = new[] { mesh.TriangleCount.ToString(), "3" } } },
+            Operators = Array.Empty<OpUsage>(),
+            LargestWeights = Array.Empty<WeightInfo>(),
+        };
+    }
+
+    public static InspectionResult InspectOBJ(byte[] objBytes)
+    {
+        var mesh = Formats.OBJExporter.Load(objBytes);
+        return new InspectionResult
+        {
+            GraphName = $"OBJ Mesh ({mesh.VertexCount:N0} vertices, {mesh.TriangleCount:N0} triangles)",
+            ProducerName = "Wavefront OBJ",
+            NodeCount = mesh.TriangleCount,
+            InitializerCount = mesh.VertexCount,
+            TotalParameters = mesh.VertexCount * 3,
+            TotalWeightBytes = objBytes.Length,
+            Inputs = new[] { new TensorInfo { Name = "vertices", Shape = new[] { mesh.VertexCount.ToString(), "3" } } },
+            Outputs = new[] { new TensorInfo { Name = "triangles", Shape = new[] { mesh.TriangleCount.ToString(), "3" } } },
+            Operators = Array.Empty<OpUsage>(),
+            LargestWeights = Array.Empty<WeightInfo>(),
         };
     }
 
