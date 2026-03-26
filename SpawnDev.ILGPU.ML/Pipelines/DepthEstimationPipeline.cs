@@ -58,6 +58,7 @@ public class DepthEstimationPipeline : IDisposable
         // Read depth output to CPU for the CPU-path result
         var output = outputs[_session.OutputNames[0]];
         int depthSize = output.ElementCount;
+        Console.WriteLine($"[Depth CPU] Output: shape=[{string.Join(",", output.Shape)}], elements={depthSize}");
         using var readBuf = _accelerator.Allocate1D<float>(depthSize);
         var ew = new ElementWiseKernels(_accelerator);
         ew.Scale(output.Data.SubView(0, depthSize), readBuf.View, depthSize, 1f);
@@ -105,16 +106,20 @@ public class DepthEstimationPipeline : IDisposable
         int outH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
         int outW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
 
-        // GPU: find min/max via small CPU readback (just 2 floats, not the whole depth map)
-        // Read a sample to estimate range — for exact, we'd need a GPU reduction kernel
-        // For now, read the raw depth to CPU just for min/max, keep the colormap on GPU
+        Console.WriteLine($"[Depth] Output: shape=[{string.Join(",", output.Shape)}], elements={depthSize}, dataLength={output.Data.Length}");
+
+        // Read output to CPU for min/max
+        // Use the actual data view, not SubView(0) which may miss the real offset
         using var tempBuf = _accelerator.Allocate1D<float>(depthSize);
         var ew = new ElementWiseKernels(_accelerator);
-        ew.Scale(output.Data.SubView(0, depthSize), tempBuf.View, depthSize, 1f);
+        int readSize = Math.Min(depthSize, (int)output.Data.Length);
+        ew.Scale(output.Data.SubView(0, readSize), tempBuf.View.SubView(0, readSize), readSize, 1f);
         await _accelerator.SynchronizeAsync();
-        var rawDepth = await tempBuf.CopyToHostAsync<float>(0, depthSize);
+        var rawDepth = await tempBuf.CopyToHostAsync<float>(0, readSize);
         float minD = rawDepth.Min();
         float maxD = rawDepth.Max();
+
+        Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={rawDepth.Max(v => MathF.Abs(v)):F4}, nonZero={rawDepth.Count(v => v != 0)}/{readSize}");
 
         // GPU: depth → plasma colormap RGBA, output to 2D buffer for zero-copy rendering
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
