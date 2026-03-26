@@ -127,6 +127,12 @@
     @@keyframes pulse-border { 0%,100% { border-color: #ef4444; } 50% { border-color: rgba(239,68,68,0.3); } }
 </style>
 
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@implements IDisposable
+
 @code {
     private string _selectedBackend = "WebGPU";
     private string _mode = "file";
@@ -144,9 +150,133 @@
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private Task HandleAudioFile(InputFileChangeEventArgs e) => Task.CompletedTask;
-    private Task StartRecording() => Task.CompletedTask;
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private SpeechRecognitionPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            _modelProgress = 5;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new ModelHub(JS);
+
+            // Load encoder
+            _modelProgress = 20;
+            StateHasChanged();
+            var encoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx");
+            var encoderSession = InferenceSession.CreateFromFile(_accelerator, encoderBytes);
+
+            // Load decoder
+            _modelProgress = 60;
+            StateHasChanged();
+            var decoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx");
+            var decoderSession = InferenceSession.CreateFromFile(_accelerator, decoderBytes);
+
+            // Load tokenizer
+            _modelProgress = 90;
+            StateHasChanged();
+            var tokenizerBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "tokenizer.json");
+            var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
+
+            _pipeline = new SpeechRecognitionPipeline(encoderSession, decoderSession, _accelerator);
+            _pipeline.LoadTokenizer(tokenizerJson);
+
+            _isModelLoaded = true;
+            _modelProgress = 100;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Whisper] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleAudioFile(InputFileChangeEventArgs e)
+    {
+        if (_pipeline == null || e.File == null) return;
+        _isRunning = true;
+        _transcription = null;
+        StateHasChanged();
+
+        try
+        {
+            // Read file bytes
+            using var stream = e.File.OpenReadStream(maxAllowedSize: 50 * 1024 * 1024);
+            var bytes = new byte[e.File.Size];
+            await stream.ReadAsync(bytes);
+
+            // Decode WAV
+            var samples = WavDecoder.DecodeWavFile(bytes);
+            if (samples == null)
+            {
+                _transcription = "Error: Only WAV files supported for direct upload. Use the microphone for other formats.";
+                _isRunning = false;
+                StateHasChanged();
+                return;
+            }
+
+            _audioDurationSeconds = samples.Length / 16000.0;
+            var result = await _pipeline.TranscribeAsync(samples, 16000);
+            _transcription = result.Text;
+            _detectedLanguage = result.Language;
+            _inferenceMs = result.InferenceTimeMs;
+        }
+        catch (Exception ex)
+        {
+            _transcription = $"Error: {ex.Message}";
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    private Task StartRecording() => Task.CompletedTask; // Needs MediaRecorder integration
     private Task StopRecording() => Task.CompletedTask;
-    private Task CopyTranscription() => Task.CompletedTask;
+
+    private async Task CopyTranscription()
+    {
+        if (_transcription == null) return;
+        try
+        {
+            using var navigator = JS.Get<SpawnDev.BlazorJS.JSObjects.Navigator>("navigator");
+            using var clipboard = navigator.Clipboard;
+            await clipboard.WriteText(_transcription);
+        }
+        catch { }
+    }
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 }

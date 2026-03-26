@@ -197,8 +197,8 @@ public class ModelHub : IDisposable
         public const string SpeechT5HiFiGAN = "Xenova/speecht5_hifigan";
 
         // ── Background Removal ──
-        /// <summary>RMBG 1.4 — Background removal (BRIA AI)</summary>
-        public const string RMBG14 = "briaai/RMBG-1.4";
+        /// <summary>RMBG 1.4 — Background removal, ONNX export (44 MB)</summary>
+        public const string RMBG14 = "Xenova/rmbg-1.4";
     }
 
     /// <summary>

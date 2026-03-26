@@ -75,6 +75,12 @@
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
 </style>
 
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@implements IDisposable
+
 @code {
     private string _selectedBackend = "WebGPU";
     private string? _imageDataUrl;
@@ -82,6 +88,8 @@
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
     private List<ConfidenceBars.Prediction>? _results;
+    private int[]? _rgbaPixels;
+    private int _imageWidth, _imageHeight;
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
@@ -97,7 +105,156 @@
         new() { Label = "Street", Url = "samples/street.jpg" },
     };
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private Task HandleImageLoaded(byte[] imageBytes) { _results = null; return Task.CompletedTask; }
-    private void ClearResult() { _results = null; _imageDataUrl = null; StateHasChanged(); }
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private ZeroShotClassificationPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            _modelProgress = 5;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new ModelHub(JS);
+
+            // Load CLIP vision model
+            _modelProgress = 20;
+            StateHasChanged();
+            var visionBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxVisionModel);
+            var visionSession = InferenceSession.CreateFromFile(_accelerator, visionBytes);
+
+            // Load CLIP text model
+            _modelProgress = 60;
+            StateHasChanged();
+            var textBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxTextModel);
+            var textSession = InferenceSession.CreateFromFile(_accelerator, textBytes);
+
+            // Load tokenizer
+            _modelProgress = 90;
+            StateHasChanged();
+            var tokenizerBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, "tokenizer.json");
+            var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
+
+            _pipeline = new ZeroShotClassificationPipeline(visionSession, textSession, _accelerator);
+            _pipeline.LoadTokenizer(tokenizerJson);
+
+            _isModelLoaded = true;
+            _modelProgress = 100;
+
+            // Auto-run if image already loaded
+            if (_rgbaPixels != null)
+                await RunClassification();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CLIP] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleImageLoaded(byte[] imageBytes)
+    {
+        _results = null;
+        try
+        {
+            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width; int h = (int)bitmap.Height;
+            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w; canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            _rgbaPixels = data.Read<int>();
+            _imageWidth = w; _imageHeight = h;
+
+            if (_isModelLoaded)
+                await RunClassification();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CLIP] Image decode error: {ex.Message}");
+        }
+    }
+
+    private async Task RunClassification()
+    {
+        if (_pipeline == null || _rgbaPixels == null) return;
+        _isRunning = true;
+        StateHasChanged();
+        await Task.Yield();
+
+        try
+        {
+            var labels = _candidateLabels
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => l.Trim())
+                .Where(l => l.Length > 0)
+                .ToArray();
+
+            if (labels.Length == 0) return;
+
+            var result = await _pipeline.ClassifyAsync(_rgbaPixels, _imageWidth, _imageHeight, labels);
+            _inferenceMs = result.InferenceTimeMs;
+
+            _results = result.Predictions.Select(p => new ConfidenceBars.Prediction
+            {
+                Label = p.Label,
+                Confidence = p.Confidence,
+            }).ToList();
+
+            Console.WriteLine($"[CLIP] {_inferenceMs:F0}ms — Top: {result.TopLabel} ({result.TopConfidence:P1})");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CLIP] Error: {ex.Message}");
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    private void ClearResult()
+    {
+        _results = null;
+        _imageDataUrl = null;
+        _rgbaPixels = null;
+        StateHasChanged();
+    }
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 }

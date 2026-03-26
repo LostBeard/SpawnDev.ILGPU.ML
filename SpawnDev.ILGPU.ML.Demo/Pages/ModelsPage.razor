@@ -198,6 +198,8 @@
             new() { Id = "yolov8n", Name = "YOLOv8 Nano", Task = "Object Detection", HuggingFaceRepo = "salim4n/yolov8n-detect-onnx", OnnxFile = "yolov8n-onnx-web/yolov8n.onnx", SizeMB = 12.2, Description = "80-class COCO detection (person, car, dog, ...)", InputWidth = 640, InputHeight = 640, DemoUrl = "detect" },
             new() { Id = "distilbert-sst2", Name = "DistilBERT SST-2", Task = "Text Classification", HuggingFaceRepo = "Xenova/distilbert-base-uncased-finetuned-sst-2-english", OnnxFile = "onnx/model.onnx", SizeMB = 257, Description = "Sentiment analysis (positive/negative)", DemoUrl = "embeddings" },
             new() { Id = "whisper-tiny", Name = "Whisper Tiny", Task = "Speech Recognition", HuggingFaceRepo = "onnx-community/whisper-tiny", OnnxFile = "onnx/encoder_model.onnx", SizeMB = 226, Description = "OpenAI Whisper speech-to-text", DemoUrl = "whisper" },
+            new() { Id = "rmbg-1.4", Name = "RMBG 1.4", Task = "Background Removal", HuggingFaceRepo = "Xenova/rmbg-1.4", OnnxFile = "onnx/model.onnx", SizeMB = 44, Description = "Salient object segmentation for background removal", InputWidth = 1024, InputHeight = 1024, DemoUrl = "remove-bg" },
+            new() { Id = "clip-vit-b32", Name = "CLIP ViT-B/32", Task = "Zero-Shot Classification", HuggingFaceRepo = "Xenova/clip-vit-base-patch32", OnnxFile = "onnx/vision_model.onnx", SizeMB = 335, Description = "Classify images into any text categories — no training needed", InputWidth = 224, InputHeight = 224, DemoUrl = "clip" },
         };
     }
 

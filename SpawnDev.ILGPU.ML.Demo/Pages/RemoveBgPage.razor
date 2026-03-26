@@ -1,4 +1,7 @@
 @page "/remove-bg"
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@implements IDisposable
 
 <PageTitle>Background Removal — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -170,16 +173,130 @@
         new() { Label = "Product", Url = "samples/product.jpg" },
     };
 
-    private Task HandleBackendChange(string backend) => Task.CompletedTask;
-    private Task HandleImageLoaded(byte[] imageBytes) { _resultImageUrl = null; return Task.CompletedTask; }
-    private Task RunRemoval()
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline? _pipeline;
+    private int[]? _rgbaPixels;
+    private int _imageWidth, _imageHeight;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // TODO: Run segmentation model through InferenceSession, apply mask
-        return Task.CompletedTask;
+        if (firstRender)
+            await LoadModelAsync();
     }
-    private Task DownloadResult()
+
+    private async Task LoadModelAsync()
     {
-        // TODO: Trigger browser download of result PNG
-        return Task.CompletedTask;
+        try
+        {
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.RMBG14,
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
+            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            _pipeline = new SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline(session, _accelerator);
+
+            _isModelLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RemoveBg] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    private async Task HandleImageLoaded(byte[] imageBytes)
+    {
+        _resultImageUrl = null;
+        try
+        {
+            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width; int h = (int)bitmap.Height;
+            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w; canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            _rgbaPixels = data.Read<int>();
+            _imageWidth = w; _imageHeight = h;
+
+            if (_isModelLoaded)
+                await RunRemoval();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RemoveBg] Image decode error: {ex.Message}");
+        }
+    }
+
+    private async Task RunRemoval()
+    {
+        if (_pipeline == null || _rgbaPixels == null) return;
+        _isRunning = true;
+        StateHasChanged();
+        await Task.Yield();
+
+        try
+        {
+            var result = await _pipeline.RemoveBackgroundAsync(_rgbaPixels, _imageWidth, _imageHeight);
+            _inferenceMs = result.InferenceTimeMs;
+            _resultImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.ResultPixels, result.Width, result.Height);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RemoveBg] Error: {ex.Message}");
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    private void DownloadResult()
+    {
+        if (_resultImageUrl == null) return;
+        try
+        {
+            using var document = JS.Get<SpawnDev.BlazorJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.BlazorJS.JSObjects.HTMLAnchorElement>("a");
+            link.Href = _resultImageUrl;
+            link.Download = "removed-bg.png";
+            using var body = document.Body!;
+            body.AppendChild(link);
+            link.Click();
+            body.RemoveChild(link);
+        }
+        catch { }
+    }
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
     }
 }

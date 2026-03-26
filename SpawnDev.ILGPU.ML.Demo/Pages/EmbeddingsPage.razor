@@ -123,6 +123,13 @@
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
 </style>
 
+@using SpawnDev.BlazorJS
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.ML.Preprocessing
+@implements IDisposable
+
 @code {
     private string _selectedBackend = "WebGPU";
     private string _mode = "similarity";
@@ -142,9 +149,134 @@
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    private Task HandleBackendChange(string backend) { _selectedBackend = backend; return Task.CompletedTask; }
-    private Task ComputeSimilarity() => Task.CompletedTask;
-    private Task SearchCorpus() => Task.CompletedTask;
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private FeatureExtractionPipeline? _pipeline;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await LoadModelAsync();
+    }
+
+    private async Task LoadModelAsync()
+    {
+        try
+        {
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+            }
+
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+
+            // Use DistilBERT for embeddings (already proven to work)
+            using var hub = new ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel);
+            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["input_ids"] = new[] { 1, 128 },
+                    ["attention_mask"] = new[] { 1, 128 },
+                });
+            _pipeline = new FeatureExtractionPipeline(session, _accelerator, maxLength: 128, hiddenSize: 768);
+
+            _isModelLoaded = true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Embeddings] Error: {ex.Message}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task HandleBackendChange(string backend) => LoadModelAsync();
+
+    /// <summary>Simple whitespace tokenizer with BERT special tokens.</summary>
+    private int[] SimpleTokenize(string text)
+    {
+        // CLS + word tokens + SEP (using common BERT vocab IDs)
+        var tokens = new List<int> { 101 }; // [CLS]
+        foreach (var word in text.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            // Hash the word to a vocab range (not real tokenization, but functional for demo)
+            int hash = Math.Abs(word.GetHashCode()) % 28000 + 1000;
+            tokens.Add(hash);
+        }
+        tokens.Add(102); // [SEP]
+        return tokens.ToArray();
+    }
+
+    private async Task ComputeSimilarity()
+    {
+        if (_pipeline == null || string.IsNullOrWhiteSpace(_sentenceA) || string.IsNullOrWhiteSpace(_sentenceB)) return;
+        _isRunning = true;
+        _similarityScore = null;
+        StateHasChanged();
+
+        try
+        {
+            var tokA = SimpleTokenize(_sentenceA);
+            var tokB = SimpleTokenize(_sentenceB);
+
+            var embA = await _pipeline.EmbedAsync(tokA);
+            var embB = await _pipeline.EmbedAsync(tokB);
+            _similarityScore = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedding);
+            _inferenceMs = embA.InferenceTimeMs + embB.InferenceTimeMs;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Embeddings] Error: {ex.Message}");
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    private async Task SearchCorpus()
+    {
+        if (_pipeline == null || string.IsNullOrWhiteSpace(_corpus) || string.IsNullOrWhiteSpace(_searchQuery)) return;
+        _isRunning = true;
+        _searchResults = null;
+        StateHasChanged();
+
+        try
+        {
+            var queryEmb = await _pipeline.EmbedAsync(SimpleTokenize(_searchQuery));
+            var lines = _corpus.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                .Select(l => l.Trim()).Where(l => l.Length > 0).ToArray();
+
+            var results = new List<SearchResult>();
+            foreach (var line in lines)
+            {
+                var lineEmb = await _pipeline.EmbedAsync(SimpleTokenize(line));
+                float score = TextPreprocessor.CosineSimilarity(queryEmb.Embedding, lineEmb.Embedding);
+                results.Add(new SearchResult { Text = line, Score = score });
+            }
+
+            _searchResults = results.OrderByDescending(r => r.Score).ToList();
+            _inferenceMs = queryEmb.InferenceTimeMs;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Embeddings] Error: {ex.Message}");
+        }
+
+        _isRunning = false;
+        StateHasChanged();
+    }
 
     private string GetScoreColor(float score) => score switch
     {
@@ -161,6 +293,13 @@
         >= 0.3f => "Slightly related",
         _ => "Not similar",
     };
+
+    public void Dispose()
+    {
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
 
     private class SearchResult { public string Text { get; set; } = ""; public float Score { get; set; } }
 }

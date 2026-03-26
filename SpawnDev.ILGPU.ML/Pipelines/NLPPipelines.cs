@@ -141,43 +141,102 @@ public class TextClassificationResult
 }
 
 /// <summary>
-/// Feature Extraction / Embeddings: text → dense vector.
-/// Models: all-MiniLM-L6-v2, BGE, E5.
+/// Feature Extraction / Embeddings: text → dense vector via mean pooling.
+/// Works with any BERT-like model that outputs last_hidden_state.
+///
+/// Usage:
+///   var pipeline = new FeatureExtractionPipeline(session, accelerator);
+///   var embA = await pipeline.EmbedAsync(new[] { 101, 7592, 2088, 102 });
+///   var embB = await pipeline.EmbedAsync(new[] { 101, 3407, 2154, 102 });
+///   float sim = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedding);
 /// </summary>
-public class FeatureExtractionPipeline : IPipeline<string, EmbeddingResult>
+public class FeatureExtractionPipeline : IDisposable
 {
     private readonly Accelerator _accelerator;
-    private InferenceSession? _session;
-    private BPETokenizer? _tokenizer;
+    private readonly InferenceSession _session;
+    private readonly int _maxLength;
+    private readonly int _hiddenSize;
 
-    public bool IsReady => _session != null;
-    public string ModelName { get; private set; } = "";
-    public string BackendName => _accelerator.AcceleratorType.ToString();
+    private const int PAD_TOKEN = 0;
 
-    private FeatureExtractionPipeline(Accelerator accelerator) => _accelerator = accelerator;
-
-    public static async Task<FeatureExtractionPipeline> CreateAsync(
-        Accelerator accelerator, HttpClient http, string? modelId, PipelineOptions options)
+    public FeatureExtractionPipeline(InferenceSession session, Accelerator accelerator,
+        int maxLength = 128, int hiddenSize = 768)
     {
-        var pipe = new FeatureExtractionPipeline(accelerator);
-        var path = modelId ?? options.ModelPath ?? "models/all-minilm-l6-v2";
-        pipe.ModelName = path;
-        pipe._session = await InferenceSession.CreateAsync(accelerator, http, path);
-        return pipe;
+        _session = session;
+        _accelerator = accelerator;
+        _maxLength = maxLength;
+        _hiddenSize = hiddenSize;
     }
 
-    public async Task<EmbeddingResult> RunAsync(string text)
+    /// <summary>
+    /// Embed pre-tokenized text to a dense vector via mean pooling + L2 normalization.
+    /// </summary>
+    public async Task<EmbeddingResult> EmbedAsync(int[] tokenIds)
     {
-        if (_session == null) throw new InvalidOperationException("Model not loaded");
-        // Pipeline: tokenize → pad → attention mask → inference → mean pooling → L2 normalize
-        throw new NotImplementedException("Awaiting tokenizer + InferenceSession integration");
+        var sw = Stopwatch.StartNew();
+
+        var padded = TextPreprocessor.PadOrTruncate(tokenIds, _maxLength, PAD_TOKEN);
+        var mask = TextPreprocessor.CreateAttentionMask(padded, PAD_TOKEN);
+        int realTokenCount = mask.Count(m => m == 1);
+
+        var idsFloat = padded.Select(t => (float)t).ToArray();
+        var maskFloat = mask.Select(m => (float)m).ToArray();
+
+        using var idsBuf = _accelerator.Allocate1D(idsFloat);
+        using var maskBuf = _accelerator.Allocate1D(maskFloat);
+
+        var inputs = new Dictionary<string, Tensor>
+        {
+            [_session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, _maxLength }),
+            [_session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, _maxLength }),
+        };
+
+        var outputs = await _session.RunAsync(inputs);
+        var output = outputs[_session.OutputNames[0]];
+
+        // Output shape: [1, seq_len, hidden_size]
+        // Mean pool over real (non-padded) token positions
+        int totalFloats = Math.Min(output.ElementCount, _maxLength * _hiddenSize);
+        using var readBuf = _accelerator.Allocate1D<float>(totalFloats);
+        new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, totalFloats), readBuf.View, totalFloats, 1f);
+        await _accelerator.SynchronizeAsync();
+        var hiddenStates = await readBuf.CopyToHostAsync<float>(0, totalFloats);
+
+        // Mean pooling: average hidden states across token positions (masked)
+        var embedding = new float[_hiddenSize];
+        if (realTokenCount > 0)
+        {
+            for (int t = 0; t < realTokenCount && t < _maxLength; t++)
+            {
+                int offset = t * _hiddenSize;
+                for (int h = 0; h < _hiddenSize && offset + h < hiddenStates.Length; h++)
+                    embedding[h] += hiddenStates[offset + h];
+            }
+            for (int h = 0; h < _hiddenSize; h++)
+                embedding[h] /= realTokenCount;
+        }
+
+        // L2 normalize
+        float norm = 0;
+        for (int i = 0; i < embedding.Length; i++) norm += embedding[i] * embedding[i];
+        norm = MathF.Sqrt(norm);
+        if (norm > 1e-12f)
+            for (int i = 0; i < embedding.Length; i++) embedding[i] /= norm;
+
+        sw.Stop();
+
+        return new EmbeddingResult
+        {
+            Embedding = embedding,
+            InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
+        };
     }
 
-    /// <summary>Compute similarity between two texts.</summary>
-    public async Task<float> SimilarityAsync(string textA, string textB)
+    /// <summary>Compute cosine similarity between two pre-tokenized texts.</summary>
+    public async Task<float> SimilarityAsync(int[] tokenIdsA, int[] tokenIdsB)
     {
-        var embA = await RunAsync(textA);
-        var embB = await RunAsync(textB);
+        var embA = await EmbedAsync(tokenIdsA);
+        var embB = await EmbedAsync(tokenIdsB);
         return embA.SimilarityTo(embB);
     }
 
