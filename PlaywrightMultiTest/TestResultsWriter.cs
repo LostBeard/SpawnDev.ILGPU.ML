@@ -88,6 +88,7 @@ public static class TestResultsWriter
             {
                 WriteIndented = true,
                 PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+                NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals,
             });
             File.WriteAllText(LatestPath, json);
         }
