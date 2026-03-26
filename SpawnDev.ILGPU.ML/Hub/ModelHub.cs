@@ -183,6 +183,8 @@ public class ModelHub : IDisposable
         public const string GPT2 = "onnxmodelzoo/gpt2-10";
         /// <summary>DistilGPT-2 — Smaller text generation (330 MB)</summary>
         public const string DistilGPT2 = "Xenova/distilgpt2";
+        /// <summary>Phi-3 Mini 4k Instruct — 3.8B conversational LLM, Q4 GGUF (~2.5 GB)</summary>
+        public const string Phi3Mini4kInstructGGUF = "microsoft/Phi-3-mini-4k-instruct-gguf";
 
         // ── Speech ──
         /// <summary>Whisper Tiny — Speech-to-text, encoder+decoder (226 MB)</summary>
