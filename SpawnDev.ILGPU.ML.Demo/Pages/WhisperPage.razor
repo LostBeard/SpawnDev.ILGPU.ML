@@ -81,7 +81,7 @@
     @if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            Whisper Tiny model (~75MB) not yet deployed. Speech-to-text will be enabled once the encoder-decoder pipeline is integrated. Audio preprocessing (mel spectrogram, FFT) is already built.
+            Loading Whisper Tiny encoder + decoder (~226MB) from HuggingFace CDN. Models will be cached locally after first download.
         </div>
     }
 
