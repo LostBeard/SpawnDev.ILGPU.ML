@@ -371,3 +371,4 @@ _mldump/
 # development/testing: run HuggingFaceModelDownloader or download manually.
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/
 models/distilgpt2/
+**/distilgpt2/
