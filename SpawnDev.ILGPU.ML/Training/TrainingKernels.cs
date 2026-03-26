@@ -312,6 +312,126 @@ public class TrainingKernels
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  Conv2D Backward (for CNN training)
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int>? _conv2dBackwardWeightKernel;
+
+    /// <summary>
+    /// Conv2D backward (weight gradient): dW[oc,ic,kh,kw] = sum over batch,oh,ow of gradOut[b,oc,oh,ow] * input[b,ic,oh+kh,ow+kw].
+    /// </summary>
+    public void Conv2DBackwardWeight(
+        ArrayView1D<float, Stride1D.Dense> gradOutput,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> gradWeight,
+        int batchSize, int inC, int outC, int H, int W,
+        int kH, int kW, int outH, int outW)
+    {
+        int totalWeightElems = outC * inC * kH * kW;
+        _conv2dBackwardWeightKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int, int>(Conv2DBackwardWeightImpl);
+        _conv2dBackwardWeightKernel(totalWeightElems, gradOutput, input, gradWeight,
+            batchSize, inC, H * 1000 + W, outC, kH * 100 + kW, outH * 100 + outW);
+    }
+
+    private static void Conv2DBackwardWeightImpl(Index1D wIdx,
+        ArrayView1D<float, Stride1D.Dense> gradOutput,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> gradWeight,
+        int B, int inC, int HW, int outC, int kHW, int outHW)
+    {
+        int H = HW / 1000, W = HW % 1000;
+        int kH = kHW / 100, kW = kHW % 100;
+        int outH = outHW / 100, outW = outHW % 100;
+
+        int oc = wIdx / (inC * kH * kW);
+        int rem = wIdx % (inC * kH * kW);
+        int ic = rem / (kH * kW);
+        rem %= (kH * kW);
+        int kh = rem / kW, kw = rem % kW;
+
+        float sum = 0f;
+        for (int b = 0; b < B; b++)
+            for (int oh = 0; oh < outH; oh++)
+                for (int ow = 0; ow < outW; ow++)
+                {
+                    float go = gradOutput[((b * outC + oc) * outH + oh) * outW + ow];
+                    float inp = input[((b * inC + ic) * H + (oh + kh)) * W + (ow + kw)];
+                    sum += go * inp;
+                }
+        gradWeight[wIdx] = sum;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  MaxPool2D with Indices (for backward pass)
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int, int, int>? _maxPoolForwardKernel;
+
+    /// <summary>
+    /// MaxPool2D forward saving argmax indices for backward pass.
+    /// </summary>
+    public void MaxPool2DForward(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        int batchChannels, int H, int W, int poolSize)
+    {
+        int outH = H / poolSize, outW = W / poolSize;
+        _maxPoolForwardKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, int, int, int>(MaxPool2DForwardImpl);
+        _maxPoolForwardKernel(batchChannels * outH * outW, input, output, indices,
+            H, W, poolSize);
+    }
+
+    private static void MaxPool2DForwardImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        int H, int W, int P)
+    {
+        int outW = W / P, outH = H / P;
+        int bc = idx / (outH * outW);
+        int rem = idx % (outH * outW);
+        int oh = rem / outW, ow = rem % outW;
+        int baseOff = bc * H * W;
+
+        float maxVal = float.MinValue;
+        int maxIdx = 0;
+        for (int ph = 0; ph < P; ph++)
+            for (int pw = 0; pw < P; pw++)
+            {
+                int ii = baseOff + (oh * P + ph) * W + (ow * P + pw);
+                if (input[ii] > maxVal) { maxVal = input[ii]; maxIdx = ii; }
+            }
+        output[idx] = maxVal;
+        indices[idx] = maxIdx;
+    }
+
+    /// <summary>
+    /// MaxPool2D backward: scatter gradients to saved argmax positions.
+    /// </summary>
+    public void MaxPool2DBackward(
+        ArrayView1D<float, Stride1D.Dense> gradOutput,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> gradInput,
+        int outputCount, int inputCount)
+    {
+        Zero(gradInput, inputCount);
+        // Scatter — safe for non-overlapping pools (stride == poolSize)
+        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(
+            (Index1D i, ArrayView1D<float, Stride1D.Dense> go, ArrayView1D<int, Stride1D.Dense> idx,
+             ArrayView1D<float, Stride1D.Dense> gi) => { gi[idx[i]] = go[i]; });
+        kernel(outputCount, gradOutput, indices, gradInput);
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  Utilities
     // ═══════════════════════════════════════════════════════════
 
