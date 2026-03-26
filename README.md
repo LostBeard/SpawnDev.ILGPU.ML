@@ -2,27 +2,30 @@
 
 [![NuGet](https://img.shields.io/nuget/v/SpawnDev.ILGPU.ML.svg?)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
 
-[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — Try image classification, style transfer, and super resolution in your browser right now.
+[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — 21 interactive demos: classification, style transfer, depth estimation, object detection, pose estimation, speech-to-text, text generation, background removal, zero-shot CLIP, image generation, and more — all running on your GPU in your browser.
 
-**Hardware-agnostic neural network inference for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
+**Hardware-agnostic neural network inference + training for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
 
-SpawnDev.ILGPU.ML implements neural network inference as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a model file — ONNX, TFLite, GGUF, or any of 7 supported formats — and run it on any of six backends.
+SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a model file — ONNX, TFLite, GGUF, or any of 11 supported formats — and run it on any of six backends. Train custom models directly on your GPU in the browser — no server, no Python, no CUDA install.
 
 > **Active development.** API is stabilizing but may change. Contributions and feedback welcome.
 
 ## Highlights
 
-- **NLP transformers run in the browser** — DistilBERT sentiment analysis, GPT-2 text generation, Whisper speech-to-text — all on WebGPU. No server, no upload, no cloud.
-- **Neural style transfer runs in the browser** — 112-node pipeline, 5 styles, entirely on WebGPU. Turn your photo into a Van Gogh, Monet, or Picasso.
-- **Image classification in-browser** — SqueezeNet identifies "tiger cat" at 51.97% confidence on WebGPU. Drop any photo.
-- **Image super resolution** — ESPCN 3x upscale running on WebGPU. The "enhance!" button is real.
-- **71 ONNX operators** — enough to run classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, and more
-- **11 format parsers** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency parsers for all. Load models from any ML ecosystem through one API: `CreateFromFileAsync()` auto-detects the format. Full round-trip export for SPZ, PLY, glTF, and OBJ.
+- **21 demo pages** — every demo fully functional, loading models from HuggingFace CDN, zero placeholders
+- **14 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM)
+- **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
+- **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
+- **TurboQuant KV cache compression** — 6x compression of attention cache with zero accuracy loss. Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
+- **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
+- **71+ ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
+- **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency. Auto-detected from magic bytes. Full round-trip export for SPZ, PLY, glTF, OBJ. First pure C# SPZ parser.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
-- **HuggingFace CDN** — Models load directly from HuggingFace with OPFS caching. No bundling, no local storage limits. Search, browse, and load any public model.
-- **Single image to 3D** — TripoSR generates exportable 3D meshes (glTF/OBJ for Blender/Unity). LGM generates 65K Gaussian splats (SPZ/PLY for SpawnScene). Both from a single photo.
-- **3D format export & import** — glTF, OBJ, PLY, SPZ. Full round-trip: generate → export → load → render. First pure C# SPZ parser.
-- **96 numpy-verified operator tests** — every operator validated against known-correct reference data
+- **HuggingFace CDN** — All models load from HuggingFace with OPFS caching. No bundling. Search, browse, and load any public model.
+- **Zero-copy GPU pipeline** — Data enters the GPU at preprocessing and stays until the pixel hits the canvas. CanvasRendererFactory for GPU→canvas rendering without CPU readback.
+- **Streaming weight loader** — Large models (GPT-2 652MB) load one tensor at a time. Minimal CPU peak memory. FP16 on GPU supported.
+- **104 numpy-verified operator tests** — every operator validated against known-correct reference data
+- **Single image to 3D** — TripoSR for exportable meshes (glTF/OBJ), LGM for Gaussian splats (SPZ/PLY)
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 
 ## Universal Model Loading
@@ -411,7 +414,7 @@ dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj
 ```
 
 **SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends. Wasm backend: **179 pass / 0 fail / 55 skip** (fiber refactor complete — all RadixSort, scan, barrier, and sort tests pass).
-**SpawnDev.ILGPU.ML: 130+ WebGPU tests** — 96 operator tests, 12 preprocessor tests, 9 HuggingFace CDN tests, 9+ reference model tests (SqueezeNet, 5 styles, ESPCN, YOLOv8, DistilBERT), format loader tests, pipeline tests, and more.
+**SpawnDev.ILGPU.ML: 200+ tests across all backends** — 104 operator tests, 12 preprocessor tests, 9 HuggingFace CDN tests, 11+ reference model tests, format round-trip tests, Blazing Edge GPU kernel tests (FWHT, RoPE, QKNorm, GroupNorm, SelectiveScan, TurboQuant), training engine tests, and more.
 
 Every kernel validates against CPU reference implementations.
 
