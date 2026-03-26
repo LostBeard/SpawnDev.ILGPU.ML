@@ -11,11 +11,31 @@ public static class OnnxParser
     /// <summary>
     /// Parse an ONNX model from raw bytes.
     /// </summary>
-    public static OnnxModelProto Parse(byte[] onnxBytes)
+    public static OnnxModelProto Parse(byte[] onnxBytes) => Parse(onnxBytes, zeroCopyThreshold: -1);
+
+    /// <summary>
+    /// Parse with zero-copy mode for large tensor raw data.
+    /// Tensors with raw_data larger than zeroCopyThreshold bytes store a reference
+    /// to onnxBytes instead of copying. Saves ~147MB per large GPT-2 tensor.
+    /// </summary>
+    public static OnnxModelProto Parse(byte[] onnxBytes, int zeroCopyThreshold)
     {
-        var reader = new ProtobufReader(onnxBytes);
-        return ParseModelProto(ref reader);
+        _zeroCopySource = zeroCopyThreshold >= 0 ? onnxBytes : null;
+        _zeroCopyThreshold = zeroCopyThreshold;
+        try
+        {
+            var reader = new ProtobufReader(onnxBytes);
+            return ParseModelProto(ref reader);
+        }
+        finally
+        {
+            _zeroCopySource = null;
+        }
     }
+
+    // Thread-local zero-copy state (safe for single-threaded WASM)
+    [ThreadStatic] private static byte[]? _zeroCopySource;
+    [ThreadStatic] private static int _zeroCopyThreshold;
 
     /// <summary>
     /// Parse an ONNX model from a ReadOnlySpan.
@@ -181,7 +201,28 @@ public static class OnnxParser
                     }
                     break;
                 case 8: tensor.Name = r.ReadString(); break;                 // name
-                case 9: tensor.RawData = r.ReadByteArray(); break;           // raw_data
+                case 9: // raw_data
+                    if (_zeroCopySource != null)
+                    {
+                        // Zero-copy: store reference into source bytes instead of copying
+                        var (refOffset, refLength) = r.ReadBytesReference();
+                        if (refLength > _zeroCopyThreshold)
+                        {
+                            tensor.RawDataSource = _zeroCopySource;
+                            tensor.RawDataOffset = refOffset;
+                            tensor.RawDataLength = refLength;
+                        }
+                        else
+                        {
+                            tensor.RawData = new byte[refLength];
+                            Buffer.BlockCopy(_zeroCopySource, refOffset, tensor.RawData, 0, refLength);
+                        }
+                    }
+                    else
+                    {
+                        tensor.RawData = r.ReadByteArray();
+                    }
+                    break;
                 case 10: // double_data (packed repeated double)
                     if (wire == 2)
                     {

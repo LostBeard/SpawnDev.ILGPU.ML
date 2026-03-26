@@ -82,7 +82,9 @@ public static class OnnxLoader
     public static (OnnxModelInfo ModelInfo, IEnumerable<(string Name, OnnxTensorProto Tensor)> TensorStream)
         LoadModelStreamingRaw(byte[] onnxBytes)
     {
-        var model = OnnxParser.Parse(onnxBytes);
+        // Zero-copy mode: tensors >1MB reference onnxBytes instead of copying raw_data.
+        // Saves ~147MB per large tensor (critical for GPT-2 in browser WASM).
+        var model = OnnxParser.Parse(onnxBytes, zeroCopyThreshold: 1024 * 1024);
         var modelInfo = ExtractModelInfo(model);
 
         IEnumerable<(string Name, OnnxTensorProto Tensor)> StreamTensors()
@@ -105,6 +107,38 @@ public static class OnnxLoader
         }
 
         return (modelInfo, StreamTensors());
+    }
+
+    /// <summary>
+    /// Extract model info from an already-parsed OnnxModelProto.
+    /// Avoids re-parsing when the model is already in memory.
+    /// </summary>
+    public static OnnxModelInfo ExtractModelInfoFromParsed(OnnxModelProto model)
+    {
+        return ExtractModelInfo(model);
+    }
+
+    /// <summary>
+    /// Stream raw tensor protos from an already-parsed model.
+    /// Avoids re-parsing 652MB of protobuf for the weight upload pass.
+    /// </summary>
+    public static IEnumerable<(string Name, OnnxTensorProto Tensor)> StreamTensorsFromParsed(OnnxModelProto model)
+    {
+        foreach (var init in model.Graph.Initializers)
+        {
+            if (init.DataLocation == 1) continue;
+            yield return (init.Name, init);
+        }
+
+        foreach (var node in model.Graph.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Count > 0)
+            {
+                var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr?.T != null)
+                    yield return (node.Outputs[0], valueAttr.T);
+            }
+        }
     }
 
     /// <summary>

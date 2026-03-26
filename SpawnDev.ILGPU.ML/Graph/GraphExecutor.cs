@@ -147,8 +147,8 @@ public class GraphExecutor : IDisposable
                 Console.Out.Flush();
             }
 
-            // Flush GPU command buffer periodically
-            if (nodeIdx > 0 && nodeIdx % 16 == 0)
+            // Flush GPU command buffer periodically (64 nodes between syncs)
+            if (nodeIdx > 0 && nodeIdx % 64 == 0)
                 _accelerator.Synchronize();
 
             // Register outputs
@@ -309,11 +309,14 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
 
-            // Capture small intermediate outputs as runtime constants (same as sync Run)
+            // Capture small intermediate outputs as runtime constants.
+            // Only sync+readback for truly small shape tensors (≤64 elements) that downstream
+            // operators need for parameter resolution (Slice starts/ends, Reshape dims, Expand shapes).
+            // Was ≤2048 with double-sync per node — killed GPT-2 perf with hundreds of unnecessary syncs.
             for (int oi = 0; oi < nodeOutputs.Length; oi++)
             {
                 var outTensor = nodeOutputs[oi];
-                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 2048)
+                if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
                 {
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
                     if (outName != null && !runtimeConstants.ContainsKey(outName))
@@ -322,7 +325,6 @@ public class GraphExecutor : IDisposable
                         int elCount = outTensor.ElementCount;
                         using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
                         tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
-                        await _accelerator.SynchronizeAsync();
                         runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
                     }
                 }
@@ -367,9 +369,10 @@ public class GraphExecutor : IDisposable
             nodeIdx++;
 
             // Flush GPU command buffer periodically to prevent massive single submissions.
-            if (nodeIdx % 16 == 0)
+            // 64 nodes between syncs balances latency vs throughput (was 16, too many syncs for GPT-2's 2620 nodes).
+            if (nodeIdx % 64 == 0)
             {
-                _accelerator.Synchronize();
+                await _accelerator.SynchronizeAsync();
                 // Now safe to return deferred buffers — GPU has finished reading them
                 foreach (var t in pendingReleases)
                     _pool.Return(t);

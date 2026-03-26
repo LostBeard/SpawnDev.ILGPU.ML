@@ -116,6 +116,26 @@ public class ModelHub : IDisposable
     }
 
     /// <summary>
+    /// Remove a specific cached model file by HuggingFace coordinates.
+    /// </summary>
+    /// <param name="repoId">Repository ID (e.g., "onnx-community/mobilenetv2-12")</param>
+    /// <param name="filename">File within the repo (e.g., "onnx/model.onnx")</param>
+    /// <param name="revision">Git revision (default: "main")</param>
+    public Task RemoveCachedAsync(string repoId, string filename, string revision = "main")
+    {
+        var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
+        return _cache.RemoveAsync(cacheKey);
+    }
+
+    /// <summary>
+    /// Remove a cached item by its raw cache key (as returned by <see cref="ListCachedAsync"/>).
+    /// </summary>
+    public Task RemoveCachedAsync(string cacheKey)
+    {
+        return _cache.RemoveAsync(cacheKey);
+    }
+
+    /// <summary>
     /// Clear all cached models.
     /// </summary>
     public Task ClearCacheAsync()

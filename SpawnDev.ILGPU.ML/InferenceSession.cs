@@ -92,7 +92,7 @@ public class InferenceSession : IDisposable
         // Load weights
         onProgress?.Invoke("weights", 0);
         var weightLoader = new WeightLoader(accelerator, http);
-        await weightLoader.LoadAsync(basePath);
+        await weightLoader.LoadAsync(basePath, onProgress);
         onProgress?.Invoke("weights", 100);
 
         // For Wasm/WebGL, pre-fetch master weight buffer to CPU once.
@@ -285,13 +285,14 @@ public class InferenceSession : IDisposable
     public static async Task<InferenceSession> CreateFromFileAsync(
         Accelerator accelerator, HttpClient http, string modelUrl,
         Action<string, int>? onProgress = null,
-        Dictionary<string, int[]>? inputShapes = null)
+        Dictionary<string, int[]>? inputShapes = null,
+        bool enableOptimization = true)
     {
         onProgress?.Invoke("download", 0);
-        var bytes = await http.GetByteArrayAsync(modelUrl);
+        var bytes = await DownloadBytesChunkedAsync(http, modelUrl, onProgress);
         onProgress?.Invoke("download", 100);
 
-        return CreateFromFile(accelerator, bytes, onProgress, inputShapes);
+        return CreateFromFile(accelerator, bytes, onProgress, inputShapes, enableOptimization);
     }
 
     /// <summary>
@@ -301,12 +302,13 @@ public class InferenceSession : IDisposable
     public static InferenceSession CreateFromFile(
         Accelerator accelerator, byte[] modelBytes,
         Action<string, int>? onProgress = null,
-        Dictionary<string, int[]>? inputShapes = null)
+        Dictionary<string, int[]>? inputShapes = null,
+        bool enableOptimization = true)
     {
         var format = DetectModelFormat(modelBytes);
         return format switch
         {
-            ModelFormat.ONNX => CreateFromOnnx(accelerator, modelBytes, onProgress, inputShapes),
+            ModelFormat.ONNX => CreateFromOnnx(accelerator, modelBytes, onProgress, inputShapes, enableOptimization),
             ModelFormat.TFLite => CreateFromTFLite(accelerator, modelBytes, onProgress),
             ModelFormat.GGUF => CreateFromGGUF(accelerator, modelBytes, onProgress),
             _ => throw new NotSupportedException($"Unknown model format. Expected ONNX (.onnx), TFLite (.tflite), or GGUF (.gguf).")
@@ -405,9 +407,9 @@ public class InferenceSession : IDisposable
         Accelerator accelerator, HttpClient http, string onnxUrl,
         Action<string, int>? onProgress = null)
     {
-        // Download .onnx file
+        // Download .onnx file using chunked download to avoid browser WASM OOM
         onProgress?.Invoke("download", 0);
-        var onnxBytes = await http.GetByteArrayAsync(onnxUrl);
+        var onnxBytes = await DownloadBytesChunkedAsync(http, onnxUrl, onProgress);
         onProgress?.Invoke("download", 100);
 
         return CreateFromOnnx(accelerator, onnxBytes, onProgress);
@@ -424,20 +426,28 @@ public class InferenceSession : IDisposable
         Dictionary<string, int[]>? inputShapes = null,
         bool enableOptimization = true)
     {
-        // Two-pass streaming weight loading for low peak CPU memory:
-        //   Pass 1: capture ONLY small constants (≤64 elements) for graph compilation.
-        //           Large weights are NOT stored — only their names are tracked.
-        //   Pass 2: re-stream ALL weights from onnxBytes, upload each to GPU then release.
-        // Peak CPU memory: one tensor at a time (~few MB) instead of all weights (~548MB for GPT-2).
+        // Single-parse architecture: parse ONNX protobuf ONCE with zero-copy for large tensors.
+        // The parsed model is kept in memory — graph info extracted for compilation,
+        // then tensors streamed to GPU from the same parsed result.
+        // Avoids scanning 652MB of protobuf twice (was the GPT-2 bottleneck).
         onProgress?.Invoke("parse", 0);
-        var (modelInfo, weightStream) = Onnx.OnnxLoader.LoadModelStreaming(onnxBytes);
+        var parsedModel = Onnx.OnnxParser.Parse(onnxBytes, zeroCopyThreshold: 1024 * 1024);
+        var modelInfo = Onnx.OnnxLoader.ExtractModelInfoFromParsed(parsedModel);
         var cpuSmallWeights = new Dictionary<string, float[]>();
-        foreach (var (name, data) in weightStream)
+        foreach (var init in parsedModel.Graph.Initializers)
         {
-            // Only keep small constants needed for graph optimization
-            if (data.Length <= 64)
-                cpuSmallWeights[name] = data;
-            // Large weights: data goes out of scope, GC can collect
+            if (init.DataLocation == 1) continue;
+            if (init.ElementCount <= 64)
+                cpuSmallWeights[init.Name] = init.ToFloatArray();
+        }
+        foreach (var node in parsedModel.Graph.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Count > 0)
+            {
+                var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr?.T != null && valueAttr.T.ElementCount <= 64)
+                    cpuSmallWeights[node.Outputs[0]] = valueAttr.T.ToFloatArray();
+            }
         }
         onProgress?.Invoke("parse", 100);
 
@@ -480,16 +490,22 @@ public class InferenceSession : IDisposable
         // Pass 2: Stream weights to GPU — one tensor at a time, minimal CPU peak.
         // Re-enumerate the ONNX weight stream. Each tensor is uploaded to GPU immediately,
         // then the CPU float[] goes out of scope and can be collected.
+        // GC between passes: free Pass 1 intermediates (cpuSmallWeights, modelInfo, etc.)
+        // to maximize headroom for large tensor raw data in Pass 2.
+        // Critical for browser WASM where 652MB onnxBytes + 147MB tensor = OOM without GC.
+        cpuSmallWeights = null;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
         onProgress?.Invoke("upload", 0);
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
 
-        // Re-stream from ONNX bytes using raw tensor protos.
+        // Stream weights to GPU from the already-parsed model (no second parse).
         // Small tensors: standard float[] path. Large tensors (>1M elements): chunked upload
         // via AllocatePermanentChunked — 1MB chunks, never allocates full float[] (fixes GPT-2 OOM).
-        var (_, tensorStream) = Onnx.OnnxLoader.LoadModelStreamingRaw(onnxBytes);
-        foreach (var (name, tensor) in tensorStream)
+        foreach (var (name, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
@@ -599,12 +615,18 @@ public class InferenceSession : IDisposable
             // Convert typed attributes to JsonElement-backed attributes
             // The GraphNode uses JsonElement for serialization compatibility,
             // but we have typed objects from the ONNX parser. Serialize and re-parse.
+            // ONNX models can contain NaN/Infinity in attributes (e.g., min/max bounds),
+            // so AllowNamedFloatingPointLiterals is required.
             if (node.Attributes.Count > 0)
             {
+                var nanSafeOptions = new System.Text.Json.JsonSerializerOptions
+                {
+                    NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
+                };
                 var jsonDict = new Dictionary<string, System.Text.Json.JsonElement>();
                 foreach (var (key, value) in node.Attributes)
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize(value);
+                    var json = System.Text.Json.JsonSerializer.Serialize(value, nanSafeOptions);
                     jsonDict[key] = System.Text.Json.JsonDocument.Parse(json).RootElement.Clone();
                 }
                 graphNode.Attributes = jsonDict;
@@ -625,7 +647,7 @@ public class InferenceSession : IDisposable
         Action<string, int>? onProgress = null)
     {
         onProgress?.Invoke("download", 0);
-        var tfliteBytes = await http.GetByteArrayAsync(tfliteUrl);
+        var tfliteBytes = await DownloadBytesChunkedAsync(http, tfliteUrl, onProgress);
         onProgress?.Invoke("download", 100);
 
         return CreateFromTFLite(accelerator, tfliteBytes, onProgress);
@@ -703,7 +725,7 @@ public class InferenceSession : IDisposable
         Action<string, int>? onProgress = null)
     {
         onProgress?.Invoke("download", 0);
-        var ggufBytes = await http.GetByteArrayAsync(ggufUrl);
+        var ggufBytes = await DownloadBytesChunkedAsync(http, ggufUrl, onProgress);
         onProgress?.Invoke("download", 100);
 
         return CreateFromGGUF(accelerator, ggufBytes, onProgress);
@@ -800,6 +822,86 @@ public class InferenceSession : IDisposable
         var inShape = InputShapes.Count > 0 ? $"[{string.Join(",", InputShapes.Values.First())}]" : "?";
         var outShape = OutputShapes.Count > 0 ? $"[{string.Join(",", OutputShapes.Values.First())}]" : "?";
         return $"{ModelName}: {NodeCount} nodes, {WeightCount} weights, {string.Join("+", OperatorTypes)}, input={inShape} output={outShape}";
+    }
+
+    /// <summary>
+    /// Download bytes using stream-based chunked reading when possible.
+    /// For desktop backends: uses ResponseHeadersRead for streaming download with progress.
+    /// For browser WASM: falls back to ReadAsByteArrayAsync which works with fetch API.
+    /// Yields periodically to keep the UI thread responsive during long downloads.
+    /// </summary>
+    /// <summary>
+    /// Download bytes using stream-based chunked reading with progress.
+    /// Avoids OOM for large files in browser WASM. Yields periodically for UI responsiveness.
+    /// </summary>
+    public static async Task<byte[]> DownloadBytesChunkedAsync(HttpClient http, string url,
+        Action<string, int>? onProgress = null)
+    {
+        try
+        {
+            using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            response.EnsureSuccessStatusCode();
+
+            var contentLength = response.Content.Headers.ContentLength;
+            using var stream = await response.Content.ReadAsStreamAsync();
+
+            // If content length is known, read in 1MB chunks with progress
+            if (contentLength.HasValue && contentLength.Value > 0)
+            {
+                var result = new byte[contentLength.Value];
+                int totalRead = 0;
+                int lastPercent = -1;
+                int yieldCounter = 0;
+                var buffer = new byte[1024 * 1024]; // 1MB chunks
+                while (totalRead < result.Length)
+                {
+                    int read = await stream.ReadAsync(buffer, 0, Math.Min(buffer.Length, result.Length - totalRead));
+                    if (read == 0) break;
+                    Buffer.BlockCopy(buffer, 0, result, totalRead, read);
+                    totalRead += read;
+
+                    int pct = (int)(totalRead * 100L / result.Length);
+                    if (pct != lastPercent)
+                    {
+                        lastPercent = pct;
+                        onProgress?.Invoke("download", pct);
+                    }
+
+                    // Yield every 4MB to keep UI responsive
+                    if (++yieldCounter % 4 == 0)
+                        await Task.Yield();
+                }
+
+                // Verify we got data — browser WASM may return 0 bytes with streaming
+                if (totalRead > 0)
+                    return totalRead == result.Length ? result : result[..totalRead];
+            }
+            else
+            {
+                // Unknown length: stream into expanding MemoryStream
+                using var ms = new MemoryStream();
+                var unknownBuffer = new byte[1024 * 1024];
+                int unknownYield = 0;
+                int bytesRead;
+                while ((bytesRead = await stream.ReadAsync(unknownBuffer, 0, unknownBuffer.Length)) > 0)
+                {
+                    ms.Write(unknownBuffer, 0, bytesRead);
+                    if (++unknownYield % 4 == 0)
+                        await Task.Yield();
+                }
+                if (ms.Length > 0)
+                    return ms.ToArray();
+            }
+        }
+        catch { /* Streaming download not supported — fall through to ReadAsByteArrayAsync */ }
+
+        // Fallback: standard byte array download (works on all platforms including browser WASM)
+        onProgress?.Invoke("download", 0);
+        using var fallbackResponse = await http.GetAsync(url);
+        fallbackResponse.EnsureSuccessStatusCode();
+        var bytes = await fallbackResponse.Content.ReadAsByteArrayAsync();
+        onProgress?.Invoke("download", 100);
+        return bytes;
     }
 
     public void Dispose()

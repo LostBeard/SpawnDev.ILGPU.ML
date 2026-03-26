@@ -200,7 +200,9 @@ public abstract partial class MLTestBase
             ["attention_mask"] = new[] { 1, 6 },
         };
 
-        var onnxBytes = await http.GetByteArrayAsync("models/distilbert-sst2/model.onnx");
+        // Load from HuggingFace CDN — 255MB should not be self-hosted
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model.onnx");
 
         // Capture per-node outputs to find where values diverge
         Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
@@ -258,15 +260,17 @@ public abstract partial class MLTestBase
 
     // ── Text Generation Reference Test ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 600000)] // 10 min — GPT-2 is 652MB + 2620 nodes, needs time on WebGPU
     public async Task Reference_GPT2_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         // GPT-2 has dynamic dims and int64 inputs. Optimizer crashes on NLP models.
-        var onnxBytes = await http.GetByteArrayAsync("models/gpt2/model.onnx");
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        // Load from HuggingFace CDN — NOT local wwwroot (652MB should not be self-hosted).
+        // Uses chunked streaming download with progress.
+        var gpt2Url = "https://huggingface.co/onnxmodelzoo/gpt2-10/resolve/main/gpt2-10.onnx";
+        var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
@@ -305,19 +309,22 @@ public abstract partial class MLTestBase
         using var maskBuf = accelerator.Allocate1D(attentionMask);
         using var posBuf = accelerator.Allocate1D(positionIds);
 
-        var inputs = new Dictionary<string, Tensor>
-        {
-            [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 }),
-            [session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 }),
-            [session.InputNames[2]] = new Tensor(posBuf.View, new[] { 1, 5 }),
-        };
+        var inputs = new Dictionary<string, Tensor>();
+        inputs[session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 });
+        if (session.InputNames.Length > 1)
+            inputs[session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 });
+        if (session.InputNames.Length > 2)
+            inputs[session.InputNames[2]] = new Tensor(posBuf.View, new[] { 1, 5 });
 
+        Console.WriteLine($"[GPT-2] Running inference with {inputs.Count} inputs: [{string.Join(", ", inputs.Keys)}]");
         var outputs = await session.RunAsync(inputs);
-        var output = outputs[session.OutputNames[0]];
+        Console.WriteLine($"[GPT-2] Inference complete. Outputs: [{string.Join(", ", outputs.Keys)}]");
+        var output = outputs.Values.First();
+        Console.WriteLine($"[GPT-2] Output shape: [{string.Join(",", output.Shape)}], elements: {output.ElementCount}");
 
-        // GPT-2 output: [1, 5, 50257] — get last token's logits
-        int vocabSize = 50257;
-        int lastTokenOffset = 4 * vocabSize; // token index 4 (last)
+        // GPT-2 output: [1, 5, 50257] or [1, 5, vocab] — get last token's logits
+        int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
+        int lastTokenOffset = (output.ElementCount / vocabSize - 1) * vocabSize; // last position
         using var readBuf = accelerator.Allocate1D<float>(vocabSize);
         new ElementWiseKernels(accelerator).Scale(
             output.Data.SubView(lastTokenOffset, vocabSize), readBuf.View, vocabSize, 1f);
@@ -392,7 +399,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         // Depth Anything has dynamic dims — override to 224x224 for browser-safe testing
-        var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
 
         try
         {

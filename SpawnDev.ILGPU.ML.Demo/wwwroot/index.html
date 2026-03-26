@@ -42,6 +42,8 @@
         <a href="." class="reload">Reload</a>
         <span class="dismiss">🗙</span>
     </div>
+    <!-- Enable cross-origin isolation for SharedArrayBuffer (multi-worker Wasm) -->
+    <script src="blazor-coi-serviceworker.js"></script>
     <script src="_framework/blazor.webassembly#[.{fingerprint}].js"></script>
 </body>
 

@@ -599,6 +599,14 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
+        // Normalize scalar inputs: treat rank-0 tensors as [1] for concat purposes.
+        // Common in Shape→Gather→Unsqueeze→Concat chains where Gather outputs a scalar.
+        for (int n = 0; n < ctx.Inputs.Length; n++)
+        {
+            if (ctx.Inputs[n].Shape.Length == 0 && ctx.Inputs[n].ElementCount > 0)
+                ctx.Inputs[n] = new Tensors.Tensor(ctx.Inputs[n].Data, new[] { ctx.Inputs[n].ElementCount }, ctx.Inputs[n].Name);
+        }
+
         int axis = ctx.GetInt("axis", 0);
         if (axis < 0) axis += ctx.Inputs[0].Shape.Length;
 
@@ -996,6 +1004,7 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             for (int ri = 0; ri < rAxes.Length; ri++)
             {
                 int rax = rAxes[ri] < 0 ? rAxes[ri] + rank : rAxes[ri];
+                if (rax < 0 || rax >= rank) continue; // Skip out-of-range axes
                 starts[rax] = resolvedStarts[ri];
                 ends[rax] = resolvedEnds[ri];
                 if (ri < rSteps.Length) steps[rax] = rSteps[ri];
@@ -1035,7 +1044,10 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < axes.Length; i++)
         {
             int ax = axes[i] < 0 ? axes[i] + rank : axes[i];
-            int s = starts[i]; int e = ends[i]; int st = steps[i];
+            if (ax < 0 || ax >= rank) continue; // Skip out-of-range axes
+            int s = i < starts.Length ? starts[i] : 0;
+            int e = i < ends.Length ? ends[i] : inShape[ax];
+            int st = i < steps.Length ? steps[i] : 1;
             if (s < 0) s += inShape[ax];
             if (e < 0) e += inShape[ax];
             s = Math.Clamp(s, 0, inShape[ax]);

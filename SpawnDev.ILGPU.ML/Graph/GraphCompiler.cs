@@ -243,9 +243,11 @@ public class GraphCompiler
                     var shapeSteps = node.Inputs.Count > 4 && graph.ConstantData.TryGetValue(node.Inputs[4], out var ss)
                         ? ss : Enumerable.Repeat(1, shapeStarts.Length).ToArray();
                     var outShape = (int[])inputShapes[0].Clone();
-                    for (int si = 0; si < shapeAxes.Length; si++)
+                    bool sliceValid = true;
+                    for (int si = 0; si < shapeAxes.Length && sliceValid; si++)
                     {
                         int ax = shapeAxes[si] < 0 ? shapeAxes[si] + outShape.Length : shapeAxes[si];
+                        if (ax < 0 || ax >= outShape.Length) { sliceValid = false; break; }
                         int s = shapeStarts[si]; int e = shapeEnds[si]; int step = Math.Abs(shapeSteps[si]);
                         if (step == 0) step = 1;
                         if (s < 0) s += outShape[ax];
@@ -254,7 +256,8 @@ public class GraphCompiler
                         e = Math.Clamp(e, 0, outShape[ax]);
                         outShape[ax] = Math.Max(0, (e - s + step - 1) / step);
                     }
-                    outputShapes = new[] { outShape };
+                    if (sliceValid)
+                        outputShapes = new[] { outShape };
 
                     // Store resolved slice params in the typed attrs dict so the executor
                     // can read them at runtime via GetInts("_resolved_starts") etc.
@@ -426,6 +429,32 @@ public class GraphCompiler
                         for (int j = 1; j < outRank; j++) outShape[j] = 1;
                         outputShapes = new[] { outShape };
                     }
+                }
+            }
+
+            // Special-case: Expand needs the shape tensor to compute broadcast output shape.
+            // Second input is a 1D tensor of target dimensions. Output = numpy-broadcast(input, target).
+            if (node.OpType == "Expand" && node.Inputs.Count >= 2)
+            {
+                var shapeTensorName = node.Inputs[1];
+                if (graph.ConstantData != null && graph.ConstantData.TryGetValue(shapeTensorName, out var targetDims))
+                {
+                    // Numpy-style broadcast: pad shorter shape with leading 1s, then max per dim
+                    var inShape = inputShapes[0];
+                    int outRank = Math.Max(inShape.Length, targetDims.Length);
+                    var outShape = new int[outRank];
+                    for (int j = 0; j < outRank; j++)
+                    {
+                        int inDim = j < outRank - inShape.Length ? 1 : inShape[j - (outRank - inShape.Length)];
+                        int tgtDim = j < outRank - targetDims.Length ? 1 : targetDims[j - (outRank - targetDims.Length)];
+                        outShape[j] = Math.Max(inDim, tgtDim);
+                    }
+                    outputShapes = new[] { outShape };
+                }
+                else
+                {
+                    var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
+                    Console.WriteLine($"[SHAPE_WARN] Expand '{outName}': shape tensor '{shapeTensorName}' not in ConstantData — using fallback");
                 }
             }
 

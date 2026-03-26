@@ -56,6 +56,11 @@ public static class TokenizerLoader
     }
 
     /// <summary>
+    /// Parse a tokenizer.json string directly (when content is already loaded).
+    /// </summary>
+    public static LoadedTokenizer FromTokenizerJson(string json) => ParseTokenizerJson(json);
+
+    /// <summary>
     /// Parse HuggingFace fast tokenizer format (tokenizer.json).
     /// This is a complex JSON structure but we only need the model vocabulary and merges.
     /// </summary>

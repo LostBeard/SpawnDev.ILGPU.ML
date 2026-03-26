@@ -221,15 +221,20 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        var output = ctx.Outputs[0];
+
         if (a.ElementCount == b.ElementCount)
         {
-            reg.ElementWise.Add(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            // Safe two-step: copy a → output, then add b in-place.
+            // Avoids 3-way aliasing (a, b, output may share same GPU buffer on WebGPU).
+            reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
+            reg.ElementWise.AddInPlace(output.Data, b.Data, a.ElementCount);
         }
         else if (b.ElementCount == a.Shape[^1])
         {
-            // Last-dim broadcast: b[C] + a[..., C]
-            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
-            reg.ElementWise.AddBias(ctx.Outputs[0].Data, b.Data, a.ElementCount, b.ElementCount);
+            // Last-dim broadcast: copy a → output, then AddBias in-place
+            reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
+            reg.ElementWise.AddBias(output.Data, b.Data, a.ElementCount, b.ElementCount);
         }
         else if (a.Rank == 4 && b.Rank == 1 && b.ElementCount == a.Shape[1])
         {
@@ -470,14 +475,100 @@ public class ConstantOfShapeOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class RangeOperator : IOnnxOperator
+public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Range";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { new[] { 1 } }; // Dynamic
+        => new[] { new[] { 1 } }; // Dynamic — resolved at runtime from scalar inputs
     public void Execute(OnnxOpContext ctx)
     {
-        throw new NotSupportedException("Range requires CPU scalar readback — not yet implemented");
+        // Range(start, limit, delta) → [start, start+delta, ..., <limit)
+        // Inputs are scalar tensors — read from runtime constants
+        var startVals = ctx.TryGetInputValues(0);
+        var limitVals = ctx.TryGetInputValues(1);
+        var deltaVals = ctx.TryGetInputValues(2);
+
+        if (startVals == null || limitVals == null || deltaVals == null)
+            throw new NotSupportedException("Range: scalar inputs not available as runtime constants");
+
+        float start = startVals[0];
+        float limit = limitVals[0];
+        float delta = deltaVals[0];
+
+        if (delta == 0) throw new ArgumentException("Range: delta cannot be 0");
+
+        int count = Math.Max(0, (int)MathF.Ceiling((limit - start) / delta));
+        var data = new float[count];
+        for (int i = 0; i < count; i++)
+            data[i] = start + i * delta;
+
+        // Upload to output GPU buffer
+        var output = ctx.Outputs[0];
+        if (output.ElementCount >= count)
+        {
+            using var tmpBuf = reg.Accelerator.Allocate1D(data);
+            reg.ElementWise.Scale(tmpBuf.View, output.Data.SubView(0, count), count, 1f);
+        }
+    }
+}
+
+/// <summary>
+/// NonZero: returns indices of non-zero elements as [rank, nnz] tensor.
+/// For attention masks (all 1s), returns all coordinate pairs.
+/// Data-dependent output size — reads input values from runtime constants.
+/// </summary>
+public class NonZeroOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "NonZero";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { new[] { inputs[0].Length, inputs[0].Aggregate(1, (a, b) => a * b) } }; // [rank, max_nnz]
+    public void Execute(OnnxOpContext ctx)
+    {
+        var input = ctx.Inputs[0];
+        var inShape = input.Shape;
+        int rank = inShape.Length;
+        int totalElems = input.ElementCount;
+
+        // Read input values — NonZero is inherently data-dependent
+        var vals = ctx.TryGetInputValues(0);
+        if (vals == null)
+        {
+            // Can't read values — assume all non-zero (common for attention masks)
+            vals = new float[totalElems];
+            for (int i = 0; i < totalElems; i++) vals[i] = 1f;
+        }
+
+        // Find non-zero indices
+        var indices = new List<int[]>();
+        var strides = new int[rank];
+        if (rank > 0) strides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * inShape[d + 1];
+
+        for (int i = 0; i < totalElems; i++)
+        {
+            if (vals[i] != 0f)
+            {
+                var coord = new int[rank];
+                int rem = i;
+                for (int d = 0; d < rank; d++) { coord[d] = rem / strides[d]; rem %= strides[d]; }
+                indices.Add(coord);
+            }
+        }
+
+        // Output: [rank, nnz] — each row is one dimension's indices
+        int nnz = indices.Count;
+        var result = new float[rank * nnz];
+        for (int d = 0; d < rank; d++)
+            for (int j = 0; j < nnz; j++)
+                result[d * nnz + j] = indices[j][d];
+
+        var output = ctx.Outputs[0];
+        int copyLen = Math.Min(result.Length, output.ElementCount);
+        if (copyLen > 0)
+        {
+            using var tmpBuf = reg.Accelerator.Allocate1D(result);
+            reg.ElementWise.Scale(tmpBuf.View.SubView(0, copyLen), output.Data.SubView(0, copyLen), copyLen, 1f);
+        }
     }
 }
 

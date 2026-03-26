@@ -47,6 +47,12 @@ public class OnnxTensorProto
     /// <summary>Raw tensor data (most common storage format). Little-endian, fixed-width.</summary>
     public byte[]? RawData { get; set; }
 
+    /// <summary>Zero-copy reference into source bytes — avoids 147MB+ allocation for large tensors.
+    /// When set, RawData is null and data should be read from RawDataSource[RawDataOffset..+RawDataLength].</summary>
+    public byte[]? RawDataSource { get; set; }
+    public int RawDataOffset { get; set; }
+    public int RawDataLength { get; set; }
+
     /// <summary>Float data (packed repeated float, proto field 4). Used when raw_data is absent.</summary>
     public float[]? FloatData { get; set; }
 
@@ -77,20 +83,28 @@ public class OnnxTensorProto
         int count = (int)ElementCount;
         if (count == 0) return Array.Empty<float>();
 
+        // Resolve raw data — either direct or zero-copy reference
+        var rawData = RawData;
+        if (rawData == null && RawDataSource != null && RawDataLength > 0)
+        {
+            rawData = new byte[RawDataLength];
+            Buffer.BlockCopy(RawDataSource, RawDataOffset, rawData, 0, RawDataLength);
+        }
+
         // raw_data is the most common format
-        if (RawData != null && RawData.Length > 0)
+        if (rawData != null && rawData.Length > 0)
         {
             return DataType switch
             {
-                1 => ReadRawFloats(RawData, count),           // FLOAT
-                10 => ReadRawFloat16s(RawData, count),        // FLOAT16
-                11 => ReadRawDoublesAsFloats(RawData, count), // DOUBLE
-                6 => ReadRawInt32sAsFloats(RawData, count),   // INT32
-                7 => ReadRawInt64sAsFloats(RawData, count),   // INT64
-                2 => ReadRawUint8sAsFloats(RawData, count),   // UINT8
-                3 => ReadRawInt8sAsFloats(RawData, count),    // INT8
-                16 => ReadRawBFloat16sAsFloats(RawData, count), // BFLOAT16
-                9 => ReadRawBoolsAsFloats(RawData, count),     // BOOL
+                1 => ReadRawFloats(rawData, count),           // FLOAT
+                10 => ReadRawFloat16s(rawData, count),        // FLOAT16
+                11 => ReadRawDoublesAsFloats(rawData, count), // DOUBLE
+                6 => ReadRawInt32sAsFloats(rawData, count),   // INT32
+                7 => ReadRawInt64sAsFloats(rawData, count),   // INT64
+                2 => ReadRawUint8sAsFloats(rawData, count),   // UINT8
+                3 => ReadRawInt8sAsFloats(rawData, count),    // INT8
+                16 => ReadRawBFloat16sAsFloats(rawData, count), // BFLOAT16
+                9 => ReadRawBoolsAsFloats(rawData, count),     // BOOL
                 _ => throw new NotSupportedException($"Unsupported tensor data type: {DataType}")
             };
         }

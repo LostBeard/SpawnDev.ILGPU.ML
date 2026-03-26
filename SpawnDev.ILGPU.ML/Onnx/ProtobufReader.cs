@@ -79,6 +79,17 @@ public ref struct ProtobufReader
         return ReadBytes().ToArray();
     }
 
+    /// <summary>Read a length-delimited field length and skip past it, returning the offset and length.
+    /// Zero-copy alternative to ReadByteArray for large fields — caller reads from source array directly.</summary>
+    public (int offset, int length) ReadBytesReference()
+    {
+        int length = (int)ReadVarint();
+        if (_pos + length > _data.Length) throw new InvalidOperationException($"Length-delimited field extends past end of data");
+        int offset = _pos;
+        _pos += length;
+        return (offset, length);
+    }
+
     /// <summary>Read a length-delimited field as a UTF-8 string.</summary>
     public string ReadString()
     {

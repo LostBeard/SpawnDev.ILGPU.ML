@@ -136,9 +136,11 @@ public class OperatorRegistry
         Register(new IsNaNOperator(this));
         Register(new NotOperator(this));
         Register(new ConstantOfShapeOperator(this));
-        Register(new RangeOperator());
+        Register(new RangeOperator(this));
         Register(new HardSigmoidOperator(this));
         Register(new HardSwishOperator(this));
+
+        Register(new NonZeroOperator(this));
 
         // Operators from #2
         Register(new DepthToSpaceOperator(_accelerator));

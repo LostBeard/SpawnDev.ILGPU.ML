@@ -41,26 +41,27 @@ public class WeightLoader
 
     /// <summary>
     /// Load all weights from the pre-extracted binary blob.
-    /// Fetches manifest + blob via HTTP, converts FP16→FP32, uploads to GPU.
+    /// Fetches manifest + blob via HTTP (chunked streaming), converts FP16→FP32, uploads to GPU.
+    /// Reports progress through onProgress callback: ("download", 0-100), ("convert", 0-100), ("upload", 0-100).
     /// </summary>
-    public async Task LoadAsync(string basePath = "models/dav3_weights")
+    public async Task LoadAsync(string basePath = "models/dav3_weights", Action<string, int>? onProgress = null)
     {
         if (IsLoaded) return;
 
-        
         var accelerator = _accelerator;
-
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
-        // Fetch manifest
+        // Fetch manifest (small — direct download is fine)
         Console.WriteLine($"[WeightLoader] Loading manifest...");
+        onProgress?.Invoke("manifest", 0);
         var manifestJson = await _http.GetStringAsync($"{basePath}/manifest_fp16.json");
         var manifest = JsonSerializer.Deserialize<Dictionary<string, TensorInfo>>(manifestJson)!;
         Console.WriteLine($"[WeightLoader] Manifest: {manifest.Count} tensors");
+        onProgress?.Invoke("manifest", 100);
 
-        // Fetch binary blob
+        // Fetch binary blob — chunked streaming to avoid OOM and keep UI responsive
         Console.WriteLine($"[WeightLoader] Downloading weight blob...");
-        var blob = await _http.GetByteArrayAsync($"{basePath}/weights_fp16.bin");
+        var blob = await InferenceSession.DownloadBytesChunkedAsync(_http, $"{basePath}/weights_fp16.bin", onProgress);
         Console.WriteLine($"[WeightLoader] Blob: {blob.Length / (1024.0 * 1024.0):F1} MB");
 
         // Convert all weights to one contiguous FP32 array, track offsets.
@@ -68,9 +69,13 @@ public class WeightLoader
         // create overlapping binding ranges after WebGPU's 256-byte alignment.
         const int ALIGN_FLOATS = 64; // 256 bytes / 4 bytes per float
         Console.WriteLine($"[WeightLoader] Converting FP16 → FP32...");
+        onProgress?.Invoke("convert", 0);
         int totalElements = manifest.Values.Sum(v => ((v.elements + ALIGN_FLOATS - 1) / ALIGN_FLOATS) * ALIGN_FLOATS);
         var allWeights = new float[totalElements];
         int currentOffset = 0;
+        int tensorsDone = 0;
+        int tensorCount = manifest.Count;
+        int lastConvertPct = -1;
 
         foreach (var (name, info) in manifest)
         {
@@ -89,12 +94,25 @@ public class WeightLoader
             _tensorSlices[name] = (currentOffset, info.elements);
             Shapes[name] = info.shape;
             currentOffset += info.elements;
+
+            // Report conversion progress + yield to keep UI responsive
+            tensorsDone++;
+            int pct = tensorsDone * 100 / tensorCount;
+            if (pct != lastConvertPct)
+            {
+                lastConvertPct = pct;
+                onProgress?.Invoke("convert", pct);
+            }
+            if (tensorsDone % 50 == 0)
+                await Task.Yield();
         }
 
         // Single GPU allocation + upload (avoids 340 separate Allocate1D calls)
         Console.WriteLine($"[WeightLoader] Uploading {totalElements:N0} params ({totalElements * 4 / (1024.0 * 1024.0):F1} MB FP32) as single buffer...");
+        onProgress?.Invoke("upload", 0);
         _weightBuffer = accelerator.Allocate1D(allWeights);
         await accelerator.SynchronizeAsync();
+        onProgress?.Invoke("upload", 100);
 
         sw.Stop();
         Console.WriteLine($"[WeightLoader] Loaded {_tensorSlices.Count} tensors in {sw.Elapsed.TotalSeconds:F1}s (1 GPU buffer)");

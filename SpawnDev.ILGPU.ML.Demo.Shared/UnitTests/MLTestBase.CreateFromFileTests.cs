@@ -218,7 +218,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         Console.WriteLine("[DepthInference] Loading model...");
-        var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
         var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -272,7 +272,7 @@ public abstract partial class MLTestBase
         var (pixels, width, height) = await LoadCatImage(http);
         Console.WriteLine($"[DepthCat] Cat image: {width}x{height}");
 
-        var onnxBytes = await http.GetByteArrayAsync("models/depth-anything-v2-small/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
         var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>

@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 
 namespace SpawnDev.ILGPU.ML.Tensors;
 
@@ -100,19 +101,29 @@ public class BufferPool : IDisposable
         const int CHUNK = 262144; // 256K floats = 1MB
         var chunk = new float[Math.Min(CHUNK, count)];
 
+        // Determine raw data source — either RawData copy or zero-copy reference
+        byte[]? rawBytes = tensor.RawData;
+        int rawOffset = 0;
+        if (rawBytes == null && tensor.RawDataSource != null)
+        {
+            rawBytes = tensor.RawDataSource;
+            rawOffset = tensor.RawDataOffset;
+        }
+
         // Convert and upload chunk by chunk
         // For FLOAT raw data (most common large tensor type): direct BlockCopy
-        if (tensor.RawData != null && tensor.RawData.Length > 0 && tensor.DataType == 1)
+        // Uses Scale(1.0f) for GPU→GPU copy — CopyTo is not supported on WebGPU.
+        if (rawBytes != null && rawBytes.Length > 0 && tensor.DataType == 1)
         {
+            var ew = new ElementWiseKernels(_accelerator);
             int offset = 0;
             while (offset < count)
             {
                 int n = Math.Min(CHUNK, count - offset);
-                Buffer.BlockCopy(tensor.RawData, offset * 4, chunk, 0, n * 4);
-                // Use Allocate1D(chunk_slice) + CopyTo for SubView upload
-                using var tempBuf = _accelerator.Allocate1D<float>(n);
-                tempBuf.View.CopyFromCPU(chunk);
-                tempBuf.View.CopyTo(buffer.View.SubView(offset, n));
+                var chunkSlice = new float[n];
+                Buffer.BlockCopy(rawBytes, rawOffset + offset * 4, chunkSlice, 0, n * 4);
+                using var tempBuf = _accelerator.Allocate1D(chunkSlice);
+                ew.Scale(tempBuf.View, buffer.View.SubView(offset, n), n, 1f);
                 offset += n;
             }
         }
@@ -120,7 +131,7 @@ public class BufferPool : IDisposable
         {
             // Other formats: convert full tensor (fallback — rare for large tensors)
             var data = tensor.ToFloatArray();
-            buffer.View.CopyFromCPU(data);
+            buffer.CopyFromCPU(data);
         }
 
         return new Tensor(buffer.View, shape, name);
