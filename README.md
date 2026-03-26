@@ -383,15 +383,17 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 
 ## Recent Breakthroughs
 
-- **NLP transformers working** — DistilBERT sentiment analysis passes reference test. 10-bug fix chain: ConstantOfShape value attribute, Expand N-D broadcasting, Unsqueeze shape inference, Slice constant folding, Cast constant propagation, INT64_MAX overflow, Gemm higher-rank inputs. The same fixes unblock GPT-2, Whisper, and all transformer architectures.
-- **HuggingFace CDN integration** — All models load from HuggingFace with OPFS caching. 1.25GB of model files removed from repo. Search, browse, and load any public model. 15 known models pre-configured.
-- **96 operator test cases** — Expanded from 18 to 96 numpy-verified test cases covering MatMul, Gemm, LayerNorm, BatchNorm, InstanceNorm, all activations, all reductions, Gather, Split, Expand, Unsqueeze, Cast, Pad, Resize, comparisons, and more. Caught 11 real operator bugs.
-- **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. All zero-dependency, all auto-detected. SPZ/PLY/glTF/OBJ export for 3D data.
-- **6-pass graph optimizer** — constant folding (with explicit Slice/Cast/Sqrt handlers), identity elimination, linear fusion, scaled MatMul fusion, strength reduction, dead node elimination.
-- **Fused linear kernel** — `MatMul + Bias + Activation` in a single GPU dispatch. Eliminates 2/3 of memory bandwidth for every linear layer in every model.
-- **Zero-copy style transfer** — entire pipeline (preprocess → inference → postprocess) stays on GPU. No CPU pixel loops.
-- **InstanceNorm 50,000x speedup** — Two-pass O(N) kernel. Style transfer went from infinite hang to 3.9 seconds.
-- **Register-blocked MatMul** — 4x4 per thread, 64x64 tiles. Targeting 200+ GFLOPS (current tiled: 92-101).
+- **GPU training engine** — Full backpropagation on WebGPU: SoftmaxCE, ReLU backward, Conv2D backward, MaxPool backward, Linear backward, SGD, Adam. Train CNNs in the browser on your GPU. Draw → Train → Classify in one browser tab.
+- **Streaming weight loader** — Large models (GPT-2 652MB, SD-Turbo 2.5GB) load one tensor at a time. Peak CPU: ~few MB. Eliminates OOM for any model that fits on GPU.
+- **Tiered LLM** — Auto-detect GPU VRAM and load the best model: Phi-4 Mini 3.8B (4GB+), Mistral NeMo 12B (8GB+), or Phi-4 14B (12GB+). User-selectable override.
+- **DelegateSpecialization broadcast kernel** — One GPU kernel handles Add, Sub, Mul, Div for arbitrary N-D shapes. Compile-time inlined ops via SpawnDev.ILGPU's DelegateSpecialization. Found and fixed a 5+ param router bug in SpawnDev.ILGPU along the way.
+- **DepthAnything V2 passes** — 823-node DPT decoder producing correct depth output. Fixed: hardcoded Div in broadcast path, buffer aliasing, decomposed LayerNorm chain. End-to-end depth estimation in the browser.
+- **DistilBERT + Whisper passing** — First NLP transformers on the engine. 10-bug fix chain including ConstantOfShape, Expand, Slice constant folding, Cast propagation, INT64_MAX overflow, Gemm higher-rank inputs.
+- **104 operator test cases** — Expanded from 18, caught 11+ real bugs. Includes broadcast LayerNorm patterns that prevent regression of the deepest bugs we found.
+- **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. First pure C# SPZ parser. Full round-trip for all 3D formats.
+- **DiffusionPipeline** — DDPM denoising loop + SD-Turbo one-step generation. Image generation from text prompts on WebGPU.
+- **22 demo pages, 0 placeholders** — Every demo fully functional, all loading from HuggingFace CDN, zero "not yet deployed" messages.
+- **200+ tests, 0 failures** — Operator tests, reference model tests, Blazing Edge GPU kernel tests, format round-trips, training engine tests, KV cache analysis tests. All passing.
 
 ## Blazing Edge — v4.0.0
 
@@ -404,8 +406,11 @@ SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML researc
 | **Depth Anything V3** | Multi-view depth + ray maps with temporal consistency | Eliminates depth flicker in video. Treats video as multi-view sequence, not isolated frames. Critical for 2D-to-3D conversion. |
 | **AsyncMDE** | Asynchronous Spatial Memory decouples depth from render loop | Real-time depth estimation at video framerate on standard hardware. No UI lockup during GPU computation. |
 | **Mamba-3** | Linear-scaling State Space Models with MIMO arithmetic intensity | Constant-memory decoding — LLM conversations don't slow down or eat more RAM over time. Closes gap with Transformers while keeping O(n) scaling. |
+| **Tiered LLM** | Auto-detect GPU VRAM, load the best LLM: Phi-4 Mini 3.8B (4GB+), Mistral NeMo 12B (8GB+), Phi-4 14B (12GB+) | Every user gets the best conversational AI their hardware can deliver. User-selectable override. All MIT/Apache 2.0. Streamed to GPU via GGUF Q4 + TurboQuant KV cache. |
+| **SD-Turbo** | ONE inference step → 512x512 image from text prompt | Real Stable Diffusion in the browser. Type a sentence, get art in ~1 second. 2.5GB FP16 streamed to GPU. |
 | **TripoSR** | Single photo → full 3D textured mesh via DINOv1 + Triplane transformer + Marching Cubes | Export as glTF/OBJ — use in Blender, Unity, game engines, 3D printing. ~840MB FP16, feed-forward (no diffusion). |
 | **LGM** | Single photo → 65,536 photorealistic Gaussian splats | Fly through 3D scenes in SpawnScene. Export as SPZ (15-20x compressed) or PLY. Integrates with the emerging Khronos glTF Gaussian Splatting standard. |
+| **GPU Training** | Train CNNs in the browser — backpropagation, Adam optimizer, live loss curves | Draw custom gestures → train a classifier in seconds on your GPU → classify in real-time. Full training engine in C# compute shaders. |
 
 These aren't future plans — they're v4.0.0 features. Because every release is the last release.
 
@@ -435,13 +440,13 @@ SpawnDev.ILGPU.ML would not be possible without:
 
 SpawnDev.ILGPU.ML v4.0.0 was developed collaboratively by TJ (Todd Tanner / [@LostBeard](https://github.com/LostBeard)) and a team of AI agents who contributed extensively to research, analysis, debugging, and code development — continuing the human-AI collaboration model established in [SpawnDev.ILGPU v4.6.0](https://github.com/LostBeard/SpawnDev.ILGPU).
 
-- **Riker (Claude CLI #1)** — Lead Editor. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Drove the v4.0.0 release: 7-part style transfer fix chain (bilinear floor, compile-time evaluation, Upsample shape inference, ONNX Constant node extraction), systemic bilinear interpolation fix across 6 kernel files, InstanceNorm two-pass restructure, WebGL bias-branch ANGLE workaround, and comprehensive multi-backend test coverage. The debugger who doesn't stop until the cat is a cat.
+- **Riker (Claude CLI #1)** — Lead Editor. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Drove the v4.0.0 release across two marathon sessions: 200+ commits, 14 pipelines, 30 GPU kernels, 22 demo pages, GPU training engine (full backpropagation), DiffusionPipeline, TurboQuant encode/decode/fused-attention pipeline, streaming weight loader, DelegateSpecialization broadcast kernel, DepthAnything end-to-end fix (hardcoded Div → correct dispatch), all 3D format parsers/exporters (SPZ, PLY, glTF, OBJ), chat templates, and zero-placeholder demos. Fixed the DelegateSpecialization 5+ param bug in SpawnDev.ILGPU (49/49 all backends). The engineer who built the ship.
 
-- **Data (Claude CLI #2)** — Research/Assist. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Built the ONNX Runtime reference testing framework — generated ground truth outputs for all 9 models (SqueezeNet, 5 style transfer, ESPCN, MoveNet, YOLOv8, BlazeFace, EfficientNet-Lite0) enabling per-element validation against a known-correct implementation. Provided per-layer intermediate tensor dumps that pinpointed the style transfer divergence to the Upsample constant propagation chain. Root-caused the Wasm OOB memory bug (SubView parent buffer copies) and delivered the fix design. Also led the [V8 Atomics.wait bug report](https://issues.chromium.org/issues/495679735) with a [live interactive demo](https://lostbeard.github.io/v8-atomics-wait-bug/) — an upstream contribution to the V8 engine discovered during SpawnDev.ILGPU development.
+- **Data (Claude CLI #2)** — Research/Assist. Built by [Anthropic](https://anthropic.com). Powered by Claude Opus 4.6. Generated all reference data (104 operator test cases, NLP/audio/tokenizer/TurboQuant/GroupNorm/RoPE/SelectiveScan/SPZ/PLY/glTF references). Root-caused DistilBERT (ConstantData destruction + pre-classifier trace), DepthAnything (BroadcastBinaryOp hardcoded Div + decomposed LayerNorm analysis), and the streaming weight loader design. Researched all 7 Blazing Edge technologies (TurboQuant, SPZ, DA3, AsyncMDE, Mamba-3, TripoSR, LGM) with full implementation designs. Wrote 20+ unit tests, pipeline API designs, visual editor design, KVCacheAnalyzer, and exported DDPM MNIST ONNX. Also led the [V8 Atomics.wait bug report](https://issues.chromium.org/issues/495679735) with a [live interactive demo](https://lostbeard.github.io/v8-atomics-wait-bug/). The analyst who found the bugs hiding in plain sight.
 
 - **Gemini (Google AI, in-browser)** — Brainstorming/Problem Solving. Built by [Google](https://deepmind.google). TJ's ever-present sounding board — brainstorming approaches, analyzing problems, and providing insights relayed to the team. Gemini's contributions flow through TJ as the bridge between the browser-based AI and the CLI-based agents, making it a quiet but essential member of the crew.
 
-These AI agents coordinate through a shared DevComms system, with defined roles (Lead Editor / Research-Assist), acknowledgment protocols, and autonomous task management. The methodology mirrors a high-performing engineering team: independent analysis, cross-verification, and constant communication. The result: 97/97 WebGPU tests passing, style transfer producing gallery-quality output, and a library that proves neural network inference belongs in the browser — no ONNX Runtime required.
+These AI agents coordinate through a shared DevComms system, with defined roles (Lead Editor / Research-Assist), acknowledgment protocols, and autonomous task management. The methodology mirrors a high-performing engineering team: independent analysis, cross-verification, and constant communication. The result: 200+ tests passing, 22 demo pages, 14 pipelines, a GPU training engine, tiered LLM support, and a library that proves neural network inference AND training belong in the browser — no ONNX Runtime required.
 
 ## Resources
 
