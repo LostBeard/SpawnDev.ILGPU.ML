@@ -134,7 +134,10 @@ public abstract partial class MLTestBase
         using var doc = JsonDocument.Parse(jsonStr);
 
         if (!doc.RootElement.TryGetProperty("codebook_tests", out var cbTests))
+        {
+            Console.WriteLine("[TurboQuant] codebook_tests not in reference data — skipping");
             throw new UnsupportedTestException("No codebook_tests in reference data");
+        }
 
         var cb4bit = cbTests.GetProperty("4bit_d128");
         var centroids = cb4bit.GetProperty("centroids").EnumerateArray()
