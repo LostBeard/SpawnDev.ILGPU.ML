@@ -79,6 +79,44 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task BlazingEdge_GroupNorm_GPU_MatchesReference() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var inputBytes = await http.GetByteArrayAsync("references/blazing-edge/groupnorm_input.bin");
+        var expectedBytes = await http.GetByteArrayAsync("references/blazing-edge/groupnorm_output_default.bin");
+        var input = new float[inputBytes.Length / 4];
+        Buffer.BlockCopy(inputBytes, 0, input, 0, inputBytes.Length);
+        var expected = new float[expectedBytes.Length / 4];
+        Buffer.BlockCopy(expectedBytes, 0, expected, 0, expectedBytes.Length);
+
+        int B = 1, C = 32, H = 8, W = 8, G = 8;
+        int total = B * C * H * W;
+
+        using var inputBuf = accelerator.Allocate1D<float>(total);
+        inputBuf.View.CopyFromCPU(input);
+        using var outputBuf = accelerator.Allocate1D<float>(total);
+        var weight = new float[C]; Array.Fill(weight, 1f);
+        var bias = new float[C];
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+
+        var gn = new GroupNormKernel(accelerator);
+        gn.Forward(inputBuf.View, outputBuf.View, wBuf.View, bBuf.View, B, C, H * W, G);
+        await accelerator.SynchronizeAsync();
+        var gpuOutput = await outputBuf.CopyToHostAsync<float>(0, total);
+
+        float maxErr = 0;
+        for (int i = 0; i < Math.Min(total, expected.Length); i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(gpuOutput[i] - expected[i]));
+
+        Console.WriteLine($"[BlazingEdge] GroupNorm GPU: maxErr={maxErr:E3} vs PyTorch reference");
+        if (maxErr > 0.01f)
+            throw new Exception($"GroupNorm GPU maxErr={maxErr:E3} exceeds tolerance 0.01");
+    });
+
+    [TestMethod]
     public async Task BlazingEdge_SelectiveScan_GPU_Causal() => await RunTest(async accelerator =>
     {
         // Verify selective scan is causal: output[t] depends only on input[0..t]
