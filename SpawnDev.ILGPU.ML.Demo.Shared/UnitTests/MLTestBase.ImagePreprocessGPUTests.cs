@@ -11,7 +11,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     [TestMethod]
-    public async Task ImagePreprocess_ForwardRaw_ValueRange() => await RunTest(async accelerator =>
+    public async Task ImagePreprocess_ForwardRaw_RedImage_ChannelSeparation() => await RunTest(async accelerator =>
     {
         var preprocess = new Kernels.ImagePreprocessKernel(accelerator);
 

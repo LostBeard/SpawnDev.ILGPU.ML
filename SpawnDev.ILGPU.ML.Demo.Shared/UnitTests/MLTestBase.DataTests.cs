@@ -18,7 +18,7 @@ public abstract partial class MLTestBase
     public async Task ImagePreprocess_ForwardRaw_ValueRange() => await RunTest(async accelerator =>
     {
         // Style transfer preprocessing: output should be in [0, 255] range
-        var preprocess = new SpawnDev.ILGPU.ML.Preprocessing.ImagePreprocessor();
+        // ImagePreprocessor is static — call methods directly
         int w = 4, h = 4;
         var rgba = new byte[w * h * 4];
         for (int i = 0; i < rgba.Length; i++) rgba[i] = (byte)(i % 256);
