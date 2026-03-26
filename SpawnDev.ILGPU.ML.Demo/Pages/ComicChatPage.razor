@@ -228,6 +228,41 @@
     private bool _isModelLoaded;
     private int _nextCharId = 3;
 
+    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            try
+            {
+                if (_context == null)
+                {
+                    var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                    await builder.AllAcceleratorsAsync();
+                    _context = builder.ToContext();
+                }
+                _accelerator = await _context.CreatePreferredAcceleratorAsync();
+                if (_accelerator == null) return;
+                using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+                var modelBytes = await hub.LoadAsync(
+                    SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
+                    SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
+                var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+                var tokenizerBytes = await hub.LoadAsync(
+                    SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
+                _textGenPipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
+                _textGenPipeline.LoadTokenizer(System.Text.Encoding.UTF8.GetString(tokenizerBytes));
+                _isModelLoaded = true;
+                StateHasChanged();
+            }
+            catch (Exception ex) { Console.WriteLine($"[ComicChat] LLM error: {ex.Message}"); }
+        }
+    }
+
     private static readonly string[] _characterColors = { "#3b82f6", "#ef4444", "#22c55e", "#f59e0b", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316" };
 
     private void AddCharacter()
@@ -255,9 +290,25 @@
         _isGenerating = true;
         StateHasChanged();
 
-        if (_isModelLoaded)
+        if (_isModelLoaded && _textGenPipeline != null)
         {
-            // TODO: Generate AI responses from each character using LLM
+            foreach (var character in _characters)
+            {
+                var prompt = $"{character.Name} ({character.Personality}). User said: \"{input}\". {character.Name}:";
+                var result = await _textGenPipeline.GenerateAsync(prompt, maxNewTokens: 40);
+                var response = result.GeneratedText.Split('\n')[0].Trim();
+                if (string.IsNullOrWhiteSpace(response))
+                    response = GetPlaceholderComicResponse(character.Personality, character.Name, input);
+                _panels.Add(new ComicPanel
+                {
+                    CharacterName = character.Name,
+                    CharacterColor = character.Color,
+                    Text = response,
+                    IsUser = false,
+                    InferenceMs = result.InferenceTimeMs,
+                });
+                StateHasChanged();
+            }
         }
         else
         {
