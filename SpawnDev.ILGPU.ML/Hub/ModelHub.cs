@@ -202,6 +202,10 @@ public class ModelHub : IDisposable
         /// <summary>SpeechT5 HiFi-GAN — Vocoder for SpeechT5 (55 MB)</summary>
         public const string SpeechT5HiFiGAN = "Xenova/speecht5_hifigan";
 
+        // ── Image Generation ──
+        /// <summary>DDPM MNIST — tiny unconditional diffusion (1 MB, 28x28 grayscale)</summary>
+        public const string DDPMMnist = "local/ddpm-mnist"; // local model, loaded from references/
+
         // ── Background Removal ──
         /// <summary>RMBG 1.4 — Background removal, ONNX export (44 MB)</summary>
         public const string RMBG14 = "Xenova/rmbg-1.4";
