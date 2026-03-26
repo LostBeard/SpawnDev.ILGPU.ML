@@ -412,6 +412,14 @@ SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML researc
 | **LGM** | Single photo → 65,536 photorealistic Gaussian splats | Fly through 3D scenes in SpawnScene. Export as SPZ (15-20x compressed) or PLY. Integrates with the emerging Khronos glTF Gaussian Splatting standard. |
 | **GPU Training** | Train CNNs in the browser — backpropagation, Adam optimizer, live loss curves | Draw custom gestures → train a classifier in seconds on your GPU → classify in real-time. Full training engine in C# compute shaders. |
 
+### Performance — Squeeze Every TFLOP
+
+| Optimization | What It Does | Impact |
+|-------------|-------------|--------|
+| **Register-Blocked MatMul** | 4x4 register blocking within 16x16 tiled kernels. Keeps more data in registers, reduces shared memory reads. | Target: 200+ GFLOPS (current: 92-101). ThunderKittens 2.0 WGSL/PTX hints. |
+| **Megakernel Attention** | Fuse entire attention block (Q@K^T → softmax → scores@V) into a single persistent kernel. | Eliminates 3+ dispatch boundaries. Critical for WebGPU where command buffer submission has latency. |
+| **Fused Weight Dequantization** | Dequantize GGUF Q4 weights inside the MatMul kernel registers — weights stay compressed in GPU memory. | Massive memory bandwidth savings. Phi-4 Mini Q4 runs without separate dequant step. |
+
 These aren't future plans — they're v4.0.0 features. Because every release is the last release.
 
 ## Testing
