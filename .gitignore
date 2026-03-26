@@ -370,3 +370,4 @@ _mldump/
 # No models are bundled in the repo. To populate locally for
 # development/testing: run HuggingFaceModelDownloader or download manually.
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/
+models/distilgpt2/

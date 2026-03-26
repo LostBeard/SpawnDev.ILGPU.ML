@@ -172,7 +172,7 @@
             StateHasChanged();
             var modelBytes = await hub.LoadAsync(
                 SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
+                "onnx/decoder_model.onnx");
 
             _modelProgress = 80;
             StateHasChanged();

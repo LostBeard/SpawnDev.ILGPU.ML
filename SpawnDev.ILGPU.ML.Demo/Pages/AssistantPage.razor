@@ -294,7 +294,7 @@
             using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
             var modelBytes = await hub.LoadAsync(
                 SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
+                "onnx/decoder_model.onnx");
             var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
 
             var tokenizerBytes = await hub.LoadAsync(
