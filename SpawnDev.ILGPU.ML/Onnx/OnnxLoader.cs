@@ -76,6 +76,38 @@ public static class OnnxLoader
     }
 
     /// <summary>
+    /// Stream raw tensor protos without converting to float[].
+    /// Enables chunked GPU upload without allocating the full tensor in managed memory.
+    /// </summary>
+    public static (OnnxModelInfo ModelInfo, IEnumerable<(string Name, OnnxTensorProto Tensor)> TensorStream)
+        LoadModelStreamingRaw(byte[] onnxBytes)
+    {
+        var model = OnnxParser.Parse(onnxBytes);
+        var modelInfo = ExtractModelInfo(model);
+
+        IEnumerable<(string Name, OnnxTensorProto Tensor)> StreamTensors()
+        {
+            foreach (var init in model.Graph.Initializers)
+            {
+                if (init.DataLocation == 1) continue;
+                yield return (init.Name, init);
+            }
+
+            foreach (var node in model.Graph.Nodes)
+            {
+                if (node.OpType == "Constant" && node.Outputs.Count > 0)
+                {
+                    var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                    if (valueAttr?.T != null)
+                        yield return (node.Outputs[0], valueAttr.T);
+                }
+            }
+        }
+
+        return (modelInfo, StreamTensors());
+    }
+
+    /// <summary>
     /// Parse an ONNX file and return just the model info (no weights).
     /// Useful for inspecting a model before loading weights to GPU.
     /// </summary>

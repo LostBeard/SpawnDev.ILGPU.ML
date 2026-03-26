@@ -193,6 +193,69 @@ public class OnnxTensorProto
         return result;
     }
 
+    /// <summary>
+    /// Convert tensor data to float and write directly to a pre-allocated float array in chunks.
+    /// Avoids allocating the full float[] — reuses a fixed-size chunk buffer.
+    /// For large tensors (GPT-2 embedding: 38M elements = 154MB), this prevents OOM.
+    /// </summary>
+    public void ToFloatArrayChunked(float[] target, int targetOffset = 0)
+    {
+        int count = (int)ElementCount;
+        if (count == 0) return;
+
+        if (RawData != null && RawData.Length > 0)
+        {
+            switch (DataType)
+            {
+                case 1: // FLOAT — direct block copy
+                    Buffer.BlockCopy(RawData, 0, target, targetOffset * 4, count * 4);
+                    return;
+                case 10: // FLOAT16
+                    for (int i = 0; i < count; i++)
+                    {
+                        ushort h = (ushort)(RawData[i * 2] | (RawData[i * 2 + 1] << 8));
+                        target[targetOffset + i] = HalfToFloat(h);
+                    }
+                    return;
+                case 11: // DOUBLE
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = (float)BitConverter.ToDouble(RawData, i * 8);
+                    return;
+                case 6: // INT32
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = BitConverter.ToInt32(RawData, i * 4);
+                    return;
+                case 7: // INT64
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = BitConverter.ToInt64(RawData, i * 8);
+                    return;
+                case 2: // UINT8
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = RawData[i];
+                    return;
+                case 3: // INT8
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = (sbyte)RawData[i];
+                    return;
+                case 16: // BFLOAT16
+                    for (int i = 0; i < count; i++)
+                    {
+                        ushort bf = (ushort)(RawData[i * 2] | (RawData[i * 2 + 1] << 8));
+                        target[targetOffset + i] = BitConverter.Int32BitsToSingle((int)((uint)bf << 16));
+                    }
+                    return;
+                case 9: // BOOL
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = RawData[i] != 0 ? 1f : 0f;
+                    return;
+            }
+        }
+
+        // Fallback for non-raw data formats
+        var data = ToFloatArray();
+        Array.Copy(data, 0, target, targetOffset, data.Length);
+    }
+
     /// <summary>IEEE 754 half-precision (16-bit) to single-precision (32-bit) conversion.</summary>
     private static float HalfToFloat(ushort h)
     {
