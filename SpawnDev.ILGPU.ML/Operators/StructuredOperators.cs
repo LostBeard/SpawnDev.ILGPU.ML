@@ -271,9 +271,18 @@ public class ArgMaxOperator(OperatorRegistry reg) : IOnnxOperator
         var data = ctx.TryGetInputValues(0);
         if (data == null || data.Length != total)
         {
-            // For large tensors that weren't pre-read, we need sync copy (CPU-only)
-            data = new float[total];
-            input.Data.SubView(0, total).CopyToCPU(data);
+            // Sync readback — works on CPU/CUDA/OpenCL but not WebGPU/WebGL/Wasm
+            try
+            {
+                data = new float[total];
+                input.Data.SubView(0, total).CopyToCPU(data);
+            }
+            catch (NotSupportedException)
+            {
+                throw new NotSupportedException(
+                    $"ArgMax requires CPU readback but this backend doesn't support synchronous copies. " +
+                    $"Ensure the GraphExecutor pre-reads this input via ConstantData.");
+            }
         }
 
         // Compute argmax
