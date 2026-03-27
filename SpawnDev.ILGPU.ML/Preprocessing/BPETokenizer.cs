@@ -216,20 +216,33 @@ public class BPETokenizer
     /// </summary>
     private static List<string> PreTokenize(string text)
     {
+        // GPT-2 style: spaces attach to the FOLLOWING word, not the preceding one.
+        // "The cat sat" → ["The", " cat", " sat"]
+        // Punctuation stays with the preceding word or becomes its own token.
         var words = new List<string>();
         var current = new List<char>();
 
         for (int i = 0; i < text.Length; i++)
         {
             char c = text[i];
-            if (char.IsWhiteSpace(c) || char.IsPunctuation(c))
+            if (char.IsWhiteSpace(c))
+            {
+                // Flush current word
+                if (current.Count > 0)
+                {
+                    words.Add(new string(current.ToArray()));
+                    current.Clear();
+                }
+                // Space attaches to the next word
+                current.Add(c);
+            }
+            else if (char.IsPunctuation(c))
             {
                 if (current.Count > 0)
                 {
                     words.Add(new string(current.ToArray()));
                     current.Clear();
                 }
-                // Space/punct becomes its own token
                 words.Add(c.ToString());
             }
             else
