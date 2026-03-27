@@ -210,9 +210,29 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
                 reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
                     inC, inH, inW, outC, kH, kW, stride, pad);
             }
+            else if (group > 1 && inC % group == 0 && outC % group == 0)
+            {
+                // General grouped convolution: split into groups, conv each, concat
+                int inCPerGroup = inC / group;
+                int outCPerGroup = outC / group;
+                for (int g = 0; g < group; g++)
+                {
+                    int inOffset = g * inCPerGroup * inH * inW;
+                    int wOffset = g * outCPerGroup * inCPerGroup * kH * kW;
+                    int outOffset = g * outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3];
+                    // Use standard conv for each group slice
+                    reg.Conv2D.Forward(
+                        x.Data.SubView(inOffset, inCPerGroup * inH * inW),
+                        w.Data.SubView(wOffset, outCPerGroup * inCPerGroup * kH * kW),
+                        bias.SubView(g * outCPerGroup, outCPerGroup),
+                        ctx.Outputs[0].Data.SubView(outOffset, outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3]),
+                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, pad);
+                }
+            }
             else
             {
-                throw new NotSupportedException($"Conv with group={group} (inC={inC}, outC={outC}) not yet implemented");
+                // Group doesn't evenly divide channels — likely shape inference error
+                throw new NotSupportedException($"Conv with group={group} (inC={inC}, outC={outC}) not supported — group must divide both inC and outC");
             }
         }
     }
@@ -689,6 +709,12 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
         // General concat: copy each input's blocks to the output at the correct offset.
         // For axis=1 (NCHW channel concat): outer=N, concat dim=C, inner=H*W
         var shape0 = ctx.Inputs[0].Shape;
+        // Handle rank mismatch: if axis >= some input's rank, treat as flat concat (axis=0)
+        // This handles CLIP's pattern where [768] and [1,4,...] are concatenated on axis=1
+        bool rankMismatch = ctx.Inputs.Any(t => axis >= t.Shape.Length);
+        if (rankMismatch && axis > 0)
+            axis = 0; // Fall back to flat concat
+
         int outer = 1; for (int i = 0; i < axis; i++) outer *= shape0[i];
         int inner = 1; for (int i = axis + 1; i < shape0.Length; i++) inner *= shape0[i];
 
