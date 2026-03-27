@@ -176,6 +176,8 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
         int group = ctx.GetInt("group", 1);
+        // group = -1 is the TFLite depthwise sentinel — resolve to inC
+        if (group == -1) group = x.Shape.Length >= 4 ? x.Shape[1] : x.Shape[0];
         int outC = w.Shape[0];
 
         // Always provide a valid bias buffer

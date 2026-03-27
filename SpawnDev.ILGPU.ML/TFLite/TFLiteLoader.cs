@@ -246,8 +246,9 @@ public static class TFLiteLoader
 
         if (builtinCode == 4) // DEPTHWISE_CONV_2D
         {
-            int depthMultiplier = fb.ReadFieldInt32(offset, 4, 1);
-            attrs["group"] = JsonSerializer.SerializeToElement((long)depthMultiplier);
+            // TFLite depthwise: group = inC (each input channel is its own group)
+            // Set group = -1 as sentinel — ConvOperator resolves to inC at execution time
+            attrs["group"] = JsonSerializer.SerializeToElement((long)-1);
         }
     }
 
