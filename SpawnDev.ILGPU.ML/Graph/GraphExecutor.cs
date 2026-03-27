@@ -181,6 +181,23 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
                 var shape = node.OutputShapes[i];
+
+                // Runtime shape resolution for Expand with dynamic targets
+                if (node.OpType == "Expand" && node.InputNames.Length >= 2
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var expandTarget))
+                {
+                    var inShape = nodeInputs[0]?.Shape ?? shape;
+                    int outRank = Math.Max(inShape.Length, expandTarget.Length);
+                    var resolved = new int[outRank];
+                    for (int j = 0; j < outRank; j++)
+                    {
+                        int inDim = j < outRank - inShape.Length ? 1 : inShape[j - (outRank - inShape.Length)];
+                        int tgtDim = j < outRank - expandTarget.Length ? 1 : (int)expandTarget[j - (outRank - expandTarget.Length)];
+                        resolved[j] = Math.Max(inDim, tgtDim);
+                    }
+                    shape = resolved;
+                }
+
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
@@ -336,6 +353,26 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
                 var shape = node.OutputShapes[i];
+
+                // Runtime shape resolution for Expand/Reshape with dynamic targets.
+                // The compiled shape may be wrong if the target shape tensor wasn't
+                // resolvable at compile time (e.g., Expand with Where-computed shapes).
+                // Use runtime constants to compute the real output shape.
+                if (node.OpType == "Expand" && node.InputNames.Length >= 2
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var expandTarget))
+                {
+                    var inShape = nodeInputs[0]?.Shape ?? shape;
+                    int outRank = Math.Max(inShape.Length, expandTarget.Length);
+                    var resolved = new int[outRank];
+                    for (int j = 0; j < outRank; j++)
+                    {
+                        int inDim = j < outRank - inShape.Length ? 1 : inShape[j - (outRank - inShape.Length)];
+                        int tgtDim = j < outRank - expandTarget.Length ? 1 : (int)expandTarget[j - (outRank - expandTarget.Length)];
+                        resolved[j] = Math.Max(inDim, tgtDim);
+                    }
+                    shape = resolved;
+                }
+
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
