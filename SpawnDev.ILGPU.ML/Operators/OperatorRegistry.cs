@@ -94,6 +94,8 @@ public class OperatorRegistry
         Register(new ReduceMeanOperator(this));
         Register(new ReduceSumOperator(this));
         Register(new SqrtOperator(this));
+        Register(new SinOperator(this));
+        Register(new CosOperator(this));
         Register(new ExpOperator(this));
         Register(new NegOperator(this));
         Register(new DivOperator(this));

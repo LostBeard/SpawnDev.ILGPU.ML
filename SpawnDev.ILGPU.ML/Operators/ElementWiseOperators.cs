@@ -796,3 +796,25 @@ public class NegOperator(OperatorRegistry reg) : IOnnxOperator
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, -1f);
     }
 }
+
+public class SinOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Sin";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Sin(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class CosOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Cos";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Cos(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
