@@ -176,60 +176,72 @@ public class GraphExecutor : IDisposable
                 nodeInputs[i] = tensor;
             }
 
-            // Allocate output tensors
+            // Allocate output tensors.
+            // Use RUNTIME input shapes to re-infer output shapes. This handles cascading
+            // dynamic shapes: if Resize/Expand produced a larger output than compiled,
+            // all downstream nodes automatically get correctly-sized buffers.
+            var actualInputShapes = nodeInputs
+                .Select(t => t?.Shape ?? Array.Empty<int>())
+                .ToArray();
+
+            int[][] runtimeOutputShapes;
+            try
+            {
+                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, node.Attributes);
+            }
+            catch
+            {
+                // Fallback to compiled shapes if runtime inference fails
+                runtimeOutputShapes = node.OutputShapes;
+            }
+
+            // For Expand/Resize, also check runtime constants for dynamic targets
+            if (node.OpType == "Expand" && node.InputNames.Length >= 2
+                && runtimeConstants.TryGetValue(node.InputNames[1], out var expandTarget))
+            {
+                var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                int outRank = Math.Max(inShape.Length, expandTarget.Length);
+                var resolved = new int[outRank];
+                for (int j = 0; j < outRank; j++)
+                {
+                    int inDim = j < outRank - inShape.Length ? 1 : inShape[j - (outRank - inShape.Length)];
+                    int tgtDim = j < outRank - expandTarget.Length ? 1 : (int)expandTarget[j - (outRank - expandTarget.Length)];
+                    resolved[j] = Math.Max(inDim, tgtDim);
+                }
+                runtimeOutputShapes = new[] { resolved };
+            }
+            if (node.OpType is "Resize" or "Upsample")
+            {
+                int sizesIdx = node.OpType == "Resize" ? 3 : -1;
+                int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
+                if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
+                    && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
+                    && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
+                    && sizes.Length > 0)
+                {
+                    var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                    var resolved = new int[Math.Max(sizes.Length, inShape.Length)];
+                    for (int j = 0; j < resolved.Length; j++)
+                        resolved[j] = j < sizes.Length && (int)sizes[j] > 0 ? (int)sizes[j] : (j < inShape.Length ? inShape[j] : 1);
+                    runtimeOutputShapes = new[] { resolved };
+                }
+                else if (node.InputNames.Length > scalesIdx
+                    && !string.IsNullOrEmpty(node.InputNames[scalesIdx])
+                    && runtimeConstants.TryGetValue(node.InputNames[scalesIdx], out var scales)
+                    && scales.Length > 0)
+                {
+                    var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                    var resolved = new int[inShape.Length];
+                    for (int j = 0; j < inShape.Length; j++)
+                        resolved[j] = j < scales.Length ? (int)MathF.Floor(inShape[j] * scales[j]) : inShape[j];
+                    runtimeOutputShapes = new[] { resolved };
+                }
+            }
+
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
-                var shape = node.OutputShapes[i];
-
-                // Runtime shape resolution for Expand with dynamic targets
-                if (node.OpType == "Expand" && node.InputNames.Length >= 2
-                    && runtimeConstants.TryGetValue(node.InputNames[1], out var expandTarget))
-                {
-                    var inShape = nodeInputs[0]?.Shape ?? shape;
-                    int outRank = Math.Max(inShape.Length, expandTarget.Length);
-                    var resolved = new int[outRank];
-                    for (int j = 0; j < outRank; j++)
-                    {
-                        int inDim = j < outRank - inShape.Length ? 1 : inShape[j - (outRank - inShape.Length)];
-                        int tgtDim = j < outRank - expandTarget.Length ? 1 : (int)expandTarget[j - (outRank - expandTarget.Length)];
-                        resolved[j] = Math.Max(inDim, tgtDim);
-                    }
-                    shape = resolved;
-                }
-
-                // Runtime shape resolution for Resize/Upsample with dynamic sizes/scales
-                if (node.OpType is "Resize" or "Upsample")
-                {
-                    int sizesIdx = node.OpType == "Resize" ? 3 : -1;
-                    int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
-
-                    // Try sizes (Resize input[3]) — absolute output dimensions
-                    if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
-                        && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
-                        && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
-                        && sizes.Length == shape.Length)
-                    {
-                        var resolved = new int[sizes.Length];
-                        var inShape = nodeInputs[0]?.Shape ?? shape;
-                        for (int j = 0; j < sizes.Length; j++)
-                            resolved[j] = (int)sizes[j] > 0 ? (int)sizes[j] : inShape[j];
-                        shape = resolved;
-                    }
-                    // Try scales (multiply input dims)
-                    else if (node.InputNames.Length > scalesIdx
-                        && !string.IsNullOrEmpty(node.InputNames[scalesIdx])
-                        && runtimeConstants.TryGetValue(node.InputNames[scalesIdx], out var scales)
-                        && scales.Length == shape.Length)
-                    {
-                        var inShape = nodeInputs[0]?.Shape ?? shape;
-                        var resolved = new int[inShape.Length];
-                        for (int j = 0; j < inShape.Length; j++)
-                            resolved[j] = (int)MathF.Floor(inShape[j] * scales[j]);
-                        shape = resolved;
-                    }
-                }
-
+                var shape = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
