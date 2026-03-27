@@ -198,6 +198,38 @@ public class GraphExecutor : IDisposable
                     shape = resolved;
                 }
 
+                // Runtime shape resolution for Resize/Upsample with dynamic sizes/scales
+                if (node.OpType is "Resize" or "Upsample")
+                {
+                    int sizesIdx = node.OpType == "Resize" ? 3 : -1;
+                    int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
+
+                    // Try sizes (Resize input[3]) — absolute output dimensions
+                    if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
+                        && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
+                        && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
+                        && sizes.Length == shape.Length)
+                    {
+                        var resolved = new int[sizes.Length];
+                        var inShape = nodeInputs[0]?.Shape ?? shape;
+                        for (int j = 0; j < sizes.Length; j++)
+                            resolved[j] = (int)sizes[j] > 0 ? (int)sizes[j] : inShape[j];
+                        shape = resolved;
+                    }
+                    // Try scales (multiply input dims)
+                    else if (node.InputNames.Length > scalesIdx
+                        && !string.IsNullOrEmpty(node.InputNames[scalesIdx])
+                        && runtimeConstants.TryGetValue(node.InputNames[scalesIdx], out var scales)
+                        && scales.Length == shape.Length)
+                    {
+                        var inShape = nodeInputs[0]?.Shape ?? shape;
+                        var resolved = new int[inShape.Length];
+                        for (int j = 0; j < inShape.Length; j++)
+                            resolved[j] = (int)MathF.Floor(inShape[j] * scales[j]);
+                        shape = resolved;
+                    }
+                }
+
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
@@ -371,6 +403,35 @@ public class GraphExecutor : IDisposable
                         resolved[j] = Math.Max(inDim, tgtDim);
                     }
                     shape = resolved;
+                }
+
+                // Runtime Resize/Upsample shape resolution
+                if (node.OpType is "Resize" or "Upsample")
+                {
+                    int sizesIdx = node.OpType == "Resize" ? 3 : -1;
+                    int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
+                    if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
+                        && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
+                        && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
+                        && sizes.Length == shape.Length)
+                    {
+                        var inShape = nodeInputs[0]?.Shape ?? shape;
+                        var resolved = new int[sizes.Length];
+                        for (int j = 0; j < sizes.Length; j++)
+                            resolved[j] = (int)sizes[j] > 0 ? (int)sizes[j] : inShape[j];
+                        shape = resolved;
+                    }
+                    else if (node.InputNames.Length > scalesIdx
+                        && !string.IsNullOrEmpty(node.InputNames[scalesIdx])
+                        && runtimeConstants.TryGetValue(node.InputNames[scalesIdx], out var scales)
+                        && scales.Length == shape.Length)
+                    {
+                        var inShape = nodeInputs[0]?.Shape ?? shape;
+                        var resolved = new int[inShape.Length];
+                        for (int j = 0; j < inShape.Length; j++)
+                            resolved[j] = (int)MathF.Floor(inShape[j] * scales[j]);
+                        shape = resolved;
+                    }
                 }
 
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
