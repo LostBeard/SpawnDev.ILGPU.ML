@@ -13,6 +13,10 @@ public class GraphCompiler
 
     public GraphCompiler(OperatorRegistry registry) => _registry = registry;
 
+    /// <summary>Check if constant data is valid (no INT_MAX/INT_MIN sentinels from dynamic dims).</summary>
+    private static bool IsValidConstant(int[] data) =>
+        data.Length > 0 && !data.Any(v => v == int.MaxValue || v == int.MinValue);
+
     /// <summary>
     /// Compile a model graph for execution.
     /// Resolves operators, topologically sorts nodes, infers output shapes.
@@ -108,6 +112,20 @@ public class GraphCompiler
                     : throw new InvalidOperationException($"Unknown shape for '{name}' (needed by {node.OpType})"))
                 .ToArray();
 
+            // Split: inject split sizes from constant input[1] (opset 13+) or node output count
+            if (node.OpType == "Split")
+            {
+                if (!attrs.ContainsKey("split") && node.Inputs.Count >= 2
+                    && !string.IsNullOrEmpty(node.Inputs[1])
+                    && graph.ConstantData != null
+                    && graph.ConstantData.TryGetValue(node.Inputs[1], out var splitVals))
+                {
+                    attrs["split"] = splitVals.Select(v => (long)v).ToArray();
+                }
+                if (!attrs.ContainsKey("num_outputs"))
+                    attrs["num_outputs"] = (long)node.Outputs.Count;
+            }
+
             // Infer output shapes
             int[][] outputShapes;
             try
@@ -116,9 +134,11 @@ public class GraphCompiler
             }
             catch (Exception shapeEx)
             {
-                if (InferenceSession.VerboseLogging)
-                    Console.WriteLine($"[GraphCompiler] Shape inference failed at node {nodeCompileIdx} '{node.OpType}' " +
-                        $"inputs=[{string.Join("; ", inputShapes.Select(s => $"[{string.Join(",", s)}]"))}]: {shapeEx.Message}");
+                var shapeMsg = $"[GraphCompiler] Shape inference failed at node {nodeCompileIdx} '{node.OpType}' " +
+                    $"inputs=[{string.Join("; ", inputShapes.Select(s => $"[{string.Join(",", s)}]"))}] " +
+                    $"inputNames=[{string.Join(",", node.Inputs)}] outputs=[{string.Join(",", node.Outputs)}]: {shapeEx.Message}";
+                Console.WriteLine(shapeMsg);
+                // Log for debugging but allow fallback (many models work despite imperfect shapes)
                 // Fallback: try known output shape (from Initializers), then first input shape
                 if (node.Outputs.Count > 0 && knownShapes.TryGetValue(node.Outputs[0], out var fallbackShape))
                     outputShapes = new[] { fallbackShape };
@@ -148,7 +168,8 @@ public class GraphCompiler
                 && graph.ConstantData != null
                 && graph.ConstantData.TryGetValue(node.Inputs[0], out var gatherSrc)
                 && graph.ConstantData.TryGetValue(node.Inputs[1], out var gatherIdxData)
-                && gatherIdxData.Length == 1)
+                && gatherIdxData.Length == 1
+                && IsValidConstant(gatherSrc) && IsValidConstant(gatherIdxData))
             {
                 int gIdx = gatherIdxData[0];
                 if (gIdx < 0) gIdx += gatherSrc.Length;
@@ -170,7 +191,8 @@ public class GraphCompiler
             // Compile-time Concat evaluation on known constants
             if (node.OpType == "Concat" && node.Inputs.Count >= 1
                 && graph.ConstantData != null
-                && node.Inputs.All(inp => !string.IsNullOrEmpty(inp) && graph.ConstantData.ContainsKey(inp)))
+                && node.Inputs.All(inp => !string.IsNullOrEmpty(inp) && graph.ConstantData.ContainsKey(inp)
+                    && IsValidConstant(graph.ConstantData[inp])))
             {
                 var concatVals = node.Inputs.SelectMany(inp => graph.ConstantData[inp]).ToArray();
                 outputShapes = new[] { new[] { concatVals.Length } };
@@ -416,9 +438,10 @@ public class GraphCompiler
                 }
                 else
                 {
-                    // Shape tensor not resolved — log warning for debugging
+                    // Shape tensor not resolved — use rank from shape tensor's known shape, put elements in dim 0
                     var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
-                    Console.WriteLine($"[SHAPE_WARN] Reshape '{outName}': shape tensor '{shapeTensorName}' not in ConstantData — using fallback");
+                    if (InferenceSession.VerboseLogging)
+                        Console.WriteLine($"[SHAPE_WARN] Reshape '{outName}': shape tensor '{shapeTensorName}' not in ConstantData — using fallback");
                     if (knownShapes.TryGetValue(shapeTensorName, out var shapeTensorShape)
                         && shapeTensorShape.Length == 1)
                     {
@@ -566,9 +589,28 @@ public class GraphCompiler
             var inNames = string.Join(",", node.Inputs.Take(3));
             var inShapes = string.Join("; ", node.Inputs.Take(3).Select(n =>
                 knownShapes.TryGetValue(n ?? "", out var s) ? $"[{string.Join(",", s)}]" : "?"));
+            // Include preceding 10 nodes for context + constant data values
+            var prevNodes = new System.Text.StringBuilder();
+            for (int p = Math.Max(0, compiledNodes.Count - 10); p < compiledNodes.Count; p++)
+            {
+                var cn = compiledNodes[p];
+                var constInfo = "";
+                if (cn.OpType is "Reshape" or "Concat" or "Gather" or "Shape" or "Unsqueeze")
+                {
+                    foreach (var inp in cn.InputNames)
+                    {
+                        if (graph.ConstantData != null && graph.ConstantData.TryGetValue(inp, out var cv))
+                            constInfo += $" {inp}=const[{string.Join(",", cv.Take(5))}]";
+                    }
+                }
+                prevNodes.Append($"\n  #{p} {cn.OpType} in=[{string.Join(",", cn.InputNames.Take(4))}] " +
+                    $"out=[{string.Join(",", cn.OutputNames)}] " +
+                    $"shapes=[{string.Join("; ", cn.OutputShapes.Select(s => $"[{string.Join(",", s)}]"))}]{constInfo}");
+            }
             throw new IndexOutOfRangeException(
                 $"Node {nodeCompileIdx}/{sorted.Count} '{node.OpType}' crashed. " +
-                $"Inputs=[{inNames}] shapes=({inShapes}) Outputs=[{outNames}]", nodeEx);
+                $"Inputs=[{inNames}] shapes=({inShapes}) Outputs=[{outNames}]" +
+                $"\nPreceding nodes:{prevNodes}", nodeEx);
           }
             nodeCompileIdx++;
         }

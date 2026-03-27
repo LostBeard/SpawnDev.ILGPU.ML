@@ -915,57 +915,69 @@ public class IntegrationTests
 
         var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
 
-        using var context = MLContext.CreateContext();
-        var cudaDevices = context.GetCudaDevices();
-        if (cudaDevices.Count == 0)
-        {
-            context.Dispose();
-            throw new UnsupportedTestException("No CUDA devices found");
-        }
-        using var accelerator = cudaDevices[0].CreateAccelerator(context);
-        Console.WriteLine($"[CudaDepth] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
-
-        InferenceSession session;
-        var sw = System.Diagnostics.Stopwatch.StartNew();
+        // Manual dispose — known ILGPU CUDA bug: large model buffer dispose throws
+        // CudaException. Using explicit dispose with try/catch so the dispose bug
+        // doesn't mask a passing inference result.
+        var context = MLContext.CreateContext();
+        Accelerator? accelerator = null;
+        InferenceSession? session = null;
+        SpawnDev.ILGPU.ML.Pipelines.DepthEstimationPipeline? pipeline = null;
         try
         {
-            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+            var cudaDevices = context.GetCudaDevices();
+            if (cudaDevices.Count == 0)
+                throw new UnsupportedTestException("No CUDA devices found");
+            accelerator = cudaDevices[0].CreateAccelerator(context);
+            Console.WriteLine($"[CudaDepth] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
+
+            // DAv2 has dynamic input dims — must specify concrete shape
+            int w = 64, h = 64;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["pixel_values"] = new[] { 1, 3, h, w }
+                });
             Console.WriteLine($"[CudaDepth] Session created in {sw.Elapsed.TotalSeconds:F1}s: {session}");
+
+            // Check for broken shape inference (Resize/Upsample constant propagation gap)
+            var outShapes = session.OutputShapes;
+            if (outShapes.Values.Any(s => s.Any(d => d == int.MaxValue || d < 0)))
+                throw new UnsupportedTestException(
+                    $"DAv2 shape inference produced sentinel values — Resize constant propagation not yet complete. " +
+                    $"Output shapes: {string.Join(", ", outShapes.Select(kv => $"{kv.Key}=[{string.Join(",", kv.Value)}]"))}");
+
+            var pixels = new int[w * h];
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    int gray = (int)(x * 255f / w);
+                    pixels[y * w + x] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
+                }
+
+            pipeline = new SpawnDev.ILGPU.ML.Pipelines.DepthEstimationPipeline(session, accelerator);
+            sw.Restart();
+            var result = await pipeline.EstimateAsync(pixels, w, h);
+            sw.Stop();
+
+            Console.WriteLine($"[CudaDepth] Depth map: {result.Width}x{result.Height}, min={result.MinDepth:F3}, max={result.MaxDepth:F3}, inference={sw.Elapsed.TotalSeconds:F1}s");
+
+            float range = result.MaxDepth - result.MinDepth;
+            if (range < 0.01f)
+                throw new Exception($"Depth map is flat: range={range:F4}");
+            if (result.Width < 10 || result.Height < 10)
+                throw new Exception($"Depth map too small: {result.Width}x{result.Height}");
+
+            Console.WriteLine("[CudaDepth] PASS");
         }
-        catch (Exception ex)
+        finally
         {
-            throw new UnsupportedTestException($"DAv2 session creation failed: {ex.Message}");
+            try { pipeline?.Dispose(); } catch { }
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
         }
-
-        // Gradient test image (64x64)
-        int w = 64, h = 64;
-        var pixels = new int[w * h];
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-            {
-                int gray = (int)(x * 255f / w);
-                pixels[y * w + x] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
-            }
-
-        var pipeline = new SpawnDev.ILGPU.ML.Pipelines.DepthEstimationPipeline(session, accelerator);
-        sw.Restart();
-        var result = await pipeline.EstimateAsync(pixels, w, h);
-        sw.Stop();
-
-        Console.WriteLine($"[CudaDepth] Depth map: {result.Width}x{result.Height}, min={result.MinDepth:F3}, max={result.MaxDepth:F3}, inference={sw.Elapsed.TotalSeconds:F1}s");
-
-        // Verify output has variation (not flat)
-        float range = result.MaxDepth - result.MinDepth;
-        if (range < 0.01f)
-            throw new Exception($"Depth map is flat: range={range:F4}");
-
-        // Verify reasonable dimensions
-        if (result.Width < 10 || result.Height < 10)
-            throw new Exception($"Depth map too small: {result.Width}x{result.Height}");
-
-        Console.WriteLine("[CudaDepth] PASS");
-        try { pipeline.Dispose(); } catch { }
-        try { session.Dispose(); } catch { }
     }
 
     /// <summary>Parse and check operator coverage for MoveNet Lightning.</summary>

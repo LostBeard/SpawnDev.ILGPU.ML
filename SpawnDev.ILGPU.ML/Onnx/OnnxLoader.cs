@@ -110,6 +110,28 @@ public static class OnnxLoader
     }
 
     /// <summary>
+    /// Resolve external data for all initializers that reference an external file.
+    /// After calling this, all tensors behave like normal embedded tensors.
+    /// Call this before streaming weights if the model uses external data format.
+    /// </summary>
+    public static void ResolveExternalData(OnnxModelProto model, byte[] externalDataBytes)
+    {
+        foreach (var init in model.Graph.Initializers)
+        {
+            if (init.DataLocation == 1)
+                init.ResolveExternalData(externalDataBytes);
+        }
+    }
+
+    /// <summary>
+    /// Check if a parsed model has any initializers with external data.
+    /// </summary>
+    public static bool HasExternalData(OnnxModelProto model)
+    {
+        return model.Graph.Initializers.Any(i => i.DataLocation == 1);
+    }
+
+    /// <summary>
     /// Extract model info from an already-parsed OnnxModelProto.
     /// Avoids re-parsing when the model is already in memory.
     /// </summary>

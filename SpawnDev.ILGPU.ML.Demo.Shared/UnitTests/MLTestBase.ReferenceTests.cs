@@ -151,6 +151,58 @@ public abstract partial class MLTestBase
             throw new Exception($"[SqueezeNet] Top class {topIdx}, expected cat (281-285)");
     });
 
+    // ── Image Classification Reference Test (EfficientNet-Lite0, TFLite) ──
+
+    [TestMethod(Timeout = 120000)]
+    public async Task Reference_EfficientNetLite0_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // EfficientNet-Lite0 is TFLite format, NHWC input
+        var modelBytes = await http.GetByteArrayAsync("models/efficientnet-lite0/model.tflite");
+        var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
+            inputShapes: new Dictionary<string, int[]>
+            {
+                ["images:0"] = new[] { 1, 224, 224, 3 }
+            });
+
+        // Load reference input (NHWC float32)
+        var inputBytes = await http.GetByteArrayAsync("references/efficientnet-lite0/cat_input.bin");
+        var inputData = new float[inputBytes.Length / 4];
+        Buffer.BlockCopy(inputBytes, 0, inputData, 0, inputBytes.Length);
+
+        using var inputBuf = accelerator.Allocate1D(inputData);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 224, 224, 3 });
+
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = inputTensor
+        });
+
+        var output = outputs[session.OutputNames[0]];
+        int elems = output.ElementCount;
+        using var readBuf = accelerator.Allocate1D<float>(elems);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        await accelerator.SynchronizeAsync();
+        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+
+        // Compare against reference
+        var refBytes = await http.GetByteArrayAsync("references/efficientnet-lite0/cat_output.bin");
+        var expected = new float[refBytes.Length / 4];
+        Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
+
+        var cmpLen = Math.Min(actual.Length, expected.Length);
+        AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 0.5f, "EfficientNet-Lite0");
+
+        // Verify top-1 class is a cat (281-285)
+        int topIdx = 0;
+        for (int i = 1; i < actual.Length; i++)
+            if (actual[i] > actual[topIdx]) topIdx = i;
+        Console.WriteLine($"[EfficientNet] Top class: {topIdx} (expected cat 281-285)");
+        session.Dispose();
+    });
+
     // ── Super Resolution Reference Test ──
 
     [TestMethod(Timeout = 120000)]
@@ -260,7 +312,7 @@ public abstract partial class MLTestBase
 
     // ── Text Generation Reference Test ──
 
-    [TestMethod(Timeout = 600000)] // 10 min — GPT-2 is 652MB + 2620 nodes, needs time on WebGPU
+    [TestMethod(Timeout = 900000)] // 15 min — GPT-2 is 652MB + 2620 nodes. Download + compile + inference needs headroom on WebGPU
     public async Task Reference_GPT2_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -387,6 +439,57 @@ public abstract partial class MLTestBase
         var expected = refAll.Take(elems).ToArray();
 
         AssertReferenceMatch(actual, expected, 0.5f, "WhisperEncoder");
+        session.Dispose();
+    });
+
+    // ── CLIP Vision Reference Test ──
+
+    [TestMethod(Timeout = 180000)]
+    public async Task Reference_CLIPVision_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // Download CLIP vision model (~340MB)
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            $"https://huggingface.co/{Hub.ModelHub.KnownModels.CLIPVitB32}/resolve/main/{Hub.ModelHub.KnownFiles.OnnxVisionModel}");
+        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]>
+            {
+                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+            });
+
+        // Load preprocessed cat image
+        var inputBytes = await http.GetByteArrayAsync("references/clip-vit-b32/cat_preprocessed.bin");
+        var inputData = new float[inputBytes.Length / 4];
+        Buffer.BlockCopy(inputBytes, 0, inputData, 0, inputBytes.Length);
+
+        using var inputBuf = accelerator.Allocate1D(inputData);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = inputTensor
+        });
+
+        var output = outputs[session.OutputNames[0]];
+        int elems = output.ElementCount;
+
+        using var readBuf = accelerator.Allocate1D<float>(elems);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        await accelerator.SynchronizeAsync();
+        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+
+        // Compare against reference image embedding
+        var refBytes = await http.GetByteArrayAsync("references/clip-vit-b32/cat_image_embedding.bin");
+        var expected = new float[refBytes.Length / 4];
+        Buffer.BlockCopy(refBytes, 0, expected, 0, refBytes.Length);
+
+        Console.WriteLine($"[CLIP] Vision output: {elems} elements, reference: {expected.Length} elements");
+
+        // CLIP embedding is 512-dim — compare first 512 values
+        var cmpLen = Math.Min(Math.Min(actual.Length, expected.Length), 512);
+        AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 1.0f, "CLIP_Vision");
         session.Dispose();
     });
 

@@ -75,6 +75,40 @@ public class OnnxTensorProto
     public long ElementCount => Dims.Aggregate(1L, (a, b) => a * b);
 
     /// <summary>
+    /// Resolve external data by reading from the external data file bytes.
+    /// After calling this, the tensor behaves like a normal embedded tensor.
+    /// </summary>
+    public void ResolveExternalData(byte[] externalDataBytes)
+    {
+        if (DataLocation != 1 || ExternalData == null) return;
+        long offset = ExternalData.TryGetValue("offset", out var o) && long.TryParse(o, out var ov) ? ov : 0;
+        long length = ExternalData.TryGetValue("length", out var l) && long.TryParse(l, out var lv) ? lv : 0;
+        if (length == 0)
+            length = ElementCount * GetBytesPerElement(DataType);
+        if (length <= 0 || offset + length > externalDataBytes.Length) return;
+        RawData = new byte[length];
+        Buffer.BlockCopy(externalDataBytes, (int)offset, RawData, 0, (int)length);
+        DataLocation = 0;
+    }
+
+    /// <summary>Bytes per element for a given ONNX data type.</summary>
+    private static int GetBytesPerElement(int dataType) => dataType switch
+    {
+        1 => 4,   // FLOAT
+        2 => 1,   // UINT8
+        3 => 1,   // INT8
+        5 => 2,   // INT16
+        6 => 4,   // INT32
+        7 => 8,   // INT64
+        9 => 1,   // BOOL
+        10 => 2,  // FLOAT16
+        11 => 8,  // DOUBLE
+        12 => 4,  // UINT32
+        16 => 2,  // BFLOAT16
+        _ => 4,   // Default to float32 size
+    };
+
+    /// <summary>
     /// Get the tensor data as a float array, converting from the stored format.
     /// Handles: raw_data (FLOAT, FLOAT16), float_data, int32_data (FLOAT16 packed).
     /// </summary>
@@ -91,8 +125,11 @@ public class OnnxTensorProto
             Buffer.BlockCopy(RawDataSource, RawDataOffset, rawData, 0, RawDataLength);
         }
 
-        // raw_data is the most common format
-        if (rawData != null && rawData.Length > 0)
+        // raw_data is the most common format — but validate byte count matches
+        // DataType × ElementCount. Some ONNX models (PyTorch exported) have garbage
+        // in the raw_data field of embedded Constant tensors (leftover protobuf bytes).
+        int expectedBytes = count * GetBytesPerElement(DataType);
+        if (rawData != null && rawData.Length >= expectedBytes && expectedBytes > 0)
         {
             return DataType switch
             {

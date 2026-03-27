@@ -169,6 +169,8 @@ public class ModelHub : IDisposable
         // ── Depth Estimation ──
         /// <summary>Depth Anything V2 Small — Monocular depth estimation, 26M params (95 MB)</summary>
         public const string DepthAnythingV2Small = "onnx-community/depth-anything-v2-small";
+        /// <summary>Depth Anything V3 Small — Monocular depth estimation with RoPE + QKNorm (211 MB, external data)</summary>
+        public const string DepthAnythingV3Small = "onnx-community/depth-anything-v3-small";
 
         // ── Object Detection ──
         /// <summary>YOLOv8 Nano — 80-class COCO object detection (13 MB)</summary>

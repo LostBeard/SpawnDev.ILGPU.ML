@@ -583,6 +583,79 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── ScatterND ──
+
+public class ScatterNDOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ScatterND";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        // Output shape = data shape (scatter updates into a copy of data)
+        return new[] { inputs[0] };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var data = ctx.Inputs[0]; var indices = ctx.Inputs[1]; var updates = ctx.Inputs[2];
+        var output = ctx.Outputs[0];
+
+        // Read reduction mode (ONNX opset 16+: none, add, mul)
+        string reduction = "none";
+        if (ctx.Attributes.TryGetValue("reduction", out var redObj) && redObj is string redStr)
+            reduction = redStr.ToLowerInvariant();
+        if (reduction != "none")
+            throw new NotSupportedException($"ScatterND: reduction='{reduction}' not yet implemented");
+
+        // Copy data to output first
+        reg.ElementWise.Scale(data.Data, output.Data, data.ElementCount, 1f);
+
+        // Read indices from GPU (small tensor, constant in most models)
+        var idxFloats = ctx.TryGetInputValues(1);
+        if (idxFloats == null)
+            throw new NotSupportedException("ScatterND: runtime indices not pre-read — add to ConstantData");
+
+        // ScatterND: indices is [num_updates, index_depth] where index_depth indexes into data dims
+        var idxShape = indices.Shape;
+        int numUpdates = 1;
+        for (int i = 0; i < idxShape.Length - 1; i++) numUpdates *= idxShape[i];
+        int indexDepth = idxShape[^1];
+
+        if (indexDepth > data.Shape.Length)
+            throw new ArgumentException($"ScatterND: index_depth={indexDepth} exceeds data rank={data.Shape.Length}");
+
+        // Compute element size for the slice that each update covers
+        int sliceSize = 1;
+        for (int i = indexDepth; i < data.Shape.Length; i++) sliceSize *= data.Shape[i];
+
+        // For each update, compute flat offset into data and copy update slice
+        for (int u = 0; u < numUpdates; u++)
+        {
+            // Compute flat offset from multi-dimensional index
+            int flatOffset = 0;
+            int stride = data.ElementCount;
+            for (int d = 0; d < indexDepth; d++)
+            {
+                stride /= data.Shape[d];
+                int idx = (int)idxFloats[u * indexDepth + d];
+                if (idx < 0) idx += data.Shape[d];
+                if (idx < 0 || idx >= data.Shape[d])
+                    throw new ArgumentOutOfRangeException(
+                        $"ScatterND: index out of bounds at update={u} dim={d}: idx={idx}, dim_size={data.Shape[d]}");
+                flatOffset += idx * stride;
+            }
+
+            if (flatOffset + sliceSize > output.ElementCount)
+                throw new ArgumentException(
+                    $"ScatterND: scatter offset out of bounds: offset={flatOffset}, slice={sliceSize}, buffer={output.ElementCount}");
+
+            // Copy update slice to output at computed offset
+            reg.ElementWise.Scale(
+                updates.Data.SubView(u * sliceSize, sliceSize),
+                output.Data.SubView(flatOffset, sliceSize),
+                sliceSize, 1f);
+        }
+    }
+}
+
 // ── Concat ──
 
 public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
@@ -681,8 +754,20 @@ public class GemmOperator(OperatorRegistry reg) : IOnnxOperator
     {
         int transA = attrs.ContainsKey("transA") ? Convert.ToInt32(attrs["transA"]) : 0;
         int transB = attrs.ContainsKey("transB") ? Convert.ToInt32(attrs["transB"]) : 0;
-        int M = transA != 0 ? inputs[0][1] : inputs[0][0];
-        int N = transB != 0 ? inputs[1][0] : inputs[1][1];
+        var a = inputs[0]; var b = inputs[1];
+        int N = transB != 0 ? b[0] : b[^1];
+        // Gemm: A[M,K] @ B[K,N] + C → [M,N]
+        // For 3D+ inputs, preserve leading dims (batch/seq) instead of flattening.
+        // The Execute method flattens internally but the output shape should match the model's expectations.
+        if (a.Length > 2)
+        {
+            // Output: [...leading_dims, N]
+            var outShape = new int[a.Length];
+            for (int i = 0; i < a.Length - 1; i++) outShape[i] = a[i];
+            outShape[a.Length - 1] = N;
+            return new[] { outShape };
+        }
+        int M = transA != 0 ? a[^1] : a[0];
         return new[] { new[] { M, N } };
     }
     public void Execute(OnnxOpContext ctx)
@@ -883,6 +968,12 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
         if (axis < 0) axis += inputs[0].Length;
         var inShape = inputs[0];
 
+        // Guard: if axis is out of bounds, throw with full context (don't let fallback hide the bug)
+        if (axis >= inShape.Length)
+            throw new InvalidOperationException(
+                $"Split.InferOutputShapes: axis={axis} >= rank={inShape.Length} for input shape=[{string.Join(",", inShape)}]. " +
+                $"Attrs: [{string.Join(",", attrs.Select(kv => $"{kv.Key}={kv.Value}"))}]");
+
         // Get split sizes from attribute (opset < 13) or default to equal splits
         int[] splitSizes;
         if (attrs.TryGetValue("split", out var splitObj) && splitObj is long[] splitLongs)
@@ -915,6 +1006,15 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
         if (axis < 0) axis += ctx.Inputs[0].Shape.Length;
         var inShape = ctx.Inputs[0].Shape;
 
+        // Guard: validate axis is in bounds
+        if (axis >= inShape.Length)
+            throw new InvalidOperationException(
+                $"Split: axis={axis} but input shape=[{string.Join(",", inShape)}] (rank={inShape.Length}). " +
+                $"Inputs={ctx.Inputs.Length}, Outputs={ctx.Outputs.Length}. " +
+                $"Input shapes: {string.Join("; ", ctx.Inputs.Select(t => $"[{string.Join(",", t.Shape)}]"))}. " +
+                $"Output shapes: {string.Join("; ", ctx.Outputs.Select(t => $"[{string.Join(",", t.Shape)}]"))}. " +
+                $"InputNames: {string.Join(",", ctx.InputNames)}");
+
         // Compute strides for the split
         int outer = 1; for (int i = 0; i < axis; i++) outer *= inShape[i];
         int inner = 1; for (int i = axis + 1; i < inShape.Length; i++) inner *= inShape[i];
@@ -925,7 +1025,12 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
         for (int outIdx = 0; outIdx < ctx.Outputs.Length; outIdx++)
         {
             if (ctx.Outputs[outIdx] == null) continue;
-            int splitSize = ctx.Outputs[outIdx].Shape[axis];
+            var outShape = ctx.Outputs[outIdx].Shape;
+            if (axis >= outShape.Length)
+                throw new InvalidOperationException(
+                    $"Split axis={axis} but output[{outIdx}] shape=[{string.Join(",", outShape)}] (len={outShape.Length}). " +
+                    $"Input shape=[{string.Join(",", inShape)}], {ctx.Outputs.Length} outputs.");
+            int splitSize = outShape[axis];
             int blockSize = splitSize * inner;
 
             for (int o = 0; o < outer; o++)

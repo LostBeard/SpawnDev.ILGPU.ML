@@ -240,6 +240,98 @@ public class TurboQuantKernels
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  3-bit packing (10 values per uint32, 2 bits spare)
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int>? _bitPack3Kernel;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int>? _bitUnpack3Kernel;
+
+    /// <summary>
+    /// Pack 3-bit indices into 32-bit ints (10 indices per int, 2 bits spare).
+    /// indices [count] (each 0-7) → packed [ceil(count/10)]
+    /// The 2 spare high bits (bits 30-31) are zeroed — available for QJL signs.
+    /// </summary>
+    public void BitPack3(
+        ArrayView1D<int, Stride1D.Dense> indices,
+        ArrayView1D<int, Stride1D.Dense> packed,
+        int count)
+    {
+        int packedCount = (count + 9) / 10;
+        _bitPack3Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            int>(BitPack3Impl);
+        _bitPack3Kernel(packedCount, indices, packed, count);
+    }
+
+    private static void BitPack3Impl(Index1D packIdx,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        ArrayView1D<int, Stride1D.Dense> packed,
+        int totalCount)
+    {
+        int result = 0;
+        int baseIdx = packIdx * 10;
+        for (int i = 0; i < 10 && baseIdx + i < totalCount; i++)
+        {
+            int val = indices[baseIdx + i] & 0x7; // mask to 3 bits
+            result |= val << (i * 3);
+        }
+        packed[packIdx] = result;
+    }
+
+    /// <summary>
+    /// Unpack 32-bit ints back to 3-bit indices.
+    /// packed [ceil(count/10)] → indices [count] (each 0-7)
+    /// </summary>
+    public void BitUnpack3(
+        ArrayView1D<int, Stride1D.Dense> packed,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        int count)
+    {
+        _bitUnpack3Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            int>(BitUnpack3Impl);
+        _bitUnpack3Kernel(count, packed, indices, count);
+    }
+
+    private static void BitUnpack3Impl(Index1D idx,
+        ArrayView1D<int, Stride1D.Dense> packed,
+        ArrayView1D<int, Stride1D.Dense> indices,
+        int totalCount)
+    {
+        int packIdx = idx / 10;
+        int bitOffset = (idx % 10) * 3;
+        indices[idx] = (packed[packIdx] >> bitOffset) & 0x7;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Codebook constants
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Lloyd-Max optimal 16-centroid codebook for unit-variance Gaussian (4-bit).
+    /// Symmetric around zero. Ref: Max (1960), MSE = 0.00950, SNR = 20.22 dB.
+    /// </summary>
+    public static readonly float[] Codebook4Bit = new float[]
+    {
+        -2.7326f, -2.0690f, -1.6180f, -1.2562f,
+        -0.9423f, -0.6568f, -0.3880f, -0.1284f,
+         0.1284f,  0.3880f,  0.6568f,  0.9423f,
+         1.2562f,  1.6180f,  2.0690f,  2.7326f,
+    };
+
+    /// <summary>
+    /// Lloyd-Max optimal 8-centroid codebook for unit-variance Gaussian (3-bit).
+    /// Symmetric around zero. Ref: Max (1960), MSE = 0.03455, SNR = 14.62 dB.
+    /// </summary>
+    public static readonly float[] Codebook3Bit = new float[]
+    {
+        -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+         0.2451f,  0.7560f,  1.3439f,  2.1519f,
+    };
+
+    // ═══════════════════════════════════════════════════════════
     //  Fused Quantized Attention
     // ═══════════════════════════════════════════════════════════
 
@@ -368,6 +460,145 @@ public class TurboQuantKernels
 
         // Normalize by softmax sum
         float invSum = 1f / (sumExp + 1e-10f);
+        for (int d = 0; d < D; d++)
+            output[queryIdx * D + d] *= invSum;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Flash Attention (Online Softmax) — Single-Pass
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _flashAttentionKernel;
+
+    /// <summary>
+    /// Flash Attention with Online Softmax and fused TurboQuant dequantization.
+    /// Single pass over the KV cache — no second traversal, no intermediate N×N storage.
+    ///
+    /// Online Softmax (Milakov & Gimelshein 2018): maintains running max, running sum,
+    /// and running weighted output. When a new score exceeds current max, rescales
+    /// accumulated state by exp(oldMax - newMax). Numerically stable, single pass.
+    ///
+    /// For long sequences this eliminates the memory bottleneck of the full attention matrix.
+    /// </summary>
+    public void FlashQuantizedAttention(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<int, Stride1D.Dense> K_packed,
+        ArrayView1D<float, Stride1D.Dense> K_codebook,
+        ArrayView1D<int, Stride1D.Dense> V_packed,
+        ArrayView1D<float, Stride1D.Dense> V_codebook,
+        ArrayView1D<float, Stride1D.Dense> K_norms,
+        ArrayView1D<float, Stride1D.Dense> V_norms,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numQueries, int numKV, int headDim, float scale)
+    {
+        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f) };
+        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+
+        _flashAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(FlashAttentionImpl);
+        _flashAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
+            K_norms, V_norms, output, paramsBuf.View);
+    }
+
+    /// <summary>
+    /// Single-pass Flash Attention with Online Softmax.
+    /// Each thread processes one query position across all KV positions in one pass.
+    ///
+    /// Algorithm: for each KV position j:
+    ///   1. Compute score_j = Q @ K_j * scale (with fused dequant)
+    ///   2. If score_j > running_max:
+    ///        correction = exp(old_max - score_j)
+    ///        running_sum *= correction
+    ///        output[d] *= correction  (rescale accumulated output)
+    ///        running_max = score_j
+    ///   3. weight_j = exp(score_j - running_max)
+    ///   4. running_sum += weight_j
+    ///   5. output[d] += weight_j * V_j[d]  (with fused dequant)
+    ///   After all KV: output[d] /= running_sum
+    /// </summary>
+    private static void FlashAttentionImpl(Index1D queryIdx,
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<int, Stride1D.Dense> K_packed,
+        ArrayView1D<float, Stride1D.Dense> K_codebook,
+        ArrayView1D<int, Stride1D.Dense> V_packed,
+        ArrayView1D<float, Stride1D.Dense> V_codebook,
+        ArrayView1D<float, Stride1D.Dense> K_norms,
+        ArrayView1D<float, Stride1D.Dense> V_norms,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        int numQ = paramsArr[0];
+        int numKV = paramsArr[1];
+        int D = paramsArr[2];
+        float scale = paramsArr[3] / 10000f;
+        int packedDim = D / 8; // 4-bit: 8 values per int
+
+        // Initialize Online Softmax state
+        float runningMax = -1e10f;
+        float runningSum = 0f;
+
+        // Zero the output accumulator
+        for (int d = 0; d < D; d++)
+            output[queryIdx * D + d] = 0f;
+
+        // Single pass over all KV positions
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            // ── Compute Q @ K_j (fused dequant) ──
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                {
+                    int idx = (packed >> (b * 4)) & 0xF;
+                    float kVal = K_codebook[idx] * kNorm;
+                    dot += Q[queryIdx * D + p * 8 + b] * kVal;
+                }
+            }
+            float score = dot * scale;
+
+            // ── Online Softmax update ──
+            if (score > runningMax)
+            {
+                // New max found — rescale all accumulated state
+                float correction = MathF.Exp(runningMax - score);
+                runningSum *= correction;
+                for (int d = 0; d < D; d++)
+                    output[queryIdx * D + d] *= correction;
+                runningMax = score;
+            }
+
+            float weight = MathF.Exp(score - runningMax);
+            runningSum += weight;
+
+            // ── Accumulate weighted V (fused dequant) ──
+            float vNorm = V_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = V_packed[kv * packedDim + p];
+                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                {
+                    int idx = (packed >> (b * 4)) & 0xF;
+                    float vVal = V_codebook[idx] * vNorm;
+                    output[queryIdx * D + p * 8 + b] += weight * vVal;
+                }
+            }
+        }
+
+        // Final normalization
+        float invSum = 1f / (runningSum + 1e-10f);
         for (int d = 0; d < D; d++)
             output[queryIdx * D + d] *= invSum;
     }

@@ -239,6 +239,102 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[BPETokenizer] GPT-2: 'Hello world' → {tokens.Length} tokens → '{decoded}'");
     }
 
+    [TestMethod]
+    public async Task BPETokenizer_GPT2_KnownEncodings()
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        string tokenizerJson;
+        try { tokenizerJson = await http.GetStringAsync("references/gpt2/tokenizer.json"); }
+        catch { throw new UnsupportedTestException("GPT-2 tokenizer.json not available"); }
+
+        var tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
+
+        // Known GPT-2 encodings (verified against Python transformers)
+        // "The cat sat on the" → [464, 3797, 3332, 319, 262]
+        var tokens = tokenizer.Encode("The cat sat on the");
+        var expected = new int[] { 464, 3797, 3332, 319, 262 };
+        AssertArrayEquals(expected, tokens, "GPT-2 'The cat sat on the'");
+
+        // Empty string
+        var emptyTokens = tokenizer.Encode("");
+        if (emptyTokens.Length != 0)
+            throw new Exception($"Empty string produced {emptyTokens.Length} tokens, expected 0");
+
+        // Single character
+        var spaceTokens = tokenizer.Encode(" ");
+        if (spaceTokens.Length < 1)
+            throw new Exception("Single space produced 0 tokens");
+
+        // Decode preserves text
+        var decoded = tokenizer.Decode(expected);
+        if (!decoded.Contains("The cat sat on the"))
+            throw new Exception($"Decode failed: '{decoded}', expected 'The cat sat on the'");
+
+        Console.WriteLine($"[BPETokenizer] Known encoding tests: PASS");
+    }
+
+    [TestMethod]
+    public async Task BPETokenizer_GPT2_SpecialCharacters()
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        string tokenizerJson;
+        try { tokenizerJson = await http.GetStringAsync("references/gpt2/tokenizer.json"); }
+        catch { throw new UnsupportedTestException("GPT-2 tokenizer.json not available"); }
+
+        var tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
+
+        // Test with punctuation
+        var tokens1 = tokenizer.Encode("Hello, world!");
+        if (tokens1.Length < 3) throw new Exception($"Punctuation test: {tokens1.Length} tokens, expected >=3");
+
+        // Test with numbers
+        var tokens2 = tokenizer.Encode("The year is 2026.");
+        if (tokens2.Length < 4) throw new Exception($"Numbers test: {tokens2.Length} tokens, expected >=4");
+
+        // Test with newlines
+        var tokens3 = tokenizer.Encode("Line 1\nLine 2");
+        if (tokens3.Length < 4) throw new Exception($"Newline test: {tokens3.Length} tokens, expected >=4");
+
+        // Test round-trip for each
+        var decoded1 = tokenizer.Decode(tokens1);
+        if (!decoded1.Contains("Hello") || !decoded1.Contains("world"))
+            throw new Exception($"Punctuation round-trip failed: '{decoded1}'");
+
+        Console.WriteLine($"[BPETokenizer] Special chars: punct={tokens1.Length}, nums={tokens2.Length}, newline={tokens3.Length} tokens");
+        Console.WriteLine($"[BPETokenizer] Special character tests: PASS");
+    }
+
+    [TestMethod]
+    public async Task BPETokenizer_GPT2_LongText()
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        string tokenizerJson;
+        try { tokenizerJson = await http.GetStringAsync("references/gpt2/tokenizer.json"); }
+        catch { throw new UnsupportedTestException("GPT-2 tokenizer.json not available"); }
+
+        var tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
+
+        // Long text — verify no crash and reasonable token count
+        var longText = string.Join(" ", Enumerable.Repeat("The quick brown fox jumps over the lazy dog.", 50));
+        var tokens = tokenizer.Encode(longText);
+        if (tokens.Length < 100)
+            throw new Exception($"Long text produced only {tokens.Length} tokens, expected >=100");
+
+        // Verify decode round-trip preserves content
+        var decoded = tokenizer.Decode(tokens);
+        if (!decoded.Contains("quick brown fox"))
+            throw new Exception("Long text round-trip lost content");
+
+        Console.WriteLine($"[BPETokenizer] Long text: {longText.Length} chars → {tokens.Length} tokens");
+        Console.WriteLine($"[BPETokenizer] Long text test: PASS");
+    }
+
     // ═══════════════════════════════════════════════════════════
     //  Helpers
     // ═══════════════════════════════════════════════════════════

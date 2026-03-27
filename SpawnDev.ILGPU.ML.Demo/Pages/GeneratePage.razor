@@ -14,11 +14,11 @@
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
             ShowModelProgress="true"
-            ModelName="SD Turbo"
+            ModelName="@_modelStatusText"
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="250">
+            ModelSizeMB="2500">
 
     <div class="gen-prompt-section">
         <label class="gen-label">Prompt:</label>
@@ -96,7 +96,7 @@
     @if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            Image generation requires Stable Diffusion Turbo (~250MB). This demo will be enabled once the model pipeline is integrated. The diffusion scheduler (DDIM + Euler) and noise generation are already built.
+            Image generation requires SD Turbo (~2.5 GB across 3 models). The first load downloads from HuggingFace and caches in your browser. Subsequent loads are instant.
         </div>
     }
 
@@ -192,7 +192,7 @@
     private string _prompt = "";
     private string _negativePrompt = "";
     private bool _showNegative;
-    private int _numSteps = 4;
+    private int _numSteps = 1;
     private float _guidanceScale = 0;
     private int? _seed;
     private int _usedSeed;
@@ -201,6 +201,7 @@
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
     private string? _generatedImageUrl;
+    private string _modelStatusText = "SD Turbo";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
@@ -210,7 +211,7 @@
     [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
-    private SpawnDev.ILGPU.ML.Pipelines.DiffusionPipeline? _pipeline;
+    private SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline? _pipeline;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -234,14 +235,16 @@
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
-            // Load tiny DDPM MNIST model (1MB)
             using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
-            // Load from local references (Data exported this)
-            var http = new HttpClient { BaseAddress = new Uri(JS.Get<string>("window.location.origin") + "/") };
-            var modelBytes = await http.GetByteArrayAsync("references/blazing-edge/ddpm_mnist_unet.onnx");
-            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
-            _pipeline = new SpawnDev.ILGPU.ML.Pipelines.DiffusionPipeline(session, _accelerator, channels: 1, size: 28);
+            _pipeline = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(
+                _accelerator, hub, onProgress: (stage, pct) =>
+                {
+                    _modelStatusText = $"SD Turbo — {stage}";
+                    _modelProgress = pct;
+                    StateHasChanged();
+                });
 
+            _modelStatusText = "SD Turbo";
             _isModelLoaded = true;
         }
         catch (Exception ex)
@@ -268,19 +271,24 @@
 
         try
         {
-            _numSteps = Math.Clamp(_numSteps, 4, 100);
-            var result = await _pipeline.GenerateAsync(
-                numSteps: _numSteps,
-                seed: _seed,
-                onStep: (step, total) =>
-                {
-                    _currentStep = step;
-                    StateHasChanged();
-                });
+            _pipeline.NumInferenceSteps = Math.Max(1, _numSteps);
+            _pipeline.GuidanceScale = _guidanceScale;
+            _pipeline.Width = _imageSize;
+            _pipeline.Height = _imageSize;
+            _pipeline.Seed = _seed;
+            _pipeline.OnProgress += OnPipelineProgress;
+
+            var result = await _pipeline.RunAsync(new SpawnDev.ILGPU.ML.Pipelines.ImageGenerationInput
+            {
+                Prompt = _prompt,
+                NegativePrompt = _negativePrompt,
+            });
+
+            _pipeline.OnProgress -= OnPipelineProgress;
 
             _inferenceMs = result.InferenceTimeMs;
             _usedSeed = result.Seed;
-            _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.ImagePixels, result.Width, result.Height);
+            _generatedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.ImageRGBA, result.Width, result.Height);
         }
         catch (Exception ex)
         {
@@ -288,6 +296,13 @@
         }
 
         _isRunning = false;
+        StateHasChanged();
+    }
+
+    private void OnPipelineProgress(int step, int total)
+    {
+        _currentStep = step;
+        _numSteps = total;
         StateHasChanged();
     }
 

@@ -9,14 +9,23 @@ public ref struct ProtobufReader
 {
     private readonly ReadOnlySpan<byte> _data;
     private int _pos;
+    private readonly int _absoluteBase; // offset of _data[0] within the root byte array
 
     public ProtobufReader(ReadOnlySpan<byte> data)
     {
         _data = data;
         _pos = 0;
+        _absoluteBase = 0;
     }
 
     public ProtobufReader(byte[] data) : this(data.AsSpan()) { }
+
+    private ProtobufReader(ReadOnlySpan<byte> data, int absoluteBase)
+    {
+        _data = data;
+        _pos = 0;
+        _absoluteBase = absoluteBase;
+    }
 
     /// <summary>Whether there's more data to read.</summary>
     public bool HasMore => _pos < _data.Length;
@@ -79,15 +88,17 @@ public ref struct ProtobufReader
         return ReadBytes().ToArray();
     }
 
-    /// <summary>Read a length-delimited field length and skip past it, returning the offset and length.
-    /// Zero-copy alternative to ReadByteArray for large fields — caller reads from source array directly.</summary>
+    /// <summary>Read a length-delimited field length and skip past it, returning the ABSOLUTE offset
+    /// within the root byte array and the length. Zero-copy alternative to ReadByteArray for large
+    /// fields — caller reads from source array directly. The absolute offset is correct even when
+    /// this reader is a submessage reader (e.g., TensorProto inside AttributeProto).</summary>
     public (int offset, int length) ReadBytesReference()
     {
         int length = (int)ReadVarint();
         if (_pos + length > _data.Length) throw new InvalidOperationException($"Length-delimited field extends past end of data");
-        int offset = _pos;
+        int absoluteOffset = _absoluteBase + _pos;
         _pos += length;
-        return (offset, length);
+        return (absoluteOffset, length);
     }
 
     /// <summary>Read a length-delimited field as a UTF-8 string.</summary>
@@ -135,12 +146,17 @@ public ref struct ProtobufReader
 
     /// <summary>
     /// Read a length-delimited field as a sub-message reader.
-    /// The returned reader operates on the sub-span.
+    /// The returned reader operates on the sub-span but tracks its absolute
+    /// position within the root byte array for zero-copy ReadBytesReference.
     /// </summary>
     public ProtobufReader ReadSubMessage()
     {
-        var bytes = ReadBytes();
-        return new ProtobufReader(bytes);
+        int length = (int)ReadVarint();
+        if (_pos + length > _data.Length) throw new InvalidOperationException("Sub-message extends past end of data");
+        int subAbsoluteBase = _absoluteBase + _pos;
+        var subSpan = _data.Slice(_pos, length);
+        _pos += length;
+        return new ProtobufReader(subSpan, subAbsoluteBase);
     }
 
     /// <summary>Skip an unknown field based on its wire type.</summary>

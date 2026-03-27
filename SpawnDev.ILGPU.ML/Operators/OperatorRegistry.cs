@@ -83,6 +83,7 @@ public class OperatorRegistry
         Register(new FlattenOperator(this));
         Register(new ConcatOperator(this));
         Register(new GatherOperator(this));
+        Register(new ScatterNDOperator(this));
         Register(new ClipOperator(this));
 
         // Tier 2: Common ops

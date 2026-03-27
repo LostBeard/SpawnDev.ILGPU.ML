@@ -338,10 +338,10 @@ public class SubOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else if (b.ElementCount == 1)
         {
-            // Scalar: a - scalar → negate scalar, then add
-            reg.ElementWise.Neg(b.Data, ctx.Outputs[0].Data, 1);
-            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Outputs[0].Data, a.ElementCount, 1);
-            reg.ElementWise.AddInPlace(ctx.Outputs[0].Data, a.Data, a.ElementCount);
+            // Scalar subtract: output = a - scalar → use BroadcastMul(a, -1→b) + BroadcastAdd
+            // Strategy: output = a (copy), then BroadcastSub via BroadcastBinaryOp
+            // Simplest safe path: use BroadcastBinaryOp which handles all broadcast shapes
+            BroadcastBinaryOp(ctx, reg, (x, y) => x - y, BroadcastOp.Sub);
         }
         else
         {

@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Operators;
 using SpawnDev.ILGPU.ML.Tensors;
 
@@ -8,6 +9,8 @@ namespace SpawnDev.ILGPU.ML.Graph;
 /// <summary>
 /// Executes a compiled graph on GPU.
 /// Manages tensor allocation, operator dispatch, and buffer lifecycle.
+/// Automatically detects and manages KV cache with TurboQuant compression
+/// for autoregressive transformer models (GPT-2, Whisper decoder, etc.).
 /// </summary>
 public class GraphExecutor : IDisposable
 {
@@ -16,6 +19,13 @@ public class GraphExecutor : IDisposable
     private readonly BufferPool _pool;
     private readonly Dictionary<string, Tensor> _weights;
     private readonly Dictionary<string, float[]>? _constantValues;
+    private readonly ElementWiseKernels _ew;
+
+    // TurboQuant KV cache (auto-detected)
+    private readonly KVCacheAnalyzer.KVCacheInfo? _kvCacheInfo;
+    private QuantizedKVCache? _kvCache;
+    private readonly Dictionary<string, int>? _presentKeyOutputToLayer;
+    private readonly Dictionary<string, int>? _presentValueOutputToLayer;
 
     /// <summary>When true, logs each node execution to Console.</summary>
     public static bool VerboseLogging { get; set; }
@@ -26,6 +36,12 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public static Dictionary<string, float[]>? CapturedOutputs { get; set; }
 
+    /// <summary>Whether TurboQuant KV cache compression is active for this model.</summary>
+    public bool HasKVCache => _kvCache != null;
+
+    /// <summary>Access to the quantized KV cache (null if model doesn't use KV cache).</summary>
+    public QuantizedKVCache? KVCache => _kvCache;
+
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null)
     {
@@ -34,6 +50,48 @@ public class GraphExecutor : IDisposable
         _pool = new BufferPool(accelerator);
         _weights = weights;
         _constantValues = constantValues;
+        _ew = new ElementWiseKernels(accelerator);
+
+        // Auto-detect KV cache pattern
+        var inputShapes = new Dictionary<string, int[]>();
+        foreach (var node in graph.Nodes)
+        {
+            for (int i = 0; i < node.InputNames.Length; i++)
+            {
+                var name = node.InputNames[i];
+                if (!string.IsNullOrEmpty(name) && weights.TryGetValue(name, out var wt))
+                    inputShapes[name] = wt.Shape;
+            }
+        }
+        _kvCacheInfo = KVCacheAnalyzer.Analyze(graph.InputNames, graph.OutputNames, inputShapes);
+
+        if (_kvCacheInfo.ShouldQuantize)
+        {
+            try
+            {
+                _kvCache = new QuantizedKVCache(accelerator, _kvCacheInfo);
+
+                // Build lookup maps for fast output interception
+                _presentKeyOutputToLayer = new Dictionary<string, int>();
+                _presentValueOutputToLayer = new Dictionary<string, int>();
+                foreach (var layer in _kvCacheInfo.Layers)
+                {
+                    _presentKeyOutputToLayer[layer.PresentKeyOutput] = layer.LayerIndex;
+                    _presentValueOutputToLayer[layer.PresentValueOutput] = layer.LayerIndex;
+                }
+
+                if (VerboseLogging)
+                    Console.WriteLine($"[GraphExecutor] TurboQuant KV cache enabled: {_kvCacheInfo.NumLayers} layers, headDim={_kvCacheInfo.Layers[0].HeadDim}");
+            }
+            catch (Exception ex)
+            {
+                // KV cache allocation failed (e.g., insufficient GPU memory) — fall back to no cache
+                if (VerboseLogging)
+                    Console.WriteLine($"[GraphExecutor] TurboQuant KV cache disabled: {ex.Message}");
+                _kvCache = null;
+                _kvCacheInfo = null;
+            }
+        }
     }
 
     /// <summary>
@@ -394,8 +452,78 @@ public class GraphExecutor : IDisposable
             if (tensors.TryGetValue(name, out var tensor))
                 results[name] = tensor;
         }
+
+        // TurboQuant KV cache: intercept present.N.key/value outputs and quantize
+        if (_kvCache != null && _presentKeyOutputToLayer != null && _presentValueOutputToLayer != null)
+        {
+            foreach (var layer in _kvCacheInfo!.Layers)
+            {
+                if (results.TryGetValue(layer.PresentKeyOutput, out var presentKey) &&
+                    results.TryGetValue(layer.PresentValueOutput, out var presentValue))
+                {
+                    // Extract the LAST token's K/V from the present output
+                    // present.N.key shape: [batch, heads, seqLen, headDim]
+                    int vecDim = _kvCache.NumLayers > 0 ? presentKey.Shape[^1] * presentKey.Shape[^3] : 0;
+                    if (vecDim <= 0) continue;
+                    int seqLen = presentKey.Shape.Length >= 3 ? presentKey.Shape[^2] : 1;
+                    int lastTokenOffset = (seqLen - 1) * vecDim;
+
+                    if (lastTokenOffset >= 0 && lastTokenOffset + vecDim <= presentKey.ElementCount)
+                    {
+                        _kvCache.Append(layer.LayerIndex,
+                            presentKey.Data.SubView(lastTokenOffset, vecDim),
+                            presentValue.Data.SubView(lastTokenOffset, vecDim));
+                    }
+                }
+            }
+            _kvCache.AdvanceToken();
+        }
+
         return results;
     }
 
-    public void Dispose() => _pool.Dispose();
+    /// <summary>
+    /// Inject dequantized KV cache tensors into the input dictionary.
+    /// Call this before RunAsync() for autoregressive generation steps 2+.
+    /// If the model has no KV cache or the cache is empty, this is a no-op.
+    /// </summary>
+    public void InjectKVCacheInputs(Dictionary<string, Tensor> inputs)
+    {
+        if (_kvCache == null || !_kvCache.HasCache || _kvCacheInfo == null) return;
+
+        foreach (var layer in _kvCacheInfo.Layers)
+        {
+            // Shape: [batch=1, heads, seqLen, headDim]
+            var shape = layer.Shape != null ? (int[])layer.Shape.Clone() : new[] { 1, 12, _kvCache.CurrentSeqLen, 64 };
+            if (shape.Length >= 3) shape[^2] = _kvCache.CurrentSeqLen; // Update seq dim
+
+            inputs[layer.PastKeyInput] = _kvCache.GetDequantizedK(layer.LayerIndex, shape);
+            inputs[layer.PastValueInput] = _kvCache.GetDequantizedV(layer.LayerIndex, shape);
+        }
+
+        // Set use_cache_branch if the model has it
+        if (_kvCacheInfo.UseCacheBranchInput != null)
+        {
+            using var flagBuf = _accelerator.Allocate1D(new float[] { 1f });
+            inputs[_kvCacheInfo.UseCacheBranchInput] = new Tensor(flagBuf.View, new[] { 1 });
+        }
+    }
+
+    /// <summary>
+    /// Reset the KV cache (e.g., when starting a new generation sequence).
+    /// </summary>
+    public void ResetKVCache()
+    {
+        if (_kvCache != null)
+        {
+            _kvCache.Dispose();
+            _kvCache = _kvCacheInfo != null ? new QuantizedKVCache(_accelerator, _kvCacheInfo) : null;
+        }
+    }
+
+    public void Dispose()
+    {
+        _pool.Dispose();
+        _kvCache?.Dispose();
+    }
 }

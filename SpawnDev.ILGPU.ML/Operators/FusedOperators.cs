@@ -34,17 +34,18 @@ public class FusedLinearOperator : IOnnxOperator
 
     public void Execute(OnnxOpContext ctx)
     {
-        var input = ctx.Inputs[0];  // [M, K]
+        var input = ctx.Inputs[0];  // [..., M, K] (may have leading batch dims)
         var weights = ctx.Inputs[1]; // [K, N]
         var bias = ctx.Inputs[2];    // [N]
-        var output = ctx.Outputs[0]; // [M, N]
+        var output = ctx.Outputs[0]; // [..., M, N]
 
-        int M = input.Shape[^2];
         int K = input.Shape[^1];
         int N = weights.Shape[^1];
+        // Flatten all leading dimensions into M — kernel does flat row/col indexing
+        int M = input.ElementCount / K;
 
         // Bounds validation with diagnostic info
-        if (M * K > input.ElementCount || K * N > weights.ElementCount || N > bias.ElementCount || M * N > output.ElementCount)
+        if (M < 1 || M * K != input.ElementCount || K * N > weights.ElementCount || N > bias.ElementCount || M * N > output.ElementCount)
         {
             throw new InvalidOperationException(
                 $"FusedLinear bounds mismatch: M={M} K={K} N={N}, " +

@@ -39,4 +39,21 @@ public static class ImageDisplayHelper
         ctx.PutImageData(imageData, 0, 0);
         return canvas.ToDataURL("image/png");
     }
+
+    /// <summary>
+    /// Convert RGBA byte[] to a base64 PNG data URL.
+    /// Byte layout: [R, G, B, A, R, G, B, A, ...] — 4 bytes per pixel.
+    /// </summary>
+    public static string ToDataUrl(BlazorJSRuntime js, byte[] rgbaBytes, int width, int height)
+    {
+        using var canvas = new HTMLCanvasElement();
+        canvas.Width = width;
+        canvas.Height = height;
+        using var ctx = canvas.Get2DContext();
+        using var imageData = ctx.CreateImageData(width, height);
+        using var data = imageData.Data;
+        data.WriteBytes(rgbaBytes);
+        ctx.PutImageData(imageData, 0, 0);
+        return canvas.ToDataURL("image/png");
+    }
 }

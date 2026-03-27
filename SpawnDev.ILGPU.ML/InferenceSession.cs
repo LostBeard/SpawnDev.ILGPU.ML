@@ -61,6 +61,9 @@ public class InferenceSession : IDisposable
     /// <summary>Model name (from graph metadata).</summary>
     public string ModelName { get; private set; } = "";
 
+    /// <summary>Access to the underlying GraphExecutor (for KV cache management).</summary>
+    public GraphExecutor Executor => _executor;
+
     private InferenceSession(Accelerator accelerator, OperatorRegistry registry,
         CompiledGraph compiled, GraphExecutor executor, BufferPool pool,
         Dictionary<string, Tensor> weights)
@@ -139,8 +142,7 @@ public class InferenceSession : IDisposable
                                     var hostBuf = new float[elems];
                                     Array.Copy(cpuWeightsAll, slice.Value.offset, hostBuf, 0, elems);
                                     constantFloatValues[name] = hostBuf;
-                                    if (elems <= 16)
-                                        modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                                    modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                                 }
                             }
                             else
@@ -149,8 +151,7 @@ public class InferenceSession : IDisposable
                                 await accelerator.SynchronizeAsync();
                                 var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
                                 constantFloatValues[name] = hostBuf;
-                                if (elems <= 16)
-                                    modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                                modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                             }
                         }
                     }
@@ -259,8 +260,7 @@ public class InferenceSession : IDisposable
                     tensor.Data.SubView(0, elems).CopyToCPU(hostBuf);
                     accelerator.Synchronize();
                     constantFloatValues[name] = hostBuf;
-                    if (elems <= 16)
-                        graph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                    graph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                 }
             }
         }
@@ -396,6 +396,38 @@ public class InferenceSession : IDisposable
         var bytes = await hub.LoadAsync(repoId, filename, revision);
         onProgress?.Invoke("download", 100);
 
+        // Check if this ONNX model uses external data format
+        byte[]? externalData = null;
+        var format = DetectModelFormat(bytes);
+        if (format == ModelFormat.ONNX)
+        {
+            // Quick parse to check for external data — lightweight since we only scan initializer headers
+            var quickParse = Onnx.OnnxParser.Parse(bytes, zeroCopyThreshold: 1024 * 1024);
+            if (Onnx.OnnxLoader.HasExternalData(quickParse))
+            {
+                // Download the external data file (typically model.onnx_data)
+                var dataFilename = filename + "_data";
+                // Check if any initializer specifies a different location
+                var firstExtInit = quickParse.Graph.Initializers.FirstOrDefault(i => i.DataLocation == 1 && i.ExternalData != null);
+                if (firstExtInit?.ExternalData?.TryGetValue("location", out var loc) == true && !string.IsNullOrEmpty(loc))
+                {
+                    // External data location is relative to the ONNX file
+                    var dir = filename.Contains('/') ? filename[..filename.LastIndexOf('/')] + "/" : "";
+                    dataFilename = dir + loc;
+                }
+                onProgress?.Invoke("download_data", 0);
+                externalData = await hub.LoadAsync(repoId, dataFilename, revision);
+                onProgress?.Invoke("download_data", 100);
+
+                // Resolve external data in the already-parsed model
+                Onnx.OnnxLoader.ResolveExternalData(quickParse, externalData);
+                externalData = null; // Free memory — data is now in the tensors
+
+                // Use the already-parsed model directly to avoid re-parsing
+                return CreateFromOnnxParsed(accelerator, quickParse, onProgress, inputShapes);
+            }
+        }
+
         return CreateFromFile(accelerator, bytes, onProgress, inputShapes);
     }
 
@@ -420,11 +452,14 @@ public class InferenceSession : IDisposable
     /// No Python extraction step needed — uses the native ONNX protobuf parser.
     /// </summary>
     /// <param name="inputShapes">Optional: override input shapes for models with dynamic dimensions.</param>
+    /// <param name="externalData">Optional: raw bytes of the external data file (model.onnx_data)
+    /// for models that store weights in a separate file.</param>
     public static InferenceSession CreateFromOnnx(
         Accelerator accelerator, byte[] onnxBytes,
         Action<string, int>? onProgress = null,
         Dictionary<string, int[]>? inputShapes = null,
-        bool enableOptimization = true)
+        bool enableOptimization = true,
+        byte[]? externalData = null)
     {
         // Single-parse architecture: parse ONNX protobuf ONCE with zero-copy for large tensors.
         // The parsed model is kept in memory — graph info extracted for compilation,
@@ -432,6 +467,11 @@ public class InferenceSession : IDisposable
         // Avoids scanning 652MB of protobuf twice (was the GPT-2 bottleneck).
         onProgress?.Invoke("parse", 0);
         var parsedModel = Onnx.OnnxParser.Parse(onnxBytes, zeroCopyThreshold: 1024 * 1024);
+
+        // Resolve external data if provided (models with separate weight files)
+        if (externalData != null && Onnx.OnnxLoader.HasExternalData(parsedModel))
+            Onnx.OnnxLoader.ResolveExternalData(parsedModel, externalData);
+
         var modelInfo = Onnx.OnnxLoader.ExtractModelInfoFromParsed(parsedModel);
         var cpuSmallWeights = new Dictionary<string, float[]>();
         foreach (var init in parsedModel.Graph.Initializers)
@@ -445,8 +485,16 @@ public class InferenceSession : IDisposable
             if (node.OpType == "Constant" && node.Outputs.Count > 0)
             {
                 var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
-                if (valueAttr?.T != null && valueAttr.T.ElementCount <= 64)
-                    cpuSmallWeights[node.Outputs[0]] = valueAttr.T.ToFloatArray();
+                if (valueAttr != null)
+                {
+                    if (valueAttr.T != null && valueAttr.T.ElementCount <= 64)
+                        cpuSmallWeights[node.Outputs[0]] = valueAttr.T.ToFloatArray();
+                    else if (valueAttr.T == null)
+                    {
+                        if (valueAttr.F != 0 || valueAttr.I != 0)
+                            cpuSmallWeights[node.Outputs[0]] = new[] { valueAttr.F != 0 ? valueAttr.F : (float)valueAttr.I };
+                    }
+                }
             }
         }
         onProgress?.Invoke("parse", 100);
@@ -472,12 +520,13 @@ public class InferenceSession : IDisposable
             if (elems > 0 && elems <= 64 && cpuSmallWeights.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
-                if (elems <= 16)
-                {
-                    graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
-                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
-                    graph.FloatConstantData[name] = data.ToArray();
-                }
+                // Populate ConstantData and FloatConstantData for ALL small constants
+                // (matching the 64-element cpuSmallWeights threshold). The old ≤16 limit
+                // broke Upsample/Resize shape inference: scales computed via
+                // Shape→Gather→Mul→Floor→Concat need FloatConstantData at every step.
+                graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                graph.FloatConstantData[name] = data.ToArray();
             }
         }
 
@@ -545,6 +594,136 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("upload", 100);
 
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX: {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
+
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        onProgress?.Invoke("ready", 100);
+
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        {
+            ModelName = modelInfo.Name
+        };
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from an already-parsed ONNX model.
+    /// Used when external data has been resolved in-place before compilation.
+    /// </summary>
+    private static InferenceSession CreateFromOnnxParsed(
+        Accelerator accelerator, Onnx.OnnxModelProto parsedModel,
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null,
+        bool enableOptimization = true)
+    {
+        onProgress?.Invoke("parse", 0);
+        var modelInfo = Onnx.OnnxLoader.ExtractModelInfoFromParsed(parsedModel);
+        var cpuSmallWeights = new Dictionary<string, float[]>();
+        foreach (var init in parsedModel.Graph.Initializers)
+        {
+            if (init.DataLocation == 1) continue;
+            if (init.ElementCount <= 64)
+                cpuSmallWeights[init.Name] = init.ToFloatArray();
+        }
+        foreach (var node in parsedModel.Graph.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Count > 0)
+            {
+                var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr != null)
+                {
+                    if (valueAttr.T != null && valueAttr.T.ElementCount <= 64)
+                        cpuSmallWeights[node.Outputs[0]] = valueAttr.T.ToFloatArray();
+                    else if (valueAttr.T == null)
+                    {
+                        // Scalar Constant: "value" attribute with F (float) or I (int) field
+                        // instead of T (tensor). Common in PyTorch-exported ONNX models.
+                        if (valueAttr.F != 0 || valueAttr.I != 0)
+                            cpuSmallWeights[node.Outputs[0]] = new[] { valueAttr.F != 0 ? valueAttr.F : (float)valueAttr.I };
+                    }
+                }
+            }
+        }
+        onProgress?.Invoke("parse", 100);
+
+        if (inputShapes != null)
+        {
+            foreach (var (name, shape) in inputShapes)
+                modelInfo.ValueShapes[name] = shape;
+        }
+
+        ModelGraph graph;
+        try { graph = ConvertToModelGraph(modelInfo); }
+        catch (Exception ex) { throw new InvalidOperationException($"ConvertToModelGraph failed: {ex.GetType().Name}: {ex.Message}", ex); }
+
+        graph.ConstantData ??= new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        foreach (var (name, shape) in graph.Initializers)
+        {
+            int elems = shape.Aggregate(1, (a, b) => a * b);
+            if (elems > 0 && elems <= 64 && cpuSmallWeights.TryGetValue(name, out var data))
+            {
+                constantFloatValues[name] = data;
+                // Populate ConstantData and FloatConstantData for ALL small constants
+                // (matching the 64-element cpuSmallWeights threshold). The old ≤16 limit
+                // broke Upsample/Resize shape inference: scales computed via
+                // Shape→Gather→Mul→Floor→Concat need FloatConstantData at every step.
+                graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                graph.FloatConstantData[name] = data.ToArray();
+            }
+        }
+
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
+        onProgress?.Invoke("compile", 100);
+
+        cpuSmallWeights = null;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        onProgress?.Invoke("upload", 0);
+        var pool = new BufferPool(accelerator);
+        var gpuWeights = new Dictionary<string, Tensor>();
+        int loaded = 0;
+
+        foreach (var (name, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
+        {
+            if (graph.Initializers.TryGetValue(name, out var shape))
+            {
+                int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+                if (tensor.ElementCount == 0 && expectedElems > 0)
+                    gpuWeights[name] = pool.AllocatePermanent(new float[expectedElems], shape, name);
+                else
+                    gpuWeights[name] = pool.AllocatePermanentChunked(tensor, shape, name);
+                loaded++;
+            }
+        }
+        foreach (var name in compiled.InitializerNames)
+        {
+            if (gpuWeights.ContainsKey(name)) continue;
+            if (constantFloatValues.TryGetValue(name, out var fData))
+            {
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fData.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fData, shape, name);
+                loaded++;
+            }
+            else if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var fcdData))
+            {
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fcdData.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fcdData, shape, name);
+                loaded++;
+            }
+            else if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var iData))
+            {
+                var fVals = iData.Select(v => (float)v).ToArray();
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fVals.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fVals, shape, name);
+                loaded++;
+            }
+        }
+        onProgress?.Invoke("upload", 100);
+
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX (ext): {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
 
         var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
         onProgress?.Invoke("ready", 100);
@@ -675,12 +854,9 @@ public class InferenceSession : IDisposable
             if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
-                if (elems <= 16)
-                {
-                    graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
-                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
-                    graph.FloatConstantData[name] = data.ToArray();
-                }
+                graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                graph.FloatConstantData[name] = data.ToArray();
             }
         }
 
@@ -759,12 +935,9 @@ public class InferenceSession : IDisposable
             if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
             {
                 constantFloatValues[name] = data;
-                if (elems <= 16)
-                {
-                    graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
-                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
-                    graph.FloatConstantData[name] = data.ToArray();
-                }
+                graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                graph.FloatConstantData[name] = data.ToArray();
             }
         }
 
