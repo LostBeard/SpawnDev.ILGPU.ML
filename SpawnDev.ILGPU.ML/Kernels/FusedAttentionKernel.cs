@@ -59,8 +59,10 @@ public class FusedAttentionKernel
     }
 
     /// <summary>
-    /// Per-element fused attention. Each thread computes one value of the output
-    /// by iterating over all KV positions (the attention "row").
+    /// Per-element fused attention with Online Softmax (single pass).
+    /// Each thread computes one output value by iterating over all KV positions once.
+    /// No dot product recomputation — eliminates WebGPU precision divergence
+    /// between two passes that caused maxErr 0.44.
     /// </summary>
     private static void FusedAttentionImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> Q,
@@ -79,38 +81,36 @@ public class FusedAttentionKernel
 
         if (bh >= BH) return;
 
-        // Q vector for this position: Q[bh, sq, :]
         int qBase = (bh * SQ + sq) * D;
 
-        // Step 1+2: Compute QK^T scores and find max (for numerical stability)
-        float maxScore = -1e10f;
-        for (int kv = 0; kv < SKV; kv++)
-        {
-            int kBase = (bh * SKV + kv) * D;
-            float dot = 0f;
-            for (int dd = 0; dd < D; dd++)
-                dot += Q[qBase + dd] * K[kBase + dd];
-            dot *= scale;
-            if (dot > maxScore) maxScore = dot;
-        }
-
-        // Step 3: Softmax — compute exp(score - max) and sum
-        // Step 4: Weighted sum of V at dimension d
-        float sumExp = 0f;
+        // Online Softmax: single pass over KV positions
+        // Maintains running max, running sum, and running weighted V
+        float runningMax = -1e10f;
+        float runningSum = 0f;
         float weightedV = 0f;
+
         for (int kv = 0; kv < SKV; kv++)
         {
             int kBase = (bh * SKV + kv) * D;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += Q[qBase + dd] * K[kBase + dd];
-            dot *= scale;
+            float score = dot * scale;
 
-            float weight = MathF.Exp(dot - maxScore);
-            sumExp += weight;
+            // Online Softmax update
+            if (score > runningMax)
+            {
+                float correction = MathF.Exp(runningMax - score);
+                runningSum *= correction;
+                weightedV *= correction;
+                runningMax = score;
+            }
+
+            float weight = MathF.Exp(score - runningMax);
+            runningSum += weight;
             weightedV += weight * V[(bh * SKV + kv) * D + d];
         }
 
-        output[idx] = weightedV / (sumExp + 1e-10f);
+        output[idx] = weightedV / (runningSum + 1e-10f);
     }
 }

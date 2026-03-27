@@ -103,6 +103,10 @@ public class FusedDequantMatMul
         output[idx] = sum;
     }
 
+    // NOTE: FusedDequantMatMul has maxErr 9.47 on WebGPU — likely ArrayView1D<byte>
+    // transpilation issue in WGSL codegen. Rule #2: fix in SpawnDev.ILGPU, not here.
+    // Tracked in DevComms: data-p2p3-progress-2026-03-27.md
+
     /// <summary>Convert FP16 bits to float.</summary>
     private static float HalfToFloat(int h)
     {
