@@ -188,6 +188,16 @@ public class GraphExecutor : IDisposable
             try
             {
                 runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, node.Attributes);
+                // Safety: if runtime inference produces shapes with sentinel values (int.MaxValue)
+                // or negative dims, fall back to compiled shapes
+                for (int ri = 0; ri < runtimeOutputShapes.Length; ri++)
+                {
+                    if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
+                    {
+                        runtimeOutputShapes = node.OutputShapes;
+                        break;
+                    }
+                }
             }
             catch
             {
@@ -399,7 +409,18 @@ public class GraphExecutor : IDisposable
                 .ToArray();
 
             int[][] runtimeOutputShapes;
-            try { runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, node.Attributes); }
+            try
+            {
+                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, node.Attributes);
+                for (int ri = 0; ri < runtimeOutputShapes.Length; ri++)
+                {
+                    if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
+                    {
+                        runtimeOutputShapes = node.OutputShapes;
+                        break;
+                    }
+                }
+            }
             catch { runtimeOutputShapes = node.OutputShapes; }
 
             if (node.OpType == "Expand" && node.InputNames.Length >= 2
