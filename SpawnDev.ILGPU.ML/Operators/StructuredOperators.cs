@@ -54,6 +54,9 @@ public class SoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         int axis = ctx.GetInt("axis", -1);
         var shape = ctx.Inputs[0].Shape;
         if (axis < 0) axis += shape.Length;
+        if (axis < 0 || axis >= shape.Length)
+            throw new InvalidOperationException(
+                $"Softmax axis {axis} out of range for shape [{string.Join(",", shape)}] (rank={shape.Length})");
 
         // Copy input to output first
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);

@@ -148,6 +148,9 @@ public class OperatorRegistry
         Register(new TopKOperator(_accelerator));
         Register(new SignOperator(_accelerator));
 
+        // General tensor operations
+        Register(new EinsumOperator(this));
+
         // Fused operators (created by GraphOptimizer)
         Register(new FusedLinearOperator(this));
         Register(new FusedScaledMatMulOperator(this));

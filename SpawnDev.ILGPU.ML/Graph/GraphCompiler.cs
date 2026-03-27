@@ -386,6 +386,45 @@ public class GraphCompiler
                 }
             }
 
+            // Compile-time Where(condition, X, Y) on known constants
+            // Common in Resize size computation: Where(Equal(dim, 0), origDim, newDim)
+            if (node.OpType == "Where" && node.Inputs.Count >= 3
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var whereCond)
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var whereX)
+                && graph.ConstantData.TryGetValue(node.Inputs[2], out var whereY))
+            {
+                int len = Math.Max(whereCond.Length, Math.Max(whereX.Length, whereY.Length));
+                var result = new int[len];
+                for (int j = 0; j < len; j++)
+                {
+                    bool cond = whereCond[j % whereCond.Length] != 0;
+                    result[j] = cond ? whereX[j % whereX.Length] : whereY[j % whereY.Length];
+                }
+                if (node.Outputs.Count > 0)
+                {
+                    graph.ConstantData[node.Outputs[0]] = result;
+                    graph.FloatConstantData![node.Outputs[0]] = result.Select(v => (float)v).ToArray();
+                }
+            }
+
+            // Compile-time Equal on known constants (produces boolean 0/1)
+            if (node.OpType == "Equal" && node.Inputs.Count >= 2
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var eqA)
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var eqB))
+            {
+                int len = Math.Max(eqA.Length, eqB.Length);
+                var result = new int[len];
+                for (int j = 0; j < len; j++)
+                    result[j] = eqA[j % eqA.Length] == eqB[j % eqB.Length] ? 1 : 0;
+                if (node.Outputs.Count > 0)
+                {
+                    graph.ConstantData[node.Outputs[0]] = result;
+                    graph.FloatConstantData![node.Outputs[0]] = result.Select(v => (float)v).ToArray();
+                }
+            }
+
             // Compile-time Floor/Ceil on known constants
             if (node.OpType is "Floor" or "Ceil" && node.Inputs.Count >= 1
                 && graph.ConstantData != null
@@ -543,6 +582,42 @@ public class GraphCompiler
                     var resolvedShape = resolved ? $"[{string.Join(",", outputShapes[0])}]" : "FALLBACK";
                     Console.WriteLine($"[GraphCompiler] {node.OpType} '{outName}': resolved={resolved} shape={resolvedShape} input=[{string.Join(",", inputShapes[0])}]");
                 }
+                // Fallback for Resize: try to resolve sizes from the Shape of a known
+                // tensor in the sizes chain. DepthAnything V2 computes Resize sizes via
+                // Shape→Slice→Concat→Where which is hard to propagate fully. But if ANY
+                // node in the sizes chain is a Shape of a tensor with known dims, we can
+                // infer the target spatial dimensions.
+                if (!resolved && node.OpType == "Resize" && node.Inputs.Count > sizesIdx
+                    && !string.IsNullOrEmpty(node.Inputs[sizesIdx]))
+                {
+                    // Trace the sizes input back to find a Shape node with known dims
+                    var visited = new HashSet<string>();
+                    var queue = new Queue<string>();
+                    queue.Enqueue(node.Inputs[sizesIdx]);
+                    while (queue.Count > 0 && visited.Count < 20 && !resolved)
+                    {
+                        var traceName = queue.Dequeue();
+                        if (string.IsNullOrEmpty(traceName) || !visited.Add(traceName)) continue;
+                        // Check if this value is in ConstantData
+                        if (graph.ConstantData.TryGetValue(traceName, out var traceData)
+                            && traceData.Length == inputShapes[0].Length
+                            && IsValidConstant(traceData))
+                        {
+                            var outShape = traceData.ToArray();
+                            for (int j = 0; j < outShape.Length; j++)
+                                if (outShape[j] <= 0) outShape[j] = inputShapes[0][j];
+                            outputShapes = new[] { outShape };
+                            resolved = true;
+                            break;
+                        }
+                        // Trace through producer node
+                        var producer = sorted.FirstOrDefault(nd => nd.Outputs.Contains(traceName));
+                        if (producer != null)
+                            foreach (var inp in producer.Inputs.Where(i => !string.IsNullOrEmpty(i)))
+                                queue.Enqueue(inp);
+                    }
+                }
+
                 if (!resolved)
                 {
                     var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
