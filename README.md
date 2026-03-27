@@ -464,6 +464,22 @@ These AI agents coordinate through a shared DevComms system, with defined roles 
 - [ILGPU Documentation](https://ilgpu.net/)
 - [Plans/full-inference-engine-plan.md](Plans/full-inference-engine-plan.md) — Detailed roadmap
 
+## Coming Soon
+
+### Decentralized Model Delivery via [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent)
+
+AI models are big. CDNs can't scale when every user downloads the same 2GB model. We're building a pure C# WebTorrent client and server that turns every browser into a peer — the more users, the faster delivery. HuggingFace serves the model once, the swarm handles the rest. Our server on spawndev.com proxies HuggingFace with caching, seeds to the swarm, and generates .torrent files on demand.
+
+### Distributed GPU Compute Across Devices
+
+The P2P network we're building for model delivery creates a natural foundation for **distributed GPU compute**. Every connected device already exchanges data over WebRTC — extending this to share compute workloads is the next step:
+
+- **Model inference sharding** — Split a 14B model across multiple devices. Each runs inference on their portion via SpawnDev.ILGPU, passes intermediate tensors to the next peer. A model that doesn't fit on one device runs across your phone, laptop, tablet, and desktop.
+- **SpawnDev.ILGPU P2P Backend** — A 7th backend (`AcceleratorType.P2P`) that distributes kernels across connected devices transparently. Same C# kernel code, same API. The living room becomes a compute cluster.
+- **Volunteer compute pools** — Users opt in to donate idle GPU time. Like Folding@Home for ML inference in the browser.
+
+This is massive AI power brought into the home by utilizing every device you own.
+
 ## License
 
 Licensed under the same terms as ILGPU. See [LICENSE](LICENSE.txt) for details.
