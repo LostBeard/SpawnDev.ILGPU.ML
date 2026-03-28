@@ -716,17 +716,30 @@ public class GraphCompiler
     /// <summary>Topological sort using Kahn's algorithm.</summary>
     private static List<GraphNode> TopologicalSort(List<GraphNode> nodes)
     {
-        // Build dependency graph
+        // Build dependency graph: map each tensor name to the node that produces it.
+        // If multiple nodes produce the same name (e.g., If branches flattened), keep the LAST
+        // producer — ONNX guarantees the last writer is authoritative for downstream consumers.
         var produced = new Dictionary<string, GraphNode>();
         foreach (var node in nodes)
             foreach (var output in node.Outputs)
-                produced[output] = node;
+                if (!string.IsNullOrEmpty(output))
+                    produced[output] = node;
 
-        var inDegree = nodes.ToDictionary(n => n, _ => 0);
+        // Build adjacency: for each node, find which other nodes it depends on
+        var deps = new Dictionary<GraphNode, HashSet<GraphNode>>();
+        foreach (var node in nodes) deps[node] = new HashSet<GraphNode>();
         foreach (var node in nodes)
             foreach (var input in node.Inputs)
-                if (produced.TryGetValue(input, out var producer) && producer != node)
-                    inDegree[node]++;
+                if (!string.IsNullOrEmpty(input) && produced.TryGetValue(input, out var producer) && producer != node)
+                    deps[node].Add(producer);
+
+        var inDegree = nodes.ToDictionary(n => n, n => deps[n].Count);
+        // Reverse map: for each node, which nodes depend on it?
+        var consumers = new Dictionary<GraphNode, List<GraphNode>>();
+        foreach (var node in nodes) consumers[node] = new List<GraphNode>();
+        foreach (var node in nodes)
+            foreach (var dep in deps[node])
+                consumers[dep].Add(node);
 
         var queue = new Queue<GraphNode>(nodes.Where(n => inDegree[n] == 0));
         var sorted = new List<GraphNode>();
@@ -734,22 +747,29 @@ public class GraphCompiler
         {
             var node = queue.Dequeue();
             sorted.Add(node);
-            foreach (var output in node.Outputs)
+            // Notify all consumers that this dependency is satisfied (once per consumer)
+            foreach (var consumer in consumers[node])
             {
-                foreach (var consumer in nodes)
-                {
-                    if (consumer.Inputs.Contains(output) && consumer != node)
-                    {
-                        inDegree[consumer]--;
-                        if (inDegree[consumer] == 0)
-                            queue.Enqueue(consumer);
-                    }
-                }
+                inDegree[consumer]--;
+                if (inDegree[consumer] == 0)
+                    queue.Enqueue(consumer);
             }
         }
 
         if (sorted.Count != nodes.Count)
-            throw new InvalidOperationException($"Graph has cycles: sorted {sorted.Count}/{nodes.Count} nodes");
+        {
+            // Diagnostic: find stuck nodes and their unresolved dependencies
+            var stuckNodes = nodes.Where(n => !sorted.Contains(n)).Take(5);
+            var diag = string.Join("; ", stuckNodes.Select(n =>
+            {
+                var unresolved = deps[n].Where(d => !sorted.Contains(d))
+                    .Select(d => $"{d.OpType}({string.Join(",", d.Outputs.Take(1))})")
+                    .Take(3);
+                return $"{n.OpType}({string.Join(",", n.Outputs.Take(1))}) waits on [{string.Join(",", unresolved)}]";
+            }));
+            throw new InvalidOperationException(
+                $"Graph has cycles: sorted {sorted.Count}/{nodes.Count} nodes. Stuck: {diag}");
+        }
 
         return sorted;
     }
