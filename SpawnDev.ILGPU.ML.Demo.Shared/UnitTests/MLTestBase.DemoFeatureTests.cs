@@ -23,10 +23,11 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // Load DistilGPT-2 model + tokenizer
-        var modelBytes = await http.GetByteArrayAsync("models/distilgpt2/model.onnx");
+        // Load DistilGPT-2 model + tokenizer from HuggingFace
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/distilgpt2/resolve/main/tokenizer.json");
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
 
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
         var pipeline = new TextGenerationPipeline(session, accelerator);
