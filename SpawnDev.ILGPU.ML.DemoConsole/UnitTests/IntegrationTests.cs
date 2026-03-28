@@ -1353,6 +1353,54 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>MoveNet Lightning on CUDA — pose estimation inference.</summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DirectOnnx_MoveNet_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "movenet-lightning", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"MoveNet model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+        var context = MLContext.CreateContext();
+        var cudaDevices = context.GetCudaDevices();
+        if (cudaDevices.Count == 0) { context.Dispose(); throw new UnsupportedTestException("No CUDA"); }
+        using var accelerator = cudaDevices[0].CreateAccelerator(context);
+
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { ["input"] = new[] { 1, 192, 192, 3 } });
+        Console.WriteLine($"[MoveNet-CUDA] {session}");
+
+        // NHWC input [1, 192, 192, 3] with pixel values [0, 255]
+        var rng = new Random(42);
+        var input = new float[1 * 192 * 192 * 3];
+        for (int i = 0; i < input.Length; i++) input[i] = rng.Next(0, 256);
+        using var inBuf = accelerator.Allocate1D(input);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = new Tensor(inBuf.View, new[] { 1, 192, 192, 3 })
+        });
+        sw.Stop();
+
+        var output = outputs[session.OutputNames[0]];
+        Console.WriteLine($"[MoveNet-CUDA] Output: [{string.Join(",", output.Shape)}], time={sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        // Output should be [1, 1, 17, 3] = 51 values (17 keypoints × [y, x, confidence])
+        int rc = Math.Min(51, output.ElementCount);
+        using var rb = accelerator.Allocate1D<float>(rc);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, rc), rb.View, rc, 1f);
+        await accelerator.SynchronizeAsync();
+        var keypoints = await rb.CopyToHostAsync<float>(0, rc);
+
+        if (keypoints.Any(v => float.IsNaN(v))) throw new Exception("MoveNet output has NaN");
+        if (keypoints.All(v => v == 0f)) throw new Exception("MoveNet output is all zeros");
+
+        Console.WriteLine($"[MoveNet-CUDA] PASS — {rc / 3} keypoints, range=[{keypoints.Min():F3}, {keypoints.Max():F3}]");
+        context.Dispose();
+    }
+
     /// <summary>ESPCN super resolution on CUDA — 3x upscaling.</summary>
     [TestMethod(Timeout = 60000)]
     public async Task DirectOnnx_ESPCN_SuperRes_Cuda()

@@ -415,11 +415,14 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
                     offset += (int)idxArr[s * lastIdxDim + d] * strides[d];
 
                 int copyLen = Math.Min(sliceSize, outputSize - s * sliceSize);
-                if (offset >= 0 && offset + copyLen <= dataTotal)
+                int dstOffset = s * sliceSize;
+                if (offset >= 0 && copyLen > 0
+                    && offset + copyLen <= (int)data.Data.Length
+                    && dstOffset + copyLen <= (int)ctx.Outputs[0].Data.Length)
                 {
                     reg.ElementWise.Scale(
                         data.Data.SubView(offset, copyLen),
-                        ctx.Outputs[0].Data.SubView(s * sliceSize, copyLen),
+                        ctx.Outputs[0].Data.SubView(dstOffset, copyLen),
                         copyLen, 1f);
                 }
             }
