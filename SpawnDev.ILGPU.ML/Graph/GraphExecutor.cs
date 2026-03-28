@@ -225,8 +225,7 @@ public class GraphExecutor : IDisposable
             catch (Exception _inferEx)
             {
                 // Fallback to compiled shapes if runtime inference fails
-                if (node.OpType is "Conv" or "ConvTranspose")
-                    Console.WriteLine($"[RT-InferFail] {node.OpType} {node.OutputNames[0]}: {_inferEx.GetType().Name}: {_inferEx.Message}");
+                Console.WriteLine($"[RT-InferFail] {node.OpType} {node.OutputNames[0]}: {_inferEx.GetType().Name}: {_inferEx.Message.Split('\n')[0]}");
                 runtimeOutputShapes = node.OutputShapes;
             }
 
@@ -507,12 +506,17 @@ public class GraphExecutor : IDisposable
                 {
                     if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
                     {
+                        Console.WriteLine($"[RT-SafetyReject-Async] {node.OpType} {node.OutputNames[0]}: inferred=[{string.Join(",", runtimeOutputShapes[ri])}] compiled=[{string.Join(",", node.OutputShapes[ri])}]");
                         runtimeOutputShapes = node.OutputShapes;
                         break;
                     }
                 }
             }
-            catch { runtimeOutputShapes = node.OutputShapes; }
+            catch (Exception _inferExAsync)
+            {
+                Console.WriteLine($"[RT-InferFail-Async] {node.OpType} {node.OutputNames[0]}: {_inferExAsync.GetType().Name}: {_inferExAsync.Message.Split('\n')[0]}");
+                runtimeOutputShapes = node.OutputShapes;
+            }
 
             // Runtime Slice (same as sync Run)
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)

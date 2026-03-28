@@ -705,11 +705,14 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "Concat";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
+        if (inputs.Length == 0 || inputs[0].Length == 0)
+            return new[] { inputs.Length > 0 ? inputs[0] : Array.Empty<int>() };
         int axis = attrs.ContainsKey("axis") ? Convert.ToInt32(attrs["axis"]) : 0;
         if (axis < 0) axis += inputs[0].Length;
+        if (axis < 0 || axis >= inputs[0].Length) return new[] { inputs[0] };
         var outShape = (int[])inputs[0].Clone();
         for (int i = 1; i < inputs.Length; i++)
-            outShape[axis] += inputs[i][axis];
+            if (inputs[i].Length > axis) outShape[axis] += inputs[i][axis];
         return new[] { outShape };
     }
     public void Execute(OnnxOpContext ctx)
@@ -1293,8 +1296,12 @@ public class TransposeOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "Transpose";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
+        if (inputs.Length == 0 || inputs[0].Length == 0) return new[] { inputs.Length > 0 ? inputs[0] : Array.Empty<int>() };
         var perm = attrs.ContainsKey("perm") ? ((long[])attrs["perm"]).Select(p => (int)p).ToArray()
                  : Enumerable.Range(0, inputs[0].Length).Reverse().ToArray();
+        // Guard: perm must match input rank
+        if (perm.Length != inputs[0].Length || perm.Any(p => p >= inputs[0].Length))
+            return new[] { inputs[0] }; // Fallback
         var outShape = new int[inputs[0].Length];
         for (int i = 0; i < perm.Length; i++) outShape[i] = inputs[0][perm[i]];
         return new[] { outShape };
