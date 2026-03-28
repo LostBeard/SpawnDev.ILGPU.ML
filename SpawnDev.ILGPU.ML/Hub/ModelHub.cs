@@ -230,6 +230,10 @@ public class ModelHub : IDisposable
         /// <summary>SD-Turbo — ONE-step text-to-image, 512x512, FP16 WebGPU-optimized (~2.5 GB)</summary>
         public const string SDTurbo = "schmuell/sd-turbo-ort-web";
 
+        // ── 3D Reconstruction ──
+        /// <summary>TripoSR — Single image to 3D mesh, ONNX conversion by julienkay (~1.7 GB total)</summary>
+        public const string TripoSR = "julienkay/TripoSR";
+
         // ── Background Removal ──
         /// <summary>RMBG 1.4 — Background removal (44 MB, public, no auth)</summary>
         public const string RMBG14 = "briaai/RMBG-1.4";
@@ -259,6 +263,16 @@ public class ModelHub : IDisposable
         public const string OnnxEncoderModel = "onnx/encoder_model.onnx";
         /// <summary>Decoder model merged (e.g., SpeechT5)</summary>
         public const string OnnxDecoderModelMerged = "onnx/decoder_model_merged.onnx";
+
+        // ── TripoSR (3D reconstruction) ──
+        /// <summary>TripoSR backbone — DINOv2 encoder + triplane transformer (1.32 GB)</summary>
+        public const string TripoSRBackbone = "backbone.onnx";
+        /// <summary>TripoSR image tokenizer (343 MB)</summary>
+        public const string TripoSRImageTokenizer = "image_tokenizer.onnx";
+        /// <summary>TripoSR post processor (660 KB)</summary>
+        public const string TripoSRPostProcessor = "post_processor.onnx";
+        /// <summary>TripoSR tokenizer (12.6 MB)</summary>
+        public const string TripoSRTokenizer = "tokenizer.onnx";
     }
 
     public void Dispose()
