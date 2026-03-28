@@ -190,16 +190,11 @@ public class GraphExecutor : IDisposable
                 nodeInputs[i] = tensor;
             }
 
-            // Allocate output tensors.
-            // Use RUNTIME input shapes to re-infer output shapes. This handles cascading
-            // dynamic shapes: if Resize/Expand produced a larger output than compiled,
-            // all downstream nodes automatically get correctly-sized buffers.
+            // Allocate output tensors using runtime input shapes for re-inference.
             var actualInputShapes = nodeInputs
                 .Select(t => t?.Shape ?? Array.Empty<int>())
                 .ToArray();
 
-            // Convert JsonElement attributes to CLR types for InferOutputShapes
-            // (attributes are stored as JsonElement from compilation, but operators expect long[]/string/etc.)
             var runtimeAttrs = ConvertAttributes(node.Attributes);
 
             int[][] runtimeOutputShapes;
