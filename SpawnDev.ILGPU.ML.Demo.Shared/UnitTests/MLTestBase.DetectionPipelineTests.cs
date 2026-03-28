@@ -97,7 +97,6 @@ public abstract partial class MLTestBase
 
         var cmpLen = Math.Min(actual.Length, expected.Length);
         AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 1.0f, "YOLOv8");
-        session.Dispose();
     });
 
     // ── Pose Estimation (MoveNet) ──
@@ -154,7 +153,6 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[Pipeline] MoveNet: {elems / 3} keypoints, values range [{keypoints.Min():F4}, {keypoints.Max():F4}]");
         Console.WriteLine($"[Pipeline] MoveNet pipeline: PASS");
-        session.Dispose();
     });
 
     // ── Face Detection (BlazeFace) ──
@@ -228,6 +226,5 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[Pipeline] BlazeFace: regressors={regElems}, classificators={clsElems}");
         Console.WriteLine($"[Pipeline] BlazeFace reference: PASS");
-        session.Dispose();
     });
 }
