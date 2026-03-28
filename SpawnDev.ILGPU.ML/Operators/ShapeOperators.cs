@@ -25,10 +25,6 @@ public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
         // This fixes the case where the pre-allocated output buffer has the wrong compiled shape
         // but the runtime Reshape target (from Concat of Shape values) is correct.
         var targetShape = ctx.TryGetInputValues(1);
-        if (targetShape != null)
-            Console.WriteLine($"[Reshape] target=[{string.Join(",", targetShape)}] inputShape=[{string.Join(",", ctx.Inputs[0].Shape)}] inputElems={ctx.Inputs[0].ElementCount}");
-        else if (ctx.InputNames.Length > 1)
-            Console.WriteLine($"[Reshape] target NOT FOUND for '{ctx.InputNames[1]}' inputShape=[{string.Join(",", ctx.Inputs[0].Shape)}]");
         if (targetShape != null && targetShape.Length > 0)
         {
             var resolved = targetShape.Select(v => (int)v).ToArray();
