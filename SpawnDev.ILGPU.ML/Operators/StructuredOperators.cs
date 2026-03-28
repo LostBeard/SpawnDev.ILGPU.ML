@@ -204,8 +204,10 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
             int kH = w.Shape[2]; int kW = w.Shape[3];
 
-            if (group == inC && group == outC)
+            if (group == inC && (group == outC || outC == 1))
             {
+                // Depthwise conv: group=inC, each channel convolved independently.
+                // outC may be 1 for TFLite depthwise (weight shape [1,kH,kW,C] transposed).
                 reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
                     inC, inH, inW, kH, kW, stride, pad);
             }
