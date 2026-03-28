@@ -29,19 +29,25 @@ public class TransformerBlock
     private readonly SoftmaxKernel _softmax;
     private readonly ElementWiseKernels _elementWise;
     private readonly AttentionKernels _attention;
+    private readonly Kernels.FusedAttentionKernel? _fusedAttention;
+
+    /// <summary>When true, uses single-dispatch fused attention kernel instead of multi-dispatch.</summary>
+    public bool UseFusedAttention { get; set; }
 
     public TransformerBlock(
         MatMulKernel matMul,
         LayerNormKernel layerNorm,
         SoftmaxKernel softmax,
         ElementWiseKernels elementWise,
-        AttentionKernels attention)
+        AttentionKernels attention,
+        Kernels.FusedAttentionKernel? fusedAttention = null)
     {
         _matMul = matMul;
         _layerNorm = layerNorm;
         _softmax = softmax;
         _elementWise = elementWise;
         _attention = attention;
+        _fusedAttention = fusedAttention;
     }
 
     /// <summary>
@@ -264,26 +270,25 @@ public class TransformerBlock
         var V = tmp.V;
         _attention.SplitHeads(qkv, Q, K, V, T);
 
-        // Step 2: Batched Q × K^T → scores [H, T, T]
-        // Q is [H, T, D], K is [H, T, D], we need Q × K^T = [H, T, T]
-        // For batched matmul: A=[H, T, D], B=[H, D, T] → C=[H, T, T]
-        // But K is [H, T, D] not [H, D, T]. We need K transposed.
-        // Use a TransposeLastTwo kernel or modify the matmul.
-        // Simpler: transpose K from [H, T, D] to [H, D, T], then batched matmul.
-        TransposeLastTwo(K, tmp.KTransposed, H, T, D);
+        if (UseFusedAttention && _fusedAttention != null)
+        {
+            // Fused path: single dispatch replaces steps 2-5.
+            // softmax(Q @ K^T / sqrt(D)) @ V computed in one kernel per thread.
+            // No intermediate scores materialization, no multi-dispatch overhead.
+            _fusedAttention.Forward(Q, K, V, tmp.AttnHeadOut, H, T, T, D);
+        }
+        else
+        {
+            // Unfused path: 4 dispatches (transpose, matmul, scale+softmax, matmul)
+            TransposeLastTwo(K, tmp.KTransposed, H, T, D);
+            _matMul.BatchedMatMul(Q, tmp.KTransposed, tmp.AttnScores, H, T, D, T);
 
-        // Batched MatMul: Q[H, T, D] × KT[H, D, T] → scores[H, T, T]
-        _matMul.BatchedMatMul(Q, tmp.KTransposed, tmp.AttnScores, H, T, D, T);
+            float scale = 1f / MathF.Sqrt(D);
+            _elementWise.ScaleInPlace(tmp.AttnScores, H * T * T, scale);
+            _softmax.Forward(tmp.AttnScores, H * T, T);
 
-        // Step 3: Scale by 1/√D = 1/8 (in-place to avoid aliasing)
-        float scale = 1f / MathF.Sqrt(D);
-        _elementWise.ScaleInPlace(tmp.AttnScores, H * T * T, scale);
-
-        // Step 4: Softmax over last dimension (T) — H*T rows of length T
-        _softmax.Forward(tmp.AttnScores, H * T, T);
-
-        // Step 5: Batched scores[H, T, T] × V[H, T, D] → attnOut[H, T, D]
-        _matMul.BatchedMatMul(tmp.AttnScores, V, tmp.AttnHeadOut, H, T, T, D);
+            _matMul.BatchedMatMul(tmp.AttnScores, V, tmp.AttnHeadOut, H, T, T, D);
+        }
 
         // Step 6: Merge heads [H, T, D] → [T, C]
         _attention.MergeHeads(tmp.AttnHeadOut, output, T);
