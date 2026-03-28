@@ -328,6 +328,41 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "GatherND";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { inputs[1] }; // Simplified — output shape depends on indices
+
+    // GPU GatherND kernel: each thread copies one element of the output.
+    // params: [lastIdxDim, sliceSize, dataTotal, strides[0], strides[1], ...]
+    private Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,  // data
+        ArrayView1D<float, Stride1D.Dense>,  // indices
+        ArrayView1D<float, Stride1D.Dense>,  // output
+        ArrayView1D<int, Stride1D.Dense>>?   // params
+        _gatherNDKernel;
+
+    private static void GatherNDImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int lastIdxDim = p[0];
+        int sliceSize = p[1];
+        int dataTotal = p[2];
+
+        // Which slice and element within slice
+        int sliceIdx = idx / sliceSize;
+        int elemInSlice = idx % sliceSize;
+
+        // Compute flat offset from multi-dimensional index
+        int flatOffset = 0;
+        for (int d = 0; d < lastIdxDim; d++)
+        {
+            int dimIdx = (int)indices[sliceIdx * lastIdxDim + d];
+            flatOffset += dimIdx * p[3 + d]; // strides[d]
+        }
+
+        int srcIdx = flatOffset + elemInSlice;
+        output[idx] = srcIdx >= 0 && srcIdx < dataTotal ? data[srcIdx] : 0f;
+    }
     public void Execute(OnnxOpContext ctx)
     {
         var data = ctx.Inputs[0];
@@ -375,22 +410,40 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Fallback: read both arrays to CPU (sync — works on CUDA/OpenCL/CPU, not WebGPU)
+            // GPU-only path: both data and indices stay on GPU.
+            // Upload strides as a params buffer, dispatch one thread per output element.
+            // Each thread reads its index from the indices tensor.
+            // params: [lastIdxDim, sliceSize, dataTotal, strides[0], strides[1], ...]
+            var paramsArr = new int[3 + strides.Length];
+            paramsArr[0] = lastIdxDim;
+            paramsArr[1] = sliceSize;
+            paramsArr[2] = dataTotal;
+            for (int i = 0; i < strides.Length; i++) paramsArr[3 + i] = strides[i];
+            using var paramsBuf = reg.Accelerator.Allocate1D(paramsArr);
+
+            _gatherNDKernel ??= reg.Accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherNDImpl);
+            _gatherNDKernel(outputSize, data.Data, indices.Data, ctx.Outputs[0].Data, paramsBuf.View);
+
+            // Legacy CPU fallback below (unreachable on WebGPU, kept for reference)
+            #pragma warning disable CS0162
+            return;
             var dataArr = ctx.TryGetInputValues(0);
             if (dataArr == null || dataArr.Length != dataTotal)
             {
                 dataArr = new float[dataTotal];
                 data.Data.SubView(0, dataTotal).CopyToCPU(dataArr);
             }
-            idxArr = new float[idxTotal];
-            indices.Data.SubView(0, idxTotal).CopyToCPU(idxArr);
+            var idxArrFallback = new float[idxTotal];
+            indices.Data.SubView(0, idxTotal).CopyToCPU(idxArrFallback);
 
             var result = new float[outputSize];
             for (int s = 0; s < numSlices && s * sliceSize < outputSize; s++)
             {
                 int offset = 0;
                 for (int d = 0; d < lastIdxDim; d++)
-                    offset += (int)idxArr[s * lastIdxDim + d] * strides[d];
+                    offset += (int)idxArrFallback[s * lastIdxDim + d] * strides[d];
 
                 for (int j = 0; j < sliceSize && s * sliceSize + j < outputSize; j++)
                     result[s * sliceSize + j] = (offset + j < dataTotal) ? dataArr[offset + j] : 0f;
