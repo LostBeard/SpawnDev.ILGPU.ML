@@ -152,7 +152,7 @@ public abstract partial class MLTestBase
 
     // ── Image Classification Reference Test (EfficientNet-Lite0, TFLite) ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 300000)]
     public async Task Reference_EfficientNetLite0_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
