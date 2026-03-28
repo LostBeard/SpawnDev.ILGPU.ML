@@ -1,3 +1,5 @@
+using ILGPU;
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Operators;
@@ -39,6 +41,11 @@ public class OnnxOpContext
     /// <summary>Pre-read constant data from small tensors (avoids GPU→CPU readback at runtime).
     /// Maps tensor name → float[] values. Populated during session creation.</summary>
     public Dictionary<string, float[]>? ConstantValues { get; init; }
+
+    /// <summary>Quantized weight buffers (Q4_0, Q8_0, etc.) stored as raw bytes on GPU.
+    /// When a weight tensor name appears here, operators should use fused dequantization
+    /// kernels instead of regular float operations. Maps tensor name → byte ArrayView.</summary>
+    public Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? QuantizedWeights { get; init; }
 
     /// <summary>Try to get pre-read float values for an input tensor (by index).
     /// Returns null if not available (tensor is dynamic, not pre-read).</summary>

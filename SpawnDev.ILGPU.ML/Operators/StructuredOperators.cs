@@ -30,6 +30,16 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         int M = a.Shape[^2]; int K = a.Shape[^1]; int N = b.Shape[^1];
+
+        // Check if weight B is quantized (Q4_0) — use fused dequant kernel
+        string? bName = ctx.InputNames.Length > 1 ? ctx.InputNames[1] : null;
+        if (bName != null && ctx.QuantizedWeights != null
+            && ctx.QuantizedWeights.TryGetValue(bName, out var q4Data))
+        {
+            reg.FusedDequant.Forward(a.Data, q4Data, ctx.Outputs[0].Data, M, K, N);
+            return;
+        }
+
         if (a.Rank == 2 && b.Rank == 2)
         {
             reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);

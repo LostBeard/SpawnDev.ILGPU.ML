@@ -30,6 +30,7 @@ public class OperatorRegistry
     public GatherKernel Gather { get; }
     public PadKernel Pad { get; }
     public ConvTranspose2DKernel ConvTranspose { get; }
+    public Kernels.FusedDequantMatMul FusedDequant { get; }
 
     public OperatorRegistry(Accelerator accelerator)
     {
@@ -50,6 +51,7 @@ public class OperatorRegistry
         Gather = new GatherKernel(accelerator);
         Pad = new PadKernel(accelerator);
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
+        FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
 
         // Register built-in operators
         RegisterBuiltins();
