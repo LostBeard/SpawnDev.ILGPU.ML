@@ -331,6 +331,7 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
 
     // GPU GatherND kernel: each thread copies one element of the output.
     // params: [lastIdxDim, sliceSize, dataTotal, strides[0], strides[1], ...]
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,  // data
         ArrayView1D<float, Stride1D.Dense>,  // indices
@@ -419,12 +420,13 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
             paramsArr[1] = sliceSize;
             paramsArr[2] = dataTotal;
             for (int i = 0; i < strides.Length; i++) paramsArr[3 + i] = strides[i];
-            using var paramsBuf = reg.Accelerator.Allocate1D(paramsArr);
+            _lastParamsBuf?.Dispose();
+            _lastParamsBuf = reg.Accelerator.Allocate1D(paramsArr);
 
             _gatherNDKernel ??= reg.Accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherNDImpl);
-            _gatherNDKernel(outputSize, data.Data, indices.Data, ctx.Outputs[0].Data, paramsBuf.View);
+            _gatherNDKernel(outputSize, data.Data, indices.Data, ctx.Outputs[0].Data, _lastParamsBuf.View);
 
             // Legacy CPU fallback below (unreachable on WebGPU, kept for reference)
             #pragma warning disable CS0162
