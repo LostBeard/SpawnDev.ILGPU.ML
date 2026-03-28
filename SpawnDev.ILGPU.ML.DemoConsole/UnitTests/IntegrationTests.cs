@@ -1353,6 +1353,63 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>YOLOv8 Nano on CUDA — object detection inference.</summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DirectOnnx_YOLOv8_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "yolov8n", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"YOLOv8 model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+        var context = MLContext.CreateContext();
+        Accelerator? accelerator = null;
+        InferenceSession? session = null;
+        try
+        {
+            var cudaDevices = context.GetCudaDevices();
+            if (cudaDevices.Count == 0) throw new UnsupportedTestException("No CUDA devices");
+            accelerator = cudaDevices[0].CreateAccelerator(context);
+
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+            Console.WriteLine($"[YOLOv8-CUDA] {session}");
+
+            // Random 640x640 input image
+            var rng = new Random(42);
+            var inputData = new float[1 * 3 * 640 * 640];
+            for (int i = 0; i < inputData.Length; i++) inputData[i] = (float)rng.NextDouble();
+            using var inputBuf = accelerator.Allocate1D(inputData);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = new Tensor(inputBuf.View,
+                    session.InputShapes.Values.First())
+            });
+            sw.Stop();
+
+            var output = outputs[session.OutputNames[0]];
+            Console.WriteLine($"[YOLOv8-CUDA] Output: [{string.Join(",", output.Shape)}], time={sw.Elapsed.TotalMilliseconds:F0}ms");
+
+            int readCount = Math.Min(50, output.ElementCount);
+            using var readBuf = accelerator.Allocate1D<float>(readCount);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
+            await accelerator.SynchronizeAsync();
+            var values = await readBuf.CopyToHostAsync<float>(0, readCount);
+
+            if (values.Any(v => float.IsNaN(v))) throw new Exception("YOLOv8 output has NaN");
+            if (values.All(v => v == 0f)) throw new Exception("YOLOv8 output is all zeros");
+
+            Console.WriteLine($"[YOLOv8-CUDA] PASS — absMax={values.Max(v => MathF.Abs(v)):F2}");
+        }
+        finally
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
+        }
+    }
+
     /// <summary>DistilBERT sentiment on CUDA — "I love this movie" → positive.</summary>
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_DistilBERT_Sentiment_Cuda()
