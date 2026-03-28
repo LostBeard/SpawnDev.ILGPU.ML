@@ -54,9 +54,12 @@ public class SoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         int axis = ctx.GetInt("axis", -1);
         var shape = ctx.Inputs[0].Shape;
         if (axis < 0) axis += shape.Length;
-        // Clamp to valid range — ONNX models may have axis=-1 (last dim) stored as
-        // a large positive value from the original higher-rank context, but the actual
-        // tensor at runtime can have a different rank due to shape inference.
+        // Clamp axis to valid range when it exceeds rank (e.g., ONNX compiled axis=-1
+        // stored as positive value from higher-rank context, but runtime tensor is lower rank).
+        // Still throw for genuinely invalid shapes (zero-rank, zero-dim).
+        if (shape.Length == 0 || shape.Any(d => d <= 0))
+            throw new InvalidOperationException(
+                $"Softmax: invalid shape [{string.Join(",", shape)}] (rank={shape.Length})");
         if (axis >= shape.Length) axis = shape.Length - 1;
         if (axis < 0) axis = 0;
 
