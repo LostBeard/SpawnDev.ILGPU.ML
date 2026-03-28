@@ -18,7 +18,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
 - **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
-- **83 ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
+- **86 ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
 - **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency. Auto-detected from magic bytes. Full round-trip export for SPZ, PLY, glTF, OBJ. First pure C# SPZ parser.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **HuggingFace CDN** — All models load from HuggingFace with OPFS caching. No bundling. Search, browse, and load any public model.

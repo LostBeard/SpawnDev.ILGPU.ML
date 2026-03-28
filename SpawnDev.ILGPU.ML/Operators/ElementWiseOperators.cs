@@ -787,6 +787,64 @@ public class LessOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+public class GreaterOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "GreaterOrEqual";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+        {
+            // a >= b is !(a < b)
+            reg.ElementWise.Less(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, a.ElementCount, -1f);
+            var ones = ctx.Pool.Rent(new[] { 1 }, "_geq_one");
+            ones.Data.SubView(0, 1).CopyFromCPU(new float[] { 1f });
+            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ones.Data, a.ElementCount, 1);
+            ctx.Pool.Return(ones);
+        }
+        else
+        {
+            BroadcastBinaryOp(ctx, reg, (x, y) => x >= y ? 1f : 0f);
+        }
+    }
+}
+
+public class OrOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Or";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+        {
+            // Or: output = (a != 0 || b != 0) = clamp(abs(a) + abs(b), 0, 1)
+            // Simple: add abs values, then threshold
+            reg.ElementWise.Add(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            // Any non-zero sum = true; zero = false
+        }
+        else
+        {
+            BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f || y != 0f) ? 1f : 0f);
+        }
+    }
+}
+
+public class XorOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Xor";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f) != (y != 0f) ? 1f : 0f);
+    }
+}
+
 public class AndOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "And";

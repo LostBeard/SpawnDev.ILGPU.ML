@@ -141,7 +141,10 @@ public class OperatorRegistry
         Register(new GreaterOperator(this));
         Register(new LessOperator(this));
         Register(new LessOrEqualOperator(this));
+        Register(new GreaterOrEqualOperator(this));
         Register(new AndOperator(this));
+        Register(new OrOperator(this));
+        Register(new XorOperator(this));
         Register(new IsNaNOperator(this));
         Register(new NotOperator(this));
         Register(new ConstantOfShapeOperator(this));
