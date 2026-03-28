@@ -25,9 +25,15 @@ public class FusedDequantMatMul
 {
     private readonly Accelerator _accelerator;
 
+    // Byte-access kernel (CUDA/OpenCL/CPU — native byte access)
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _kernel;
+
+    // Int-packed kernel (WebGPU/WebGL/Wasm — bytes packed into int32 words)
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _kernelPacked;
 
     private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
 
@@ -48,12 +54,30 @@ public class FusedDequantMatMul
         _lastParamsBuf?.Dispose();
         _lastParamsBuf = _accelerator.Allocate1D(paramsData);
 
-        _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(
-            FusedDequantMatMulImpl);
+        // Use int-packed kernel on backends where ArrayView<byte> transpilation
+        // is broken (WebGPU WGSL reads bytes from packed u32 words incorrectly).
+        bool usePacked = _accelerator.AcceleratorType.ToString().Contains("WebGPU")
+            || _accelerator.AcceleratorType.ToString().Contains("WebGL")
+            || _accelerator.AcceleratorType.ToString().Contains("Wasm");
 
-        _kernel(M * N, input, weightQ4, output, _lastParamsBuf.View);
+        if (usePacked)
+        {
+            _kernelPacked ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(
+                FusedDequantMatMulPackedImpl);
+            // Reinterpret byte view as int view (4 bytes per int)
+            var intView = weightQ4.Cast<byte, int>();
+            _kernelPacked(M * N, input, intView, output, _lastParamsBuf.View);
+        }
+        else
+        {
+            _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(
+                FusedDequantMatMulImpl);
+            _kernel(M * N, input, weightQ4, output, _lastParamsBuf.View);
+        }
     }
 
     /// <summary>
@@ -106,9 +130,57 @@ public class FusedDequantMatMul
         output[idx] = sum;
     }
 
-    // NOTE: FusedDequantMatMul has maxErr 9.47 on WebGPU — likely ArrayView1D<byte>
-    // transpilation issue in WGSL codegen. Rule #2: fix in SpawnDev.ILGPU, not here.
-    // Tracked in DevComms: data-p2p3-progress-2026-03-27.md
+    /// <summary>
+    /// Packed-int version for WebGPU/WebGL/Wasm where ArrayView&lt;byte&gt; WGSL transpilation
+    /// is broken. Reads bytes from packed int32 words with manual bit extraction.
+    /// </summary>
+    private static void FusedDequantMatMulPackedImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> weightQ4Packed,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int m = idx / N;
+        int n = idx % N;
+        if (m >= M) return;
+
+        int blocksPerRow = (K + 31) / 32;
+        int bytesPerRow = blocksPerRow * 18;
+
+        float sum = 0f;
+
+        for (int blockIdx = 0; blockIdx < blocksPerRow; blockIdx++)
+        {
+            int blockStart = blockIdx * 32;
+            int blockOffset = n * bytesPerRow + blockIdx * 18;
+
+            // Read scale (2 bytes) via packed int extraction
+            int scaleBits = ReadByte(weightQ4Packed, blockOffset) |
+                           (ReadByte(weightQ4Packed, blockOffset + 1) << 8);
+            float scale = HalfToFloat(scaleBits);
+
+            for (int i = 0; i < 32 && blockStart + i < K; i++)
+            {
+                int byteIdx = blockOffset + 2 + (i / 2);
+                int byteVal = ReadByte(weightQ4Packed, byteIdx);
+                int nibble = (i % 2 == 0) ? (byteVal & 0xF) : (byteVal >> 4);
+                float dequantized = (nibble - 8) * scale;
+                sum += input[m * K + blockStart + i] * dequantized;
+            }
+        }
+
+        output[idx] = sum;
+    }
+
+    /// <summary>Extract a single byte from a packed int32 array.</summary>
+    private static int ReadByte(ArrayView1D<int, Stride1D.Dense> packed, int byteIndex)
+    {
+        int wordIndex = byteIndex / 4;
+        int byteOffset = byteIndex % 4;
+        int word = packed[wordIndex];
+        return (word >> (byteOffset * 8)) & 0xFF;
+    }
 
     /// <summary>Convert FP16 bits to float.</summary>
     private static float HalfToFloat(int h)

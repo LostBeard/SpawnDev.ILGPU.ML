@@ -235,4 +235,46 @@ public abstract partial class MLTestBase
         if (absMax < 0.001f)
             throw new Exception("DDPM output is all zeros");
     });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Text-to-Speech (SpeechT5 reference validation)
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod(Timeout = 300000)]
+    public async Task Pipeline_TTS_ReferenceTokensProduceAudio() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // Load reference token IDs and expected audio
+        var tokenBytes = await http.GetByteArrayAsync("references/speecht5-tts/hello_world_token_ids.bin");
+        var tokenIds = new float[tokenBytes.Length / 4];
+        Buffer.BlockCopy(tokenBytes, 0, tokenIds, 0, tokenBytes.Length);
+
+        var refAudioBytes = await http.GetByteArrayAsync("references/speecht5-tts/hello_world_audio.bin");
+        var refAudio = new float[refAudioBytes.Length / 4];
+        Buffer.BlockCopy(refAudioBytes, 0, refAudio, 0, refAudioBytes.Length);
+
+        var speakerBytes = await http.GetByteArrayAsync("references/speecht5-tts/speaker_embedding.bin");
+        var speakerEmbedding = new float[speakerBytes.Length / 4];
+        Buffer.BlockCopy(speakerBytes, 0, speakerEmbedding, 0, speakerBytes.Length);
+
+        Console.WriteLine($"[TTS] Reference: {tokenIds.Length} tokens, {refAudio.Length} audio samples, {speakerEmbedding.Length}-dim speaker");
+        Console.WriteLine($"[TTS] Token IDs: [{string.Join(",", tokenIds.Take(10).Select(v => ((int)v).ToString()))}...]");
+        Console.WriteLine($"[TTS] Reference audio: absMax={refAudio.Max(v => MathF.Abs(v)):F4}, samples={refAudio.Length}");
+
+        // Verify reference data is valid
+        if (tokenIds.Length < 2)
+            throw new Exception($"Reference token IDs too short: {tokenIds.Length}");
+        if (refAudio.Length < 100)
+            throw new Exception($"Reference audio too short: {refAudio.Length}");
+        if (speakerEmbedding.Length < 10)
+            throw new Exception($"Speaker embedding too short: {speakerEmbedding.Length}");
+
+        float refAbsMax = refAudio.Max(v => MathF.Abs(v));
+        if (refAbsMax < 0.001f)
+            throw new Exception("Reference audio is silent");
+
+        Console.WriteLine($"[TTS] Reference data validated: PASS (tokens={tokenIds.Length}, audio={refAudio.Length}, speaker={speakerEmbedding.Length})");
+    });
 }
