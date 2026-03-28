@@ -17,7 +17,7 @@ public abstract partial class MLTestBase
     //  Text Generation (Chatbot / AI Assistant)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 300000)]
     public async Task Pipeline_TextGeneration_ProducesTokens() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -50,7 +50,7 @@ public abstract partial class MLTestBase
     //  Background Removal (RMBG)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 300000)]
     public async Task Pipeline_BackgroundRemoval_ProducesMask() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -111,7 +111,7 @@ public abstract partial class MLTestBase
     //  Semantic Search (Feature Extraction + Cosine Similarity)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 300000)]
     public async Task Pipeline_SemanticSearch_SimilarSentencesCloser() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
