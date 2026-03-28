@@ -707,6 +707,10 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
 
                 int srcOffset = (o * axisSize + srcIdx) * innerSize2;
                 int dstOffset = (o * numIdx2 + idx) * innerSize2;
+                // Bounds check: skip if source or dest would exceed buffer
+                if (srcOffset + innerSize2 > data.ElementCount ||
+                    dstOffset + innerSize2 > ctx.Outputs[0].ElementCount)
+                    continue;
                 reg.ElementWise.Scale(
                     data.Data.SubView(srcOffset, innerSize2),
                     ctx.Outputs[0].Data.SubView(dstOffset, innerSize2),

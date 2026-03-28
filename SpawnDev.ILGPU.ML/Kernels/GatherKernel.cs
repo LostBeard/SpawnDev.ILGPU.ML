@@ -33,7 +33,8 @@ public class GatherKernel
         int outRow = idx / innerSize;
         int col = idx % innerSize;
         int srcRow = indices[outRow];
-        output[idx] = data[srcRow * innerSize + col];
+        int srcIdx = srcRow * innerSize + col;
+        output[idx] = (srcIdx >= 0 && srcIdx < data.Length) ? data[srcIdx] : 0f;
     }
 
     /// <summary>
@@ -69,7 +70,9 @@ public class GatherKernel
         int col = idx % innerSize;
         int srcRow = (int)indices[outRow];
         if (srcRow < 0) srcRow += dataRows;
-        output[idx] = data[srcRow * innerSize + col];
+        int srcIdx = srcRow * innerSize + col;
+        output[idx] = (srcRow >= 0 && srcRow < dataRows && srcIdx >= 0 && srcIdx < data.Length)
+            ? data[srcIdx] : 0f;
     }
 
     /// <summary>
