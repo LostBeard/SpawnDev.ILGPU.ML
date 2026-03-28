@@ -1353,6 +1353,91 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>GPT-2 full model on CUDA — verifies 12-block transformer with 652MB weights.</summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task DirectOnnx_GPT2_Full_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "gpt2", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"GPT-2 model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+
+        var context = MLContext.CreateContext();
+        Accelerator? accelerator = null;
+        InferenceSession? session = null;
+        try
+        {
+            var cudaDevices = context.GetCudaDevices();
+            if (cudaDevices.Count == 0)
+                throw new UnsupportedTestException("No CUDA devices found");
+            accelerator = cudaDevices[0].CreateAccelerator(context);
+            Console.WriteLine($"[GPT2-Full] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F0} MB");
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["input_ids"] = new[] { 1, 8 }
+                });
+            Console.WriteLine($"[GPT2-Full] Session created in {sw.Elapsed.TotalSeconds:F1}s: {session}");
+
+            // "The cat sat on the" as GPT-2 token IDs
+            var tokenIds = new float[] { 464, 3797, 3332, 319, 262, 0, 0, 0 };
+            using var inputBuf = accelerator.Allocate1D(tokenIds);
+
+            // GPT-2 needs position_ids [1, seq_len] and attention_mask [1, seq_len]
+            var posIds = new float[] { 0, 1, 2, 3, 4, 5, 6, 7 };
+            var mask = new float[] { 1, 1, 1, 1, 1, 0, 0, 0 };
+            using var posBuf = accelerator.Allocate1D(posIds);
+            using var maskBuf = accelerator.Allocate1D(mask);
+
+            var inputs = new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = new Tensor(inputBuf.View, new[] { 1, 8 })
+            };
+            foreach (var name in session.InputNames)
+            {
+                if (inputs.ContainsKey(name)) continue;
+                if (name.Contains("position"))
+                    inputs[name] = new Tensor(posBuf.View, new[] { 1, 8 });
+                else if (name.Contains("attention") || name.Contains("mask"))
+                    inputs[name] = new Tensor(maskBuf.View, new[] { 1, 8 });
+            }
+
+            sw.Restart();
+            var outputs = await session.RunAsync(inputs);
+            sw.Stop();
+
+            var output = outputs[session.OutputNames[0]];
+            Console.WriteLine($"[GPT2-Full] Output: [{string.Join(",", output.Shape)}], time={sw.Elapsed.TotalSeconds:F1}s");
+
+            int readCount = Math.Min(50, output.ElementCount);
+            using var readBuf = accelerator.Allocate1D<float>(readCount);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
+            await accelerator.SynchronizeAsync();
+            var logits = await readBuf.CopyToHostAsync<float>(0, readCount);
+
+            bool hasNaN = logits.Any(v => float.IsNaN(v));
+            float absMax = logits.Max(v => MathF.Abs(v));
+
+            Console.WriteLine($"[GPT2-Full] Logits: absMax={absMax:F2}, hasNaN={hasNaN}");
+
+            if (hasNaN)
+                throw new Exception("GPT-2 output contains NaN");
+            if (absMax < 0.01f)
+                throw new Exception("GPT-2 output is all zeros");
+
+            Console.WriteLine("[GPT2-Full] PASS");
+        }
+        finally
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
+        }
+    }
+
     /// <summary>Whisper encoder+decoder on CUDA — full speech-to-text inference chain.</summary>
     [TestMethod(Timeout = 300000)]
     public async Task DirectOnnx_WhisperEncoderDecoder_Cuda()
