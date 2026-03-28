@@ -161,6 +161,37 @@ public abstract partial class MLTestBase
         Console.WriteLine("[Less] PASS");
     });
 
+    /// <summary>Sub with per-row broadcast: [N, C] - [N, 1] (LayerNorm mean subtraction).</summary>
+    [TestMethod]
+    public async Task Sub_PerRowBroadcast_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // [2, 3] - [2, 1] = each row subtracts its own scalar
+        var a = new float[] { 10, 20, 30, 40, 50, 60 };
+        var b = new float[] { 5, 15 }; // row 0 subtracts 5, row 1 subtracts 15
+        var expected = new float[] { 5, 15, 25, 25, 35, 45 };
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var outBuf = accelerator.Allocate1D<float>(6);
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("Sub");
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(aBuf.View, new[] { 2, 3 }), new Tensor(bBuf.View, new[] { 2, 1 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 2, 3 }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "a", "b" },
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 6);
+
+        float maxErr = 0;
+        for (int i = 0; i < 6; i++) maxErr = MathF.Max(maxErr, MathF.Abs(result[i] - expected[i]));
+        if (maxErr > 0.01f) throw new Exception($"Sub per-row broadcast maxErr={maxErr}");
+        Console.WriteLine($"[Sub PerRow] PASS — [{string.Join(",", result.Select(v => v.ToString("F0")))}]");
+    });
+
     [TestMethod]
     public async Task LessOrEqual_MatchesCpu() => await RunTest(async accelerator =>
     {
