@@ -930,8 +930,9 @@ public class IntegrationTests
             accelerator = cudaDevices[0].CreateAccelerator(context);
             Console.WriteLine($"[CudaDepth] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
 
-            // DAv2 has dynamic input dims — must specify concrete shape
-            int w = 64, h = 64;
+            // DAv2 has dynamic input dims — must be multiple of patch_size (14)
+            // 518x518 is the model's intended input size (37x37 patches)
+            int w = 518, h = 518;
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
