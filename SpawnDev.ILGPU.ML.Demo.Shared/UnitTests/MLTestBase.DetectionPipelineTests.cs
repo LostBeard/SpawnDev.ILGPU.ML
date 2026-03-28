@@ -55,7 +55,7 @@ public abstract partial class MLTestBase
             throw new Exception($"Result dimensions wrong: {result.ImageWidth}x{result.ImageHeight}");
 
         Console.WriteLine($"[Pipeline] YOLOv8 pipeline: PASS");
-        pipeline.Dispose();
+        // Don't call pipeline.Dispose() — it disposes the session, but 'using var session' already handles that.
     });
 
     [TestMethod(Timeout = 120000)]
