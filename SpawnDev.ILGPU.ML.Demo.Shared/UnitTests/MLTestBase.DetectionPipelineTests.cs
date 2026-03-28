@@ -165,9 +165,8 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // BlazeFace is TFLite format — load from HF
-        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/litert-community/blaze-face/resolve/main/model_unquant.tflite");
+        // BlazeFace is TFLite format — use local model (HF litert-community repo requires auth)
+        var modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite");
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 
         // Load reference input
