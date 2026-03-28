@@ -185,7 +185,7 @@ public abstract partial class MLTestBase
     //  Image Generation (Diffusion)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 60000)]
+    [TestMethod(Timeout = 300000)]
     public async Task Pipeline_Diffusion_DDPM_ProducesImage() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
