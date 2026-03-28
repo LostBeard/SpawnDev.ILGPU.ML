@@ -25,7 +25,7 @@ public abstract partial class MLTestBase
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
@@ -61,7 +61,7 @@ public abstract partial class MLTestBase
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
@@ -363,7 +363,7 @@ public abstract partial class MLTestBase
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model_merged.onnx");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 1 },
@@ -403,7 +403,7 @@ public abstract partial class MLTestBase
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model_merged.onnx");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 4 },
@@ -715,7 +715,7 @@ public abstract partial class MLTestBase
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/model.onnx");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
@@ -800,7 +800,7 @@ public abstract partial class MLTestBase
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },

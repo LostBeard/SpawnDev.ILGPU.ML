@@ -46,7 +46,6 @@ public abstract partial class MLTestBase
         await accelerator.SynchronizeAsync();
         var actual = await readBuf.CopyToHostAsync<float>(0, elems);
 
-        session.Dispose();
         return (actual, expected);
     }
 
@@ -161,7 +160,7 @@ public abstract partial class MLTestBase
 
         // EfficientNet-Lite0 is TFLite format, NHWC input
         var modelBytes = await http.GetByteArrayAsync("models/efficientnet-lite0/model.tflite");
-        var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
+        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["images:0"] = new[] { 1, 224, 224, 3 }
@@ -200,7 +199,6 @@ public abstract partial class MLTestBase
         for (int i = 1; i < actual.Length; i++)
             if (actual[i] > actual[topIdx]) topIdx = i;
         Console.WriteLine($"[EfficientNet] Top class: {topIdx} (expected cat 281-285)");
-        session.Dispose();
     });
 
     // ── Super Resolution Reference Test ──
@@ -260,7 +258,7 @@ public abstract partial class MLTestBase
         Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
         try
         {
-            var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes, inputShapes: shapes);
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes, inputShapes: shapes);
 
             // "I love this movie" tokenized: [CLS]=101 I=1045 love=2293 this=2023 movie=3185 [SEP]=102
             var tokenIds = new float[] { 101, 1045, 2293, 2023, 3185, 102 };
@@ -302,7 +300,6 @@ public abstract partial class MLTestBase
             Buffer.BlockCopy(refBytes, 0, refLogits, 0, refBytes.Length);
             AssertReferenceMatch(logits, refLogits, 0.5f, $"DistilBERT\n{sb}");
 
-            session.Dispose();
         }
         finally
         {
@@ -398,7 +395,6 @@ public abstract partial class MLTestBase
         if (nextToken != 4314)
             throw new Exception($"[GPT-2] Expected next token 4314 (floor), got {nextToken} (logit={maxLogit:F4}, nanCount={nanCount})");
 
-        session.Dispose();
     });
 
     // ── Whisper Encoder Reference Test ──
@@ -439,7 +435,6 @@ public abstract partial class MLTestBase
         var expected = refAll.Take(elems).ToArray();
 
         AssertReferenceMatch(actual, expected, 0.5f, "WhisperEncoder");
-        session.Dispose();
     });
 
     // ── CLIP Vision Reference Test ──
@@ -453,7 +448,7 @@ public abstract partial class MLTestBase
         // Download CLIP vision model (~340MB)
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             $"https://huggingface.co/{Hub.ModelHub.KnownModels.CLIPVitB32}/resolve/main/{Hub.ModelHub.KnownFiles.OnnxVisionModel}");
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["pixel_values"] = new[] { 1, 3, 224, 224 }
@@ -490,7 +485,6 @@ public abstract partial class MLTestBase
         // CLIP embedding is 512-dim — compare first 512 values
         var cmpLen = Math.Min(Math.Min(actual.Length, expected.Length), 512);
         AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 1.0f, "CLIP_Vision");
-        session.Dispose();
     });
 
     // ── Depth Estimation Reference Test ──
@@ -506,7 +500,7 @@ public abstract partial class MLTestBase
 
         try
         {
-            var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            using var daSession = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]>
                 {
                     ["pixel_values"] = new[] { 1, 3, 224, 224 }
@@ -519,12 +513,12 @@ public abstract partial class MLTestBase
             using var inputBuf = accelerator.Allocate1D(inputFloats);
             var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
 
-            var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+            var outputs = await daSession.RunAsync(new Dictionary<string, Tensor>
             {
-                [session.InputNames[0]] = inputTensor
+                [daSession.InputNames[0]] = inputTensor
             });
 
-            var output = outputs[session.OutputNames[0]];
+            var output = outputs[daSession.OutputNames[0]];
             int elems = output.ElementCount;
 
             if (elems < 100)
@@ -541,7 +535,6 @@ public abstract partial class MLTestBase
 
             var cmpLen = Math.Min(actual.Length, expected.Length);
             AssertReferenceMatch(actual.Take(cmpLen).ToArray(), expected.Take(cmpLen).ToArray(), 0.5f, "DepthAnything");
-            session.Dispose();
         }
         finally { }
     });

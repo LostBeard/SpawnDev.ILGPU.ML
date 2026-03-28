@@ -219,7 +219,7 @@ public abstract partial class MLTestBase
 
         Console.WriteLine("[DepthInference] Loading model...");
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
-        var session = InferenceSession.CreateFromOnnx(
+        using var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
@@ -273,7 +273,7 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[DepthCat] Cat image: {width}x{height}");
 
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
-        var session = InferenceSession.CreateFromOnnx(
+        using var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {

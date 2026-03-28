@@ -132,7 +132,7 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DA3] model.onnx: {onnxBytes.Length / 1024}KB, model.onnx_data: {extDataBytes.Length / 1024 / 1024}MB");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["pixel_values"] = new[] { 1, 3, 224, 224 }
@@ -162,7 +162,7 @@ public abstract partial class MLTestBase
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["pixel_values"] = new[] { 1, 3, 224, 224 }
@@ -230,7 +230,7 @@ public abstract partial class MLTestBase
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
 
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["pixel_values"] = new[] { 1, 3, 224, 224 }

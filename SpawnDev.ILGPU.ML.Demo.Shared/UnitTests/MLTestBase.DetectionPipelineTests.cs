@@ -27,7 +27,7 @@ public abstract partial class MLTestBase
         // Load model (same path as demo page)
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/salim4n/yolov8n-detect-onnx/resolve/main/yolov8n-onnx-web/yolov8n.onnx");
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
 
         var pipeline = new ObjectDetectionPipeline(session, accelerator);
 
@@ -67,7 +67,7 @@ public abstract partial class MLTestBase
         // Load model and run with reference input
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/salim4n/yolov8n-detect-onnx/resolve/main/yolov8n-onnx-web/yolov8n.onnx");
-        var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
 
         // Load reference input (pre-preprocessed NCHW)
         var inputBytes = await http.GetByteArrayAsync("references/yolov8n/cat_input_nchw.bin");
@@ -111,7 +111,7 @@ public abstract partial class MLTestBase
         // MoveNet is TFLite format
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/main/onnx/model.onnx");
-        var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
+        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input"] = new[] { 1, 192, 192, 3 }
@@ -168,7 +168,7 @@ public abstract partial class MLTestBase
         // BlazeFace is TFLite format — load from HF
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/litert-community/blaze-face/resolve/main/model_unquant.tflite");
-        var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 
         // Load reference input
         var inputBytes = await http.GetByteArrayAsync("references/blaze-face/cat_input.bin");
