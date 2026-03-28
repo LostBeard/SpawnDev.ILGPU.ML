@@ -694,10 +694,24 @@ public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Large tensor fallback — copy what we can
-            int copyCount = Math.Min(input.ElementCount, outCount);
-            reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
-                output.Data.SubView(0, copyCount), copyCount, 1f);
+            // GPU broadcast: tile input data to fill output using stride-based copy.
+            // Common case: [1, C] → [N, C] = copy row N times
+            int inCount = input.ElementCount;
+            if (inCount > 0 && outCount % inCount == 0)
+            {
+                // Exact tiling: repeat input block to fill output
+                int repeats = outCount / inCount;
+                for (int r = 0; r < repeats; r++)
+                    reg.ElementWise.Scale(input.Data.SubView(0, inCount),
+                        output.Data.SubView(r * inCount, inCount), inCount, 1f);
+            }
+            else
+            {
+                // Fallback: copy what we can
+                int copyCount = Math.Min(inCount, outCount);
+                reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
+                    output.Data.SubView(0, copyCount), copyCount, 1f);
+            }
         }
     }
 }
@@ -754,7 +768,22 @@ public class LessOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        BroadcastBinaryOp(ctx, reg, (a, b) => a <= b ? 1f : 0f);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+        {
+            // a <= b is !(a > b). Greater returns 1.0 for true, 0.0 for false.
+            // Negate: output = 1.0 - Greater(a, b)
+            reg.ElementWise.Greater(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, a.ElementCount, -1f);
+            var ones = ctx.Pool.Rent(new[] { 1 }, "_leq_one");
+            ones.Data.SubView(0, 1).CopyFromCPU(new float[] { 1f });
+            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ones.Data, a.ElementCount, 1);
+            ctx.Pool.Return(ones);
+        }
+        else
+        {
+            BroadcastBinaryOp(ctx, reg, (x, y) => x <= y ? 1f : 0f);
+        }
     }
 }
 

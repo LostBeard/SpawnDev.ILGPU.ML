@@ -160,4 +160,132 @@ public abstract partial class MLTestBase
                 throw new Exception($"Less[{i}]: got {result[i]}, expected {expected[i]}");
         Console.WriteLine("[Less] PASS");
     });
+
+    [TestMethod]
+    public async Task LessOrEqual_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var a = new float[] { 1, 3, 5, 3 };
+        var b = new float[] { 3, 3, 3, 3 };
+        var expected = new float[] { 1, 1, 0, 1 }; // 1<=3=T, 3<=3=T, 5<=3=F, 3<=3=T
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("LessOrEqual");
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(aBuf.View, new[] { 4 }), new Tensor(bBuf.View, new[] { 4 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 4 }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "a", "b" },
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 4);
+
+        for (int i = 0; i < 4; i++)
+            if (result[i] != expected[i])
+                throw new Exception($"LessOrEqual[{i}]: got {result[i]}, expected {expected[i]}");
+        Console.WriteLine("[LessOrEqual] PASS");
+    });
+
+    [TestMethod]
+    public async Task Expand_BroadcastVector_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Expand [1, 3] → [2, 3] by broadcasting dim 0
+        var data = new float[] { 10, 20, 30 };
+        var expected = new float[] { 10, 20, 30, 10, 20, 30 };
+
+        using var inBuf = accelerator.Allocate1D(data);
+        using var outBuf = accelerator.Allocate1D<float>(6);
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("Expand");
+
+        // Expand needs shape tensor as second input — use constant values
+        using var shapeBuf = accelerator.Allocate1D(new float[] { 2, 3 });
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(inBuf.View, new[] { 1, 3 }), new Tensor(shapeBuf.View, new[] { 2 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 2, 3 }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "input", "shape" },
+            ConstantValues = new Dictionary<string, float[]> { ["shape"] = new float[] { 2, 3 } },
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 6);
+
+        for (int i = 0; i < 6; i++)
+            if (MathF.Abs(result[i] - expected[i]) > 0.01f)
+                throw new Exception($"Expand[{i}]: got {result[i]}, expected {expected[i]}");
+        Console.WriteLine("[Expand] PASS");
+    });
+
+    [TestMethod]
+    public async Task DepthToSpace_2x2_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // [1, 4, 1, 1] → DepthToSpace blocksize=2 → [1, 1, 2, 2]
+        var data = new float[] { 1, 2, 3, 4 };
+        // DCR mode: output[0,0,0,0]=1, [0,0,0,1]=2, [0,0,1,0]=3, [0,0,1,1]=4
+        var expected = new float[] { 1, 2, 3, 4 };
+
+        using var inBuf = accelerator.Allocate1D(data);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("DepthToSpace");
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(inBuf.View, new[] { 1, 4, 1, 1 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 1, 1, 2, 2 }) },
+            Attributes = new Dictionary<string, object> { ["blocksize"] = 2L },
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "x" },
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 4);
+
+        float absMax = result.Max(v => MathF.Abs(v));
+        if (absMax < 0.01f) throw new Exception("DepthToSpace output is all zeros");
+        Console.WriteLine($"[DepthToSpace] Output: [{string.Join(",", result.Select(v => v.ToString("F1")))}] PASS");
+    });
+
+    [TestMethod]
+    public async Task ScatterND_SimpleUpdate_Works() => await RunTest(async accelerator =>
+    {
+        // data [3] = {10, 20, 30}, update index 1 to 99
+        var data = new float[] { 10, 20, 30 };
+        var indices = new float[] { 1 }; // update position 1
+        var updates = new float[] { 99 };
+        var expected = new float[] { 10, 99, 30 };
+
+        using var dataBuf = accelerator.Allocate1D(data);
+        using var idxBuf = accelerator.Allocate1D(indices);
+        using var updateBuf = accelerator.Allocate1D(updates);
+        using var outBuf = accelerator.Allocate1D<float>(3);
+
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("ScatterND");
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(dataBuf.View, new[] { 3 }),
+                new Tensor(idxBuf.View, new[] { 1, 1 }),
+                new Tensor(updateBuf.View, new[] { 1 }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 3 }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "data", "indices", "updates" },
+            ConstantValues = new Dictionary<string, float[]> { ["indices"] = indices },
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 3);
+
+        for (int i = 0; i < 3; i++)
+            if (MathF.Abs(result[i] - expected[i]) > 0.01f)
+                throw new Exception($"ScatterND[{i}]: got {result[i]}, expected {expected[i]}");
+        Console.WriteLine("[ScatterND] PASS");
+    });
 }
