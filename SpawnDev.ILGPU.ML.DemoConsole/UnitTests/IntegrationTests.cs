@@ -931,8 +931,8 @@ public class IntegrationTests
             Console.WriteLine($"[CudaDepth] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
 
             // DAv2 has dynamic input dims — must be multiple of patch_size (14)
-            // 252x252 = 18x18 patches — reasonable VRAM for test
-            int w = 252, h = 252;
+            // 140x140 = 10x10 patches — minimal VRAM for CUDA test
+            int w = 140, h = 140;
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,

@@ -223,8 +223,10 @@ public class GraphExecutor : IDisposable
                 }
             }
 
-            // Runtime Reshape: resolve target shape from runtime constants
-            if (node.OpType == "Reshape" && node.InputNames.Length >= 2
+            // Runtime Reshape: DISABLED — compiled shapes are authoritative and Reshape
+            // operator applies correct shape at execution time via Tensor.Shape setter.
+            // Enabling this caused cascading buffer size mismatches in attention blocks.
+            if (false && node.OpType == "Reshape" && node.InputNames.Length >= 2
                 && runtimeConstants.TryGetValue(node.InputNames[1], out var reshapeTarget)
                 && reshapeTarget.Length > 0)
             {
@@ -463,26 +465,9 @@ public class GraphExecutor : IDisposable
                 .Select(t => t?.Shape ?? Array.Empty<int>())
                 .ToArray();
 
-            var runtimeAttrsAsync = ConvertAttributes(node.Attributes);
-            int[][] runtimeOutputShapes;
-            try
-            {
-                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, runtimeAttrsAsync);
-                for (int ri = 0; ri < runtimeOutputShapes.Length; ri++)
-                {
-                    if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
-                    {
-                        Console.WriteLine($"[RT-SafetyReject-Async] {node.OpType} {node.OutputNames[0]}: inferred=[{string.Join(",", runtimeOutputShapes[ri])}] compiled=[{string.Join(",", node.OutputShapes[ri])}]");
-                        runtimeOutputShapes = node.OutputShapes;
-                        break;
-                    }
-                }
-            }
-            catch (Exception _inferExAsync)
-            {
-                Console.WriteLine($"[RT-InferFail-Async] {node.OpType} {node.OutputNames[0]}: {_inferExAsync.GetType().Name}: {_inferExAsync.Message.Split('\n')[0]}");
-                runtimeOutputShapes = node.OutputShapes;
-            }
+            // Use COMPILED shapes by default (same as sync Run path).
+            // Full runtime re-inference caused cascading shape mismatches in attention blocks.
+            int[][] runtimeOutputShapes = node.OutputShapes;
 
             // Runtime Slice (same as sync Run)
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
