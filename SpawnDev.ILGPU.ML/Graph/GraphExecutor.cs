@@ -184,24 +184,35 @@ public class GraphExecutor : IDisposable
                 .Select(t => t?.Shape ?? Array.Empty<int>())
                 .ToArray();
 
+            // Convert JsonElement attributes to CLR types for InferOutputShapes
+            // (attributes are stored as JsonElement from compilation, but operators expect long[]/string/etc.)
+            var runtimeAttrs = ConvertAttributes(node.Attributes);
+
             int[][] runtimeOutputShapes;
             try
             {
-                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, node.Attributes);
+                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, runtimeAttrs);
+                if (node.OpType == "Conv" && runtimeOutputShapes[0].Length < 4)
+                    Console.WriteLine($"[RT-Conv3D] {node.OutputNames[0]}: inferred=[{string.Join(",", runtimeOutputShapes[0])}] inputs=[{string.Join("; ", actualInputShapes.Select(s => $"[{string.Join(",", s)}]"))}] pads={runtimeAttrs.ContainsKey("pads")} padsType={runtimeAttrs.GetValueOrDefault("pads")?.GetType().Name} group={runtimeAttrs.GetValueOrDefault("group")}");
+
                 // Safety: if runtime inference produces shapes with sentinel values (int.MaxValue)
                 // or negative dims, fall back to compiled shapes
                 for (int ri = 0; ri < runtimeOutputShapes.Length; ri++)
                 {
                     if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
                     {
+                        if (node.OpType is "Conv" or "ConvTranspose")
+                            Console.WriteLine($"[RT-SafetyReject] {node.OpType} {node.OutputNames[0]}: inferred=[{string.Join(",", runtimeOutputShapes[ri])}] compiled=[{string.Join(",", node.OutputShapes[ri])}] inputs=[{string.Join("; ", actualInputShapes.Select(s => $"[{string.Join(",", s)}]"))}]");
                         runtimeOutputShapes = node.OutputShapes;
                         break;
                     }
                 }
             }
-            catch
+            catch (Exception _inferEx)
             {
                 // Fallback to compiled shapes if runtime inference fails
+                if (node.OpType is "Conv" or "ConvTranspose")
+                    Console.WriteLine($"[RT-InferFail] {node.OpType} {node.OutputNames[0]}: {_inferEx.GetType().Name}: {_inferEx.Message}");
                 runtimeOutputShapes = node.OutputShapes;
             }
 
@@ -224,6 +235,13 @@ public class GraphExecutor : IDisposable
             {
                 int sizesIdx = node.OpType == "Resize" ? 3 : -1;
                 int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
+                // Log ALL Resize resolution for debugging
+                if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx && !string.IsNullOrEmpty(node.InputNames[sizesIdx]))
+                {
+                    var outName = node.OutputNames.Length > 0 ? node.OutputNames[0] : "?";
+                    bool hasSizes = runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var _dbgSz);
+                    Console.WriteLine($"[RT-Resize] {outName}: hasSizes={hasSizes} vals=[{string.Join(",", (_dbgSz ?? Array.Empty<float>()).Take(6).Select(v => v.ToString("F0")))}] inShape=[{string.Join(",", nodeInputs[0]?.Shape ?? Array.Empty<int>())}] compiledShape=[{string.Join(",", node.OutputShapes[0])}] runtimeShape=[{string.Join(",", runtimeOutputShapes[0])}]");
+                }
                 if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
                     && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
                     && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
@@ -408,10 +426,11 @@ public class GraphExecutor : IDisposable
                 .Select(t => t?.Shape ?? Array.Empty<int>())
                 .ToArray();
 
+            var runtimeAttrsAsync = ConvertAttributes(node.Attributes);
             int[][] runtimeOutputShapes;
             try
             {
-                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, node.Attributes);
+                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, runtimeAttrsAsync);
                 for (int ri = 0; ri < runtimeOutputShapes.Length; ri++)
                 {
                     if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
@@ -441,6 +460,13 @@ public class GraphExecutor : IDisposable
             {
                 int sizesIdx = node.OpType == "Resize" ? 3 : -1;
                 int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
+                // Log ALL Resize resolution for debugging
+                if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx && !string.IsNullOrEmpty(node.InputNames[sizesIdx]))
+                {
+                    var outName = node.OutputNames.Length > 0 ? node.OutputNames[0] : "?";
+                    bool hasSizes = runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var _dbgSz);
+                    Console.WriteLine($"[RT-Resize] {outName}: hasSizes={hasSizes} vals=[{string.Join(",", (_dbgSz ?? Array.Empty<float>()).Take(6).Select(v => v.ToString("F0")))}] inShape=[{string.Join(",", nodeInputs[0]?.Shape ?? Array.Empty<int>())}] compiledShape=[{string.Join(",", node.OutputShapes[0])}] runtimeShape=[{string.Join(",", runtimeOutputShapes[0])}]");
+                }
                 if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
                     && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
                     && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
@@ -658,5 +684,36 @@ public class GraphExecutor : IDisposable
     {
         _pool.Dispose();
         _kvCache?.Dispose();
+    }
+
+    /// <summary>
+    /// Convert JsonElement attributes to CLR types (long[], string, long) for InferOutputShapes.
+    /// Attributes are stored as JsonElement from graph compilation but operators expect typed values.
+    /// </summary>
+    private static Dictionary<string, object> ConvertAttributes(Dictionary<string, object>? attrs)
+    {
+        if (attrs == null) return new Dictionary<string, object>();
+        var result = new Dictionary<string, object>();
+        foreach (var (key, val) in attrs)
+        {
+            if (val is System.Text.Json.JsonElement je)
+            {
+                try
+                {
+                    if (je.ValueKind == System.Text.Json.JsonValueKind.Array)
+                        result[key] = je.EnumerateArray().Select(e => e.GetInt64()).ToArray();
+                    else if (je.ValueKind == System.Text.Json.JsonValueKind.Number)
+                        result[key] = je.GetInt64();
+                    else if (je.ValueKind == System.Text.Json.JsonValueKind.String)
+                        result[key] = je.GetString() ?? "";
+                    else
+                        result[key] = val;
+                }
+                catch { result[key] = val; }
+            }
+            else
+                result[key] = val; // Already CLR type
+        }
+        return result;
     }
 }
