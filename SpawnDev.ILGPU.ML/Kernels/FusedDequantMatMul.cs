@@ -29,6 +29,8 @@ public class FusedDequantMatMul
         ArrayView1D<byte, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _kernel;
 
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
+
     public FusedDequantMatMul(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -43,14 +45,15 @@ public class FusedDequantMatMul
         int M, int K, int N)
     {
         var paramsData = new int[] { M, K, N };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _lastParamsBuf?.Dispose();
+        _lastParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<byte, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(
             FusedDequantMatMulImpl);
 
-        _kernel(M * N, input, weightQ4, output, paramsBuf.View);
+        _kernel(M * N, input, weightQ4, output, _lastParamsBuf.View);
     }
 
     /// <summary>

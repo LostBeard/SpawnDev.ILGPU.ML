@@ -30,6 +30,11 @@ public class FusedAttentionKernel
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _kernel;
 
+    // Deferred disposal: keep params buffer alive until the NEXT call so the GPU
+    // has time to read it. Same pattern as BroadcastBinaryOpND — WebGPU dispatch
+    // is async, disposing immediately causes the kernel to read garbage params.
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
+
     public FusedAttentionKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -47,7 +52,8 @@ public class FusedAttentionKernel
         // params: [batchHeads, seqQ, seqKV, headDim, scale*10000]
         float scale = 1f / MathF.Sqrt(headDim);
         var paramsData = new int[] { batchHeads, seqQ, seqKV, headDim, (int)(scale * 10000f) };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _lastParamsBuf?.Dispose();
+        _lastParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -55,7 +61,7 @@ public class FusedAttentionKernel
             ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
 
         // One thread per output element: batchHeads * seqQ * headDim
-        _kernel(batchHeads * seqQ * headDim, Q, K, V, output, paramsBuf.View);
+        _kernel(batchHeads * seqQ * headDim, Q, K, V, output, _lastParamsBuf.View);
     }
 
     /// <summary>

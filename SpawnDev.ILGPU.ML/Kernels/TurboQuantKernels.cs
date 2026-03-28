@@ -14,6 +14,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 public class TurboQuantKernels
 {
     private readonly Accelerator _accelerator;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
     private readonly FWHTKernel _fwht;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -361,7 +362,8 @@ public class TurboQuantKernels
         // Pack scalars into int buffer to reduce kernel param count
         // params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*1000 (as int)
         var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f) };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _lastParamsBuf?.Dispose();
+        _lastParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _fusedAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -371,7 +373,7 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
         _fusedAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, paramsBuf.View);
+            K_norms, V_norms, output, _lastParamsBuf.View);
     }
 
     /// <summary>
@@ -497,7 +499,8 @@ public class TurboQuantKernels
         int numQueries, int numKV, int headDim, float scale)
     {
         var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f) };
-        using var paramsBuf = _accelerator.Allocate1D(paramsData);
+        _lastParamsBuf?.Dispose();
+        _lastParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _flashAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -507,7 +510,7 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlashAttentionImpl);
         _flashAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, paramsBuf.View);
+            K_norms, V_norms, output, _lastParamsBuf.View);
     }
 
     /// <summary>
