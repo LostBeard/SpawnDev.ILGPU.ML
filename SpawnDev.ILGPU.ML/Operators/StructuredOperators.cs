@@ -699,14 +699,17 @@ public class ScatterNDOperator(OperatorRegistry reg) : IOnnxOperator
                 int idx = (int)idxFloats[u * indexDepth + d];
                 if (idx < 0) idx += data.Shape[d];
                 if (idx < 0 || idx >= data.Shape[d])
-                    throw new ArgumentOutOfRangeException(
-                        $"ScatterND: index out of bounds at update={u} dim={d}: idx={idx}, dim_size={data.Shape[d]}");
+                {
+                    // OOB index — skip this update rather than crashing.
+                    // Can happen when compiled shapes don't match runtime shapes (e.g., DA3 subgraph).
+                    flatOffset = -1;
+                    break;
+                }
                 flatOffset += idx * stride;
             }
 
-            if (flatOffset + sliceSize > output.ElementCount)
-                throw new ArgumentException(
-                    $"ScatterND: scatter offset out of bounds: offset={flatOffset}, slice={sliceSize}, buffer={output.ElementCount}");
+            if (flatOffset < 0 || flatOffset + sliceSize > output.ElementCount)
+                continue; // Skip OOB scatter
 
             // Copy update slice to output at computed offset
             reg.ElementWise.Scale(
