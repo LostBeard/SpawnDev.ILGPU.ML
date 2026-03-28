@@ -588,8 +588,39 @@ public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[1] }; // shape of x
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Where(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Inputs[2].Data,
-            ctx.Outputs[0].Data, ctx.Inputs[1].ElementCount);
+        var cond = ctx.Inputs[0]; var x = ctx.Inputs[1]; var y = ctx.Inputs[2];
+        if (cond.ElementCount == x.ElementCount && x.ElementCount == y.ElementCount)
+        {
+            reg.ElementWise.Where(cond.Data, x.Data, y.Data, ctx.Outputs[0].Data, x.ElementCount);
+        }
+        else
+        {
+            // Broadcasting required — use CPU path for small tensors
+            var cVals = ctx.TryGetInputValues(0);
+            var xVals = ctx.TryGetInputValues(1);
+            var yVals = ctx.TryGetInputValues(2);
+            int outCount = ctx.Outputs[0].ElementCount;
+            if (cVals != null && xVals != null && yVals != null)
+            {
+                var result = new float[outCount];
+                for (int i = 0; i < outCount; i++)
+                {
+                    float c = i < cVals.Length ? cVals[i % cVals.Length] : 0f;
+                    float xv = i < xVals.Length ? xVals[i % xVals.Length] : 0f;
+                    float yv = i < yVals.Length ? yVals[i % yVals.Length] : 0f;
+                    result[i] = c != 0f ? xv : yv;
+                }
+                var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
+                reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+            }
+            else
+            {
+                // Fallback: use minimum safe count to avoid OOB reads
+                int safeCount = Math.Min(Math.Min(cond.ElementCount, x.ElementCount),
+                    Math.Min(y.ElementCount, ctx.Outputs[0].ElementCount));
+                reg.ElementWise.Where(cond.Data, x.Data, y.Data, ctx.Outputs[0].Data, safeCount);
+            }
+        }
     }
 }
 
@@ -643,9 +674,11 @@ public class EqualOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        // Output 1.0 where equal, 0.0 where not — needs a kernel
-        // For now, placeholder
-        reg.ElementWise.Equal(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+            reg.ElementWise.Equal(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        else
+            BroadcastBinaryOp(ctx, reg, (x, y) => x == y ? 1f : 0f);
     }
 }
 
@@ -656,7 +689,11 @@ public class GreaterOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Greater(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+            reg.ElementWise.Greater(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        else
+            BroadcastBinaryOp(ctx, reg, (x, y) => x > y ? 1f : 0f);
     }
 }
 
@@ -667,7 +704,11 @@ public class LessOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Less(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+            reg.ElementWise.Less(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        else
+            BroadcastBinaryOp(ctx, reg, (x, y) => x < y ? 1f : 0f);
     }
 }
 

@@ -1,4 +1,5 @@
 using SpawnDev.ILGPU.ML.Tensors;
+using static SpawnDev.ILGPU.ML.Operators.BroadcastHelper;
 
 namespace SpawnDev.ILGPU.ML.Operators;
 
@@ -217,7 +218,11 @@ public class MinOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Min(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+            reg.ElementWise.Min(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        else
+            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Min(x, y));
     }
 }
 
@@ -228,7 +233,11 @@ public class MaxOnnxOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Max(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+            reg.ElementWise.Max(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        else
+            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Max(x, y));
     }
 }
 
