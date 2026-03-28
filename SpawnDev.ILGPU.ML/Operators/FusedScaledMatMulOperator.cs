@@ -55,16 +55,23 @@ public class FusedScaledMatMulOperator : IOnnxOperator
             scaleValue = isDiv ? (1f / preRead[0]) : preRead[0];
         }
 
-        // Use tiled MatMul (high throughput) then apply scale if needed.
-        // The graph-level fusion still helps by eliminating the intermediate tensor
-        // and the overhead of a separate Scale operator node.
-        _registry.MatMul.MatMul(A.Data.SubView(0, M * K), B.Data.SubView(0, K * N),
-            output.Data.SubView(0, M * N), M, K, N);
+        // Batch-aware MatMul: handle multi-head attention [batch, heads, M, K]
+        if (A.Rank == 2 && B.Rank == 2)
+        {
+            _registry.MatMul.MatMul(A.Data, B.Data, output.Data, M, K, N);
+        }
+        else
+        {
+            int batch = A.ElementCount / (M * K);
+            _registry.MatMul.BatchedMatMul(A.Data, B.Data, output.Data, batch, M, K, N);
+        }
 
+        // Apply scale to ALL elements (not just first batch)
+        int totalElements = output.ElementCount;
         if (MathF.Abs(scaleValue - 1f) > 1e-7f)
         {
-            _registry.ElementWise.Scale(output.Data.SubView(0, M * N),
-                output.Data.SubView(0, M * N), M * N, scaleValue);
+            _registry.ElementWise.Scale(output.Data.SubView(0, totalElements),
+                output.Data.SubView(0, totalElements), totalElements, scaleValue);
         }
     }
 }
