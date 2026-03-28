@@ -16,7 +16,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **14 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
-- **TurboQuant KV cache compression** — 6x compression of attention cache with zero accuracy loss. Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
+- **TurboQuant KV cache compression** — 7-10x compression of attention cache with selectable modes: 4-bit (7.3x, safe default), 3-bit (10.4x, max savings), or 3-bit+QJL (7.3x, unbiased attention — paper-recommended default, 0.9944 cosine similarity). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
 - **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
 - **71+ ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
 - **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency. Auto-detected from magic bytes. Full round-trip export for SPZ, PLY, glTF, OBJ. First pure C# SPZ parser.
@@ -231,7 +231,7 @@ Every model is automatically optimized during compilation:
 | **ImageTransform** | GPU resize, crop, flip | — |
 | **TensorLayout** | NCHW↔NHWC, interleaved↔planar on GPU | — |
 | **FWHT** | Fast Walsh-Hadamard Transform (TurboQuant core) | O(d log d) |
-| **TurboQuant** | 4-bit KV cache: normalize, sign-flip, quantize, bit-pack, fused attention | 7.9x compression |
+| **TurboQuant** | KV cache compression via FWHT: 4-bit (7.3x), 3-bit (10.4x), 3-bit+QJL (7.3x, unbiased). Fused attention kernel. | 7-10x compression |
 | **RoPE** | Rotary Position Embeddings (DA3, LLaMA, Mistral) | — |
 | **QKNorm** | L2-normalize Q/K per head (DA3) | — |
 | **GroupNorm** | Per-group normalization for U-Net (LGM) | — |
@@ -401,7 +401,7 @@ SpawnDev.ILGPU.ML v4.0.0 integrates the latest breakthroughs from the ML researc
 
 | Technology | What It Does | Why It Matters |
 |-----------|-------------|----------------|
-| **TurboQuant** | 7.9x KV cache compression via FWHT + 4-bit quantization, fused attention kernel | Large NLP models (GPT-2, Whisper) fit in browser memory. Data-oblivious — works for every model automatically. Full pipeline: normalize → sign-flip → FWHT → quantize → bit-pack → fused attention. |
+| **TurboQuant** | 7-10x KV cache compression via FWHT + quantization, fused attention kernel. Three selectable modes: **4-bit** (16 centroids, 7.3x), **3-bit** (8 centroids, 10.4x), **3-bit+QJL** (8 centroids + error correction, 7.3x, 0.9944 cosine — default). | Large NLP models (GPT-2, Whisper) fit in browser memory. Data-oblivious — works for every model automatically. `KVQuantMode` enum: `Auto` (3-bit+QJL), `TurboQuant4Bit`, `TurboQuant3Bit`, `TurboQuant3BitQJL`. Full pipeline: normalize → sign-flip → FWHT → quantize → bit-pack → fused attention. |
 | **SPZ Compression** | 15-20x compression for Gaussian Splat scenes, optimized for WebGPU | 500MB 3D scenes become 25MB. Spatially-ordered Gaussians make GPU sorting faster. Instant sharing. |
 | **Depth Anything V3** | Multi-view depth + ray maps with temporal consistency | Eliminates depth flicker in video. Treats video as multi-view sequence, not isolated frames. Critical for 2D-to-3D conversion. |
 | **AsyncMDE** | Asynchronous Spatial Memory decouples depth from render loop | Real-time depth estimation at video framerate on standard hardware. No UI lockup during GPU computation. |
