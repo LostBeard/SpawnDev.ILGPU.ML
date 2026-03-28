@@ -69,6 +69,24 @@ public class GGUFModel
         return count;
     }
 
+    /// <summary>Get raw tensor bytes without dequantizing. For Q4/Q8 weights that will
+    /// be dequantized on-the-fly during MatMul via FusedDequantMatMul.</summary>
+    public byte[]? GetTensorRawBytes(GGUFTensorInfo tensor)
+    {
+        long elements = GetTensorElementCount(tensor);
+        if (elements <= 0) return null;
+        long offset = GetTensorDataOffset(tensor);
+        long byteSize = GGMLTypes.TypeSize(tensor.Type, elements);
+        if (offset + byteSize > RawData.Length) return null;
+        var result = new byte[byteSize];
+        Buffer.BlockCopy(RawData, (int)offset, result, 0, (int)byteSize);
+        return result;
+    }
+
+    /// <summary>True if tensor type is a quantized format that FusedDequantMatMul supports.</summary>
+    public static bool IsQuantized(GGMLType type) => type is GGMLType.Q4_0 or GGMLType.Q4_1
+        or GGMLType.Q5_0 or GGMLType.Q5_1 or GGMLType.Q8_0;
+
     /// <summary>Get tensor data as float32 (dequantizes if needed).</summary>
     public float[]? GetTensorFloat32(GGUFTensorInfo tensor)
     {

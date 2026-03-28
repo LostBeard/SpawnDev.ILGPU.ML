@@ -25,11 +25,18 @@ public static class GGUFGraphBuilder
     /// Build a ModelGraph + weight dictionary from a parsed GGUF model.
     /// The graph represents a single forward pass for next-token prediction.
     /// </summary>
-    public static (ModelGraph Graph, Dictionary<string, float[]> Weights) BuildGraph(GGUFModel model)
+    /// <summary>
+    /// Build a ModelGraph + weight dictionary from a parsed GGUF model.
+    /// The graph represents a single forward pass for next-token prediction.
+    /// Quantized weights (Q4/Q8) are returned separately as raw bytes in QuantizedWeightBytes
+    /// for on-the-fly dequantization via FusedDequantMatMul.
+    /// </summary>
+    public static (ModelGraph Graph, Dictionary<string, float[]> Weights, Dictionary<string, byte[]> QuantizedWeightBytes) BuildGraph(GGUFModel model)
     {
         var arch = model.Architecture.ToLowerInvariant();
         var graph = new ModelGraph { Name = $"{model.Name} ({arch})" };
         var weights = new Dictionary<string, float[]>();
+        var quantizedBytes = new Dictionary<string, byte[]>();
 
         // Extract architecture hyperparameters
         int vocabSize = (int)model.VocabSize;
@@ -59,7 +66,7 @@ public static class GGUFGraphBuilder
         var embedWeight = FindTensor(model, "token_embd.weight");
         if (embedWeight != null)
         {
-            ExtractWeight(model, embedWeight, weights);
+            ExtractWeight(model, embedWeight, weights, quantizedBytes);
             graph.Initializers[embedWeight.Name] = embedWeight.Shape;
             AddNode(graph, "Gather", new[] { embedWeight.Name, prevOutput }, new[] { "embed_out" });
             prevOutput = "embed_out";
@@ -74,13 +81,13 @@ public static class GGUFGraphBuilder
 
             // Attention norm
             string normOut = $"{prefix}_attn_norm";
-            AddNorm(graph, model, weights, $"{prefix}.attn_norm", layerIn, normOut, embedDim, useRMSNorm);
+            AddNorm(graph, model, weights, $"{prefix}.attn_norm", layerIn, normOut, embedDim, useRMSNorm, quantizedBytes);
 
             // Q, K, V projections
             string qOut = $"{prefix}_q", kOut = $"{prefix}_k", vOut = $"{prefix}_v";
-            AddLinear(graph, model, weights, $"{prefix}.attn_q", normOut, qOut);
-            AddLinear(graph, model, weights, $"{prefix}.attn_k", normOut, kOut);
-            AddLinear(graph, model, weights, $"{prefix}.attn_v", normOut, vOut);
+            AddLinear(graph, model, weights, $"{prefix}.attn_q", normOut, qOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{prefix}.attn_k", normOut, kOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{prefix}.attn_v", normOut, vOut, quantizedBytes);
 
             // Attention output projection
             string attnOut = $"{prefix}_attn_out";
@@ -97,7 +104,7 @@ public static class GGUFGraphBuilder
             string attnValues = $"{prefix}_attn_values";
             AddNode(graph, "MatMul", new[] { attnWeights, vOut }, new[] { attnValues });
 
-            AddLinear(graph, model, weights, $"{prefix}.attn_output", attnValues, attnOut);
+            AddLinear(graph, model, weights, $"{prefix}.attn_output", attnValues, attnOut, quantizedBytes);
 
             // Residual connection
             string residual1 = $"{prefix}_residual1";
@@ -105,13 +112,13 @@ public static class GGUFGraphBuilder
 
             // FFN norm
             string ffnNormOut = $"{prefix}_ffn_norm";
-            AddNorm(graph, model, weights, $"{prefix}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
+            AddNorm(graph, model, weights, $"{prefix}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm, quantizedBytes);
 
             // FFN: gate + up projections → activation → down projection
             string gateOut = $"{prefix}_ffn_gate";
             string upOut = $"{prefix}_ffn_up";
-            AddLinear(graph, model, weights, $"{prefix}.ffn_gate", ffnNormOut, gateOut);
-            AddLinear(graph, model, weights, $"{prefix}.ffn_up", ffnNormOut, upOut);
+            AddLinear(graph, model, weights, $"{prefix}.ffn_gate", ffnNormOut, gateOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{prefix}.ffn_up", ffnNormOut, upOut, quantizedBytes);
 
             // SiLU gate: sigmoid(gate) * up (for llama) or GELU(gate) * up (for phi)
             string activatedGate = $"{prefix}_gate_act";
@@ -131,7 +138,7 @@ public static class GGUFGraphBuilder
                 AddNode(graph, "Mul", new[] { activatedGate, upOut }, new[] { ffnMul });
 
             string ffnOut = $"{prefix}_ffn_out";
-            AddLinear(graph, model, weights, $"{prefix}.ffn_down", ffnMul, ffnOut);
+            AddLinear(graph, model, weights, $"{prefix}.ffn_down", ffnMul, ffnOut, quantizedBytes);
 
             // Residual connection
             AddNode(graph, "Add", new[] { residual1, ffnOut }, new[] { layerOut });
@@ -140,13 +147,13 @@ public static class GGUFGraphBuilder
 
         // 3. Final norm
         string finalNormOut = "final_norm_out";
-        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm);
+        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm, quantizedBytes);
 
         // 4. Output projection (LM head)
         var outputWeight = FindTensor(model, "output.weight");
         if (outputWeight != null)
         {
-            ExtractWeight(model, outputWeight, weights);
+            ExtractWeight(model, outputWeight, weights, quantizedBytes);
             graph.Initializers[outputWeight.Name] = outputWeight.Shape;
             AddNode(graph, "MatMul", new[] { finalNormOut, outputWeight.Name }, new[] { "logits" });
         }
@@ -157,7 +164,7 @@ public static class GGUFGraphBuilder
                 AddNode(graph, "MatMul", new[] { finalNormOut, embedWeight.Name }, new[] { "logits" });
         }
 
-        return (graph, weights);
+        return (graph, weights, quantizedBytes);
     }
 
     // ── Helper methods ──
@@ -167,8 +174,23 @@ public static class GGUFGraphBuilder
         return model.Tensors.FirstOrDefault(t => t.Name == name);
     }
 
-    private static void ExtractWeight(GGUFModel model, GGUFTensorInfo tensor, Dictionary<string, float[]> weights)
+    private static void ExtractWeight(GGUFModel model, GGUFTensorInfo tensor,
+        Dictionary<string, float[]> weights, Dictionary<string, byte[]>? quantizedBytes = null)
     {
+        // For quantized types with FusedDequantMatMul support, keep raw bytes
+        if (quantizedBytes != null && GGUFModel.IsQuantized(tensor.Type))
+        {
+            var rawBytes = model.GetTensorRawBytes(tensor);
+            if (rawBytes != null)
+            {
+                quantizedBytes[tensor.Name] = rawBytes;
+                // Still need a dummy float weight for shape inference in the graph compiler.
+                // Use a minimal placeholder — the actual data stays in quantizedBytes.
+                weights[tensor.Name] = new float[0];
+                return;
+            }
+        }
+        // Non-quantized or fallback: dequantize to float32
         var data = model.GetTensorFloat32(tensor);
         if (data != null)
             weights[tensor.Name] = data;
@@ -187,12 +209,13 @@ public static class GGUFGraphBuilder
     }
 
     private static void AddNorm(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
-        string tensorPrefix, string input, string output, int dim, bool useRMSNorm)
+        string tensorPrefix, string input, string output, int dim, bool useRMSNorm,
+        Dictionary<string, byte[]>? quantizedBytes = null)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
         {
-            ExtractWeight(model, weightTensor, weights);
+            ExtractWeight(model, weightTensor, weights, quantizedBytes);
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
         }
 
@@ -218,12 +241,13 @@ public static class GGUFGraphBuilder
     }
 
     private static void AddLinear(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
-        string tensorPrefix, string input, string output)
+        string tensorPrefix, string input, string output,
+        Dictionary<string, byte[]>? quantizedBytes = null)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
         {
-            ExtractWeight(model, weightTensor, weights);
+            ExtractWeight(model, weightTensor, weights, quantizedBytes);
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
             AddNode(graph, "MatMul", new[] { input, weightTensor.Name }, new[] { output });
         }

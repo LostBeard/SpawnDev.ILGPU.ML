@@ -923,7 +923,7 @@ public class InferenceSession : IDisposable
 
         // Build transformer graph from architecture metadata
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeightsAll) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        var (graph, cpuWeightsAll, quantizedWeightBytes) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values
@@ -951,20 +951,37 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("upload", 0);
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
+        var gpuQuantizedWeights = new Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>();
+        var quantizedBuffers = new List<MemoryBuffer1D<byte, Stride1D.Dense>>(); // keep alive
         int loaded = 0;
         foreach (var (name, data) in cpuWeightsAll)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
-                gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                // Check if this weight has quantized bytes — upload raw if so
+                if (quantizedWeightBytes.TryGetValue(name, out var qBytes))
+                {
+                    var qBuf = accelerator.Allocate1D<byte>(qBytes.Length);
+                    qBuf.View.CopyFromCPU(qBytes);
+                    gpuQuantizedWeights[name] = qBuf.View;
+                    quantizedBuffers.Add(qBuf);
+                    // Still need a Tensor entry for shape tracking (empty data)
+                    gpuWeights[name] = pool.Rent(shape, name);
+                }
+                else if (data.Length > 0)
+                {
+                    gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                }
                 loaded++;
             }
         }
         onProgress?.Invoke("upload", 100);
 
-        if (VerboseLogging) Console.WriteLine($"[InferenceSession] GGUF: {ggufModel.Name} ({ggufModel.Architecture}), {compiled.Nodes.Length} nodes, {loaded} weights, {ggufModel.BlockCount} layers");
+        int qCount = gpuQuantizedWeights.Count;
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] GGUF: {ggufModel.Name} ({ggufModel.Architecture}), {compiled.Nodes.Length} nodes, {loaded} weights ({qCount} quantized), {ggufModel.BlockCount} layers");
 
-        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues,
+            quantizedWeights: gpuQuantizedWeights.Count > 0 ? gpuQuantizedWeights : null);
         onProgress?.Invoke("ready", 100);
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)

@@ -42,14 +42,20 @@ public class GraphExecutor : IDisposable
     /// <summary>Access to the quantized KV cache (null if model doesn't use KV cache).</summary>
     public QuantizedKVCache? KVCache => _kvCache;
 
+    /// <summary>Quantized weight byte buffers on GPU (Q4_0, Q8_0, etc.)
+    /// for fused dequantization during MatMul.</summary>
+    private readonly Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? _quantizedWeights;
+
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
-        Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null)
+        Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
+        Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null)
     {
         _accelerator = accelerator;
         _graph = graph;
         _pool = new BufferPool(accelerator);
         _weights = weights;
         _constantValues = constantValues;
+        _quantizedWeights = quantizedWeights;
         _ew = new ElementWiseKernels(accelerator);
 
         // Auto-detect KV cache pattern
@@ -317,6 +323,7 @@ public class GraphExecutor : IDisposable
                 Pool = _pool,
                 InputNames = node.InputNames,
                 ConstantValues = runtimeConstants,
+                QuantizedWeights = _quantizedWeights,
             };
             var nodeSw = VerboseLogging ? System.Diagnostics.Stopwatch.StartNew() : null;
             node.Operator.Execute(ctx);
@@ -591,6 +598,7 @@ public class GraphExecutor : IDisposable
                 Pool = _pool,
                 InputNames = node.InputNames,
                 ConstantValues = runtimeConstants,
+                QuantizedWeights = _quantizedWeights,
             };
             try
             {
