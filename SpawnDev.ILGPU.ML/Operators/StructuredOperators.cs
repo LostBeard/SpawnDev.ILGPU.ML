@@ -29,7 +29,12 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        int M = a.Shape[^2]; int K = a.Shape[^1]; int N = b.Shape[^1];
+        // Handle rank-1 vectors: treat as [1, K] or [K, 1]
+        if (a.ElementCount == 0 || b.ElementCount == 0) return; // empty tensor
+        int M = a.Rank >= 2 ? a.Shape[^2] : 1;
+        int K = a.Shape[^1];
+        int N = b.Rank >= 2 ? b.Shape[^1] : 1;
+        if (M == 0 || K == 0 || N == 0) return; // degenerate dimensions
 
         // Check if weight B is quantized (Q4_0) — use fused dequant kernel
         string? bName = ctx.InputNames.Length > 1 ? ctx.InputNames[1] : null;

@@ -134,6 +134,7 @@ public class OperatorRegistry
         Register(new SiLUOperator(this));
         Register(new LeakyReluOperator(this));
         Register(new ExpandOperator(this));
+        Register(new TileOperator(this));
         Register(new EqualOperator(this));
         Register(new GreaterOperator(this));
         Register(new LessOperator(this));

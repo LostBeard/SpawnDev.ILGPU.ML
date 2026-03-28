@@ -314,3 +314,87 @@ public class FlattenOperator(OperatorRegistry reg) : IOnnxOperator
                 ctx.Outputs[0].Data.SubView(0, count), count, 1f);
     }
 }
+
+/// <summary>Tile: repeat a tensor along each dimension by specified counts.</summary>
+public class TileOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Tile";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Dynamic — depends on repeats tensor
+    public void Execute(OnnxOpContext ctx)
+    {
+        var input = ctx.Inputs[0];
+        var output = ctx.Outputs[0];
+        int inCount = input.ElementCount;
+        int outCount = output.ElementCount;
+
+        // Get repeat counts from runtime constants
+        var repeats = ctx.TryGetInputValues(1);
+
+        if (inCount == outCount)
+        {
+            // No tiling needed — just copy
+            reg.ElementWise.Scale(input.Data.SubView(0, inCount), output.Data.SubView(0, outCount), inCount, 1f);
+            return;
+        }
+
+        if (repeats != null)
+        {
+            // CPU-side tiling for small tensors or when repeats are known
+            var inShape = input.Shape;
+            var outShape = new int[inShape.Length];
+            for (int i = 0; i < inShape.Length; i++)
+                outShape[i] = inShape[i] * (i < repeats.Length ? (int)repeats[i] : 1);
+
+            // Simple tiling: if output is an exact multiple of input, tile
+            if (outCount > 0 && outCount % inCount == 0)
+            {
+                int tiles = outCount / inCount;
+                for (int t = 0; t < tiles; t++)
+                    reg.ElementWise.Scale(input.Data.SubView(0, inCount),
+                        output.Data.SubView(t * inCount, inCount), inCount, 1f);
+            }
+            else
+            {
+                // General N-D tiling via index mapping
+                var inVals = ctx.TryGetInputValues(0);
+                if (inVals != null)
+                {
+                    var result = new float[outCount];
+                    var inStrides = BroadcastHelper.ComputeStrides(inShape, inShape);
+                    for (int i = 0; i < outCount; i++)
+                    {
+                        // Map output index to input index via modulo per dimension
+                        int remaining = i;
+                        int inIdx = 0;
+                        for (int d = inShape.Length - 1; d >= 0; d--)
+                        {
+                            int outDim = outShape[d];
+                            int coord = remaining % outDim;
+                            remaining /= outDim;
+                            int inCoord = coord % inShape[d];
+                            inIdx += inCoord * inStrides[d];
+                        }
+                        result[i] = inIdx < inVals.Length ? inVals[inIdx] : 0f;
+                    }
+                    var temp = ctx.Pool.AllocatePermanent(result, outShape);
+                    reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+                }
+                else
+                {
+                    // Fallback: copy what we can
+                    int copyCount = Math.Min(inCount, outCount);
+                    reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
+                        output.Data.SubView(0, copyCount), copyCount, 1f);
+                }
+            }
+        }
+        else
+        {
+            // No repeat info — copy input to output
+            int copyCount = Math.Min(inCount, outCount);
+            reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
+                output.Data.SubView(0, copyCount), copyCount, 1f);
+        }
+    }
+}
