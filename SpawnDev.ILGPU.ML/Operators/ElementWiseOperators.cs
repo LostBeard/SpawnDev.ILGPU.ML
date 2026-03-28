@@ -281,7 +281,20 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         if (a.ElementCount == b.ElementCount)
         {
-            reg.ElementWise.Mul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            // WebGPU forbids binding the same buffer to multiple storage slots.
+            // Detect aliasing (e.g., x * x where both inputs are the same tensor)
+            // and copy to a temp buffer to avoid the aliasing violation.
+            if (object.ReferenceEquals(a, b))
+            {
+                var temp = ctx.Pool.Rent(b.Shape, "_mul_alias");
+                reg.ElementWise.Scale(b.Data, temp.Data, b.ElementCount, 1f);
+                reg.ElementWise.Mul(a.Data, temp.Data, ctx.Outputs[0].Data, a.ElementCount);
+                ctx.Pool.Return(temp);
+            }
+            else
+            {
+                reg.ElementWise.Mul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            }
         }
         else if (b.ElementCount == a.Shape[^1])
         {
