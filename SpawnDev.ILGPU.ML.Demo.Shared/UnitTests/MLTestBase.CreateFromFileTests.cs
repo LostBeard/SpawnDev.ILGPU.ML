@@ -45,7 +45,6 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[CreateFromFile_SN] PASS — ratio={ratio:F1}x");
         pipeline.Dispose();
-        session.Dispose();
     });
 
     /// <summary>
@@ -79,7 +78,6 @@ public abstract partial class MLTestBase
         var catResult = results.First(r => catClasses.Contains(r.ClassIndex));
         Console.WriteLine($"[CreateFromFile_Cat] PASS — '{catResult.Label}' at {catResult.Confidence:P2}");
         pipeline.Dispose();
-        session.Dispose();
     });
 
     /// <summary>
@@ -123,7 +121,6 @@ public abstract partial class MLTestBase
 
         Console.WriteLine("[CreateFromFile_Style] PASS");
         pipeline.Dispose();
-        session.Dispose();
     });
 
     /// <summary>
@@ -167,7 +164,6 @@ public abstract partial class MLTestBase
 
         Console.WriteLine("[CreateFromFile_SR] PASS");
         pipeline.Dispose();
-        session.Dispose();
     });
 
     /// <summary>
@@ -203,7 +199,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Expected many weights, got {session.WeightCount}");
 
         Console.WriteLine("[CreateFromFile_Depth] PASS — model loaded and compiled");
-        session.Dispose();
     });
 
     /// <summary>
@@ -256,7 +251,6 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DepthInference] PASS — {result.DepthMap.Length} depth values, range={range:F3}");
         pipeline.Dispose();
-        session.Dispose();
     });
 
     /// <summary>
@@ -291,7 +285,6 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DepthCat] PASS — {result.DepthMap.Length} values, range={range:F3}");
         pipeline.Dispose();
-        session.Dispose();
     });
 
     // ──────────────────────────────────────────────────────────────
@@ -341,7 +334,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Expected many nodes, got {session.NodeCount}");
 
         Console.WriteLine($"[MoveNet] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
-        session.Dispose();
     });
 
     /// <summary>EfficientNet-Lite0 (TFLite) — README claims it loads.</summary>
@@ -359,7 +351,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Expected many nodes, got {session.NodeCount}");
 
         Console.WriteLine($"[EfficientNet] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
-        session.Dispose();
     });
 
     /// <summary>YOLOv8 Nano (ONNX) — README claims it loads.</summary>
@@ -377,6 +368,5 @@ public abstract partial class MLTestBase
             throw new Exception($"Expected many nodes, got {session.NodeCount}");
 
         Console.WriteLine($"[YOLOv8n] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
-        session.Dispose();
     });
 }

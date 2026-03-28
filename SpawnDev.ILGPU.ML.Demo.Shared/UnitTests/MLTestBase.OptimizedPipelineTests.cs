@@ -38,7 +38,6 @@ public abstract partial class MLTestBase
             Console.WriteLine($"[OptPipeline] Optimized: {optimizedResults[0].Label} ({optimizedResults[0].Confidence:P2})");
             Console.WriteLine($"[OptPipeline] Session: {session.NodeCount} nodes (after optimization)");
             pipeline.Dispose();
-            session.Dispose();
         }
         catch (HttpRequestException)
         {

@@ -147,7 +147,6 @@ public abstract partial class MLTestBase
             throw new Exception("DA3 model has no outputs");
 
         Console.WriteLine($"[DA3] DA3-Small ONNX load: PASS");
-        session.Dispose();
     });
 
     [TestMethod(Timeout = 300000)]
@@ -215,7 +214,6 @@ public abstract partial class MLTestBase
             throw new Exception("DA3 output is all zeros");
 
         Console.WriteLine($"[DA3] DA3-Small inference: PASS");
-        session.Dispose();
     });
 
     [TestMethod(Timeout = 300000)]
@@ -276,6 +274,5 @@ public abstract partial class MLTestBase
             throw new Exception($"DA3 depth map is flat (range={range:F6}). Model not computing correctly.");
 
         Console.WriteLine($"[DA3] DA3-Small depth map variation: PASS (range={range:F4})");
-        session.Dispose();
     });
 }

@@ -130,7 +130,6 @@ public abstract partial class MLTestBase
         var result = await bufA.CopyToHostAsync<float>(0, 10);
         Console.WriteLine($"[DiagMapAsync2] PASS — CopyToHostAsync after 126 dispatches works");
 
-        session.Dispose();
         pipeline.Dispose();
     });
 }

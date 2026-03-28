@@ -63,7 +63,6 @@ public abstract partial class MLTestBase
         var catResult = results.First(r => catClasses.Contains(r.ClassIndex));
         Console.WriteLine($"[CatTest] PASS: Found '{catResult.Label}' (class {catResult.ClassIndex}) at {catResult.Confidence:P2}");
 
-        session.Dispose();
         pipeline.Dispose();
     });
 }

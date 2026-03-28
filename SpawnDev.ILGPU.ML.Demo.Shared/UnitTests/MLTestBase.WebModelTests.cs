@@ -52,7 +52,6 @@ public abstract partial class MLTestBase
         if (ratio < 1.5f)
             throw new Exception($"Output uniform: top={topConf:P4}, bot={botConf:P4}, ratio={ratio:F2}x");
 
-        session.Dispose();
         pipeline.Dispose();
     });
 }

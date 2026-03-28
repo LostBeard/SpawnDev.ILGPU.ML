@@ -53,7 +53,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Style barely changed image: only {diffPct:P1} pixels differ");
 
         Console.WriteLine("[StyleTest] PASS");
-        session.Dispose();
         pipeline.Dispose();
     });
 
@@ -107,7 +106,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Output has only {uniqueGrays} unique values — too flat");
 
         Console.WriteLine("[SRTest] PASS");
-        session.Dispose();
         pipeline.Dispose();
     });
 
@@ -150,7 +148,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Output lacks color variety: only {uniqueColors.Count} unique colors");
 
         Console.WriteLine("[StyleCatTest] PASS");
-        session.Dispose();
         pipeline.Dispose();
     });
 
@@ -203,7 +200,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Output too flat: only {uniqueGrays} unique values");
 
         Console.WriteLine("[SRCatTest] PASS");
-        session.Dispose();
         pipeline.Dispose();
     });
 }

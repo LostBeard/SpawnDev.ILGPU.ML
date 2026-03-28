@@ -35,7 +35,6 @@ public abstract partial class MLTestBase
                 throw new Exception("TFLite session has 0 nodes");
 
             Console.WriteLine("[TFLite] PASS — session created from .tflite");
-            session.Dispose();
         }
         catch (HttpRequestException)
         {

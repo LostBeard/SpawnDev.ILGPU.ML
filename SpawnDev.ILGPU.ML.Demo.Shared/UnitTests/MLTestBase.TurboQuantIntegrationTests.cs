@@ -46,7 +46,6 @@ public abstract partial class MLTestBase
         }
 
         Console.WriteLine($"[TurboQuant] DistilGPT-2 KV cache detection: PASS");
-        session.Dispose();
     });
 
     /// <summary>
@@ -73,7 +72,6 @@ public abstract partial class MLTestBase
         if (!session.Executor.HasKVCache)
         {
             Console.WriteLine("[TurboQuant] Skipping — no KV cache detected");
-            session.Dispose();
             return;
         }
 
@@ -102,7 +100,6 @@ public abstract partial class MLTestBase
             throw new Exception($"KV cache empty after inference — expected ≥1, got {kvCache.CurrentSeqLen}");
 
         Console.WriteLine($"[TurboQuant] DistilGPT-2 KV cache capture: PASS (seqLen={kvCache.CurrentSeqLen})");
-        session.Dispose();
     });
     [TestMethod]
     public async Task TurboQuant_QuantizedAttention_MatchesFP32() => await RunTest(async accelerator =>
@@ -387,7 +384,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Whisper Tiny should have at least 4 KV cache layers, got {kvCache.NumLayers}");
 
         Console.WriteLine($"[TurboQuant] Whisper decoder KV cache detection: PASS");
-        session.Dispose();
     });
 
     /// <summary>
@@ -413,7 +409,6 @@ public abstract partial class MLTestBase
         if (!session.Executor.HasKVCache)
         {
             Console.WriteLine("[TurboQuant] Skipping — no KV cache detected");
-            session.Dispose();
             return;
         }
 
@@ -456,7 +451,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Whisper KV cache empty after inference — expected ≥1, got {kvCache.CurrentSeqLen}");
 
         Console.WriteLine($"[TurboQuant] Whisper decoder KV cache capture: PASS (seqLen={kvCache.CurrentSeqLen})");
-        session.Dispose();
     });
 
     /// <summary>
@@ -778,7 +772,6 @@ public abstract partial class MLTestBase
             throw new Exception($"[GPT-2 Baseline] {nanCount} NaN/Inf logits");
 
         Console.WriteLine($"[GPT-2 Baseline] PASS — next token {nextToken}, no NaN");
-        session.Dispose();
     });
 
     /// <summary>
@@ -881,7 +874,6 @@ public abstract partial class MLTestBase
         }
 
         Console.WriteLine($"[GPT-2 TurboQuant] PASS — next token {nextToken}, KV cache active, no NaN");
-        session.Dispose();
     });
 
     /// <summary>

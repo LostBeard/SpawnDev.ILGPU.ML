@@ -42,7 +42,6 @@ public abstract partial class MLTestBase
             throw new Exception($"Output uniform: ratio={ratio:F2}x");
 
         Console.WriteLine($"[DirectOnnxHttp] PASS — ratio={ratio:F1}x");
-        session.Dispose();
         pipeline.Dispose();
     });
 }
