@@ -1353,6 +1353,71 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>DistilBERT sentiment on CUDA — "I love this movie" → positive.</summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DirectOnnx_DistilBERT_Sentiment_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "distilbert-sst2", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"DistilBERT model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+        var context = MLContext.CreateContext();
+        Accelerator? accelerator = null;
+        InferenceSession? session = null;
+        try
+        {
+            var cudaDevices = context.GetCudaDevices();
+            if (cudaDevices.Count == 0) throw new UnsupportedTestException("No CUDA devices");
+            accelerator = cudaDevices[0].CreateAccelerator(context);
+
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["input_ids"] = new[] { 1, 6 },
+                    ["attention_mask"] = new[] { 1, 6 },
+                });
+            Console.WriteLine($"[DistilBERT-CUDA] {session}");
+
+            // "I love this movie" tokenized: [CLS]=101, I=1045, love=2293, this=2023, movie=3185, [SEP]=102
+            var tokenIds = new float[] { 101, 1045, 2293, 2023, 3185, 102 };
+            var mask = new float[] { 1, 1, 1, 1, 1, 1 };
+            using var idsBuf = accelerator.Allocate1D(tokenIds);
+            using var maskBuf = accelerator.Allocate1D(mask);
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 6 }),
+                [session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 6 }),
+            });
+            sw.Stop();
+
+            var output = outputs[session.OutputNames[0]];
+            int readCount = Math.Min(2, output.ElementCount);
+            using var readBuf = accelerator.Allocate1D<float>(readCount);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
+            await accelerator.SynchronizeAsync();
+            var logits = await readBuf.CopyToHostAsync<float>(0, readCount);
+
+            Console.WriteLine($"[DistilBERT-CUDA] Logits: neg={logits[0]:F3}, pos={logits[1]:F3}, time={sw.Elapsed.TotalMilliseconds:F0}ms");
+
+            if (logits.Any(v => float.IsNaN(v)))
+                throw new Exception("DistilBERT output contains NaN");
+            // "I love this movie" should be positive (logits[1] > logits[0])
+            if (logits[1] <= logits[0])
+                throw new Exception($"Expected positive sentiment but neg={logits[0]:F3} >= pos={logits[1]:F3}");
+
+            Console.WriteLine("[DistilBERT-CUDA] PASS — correctly classified as positive");
+        }
+        finally
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
+        }
+    }
+
     /// <summary>GPT-2 full model on CUDA — verifies 12-block transformer with 652MB weights.</summary>
     [TestMethod(Timeout = 300000)]
     public async Task DirectOnnx_GPT2_Full_Cuda()
