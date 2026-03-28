@@ -257,10 +257,12 @@ public class ArgMaxOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // CPU-side ArgMax (small output tensor)
         var input = ctx.Inputs[0];
         int axis = ctx.GetInt("axis", 0);
         if (axis < 0) axis += input.Shape.Length;
+        if (axis < 0 || axis >= input.Shape.Length)
+            throw new InvalidOperationException(
+                $"ArgMax axis {axis} out of range for shape [{string.Join(",", input.Shape)}] (rank={input.Shape.Length})");
 
         int outerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= input.Shape[i];
@@ -268,12 +270,16 @@ public class ArgMaxOperator(OperatorRegistry reg) : IOnnxOperator
         int innerSize = 1;
         for (int i = axis + 1; i < input.Shape.Length; i++) innerSize *= input.Shape[i];
 
-        // Read input to CPU — use pre-read values if available
+        // GPU ArgMax kernel — works on all backends including WebGPU/Wasm
+        reg.ElementWise.ArgMax(input.Data, ctx.Outputs[0].Data, outerSize, axisSize, innerSize);
+        return;
+
+        // Legacy CPU fallback below (unreachable, kept for reference)
+        #pragma warning disable CS0162
         int total = input.ElementCount;
         var data = ctx.TryGetInputValues(0);
         if (data == null || data.Length != total)
         {
-            // Sync readback — works on CPU/CUDA/OpenCL but not WebGPU/WebGL/Wasm
             try
             {
                 data = new float[total];
@@ -282,12 +288,10 @@ public class ArgMaxOperator(OperatorRegistry reg) : IOnnxOperator
             catch (NotSupportedException)
             {
                 throw new NotSupportedException(
-                    $"ArgMax requires CPU readback but this backend doesn't support synchronous copies. " +
-                    $"Ensure the GraphExecutor pre-reads this input via ConstantData.");
+                    $"ArgMax requires CPU readback but this backend doesn't support synchronous copies.");
             }
         }
 
-        // Compute argmax
         var result = new float[outerSize * innerSize];
         for (int o = 0; o < outerSize; o++)
         {
