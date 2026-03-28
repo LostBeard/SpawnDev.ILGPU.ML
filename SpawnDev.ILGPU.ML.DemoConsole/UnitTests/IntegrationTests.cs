@@ -949,16 +949,19 @@ public class IntegrationTests
                     $"DAv2 shape inference produced sentinel values — Resize constant propagation not yet complete. " +
                     $"Output shapes: {string.Join(", ", outShapes.Select(kv => $"{kv.Key}=[{string.Join(",", kv.Value)}]"))}");
 
+            // Checkerboard + gradient: distinct regions for depth variation
             var pixels = new int[w * h];
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++)
                 {
-                    int gray = (int)(x * 255f / w);
-                    pixels[y * w + x] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
+                    bool check = ((x / 20) + (y / 20)) % 2 == 0;
+                    int r = check ? (int)(x * 255f / w) : 0;
+                    int g = (int)(y * 255f / h);
+                    int b = check ? 128 : (int)((x + y) * 128f / (w + h));
+                    pixels[y * w + x] = r | (g << 8) | (b << 16) | (0xFF << 24);
                 }
 
             // Enable captured outputs to find where signal dies
-            Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
             pipeline = new SpawnDev.ILGPU.ML.Pipelines.DepthEstimationPipeline(session, accelerator);
             sw.Restart();
             var result = await pipeline.EstimateAsync(pixels, w, h);
