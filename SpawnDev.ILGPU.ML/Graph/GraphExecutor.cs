@@ -190,39 +190,10 @@ public class GraphExecutor : IDisposable
                 nodeInputs[i] = tensor;
             }
 
-            // Allocate output tensors using runtime input shapes for re-inference.
-            var actualInputShapes = nodeInputs
-                .Select(t => t?.Shape ?? Array.Empty<int>())
-                .ToArray();
-
-            var runtimeAttrs = ConvertAttributes(node.Attributes);
-
-            int[][] runtimeOutputShapes;
-            try
-            {
-                runtimeOutputShapes = node.Operator.InferOutputShapes(actualInputShapes, runtimeAttrs);
-                if (node.OpType == "Conv" && runtimeOutputShapes[0].Length < 4)
-                    Console.WriteLine($"[RT-Conv3D] {node.OutputNames[0]}: inferred=[{string.Join(",", runtimeOutputShapes[0])}] inputs=[{string.Join("; ", actualInputShapes.Select(s => $"[{string.Join(",", s)}]"))}] pads={runtimeAttrs.ContainsKey("pads")} padsType={runtimeAttrs.GetValueOrDefault("pads")?.GetType().Name} group={runtimeAttrs.GetValueOrDefault("group")}");
-
-                // Safety: if runtime inference produces shapes with sentinel values (int.MaxValue)
-                // or negative dims, fall back to compiled shapes
-                for (int ri = 0; ri < runtimeOutputShapes.Length; ri++)
-                {
-                    if (runtimeOutputShapes[ri].Any(d => d <= 0 || d == int.MaxValue))
-                    {
-                        if (node.OpType is "Conv" or "ConvTranspose")
-                            Console.WriteLine($"[RT-SafetyReject] {node.OpType} {node.OutputNames[0]}: inferred=[{string.Join(",", runtimeOutputShapes[ri])}] compiled=[{string.Join(",", node.OutputShapes[ri])}] inputs=[{string.Join("; ", actualInputShapes.Select(s => $"[{string.Join(",", s)}]"))}]");
-                        runtimeOutputShapes = node.OutputShapes;
-                        break;
-                    }
-                }
-            }
-            catch (Exception _inferEx)
-            {
-                // Fallback to compiled shapes if runtime inference fails
-                Console.WriteLine($"[RT-InferFail] {node.OpType} {node.OutputNames[0]}: {_inferEx.GetType().Name}: {_inferEx.Message.Split('\n')[0]}");
-                runtimeOutputShapes = node.OutputShapes;
-            }
+            // Use COMPILED shapes by default — they're correct for the compiled input dims.
+            // Only override for operators with runtime-dependent shape tensors
+            // (Reshape, Slice, Expand, Resize) resolved below.
+            int[][] runtimeOutputShapes = node.OutputShapes;
 
             // Runtime Slice: resolve output shape from starts/ends/axes constants
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
