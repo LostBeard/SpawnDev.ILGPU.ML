@@ -18,8 +18,8 @@ public class Tensor
     /// <summary>Shape dimensions (e.g., [1370, 384] for T×C). Settable for runtime Reshape.</summary>
     public int[] Shape { get; set; }
 
-    /// <summary>Total number of elements (product of shape dimensions).</summary>
-    public int ElementCount { get; }
+    /// <summary>Total number of elements (product of shape dimensions). Recomputed when Shape changes.</summary>
+    public int ElementCount => TensorHelpers.ElementCount(Shape);
 
     /// <summary>GPU data view. Length == ElementCount.</summary>
     public ArrayView1D<float, Stride1D.Dense> Data { get; }
@@ -34,7 +34,6 @@ public class Tensor
             throw new ArgumentException($"Data length {data.Length} < shape element count {count}");
         Data = data.SubView(0, count);
         Shape = shape;
-        ElementCount = count;
         Strides = TensorHelpers.ComputeStrides(shape);
         Name = name;
     }

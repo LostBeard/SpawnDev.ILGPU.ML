@@ -422,10 +422,17 @@ public class GraphExecutor : IDisposable
             ? new Dictionary<string, float[]>(_constantValues)
             : new Dictionary<string, float[]>();
 
-        // Clear stale compile-time constants for node outputs (same as Run)
-        var nodeOutputNamesAsync = new HashSet<string>(_graph.Nodes.SelectMany(n => n.OutputNames));
-        foreach (var name in nodeOutputNamesAsync)
-            runtimeConstants.Remove(name);
+        // Clear stale compile-time constants for non-Constant node outputs (same as Run).
+        // PRESERVE Constant node outputs — they're fixed model values (indices, axes, etc.).
+        var constantNodeOutputsAsync = new HashSet<string>(
+            _graph.Nodes.Where(n => n.OpType == "Constant").SelectMany(n => n.OutputNames));
+        foreach (var node in _graph.Nodes)
+        {
+            if (node.OpType == "Constant") continue;
+            foreach (var outName in node.OutputNames)
+                if (!constantNodeOutputsAsync.Contains(outName))
+                    runtimeConstants.Remove(outName);
+        }
 
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
