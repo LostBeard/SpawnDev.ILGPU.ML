@@ -1,6 +1,8 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
+using SpawnDev.ILGPU.ML.Operators;
+using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -107,6 +109,93 @@ public abstract partial class MLTestBase
         if (mant > 1023) mant = 1023;
         return (sign << 15) | (biasedExp << 10) | mant;
     }
+
+    /// <summary>
+    /// Validates the Q4 routing through MatMulOperator — same as above but exercises
+    /// the QuantizedWeights → MatMulOperator → FusedDequantMatMul pipeline.
+    /// </summary>
+    [TestMethod]
+    public async Task Q4MatMulRouting_ViaOperator_MatchesDirect() => await RunTest(async accelerator =>
+    {
+        int M = 2, K = 32, N = 2;
+        var rng = new Random(42);
+
+        var input = new float[M * K];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Build Q4 weight bytes
+        int blocksPerRow = (K + 31) / 32;
+        int bytesPerRow = blocksPerRow * 18;
+        var weightQ4 = new byte[N * bytesPerRow];
+        for (int n = 0; n < N; n++)
+            for (int blockIdx = 0; blockIdx < blocksPerRow; blockIdx++)
+            {
+                int blockOffset = n * bytesPerRow + blockIdx * 18;
+                float scale = 0.1f + (float)rng.NextDouble() * 0.5f;
+                int scaleFP16 = FloatToHalf(scale);
+                weightQ4[blockOffset] = (byte)(scaleFP16 & 0xFF);
+                weightQ4[blockOffset + 1] = (byte)((scaleFP16 >> 8) & 0xFF);
+                for (int i = 0; i < 32; i++)
+                {
+                    int nibble = rng.Next(0, 16);
+                    int byteIdx = blockOffset + 2 + (i / 2);
+                    if (i % 2 == 0) weightQ4[byteIdx] = (byte)((weightQ4[byteIdx] & 0xF0) | (nibble & 0xF));
+                    else weightQ4[byteIdx] = (byte)((weightQ4[byteIdx] & 0x0F) | ((nibble & 0xF) << 4));
+                }
+            }
+
+        // Get reference output from direct FusedDequantMatMul
+        using var inputBuf = accelerator.Allocate1D(input);
+        using var weightBuf = accelerator.Allocate1D(weightQ4);
+        using var directOut = accelerator.Allocate1D<float>(M * N);
+        var fused = new Kernels.FusedDequantMatMul(accelerator);
+        fused.Forward(inputBuf.View, weightBuf.View, directOut.View, M, K, N);
+        await accelerator.SynchronizeAsync();
+        var directResult = await directOut.CopyToHostAsync<float>(0, M * N);
+
+        // Now test via MatMulOperator with QuantizedWeights routing
+        var registry = new OperatorRegistry(accelerator);
+        var matmulOp = registry.Resolve("MatMul");
+
+        // Create dummy float tensor for shape tracking (data doesn't matter — Q4 route used)
+        using var dummyWeight = accelerator.Allocate1D<float>(K * N);
+        using var routedOut = accelerator.Allocate1D<float>(M * N);
+
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensors.Tensor(inputBuf.View, new[] { M, K }),
+                new Tensors.Tensor(dummyWeight.View, new[] { K, N }),
+            },
+            Outputs = new[] { new Tensors.Tensor(routedOut.View, new[] { M, N }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new Tensors.BufferPool(accelerator),
+            InputNames = new[] { "input", "weight_q4" },
+            QuantizedWeights = new Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>
+            {
+                ["weight_q4"] = weightBuf.View
+            },
+        };
+
+        matmulOp.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var routedResult = await routedOut.CopyToHostAsync<float>(0, M * N);
+
+        // Direct and routed should match exactly
+        float maxErr = 0;
+        for (int i = 0; i < M * N; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(routedResult[i] - directResult[i]));
+
+        Console.WriteLine($"[Q4Routing] Direct vs Routed maxErr={maxErr:E3}");
+        Console.WriteLine($"[Q4Routing] Direct: [{string.Join(", ", directResult.Select(v => v.ToString("F4")))}]");
+        Console.WriteLine($"[Q4Routing] Routed: [{string.Join(", ", routedResult.Select(v => v.ToString("F4")))}]");
+
+        if (maxErr > 1e-6f)
+            throw new Exception($"Q4 routing mismatch: maxErr={maxErr:E3}. Direct and routed paths should be identical.");
+
+        Console.WriteLine("[Q4Routing] PASS — MatMulOperator correctly routes to FusedDequantMatMul");
+    });
 
     /// <summary>FP16 → FP32 conversion (CPU reference, matches kernel's HalfToFloat).</summary>
     private static float HalfToFloatCPU(int h)
