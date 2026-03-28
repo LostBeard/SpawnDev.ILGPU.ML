@@ -4,7 +4,7 @@ using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML;
 
 /// <summary>Binary operations for GPU broadcast kernels.</summary>
-public enum BroadcastOp { Add, Sub, Mul, Div }
+public enum BroadcastOp { Add, Sub, Mul, Div, Pow }
 
 /// <summary>
 /// Element-wise neural network operations: GELU, ReLU, Add, Mul, AddBias.
@@ -183,6 +183,7 @@ public class ElementWiseKernels
     static float BroadcastSubOp(float a, float b) => a - b;
     static float BroadcastMulOp(float a, float b) => a * b;
     static float BroadcastDivOp(float a, float b) => b != 0f ? a / b : 0f;
+    static float BroadcastPowOp(float a, float b) => MathF.Pow(a, b);
 
     /// <summary>
     /// Unified broadcast binary kernel: output[i] = op(a[mapA(i)], b[mapB(i)]).
@@ -494,6 +495,7 @@ public class ElementWiseKernels
             BroadcastOp.Sub => new DelegateSpecialization<Func<float, float, float>>(BroadcastSubOp),
             BroadcastOp.Mul => new DelegateSpecialization<Func<float, float, float>>(BroadcastMulOp),
             BroadcastOp.Div => new DelegateSpecialization<Func<float, float, float>>(BroadcastDivOp),
+            BroadcastOp.Pow => new DelegateSpecialization<Func<float, float, float>>(BroadcastPowOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
         _broadcastBinaryKernel!(outCount, a, b, output, stridesBuf.View, opSpec);

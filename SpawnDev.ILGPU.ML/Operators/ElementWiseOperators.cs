@@ -418,7 +418,16 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Pow(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+        {
+            reg.ElementWise.Pow(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        }
+        else
+        {
+            // Broadcasting required (e.g., LayerNorm: x^2 where 2 is scalar)
+            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Pow(x, y), BroadcastOp.Pow);
+        }
     }
 }
 

@@ -961,24 +961,10 @@ public class IntegrationTests
                     pixels[y * w + x] = r | (g << 8) | (b << 16) | (0xFF << 24);
                 }
 
-            // Enable captured outputs to find where signal dies
             pipeline = new SpawnDev.ILGPU.ML.Pipelines.DepthEstimationPipeline(session, accelerator);
             sw.Restart();
             var result = await pipeline.EstimateAsync(pixels, w, h);
             sw.Stop();
-
-            // Analyze captured outputs — find where values go flat
-            if (Graph.GraphExecutor.CapturedOutputs != null)
-            {
-                foreach (var (key, vals) in Graph.GraphExecutor.CapturedOutputs.OrderBy(kv => kv.Key))
-                {
-                    float absMax = vals.Max(v => MathF.Abs(v));
-                    float variance = vals.Length > 1 ? vals.Select(v => v - vals.Average()).Select(d => d * d).Average() : 0;
-                    if (absMax < 0.001f || variance < 1e-10f)
-                        Console.WriteLine($"[DEAD] {key}: absMax={absMax:E2} var={variance:E2} len={vals.Length}");
-                }
-                Graph.GraphExecutor.CapturedOutputs = null;
-            }
 
             Console.WriteLine($"[CudaDepth] Depth map: {result.Width}x{result.Height}, min={result.MinDepth:F3}, max={result.MaxDepth:F3}, inference={sw.Elapsed.TotalSeconds:F1}s");
 

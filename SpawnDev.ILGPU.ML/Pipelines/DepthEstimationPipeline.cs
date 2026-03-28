@@ -26,11 +26,19 @@ public class DepthEstimationPipeline : IDisposable
     private readonly int _inputSize;
 
     public DepthEstimationPipeline(InferenceSession session, Accelerator accelerator,
-        int inputSize = 518)
+        int inputSize = 0)
     {
         _session = session;
         _accelerator = accelerator;
         _preprocess = new Kernels.ImagePreprocessKernel(accelerator);
+        // Derive input size from session's compiled input shapes if not specified.
+        // Prevents mismatch between preprocessing resolution and compiled graph shapes,
+        // which causes silent GPU memory corruption (OOB writes from Conv kernels).
+        if (inputSize <= 0)
+        {
+            var firstShape = session.InputShapes.Values.FirstOrDefault();
+            inputSize = firstShape != null && firstShape.Length >= 4 ? firstShape[^1] : 518;
+        }
         _inputSize = inputSize;
     }
 
