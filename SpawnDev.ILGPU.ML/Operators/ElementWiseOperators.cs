@@ -794,7 +794,16 @@ public class AndOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        BroadcastBinaryOp(ctx, reg, (a, b) => (a != 0f && b != 0f) ? 1f : 0f);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        if (a.ElementCount == b.ElementCount)
+        {
+            // And = Mul(a, b) then threshold: any non-zero × non-zero = non-zero
+            reg.ElementWise.Mul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+        }
+        else
+        {
+            BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f && y != 0f) ? 1f : 0f);
+        }
     }
 }
 
