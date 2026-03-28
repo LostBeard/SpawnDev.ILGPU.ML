@@ -141,6 +141,20 @@ public class GraphExecutor : IDisposable
             ? new Dictionary<string, float[]>(_constantValues)
             : new Dictionary<string, float[]>();
 
+        // Remove stale compile-time constants for dynamically-computed node outputs.
+        // These may have been computed with different input dimensions at compile time.
+        // KEEP: Constant node outputs (fixed model values like indices, scales, axes).
+        // CLEAR: Shape, Gather, Concat, Slice, etc. outputs that depend on input dims.
+        var constantNodeOutputs = new HashSet<string>(
+            _graph.Nodes.Where(n => n.OpType == "Constant").SelectMany(n => n.OutputNames));
+        foreach (var node in _graph.Nodes)
+        {
+            if (node.OpType == "Constant") continue;
+            foreach (var outName in node.OutputNames)
+                if (!constantNodeOutputs.Contains(outName))
+                    runtimeConstants.Remove(outName);
+        }
+
         // Execute each node in topological order
         int nodeIdx = 0;
         foreach (var node in _graph.Nodes)
@@ -214,6 +228,34 @@ public class GraphExecutor : IDisposable
                 if (node.OpType is "Conv" or "ConvTranspose")
                     Console.WriteLine($"[RT-InferFail] {node.OpType} {node.OutputNames[0]}: {_inferEx.GetType().Name}: {_inferEx.Message}");
                 runtimeOutputShapes = node.OutputShapes;
+            }
+
+            // Runtime Slice: resolve output shape from starts/ends/axes constants
+            if (node.OpType == "Slice" && node.InputNames.Length >= 3)
+            {
+                var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                float[]? starts = node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null;
+                float[]? ends = node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null;
+                float[]? axes = node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null;
+                float[]? steps = node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null;
+                if (starts != null && ends != null)
+                {
+                    var resolved = inShape.ToArray();
+                    for (int si = 0; si < starts.Length; si++)
+                    {
+                        int ax = axes != null && si < axes.Length ? (int)axes[si] : si;
+                        if (ax < 0) ax += resolved.Length;
+                        if (ax >= 0 && ax < resolved.Length)
+                        {
+                            int s = (int)starts[si]; if (s < 0) s += resolved[ax];
+                            int e = (int)ends[si]; if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
+                            int st = steps != null && si < steps.Length ? (int)steps[si] : 1;
+                            resolved[ax] = (e - s + st - 1) / st;
+                        }
+                    }
+                    if (resolved.All(d => d > 0))
+                        runtimeOutputShapes = new[] { resolved };
+                }
             }
 
             // Runtime Reshape: resolve target shape from runtime constants
@@ -413,6 +455,11 @@ public class GraphExecutor : IDisposable
             ? new Dictionary<string, float[]>(_constantValues)
             : new Dictionary<string, float[]>();
 
+        // Clear stale compile-time constants for node outputs (same as Run)
+        var nodeOutputNamesAsync = new HashSet<string>(_graph.Nodes.SelectMany(n => n.OutputNames));
+        foreach (var name in nodeOutputNamesAsync)
+            runtimeConstants.Remove(name);
+
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
         foreach (var node in _graph.Nodes)
@@ -466,6 +513,34 @@ public class GraphExecutor : IDisposable
                 }
             }
             catch { runtimeOutputShapes = node.OutputShapes; }
+
+            // Runtime Slice (same as sync Run)
+            if (node.OpType == "Slice" && node.InputNames.Length >= 3)
+            {
+                var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                float[]? starts = node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null;
+                float[]? ends = node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null;
+                float[]? axes = node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null;
+                float[]? steps = node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null;
+                if (starts != null && ends != null)
+                {
+                    var resolved = inShape.ToArray();
+                    for (int si = 0; si < starts.Length; si++)
+                    {
+                        int ax = axes != null && si < axes.Length ? (int)axes[si] : si;
+                        if (ax < 0) ax += resolved.Length;
+                        if (ax >= 0 && ax < resolved.Length)
+                        {
+                            int s = (int)starts[si]; if (s < 0) s += resolved[ax];
+                            int e = (int)ends[si]; if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
+                            int st = steps != null && si < steps.Length ? (int)steps[si] : 1;
+                            resolved[ax] = (e - s + st - 1) / st;
+                        }
+                    }
+                    if (resolved.All(d => d > 0))
+                        runtimeOutputShapes = new[] { resolved };
+                }
+            }
 
             // Runtime Reshape (same as sync Run)
             if (node.OpType == "Reshape" && node.InputNames.Length >= 2
