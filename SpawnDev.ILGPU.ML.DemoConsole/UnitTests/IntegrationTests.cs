@@ -1283,6 +1283,76 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>Whisper Tiny encoder on CUDA — verifies transformer LayerNorm produces non-NaN hidden states.</summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DirectOnnx_WhisperEncoder_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "whisper-tiny", "encoder_model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"Whisper encoder not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+
+        var context = MLContext.CreateContext();
+        Accelerator? accelerator = null;
+        InferenceSession? session = null;
+        try
+        {
+            var cudaDevices = context.GetCudaDevices();
+            if (cudaDevices.Count == 0)
+                throw new UnsupportedTestException("No CUDA devices found");
+            accelerator = cudaDevices[0].CreateAccelerator(context);
+            Console.WriteLine($"[Whisper-CUDA] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
+
+            // Whisper encoder input: [batch, mel_features, mel_length] = [1, 80, 3000]
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["input_features"] = new[] { 1, 80, 3000 }
+                });
+            Console.WriteLine($"[Whisper-CUDA] Session: {session}");
+
+            // Create fake mel spectrogram input (silence = all zeros)
+            var melInput = new float[1 * 80 * 3000];
+            using var inputBuf = accelerator.Allocate1D(melInput);
+            var inputTensor = new Tensor(inputBuf.View, new[] { 1, 80, 3000 });
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = inputTensor
+            });
+            sw.Stop();
+
+            var output = outputs.Values.First();
+            Console.WriteLine($"[Whisper-CUDA] Output: shape=[{string.Join(",", output.Shape)}], elements={output.ElementCount}, time={sw.Elapsed.TotalSeconds:F1}s");
+
+            int readCount = Math.Min(100, output.ElementCount);
+            using var readBuf = accelerator.Allocate1D<float>(readCount);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
+            await accelerator.SynchronizeAsync();
+            var values = await readBuf.CopyToHostAsync<float>(0, readCount);
+
+            bool hasNaN = values.Any(v => float.IsNaN(v));
+            float absMax = values.Max(v => MathF.Abs(v));
+
+            Console.WriteLine($"[Whisper-CUDA] Hidden: absMax={absMax:F3}, hasNaN={hasNaN}, nonZero={values.Count(v => v != 0)}/{readCount}");
+
+            if (hasNaN)
+                throw new Exception("Whisper encoder output contains NaN — LayerNorm Pow broadcast bug may still be present");
+            if (absMax < 0.001f)
+                throw new Exception($"Whisper encoder output is all zeros: absMax={absMax}");
+
+            Console.WriteLine("[Whisper-CUDA] PASS");
+        }
+        finally
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
+        }
+    }
+
     private static string? FindTFLiteModel(string filename)
     {
         var tempPath = Path.Combine(Path.GetTempPath(), filename);
