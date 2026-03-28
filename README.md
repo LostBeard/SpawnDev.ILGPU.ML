@@ -27,6 +27,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **104 numpy-verified operator tests** — every operator validated against known-correct reference data
 - **Single image to 3D** — TripoSR for exportable meshes (glTF/OBJ), LGM for Gaussian splats (SPZ/PLY)
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
+- **P2P Model Delivery + Shared Compute** — [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) integration for decentralized model delivery via BitTorrent. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. WebCrypto-native ECDSA signing for browser compatibility. Foundation for `AcceleratorType.P2P` distributed compute.
 
 ## Universal Model Loading
 
