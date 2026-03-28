@@ -394,6 +394,10 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
+        if (x.Shape.Length < 4)
+            throw new InvalidOperationException(
+                $"ConvTranspose expects 4D input [N,C,H,W], got shape [{string.Join(",", x.Shape)}] (rank={x.Shape.Length}). " +
+                $"This may be caused by an upstream Resize/Expand with unresolved dynamic shapes.");
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
         var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
         int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
