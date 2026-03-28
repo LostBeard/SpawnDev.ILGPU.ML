@@ -77,7 +77,45 @@ public class FWHTKernel
             return;
         }
 
-        // Fallback: multi-dispatch global memory path for large d
+        // Fallback: multi-dispatch global memory path for large d.
+        // FWHT requires power-of-2 dimensions. Pad to next power of 2 if needed.
+        int dPad = d;
+        if ((dPad & (dPad - 1)) != 0)
+        {
+            dPad = 1;
+            while (dPad < d) dPad <<= 1;
+        }
+
+        var ew = new ElementWiseKernels(_accelerator);
+
+        if (dPad != d)
+        {
+            // Non-power-of-2: allocate padded temp buffer, zero-fill, copy input rows,
+            // run FWHT on padded buffer, copy results back to output.
+            using var padBuf = _accelerator.Allocate1D<float>(batchSize * dPad);
+            ew.Fill(padBuf.View, batchSize * dPad, 0f);
+            for (int b = 0; b < batchSize; b++)
+                input.SubView(b * d, d).CopyTo(padBuf.View.SubView(b * dPad, d));
+
+            int numStagesPad = 0;
+            for (int s = dPad; s > 1; s >>= 1) numStagesPad++;
+            for (int stage = 0; stage < numStagesPad; stage++)
+            {
+                int halfSize = 1 << stage;
+                _fwhtBatchKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int>(FWHTBatchStageImpl);
+                _fwhtBatchKernel(batchSize * dPad / 2, padBuf.View, padBuf.View, halfSize);
+            }
+
+            // Copy first d elements of each padded row to output, with normalization
+            float scalePad = 1f / MathF.Sqrt(d);
+            for (int b = 0; b < batchSize; b++)
+                ew.Scale(padBuf.View.SubView(b * dPad, d), output.SubView(b * d, d), d, scalePad);
+            return;
+        }
+
+        // Power-of-2: in-place butterfly
         output.SubView(0, batchSize * d).CopyFrom(input.SubView(0, batchSize * d));
 
         int numStages = 0;
@@ -94,7 +132,6 @@ public class FWHTKernel
 
         // Normalize
         float scale = 1f / MathF.Sqrt(d);
-        var ew = new ElementWiseKernels(_accelerator);
         ew.Scale(output, output, batchSize * d, scale);
     }
 
