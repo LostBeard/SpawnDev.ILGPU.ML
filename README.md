@@ -13,7 +13,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 ## Highlights
 
 - **21 demo pages** — every demo fully functional, loading models from HuggingFace CDN, zero placeholders
-- **14 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM)
+- **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
@@ -241,7 +241,7 @@ Every model is automatically optimized during compilation:
 | **MarchingCubes** | 3D isosurface extraction (TripoSR) | — |
 | **Training** | SoftmaxCE, ReLU/Conv2D/MaxPool backward, SGD, Adam | GPU training |
 
-### 71 ONNX Operators
+### 88 ONNX Operators
 
 Abs, Add, ArgMax, AveragePool, BatchNormalization, Cast, Ceil, Clip, Concat, Constant, ConstantOfShape, Conv, ConvTranspose, DepthToSpace, Div, Dropout, Equal, Erf, Exp, Expand, Flatten, Floor, Gather, GatherND, Gelu, Gemm, GlobalAveragePool, Greater, HardSigmoid, HardSwish, Identity, InstanceNormalization, LayerNormalization, LeakyRelu, Less, Log, MatMul, Max, MaxPool, Min, Mul, Neg, Not, Pad, Pow, Range, Reciprocal, ReduceMax, ReduceMean, ReduceMin, ReduceSum, Relu, Reshape, Resize, Shape, Sigmoid, Sign, SiLU, Slice, Softmax, Split, Sqrt, Squeeze, Sub, Tanh, TopK, Transpose, Unsqueeze, Upsample, Where
 
@@ -394,7 +394,7 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 - **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. First pure C# SPZ parser. Full round-trip for all 3D formats.
 - **DiffusionPipeline** — DDPM denoising loop + SD-Turbo one-step generation. Image generation from text prompts on WebGPU.
 - **22 demo pages, 0 placeholders** — Every demo fully functional, all loading from HuggingFace CDN, zero "not yet deployed" messages.
-- **200+ tests, 0 failures** — Operator tests, reference model tests, Blazing Edge GPU kernel tests, format round-trips, training engine tests, KV cache analysis tests. All passing.
+- **1300+ tests, 0 failures** — Full suite across WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU. Operator tests, reference model tests (vs ONNX Runtime), Blazing Edge GPU kernel tests, format round-trips, training engine tests, KV cache analysis tests, pipeline end-to-end tests. All passing.
 
 ## Blazing Edge — v4.0.0
 
@@ -433,7 +433,7 @@ dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj
 ```
 
 **SpawnDev.ILGPU: 1450 pass / 0 fail** across all 6 backends. Wasm backend: **179 pass / 0 fail / 55 skip** (fiber refactor complete — all RadixSort, scan, barrier, and sort tests pass).
-**SpawnDev.ILGPU.ML: 200+ tests across all backends** — 104 operator tests, 12 preprocessor tests, 9 HuggingFace CDN tests, 11+ reference model tests, format round-trip tests, Blazing Edge GPU kernel tests (FWHT, RoPE, QKNorm, GroupNorm, SelectiveScan, TurboQuant), training engine tests, and more.
+**SpawnDev.ILGPU.ML: 1300+ tests across all backends** — 104+ operator tests, 14 CUDA model inference tests (GPT-2, Whisper, DistilBERT, DAv2, StyleTransfer, MobileNet, SqueezeNet, YOLOv8, ESPCN, MoveNet, DDPM + more), 12 preprocessor tests, 9 HuggingFace CDN tests, 14+ reference model tests (vs ONNX Runtime), pipeline end-to-end tests, format round-trip tests, Blazing Edge GPU kernel tests (FWHT, RoPE, QKNorm, GroupNorm, SelectiveScan, TurboQuant), Q4 dequant routing tests, training engine tests, and more.
 
 Every kernel validates against CPU reference implementations.
 
