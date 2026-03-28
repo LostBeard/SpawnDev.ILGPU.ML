@@ -165,8 +165,18 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // BlazeFace is TFLite format — use local model (HF litert-community repo requires auth)
-        var modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite");
+        // BlazeFace is TFLite format — try Kaggle TF model first, fall back to local
+        byte[] modelBytes;
+        try
+        {
+            modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite");
+        }
+        catch
+        {
+            // Fallback to local model (may be quantized with different tensor names)
+            modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite");
+        }
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 
         // Load reference input
