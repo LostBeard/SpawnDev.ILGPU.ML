@@ -135,6 +135,8 @@ public class OperatorRegistry
         Register(new LeakyReluOperator(this));
         Register(new ExpandOperator(this));
         Register(new TileOperator(this));
+        Register(new GatherElementsOperator(this));
+        Register(new ModOperator(this));
         Register(new EqualOperator(this));
         Register(new GreaterOperator(this));
         Register(new LessOperator(this));

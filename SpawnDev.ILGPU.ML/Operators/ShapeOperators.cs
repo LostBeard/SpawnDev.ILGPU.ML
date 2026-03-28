@@ -398,3 +398,93 @@ public class TileOperator(OperatorRegistry reg) : IOnnxOperator
         }
     }
 }
+
+/// <summary>GatherElements: index into data along an axis using indices tensor.</summary>
+public class GatherElementsOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "GatherElements";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[1] }; // output shape = indices shape
+    public void Execute(OnnxOpContext ctx)
+    {
+        var data = ctx.Inputs[0];
+        var indices = ctx.Inputs[1];
+        var output = ctx.Outputs[0];
+        int axis = ctx.GetInt("axis", 0);
+        if (axis < 0) axis += data.Shape.Length;
+
+        int outCount = output.ElementCount;
+        var idxVals = ctx.TryGetInputValues(1);
+        var dataVals = ctx.TryGetInputValues(0);
+
+        if (idxVals != null && dataVals != null)
+        {
+            var result = new float[outCount];
+            var shape = data.Shape;
+            var idxShape = indices.Shape;
+            var strides = new int[shape.Length];
+            strides[^1] = 1;
+            for (int i = shape.Length - 2; i >= 0; i--) strides[i] = strides[i + 1] * shape[i + 1];
+
+            for (int i = 0; i < outCount; i++)
+            {
+                int remaining = i;
+                int srcIdx = 0;
+                for (int d = idxShape.Length - 1; d >= 0; d--)
+                {
+                    int coord = remaining % idxShape[d];
+                    remaining /= idxShape[d];
+                    if (d == axis)
+                    {
+                        int gatherIdx = (int)idxVals[i];
+                        if (gatherIdx < 0) gatherIdx += shape[d];
+                        srcIdx += gatherIdx * strides[d];
+                    }
+                    else
+                        srcIdx += coord * strides[d];
+                }
+                result[i] = srcIdx >= 0 && srcIdx < dataVals.Length ? dataVals[srcIdx] : 0f;
+            }
+            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
+            reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+        }
+        else
+        {
+            int copyCount = Math.Min(data.ElementCount, outCount);
+            reg.ElementWise.Scale(data.Data.SubView(0, copyCount),
+                output.Data.SubView(0, copyCount), copyCount, 1f);
+        }
+    }
+}
+
+/// <summary>Mod: element-wise modulo operation.</summary>
+public class ModOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Mod";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        var aVals = ctx.TryGetInputValues(0);
+        var bVals = ctx.TryGetInputValues(1);
+        if (aVals != null && bVals != null)
+        {
+            int fmod = ctx.GetInt("fmod", 0);
+            int outCount = ctx.Outputs[0].ElementCount;
+            var result = new float[outCount];
+            for (int i = 0; i < outCount; i++)
+            {
+                float av = i < aVals.Length ? aVals[i % aVals.Length] : 0f;
+                float bv = i < bVals.Length ? bVals[i % bVals.Length] : 1f;
+                result[i] = fmod != 0 ? av % bv : (bv != 0 ? (int)av % (int)bv : 0f);
+            }
+            var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
+            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+        }
+        else
+        {
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x % y : 0f);
+        }
+    }
+}
