@@ -96,6 +96,7 @@ public class OperatorRegistry
         Register(new SqrtOperator(this));
         Register(new SinOperator(this));
         Register(new CosOperator(this));
+        Register(new TanOperator(this));
         Register(new ExpOperator(this));
         Register(new NegOperator(this));
         Register(new DivOperator(this));

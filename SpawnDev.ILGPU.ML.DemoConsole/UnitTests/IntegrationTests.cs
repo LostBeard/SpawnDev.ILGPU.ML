@@ -1196,6 +1196,93 @@ public class IntegrationTests
         Console.WriteLine("[SafeTensors] PASS");
     }
 
+    /// <summary>DistilGPT-2 on CUDA — verifies transformer LayerNorm + attention produces non-zero logits.</summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DirectOnnx_DistilGPT2_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "distilgpt2", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"DistilGPT-2 model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+
+        var context = MLContext.CreateContext();
+        Accelerator? accelerator = null;
+        InferenceSession? session = null;
+        try
+        {
+            var cudaDevices = context.GetCudaDevices();
+            if (cudaDevices.Count == 0)
+                throw new UnsupportedTestException("No CUDA devices found");
+            accelerator = cudaDevices[0].CreateAccelerator(context);
+            Console.WriteLine($"[GPT2-CUDA] CUDA: {accelerator.Name}, ONNX: {onnxBytes.Length / 1024.0 / 1024.0:F1} MB");
+
+            session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+            Console.WriteLine($"[GPT2-CUDA] Session: {session}");
+
+            // Simple input: "Hello" as token IDs [15496] padded
+            // DistilGPT-2 input_ids shape: [batch, seq_len]
+            var inputShape = session.InputShapes.Values.First();
+            int seqLen = inputShape.Length >= 2 ? inputShape[1] : 8;
+            if (seqLen <= 0 || seqLen > 512) seqLen = 8;
+
+            // Create input tokens: [Hello=15496, world=995, !=0] padded with 0
+            var tokenIds = new float[seqLen];
+            tokenIds[0] = 15496; // "Hello"
+            tokenIds[1] = 995;   // " world"
+            tokenIds[2] = 0;     // padding
+
+            using var inputBuf = accelerator.Allocate1D(tokenIds);
+            var inputTensor = new Tensor(inputBuf.View, inputShape);
+
+            // Build inputs (may need attention_mask too)
+            var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = inputTensor };
+
+            // Add attention mask if needed (all 1s for non-padding positions)
+            if (session.InputNames.Length > 1 && session.InputNames[1].Contains("attention_mask"))
+            {
+                var mask = new float[seqLen];
+                for (int i = 0; i < Math.Min(3, seqLen); i++) mask[i] = 1f;
+                using var maskBuf = accelerator.Allocate1D(mask);
+                inputs[session.InputNames[1]] = new Tensor(maskBuf.View, inputShape);
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var outputs = await session.RunAsync(inputs);
+            sw.Stop();
+
+            var output = outputs.Values.First();
+            Console.WriteLine($"[GPT2-CUDA] Output: shape=[{string.Join(",", output.Shape)}], elements={output.ElementCount}, time={sw.Elapsed.TotalSeconds:F1}s");
+
+            // Read first 100 logits to check for non-zero
+            int readCount = Math.Min(100, output.ElementCount);
+            using var readBuf = accelerator.Allocate1D<float>(readCount);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
+            await accelerator.SynchronizeAsync();
+            var logits = await readBuf.CopyToHostAsync<float>(0, readCount);
+
+            float absMax = logits.Max(v => MathF.Abs(v));
+            float mean = logits.Average();
+            int nonZero = logits.Count(v => v != 0f);
+            bool hasNaN = logits.Any(v => float.IsNaN(v));
+
+            Console.WriteLine($"[GPT2-CUDA] Logits: absMax={absMax:F3}, mean={mean:F3}, nonZero={nonZero}/{readCount}, hasNaN={hasNaN}");
+
+            if (hasNaN)
+                throw new Exception("GPT-2 output contains NaN — LayerNorm Pow broadcast bug may still be present");
+            if (absMax < 0.001f)
+                throw new Exception($"GPT-2 output is all zeros: absMax={absMax}");
+
+            Console.WriteLine("[GPT2-CUDA] PASS");
+        }
+        finally
+        {
+            try { session?.Dispose(); } catch { }
+            try { accelerator?.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
+        }
+    }
+
     private static string? FindTFLiteModel(string filename)
     {
         var tempPath = Path.Combine(Path.GetTempPath(), filename);

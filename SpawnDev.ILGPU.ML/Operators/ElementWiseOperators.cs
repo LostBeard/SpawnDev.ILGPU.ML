@@ -423,9 +423,31 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
         {
             reg.ElementWise.Pow(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         }
+        else if (b.ElementCount <= a.ElementCount)
+        {
+            // Scalar/small exponent broadcast (LayerNorm x^2, InstanceNorm x^2).
+            // Expand exponent to full size on CPU, then element-wise Pow.
+            // Avoids BroadcastBinaryOpND which has synchronous Synchronize() — deadlocks on WebGPU.
+            var bVals = ctx.TryGetInputValues(1);
+            if (bVals != null)
+            {
+                int outCount = ctx.Outputs[0].ElementCount;
+                var expanded = new float[outCount];
+                for (int i = 0; i < outCount; i++)
+                    expanded[i] = bVals[i % bVals.Length];
+                var expandedTensor = ctx.Pool.Rent(ctx.Outputs[0].Shape, "_pow_exp");
+                expandedTensor.Data.SubView(0, outCount).CopyFromCPU(expanded);
+                reg.ElementWise.Pow(a.Data, expandedTensor.Data, ctx.Outputs[0].Data, outCount);
+                ctx.Pool.Return(expandedTensor);
+            }
+            else
+            {
+                // Exponent not in runtime constants — use BroadcastBinaryOp (desktop backends only)
+                BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Pow(x, y), BroadcastOp.Pow);
+            }
+        }
         else
         {
-            // Broadcasting required (e.g., LayerNorm: x^2 where 2 is scalar)
             BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Pow(x, y), BroadcastOp.Pow);
         }
     }
@@ -866,5 +888,16 @@ public class CosOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         reg.ElementWise.Cos(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+}
+
+public class TanOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Tan";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.ElementWise.Tan(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
