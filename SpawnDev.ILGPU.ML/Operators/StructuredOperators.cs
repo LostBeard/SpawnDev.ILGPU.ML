@@ -323,30 +323,16 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[1] }; // Simplified — output shape depends on indices
     public void Execute(OnnxOpContext ctx)
     {
-        // CPU-side GatherND (indices are typically small)
         var data = ctx.Inputs[0];
         var indices = ctx.Inputs[1];
         int batchDims = ctx.GetInt("batch_dims", 0);
 
         int dataTotal = data.ElementCount;
         int idxTotal = indices.ElementCount;
-        // Use pre-read values if available (avoids GPU→CPU readback on browser backends)
-        var dataArr = ctx.TryGetInputValues(0);
-        if (dataArr == null || dataArr.Length != dataTotal)
-        {
-            dataArr = new float[dataTotal];
-            data.Data.SubView(0, dataTotal).CopyToCPU(dataArr);
-        }
-        var idxArr = ctx.TryGetInputValues(1);
-        if (idxArr == null || idxArr.Length != idxTotal)
-        {
-            idxArr = new float[idxTotal];
-            indices.Data.SubView(0, idxTotal).CopyToCPU(idxArr);
-        }
-
-        // Simple 1D gather for common case
         int outputSize = ctx.Outputs[0].ElementCount;
-        var result = new float[outputSize];
+
+        // Try to get indices from runtime constants (avoids GPU→CPU sync on WebGPU)
+        var idxArr = ctx.TryGetInputValues(1);
 
         // Compute strides for data tensor
         var dataShape = data.Shape;
@@ -361,18 +347,51 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = lastIdxDim; i < dataShape.Length; i++)
             sliceSize *= dataShape[i];
 
-        for (int s = 0; s < numSlices && s * sliceSize < outputSize; s++)
+        if (idxArr != null)
         {
-            int offset = 0;
-            for (int d = 0; d < lastIdxDim; d++)
-                offset += (int)idxArr[s * lastIdxDim + d] * strides[d];
+            // GPU path: indices on CPU, data stays on GPU. Copy slices via SubView.
+            for (int s = 0; s < numSlices && s * sliceSize < outputSize; s++)
+            {
+                int offset = 0;
+                for (int d = 0; d < lastIdxDim; d++)
+                    offset += (int)idxArr[s * lastIdxDim + d] * strides[d];
 
-            for (int j = 0; j < sliceSize && s * sliceSize + j < outputSize; j++)
-                result[s * sliceSize + j] = (offset + j < dataTotal) ? dataArr[offset + j] : 0f;
+                int copyLen = Math.Min(sliceSize, outputSize - s * sliceSize);
+                if (offset >= 0 && offset + copyLen <= dataTotal)
+                {
+                    reg.ElementWise.Scale(
+                        data.Data.SubView(offset, copyLen),
+                        ctx.Outputs[0].Data.SubView(s * sliceSize, copyLen),
+                        copyLen, 1f);
+                }
+            }
         }
+        else
+        {
+            // Fallback: read both arrays to CPU (sync — works on CUDA/OpenCL/CPU, not WebGPU)
+            var dataArr = ctx.TryGetInputValues(0);
+            if (dataArr == null || dataArr.Length != dataTotal)
+            {
+                dataArr = new float[dataTotal];
+                data.Data.SubView(0, dataTotal).CopyToCPU(dataArr);
+            }
+            idxArr = new float[idxTotal];
+            indices.Data.SubView(0, idxTotal).CopyToCPU(idxArr);
 
-        var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
-        reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outputSize, 1f);
+            var result = new float[outputSize];
+            for (int s = 0; s < numSlices && s * sliceSize < outputSize; s++)
+            {
+                int offset = 0;
+                for (int d = 0; d < lastIdxDim; d++)
+                    offset += (int)idxArr[s * lastIdxDim + d] * strides[d];
+
+                for (int j = 0; j < sliceSize && s * sliceSize + j < outputSize; j++)
+                    result[s * sliceSize + j] = (offset + j < dataTotal) ? dataArr[offset + j] : 0f;
+            }
+
+            var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
+            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outputSize, 1f);
+        }
     }
 }
 
