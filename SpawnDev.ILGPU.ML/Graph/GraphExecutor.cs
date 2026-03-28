@@ -216,6 +216,31 @@ public class GraphExecutor : IDisposable
                 runtimeOutputShapes = node.OutputShapes;
             }
 
+            // Runtime Reshape: resolve target shape from runtime constants
+            if (node.OpType == "Reshape" && node.InputNames.Length >= 2
+                && runtimeConstants.TryGetValue(node.InputNames[1], out var reshapeTarget)
+                && reshapeTarget.Length > 0)
+            {
+                int inputElems = nodeInputs[0]?.ElementCount ?? runtimeOutputShapes[0].Aggregate(1, (a, b) => a * b);
+                var resolved = reshapeTarget.Select(v => (int)v).ToArray();
+                // Handle 0 dims (copy from input) and -1 dims (infer)
+                for (int j = 0; j < resolved.Length; j++)
+                    if (resolved[j] == 0 && j < (nodeInputs[0]?.Shape.Length ?? 0)) resolved[j] = nodeInputs[0]!.Shape[j];
+                int negIdx = Array.IndexOf(resolved, -1);
+                if (negIdx >= 0)
+                {
+                    int known = 1;
+                    for (int j = 0; j < resolved.Length; j++) if (j != negIdx && resolved[j] > 0) known *= resolved[j];
+                    resolved[negIdx] = known > 0 ? inputElems / known : 1;
+                }
+                // Validate: all dims positive and total matches input elements
+                bool valid = resolved.All(d => d > 0) &&
+                    resolved.Aggregate(1L, (a, b) => a * b) == inputElems;
+                if (valid)
+                    runtimeOutputShapes = new[] { resolved };
+                // else fall through to compiled shapes
+            }
+
             // For Expand/Resize, also check runtime constants for dynamic targets
             if (node.OpType == "Expand" && node.InputNames.Length >= 2
                 && runtimeConstants.TryGetValue(node.InputNames[1], out var expandTarget))
@@ -312,7 +337,7 @@ public class GraphExecutor : IDisposable
                 if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 2048)
                 {
                     var outName = i < node.OutputNames.Length ? node.OutputNames[i] : null;
-                    if (outName != null && !runtimeConstants.ContainsKey(outName))
+                    if (outName != null)
                     {
                         // Skip runtime constant capture in sync Run() — WebGPU/WebGL/Wasm
                         // don't support synchronous GPU→CPU copies. NLP models that need
@@ -442,6 +467,28 @@ public class GraphExecutor : IDisposable
             }
             catch { runtimeOutputShapes = node.OutputShapes; }
 
+            // Runtime Reshape (same as sync Run)
+            if (node.OpType == "Reshape" && node.InputNames.Length >= 2
+                && runtimeConstants.TryGetValue(node.InputNames[1], out var reshapeTargetAsync)
+                && reshapeTargetAsync.Length > 0)
+            {
+                int inputElems = nodeInputs[0]?.ElementCount ?? runtimeOutputShapes[0].Aggregate(1, (a, b) => a * b);
+                var resolved = reshapeTargetAsync.Select(v => (int)v).ToArray();
+                for (int j = 0; j < resolved.Length; j++)
+                    if (resolved[j] == 0 && j < (nodeInputs[0]?.Shape.Length ?? 0)) resolved[j] = nodeInputs[0]!.Shape[j];
+                int negIdx = Array.IndexOf(resolved, -1);
+                if (negIdx >= 0)
+                {
+                    int known = 1;
+                    for (int j = 0; j < resolved.Length; j++) if (j != negIdx && resolved[j] > 0) known *= resolved[j];
+                    resolved[negIdx] = known > 0 ? inputElems / known : 1;
+                }
+                bool valid = resolved.All(d => d > 0) &&
+                    resolved.Aggregate(1L, (a, b) => a * b) == inputElems;
+                if (valid)
+                    runtimeOutputShapes = new[] { resolved };
+            }
+
             if (node.OpType == "Expand" && node.InputNames.Length >= 2
                 && runtimeConstants.TryGetValue(node.InputNames[1], out var expandTarget))
             {
@@ -536,7 +583,7 @@ public class GraphExecutor : IDisposable
                 if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
                 {
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
-                    if (outName != null && !runtimeConstants.ContainsKey(outName))
+                    if (outName != null)
                     {
                         await _accelerator.SynchronizeAsync();
                         int elCount = outTensor.ElementCount;

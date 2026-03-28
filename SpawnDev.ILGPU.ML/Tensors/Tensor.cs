@@ -15,8 +15,8 @@ public class Tensor
     /// <summary>Optional name (for debugging and graph execution).</summary>
     public string? Name { get; init; }
 
-    /// <summary>Shape dimensions (e.g., [1370, 384] for T×C).</summary>
-    public int[] Shape { get; }
+    /// <summary>Shape dimensions (e.g., [1370, 384] for T×C). Settable for runtime Reshape.</summary>
+    public int[] Shape { get; set; }
 
     /// <summary>Total number of elements (product of shape dimensions).</summary>
     public int ElementCount { get; }

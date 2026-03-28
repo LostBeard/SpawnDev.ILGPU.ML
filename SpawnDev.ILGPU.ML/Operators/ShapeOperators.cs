@@ -15,10 +15,38 @@ public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] }; // Resolved from shape tensor at graph compile time
     public void Execute(OnnxOpContext ctx)
     {
-        // Copy input to output (different buffers allocated by executor).
-        // Zero-copy would be ideal but requires buffer aliasing in the executor.
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
-            ctx.Inputs[0].ElementCount, 1f);
+        // Copy input to output
+        int count = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+        if (count > 0)
+            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count),
+                ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+
+        // If target shape is available in runtime constants, apply it to the output tensor.
+        // This fixes the case where the pre-allocated output buffer has the wrong compiled shape
+        // but the runtime Reshape target (from Concat of Shape values) is correct.
+        var targetShape = ctx.TryGetInputValues(1);
+        if (targetShape != null)
+            Console.WriteLine($"[Reshape] target=[{string.Join(",", targetShape)}] inputShape=[{string.Join(",", ctx.Inputs[0].Shape)}] inputElems={ctx.Inputs[0].ElementCount}");
+        else if (ctx.InputNames.Length > 1)
+            Console.WriteLine($"[Reshape] target NOT FOUND for '{ctx.InputNames[1]}' inputShape=[{string.Join(",", ctx.Inputs[0].Shape)}]");
+        if (targetShape != null && targetShape.Length > 0)
+        {
+            var resolved = targetShape.Select(v => (int)v).ToArray();
+            int inputElems = ctx.Inputs[0].ElementCount;
+            // Handle -1 (infer) and 0 (copy from input)
+            for (int j = 0; j < resolved.Length; j++)
+                if (resolved[j] == 0 && j < ctx.Inputs[0].Shape.Length) resolved[j] = ctx.Inputs[0].Shape[j];
+            int negIdx = Array.IndexOf(resolved, -1);
+            if (negIdx >= 0)
+            {
+                int known = 1;
+                for (int j = 0; j < resolved.Length; j++) if (j != negIdx && resolved[j] > 0) known *= resolved[j];
+                resolved[negIdx] = known > 0 ? inputElems / known : 1;
+            }
+            // Validate element count matches
+            if (resolved.All(d => d > 0) && resolved.Aggregate(1L, (a, b) => a * b) == inputElems)
+                ctx.Outputs[0].Shape = resolved;
+        }
     }
 }
 
