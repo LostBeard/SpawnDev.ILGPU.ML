@@ -29,6 +29,10 @@ public class ElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scaleInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _fillKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>>? _broadcastBinaryKernel;
+    // Kept alive until next BroadcastBinaryOpND call to avoid synchronous Synchronize()
+    // which deadlocks on WebGPU/WebGL/Wasm backends. By the next call, the GPU has
+    // finished reading the previous strides buffer.
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastStridesBuf;
     private MemoryBuffer1D<int, Stride1D.Dense>? _broadcastStridesBuf;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
@@ -481,13 +485,17 @@ public class ElementWiseKernels
         // BroadcastBinaryOpND calls are queued (e.g., decomposed LayerNorm:
         // Sub, Pow, Div, Mul all dispatch in sequence without sync).
         int paramsSize = 1 + 3 * rank;
-        using var stridesBuf = _accelerator.Allocate1D<int>(paramsSize);
+        // Dispose previous strides buffer — by now the GPU has finished reading it
+        // (at least one kernel dispatch + any sync has occurred since last call).
+        // This avoids synchronous Synchronize() which deadlocks on WebGPU/WebGL/Wasm.
+        _lastStridesBuf?.Dispose();
+        _lastStridesBuf = _accelerator.Allocate1D<int>(paramsSize);
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
         for (int i = 0; i < rank; i++) paramsData[1 + i] = aStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = bStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = outStrides[i];
-        stridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+        _lastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
 
         var opSpec = op switch
         {
@@ -498,9 +506,7 @@ public class ElementWiseKernels
             BroadcastOp.Pow => new DelegateSpecialization<Func<float, float, float>>(BroadcastPowOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
-        _broadcastBinaryKernel!(outCount, a, b, output, stridesBuf.View, opSpec);
-        // Synchronize to ensure the kernel reads strides before the buffer is disposed
-        _accelerator.Synchronize();
+        _broadcastBinaryKernel!(outCount, a, b, output, _lastStridesBuf.View, opSpec);
     }
 
     /// <summary>Fill every element with a constant value. Handles -Infinity, Infinity, NaN.</summary>
