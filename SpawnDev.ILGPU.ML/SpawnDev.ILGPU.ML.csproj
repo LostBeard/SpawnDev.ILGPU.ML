@@ -38,7 +38,7 @@
 	</ItemGroup>
 
 	<ItemGroup>
-	  <PackageReference Include="SpawnDev.ILGPU" Version="4.7.0" />
+	  <PackageReference Include="SpawnDev.ILGPU" Version="4.7.1-preview.2" />
 	</ItemGroup>
 
 	<ItemGroup>
