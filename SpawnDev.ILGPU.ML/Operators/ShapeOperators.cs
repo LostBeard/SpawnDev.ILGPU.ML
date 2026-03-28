@@ -399,6 +399,106 @@ public class TileOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+/// <summary>CumSum: cumulative sum along an axis.</summary>
+public class CumSumOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "CumSum";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var input = ctx.Inputs[0];
+        var output = ctx.Outputs[0];
+        int count = input.ElementCount;
+
+        // Get axis from second input (constant tensor)
+        var axisVals = ctx.TryGetInputValues(1);
+        int axis = axisVals != null && axisVals.Length > 0 ? (int)axisVals[0] : 0;
+        if (axis < 0) axis += input.Shape.Length;
+        int exclusive = ctx.GetInt("exclusive", 0);
+        int reverse = ctx.GetInt("reverse", 0);
+
+        var inVals = ctx.TryGetInputValues(0);
+        if (inVals != null)
+        {
+            var result = new float[count];
+            var shape = input.Shape;
+
+            int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
+            int axisSize = shape[axis];
+            int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
+
+            for (int o = 0; o < outer; o++)
+                for (int inn = 0; inn < inner; inn++)
+                {
+                    float sum = 0;
+                    for (int a = 0; a < axisSize; a++)
+                    {
+                        int ai = reverse != 0 ? axisSize - 1 - a : a;
+                        int idx = (o * axisSize + ai) * inner + inn;
+                        if (exclusive != 0)
+                        {
+                            result[idx] = sum;
+                            sum += inVals[idx];
+                        }
+                        else
+                        {
+                            sum += inVals[idx];
+                            result[idx] = sum;
+                        }
+                    }
+                }
+
+            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
+            reg.ElementWise.Scale(temp.Data, output.Data, count, 1f);
+        }
+        else
+        {
+            reg.ElementWise.Scale(input.Data, output.Data, count, 1f);
+        }
+    }
+}
+
+/// <summary>OneHot: generate one-hot encoded tensor from indices.</summary>
+public class OneHotOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "OneHot";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] }; // Dynamic — depends on depth
+    public void Execute(OnnxOpContext ctx)
+    {
+        var indices = ctx.Inputs[0];
+        var output = ctx.Outputs[0];
+        int axis = ctx.GetInt("axis", -1);
+
+        var idxVals = ctx.TryGetInputValues(0);
+        var depthVals = ctx.TryGetInputValues(1);
+        var valueVals = ctx.TryGetInputValues(2);
+
+        if (idxVals != null && depthVals != null && valueVals != null)
+        {
+            int depth = (int)depthVals[0];
+            float offValue = valueVals.Length > 0 ? valueVals[0] : 0f;
+            float onValue = valueVals.Length > 1 ? valueVals[1] : 1f;
+
+            int outCount = output.ElementCount;
+            var result = new float[outCount];
+            Array.Fill(result, offValue);
+
+            for (int i = 0; i < idxVals.Length; i++)
+            {
+                int idx = (int)idxVals[i];
+                if (idx < 0) idx += depth;
+                if (idx >= 0 && idx < depth && i * depth + idx < outCount)
+                    result[i * depth + idx] = onValue;
+            }
+
+            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
+            reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+        }
+    }
+}
+
 /// <summary>GatherElements: index into data along an axis using indices tensor.</summary>
 public class GatherElementsOperator(OperatorRegistry reg) : IOnnxOperator
 {

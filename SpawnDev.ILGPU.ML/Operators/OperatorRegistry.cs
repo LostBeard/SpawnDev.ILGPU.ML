@@ -137,6 +137,8 @@ public class OperatorRegistry
         Register(new TileOperator(this));
         Register(new GatherElementsOperator(this));
         Register(new ModOperator(this));
+        Register(new CumSumOperator(this));
+        Register(new OneHotOperator(this));
         Register(new EqualOperator(this));
         Register(new GreaterOperator(this));
         Register(new LessOperator(this));
