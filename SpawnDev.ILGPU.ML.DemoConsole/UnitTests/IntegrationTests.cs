@@ -1353,6 +1353,57 @@ public class IntegrationTests
         }
     }
 
+    /// <summary>ESPCN super resolution on CUDA — 3x upscaling.</summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task DirectOnnx_ESPCN_SuperRes_Cuda()
+    {
+        var onnxPath = Path.Combine(FindModelsDir(), "super-resolution", "model.onnx");
+        if (!File.Exists(onnxPath))
+            throw new UnsupportedTestException($"ESPCN model not found: {onnxPath}");
+
+        var onnxBytes = await File.ReadAllBytesAsync(onnxPath);
+        var context = MLContext.CreateContext();
+        var cudaDevices = context.GetCudaDevices();
+        if (cudaDevices.Count == 0) { context.Dispose(); throw new UnsupportedTestException("No CUDA"); }
+        using var accelerator = cudaDevices[0].CreateAccelerator(context);
+
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { ["input"] = new[] { 1, 1, 224, 224 } });
+        Console.WriteLine($"[ESPCN-CUDA] {session}");
+
+        // Y-channel input [1, 1, 224, 224]
+        var rng = new Random(42);
+        var input = new float[1 * 1 * 224 * 224];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)rng.NextDouble();
+        using var inBuf = accelerator.Allocate1D(input);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = new Tensor(inBuf.View, new[] { 1, 1, 224, 224 })
+        });
+        sw.Stop();
+
+        var output = outputs[session.OutputNames[0]];
+        Console.WriteLine($"[ESPCN-CUDA] Output: [{string.Join(",", output.Shape)}], time={sw.Elapsed.TotalMilliseconds:F0}ms");
+
+        // 3x upscale: 224 → 672
+        if (output.Shape.Length >= 3 && output.Shape[^1] < 224)
+            throw new Exception($"ESPCN output too small: [{string.Join(",", output.Shape)}]");
+
+        int rc = Math.Min(50, output.ElementCount);
+        using var rb = accelerator.Allocate1D<float>(rc);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, rc), rb.View, rc, 1f);
+        await accelerator.SynchronizeAsync();
+        var vals = await rb.CopyToHostAsync<float>(0, rc);
+
+        if (vals.Any(v => float.IsNaN(v))) throw new Exception("ESPCN output has NaN");
+        if (vals.All(v => v == 0f)) throw new Exception("ESPCN output is all zeros");
+
+        Console.WriteLine($"[ESPCN-CUDA] PASS — absMax={vals.Max(v => MathF.Abs(v)):F2}");
+        context.Dispose();
+    }
+
     /// <summary>YOLOv8 Nano on CUDA — object detection inference.</summary>
     [TestMethod(Timeout = 120000)]
     public async Task DirectOnnx_YOLOv8_Cuda()
