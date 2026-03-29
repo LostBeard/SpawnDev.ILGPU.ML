@@ -218,6 +218,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
+        var fmt = ctx.Format;
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
 
         // Handle auto_pad (SAME_UPPER/SAME_LOWER from TFLite models)
@@ -225,8 +226,8 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         int pad;
         if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
         {
-            int inH = x.Shape.Length >= 3 ? x.Shape[2] : 1;
-            int kH = w.Shape.Length >= 3 ? w.Shape[2] : 1;
+            int inH = x.Shape.Length >= 4 ? x.Shape[LayoutHelper.HeightAxis(fmt)] : (x.Shape.Length >= 3 ? x.Shape[2] : 1);
+            int kH = w.Shape.Length >= 4 ? w.Shape[LayoutHelper.HeightAxis(fmt)] : (w.Shape.Length >= 3 ? w.Shape[2] : 1);
             int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kH - inH);
             pad = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
         }
@@ -236,8 +237,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             pad = pads.Length > 0 ? pads[0] : 0;
         }
         int group = ctx.GetInt("group", 1);
+        var (_, inC_from_x, _, _) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, fmt) : (1, x.Shape.Length > 1 ? x.Shape[1] : 1, 1, 1);
         // group = -1 is the TFLite depthwise sentinel — resolve to inC
-        if (group == -1) group = x.Shape.Length >= 4 ? x.Shape[1] : x.Shape[0];
+        if (group == -1) group = inC_from_x;
         int outC = w.Shape[0];
 
         // Always provide a valid bias buffer (zero-filled if no bias input)
@@ -265,9 +267,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Conv2D: [N, C, H, W]
-            int inC = x.Shape[1]; int inH = x.Shape[2]; int inW = x.Shape[3];
-            int kH = w.Shape[2]; int kW = w.Shape[3];
+            // Conv2D: layout-aware dim extraction
+            var (_, inC, inH, inW) = LayoutHelper.GetDims(x.Shape, fmt);
+            var (_, _, kH, kW) = LayoutHelper.GetWeightDims(w.Shape, fmt);
 
             if (group == inC && (group == outC || outC == 1))
             {

@@ -36,6 +36,8 @@ public class OnnxOpContext
     public required Tensor[] Outputs { get; init; }
     public required Dictionary<string, object> Attributes { get; init; }
     public required BufferPool Pool { get; init; }
+    /// <summary>Data layout format (NCHW for ONNX, NHWC for TFLite).</summary>
+    public DataFormat Format { get; init; } = DataFormat.NCHW;
     /// <summary>Input tensor names (for looking up pre-read constant data).</summary>
     public string[] InputNames { get; init; } = Array.Empty<string>();
     /// <summary>Pre-read constant data from small tensors (avoids GPU→CPU readback at runtime).
