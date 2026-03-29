@@ -704,6 +704,8 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
             int innerSize = 1;
             for (int i = 1; i < data.Shape.Length; i++) innerSize *= data.Shape[i];
             int dataRows = data.Shape[0];
+            if (numIdx <= 0 || innerSize <= 0)
+                throw new InvalidOperationException($"Gather axis=0 invalid dims: numIdx={numIdx} innerSize={innerSize} dataRows={dataRows} data=[{string.Join(",", data.Shape)}] indices=[{string.Join(",", indices.Shape)}] output=[{string.Join(",", ctx.Outputs[0].Shape)}]");
             reg.Gather.GatherAxis0Float(data.Data, indices.Data, ctx.Outputs[0].Data,
                 numIdx, innerSize, dataRows);
             return;
