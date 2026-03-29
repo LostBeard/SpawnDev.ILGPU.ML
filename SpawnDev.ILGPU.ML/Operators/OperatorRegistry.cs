@@ -120,6 +120,7 @@ public class OperatorRegistry
         Register(new DropoutOperator(this));
         Register(new GemmOperator(this));
         Register(new InstanceNormOperator(this));
+        Register(new GroupNormOperator(_accelerator));
         Register(new ConstantOperator());
         Register(new CeilOperator(this));
         Register(new LogOperator(this));

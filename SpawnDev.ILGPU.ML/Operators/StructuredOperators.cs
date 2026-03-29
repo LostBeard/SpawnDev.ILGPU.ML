@@ -912,6 +912,28 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── GroupNormalization ──
+
+public class GroupNormOperator : IOnnxOperator
+{
+    private readonly Kernels.GroupNormKernel _kernel;
+    public GroupNormOperator(Accelerator accelerator) => _kernel = new Kernels.GroupNormKernel(accelerator);
+    public string OpType => "GroupNormalization";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        int N = shape[0]; int C = shape[1];
+        int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
+        int numGroups = ctx.GetInt("num_groups", 32);
+        float eps = ctx.GetFloat("epsilon", 1e-5f);
+        _kernel.Forward(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+            ctx.Inputs[1].Data, ctx.Inputs[2].Data,
+            N, C, spatial, numGroups, eps);
+    }
+}
+
 // ── InstanceNormalization ──
 
 public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator
