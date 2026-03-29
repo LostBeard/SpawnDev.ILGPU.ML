@@ -95,12 +95,10 @@ public static class TFLiteLoader
             if (data != null)
             {
                 weights[name] = data;
-                // Quantized models reference dequantized names with _dequantize suffix
-                if (tensor.Type == TFLiteTensorType.Int8 || tensor.Type == TFLiteTensorType.UInt8)
-                {
-                    weights[name + "_dequantize"] = data;
-                    graph.Initializers[name + "_dequantize"] = tensor.Shape;
-                }
+                // TFLite graphs reference dequantized/converted tensor names with
+                // _dequantize suffix. Register under both names for compatibility.
+                weights[name + "_dequantize"] = data;
+                graph.Initializers[name + "_dequantize"] = tensor.Shape;
             }
         }
 
