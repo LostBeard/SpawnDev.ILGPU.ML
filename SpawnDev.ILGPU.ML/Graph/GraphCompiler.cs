@@ -644,7 +644,8 @@ public class GraphCompiler
                 int rank = padded.Length;
                 for (int d = 0; d < rank; d++)
                     padded[d] += padConst[d] + padConst[rank + d];
-                outputShapes = new[] { padded };
+                if (padded.All(d => d > 0))
+                    outputShapes = new[] { padded };
             }
 
             // If the operator returned fewer shapes than outputs (e.g., Split returning
