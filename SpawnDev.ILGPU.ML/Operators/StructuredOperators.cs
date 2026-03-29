@@ -168,8 +168,12 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var x = inputs[0]; var w = inputs[1];
+        var fmt = attrs.ContainsKey("_data_format") && attrs["_data_format"].ToString() == "NHWC"
+            ? DataFormat.NHWC : DataFormat.NCHW;
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
-        int outC = w[0];
+        var (_, _, _, _) = x.Length >= 4 ? LayoutHelper.GetDims(x, fmt) : (1, 1, 1, 1);
+        var (wOutC, _, wKH, wKW) = w.Length >= 4 ? LayoutHelper.GetWeightDims(w, fmt) : (w[0], 1, w.Length > 2 ? w[2] : 1, w.Length > 3 ? w[3] : 1);
+        int outC = wOutC;
 
         // Handle auto_pad (SAME_UPPER/SAME_LOWER from TFLite models)
         string autoPad = attrs.ContainsKey("auto_pad") ? attrs["auto_pad"].ToString()! : "NOTSET";
@@ -209,10 +213,12 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            int kH = w[2]; int kW = w[3];
-            int outH = (x[2] + pads[0] + (pads.Length > 2 ? pads[2] : 0) - kH) / strides[0] + 1;
-            int outW = (x[3] + (pads.Length > 1 ? pads[1] : 0) + (pads.Length > 3 ? pads[3] : 0) - kW) / (strides.Length > 1 ? strides[1] : 1) + 1;
-            return new[] { new[] { x[0], outC, outH, outW } };
+            var (_, _, xH, xW) = LayoutHelper.GetDims(x, fmt);
+            int outH = (xH + pads[0] + (pads.Length > 2 ? pads[2] : 0) - wKH) / strides[0] + 1;
+            int outW = (xW + (pads.Length > 1 ? pads[1] : 0) + (pads.Length > 3 ? pads[3] : 0) - wKW) / (strides.Length > 1 ? strides[1] : 1) + 1;
+            return fmt == DataFormat.NHWC
+                ? new[] { new[] { x[0], outH, outW, outC } }
+                : new[] { new[] { x[0], outC, outH, outW } };
         }
     }
     public void Execute(OnnxOpContext ctx)

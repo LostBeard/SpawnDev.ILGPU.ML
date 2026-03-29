@@ -66,7 +66,7 @@ public static class TFLiteLoader
             graph.Inputs.Add(new GraphValueInfo
             {
                 Name = tensorNames[inputIdx],
-                Shape = ConvertShape(tensor.Shape, tensor.Type)
+                Shape = tensor.Shape // Keep native NHWC — dual layout handles it
             });
         }
 
@@ -76,7 +76,7 @@ public static class TFLiteLoader
             graph.Outputs.Add(new GraphValueInfo
             {
                 Name = tensorNames[outputIdx],
-                Shape = ConvertShape(sg.Tensors[outputIdx].Shape, sg.Tensors[outputIdx].Type)
+                Shape = sg.Tensors[outputIdx].Shape // Keep native NHWC
             });
         }
 
@@ -129,36 +129,18 @@ public static class TFLiteLoader
 
             var name = tensorNames[i];
 
-            // Extract weight data as float[]
+            // Extract weight data as float[] — keep native NHWC layout
             var data = model.GetTensorData(tensor);
             if (data != null)
             {
-                int[] nchwShape;
-                if (tensor.Shape.Length == 4 && depthwiseWeightIndices.Contains(i))
-                {
-                    // Depthwise: [1, kH, kW, outC] → [outC, 1, kH, kW]
-                    Console.WriteLine($"[TFLite] DEPTHWISE transpose: tensor {i} shape=[{string.Join(",", tensor.Shape)}]");
-                    data = TransposeDepthwiseWeight(data, tensor.Shape);
-                    nchwShape = new[] { tensor.Shape[3], 1, tensor.Shape[1], tensor.Shape[2] };
-                }
-                else if (tensor.Shape.Length == 4)
-                {
-                    // Regular conv: [outC, kH, kW, inC] → [outC, inC, kH, kW]
-                    data = TransposeNHWCtoNCHW(data, tensor.Shape);
-                    nchwShape = ConvertShape(tensor.Shape, tensor.Type);
-                }
-                else
-                {
-                    nchwShape = tensor.Shape;
-                }
-                graph.Initializers[name] = nchwShape;
+                graph.Initializers[name] = tensor.Shape;
                 weights[name] = data;
                 weights[name + "_dequantize"] = data;
-                graph.Initializers[name + "_dequantize"] = nchwShape;
+                graph.Initializers[name + "_dequantize"] = tensor.Shape;
             }
             else
             {
-                graph.Initializers[name] = ConvertShape(tensor.Shape, tensor.Type);
+                graph.Initializers[name] = tensor.Shape;
             }
         }
 
@@ -222,32 +204,24 @@ public static class TFLiteLoader
 
             // Extract operator-specific attributes from builtin options
             var attrs = ExtractAttributes(model, op, sg);
-            if (attrs.Count > 0)
-                node.Attributes = attrs;
+            attrs["_data_format"] = System.Text.Json.JsonSerializer.SerializeToElement("NHWC");
+            node.Attributes = attrs;
 
             graph.Nodes.Add(node);
 
-            // Convert TFLite PAD constants: deinterleave + NHWC→NCHW reorder
+            // TFLite PAD constants: deinterleave [b0,e0,b1,e1,...] → ONNX [b0,b1,...,e0,e1,...]
+            // No NHWC→NCHW reorder needed — model runs in native NHWC layout.
             if (onnxOpType == "Pad" && op.Inputs.Length >= 2 && op.Inputs[1] >= 0)
             {
                 var padName = tensorNames[op.Inputs[1]];
                 if (weights.TryGetValue(padName, out var padData) && padData.Length >= 4)
                 {
                     int rank = padData.Length / 2;
-                    // Deinterleave: [b0,e0,b1,e1,...] → [b0,b1,...,e0,e1,...]
                     var onnxPad = new float[padData.Length];
                     for (int d = 0; d < rank; d++)
                     {
                         onnxPad[d] = padData[d * 2];
                         onnxPad[rank + d] = padData[d * 2 + 1];
-                    }
-                    // NHWC→NCHW reorder for 4D
-                    if (rank == 4)
-                    {
-                        var nchw = new float[8];
-                        nchw[0] = onnxPad[0]; nchw[1] = onnxPad[3]; nchw[2] = onnxPad[1]; nchw[3] = onnxPad[2];
-                        nchw[4] = onnxPad[4]; nchw[5] = onnxPad[7]; nchw[6] = onnxPad[5]; nchw[7] = onnxPad[6];
-                        onnxPad = nchw;
                     }
                     weights[padName] = onnxPad;
                     if (weights.ContainsKey(padName + "_dequantize"))

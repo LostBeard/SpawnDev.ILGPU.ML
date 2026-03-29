@@ -884,6 +884,7 @@ public class InferenceSession : IDisposable
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] TFLite: {graph.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
 
         var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        executor.Format = DataFormat.NHWC; // TFLite models use NHWC natively
         onProgress?.Invoke("ready", 100);
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)

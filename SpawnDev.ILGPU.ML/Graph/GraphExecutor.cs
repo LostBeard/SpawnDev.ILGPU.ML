@@ -36,6 +36,9 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public static Dictionary<string, float[]>? CapturedOutputs { get; set; }
 
+    /// <summary>Data layout format (NCHW for ONNX, NHWC for TFLite).</summary>
+    public DataFormat Format { get; set; } = DataFormat.NCHW;
+
     /// <summary>Whether TurboQuant KV cache compression is active for this model.</summary>
     public bool HasKVCache => _kvCache != null;
 
@@ -319,6 +322,7 @@ public class GraphExecutor : IDisposable
                 Outputs = nodeOutputs,
                 Attributes = node.Attributes,
                 Pool = _pool,
+                Format = Format,
                 InputNames = node.InputNames,
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
@@ -601,6 +605,7 @@ public class GraphExecutor : IDisposable
                 Outputs = nodeOutputs,
                 Attributes = node.Attributes,
                 Pool = _pool,
+                Format = Format,
                 InputNames = node.InputNames,
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
