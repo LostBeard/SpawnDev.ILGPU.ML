@@ -529,6 +529,15 @@ public class GraphExecutor : IDisposable
                     resolved.Aggregate(1L, (a, b) => a * b) == inputElems;
                 if (valid)
                     runtimeOutputShapes = new[] { resolved };
+                else if (nodeInputs[0] != null)
+                {
+                    // Reshape target doesn't match input elements — use input shape as
+                    // safe fallback to prevent undersized buffer allocation crashes.
+                    // The Reshape operator will handle the actual reshape at runtime.
+                    long compiledElems = runtimeOutputShapes[0].Aggregate(1L, (a, b) => a * b);
+                    if (compiledElems < inputElems)
+                        runtimeOutputShapes = new[] { nodeInputs[0].Shape };
+                }
             }
 
             if (node.OpType == "Expand" && node.InputNames.Length >= 2
