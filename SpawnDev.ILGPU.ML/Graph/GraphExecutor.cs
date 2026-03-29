@@ -635,11 +635,15 @@ public class GraphExecutor : IDisposable
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
                     if (outName != null)
                     {
-                        await _accelerator.SynchronizeAsync();
-                        int elCount = outTensor.ElementCount;
-                        using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
-                        tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
-                        runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
+                        try
+                        {
+                            await _accelerator.SynchronizeAsync();
+                            int elCount = outTensor.ElementCount;
+                            using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
+                            tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
+                            runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
+                        }
+                        catch (NotSupportedException) { /* WebGPU/WASM — sync copy not available */ }
                     }
                 }
             }
