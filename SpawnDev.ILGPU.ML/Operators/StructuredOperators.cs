@@ -152,8 +152,9 @@ public class BatchNormOperator(OperatorRegistry reg) : IOnnxOperator
     {
         // inputs: X, scale, B, input_mean, input_var
         var shape = ctx.Inputs[0].Shape;
-        int N = shape[0]; int C = shape[1];
-        int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
+        var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
+            : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
+        int spatial = ctx.Inputs[0].ElementCount / (N * C);
         reg.Normalization.BatchNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[1].Data, ctx.Inputs[2].Data,
             ctx.Inputs[3].Data, ctx.Inputs[4].Data, N, C, spatial);
@@ -279,15 +280,22 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
 
             if (group == inC && (group == outC || outC == 1))
             {
-                // Depthwise conv: group=inC, each channel convolved independently.
-                // outC may be 1 for TFLite depthwise (weight shape [1,kH,kW,C] transposed).
-                reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                    inC, inH, inW, kH, kW, stride, pad);
+                // Depthwise conv
+                if (fmt == DataFormat.NHWC)
+                    reg.Conv2D.ForwardDepthwiseNHWC(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, kH, kW, stride, pad);
+                else
+                    reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, kH, kW, stride, pad);
             }
             else if (group == 1)
             {
-                reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                    inC, inH, inW, outC, kH, kW, stride, pad);
+                if (fmt == DataFormat.NHWC)
+                    reg.Conv2D.ForwardNHWC(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, outC, kH, kW, stride, pad);
+                else
+                    reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, outC, kH, kW, stride, pad);
             }
             else if (group > 1 && inC % group == 0 && outC % group == 0)
             {
@@ -575,13 +583,19 @@ public class GlobalAvgPoolOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var s = inputs[0];
-        return new[] { new[] { s[0], s[1], 1, 1 } };
+        var fmt = attrs.ContainsKey("_data_format") && attrs["_data_format"].ToString() == "NHWC"
+            ? DataFormat.NHWC : DataFormat.NCHW;
+        var (n, c, _, _) = s.Length >= 4 ? LayoutHelper.GetDims(s, fmt) : (s[0], s.Length > 1 ? s[1] : 1, 1, 1);
+        return fmt == DataFormat.NHWC
+            ? new[] { new[] { n, 1, 1, c } }
+            : new[] { new[] { n, c, 1, 1 } };
     }
     public void Execute(OnnxOpContext ctx)
     {
         var s = ctx.Inputs[0].Shape;
-        int N = s[0]; int C = s[1];
-        int spatial = 1; for (int i = 2; i < s.Length; i++) spatial *= s[i];
+        var (N, C, _, _) = s.Length >= 4 ? LayoutHelper.GetDims(s, ctx.Format)
+            : (s[0], s.Length > 1 ? s[1] : 1, 1, 1);
+        int spatial = ctx.Inputs[0].ElementCount / (N * C);
         reg.Pooling.GlobalAvgPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, N, C, spatial);
     }
 }

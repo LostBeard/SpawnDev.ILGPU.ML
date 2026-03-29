@@ -193,6 +193,145 @@ public class Conv2DKernel
         _depthwiseKernel!(C * outH * outW, input, weight, bias, output, _paramsBuf.View);
     }
 
+    // ═══ NHWC Variants (TFLite native layout) ═══
+
+    /// <summary>
+    /// Conv2D NHWC: input [N,H,W,inC], weight [outC,kH,kW,inC], output [N,outH,outW,outC].
+    /// One thread per output element. Native NHWC indexing — zero layout conversion.
+    /// </summary>
+    private static void Conv2DNHWCImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int inC = p[0]; int inH = p[1]; int inW = p[2];
+        int outC = p[3]; int kH = p[4]; int kW = p[5];
+        int stride = p[6]; int padding = p[7];
+
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+
+        // NHWC output: [oy, ox, oc] indexing
+        int oc = idx % outC;
+        int rem = idx / outC;
+        int ox = rem % outW;
+        int oy = rem / outW;
+
+        double sum = (double)bias[oc];
+
+        for (int ic = 0; ic < inC; ic++)
+        {
+            for (int ky = 0; ky < kH; ky++)
+            {
+                int iy = oy * stride + ky - padding;
+                if (iy < 0 || iy >= inH) continue;
+
+                for (int kx = 0; kx < kW; kx++)
+                {
+                    int ix = ox * stride + kx - padding;
+                    if (ix < 0 || ix >= inW) continue;
+
+                    // NHWC input: [iy, ix, ic]
+                    int inIdx = (iy * inW + ix) * inC + ic;
+                    // NHWC weight (TFLite OHWI): [oc, ky, kx, ic]
+                    int wIdx = ((oc * kH + ky) * kW + kx) * inC + ic;
+                    sum += (double)input[inIdx] * (double)weight[wIdx];
+                }
+            }
+        }
+
+        output[idx] = (float)sum;
+    }
+
+    /// <summary>
+    /// Depthwise Conv2D NHWC: input [N,H,W,C], weight [1,kH,kW,C], output [N,outH,outW,C].
+    /// </summary>
+    private static void DepthwiseConv2DNHWCImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int C = p[0]; int inH = p[1]; int inW = p[2];
+        int kH = p[3]; int kW = p[4]; int stride = p[5]; int padding = p[6];
+
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+
+        // NHWC output: [oy, ox, c]
+        int c = idx % C;
+        int rem = idx / C;
+        int ox = rem % outW;
+        int oy = rem / outW;
+
+        double sum = (double)bias[c];
+
+        for (int ky = 0; ky < kH; ky++)
+        {
+            int iy = oy * stride + ky - padding;
+            if (iy < 0 || iy >= inH) continue;
+
+            for (int kx = 0; kx < kW; kx++)
+            {
+                int ix = ox * stride + kx - padding;
+                if (ix < 0 || ix >= inW) continue;
+
+                // NHWC input: [iy, ix, c]
+                int inIdx = (iy * inW + ix) * C + c;
+                // NHWC weight [1, kH, kW, C]: [ky, kx, c]
+                int wIdx = (ky * kW + kx) * C + c;
+                sum += (double)input[inIdx] * (double)weight[wIdx];
+            }
+        }
+
+        output[idx] = (float)sum;
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _conv2dNHWCKernel;
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _depthwiseNHWCKernel;
+
+    public void ForwardNHWC(
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kH, int kW, int stride = 1, int padding = 0)
+    {
+        _conv2dNHWCKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(Conv2DNHWCImpl);
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
+        _conv2dNHWCKernel(outH * outW * outC, input, weight, bias, output, _paramsBuf.View);
+    }
+
+    public void ForwardDepthwiseNHWC(
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int kH, int kW, int stride = 1, int padding = 0)
+    {
+        _depthwiseNHWCKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(DepthwiseConv2DNHWCImpl);
+        int outH = (inH + 2 * padding - kH) / stride + 1;
+        int outW = (inW + 2 * padding - kW) / stride + 1;
+        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+        _paramsBuf.CopyFromCPU(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
+        _depthwiseNHWCKernel(outH * outW * C, input, weight, bias, output, _paramsBuf.View);
+    }
+
     private void EnsureLoaded()
     {
         _conv2dKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
