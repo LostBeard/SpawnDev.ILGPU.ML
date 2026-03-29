@@ -88,17 +88,21 @@ public static class TFLiteLoader
             if (buffer.DataLength == 0) continue; // not a constant
 
             var name = tensorNames[i];
-            graph.Initializers[name] = tensor.Shape;
+            graph.Initializers[name] = ConvertShape(tensor.Shape, tensor.Type);
 
             // Extract weight data as float[]
             var data = model.GetTensorData(tensor);
             if (data != null)
             {
+                // Transpose 4D weight data from NHWC to NCHW
+                if (tensor.Shape.Length == 4)
+                    data = TransposeNHWCtoNCHW(data, tensor.Shape);
+                var nchwShape = ConvertShape(tensor.Shape, tensor.Type);
                 weights[name] = data;
                 // TFLite graphs reference dequantized/converted tensor names with
                 // _dequantize suffix. Register under both names for compatibility.
                 weights[name + "_dequantize"] = data;
-                graph.Initializers[name + "_dequantize"] = tensor.Shape;
+                graph.Initializers[name + "_dequantize"] = nchwShape;
             }
         }
 
@@ -173,6 +177,26 @@ public static class TFLiteLoader
         }
 
         return (graph, weights);
+    }
+
+    /// <summary>
+    /// Transpose 4D float data from NHWC to NCHW layout.
+    /// </summary>
+    private static float[] TransposeNHWCtoNCHW(float[] data, int[] nhwcShape)
+    {
+        int N = nhwcShape[0], H = nhwcShape[1], W = nhwcShape[2], C = nhwcShape[3];
+        var result = new float[data.Length];
+        for (int n = 0; n < N; n++)
+            for (int h = 0; h < H; h++)
+                for (int w = 0; w < W; w++)
+                    for (int c = 0; c < C; c++)
+                    {
+                        int srcIdx = ((n * H + h) * W + w) * C + c;
+                        int dstIdx = ((n * C + c) * H + h) * W + w;
+                        if (srcIdx < data.Length && dstIdx < result.Length)
+                            result[dstIdx] = data[srcIdx];
+                    }
+        return result;
     }
 
     /// <summary>
