@@ -311,7 +311,12 @@ public class TextGenerationPipeline : IDisposable
 
             // Get logits for last position: [1, seq, vocab] → last position
             int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
-            int lastOffset = (allTokens.Count - 1) * vocabSize;
+            int seqLen = output.Shape.Length >= 3 ? output.Shape[^2] : 1;
+            int lastPos = Math.Min(allTokens.Count - 1, seqLen - 1);
+            int lastOffset = lastPos * vocabSize;
+            // Bounds safety: ensure we don't read past the output buffer
+            if (lastOffset + vocabSize > output.ElementCount)
+                lastOffset = Math.Max(0, output.ElementCount - vocabSize);
 
             using var readBuf = _accelerator.Allocate1D<float>(vocabSize);
             new ElementWiseKernels(_accelerator).Scale(
