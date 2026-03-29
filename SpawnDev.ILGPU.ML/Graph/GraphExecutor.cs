@@ -637,13 +637,15 @@ public class GraphExecutor : IDisposable
                     {
                         try
                         {
-                            await _accelerator.SynchronizeAsync();
                             int elCount = outTensor.ElementCount;
+                            // GPU→GPU via kernel dispatch (works on ALL backends including WebGPU).
+                            // CopyFrom throws NotSupportedException on WebGPU.
                             using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
-                            tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
+                            _ew.Scale(outTensor.Data.SubView(0, elCount), tmpBuf.View, elCount, 1f);
+                            await _accelerator.SynchronizeAsync();
                             runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
                         }
-                        catch (NotSupportedException) { /* WebGPU/WASM — sync copy not available */ }
+                        catch (NotSupportedException) { /* Fallback: backend doesn't support async readback */ }
                     }
                 }
             }
