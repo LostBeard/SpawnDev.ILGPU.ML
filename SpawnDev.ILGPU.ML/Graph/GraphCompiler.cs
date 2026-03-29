@@ -648,6 +648,7 @@ public class GraphCompiler
                 knownShapes[outName] = outputShapes[i];
             }
 
+
             compiledNodes.Add(new CompiledNode
             {
                 OpType = node.OpType,

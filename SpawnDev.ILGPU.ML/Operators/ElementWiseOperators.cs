@@ -620,7 +620,16 @@ public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Where";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[1] }; // shape of x
+    {
+        // ONNX Where: output = broadcast(condition, x, y)
+        // Return the largest shape among the three inputs
+        var best = inputs[0];
+        for (int i = 1; i < inputs.Length; i++)
+            if (inputs[i].Length > best.Length || (inputs[i].Length == best.Length
+                && inputs[i].Aggregate(1, (a, b) => a * b) > best.Aggregate(1, (a, b) => a * b)))
+                best = inputs[i];
+        return new[] { best };
+    }
     public void Execute(OnnxOpContext ctx)
     {
         var cond = ctx.Inputs[0]; var x = ctx.Inputs[1]; var y = ctx.Inputs[2];
