@@ -177,13 +177,20 @@ public abstract partial class MLTestBase
         }
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 
-        // Load reference input
+        // Load reference input (NHWC format) and transpose to NCHW
         var inputBytes = await http.GetByteArrayAsync("references/blaze-face/cat_input.bin");
-        var inputData = new float[inputBytes.Length / 4];
-        Buffer.BlockCopy(inputBytes, 0, inputData, 0, inputBytes.Length);
+        var nhwcData = new float[inputBytes.Length / 4];
+        Buffer.BlockCopy(inputBytes, 0, nhwcData, 0, inputBytes.Length);
+        // Transpose [1,128,128,3] NHWC → [1,3,128,128] NCHW
+        var inputData = new float[nhwcData.Length];
+        int H = 128, W = 128, C = 3;
+        for (int h = 0; h < H; h++)
+            for (int w = 0; w < W; w++)
+                for (int c = 0; c < C; c++)
+                    inputData[c * H * W + h * W + w] = nhwcData[h * W * C + w * C + c];
 
         using var inputBuf = accelerator.Allocate1D(inputData);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 128, 128, 3 });
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 128, 128 });
 
         var outputs = await session.RunAsync(new Dictionary<string, Tensor>
         {
