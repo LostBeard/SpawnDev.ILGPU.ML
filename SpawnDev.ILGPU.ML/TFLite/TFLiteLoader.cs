@@ -80,29 +80,55 @@ public static class TFLiteLoader
             });
         }
 
+        // Identify depthwise conv weight tensors (different layout from regular conv)
+        var depthwiseWeightIndices = new HashSet<int>();
+        for (int opIdx = 0; opIdx < sg.Operators.Length; opIdx++)
+        {
+            var op2 = sg.Operators[opIdx];
+            int bc = model.OperatorCodes[op2.OpcodeIndex].BuiltinCode;
+            if (bc == 4 && op2.Inputs.Length >= 2 && op2.Inputs[1] >= 0) // DEPTHWISE_CONV_2D
+                depthwiseWeightIndices.Add(op2.Inputs[1]);
+        }
+
         // Extract constant tensors (weights/biases) as initializers
         for (int i = 0; i < sg.Tensors.Length; i++)
         {
             var tensor = sg.Tensors[i];
             var buffer = model.Buffers[tensor.BufferIndex];
-            if (buffer.DataLength == 0) continue; // not a constant
+            if (buffer.DataLength == 0) continue;
 
             var name = tensorNames[i];
-            graph.Initializers[name] = ConvertShape(tensor.Shape, tensor.Type);
 
             // Extract weight data as float[]
             var data = model.GetTensorData(tensor);
             if (data != null)
             {
-                // Transpose 4D weight data from NHWC to NCHW
-                if (tensor.Shape.Length == 4)
+                int[] nchwShape;
+                if (tensor.Shape.Length == 4 && depthwiseWeightIndices.Contains(i))
+                {
+                    // Depthwise: [1, kH, kW, outC] → [outC, 1, kH, kW]
+                    Console.WriteLine($"[TFLite] DEPTHWISE transpose: tensor {i} shape=[{string.Join(",", tensor.Shape)}]");
+                    data = TransposeDepthwiseWeight(data, tensor.Shape);
+                    nchwShape = new[] { tensor.Shape[3], 1, tensor.Shape[1], tensor.Shape[2] };
+                }
+                else if (tensor.Shape.Length == 4)
+                {
+                    // Regular conv: [outC, kH, kW, inC] → [outC, inC, kH, kW]
                     data = TransposeNHWCtoNCHW(data, tensor.Shape);
-                var nchwShape = ConvertShape(tensor.Shape, tensor.Type);
+                    nchwShape = ConvertShape(tensor.Shape, tensor.Type);
+                }
+                else
+                {
+                    nchwShape = tensor.Shape;
+                }
+                graph.Initializers[name] = nchwShape;
                 weights[name] = data;
-                // TFLite graphs reference dequantized/converted tensor names with
-                // _dequantize suffix. Register under both names for compatibility.
                 weights[name + "_dequantize"] = data;
                 graph.Initializers[name + "_dequantize"] = nchwShape;
+            }
+            else
+            {
+                graph.Initializers[name] = ConvertShape(tensor.Shape, tensor.Type);
             }
         }
 
@@ -171,12 +197,59 @@ public static class TFLiteLoader
 
             graph.Nodes.Add(node);
 
+            // Convert TFLite PAD constants: deinterleave + NHWC→NCHW reorder
+            if (onnxOpType == "Pad" && op.Inputs.Length >= 2 && op.Inputs[1] >= 0)
+            {
+                var padName = tensorNames[op.Inputs[1]];
+                if (weights.TryGetValue(padName, out var padData) && padData.Length >= 4)
+                {
+                    int rank = padData.Length / 2;
+                    // Deinterleave: [b0,e0,b1,e1,...] → [b0,b1,...,e0,e1,...]
+                    var onnxPad = new float[padData.Length];
+                    for (int d = 0; d < rank; d++)
+                    {
+                        onnxPad[d] = padData[d * 2];
+                        onnxPad[rank + d] = padData[d * 2 + 1];
+                    }
+                    // NHWC→NCHW reorder for 4D
+                    if (rank == 4)
+                    {
+                        var nchw = new float[8];
+                        nchw[0] = onnxPad[0]; nchw[1] = onnxPad[3]; nchw[2] = onnxPad[1]; nchw[3] = onnxPad[2];
+                        nchw[4] = onnxPad[4]; nchw[5] = onnxPad[7]; nchw[6] = onnxPad[5]; nchw[7] = onnxPad[6];
+                        onnxPad = nchw;
+                    }
+                    weights[padName] = onnxPad;
+                    if (weights.ContainsKey(padName + "_dequantize"))
+                        weights[padName + "_dequantize"] = onnxPad;
+                }
+            }
+
             // Handle fused activations (TFLite fuses RELU/RELU6 into Conv/Pool ops)
             if (builtinCodeForNode is 3 or 4 or 1 or 17)
                 HandleFusedActivation(graph, model, op, tensorNames, 3);
         }
 
         return (graph, weights);
+    }
+
+    /// <summary>
+    /// Transpose depthwise conv weights: [1, kH, kW, outC] → [outC, 1, kH, kW]
+    /// </summary>
+    private static float[] TransposeDepthwiseWeight(float[] data, int[] shape)
+    {
+        int kH = shape[1], kW = shape[2], outC = shape[3];
+        var result = new float[data.Length];
+        for (int oc = 0; oc < outC; oc++)
+            for (int h = 0; h < kH; h++)
+                for (int w = 0; w < kW; w++)
+                {
+                    int srcIdx = (h * kW + w) * outC + oc;
+                    int dstIdx = (oc * kH + h) * kW + w;
+                    if (srcIdx < data.Length && dstIdx < result.Length)
+                        result[dstIdx] = data[srcIdx];
+                }
+        return result;
     }
 
     /// <summary>
