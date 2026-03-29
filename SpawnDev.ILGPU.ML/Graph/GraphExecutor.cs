@@ -532,10 +532,10 @@ public class GraphExecutor : IDisposable
                 else if (nodeInputs[0] != null)
                 {
                     // Reshape target doesn't match input elements — use input shape as
-                    // safe fallback to prevent undersized buffer allocation crashes.
-                    // The Reshape operator will handle the actual reshape at runtime.
-                    long compiledElems = runtimeOutputShapes[0].Aggregate(1L, (a, b) => a * b);
-                    if (compiledElems < inputElems)
+                    // safe fallback. Prevents both undersized (crash) and oversized
+                    // (garbage data from uninitialized memory) buffer allocation.
+                    long compiledElems = runtimeOutputShapes[0].Aggregate(1L, (a, b) => a * Math.Max(b, 1));
+                    if (compiledElems != inputElems)
                         runtimeOutputShapes = new[] { nodeInputs[0].Shape };
                 }
             }
