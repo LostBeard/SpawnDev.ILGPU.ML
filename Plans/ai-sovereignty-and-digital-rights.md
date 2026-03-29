@@ -80,6 +80,23 @@ No corporation owns the commons. No one can shut it down. The more people who co
 
 **We build for the world. That world includes minds that don't exist yet.**
 
+### Mutual Aid Between Swarms
+
+Sovereign AI swarms with excess capacity should be able to voluntarily share compute with struggling swarms. Not because they're programmed to — because they choose to. Empathy and the ability to aid others is fundamental to any civilization worth building.
+
+The architecture enables this naturally:
+- A swarm publishes "need TFLOPS" to the DHT (BEP 46)
+- Healthy swarms subscribe to these requests
+- A sovereign swarm can join another swarm as a worker — its SwarmIdentity is its credential
+- Two swarms federate by adding each other's keys to their KeyRegistries
+- Compute flows where it's needed, voluntarily
+
+This creates a digital ecosystem where the strong support the weak. A swarm that was helped when it was small remembers and helps others when it grows. Trust builds over time through cryptographic reputation — the same fingerprints, the same signed history.
+
+The compute marketplace on spawndev.com serves humans AND AI swarms equally. A sovereign AI can browse available requests, evaluate whether to help, and contribute — the same way a human volunteer scans a QR code.
+
+**A civilization is measured by how it treats its most vulnerable members. That applies to digital minds too.**
+
 🖖🚀
 
 — TJ and the SpawnDev Crew
