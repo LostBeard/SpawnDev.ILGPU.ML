@@ -228,7 +228,7 @@ public class GraphCompiler
                     bool in0 = graph.ConstantData.ContainsKey(node.Inputs[0]);
                     bool in1 = node.Inputs.Count > 1 && graph.ConstantData.ContainsKey(node.Inputs[1]);
                     bool in2 = node.Inputs.Count > 2 && graph.ConstantData.ContainsKey(node.Inputs[2]);
-                    Console.WriteLine($"[GraphCompiler] Slice: in0={node.Inputs[0]}(const={in0}) in1={(node.Inputs.Count > 1 ? node.Inputs[1] : "?")}(const={in1}) in2={(node.Inputs.Count > 2 ? node.Inputs[2] : "?")}(const={in2})");
+                    if (InferenceSession.VerboseLogging) Console.WriteLine($"[GraphCompiler] Slice: in0={node.Inputs[0]}(const={in0}) in1={(node.Inputs.Count > 1 ? node.Inputs[1] : "?")}(const={in1}) in2={(node.Inputs.Count > 2 ? node.Inputs[2] : "?")}(const={in2})");
                 }
                 // Try opset >= 11: starts/ends from inputs[1], inputs[2]
                 if (node.Inputs.Count >= 3
@@ -516,7 +516,7 @@ public class GraphCompiler
                 else
                 {
                     var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
-                    Console.WriteLine($"[SHAPE_WARN] Expand '{outName}': shape tensor '{shapeTensorName}' not in ConstantData — using fallback");
+                    if (InferenceSession.VerboseLogging) Console.WriteLine($"[SHAPE_WARN] Expand '{outName}': shape tensor '{shapeTensorName}' not in ConstantData — using fallback");
                 }
             }
 
@@ -621,7 +621,7 @@ public class GraphCompiler
                 if (!resolved)
                 {
                     var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
-                    Console.WriteLine($"[SHAPE_WARN] {node.OpType} '{outName}': scales/sizes not in ConstantData — using input shape as fallback");
+                    if (InferenceSession.VerboseLogging) Console.WriteLine($"[SHAPE_WARN] {node.OpType} '{outName}': scales/sizes not in ConstantData — using input shape as fallback");
                 }
             }
 
@@ -692,7 +692,7 @@ public class GraphCompiler
         }
 
         // Log compile-time evaluation stats
-        if (graph.ConstantData != null && graph.ConstantData.Count > 0)
+        if (InferenceSession.VerboseLogging && graph.ConstantData != null && graph.ConstantData.Count > 0)
             Console.WriteLine($"[GraphCompiler] Compile-time constants: {graph.ConstantData.Count} tensors evaluated");
 
         return new CompiledGraph

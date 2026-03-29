@@ -275,13 +275,6 @@ public class GraphExecutor : IDisposable
             {
                 int sizesIdx = node.OpType == "Resize" ? 3 : -1;
                 int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
-                // Log ALL Resize resolution for debugging
-                if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx && !string.IsNullOrEmpty(node.InputNames[sizesIdx]))
-                {
-                    var outName = node.OutputNames.Length > 0 ? node.OutputNames[0] : "?";
-                    bool hasSizes = runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var _dbgSz);
-                    Console.WriteLine($"[RT-Resize] {outName}: hasSizes={hasSizes} vals=[{string.Join(",", (_dbgSz ?? Array.Empty<float>()).Take(6).Select(v => v.ToString("F0")))}] inShape=[{string.Join(",", nodeInputs[0]?.Shape ?? Array.Empty<int>())}] compiledShape=[{string.Join(",", node.OutputShapes[0])}] runtimeShape=[{string.Join(",", runtimeOutputShapes[0])}]");
-                }
                 if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
                     && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
                     && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
@@ -556,13 +549,6 @@ public class GraphExecutor : IDisposable
             {
                 int sizesIdx = node.OpType == "Resize" ? 3 : -1;
                 int scalesIdx = node.OpType == "Upsample" ? 1 : 2;
-                // Log ALL Resize resolution for debugging
-                if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx && !string.IsNullOrEmpty(node.InputNames[sizesIdx]))
-                {
-                    var outName = node.OutputNames.Length > 0 ? node.OutputNames[0] : "?";
-                    bool hasSizes = runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var _dbgSz);
-                    Console.WriteLine($"[RT-Resize] {outName}: hasSizes={hasSizes} vals=[{string.Join(",", (_dbgSz ?? Array.Empty<float>()).Take(6).Select(v => v.ToString("F0")))}] inShape=[{string.Join(",", nodeInputs[0]?.Shape ?? Array.Empty<int>())}] compiledShape=[{string.Join(",", node.OutputShapes[0])}] runtimeShape=[{string.Join(",", runtimeOutputShapes[0])}]");
-                }
                 if (sizesIdx >= 0 && node.InputNames.Length > sizesIdx
                     && !string.IsNullOrEmpty(node.InputNames[sizesIdx])
                     && runtimeConstants.TryGetValue(node.InputNames[sizesIdx], out var sizes)
