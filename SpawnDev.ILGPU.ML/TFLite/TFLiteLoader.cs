@@ -76,7 +76,7 @@ public static class TFLiteLoader
             graph.Outputs.Add(new GraphValueInfo
             {
                 Name = tensorNames[outputIdx],
-                Shape = sg.Tensors[outputIdx].Shape
+                Shape = ConvertShape(sg.Tensors[outputIdx].Shape, sg.Tensors[outputIdx].Type)
             });
         }
 
