@@ -89,6 +89,59 @@ public class GatherKernel
         _gatherAxis0FloatKernel!(numIndices * innerSize, data, indices, output, innerSize, dataRows);
     }
 
+    // ── Generic-axis Gather with float indices (GPU) ──
+
+    // ── Generic-axis Gather with float indices (GPU) ──
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gatherGenericFloatKernel;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastGenericParams;
+
+    /// <summary>
+    /// General Gather along any axis with float indices.
+    /// params[0]=numIdx, params[1]=innerSize, params[2]=outerSize, params[3]=axisSize.
+    /// Total output elements = outerSize * numIdx * innerSize.
+    /// </summary>
+    private static void GatherGenericFloatImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int numIdx = p[0];
+        int innerSize = p[1];
+        int axisSize = p[3];
+        int sliceSize = numIdx * innerSize;
+
+        int outerIdx = idx / sliceSize;
+        int rem = idx % sliceSize;
+        int idxIdx = rem / innerSize;
+        int innerIdx = rem % innerSize;
+
+        int srcRow = (int)indices[idxIdx];
+        if (srcRow < 0) srcRow += axisSize;
+
+        int srcLinear = (outerIdx * axisSize + srcRow) * innerSize + innerIdx;
+        output[idx] = (srcRow >= 0 && srcRow < axisSize && srcLinear >= 0 && srcLinear < data.Length)
+            ? data[srcLinear] : 0f;
+    }
+
+    /// <summary>
+    /// Gather along arbitrary axis with float indices.
+    /// data: [..., axisSize, ...], indices: [numIdx] (float).
+    /// Output: [..., numIdx, ...] with axis dimension replaced.
+    /// </summary>
+    public void GatherGenericFloat(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numIdx, int innerSize, int outerSize, int axisSize)
+    {
+        EnsureLoaded();
+        _lastGenericParams?.Dispose();
+        _lastGenericParams = _accelerator.Allocate1D(new[] { numIdx, innerSize, outerSize, axisSize });
+        _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, _lastGenericParams.View);
+    }
+
     private void EnsureLoaded()
     {
         _gatherAxis0Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
@@ -97,5 +150,8 @@ public class GatherKernel
         _gatherAxis0FloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int>(GatherAxis0FloatImpl);
+        _gatherGenericFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherGenericFloatImpl);
     }
 }

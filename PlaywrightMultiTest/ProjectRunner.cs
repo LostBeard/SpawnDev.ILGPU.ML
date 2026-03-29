@@ -292,7 +292,14 @@ namespace PlaywrightMultiTest
                 }
                 else if (project.AppProjectType == ProjectType.Exe)
                 {
-                    // enumerate tests by calling the console app. by default it will return a list of the tests in the exe
+                    // Set TEST_SERVER_URL so DemoConsole tests can access
+                    // model files and reference data served by the static file server.
+                    // The Blazor WASM project's static server runs at port 5551.
+                    if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TEST_SERVER_URL")))
+                    {
+                        Environment.SetEnvironmentVariable("TEST_SERVER_URL", "https://localhost:5551/");
+                        LogStatus("Set TEST_SERVER_URL=https://localhost:5551/ for desktop tests");
+                    }
 
                     var testableProject = new TestableConsole
                     {
@@ -360,10 +367,12 @@ namespace PlaywrightMultiTest
                             }
                             else if (rowTest.Result == TestResult.Error)
                             {
-                                if (string.IsNullOrWhiteSpace(stateMessage))
-                                {
+                                // Include the actual error details from the test output
+                                var errorDetail = unitTest.Error;
+                                if (!string.IsNullOrWhiteSpace(errorDetail))
+                                    stateMessage = errorDetail.Length > 500 ? errorDetail[..500] : errorDetail;
+                                else if (string.IsNullOrWhiteSpace(stateMessage))
                                     stateMessage = "Failed";
-                                }
                                 rowTest.ResultMessage = stateMessage;
                                 throw new Exception(stateMessage);
                             }

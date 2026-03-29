@@ -191,14 +191,16 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // DDPM MNIST U-Net (~1MB)
+        // DDPM MNIST U-Net (~1MB + 4MB external data)
         var modelBytes = await http.GetByteArrayAsync("references/blazing-edge/ddpm_mnist_unet.onnx");
-        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
+        var extDataBytes = await http.GetByteArrayAsync("references/blazing-edge/ddpm_mnist_unet.onnx.data");
+        using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["sample"] = new[] { 1, 1, 28, 28 },
                 ["timestep"] = new[] { 1 },
-            });
+            },
+            externalData: extDataBytes);
 
         // Start from random noise
         var rng = new Random(42);

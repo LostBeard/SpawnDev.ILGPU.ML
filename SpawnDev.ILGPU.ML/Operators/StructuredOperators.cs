@@ -673,9 +673,17 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
+        if (ctx.Inputs.Length < 2)
+            throw new InvalidOperationException($"Gather requires 2 inputs, got {ctx.Inputs.Length}");
+
         var data = ctx.Inputs[0]; var indices = ctx.Inputs[1];
-        int axis = ctx.GetInt("axis", 0);
-        if (axis < 0) axis += data.Shape.Length;
+        int rawAxis = ctx.GetInt("axis", 0);
+        int axis = rawAxis < 0 ? rawAxis + data.Shape.Length : rawAxis;
+        // Clamp axis for constant-folded tensors: Shape→Gather chains produce rank-1
+        // vectors where the original axis referenced a higher-rank tensor's dimension.
+        // The constant-folded result is flat, so axis must be 0.
+        if (axis >= data.Shape.Length)
+            axis = 0;
 
         // Get index values from pre-read constants (avoids GPU→CPU readback)
         var idxFloats = ctx.TryGetInputValues(1);
@@ -693,27 +701,35 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else if (idxFloats == null)
         {
-            // Non-axis-0 gather without pre-read indices — not yet supported on GPU
-            throw new NotSupportedException($"GPU Gather on axis {axis} with runtime indices not yet implemented");
+            // Non-axis-0: use GPU kernel with runtime indices
+            int numIdx = indices.ElementCount;
+            int axisSize = data.Shape[axis];
+            int innerSize = 1;
+            for (int i = axis + 1; i < data.Shape.Length; i++) innerSize *= data.Shape[i];
+            int outerSize = 1;
+            for (int i = 0; i < axis; i++) outerSize *= data.Shape[i];
+            reg.Gather.GatherGenericFloat(data.Data, indices.Data, ctx.Outputs[0].Data,
+                numIdx, innerSize, outerSize, axisSize);
+            return;
         }
 
         int numIdx2 = idxFloats.Length;
         int innerSize2 = 1;
         for (int i = axis + 1; i < data.Shape.Length; i++) innerSize2 *= data.Shape[i];
-        int outerSize = 1;
-        for (int i = 0; i < axis; i++) outerSize *= data.Shape[i];
-        int axisSize = data.Shape[axis];
+        int outerSize2 = 1;
+        for (int i = 0; i < axis; i++) outerSize2 *= data.Shape[i];
+        int axisSize2 = data.Shape[axis];
 
         // CPU-side Gather with pre-read indices (for constant/small index tensors)
-        for (int o = 0; o < outerSize; o++)
+        for (int o = 0; o < outerSize2; o++)
         {
             for (int idx = 0; idx < numIdx2; idx++)
             {
                 int srcIdx = (int)idxFloats[idx];
-                if (srcIdx < 0) srcIdx += axisSize;
-                if (srcIdx < 0 || srcIdx >= axisSize) srcIdx = 0;
+                if (srcIdx < 0) srcIdx += axisSize2;
+                if (srcIdx < 0 || srcIdx >= axisSize2) srcIdx = 0;
 
-                int srcOffset = (o * axisSize + srcIdx) * innerSize2;
+                int srcOffset = (o * axisSize2 + srcIdx) * innerSize2;
                 int dstOffset = (o * numIdx2 + idx) * innerSize2;
                 // Bounds check: skip if source or dest would exceed buffer
                 if (srcOffset + innerSize2 > data.ElementCount ||
