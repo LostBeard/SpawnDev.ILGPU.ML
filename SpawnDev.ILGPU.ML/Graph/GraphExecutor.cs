@@ -638,10 +638,8 @@ public class GraphExecutor : IDisposable
                         try
                         {
                             int elCount = outTensor.ElementCount;
-                            // WORKAROUND: GPU→GPU via Scale kernel + temp buffer because
-                            // CopyToHostAsync<T>(offset, count) doesn't exist yet on ArrayView.
-                            // Data is adding the overload to SpawnDev.ILGPU — when available,
-                            // replace with: runtimeConstants[outName] = await outTensor.Data.CopyToHostAsync<float>(0, elCount);
+                            // GPU→GPU copy via Scale kernel (works on all backends),
+                            // then async readback via CopyToHostAsync(offset, count).
                             using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
                             _ew.Scale(outTensor.Data.SubView(0, elCount), tmpBuf.View, elCount, 1f);
                             await _accelerator.SynchronizeAsync();
