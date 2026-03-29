@@ -310,6 +310,11 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
                 var shape = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
+                // Replace zero/negative dimensions with 1 — zero-sized buffers are always
+                // a compile-time inference error. The runtime operator will produce correct
+                // data within the allocated buffer.
+                for (int d = 0; d < shape.Length; d++)
+                    if (shape[d] <= 0) shape[d] = 1;
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
@@ -586,6 +591,11 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
                 var shape = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
+                // Replace zero/negative dimensions with 1 — zero-sized buffers are always
+                // a compile-time inference error. The runtime operator will produce correct
+                // data within the allocated buffer.
+                for (int d = 0; d < shape.Length; d++)
+                    if (shape[d] <= 0) shape[d] = 1;
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
