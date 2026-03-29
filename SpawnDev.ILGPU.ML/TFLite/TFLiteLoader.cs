@@ -80,14 +80,44 @@ public static class TFLiteLoader
             });
         }
 
-        // Identify depthwise conv weight tensors (different layout from regular conv)
+
+        // Identify depthwise conv weight tensors via DEQUANTIZE chain trace.
+        // For float16 models, weights go through DEQUANTIZE → DEPTHWISE_CONV_2D.
+        // We trace back through the chain to find the source tensor with buffer data.
         var depthwiseWeightIndices = new HashSet<int>();
+        var tensorProducer = new Dictionary<int, (int opIdx, int builtinCode)>();
+        for (int opIdx = 0; opIdx < sg.Operators.Length; opIdx++)
+        {
+            var op2 = sg.Operators[opIdx];
+            int bc = model.OperatorCodes[op2.OpcodeIndex].BuiltinCode;
+            foreach (var outIdx in op2.Outputs)
+                if (outIdx >= 0) tensorProducer[outIdx] = (opIdx, bc);
+        }
         for (int opIdx = 0; opIdx < sg.Operators.Length; opIdx++)
         {
             var op2 = sg.Operators[opIdx];
             int bc = model.OperatorCodes[op2.OpcodeIndex].BuiltinCode;
             if (bc == 4 && op2.Inputs.Length >= 2 && op2.Inputs[1] >= 0) // DEPTHWISE_CONV_2D
-                depthwiseWeightIndices.Add(op2.Inputs[1]);
+            {
+                int weightIdx = op2.Inputs[1];
+                depthwiseWeightIndices.Add(weightIdx);
+                // Look-back through DEQUANTIZE chain to find source with buffer data
+                int traceIdx = weightIdx;
+                for (int depth = 0; depth < 3; depth++) // max 3 hops
+                {
+                    if (tensorProducer.TryGetValue(traceIdx, out var producer) && producer.builtinCode == 6)
+                    {
+                        var deqOp = sg.Operators[producer.opIdx];
+                        if (deqOp.Inputs.Length > 0 && deqOp.Inputs[0] >= 0)
+                        {
+                            depthwiseWeightIndices.Add(deqOp.Inputs[0]);
+                            traceIdx = deqOp.Inputs[0];
+                        }
+                        else break;
+                    }
+                    else break;
+                }
+            }
         }
 
         // Extract constant tensors (weights/biases) as initializers
