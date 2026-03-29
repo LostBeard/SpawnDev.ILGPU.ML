@@ -22,15 +22,14 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
+        // Use base decoder (no If control flow nodes) — same KV cache outputs
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
-                ["attention_mask"] = new[] { 1, 5 },
-                ["position_ids"] = new[] { 1, 5 },
             },
             enableOptimization: false);
 
@@ -57,15 +56,14 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
+        // Use base decoder (no If control flow nodes) — same KV cache outputs
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
-                ["attention_mask"] = new[] { 1, 5 },
-                ["position_ids"] = new[] { 1, 5 },
             },
             enableOptimization: false);
 
@@ -357,8 +355,9 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
+        // Use base decoder (no If control flow nodes) — same KV cache outputs
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model_merged.onnx");
+            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model.onnx");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -396,8 +395,9 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
+        // Use base decoder (no If control flow nodes) — same KV cache outputs
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model_merged.onnx");
+            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model.onnx");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -705,15 +705,14 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // DistilGPT-2 non-merged (no KV cache inputs/outputs)
+        // DistilGPT-2 base decoder (no If control flow, no past_key_values inputs)
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/model.onnx");
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
-                ["attention_mask"] = new[] { 1, 5 },
             },
             enableOptimization: false);
 
@@ -790,15 +789,14 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         // DistilGPT-2 merged (WITH KV cache inputs/outputs)
+        // Use base decoder (no If control flow nodes) — same KV cache outputs
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
-                ["attention_mask"] = new[] { 1, 5 },
-                ["position_ids"] = new[] { 1, 5 },
             },
             enableOptimization: false);
 
