@@ -200,10 +200,17 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         if (group == -1) group = x.Shape.Length >= 4 ? x.Shape[1] : x.Shape[0];
         int outC = w.Shape[0];
 
-        // Always provide a valid bias buffer
-        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
-            ? ctx.Inputs[2].Data
-            : ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias").Data;
+        // Always provide a valid bias buffer (zero-filled if no bias input)
+        ArrayView1D<float, Stride1D.Dense> bias;
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
+        {
+            bias = ctx.Inputs[2].Data;
+        }
+        else
+        {
+            // Upload fresh zeros — Pool.Rent reuses buffers with stale data
+            bias = ctx.Pool.AllocatePermanent(new float[outC], new[] { outC }, "_conv_zero_bias").Data;
+        }
 
         // (Debug diagnostics removed)
 
