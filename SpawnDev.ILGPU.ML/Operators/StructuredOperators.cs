@@ -659,6 +659,8 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
         var idxShape = inputs[1];
         int axis = attrs.ContainsKey("axis") ? Convert.ToInt32(attrs["axis"]) : 0;
         if (axis < 0) axis += dataShape.Length;
+        // Clamp axis for rank-1 tensors (constant-folded Shape→Gather chains)
+        if (axis >= dataShape.Length) axis = Math.Max(0, dataShape.Length - 1);
 
         // For multi-dimensional data with single-element [1] indices, treat the index
         // as scalar [] to avoid adding an extra dimension. This is critical for:
