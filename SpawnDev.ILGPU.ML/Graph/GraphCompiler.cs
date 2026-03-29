@@ -71,10 +71,13 @@ public class GraphCompiler
 
         // Shape inference: track known shapes from inputs, initializers, and outputs
         var knownShapes = new Dictionary<string, int[]>();
+        var dynamicInputs = new HashSet<string>(); // Inputs with dynamic dims (d<=0 in ONNX)
         foreach (var input in graph.Inputs)
         {
             var shape = input.Shape.Select(d => d <= 0 ? 1 : d).ToArray();
             knownShapes[input.Name] = shape;
+            if (input.Shape.Any(d => d <= 0))
+                dynamicInputs.Add(input.Name);
         }
         foreach (var (name, shape) in graph.Initializers)
         {
@@ -148,9 +151,13 @@ public class GraphCompiler
                     outputShapes = new[] { new[] { 1 } };
             }
 
-            // Compile-time evaluation of Shape nodes: output = input's known shape as a 1D tensor
+            // Compile-time evaluation of Shape nodes: output = input's known shape as a 1D tensor.
+            // Skip folding for graph inputs with dynamic dims — their compile-time shapes
+            // (with d<=0 replaced by 1) produce wrong values for downstream Reshape/Resize.
+            // The runtime GraphExecutor resolves these correctly from actual tensor shapes.
             if (node.OpType == "Shape" && node.Inputs.Count >= 1
-                && knownShapes.TryGetValue(node.Inputs[0], out var shapeInputShape))
+                && knownShapes.TryGetValue(node.Inputs[0], out var shapeInputShape)
+                && !dynamicInputs.Contains(node.Inputs[0]))
             {
                 var shapeValues = shapeInputShape;
                 outputShapes = new[] { new[] { shapeValues.Length } };
