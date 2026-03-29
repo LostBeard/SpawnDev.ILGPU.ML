@@ -216,9 +216,9 @@ public class InferenceSession : IDisposable
             if (missingCount > 0)
             {
                 var missing = allInitNames.Where(n => !weights.ContainsKey(n)).Take(5);
-                Console.WriteLine($"[InferenceSession] WARNING: {missingCount} initializers not found in weights. First few: {string.Join(", ", missing)}");
+                if (VerboseLogging) Console.WriteLine($"[InferenceSession] WARNING: {missingCount} initializers not found in weights. First few: {string.Join(", ", missing)}");
             }
-            Console.WriteLine($"[InferenceSession] Loaded {loadedCount}/{allInitNames.Count} weights, {compiled.Nodes.Length} nodes compiled");
+            if (VerboseLogging) Console.WriteLine($"[InferenceSession] Loaded {loadedCount}/{allInitNames.Count} weights, {compiled.Nodes.Length} nodes compiled");
         }
 
         // Create executor with pre-read constant values (avoids GPU→CPU readback during inference)

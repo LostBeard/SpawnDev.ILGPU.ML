@@ -64,7 +64,7 @@ public class TextToSpeechPipeline : IDisposable
         });
 
         var encoderHidden = encoderOutputs[_encoder.OutputNames[0]];
-        Console.WriteLine($"[TTS] Encoder output: [{string.Join(",", encoderHidden.Shape)}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[TTS] Encoder output: [{string.Join(",", encoderHidden.Shape)}]");
 
         // Step 2: Run vocoder on encoder output (simplified — full pipeline would use decoder)
         // SpeechT5 HiFi-GAN vocoder takes mel spectrogram → audio waveform
@@ -80,7 +80,7 @@ public class TextToSpeechPipeline : IDisposable
         var audioTensor = vocoderOutputs[_vocoder.OutputNames[0]];
         int audioLen = audioTensor.ElementCount;
 
-        Console.WriteLine($"[TTS] Audio output: [{string.Join(",", audioTensor.Shape)}], samples={audioLen}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[TTS] Audio output: [{string.Join(",", audioTensor.Shape)}], samples={audioLen}");
 
         // Read audio to CPU
         using var readBuf = _accelerator.Allocate1D<float>(audioLen);

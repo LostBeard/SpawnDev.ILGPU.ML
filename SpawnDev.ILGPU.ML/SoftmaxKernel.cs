@@ -153,7 +153,7 @@ public class SoftmaxKernel
         Forward(dataBuf.View, 1, 4);
         await accelerator.SynchronizeAsync();
         var gpuOut = await dataBuf.CopyToHostAsync<float>(0, 4);
-        Console.WriteLine($"[Softmax] Diagnostic [1,2,3,4]: [{string.Join(", ", gpuOut.Select(v => v.ToString("F4")))}] (expect [0.0321, 0.0871, 0.2369, 0.6439])");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Softmax] Diagnostic [1,2,3,4]: [{string.Join(", ", gpuOut.Select(v => v.ToString("F4")))}] (expect [0.0321, 0.0871, 0.2369, 0.6439])");
     }
 
     public async Task<(float maxError, float avgError)> ValidateAsync(int rows = 96, int cols = 1369)
@@ -189,7 +189,7 @@ public class SoftmaxKernel
             if (err > maxErr) maxErr = err;
             sumErr += err;
         }
-        Console.WriteLine($"[Softmax] Validate {rows}x{cols}: maxErr={maxErr:E3}, avgErr={sumErr / cpuOut.Length:E3}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Softmax] Validate {rows}x{cols}: maxErr={maxErr:E3}, avgErr={sumErr / cpuOut.Length:E3}");
         return (maxErr, sumErr / cpuOut.Length);
     }
 }

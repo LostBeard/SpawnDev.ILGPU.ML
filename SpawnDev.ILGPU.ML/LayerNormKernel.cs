@@ -150,7 +150,7 @@ public class LayerNormKernel
         await accelerator.SynchronizeAsync();
 
         var gpuOut = await outputBuf.CopyToHostAsync<float>(0, 4);
-        Console.WriteLine($"[LayerNorm] Diagnostic [1,2,3,4]: [{string.Join(", ", gpuOut.Select(v => v.ToString("F4")))}] (expect [-1.3416, -0.4472, 0.4472, 1.3416])");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[LayerNorm] Diagnostic [1,2,3,4]: [{string.Join(", ", gpuOut.Select(v => v.ToString("F4")))}] (expect [-1.3416, -0.4472, 0.4472, 1.3416])");
     }
 
     public async Task<(float maxError, float avgError)> ValidateAsync(int rows = 1369, int C = 384)
@@ -196,7 +196,7 @@ public class LayerNormKernel
             if (err > maxErr) maxErr = err;
             sumErr += err;
         }
-        Console.WriteLine($"[LayerNorm] Validate {rows}x{C}: maxErr={maxErr:E3}, avgErr={sumErr / cpuOut.Length:E3}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[LayerNorm] Validate {rows}x{C}: maxErr={maxErr:E3}, avgErr={sumErr / cpuOut.Length:E3}");
         return (maxErr, sumErr / cpuOut.Length);
     }
 }

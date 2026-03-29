@@ -938,6 +938,6 @@ public class ElementWiseKernels
         for (int i = 0; i < count; i++)
             maxErr = MathF.Max(maxErr, MathF.Abs(cpuOut[i] - gpuOut[i]));
 
-        Console.WriteLine($"[GELU] Validate {count} elements: maxErr={maxErr:E3}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[GELU] Validate {count} elements: maxErr={maxErr:E3}");
     }
 }

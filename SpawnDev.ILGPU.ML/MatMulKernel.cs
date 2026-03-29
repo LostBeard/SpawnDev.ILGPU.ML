@@ -330,11 +330,11 @@ public class MatMulKernel
 
         // Print first row (cols 0..N-1) — should all be K
         var firstRow = string.Join(", ", gpuC.Take(Math.Min(N, 40)).Select(v => v.ToString("F1")));
-        Console.WriteLine($"[MatMul] Known {M}x{K}x{K}x{N}: first row (expect all {K}.0): [{firstRow}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[MatMul] Known {M}x{K}x{K}x{N}: first row (expect all {K}.0): [{firstRow}]");
 
         // Check row 0 col 0 vs col 16
         if (N > 16)
-            Console.WriteLine($"[MatMul]   C[0,0]={gpuC[0]:F1}, C[0,16]={gpuC[16]:F1}, C[0,31]={gpuC[Math.Min(31, N - 1)]:F1}");
+            if (InferenceSession.VerboseLogging) Console.WriteLine($"[MatMul]   C[0,0]={gpuC[0]:F1}, C[0,16]={gpuC[16]:F1}, C[0,31]={gpuC[Math.Min(31, N - 1)]:F1}");
     }
 
     /// <summary>
@@ -374,7 +374,7 @@ public class MatMulKernel
 
         double avgMs = sw.Elapsed.TotalMilliseconds / runs;
         double gflops = 2.0 * M * K * N / (avgMs * 1e6); // 2*M*K*N FLOPs for matmul
-        Console.WriteLine($"[MatMul] Benchmark {M}x{K} x {K}x{N}: {avgMs:F1}ms avg, {gflops:F1} GFLOPS");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[MatMul] Benchmark {M}x{K} x {K}x{N}: {avgMs:F1}ms avg, {gflops:F1} GFLOPS");
     }
 
     /// <summary>
@@ -424,10 +424,10 @@ public class MatMulKernel
         }
         float avgErr = sumErr / cpuC.Length;
 
-        Console.WriteLine($"[MatMul] Validate {M}x{K} x {K}x{N}: maxErr={maxErr:E3}, avgErr={avgErr:E3}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[MatMul] Validate {M}x{K} x {K}x{N}: maxErr={maxErr:E3}, avgErr={avgErr:E3}");
 
         if (maxErr > tolerance)
-            Console.WriteLine($"[MatMul] WARNING: maxErr {maxErr:E3} exceeds tolerance {tolerance:E3}!");
+            if (InferenceSession.VerboseLogging) Console.WriteLine($"[MatMul] WARNING: maxErr {maxErr:E3} exceeds tolerance {tolerance:E3}!");
 
         return (maxErr, avgErr);
     }

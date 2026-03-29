@@ -100,7 +100,7 @@ public class Dav3Inference
         _dptHead = new DptHead(_accelerator, _conv2d, _convTranspose, _elementWise, _layerNorm);
         _dptHead.Initialize();
 
-        Console.WriteLine($"[Dav3] Initialized: 12 blocks, buffers allocated (build: 2026-03-18T10:00)");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Dav3] Initialized: 12 blocks, buffers allocated (build: 2026-03-18T10:00)");
     }
 
     /// <summary>
@@ -285,9 +285,9 @@ public class Dav3Inference
         float maxErr = 0;
         for (int i = 0; i < C; i++)
             maxErr = MathF.Max(maxErr, MathF.Abs(cpuLn[i] - gpuLn[i]));
-        Console.WriteLine($"[CPUCheck] LN1 row0: CPU first5=[{string.Join(", ", cpuLn.Take(5).Select(v => v.ToString("F4")))}]");
-        Console.WriteLine($"[CPUCheck] LN1 row0: GPU first5=[{string.Join(", ", gpuLn.Take(5).Select(v => v.ToString("F4")))}]");
-        Console.WriteLine($"[CPUCheck] LN1 row0: maxErr={maxErr:E3} ({(maxErr < 1e-3 ? "PASS" : "FAIL")})");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[CPUCheck] LN1 row0: CPU first5=[{string.Join(", ", cpuLn.Take(5).Select(v => v.ToString("F4")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[CPUCheck] LN1 row0: GPU first5=[{string.Join(", ", gpuLn.Take(5).Select(v => v.ToString("F4")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[CPUCheck] LN1 row0: maxErr={maxErr:E3} ({(maxErr < 1e-3 ? "PASS" : "FAIL")})");
 
         // Now check QKV MatMul: compute dot product on CPU for first 5 output elements
         var qkvWeight = await ReadViewToCpuAsync(w.QkvWeight, C * 3 * C);
@@ -309,11 +309,11 @@ public class Dav3Inference
         await _accelerator.SynchronizeAsync();
         var gpuQkv = await _tmpBuffers.QkvBuf.CopyToHostAsync<float>(0, 5);
 
-        Console.WriteLine($"[CPUCheck] QKV row0: CPU first5=[{string.Join(", ", cpuQkv.Select(v => v.ToString("F4")))}]");
-        Console.WriteLine($"[CPUCheck] QKV row0: GPU first5=[{string.Join(", ", gpuQkv.Select(v => v.ToString("F4")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[CPUCheck] QKV row0: CPU first5=[{string.Join(", ", cpuQkv.Select(v => v.ToString("F4")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[CPUCheck] QKV row0: GPU first5=[{string.Join(", ", gpuQkv.Select(v => v.ToString("F4")))}]");
         float qkvErr = 0;
         for (int i = 0; i < 5; i++) qkvErr = MathF.Max(qkvErr, MathF.Abs(cpuQkv[i] - gpuQkv[i]));
-        Console.WriteLine($"[CPUCheck] QKV row0: maxErr={qkvErr:E3} ({(qkvErr < 0.05 ? "PASS" : "FAIL")})");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[CPUCheck] QKV row0: maxErr={qkvErr:E3} ({(qkvErr < 0.05 ? "PASS" : "FAIL")})");
     }
 
     private async Task LogBufferStatsAsync(string label, MemoryBuffer1D<float, Stride1D.Dense> buffer, int offset, int count)
@@ -332,7 +332,7 @@ public class Dav3Inference
         double mean = sum / data.Length;
         double std = Math.Sqrt(sumSq / data.Length - mean * mean);
         var first5 = string.Join(", ", data.Take(5).Select(v => v.ToString("F4")));
-        Console.WriteLine($"[Dav3Diag] {label}: min={min:F4} max={max:F4} std={std:F4} first5=[{first5}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Dav3Diag] {label}: min={min:F4} max={max:F4} std={std:F4} first5=[{first5}]");
     }
 
     private MemoryBuffer1D<float, Stride1D.Dense>? _lastResultBuf;
@@ -415,7 +415,7 @@ public class Dav3Inference
         await _accelerator.SynchronizeAsync();
         var concatSample = await concatBuf.CopyToHostAsync<float>(0, count);
         float concatMax = concatSample.Max(v => MathF.Abs(v));
-        Console.WriteLine($"[DptDbg] After concat: maxAbs={concatMax:E3}  [{string.Join(", ", concatSample.Select(v => v.ToString("E2")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[DptDbg] After concat: maxAbs={concatMax:E3}  [{string.Join(", ", concatSample.Select(v => v.ToString("E2")))}]");
 
         // Stage 2: LayerNorm [T, 768]
         using var normBuf = _accelerator.Allocate1D<float>(T * 768);
@@ -425,7 +425,7 @@ public class Dav3Inference
         await _accelerator.SynchronizeAsync();
         var normSample = await normBuf.CopyToHostAsync<float>(0, count);
         float normMax = normSample.Max(v => MathF.Abs(v));
-        Console.WriteLine($"[DptDbg] After layernorm: maxAbs={normMax:E3}  [{string.Join(", ", normSample.Select(v => v.ToString("E2")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[DptDbg] After layernorm: maxAbs={normMax:E3}  [{string.Join(", ", normSample.Select(v => v.ToString("E2")))}]");
 
         // Stage 3: TransposeLastTwo [T,768] → [768,T]
         using var transposeBuf = _accelerator.Allocate1D<float>(768 * T);
@@ -433,7 +433,7 @@ public class Dav3Inference
         await _accelerator.SynchronizeAsync();
         var transSample = await transposeBuf.CopyToHostAsync<float>(0, count);
         float transMax = transSample.Max(v => MathF.Abs(v));
-        Console.WriteLine($"[DptDbg] After transpose: maxAbs={transMax:E3}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[DptDbg] After transpose: maxAbs={transMax:E3}");
 
         // Stage 4: Conv1×1 [768→48]
         using var projScratch = _accelerator.Allocate1D<float>(48 * GRID_SIZE * GRID_SIZE);
@@ -444,7 +444,7 @@ public class Dav3Inference
         await _accelerator.SynchronizeAsync();
         var projSample = await projScratch.CopyToHostAsync<float>(0, count);
         float projMax = projSample.Max(v => MathF.Abs(v));
-        Console.WriteLine($"[DptDbg] After proj[0] (768→48): maxAbs={projMax:E3}  [{string.Join(", ", projSample.Select(v => v.ToString("E2")))}]");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[DptDbg] After proj[0] (768→48): maxAbs={projMax:E3}  [{string.Join(", ", projSample.Select(v => v.ToString("E2")))}]");
 
         return projSample;
     }

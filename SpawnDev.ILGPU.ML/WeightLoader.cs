@@ -52,23 +52,23 @@ public class WeightLoader
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // Fetch manifest (small — direct download is fine)
-        Console.WriteLine($"[WeightLoader] Loading manifest...");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Loading manifest...");
         onProgress?.Invoke("manifest", 0);
         var manifestJson = await _http.GetStringAsync($"{basePath}/manifest_fp16.json");
         var manifest = JsonSerializer.Deserialize<Dictionary<string, TensorInfo>>(manifestJson)!;
-        Console.WriteLine($"[WeightLoader] Manifest: {manifest.Count} tensors");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Manifest: {manifest.Count} tensors");
         onProgress?.Invoke("manifest", 100);
 
         // Fetch binary blob — chunked streaming to avoid OOM and keep UI responsive
-        Console.WriteLine($"[WeightLoader] Downloading weight blob...");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Downloading weight blob...");
         var blob = await InferenceSession.DownloadBytesChunkedAsync(_http, $"{basePath}/weights_fp16.bin", onProgress);
-        Console.WriteLine($"[WeightLoader] Blob: {blob.Length / (1024.0 * 1024.0):F1} MB");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Blob: {blob.Length / (1024.0 * 1024.0):F1} MB");
 
         // Convert all weights to one contiguous FP32 array, track offsets.
         // Each tensor is aligned to 64 floats (256 bytes) so SubViews don't
         // create overlapping binding ranges after WebGPU's 256-byte alignment.
         const int ALIGN_FLOATS = 64; // 256 bytes / 4 bytes per float
-        Console.WriteLine($"[WeightLoader] Converting FP16 → FP32...");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Converting FP16 → FP32...");
         onProgress?.Invoke("convert", 0);
         int totalElements = manifest.Values.Sum(v => ((v.elements + ALIGN_FLOATS - 1) / ALIGN_FLOATS) * ALIGN_FLOATS);
         var allWeights = new float[totalElements];
@@ -108,14 +108,14 @@ public class WeightLoader
         }
 
         // Single GPU allocation + upload (avoids 340 separate Allocate1D calls)
-        Console.WriteLine($"[WeightLoader] Uploading {totalElements:N0} params ({totalElements * 4 / (1024.0 * 1024.0):F1} MB FP32) as single buffer...");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Uploading {totalElements:N0} params ({totalElements * 4 / (1024.0 * 1024.0):F1} MB FP32) as single buffer...");
         onProgress?.Invoke("upload", 0);
         _weightBuffer = accelerator.Allocate1D(allWeights);
         await accelerator.SynchronizeAsync();
         onProgress?.Invoke("upload", 100);
 
         sw.Stop();
-        Console.WriteLine($"[WeightLoader] Loaded {_tensorSlices.Count} tensors in {sw.Elapsed.TotalSeconds:F1}s (1 GPU buffer)");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Loaded {_tensorSlices.Count} tensors in {sw.Elapsed.TotalSeconds:F1}s (1 GPU buffer)");
     }
 
     /// <summary>Get a weight tensor view by name. Returns a SubView into the single weight buffer.</summary>
@@ -172,14 +172,14 @@ public class WeightLoader
     public void PrintSummary(int maxEntries = 20)
     {
         var sorted = Shapes.OrderByDescending(kv => kv.Value.Aggregate(1, (a, b) => a * b)).ToList();
-        Console.WriteLine($"[WeightLoader] {sorted.Count} tensors loaded:");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] {sorted.Count} tensors loaded:");
         foreach (var (name, shape) in sorted.Take(maxEntries))
         {
             int elements = shape.Aggregate(1, (a, b) => a * b);
-            Console.WriteLine($"  {name}: [{string.Join(", ", shape)}] ({elements:N0} params)");
+            if (InferenceSession.VerboseLogging) Console.WriteLine($"  {name}: [{string.Join(", ", shape)}] ({elements:N0} params)");
         }
         if (sorted.Count > maxEntries)
-            Console.WriteLine($"  ... and {sorted.Count - maxEntries} more");
+            if (InferenceSession.VerboseLogging) Console.WriteLine($"  ... and {sorted.Count - maxEntries} more");
     }
 
     /// <summary>Convert FP16 bytes to FP32 into an existing array at a given offset.</summary>

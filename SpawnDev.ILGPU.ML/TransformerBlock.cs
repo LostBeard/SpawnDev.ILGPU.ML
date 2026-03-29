@@ -189,7 +189,7 @@ public class TransformerBlock
             for (int i = 0; i < data.Length; i++) { float v = data[i]; if (v < min) min = v; if (v > max) max = v; sum += v; sumSq += (double)v * v; }
             double std = Math.Sqrt(sumSq / data.Length - (sum / data.Length) * (sum / data.Length));
             var first5 = string.Join(", ", data.Take(5).Select(v => v.ToString("F4")));
-            Console.WriteLine($"[Block{blockIdx}] {step}: min={min:F4} max={max:F4} std={std:F4} first5=[{first5}]");
+            if (InferenceSession.VerboseLogging) Console.WriteLine($"[Block{blockIdx}] {step}: min={min:F4} max={max:F4} std={std:F4} first5=[{first5}]");
         }
 
         // ── Attention branch ──
@@ -233,7 +233,7 @@ public class TransformerBlock
 
         _elementWise.AddInPlace(output, tmp.Scaled, TC);
         // Can't easily log output view here
-        Console.WriteLine($"[Block{blockIdx}] Done");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Block{blockIdx}] Done");
     }
 
     /// <summary>
