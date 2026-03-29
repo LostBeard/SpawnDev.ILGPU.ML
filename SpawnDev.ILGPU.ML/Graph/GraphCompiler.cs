@@ -632,6 +632,21 @@ public class GraphCompiler
                 }
             }
 
+            // Compile-time Pad shape resolution: if pads tensor is a known constant,
+            // compute output shape = input + pads. Handles TFLite PAD and ONNX opset >= 11.
+            if (node.OpType == "Pad" && node.Inputs.Count >= 2
+                && graph.ConstantData != null
+                && !string.IsNullOrEmpty(node.Inputs[1])
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var padConst)
+                && padConst.Length == inputShapes[0].Length * 2)
+            {
+                var padded = (int[])inputShapes[0].Clone();
+                int rank = padded.Length;
+                for (int d = 0; d < rank; d++)
+                    padded[d] += padConst[d] + padConst[rank + d];
+                outputShapes = new[] { padded };
+            }
+
             // If the operator returned fewer shapes than outputs (e.g., Split returning
             // equal splits without knowing exact output count), extend to match.
             if (outputShapes.Length < node.Outputs.Count && outputShapes.Length > 0)
