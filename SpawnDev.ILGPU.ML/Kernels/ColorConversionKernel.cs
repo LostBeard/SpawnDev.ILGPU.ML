@@ -16,7 +16,7 @@ public class ColorConversionKernel
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _yCbCrToRGBAKernel;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _rgbaToGrayscaleKernel;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _rgbaToBGRAKernel;
-    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _flipHorizontalKernel;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _flipHorizontalKernel;
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _flipVerticalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _depthToColormapKernel;
 
@@ -164,30 +164,28 @@ public class ColorConversionKernel
     private static void FlipHorizontalImpl(Index1D idx,
         ArrayView1D<int, Stride1D.Dense> input,
         ArrayView1D<int, Stride1D.Dense> output,
-        int width, int height)
+        ArrayView1D<int, Stride1D.Dense> paramsView)
     {
+        int width = paramsView[0];
         int y = idx / width;
         int x = idx % width;
         output[y * width + (width - 1 - x)] = input[idx];
     }
+
+    private MemoryBuffer1D<int, Stride1D.Dense>? _flipParamsBuf;
 
     public void FlipHorizontal(
         ArrayView1D<int, Stride1D.Dense> input,
         ArrayView1D<int, Stride1D.Dense> output,
         int width, int height)
     {
-        // WORKAROUND: Using separate kernel that takes width/height as scalars
-        // because we can't use the 2-param version without hitting the scalar param limit
         _flipHorizontalKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(
-            (Index1D idx, ArrayView1D<int, Stride1D.Dense> inp, ArrayView1D<int, Stride1D.Dense> outp) =>
-            {
-                // Can't capture width in kernel lambda — need params buffer approach
-                outp[idx] = inp[idx]; // placeholder
-            });
-        // TODO: Use params buffer like Conv1DKernel for width/height
-        _flipHorizontalKernel(width * height, input, output);
+            ArrayView1D<int, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(FlipHorizontalImpl);
+        _flipParamsBuf?.Dispose();
+        _flipParamsBuf = _accelerator.Allocate1D(new[] { width, height });
+        _flipHorizontalKernel(width * height, input, output, _flipParamsBuf.View);
     }
 
     // ──────────────────────────────────────────────
