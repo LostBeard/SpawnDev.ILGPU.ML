@@ -52,8 +52,26 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                 dimSizes[labels[d]] = shape[d];
         }
 
-        // Compute output on CPU then upload — general but correct for all equations.
-        // GPU-optimized fast paths can be added for common patterns.
+        // GPU fast path: element-wise broadcast multiply (e.g., bnhd,hd->bnhd for RoPE).
+        // Pattern: all output labels appear in input A, input B's labels are a suffix of A's.
+        if (ctx.Inputs.Length == 2 && parsed.OutputLabels.SequenceEqual(parsed.InputLabels[0]))
+        {
+            var aLabels = parsed.InputLabels[0];
+            var bLabels = parsed.InputLabels[1];
+            // Check if B's labels are a contiguous suffix of A's labels (broadcast multiply)
+            bool isBroadcastMul = bLabels.Length <= aLabels.Length
+                && bLabels.SequenceEqual(aLabels.Skip(aLabels.Length - bLabels.Length).ToArray());
+            if (isBroadcastMul)
+            {
+                reg.ElementWise.BroadcastBinaryOpND(
+                    ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
+                    ctx.Inputs[0].Shape, ctx.Inputs[1].Shape, ctx.Outputs[0].Shape,
+                    BroadcastOp.Mul);
+                return;
+            }
+        }
+
+        // CPU fallback for general equations (reads GPU→CPU — not supported on WebGPU).
         int outputSize = ctx.Outputs[0].ElementCount;
         var result = new float[outputSize];
         var outLabels = parsed.OutputLabels;
