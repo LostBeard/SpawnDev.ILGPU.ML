@@ -93,7 +93,15 @@ public static class TFLiteLoader
             // Extract weight data as float[]
             var data = model.GetTensorData(tensor);
             if (data != null)
+            {
                 weights[name] = data;
+                // Quantized models reference dequantized names with _dequantize suffix
+                if (tensor.Type == TFLiteTensorType.Int8 || tensor.Type == TFLiteTensorType.UInt8)
+                {
+                    weights[name + "_dequantize"] = data;
+                    graph.Initializers[name + "_dequantize"] = tensor.Shape;
+                }
+            }
         }
 
         // Convert operators to graph nodes
