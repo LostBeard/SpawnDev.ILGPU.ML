@@ -168,13 +168,39 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var x = inputs[0]; var w = inputs[1];
-        var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[x.Length == 3 ? 2 : 4];
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
         int outC = w[0];
 
+        // Handle auto_pad (SAME_UPPER/SAME_LOWER from TFLite models)
+        string autoPad = attrs.ContainsKey("auto_pad") ? attrs["auto_pad"].ToString()! : "NOTSET";
+        int[] pads;
+        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
+        {
+            if (x.Length == 3)
+            {
+                int outL = (int)Math.Ceiling((double)x[2] / strides[0]);
+                int padTotal = Math.Max(0, (outL - 1) * strides[0] + w[2] - x[2]);
+                pads = new[] { padTotal / 2, padTotal - padTotal / 2 };
+            }
+            else
+            {
+                int sH = strides[0], sW = strides.Length > 1 ? strides[1] : 1;
+                int outH = (int)Math.Ceiling((double)x[2] / sH);
+                int outW = (int)Math.Ceiling((double)x[3] / sW);
+                int padH = Math.Max(0, (outH - 1) * sH + w[2] - x[2]);
+                int padW = Math.Max(0, (outW - 1) * sW + w[3] - x[3]);
+                pads = autoPad == "SAME_UPPER"
+                    ? new[] { padH / 2, padW / 2, padH - padH / 2, padW - padW / 2 }
+                    : new[] { padH - padH / 2, padW - padW / 2, padH / 2, padW / 2 };
+            }
+        }
+        else
+        {
+            pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[x.Length == 3 ? 2 : 4];
+        }
+
         if (x.Length == 3)
         {
-            // Conv1D: [N, C, L]
             int kL = w[2];
             var dilations = attrs.ContainsKey("dilations") ? ((long[])attrs["dilations"]).Select(d => (int)d).ToArray() : new[] { 1 };
             int dilation = dilations.Length > 0 ? dilations[0] : 1;
@@ -183,7 +209,6 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Conv2D: [N, C, H, W]
             int kH = w[2]; int kW = w[3];
             int outH = (x[2] + pads[0] + (pads.Length > 2 ? pads[2] : 0) - kH) / strides[0] + 1;
             int outW = (x[3] + (pads.Length > 1 ? pads[1] : 0) + (pads.Length > 3 ? pads[3] : 0) - kW) / (strides.Length > 1 ? strides[1] : 1) + 1;
@@ -193,8 +218,23 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
-        var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
+
+        // Handle auto_pad (SAME_UPPER/SAME_LOWER from TFLite models)
+        var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap) ? ap.ToString()! : "NOTSET";
+        int pad;
+        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
+        {
+            int inH = x.Shape.Length >= 3 ? x.Shape[2] : 1;
+            int kH = w.Shape.Length >= 3 ? w.Shape[2] : 1;
+            int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kH - inH);
+            pad = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
+        }
+        else
+        {
+            var pads = ctx.GetInts("pads");
+            pad = pads.Length > 0 ? pads[0] : 0;
+        }
         int group = ctx.GetInt("group", 1);
         // group = -1 is the TFLite depthwise sentinel — resolve to inC
         if (group == -1) group = x.Shape.Length >= 4 ? x.Shape[1] : x.Shape[0];

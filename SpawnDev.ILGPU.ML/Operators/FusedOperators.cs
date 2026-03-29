@@ -23,10 +23,11 @@ public class FusedLinearOperator : IOnnxOperator
 
     public int[][] InferOutputShapes(int[][] inputShapes, Dictionary<string, object> attributes)
     {
-        // Input: [M, K], Weights: [K, N] → Output: [M, N]
+        // Input: [M, K], Weights: [K, N] or [N, K] (transB) → Output: [M, N]
         if (inputShapes.Length < 2) return new[] { inputShapes[0] };
-        int M = inputShapes[0][^2];
-        int N = inputShapes[1][^1];
+        int K = inputShapes[0][^1];
+        // Detect weight layout: if weights[^1] == K, layout is [N, K] (transB)
+        int N = inputShapes[1][^1] == K ? inputShapes[1][0] : inputShapes[1][^1];
         var outShape = inputShapes[0].ToArray();
         outShape[^1] = N;
         return new[] { outShape };
@@ -40,7 +41,8 @@ public class FusedLinearOperator : IOnnxOperator
         var output = ctx.Outputs[0]; // [..., M, N]
 
         int K = input.Shape[^1];
-        int N = weights.Shape[^1];
+        // Detect weight layout: [K, N] or [N, K] (transB from TFLite/Gemm)
+        int N = weights.Shape[^1] == K ? weights.Shape[0] : weights.Shape[^1];
         // Flatten all leading dimensions into M — kernel does flat row/col indexing
         int M = input.ElementCount / K;
 
