@@ -638,14 +638,16 @@ public class GraphExecutor : IDisposable
                         try
                         {
                             int elCount = outTensor.ElementCount;
-                            // GPU→GPU via kernel dispatch (works on ALL backends including WebGPU).
-                            // CopyFrom throws NotSupportedException on WebGPU.
+                            // WORKAROUND: GPU→GPU via Scale kernel + temp buffer because
+                            // CopyToHostAsync<T>(offset, count) doesn't exist yet on ArrayView.
+                            // Data is adding the overload to SpawnDev.ILGPU — when available,
+                            // replace with: runtimeConstants[outName] = await outTensor.Data.CopyToHostAsync<float>(0, elCount);
                             using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
                             _ew.Scale(outTensor.Data.SubView(0, elCount), tmpBuf.View, elCount, 1f);
                             await _accelerator.SynchronizeAsync();
                             runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
                         }
-                        catch (NotSupportedException) { /* Fallback: backend doesn't support async readback */ }
+                        catch (NotSupportedException) { /* Backend doesn't support async readback */ }
                     }
                 }
             }
