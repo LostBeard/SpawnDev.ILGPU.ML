@@ -57,11 +57,28 @@ public class ModelHub : IDisposable
     /// <param name="repoId">Repository ID (e.g., "onnx-community/mobilenetv2-12")</param>
     /// <param name="filename">File within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
     /// <param name="revision">Git revision (default: "main")</param>
-    public Task<byte[]> LoadAsync(string repoId, string filename, string revision = "main")
+    /// <summary>
+    /// Optional WebTorrent client for P2P model delivery.
+    /// When set, downloads use WebTorrent (P2P + web seed) with HTTP CDN fallback.
+    /// </summary>
+    public SpawnDev.WebTorrent.ModelDelivery.ModelTorrentClient? TorrentClient { get; set; }
+
+    public async Task<byte[]> LoadAsync(string repoId, string filename, string revision = "main")
     {
+        // Try WebTorrent P2P delivery if available (peers + web seed + HTTP CDN fallback)
+        if (TorrentClient != null)
+        {
+            try
+            {
+                return await TorrentClient.DownloadModelAsync(repoId, filename);
+            }
+            catch { /* Fall through to direct HTTP CDN */ }
+        }
+
+        // Direct HTTP CDN with OPFS cache
         var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
-        return _cache.GetOrFetchAsync(url, cacheKey);
+        return await _cache.GetOrFetchAsync(url, cacheKey);
     }
 
     /// <summary>
