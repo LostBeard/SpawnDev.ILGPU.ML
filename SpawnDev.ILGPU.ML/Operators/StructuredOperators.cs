@@ -1009,8 +1009,9 @@ public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var shape = ctx.Inputs[0].Shape;
-        int N = shape[0]; int C = shape[1];
-        int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
+        var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
+            : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
+        int spatial = ctx.Inputs[0].ElementCount / (N * C);
         reg.Normalization.InstanceNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[1].Data, ctx.Inputs[2].Data, N, C, spatial);
     }
@@ -1095,20 +1096,42 @@ public class MaxPoolOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var x = inputs[0];
+        var fmt = attrs.ContainsKey("_data_format") && attrs["_data_format"].ToString() == "NHWC"
+            ? DataFormat.NHWC : DataFormat.NCHW;
+        var (n, c, xH, xW) = x.Length >= 4 ? LayoutHelper.GetDims(x, fmt) : (x[0], x.Length > 1 ? x[1] : 1, 1, 1);
         var kernelShape = attrs.ContainsKey("kernel_shape") ? ((long[])attrs["kernel_shape"]).Select(k => (int)k).ToArray() : new[] { 2, 2 };
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
         var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[4];
-        int outH = (x[2] + pads[0] + pads[2] - kernelShape[0]) / strides[0] + 1;
-        int outW = (x[3] + pads[1] + pads[3] - kernelShape[1]) / strides[1] + 1;
-        return new[] { new[] { x[0], x[1], outH, outW } };
+        // Handle auto_pad for TFLite
+        string autoPad = attrs.ContainsKey("auto_pad") ? attrs["auto_pad"].ToString()! : "NOTSET";
+        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
+        {
+            int padH = Math.Max(0, ((int)Math.Ceiling((double)xH / strides[0]) - 1) * strides[0] + kernelShape[0] - xH);
+            int padW = Math.Max(0, ((int)Math.Ceiling((double)xW / strides[1]) - 1) * strides[1] + kernelShape[1] - xW);
+            pads = new[] { padH / 2, padW / 2, padH - padH / 2, padW - padW / 2 };
+        }
+        int outH = (xH + pads[0] + pads[2] - kernelShape[0]) / strides[0] + 1;
+        int outW = (xW + pads[1] + pads[3] - kernelShape[1]) / strides[1] + 1;
+        return fmt == DataFormat.NHWC
+            ? new[] { new[] { n, outH, outW, c } }
+            : new[] { new[] { n, c, outH, outW } };
     }
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0];
+        var (N, C, H, W) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, ctx.Format) : (x.Shape[0], 1, 1, 1);
         var ks = ctx.GetInts("kernel_shape"); int kH = ks.Length > 0 ? ks[0] : 2; int kW = ks.Length > 1 ? ks[1] : kH;
         var st = ctx.GetInts("strides"); int sH = st.Length > 0 ? st[0] : 1; int sW = st.Length > 1 ? st[1] : sH;
         var pa = ctx.GetInts("pads"); int pH = pa.Length > 0 ? pa[0] : 0; int pW = pa.Length > 1 ? pa[1] : 0;
-        reg.Pooling.MaxPool2D(x.Data, ctx.Outputs[0].Data, x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3], kH, kW, sH, sW, pH, pW);
+        // Handle auto_pad
+        var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap2) ? ap2.ToString()! : "NOTSET";
+        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
+        {
+            int padH = Math.Max(0, ((int)Math.Ceiling((double)H / sH) - 1) * sH + kH - H);
+            pH = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
+            pW = pH; // Assume square padding for now
+        }
+        reg.Pooling.MaxPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
     }
 }
 
@@ -1122,10 +1145,18 @@ public class AveragePoolOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0];
+        var (N, C, H, W) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, ctx.Format) : (x.Shape[0], 1, 1, 1);
         var ks = ctx.GetInts("kernel_shape"); int kH = ks[0]; int kW = ks.Length > 1 ? ks[1] : kH;
         var st = ctx.GetInts("strides"); int sH = st.Length > 0 ? st[0] : 1; int sW = st.Length > 1 ? st[1] : sH;
         var pa = ctx.GetInts("pads"); int pH = pa.Length > 0 ? pa[0] : 0; int pW = pa.Length > 1 ? pa[1] : 0;
-        reg.Pooling.AvgPool2D(x.Data, ctx.Outputs[0].Data, x.Shape[0], x.Shape[1], x.Shape[2], x.Shape[3], kH, kW, sH, sW, pH, pW);
+        var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap2) ? ap2.ToString()! : "NOTSET";
+        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
+        {
+            int padH = Math.Max(0, ((int)Math.Ceiling((double)H / sH) - 1) * sH + kH - H);
+            pH = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
+            pW = pH;
+        }
+        reg.Pooling.AvgPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
     }
 }
 
