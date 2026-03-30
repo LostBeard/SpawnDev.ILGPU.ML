@@ -147,7 +147,7 @@ public class InferenceSession : IDisposable
                             }
                             else
                             {
-                                readBuf.View.SubView(0, elems).CopyFrom(view.Value.SubView(0, elems));
+                                new ElementWiseKernels(accelerator).Scale(view.Value.SubView(0, elems), readBuf.View.SubView(0, elems), elems, 1f);
                                 await accelerator.SynchronizeAsync();
                                 var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
                                 constantFloatValues[name] = hostBuf;

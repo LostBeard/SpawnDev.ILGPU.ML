@@ -365,7 +365,7 @@ public class GraphExecutor : IDisposable
                         {
                             int elCount = outTensor.ElementCount;
                             using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
-                            tmpBuf.View.SubView(0, elCount).CopyFrom(outTensor.Data.SubView(0, elCount));
+                            _ew.Scale(outTensor.Data.SubView(0, elCount), tmpBuf.View, elCount, 1f);
                             _accelerator.Synchronize();
                             runtimeConstants[outName] = tmpBuf.GetAsArray1D();
                         }

@@ -153,7 +153,7 @@ public class AsyncDepthPipeline : IDisposable
         if (!_memoryInitialized)
         {
             // First frame: use fast path as initial memory
-            _memoryCache!.View.SubView(0, pixels).CopyFrom(fastPathOutput.SubView(0, pixels));
+            _ew.Scale(fastPathOutput.SubView(0, pixels), _memoryCache!.View.SubView(0, pixels), pixels, 1f);
             _memoryInitialized = true;
         }
 

@@ -240,7 +240,7 @@ public class TrainableModel : IDisposable
             }
 
             // Save input for backward
-            _savedInput!.View.SubView(0, _size).CopyFrom(input.SubView(0, _size));
+            new ElementWiseKernels(acc).Scale(input.SubView(0, _size), _savedInput!.View.SubView(0, _size), _size, 1f);
 
             // ReLU forward: output = max(0, input)
             var ew = new ElementWiseKernels(acc);

@@ -95,7 +95,7 @@ public class FWHTKernel
             using var padBuf = _accelerator.Allocate1D<float>(batchSize * dPad);
             ew.Fill(padBuf.View, batchSize * dPad, 0f);
             for (int b = 0; b < batchSize; b++)
-                input.SubView(b * d, d).CopyTo(padBuf.View.SubView(b * dPad, d));
+                ew.Scale(input.SubView(b * d, d), padBuf.View.SubView(b * dPad, d), d, 1f);
 
             int numStagesPad = 0;
             for (int s = dPad; s > 1; s >>= 1) numStagesPad++;
@@ -116,7 +116,7 @@ public class FWHTKernel
         }
 
         // Power-of-2: in-place butterfly
-        output.SubView(0, batchSize * d).CopyFrom(input.SubView(0, batchSize * d));
+        ew.Scale(input.SubView(0, batchSize * d), output.SubView(0, batchSize * d), batchSize * d, 1f);
 
         int numStages = 0;
         for (int s = d; s > 1; s >>= 1) numStages++;

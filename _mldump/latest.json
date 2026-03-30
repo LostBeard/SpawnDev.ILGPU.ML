@@ -1,122 +1,122 @@
 {
-  "timestamp": "2026-03-29T18:37:36.1050000Z",
+  "timestamp": "2026-03-30T01:41:27.5900000Z",
   "runState": "None",
   "total": 868,
-  "passed": 79,
-  "failed": 2,
+  "passed": 225,
+  "failed": 11,
   "skipped": 0,
-  "pending": 787,
-  "totalDurationMs": 326580,
+  "pending": 632,
+  "totalDurationMs": 702710,
   "tests": [
     {
       "index": 1,
       "className": "DumpFolderTests",
       "method": "DumpFolder_IsWritable",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 3,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 2,
       "className": "HuggingFaceTests",
       "method": "HF_GetDownloadUrl_ConstructsCorrectUrl",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 1,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 3,
       "className": "HuggingFaceTests",
       "method": "HF_SearchModels_ReturnsResults",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 116,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 4,
       "className": "HuggingFaceTests",
       "method": "HF_SearchModels_FilterByTask",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 39,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 5,
       "className": "HuggingFaceTests",
       "method": "HF_GetModelInfo_ReturnsDetailedInfo",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 41,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 6,
       "className": "HuggingFaceTests",
       "method": "HF_ListRepoFiles_ReturnsFiles",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 50,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 7,
       "className": "HuggingFaceTests",
       "method": "HF_DownloadFile_SmallModel",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 338,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 8,
       "className": "HuggingFaceTests",
       "method": "HF_DirectUrl_DownloadAndDetect",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 69,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 9,
       "className": "HuggingFaceTests",
       "method": "HF_KnownModels_AllReposExist",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 268,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 10,
       "className": "HuggingFaceTests",
       "method": "HF_KnownModels_StyleAndSuperRes_AllExist",
-      "state": "Done",
-      "result": "Success",
-      "durationMs": 228,
+      "state": "None",
+      "result": "None",
+      "durationMs": 0,
       "error": null,
       "stackTrace": null,
-      "resultText": "Success"
+      "resultText": null
     },
     {
       "index": 11,
@@ -124,7 +124,7 @@
       "method": "Sigmoid_MatchesCpu",
       "state": "Done",
       "result": "Success",
-      "durationMs": 645,
+      "durationMs": 694,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -135,7 +135,7 @@
       "method": "Tanh_MatchesCpu",
       "state": "Done",
       "result": "Success",
-      "durationMs": 117,
+      "durationMs": 152,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -146,7 +146,7 @@
       "method": "SiLU_MatchesCpu",
       "state": "Done",
       "result": "Success",
-      "durationMs": 121,
+      "durationMs": 118,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -168,7 +168,7 @@
       "method": "HardSwish_MatchesCpu",
       "state": "Done",
       "result": "Success",
-      "durationMs": 89,
+      "durationMs": 97,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -179,7 +179,7 @@
       "method": "AsyncMDE_SMU_ConvexCombination",
       "state": "Done",
       "result": "Success",
-      "durationMs": 75,
+      "durationMs": 71,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -190,7 +190,7 @@
       "method": "AsyncMDE_EMA_DecayCorrect",
       "state": "Done",
       "result": "Success",
-      "durationMs": 56,
+      "durationMs": 61,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -201,7 +201,7 @@
       "method": "Mamba3_MIMO_MatchesSingleIO",
       "state": "Done",
       "result": "Success",
-      "durationMs": 209,
+      "durationMs": 251,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -212,7 +212,7 @@
       "method": "Mamba3_ZeroInput_ZeroOutput",
       "state": "Done",
       "result": "Success",
-      "durationMs": 102,
+      "durationMs": 112,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -223,7 +223,7 @@
       "method": "Mamba3_ConstantMemory_StateSize",
       "state": "Done",
       "result": "Success",
-      "durationMs": 113,
+      "durationMs": 124,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -234,7 +234,7 @@
       "method": "AsyncMDE_Pipeline_MemoryWarms",
       "state": "Done",
       "result": "Success",
-      "durationMs": 271,
+      "durationMs": 340,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -245,7 +245,7 @@
       "method": "Benchmark_RegisterBlockedMatMul_GFLOPS",
       "state": "Done",
       "result": "Success",
-      "durationMs": 8795,
+      "durationMs": 9042,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -256,7 +256,7 @@
       "method": "Benchmark_MatMulAutoSelect_LargeUsesRegisterBlocked",
       "state": "Done",
       "result": "Success",
-      "durationMs": 1259,
+      "durationMs": 1359,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -267,7 +267,7 @@
       "method": "BlazingEdge_RoPE_GPU_MatchesReference",
       "state": "Done",
       "result": "Success",
-      "durationMs": 78,
+      "durationMs": 379,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -278,7 +278,7 @@
       "method": "BlazingEdge_QKNorm_GPU_UnitLength",
       "state": "Done",
       "result": "Success",
-      "durationMs": 55,
+      "durationMs": 67,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -289,7 +289,7 @@
       "method": "BlazingEdge_GroupNorm_GPU_MatchesReference",
       "state": "Done",
       "result": "Success",
-      "durationMs": 140,
+      "durationMs": 130,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -300,7 +300,7 @@
       "method": "BlazingEdge_SelectiveScan_GPU_Causal",
       "state": "Done",
       "result": "Success",
-      "durationMs": 112,
+      "durationMs": 131,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -311,7 +311,7 @@
       "method": "BlazingEdge_GroupNorm_DefaultParams_MatchesReference",
       "state": "Done",
       "result": "Success",
-      "durationMs": 31,
+      "durationMs": 25,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -322,7 +322,7 @@
       "method": "BlazingEdge_RoPE_Reference_Loaded",
       "state": "Done",
       "result": "Success",
-      "durationMs": 18,
+      "durationMs": 24,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -333,7 +333,7 @@
       "method": "BlazingEdge_SelectiveScan_Reference_Loaded",
       "state": "Done",
       "result": "Success",
-      "durationMs": 30,
+      "durationMs": 22,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -344,7 +344,7 @@
       "method": "BlazingEdge_SPZ_Header_ValidMagic",
       "state": "Done",
       "result": "Success",
-      "durationMs": 15,
+      "durationMs": 16,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -366,7 +366,7 @@
       "method": "Broadcast_Add_LastDim",
       "state": "Done",
       "result": "Success",
-      "durationMs": 222,
+      "durationMs": 221,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -377,7 +377,7 @@
       "method": "Broadcast_Add_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 171,
+      "durationMs": 160,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -388,7 +388,7 @@
       "method": "Broadcast_Sub_LastDim",
       "state": "Done",
       "result": "Success",
-      "durationMs": 142,
+      "durationMs": 154,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -399,7 +399,7 @@
       "method": "Broadcast_Sub_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 162,
+      "durationMs": 158,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -410,7 +410,7 @@
       "method": "Broadcast_Sub_PerRow",
       "state": "Done",
       "result": "Success",
-      "durationMs": 171,
+      "durationMs": 172,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -421,7 +421,7 @@
       "method": "Broadcast_Mul_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 126,
+      "durationMs": 185,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -432,7 +432,7 @@
       "method": "Broadcast_Div_LastDim",
       "state": "Done",
       "result": "Success",
-      "durationMs": 316,
+      "durationMs": 340,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -443,7 +443,7 @@
       "method": "Broadcast_Div_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 303,
+      "durationMs": 313,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -454,7 +454,7 @@
       "method": "Broadcast_Pow_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 247,
+      "durationMs": 217,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -465,7 +465,7 @@
       "method": "Broadcast_Greater_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 157,
+      "durationMs": 175,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -476,7 +476,7 @@
       "method": "Broadcast_Less_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 198,
+      "durationMs": 168,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -487,7 +487,7 @@
       "method": "Broadcast_Equal_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 148,
+      "durationMs": 175,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -498,7 +498,7 @@
       "method": "Broadcast_LessOrEqual_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 166,
+      "durationMs": 170,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -509,7 +509,7 @@
       "method": "Broadcast_GreaterOrEqual_Scalar",
       "state": "Done",
       "result": "Success",
-      "durationMs": 185,
+      "durationMs": 178,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -520,7 +520,7 @@
       "method": "WebModel_SqueezeNet_CatClassification",
       "state": "Done",
       "result": "Success",
-      "durationMs": 3413,
+      "durationMs": 3775,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -531,7 +531,7 @@
       "method": "Concat_Axis1_ChannelMerge",
       "state": "Done",
       "result": "Success",
-      "durationMs": 173,
+      "durationMs": 168,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -542,7 +542,7 @@
       "method": "Conv2D_1x1Projection",
       "state": "Done",
       "result": "Success",
-      "durationMs": 2271,
+      "durationMs": 2235,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -553,7 +553,7 @@
       "method": "Conv2D_3x3WithPadding",
       "state": "Done",
       "result": "Success",
-      "durationMs": 811,
+      "durationMs": 849,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -564,7 +564,7 @@
       "method": "Conv2D_PatchEmbed14x14",
       "state": "Done",
       "result": "Success",
-      "durationMs": 130,
+      "durationMs": 137,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -575,7 +575,7 @@
       "method": "Conv2D_3x3NoPadding",
       "state": "Done",
       "result": "Success",
-      "durationMs": 112,
+      "durationMs": 119,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -586,7 +586,7 @@
       "method": "Conv2D_3x3Stride2",
       "state": "Done",
       "result": "Success",
-      "durationMs": 130,
+      "durationMs": 121,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -597,7 +597,7 @@
       "method": "Conv2D_Depthwise3x3",
       "state": "Done",
       "result": "Success",
-      "durationMs": 147,
+      "durationMs": 144,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -608,7 +608,7 @@
       "method": "ConvTranspose2D_Stride4",
       "state": "Done",
       "result": "Success",
-      "durationMs": 125,
+      "durationMs": 128,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -619,7 +619,7 @@
       "method": "AttentionSplitMerge_RoundTrip",
       "state": "Done",
       "result": "Success",
-      "durationMs": 236,
+      "durationMs": 214,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -630,7 +630,7 @@
       "method": "CreateFromFile_SqueezeNet_Classify",
       "state": "Done",
       "result": "Success",
-      "durationMs": 3204,
+      "durationMs": 3892,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -641,7 +641,7 @@
       "method": "CreateFromFile_SqueezeNet_CatClassification",
       "state": "Done",
       "result": "Success",
-      "durationMs": 3328,
+      "durationMs": 3239,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -652,7 +652,7 @@
       "method": "CreateFromFile_StyleTransfer_Mosaic",
       "state": "Done",
       "result": "Success",
-      "durationMs": 36302,
+      "durationMs": 36756,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -663,7 +663,7 @@
       "method": "CreateFromFile_SuperResolution_ESPCN",
       "state": "Done",
       "result": "Success",
-      "durationMs": 14216,
+      "durationMs": 14410,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -674,7 +674,7 @@
       "method": "CreateFromFile_DepthAnything_Load",
       "state": "Done",
       "result": "Success",
-      "durationMs": 12276,
+      "durationMs": 9351,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -685,7 +685,7 @@
       "method": "CreateFromFile_DepthAnything_Inference",
       "state": "Done",
       "result": "Success",
-      "durationMs": 60216,
+      "durationMs": 43720,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -695,11 +695,11 @@
       "className": "WebGPUTests",
       "method": "CreateFromFile_DepthAnything_CatImage",
       "state": "Done",
-      "result": "Success",
-      "durationMs": 43140,
-      "error": null,
-      "stackTrace": null,
-      "resultText": "Success"
+      "result": "Error",
+      "durationMs": 8117,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CCreateFromFile_DepthAnything_CatImage\u003Eb__54_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.CreateFromFile_DepthAnything_CatImage()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 64,
@@ -707,7 +707,7 @@
       "method": "CreateFromFile_MoveNet_Compiles",
       "state": "Done",
       "result": "Success",
-      "durationMs": 1832,
+      "durationMs": 2066,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -718,7 +718,7 @@
       "method": "CreateFromFile_EfficientNetLite0_TFLite",
       "state": "Done",
       "result": "Success",
-      "durationMs": 1817,
+      "durationMs": 2595,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -729,7 +729,7 @@
       "method": "CreateFromFile_YOLOv8Nano_ONNX",
       "state": "Done",
       "result": "Success",
-      "durationMs": 1495,
+      "durationMs": 2172,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -740,7 +740,7 @@
       "method": "DA3_RoPE_Position0_Identity",
       "state": "Done",
       "result": "Success",
-      "durationMs": 71,
+      "durationMs": 64,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -751,7 +751,7 @@
       "method": "DA3_RoPE_DotProduct_PositionInvariant",
       "state": "Done",
       "result": "Success",
-      "durationMs": 79,
+      "durationMs": 71,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -762,7 +762,7 @@
       "method": "DA3_QKNorm_PreservesDirection",
       "state": "Done",
       "result": "Success",
-      "durationMs": 58,
+      "durationMs": 69,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -773,7 +773,7 @@
       "method": "DA3Small_ONNX_Loads",
       "state": "Done",
       "result": "Success",
-      "durationMs": 15173,
+      "durationMs": 14243,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -784,9 +784,9 @@
       "method": "DA3Small_Inference_ProducesDepth",
       "state": "Done",
       "result": "Error",
-      "durationMs": 55492,
-      "error": "System.NotSupportedException: Synchronous GPU to CPU copies are not supported in WebGPU backend. Use CopyToHostAsync.\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer.CopyTo(AcceleratorStream stream, ArrayView\u00601\u0026 source, ArrayView\u00601\u0026 destination)\n   at ILGPU.Runtime.ArrayViewExtensions.CopyToCPUUnsafeAsync[Single,ArrayView\u00601](ArrayView\u00601 source, AcceleratorStream stream, Single\u0026 cpuData, Int64 length)\n   at ILGPU.Runtime.ArrayViewExtensions.CopyToCPU[Single,ArrayView\u00601](ArrayView\u00601 source, AcceleratorStream stream, Span\u00601\u0026 span)\n   at ILGPU.Runtime.ArrayViewExtensions.CopyToCPU[Single](ArrayView1D\u00602 view, AcceleratorStream stream, Single[] data)\n   at ILGPU.Runtime.ArrayViewExtensions.GetAsArray1D[Single](ArrayView1D\u00602 view, AcceleratorStream stream)\n   at SpawnDev.ILGPU.ML.Operators.EinsumOperator.Execute(OnnxOpContext ctx)\n   at SpawnDev.ILGPU.ML.Graph.GraphExecutor.RunAsync(Dictionary\u00602 inputs)",
-      "stackTrace": "   at SpawnDev.ILGPU.ML.Graph.GraphExecutor.RunAsync(Dictionary\u00602 inputs)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CDA3Small_Inference_ProducesDepth\u003Eb__82_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.DA3Small_Inference_ProducesDepth()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "durationMs": 10906,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CDA3Small_Inference_ProducesDepth\u003Eb__82_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.DA3Small_Inference_ProducesDepth()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
       "resultText": "Error"
     },
     {
@@ -795,7 +795,7 @@
       "method": "DA3Small_DepthMap_NotFlat",
       "state": "Done",
       "result": "Error",
-      "durationMs": 53732,
+      "durationMs": 57586,
       "error": "System.NotSupportedException: Synchronous GPU to CPU copies are not supported in WebGPU backend. Use CopyToHostAsync.\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer.CopyTo(AcceleratorStream stream, ArrayView\u00601\u0026 source, ArrayView\u00601\u0026 destination)\n   at ILGPU.Runtime.ArrayViewExtensions.CopyToCPUUnsafeAsync[Single,ArrayView\u00601](ArrayView\u00601 source, AcceleratorStream stream, Single\u0026 cpuData, Int64 length)\n   at ILGPU.Runtime.ArrayViewExtensions.CopyToCPU[Single,ArrayView\u00601](ArrayView\u00601 source, AcceleratorStream stream, Span\u00601\u0026 span)\n   at ILGPU.Runtime.ArrayViewExtensions.CopyToCPU[Single](ArrayView1D\u00602 view, AcceleratorStream stream, Single[] data)\n   at ILGPU.Runtime.ArrayViewExtensions.GetAsArray1D[Single](ArrayView1D\u00602 view, AcceleratorStream stream)\n   at SpawnDev.ILGPU.ML.Operators.EinsumOperator.Execute(OnnxOpContext ctx)\n   at SpawnDev.ILGPU.ML.Graph.GraphExecutor.RunAsync(Dictionary\u00602 inputs)",
       "stackTrace": "   at SpawnDev.ILGPU.ML.Graph.GraphExecutor.RunAsync(Dictionary\u00602 inputs)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CDA3Small_DepthMap_NotFlat\u003Eb__83_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.DA3Small_DepthMap_NotFlat()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
       "resultText": "Error"
@@ -806,7 +806,7 @@
       "method": "ImagePreprocess_ForwardRaw_ValueRange",
       "state": "Done",
       "result": "Success",
-      "durationMs": 69,
+      "durationMs": 55,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -817,7 +817,7 @@
       "method": "ImagePreprocess_ImageNet_MeanStd",
       "state": "Done",
       "result": "Success",
-      "durationMs": 20,
+      "durationMs": 21,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -828,7 +828,7 @@
       "method": "ImagePreprocess_BilinearResize_Dimensions",
       "state": "Done",
       "result": "Success",
-      "durationMs": 33,
+      "durationMs": 21,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -839,7 +839,7 @@
       "method": "TurboQuant_BitPack_4bit_RoundTrip",
       "state": "Done",
       "result": "Success",
-      "durationMs": 40,
+      "durationMs": 335,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -850,7 +850,7 @@
       "method": "TurboQuant_Quantize_RoundTrip_MSE",
       "state": "Done",
       "result": "Success",
-      "durationMs": 27,
+      "durationMs": 28,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -861,7 +861,7 @@
       "method": "SPZ_InvalidMagic_Throws",
       "state": "Done",
       "result": "Success",
-      "durationMs": 22,
+      "durationMs": 23,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -872,7 +872,7 @@
       "method": "SPZ_Decompression_Works",
       "state": "Done",
       "result": "Success",
-      "durationMs": 27,
+      "durationMs": 22,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -883,7 +883,7 @@
       "method": "FWHT_CPU_Impulse_MatchesReference",
       "state": "Done",
       "result": "Success",
-      "durationMs": 33,
+      "durationMs": 27,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -894,7 +894,7 @@
       "method": "FWHT_CPU_RoundTrip_d128",
       "state": "Done",
       "result": "Success",
-      "durationMs": 29,
+      "durationMs": 34,
       "error": null,
       "stackTrace": null,
       "resultText": "Success"
@@ -903,1816 +903,1816 @@
       "index": 82,
       "className": "WebGPUTests",
       "method": "Pipeline_TextGeneration_ProducesTokens",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 128998,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 83,
       "className": "WebGPUTests",
       "method": "Pipeline_BackgroundRemoval_ProducesMask",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 9489,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(Accelerator accelerator, Byte[] modelBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CPipeline_BackgroundRemoval_ProducesMask\u003Eb__95_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.Pipeline_BackgroundRemoval_ProducesMask()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 84,
       "className": "WebGPUTests",
       "method": "Pipeline_SemanticSearch_SimilarSentencesCloser",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 36703,
+      "error": "System.Exception: \u0027I love dogs\u0027 should be positive but logits=[0.001,0.001]\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CPipeline_SemanticSearch_SimilarSentencesCloser\u003Eb__96_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.Pipeline_SemanticSearch_SimilarSentencesCloser()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "stackTrace": "   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CPipeline_SemanticSearch_SimilarSentencesCloser\u003Eb__96_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.Pipeline_SemanticSearch_SimilarSentencesCloser()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 85,
       "className": "WebGPUTests",
       "method": "Pipeline_Diffusion_DDPM_ProducesImage",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 11406,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 86,
       "className": "WebGPUTests",
       "method": "Pipeline_TTS_ReferenceTokensProduceAudio",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 39,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 87,
       "className": "WebGPUTests",
       "method": "Pipeline_YOLOv8_DetectsObjects",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 1097,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CPipeline_YOLOv8_DetectsObjects\u003Eb__99_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.Pipeline_YOLOv8_DetectsObjects()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 88,
       "className": "WebGPUTests",
       "method": "Pipeline_YOLOv8_Reference_MatchesOnnxRuntime",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 28996,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 89,
       "className": "WebGPUTests",
       "method": "Pipeline_MoveNet_DetectsKeypoints",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 352,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(Accelerator accelerator, Byte[] modelBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CPipeline_MoveNet_DetectsKeypoints\u003Eb__101_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.Pipeline_MoveNet_DetectsKeypoints()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 90,
       "className": "WebGPUTests",
       "method": "Pipeline_BlazeFace_Reference_MatchesOnnxRuntime",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 4649,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 91,
       "className": "WebGPUTests",
       "method": "Diffusion_BetaSchedule_LinearRange",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 92,
       "className": "WebGPUTests",
       "method": "Diffusion_GaussianNoise_Statistics",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 8,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 93,
       "className": "WebGPUTests",
       "method": "DirectOnnx_SqueezeNet_ViaHttp",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 136,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxAsync(Accelerator accelerator, HttpClient http, String onnxUrl, Action\u00602 onProgress)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CDirectOnnx_SqueezeNet_ViaHttp\u003Eb__105_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.DirectOnnx_SqueezeNet_ViaHttp()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 94,
       "className": "WebGPUTests",
       "method": "EdgeCase_UnknownOperator_ThrowsClearError",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 55,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 95,
       "className": "WebGPUTests",
       "method": "EdgeCase_EmptyGraph_Compiles",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 28,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 96,
       "className": "WebGPUTests",
       "method": "EdgeCase_SoftmaxZeroDim_ThrowsClearError",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 41,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 97,
       "className": "WebGPUTests",
       "method": "FormatDetection_AllFormats_Detected",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 26,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 98,
       "className": "WebGPUTests",
       "method": "FormatLoader_ONNX_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 287,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 99,
       "className": "WebGPUTests",
       "method": "FormatLoader_TFLite_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 38,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 100,
       "className": "WebGPUTests",
       "method": "FormatLoader_SafeTensors_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 32,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 101,
       "className": "WebGPUTests",
       "method": "FormatLoader_GGUF_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 36,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 102,
       "className": "WebGPUTests",
       "method": "FormatLoader_TFGraphDef_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 33,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 103,
       "className": "WebGPUTests",
       "method": "FormatLoader_PyTorch_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 57,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 104,
       "className": "WebGPUTests",
       "method": "FormatLoader_CoreML_ParsesCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 34,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 105,
       "className": "WebGPUTests",
       "method": "FormatDetection_AllFormats",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 311,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 106,
       "className": "WebGPUTests",
       "method": "Format_PLY_RoundTrip_VerticesPreserved",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 6,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 107,
       "className": "WebGPUTests",
       "method": "Format_OBJ_RoundTrip_MeshPreserved",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 4,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 108,
       "className": "WebGPUTests",
       "method": "Format_GLTF_RoundTrip_MeshPreserved",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 40,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 109,
       "className": "WebGPUTests",
       "method": "Format_SPZ_CompressionRatio",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 6,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 110,
       "className": "WebGPUTests",
       "method": "TFLite_CreateSession_BlazeFace",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 2394,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 111,
       "className": "WebGPUTests",
       "method": "AutoDetect_LoadOnnxAndTFLite",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 802,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromTFLite(Accelerator accelerator, Byte[] tfliteBytes, Action\u00602 onProgress)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(Accelerator accelerator, Byte[] modelBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromFileAsync(Accelerator accelerator, HttpClient http, String modelUrl, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003CAutoDetect_LoadOnnxAndTFLite\u003Eb__124_0(Accelerator accelerator)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.AutoDetect_LoadOnnxAndTFLite()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 112,
       "className": "WebGPUTests",
       "method": "FormatDetection_MagicBytes",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 45,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 113,
       "className": "WebGPUTests",
       "method": "OperatorCoverage_AllDemoModels",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 25,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 114,
       "className": "WebGPUTests",
       "method": "WebModel_StyleTransfer_Mosaic",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 36887,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 115,
       "className": "WebGPUTests",
       "method": "WebModel_SuperResolution_ESPCN",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 14013,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 116,
       "className": "WebGPUTests",
       "method": "WebModel_StyleTransfer_CatImage",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 38699,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 117,
       "className": "WebGPUTests",
       "method": "WebModel_SuperResolution_CatImage",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 15252,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 118,
       "className": "WebGPUTests",
       "method": "FusedAttention_MatchesCPU",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 170,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 119,
       "className": "WebGPUTests",
       "method": "FusedDequantMatMul_SmallMatrix_MatchesCPU",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 161,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 120,
       "className": "WebGPUTests",
       "method": "Q4MatMulRouting_ViaOperator_MatchesDirect",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 292,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 121,
       "className": "WebGPUTests",
       "method": "FusedLinear_Relu_MatchesSeparate",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 122,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 122,
       "className": "WebGPUTests",
       "method": "FusedLinear_Gelu_MatchesSeparate",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 148,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 123,
       "className": "WebGPUTests",
       "method": "FusedLinear_None_MatchesMatMulPlusBias",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 120,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 124,
       "className": "WebGPUTests",
       "method": "GatherAxis0_EmbeddingLookup",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 122,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 125,
       "className": "WebGPUTests",
       "method": "Graph_CompileSimpleModel",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 28,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 126,
       "className": "WebGPUTests",
       "method": "Graph_ExecuteSimpleMLP",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 249,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 127,
       "className": "WebGPUTests",
       "method": "Graph_SerializeRoundTrip",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 38,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 128,
       "className": "WebGPUTests",
       "method": "HF_GetDownloadUrl_ConstructsCorrectUrl",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 129,
       "className": "WebGPUTests",
       "method": "HF_SearchModels_ReturnsResults",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 69,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 130,
       "className": "WebGPUTests",
       "method": "HF_SearchModels_FilterByTask",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 38,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 131,
       "className": "WebGPUTests",
       "method": "HF_GetModelInfo_ReturnsDetailedInfo",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 48,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 132,
       "className": "WebGPUTests",
       "method": "HF_GetModelInfo_HasOnnxProperty",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 40,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 133,
       "className": "WebGPUTests",
       "method": "HF_ListRepoFiles_ReturnsFiles",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 52,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 134,
       "className": "WebGPUTests",
       "method": "HF_DownloadFile_SmallModel",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 183,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 135,
       "className": "WebGPUTests",
       "method": "HF_DirectUrl_DownloadStyleModel",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 68,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 136,
       "className": "WebGPUTests",
       "method": "HF_DownloadAndLoadSession_SqueezeNet",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1100,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 137,
       "className": "WebGPUTests",
       "method": "HF_DownloadAndLoadSession_SuperResolution",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 113,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanent(Single[] data, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.Tensors.BufferPool.AllocatePermanentChunked(OnnxTensorProto tensor, Int32[] shape, String name)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnx(Accelerator accelerator, Byte[] onnxBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization, Byte[] externalData)\n   at SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(Accelerator accelerator, Byte[] modelBytes, Action\u00602 onProgress, Dictionary\u00602 inputShapes, Boolean enableOptimization)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003C\u003Ec.\u003C\u003CHF_DownloadAndLoadSession_SuperResolution\u003Eb__153_0\u003Ed.MoveNext()\n--- End of stack trace from previous location ---\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.HF_DownloadAndLoadSession_SuperResolution()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 138,
       "className": "WebGPUTests",
       "method": "HF_KnownModels_AllReposExist",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 267,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 139,
       "className": "WebGPUTests",
       "method": "HF_KnownModels_StyleAndSuperRes_AllExist",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 226,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 140,
       "className": "WebGPUTests",
       "method": "ImagePreprocess_ForwardRaw_RedImage_ChannelSeparation",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 231,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 141,
       "className": "WebGPUTests",
       "method": "ImagePreprocess_Forward_ImageNetNormalization",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 170,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 142,
       "className": "WebGPUTests",
       "method": "ImagePreprocess_BilinearResize_OutputSize",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 163,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 143,
       "className": "WebGPUTests",
       "method": "ImagePreprocess_YChannel_LuminanceCorrect",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 172,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 144,
       "className": "WebGPUTests",
       "method": "ImageResize_Bilinear_2x2to4x4",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 185,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 145,
       "className": "WebGPUTests",
       "method": "ColorConversion_RGBtoGray",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 95,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 146,
       "className": "WebGPUTests",
       "method": "InferenceSession_CreateAndRun",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 306,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 147,
       "className": "WebGPUTests",
       "method": "LayerNorm_Dav3Dimensions",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
-      "error": null,
-      "stackTrace": null,
-      "resultText": null
+      "state": "Done",
+      "result": "Error",
+      "durationMs": 83,
+      "error": "Error: obj null or undefined",
+      "stackTrace": "   at Microsoft.JSInterop.WebAssembly.WebAssemblyJSRuntime.InvokeJS(JSInvocationInfo\u0026 invocationInfo)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Int64 targetInstanceId, JSCallType callType, Object[] args)\n   at Microsoft.JSInterop.JSInProcessRuntime.Invoke[GPUBuffer](String identifier, Object[] args)\n   at SpawnDev.BlazorJS.Internal.BlazorJSInterop._invoke[GPUBuffer](String fnName, Object[] args)\n   at SpawnDev.ILGPU.WebGPU.WebGPUBuffer\u00601[[System.Byte, System.Private.CoreLib, Version=10.0.0.0, Culture=neutral, PublicKeyToken=7cec85d7bea7798e]]..ctor(WebGPUNativeAccelerator accelerator, Int64 length)\n   at SpawnDev.ILGPU.WebGPU.WebGPUNativeAccelerator.Allocate[Byte](Int64 length)\n   at SpawnDev.ILGPU.WebGPU.Backend.WebGPUMemoryBuffer..ctor(WebGPUAccelerator accelerator, Int64 length, Int32 elementSize)\n   at SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.AllocateRawInternal(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw(Int64 length, Int32 elementSize)\n   at ILGPU.Runtime.Accelerator.AllocateRaw[Single,LongIndex1D,Index1D,Dense](LongIndex1D extent, Dense stride)\n   at ILGPU.Runtime.Accelerator.Allocate1D[Single,Dense](Int64 length, Dense stride)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, AcceleratorStream stream, Single[] data)\n   at ILGPU.Runtime.ArrayViewExtensions.Allocate1D[Single](Accelerator accelerator, Single[] data)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.\u003C\u003Ec.\u003C\u003CLayerNorm_Dav3Dimensions\u003Eb__164_0\u003Ed.MoveNext()\n--- End of stack trace from previous location ---\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.RunTest(Func\u00602 testBody)\n   at SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase.LayerNorm_Dav3Dimensions()\n   at SpawnDev.UnitTesting.UnitTestRunner.RunTest(UnitTest test)",
+      "resultText": "Error"
     },
     {
       "index": 148,
       "className": "WebGPUTests",
       "method": "GELU_MatchesCpuErf",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 277,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 149,
       "className": "WebGPUTests",
       "method": "BroadcastMul_LayerScale",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 275,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 150,
       "className": "WebGPUTests",
       "method": "Softmax_AttentionDimensions",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 151,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 151,
       "className": "WebGPUTests",
       "method": "TransposeLastTwo_RoundTrip",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 251,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 152,
       "className": "WebGPUTests",
       "method": "KVCache_DetectsExplicitPastKeyValues",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 48,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 153,
       "className": "WebGPUTests",
       "method": "KVCache_NoDetectionForInferenceOnly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 41,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 154,
       "className": "WebGPUTests",
       "method": "KVCache_PartialPairsIgnored",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 32,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 155,
       "className": "WebGPUTests",
       "method": "KVCache_HeadDimFromShape",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 38,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 156,
       "className": "WebGPUTests",
       "method": "LGM_GroupNorm_CustomWeightBias",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 159,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 157,
       "className": "WebGPUTests",
       "method": "LGM_SPZ_PLY_RoundTrip",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 3,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 158,
       "className": "WebGPUTests",
       "method": "LGM_GaussianValidation_OpacityRange",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 159,
       "className": "WebGPUTests",
       "method": "Diagnostic_MapAsync_After_ManyDispatches",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 3217,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 160,
       "className": "WebGPUTests",
       "method": "Diagnostic_MapAsync_After_SqueezeNet_PlusExtra",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 3483,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 161,
       "className": "WebGPUTests",
       "method": "MarchingCubes_Sphere_ProducesVertices",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 6,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 162,
       "className": "WebGPUTests",
       "method": "MarchingCubes_Empty_NoOutput",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 163,
       "className": "WebGPUTests",
       "method": "MarchingCubes_ToGLTF_ValidFile",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 2,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 164,
       "className": "WebGPUTests",
       "method": "MarchingCubes_ToOBJ_ValidFile",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 9,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 165,
       "className": "WebGPUTests",
       "method": "Sqrt_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 241,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 166,
       "className": "WebGPUTests",
       "method": "Exp_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 239,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 167,
       "className": "WebGPUTests",
       "method": "Div_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 266,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 168,
       "className": "WebGPUTests",
       "method": "Erf_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 254,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 169,
       "className": "WebGPUTests",
       "method": "Abs_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 202,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 170,
       "className": "WebGPUTests",
       "method": "MatMul_QkvDimensions",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 6045,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 171,
       "className": "WebGPUTests",
       "method": "MatMul_MlpFc2Dimensions",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 4912,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 172,
       "className": "WebGPUTests",
       "method": "MatMul_BatchedAttentionScores",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 6489,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 173,
       "className": "WebGPUTests",
       "method": "MatMul_SmallNonAligned",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 241,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 174,
       "className": "WebGPUTests",
       "method": "MobileNetV2_GraphCompiles",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 734,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 175,
       "className": "WebGPUTests",
       "method": "SqueezeNet_MiniGraphExecution",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 576,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 176,
       "className": "WebGPUTests",
       "method": "BatchNorm_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 235,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 177,
       "className": "WebGPUTests",
       "method": "InstanceNorm_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 192,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 178,
       "className": "WebGPUTests",
       "method": "InstanceNorm_StyleTransferDims_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 193,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 179,
       "className": "WebGPUTests",
       "method": "RMSNorm_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 142,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 180,
       "className": "WebGPUTests",
       "method": "ArgMax_Axis1_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 196,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 181,
       "className": "WebGPUTests",
       "method": "LeakyRelu_NegativeSlope_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 91,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 182,
       "className": "WebGPUTests",
       "method": "Ceil_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 187,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 183,
       "className": "WebGPUTests",
       "method": "Reciprocal_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 230,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 184,
       "className": "WebGPUTests",
       "method": "ReduceMin_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 159,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 185,
       "className": "WebGPUTests",
       "method": "Greater_Broadcast_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 216,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 186,
       "className": "WebGPUTests",
       "method": "Less_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 186,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 187,
       "className": "WebGPUTests",
       "method": "Sub_PerRowBroadcast_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 277,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 188,
       "className": "WebGPUTests",
       "method": "LessOrEqual_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 311,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 189,
       "className": "WebGPUTests",
       "method": "Expand_BroadcastVector_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 246,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 190,
       "className": "WebGPUTests",
       "method": "DepthToSpace_2x2_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 128,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 191,
       "className": "WebGPUTests",
       "method": "ScatterND_SimpleUpdate_Works",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 208,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 192,
       "className": "WebGPUTests",
       "method": "OperatorRef_AllCases_MatchNumpy",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 11679,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 193,
       "className": "WebGPUTests",
       "method": "OperatorRegistry_ResolvesBuiltinOps",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 29,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 194,
       "className": "WebGPUTests",
       "method": "Operator_MatMul_ViaRegistry",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 372,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 195,
       "className": "WebGPUTests",
       "method": "Operator_ReluAdd_Chain",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 200,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 196,
       "className": "WebGPUTests",
       "method": "OptimizedPipeline_SqueezeNet_SameResult",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 3376,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 197,
       "className": "WebGPUTests",
       "method": "Optimizer_StyleTransfer_ReducesNodes",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 56,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 198,
       "className": "WebGPUTests",
       "method": "ImagePostprocess_NCHWToRGBA_MatchesCPU",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 101,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 199,
       "className": "WebGPUTests",
       "method": "GraphOptimizer_ReducesNodeCount",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 56,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 200,
       "className": "WebGPUTests",
       "method": "PadDiag_Rank1_Constant",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 134,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 201,
       "className": "WebGPUTests",
       "method": "PadDiag_BufferLoopBound",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 82,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 202,
       "className": "WebGPUTests",
       "method": "PadDiag_ComputedBufferIndex",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 101,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 203,
       "className": "WebGPUTests",
       "method": "PadDiag_BreakInsideLoop",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 86,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 204,
       "className": "WebGPUTests",
       "method": "PadDiag_TernaryBool",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 93,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 205,
       "className": "WebGPUTests",
       "method": "Pad_Constant_2D",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 118,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 206,
       "className": "WebGPUTests",
       "method": "Pad_Reflect_4D_StyleTransfer",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 144,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 207,
       "className": "WebGPUTests",
       "method": "Pad_Edge_2D",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 141,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 208,
       "className": "WebGPUTests",
       "method": "NearestUpsample_2x",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 198,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 209,
       "className": "WebGPUTests",
       "method": "NearestUpsample_StyleTransferDims",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 276,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 210,
       "className": "WebGPUTests",
       "method": "Div_ElementWise_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 217,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 211,
       "className": "WebGPUTests",
       "method": "Floor_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 178,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 212,
       "className": "WebGPUTests",
       "method": "Pipeline_CLIP_Reference_CatIsTopMatch",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 26,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 213,
       "className": "WebGPUTests",
       "method": "Pipeline_WhisperDecoder_Reference_440HzTone",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 15,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 214,
       "className": "WebGPUTests",
       "method": "Pipeline_TextClassification_Reference_Cases",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 16,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 215,
       "className": "WebGPUTests",
       "method": "Pipeline_ConvReluPoolReshape_NonUniformOutput",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 406,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 216,
       "className": "WebGPUTests",
       "method": "MaxPool2D_3x3Stride2",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 163,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 217,
       "className": "WebGPUTests",
       "method": "GlobalAvgPool_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 113,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 218,
       "className": "WebGPUTests",
       "method": "Postprocess_GrayscaleToRGBA_WhiteIsWhite",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 92,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 219,
       "className": "WebGPUTests",
       "method": "Postprocess_DepthToColormap_EndpointsCorrect",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 121,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 220,
       "className": "WebGPUTests",
       "method": "Postprocess_Normalize_RangeCorrect",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 85,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 221,
       "className": "WebGPUTests",
       "method": "Postprocess_NCHWToRGBA_PacksCorrectly",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 93,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 222,
       "className": "WebGPUTests",
       "method": "Preprocessing_ForwardRaw_MatchesReference",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 277,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 223,
       "className": "WebGPUTests",
       "method": "Preprocessing_ImageNet_MatchesReference",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 239,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 224,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_AttentionMask",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 225,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_PadOrTruncate",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 226,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_PositionIds",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 227,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_Softmax_Basic",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 228,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_Softmax_NumericalStability",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 229,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_TopK",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 3,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 230,
       "className": "WebGPUTests",
       "method": "TextPreprocessor_CosineSimilarity",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 231,
       "className": "WebGPUTests",
       "method": "AudioPreprocessor_HzToMel_RoundTrip",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 232,
       "className": "WebGPUTests",
       "method": "AudioPreprocessor_HannWindow_Endpoints",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 233,
       "className": "WebGPUTests",
       "method": "AudioPreprocessor_Resample_Frequency",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 3,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 234,
       "className": "WebGPUTests",
       "method": "AudioPreprocessor_PadOrTrim",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 235,
       "className": "WebGPUTests",
       "method": "AudioPreprocessor_StereoToMono",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 1,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 236,
       "className": "WebGPUTests",
       "method": "BPETokenizer_LoadAndEncode_GPT2",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 628,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 237,
       "className": "WebGPUTests",
       "method": "BPETokenizer_GPT2_KnownEncodings",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 449,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 238,
       "className": "WebGPUTests",
       "method": "BPETokenizer_GPT2_SpecialCharacters",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 545,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 239,
       "className": "WebGPUTests",
       "method": "BPETokenizer_GPT2_LongText",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 545,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 240,
       "className": "WebGPUTests",
       "method": "RealMobileNetV2_CompileGraph",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 508,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 241,
       "className": "WebGPUTests",
       "method": "RealESPCN_CompileAndRun",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 538,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 242,
       "className": "WebGPUTests",
       "method": "ReduceSum_LastAxis",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 114,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 243,
       "className": "WebGPUTests",
       "method": "ReduceMean_MiddleAxis",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 157,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 244,
       "className": "WebGPUTests",
       "method": "ReduceMax_MatchesCpu",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 162,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 245,
       "className": "WebGPUTests",
       "method": "Reference_StyleMosaic_MatchesOnnxRuntime",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 38454,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 246,
       "className": "WebGPUTests",
       "method": "Reference_StyleCandy_MatchesOnnxRuntime",
-      "state": "None",
-      "result": "None",
-      "durationMs": 0,
+      "state": "Done",
+      "result": "Success",
+      "durationMs": 40019,
       "error": null,
       "stackTrace": null,
-      "resultText": null
+      "resultText": "Success"
     },
     {
       "index": 247,
