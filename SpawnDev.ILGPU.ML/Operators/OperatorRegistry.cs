@@ -172,15 +172,14 @@ public class OperatorRegistry : IDisposable
 
     public void Dispose()
     {
-        // Dispose kernel instances that hold GPU param buffers.
+        // Dispose ALL kernel instances that may hold GPU param buffers.
         // Without this, every InferenceSession leaks param buffers on Dispose.
         foreach (var op in _ops.Values)
-            if (op is IDisposable d) d.Dispose();
-        // Dispose kernels with persistent param buffers
-        try { (Conv2D as IDisposable)?.Dispose(); } catch { }
-        try { (Conv1D as IDisposable)?.Dispose(); } catch { }
-        try { (Gather as IDisposable)?.Dispose(); } catch { }
-        try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
-        try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
+            if (op is IDisposable d) try { d.Dispose(); } catch { }
+        // Dispose all kernel properties via reflection — catches every param buffer
+        foreach (var prop in GetType().GetProperties())
+        {
+            try { if (prop.GetValue(this) is IDisposable k) k.Dispose(); } catch { }
+        }
     }
 }

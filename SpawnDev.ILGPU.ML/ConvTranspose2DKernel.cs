@@ -13,7 +13,7 @@ namespace SpawnDev.ILGPU.ML;
 /// Implemented in "gather" direction — one thread per output element, no atomics.
 /// Parameters packed into ArrayView to avoid WebGPU scalar packing issues.
 /// </summary>
-public class ConvTranspose2DKernel
+public class ConvTranspose2DKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -109,4 +109,6 @@ public class ConvTranspose2DKernel
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ConvTranspose2DImpl);
     }
+
+    public void Dispose() => _paramsBuf?.Dispose();
 }

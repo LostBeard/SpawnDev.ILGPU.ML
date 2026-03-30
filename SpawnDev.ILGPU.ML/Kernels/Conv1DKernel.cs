@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// Supports stride, padding, dilation, and grouped convolution.
 /// Layout: [N, C, L] (batch, channels, length).
 /// </summary>
-public class Conv1DKernel
+public class Conv1DKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -121,4 +121,6 @@ public class Conv1DKernel
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(Conv1DFlatImpl);
     }
+
+    public void Dispose() => _paramsBuf?.Dispose();
 }

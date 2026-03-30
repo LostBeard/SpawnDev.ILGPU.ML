@@ -12,7 +12,7 @@ public enum BroadcastOp { Add, Sub, Mul, Div, Pow }
 ///
 /// Future home: SpawnDev.ILGPU.ML
 /// </summary>
-public class ElementWiseKernels
+public class ElementWiseKernels : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -939,5 +939,11 @@ public class ElementWiseKernels
             maxErr = MathF.Max(maxErr, MathF.Abs(cpuOut[i] - gpuOut[i]));
 
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[GELU] Validate {count} elements: maxErr={maxErr:E3}");
+    }
+
+    public void Dispose()
+    {
+        _lastStridesBuf?.Dispose();
+        _broadcastStridesBuf?.Dispose();
     }
 }

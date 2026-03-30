@@ -10,7 +10,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// Simplified version for common cases: 1D indices gathering along axis 0.
 /// For the full ONNX Gather spec with arbitrary axis, use the params-buffer variant.
 /// </summary>
-public class GatherKernel
+public class GatherKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -154,4 +154,6 @@ public class GatherKernel
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherGenericFloatImpl);
     }
+
+    public void Dispose() => _lastGenericParams?.Dispose();
 }

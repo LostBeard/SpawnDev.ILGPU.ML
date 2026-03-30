@@ -21,7 +21,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 ///   - 32 × 4-bit quantized values (16 bytes)
 ///   - Total: 18 bytes per 32 values = 4.5 bits/value
 /// </summary>
-public class FusedDequantMatMul
+public class FusedDequantMatMul : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -206,4 +206,6 @@ public class FusedDequantMatMul
         float result = (1f + mant / 1024f) * MathF.Pow(2, exp - 15);
         return sign == 1 ? -result : result;
     }
+
+    public void Dispose() => _lastParamsBuf?.Dispose();
 }

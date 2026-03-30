@@ -22,7 +22,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// faster than tiled MatMul because the attention matrix is computed and
 /// consumed immediately — never materialized in global memory.
 /// </summary>
-public class FusedAttentionKernel
+public class FusedAttentionKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -119,4 +119,6 @@ public class FusedAttentionKernel
 
         output[idx] = weightedV / (runningSum + 1e-10f);
     }
+
+    public void Dispose() => _lastParamsBuf?.Dispose();
 }

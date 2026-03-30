@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// All operations are one thread per pixel — embarrassingly parallel.
 /// Replaces the CPU-side ColorConversion utility with GPU-native execution.
 /// </summary>
-public class ColorConversionKernel
+public class ColorConversionKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -275,5 +275,11 @@ public class ColorConversionKernel
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(DepthToColormapImpl);
         _depthToColormapKernel(pixelCount, depth, rgba, _paramsBuf.View);
+    }
+
+    public void Dispose()
+    {
+        _paramsBuf?.Dispose();
+        _flipParamsBuf?.Dispose();
     }
 }
