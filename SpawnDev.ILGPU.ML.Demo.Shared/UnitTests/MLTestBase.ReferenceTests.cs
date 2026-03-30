@@ -160,6 +160,7 @@ public abstract partial class MLTestBase
 
         // EfficientNet-Lite0 is TFLite format, NHWC input
         Console.WriteLine("[EfficientNet] Downloading model..."); Console.Out.Flush();
+        
         using var dlCts = new System.Threading.CancellationTokenSource(30000); // 30s timeout
         var modelBytes = await http.GetByteArrayAsync("models/efficientnet-lite0/model.tflite", dlCts.Token);
         Console.WriteLine($"[EfficientNet] Model: {modelBytes.Length} bytes, compiling..."); Console.Out.Flush();
