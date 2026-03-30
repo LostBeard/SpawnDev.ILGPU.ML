@@ -2,6 +2,9 @@ using SpawnDev.UnitTesting;
 using System.Reflection;
 using System.Text.Json;
 
+// Auto-flush stdout so PlaywrightMultiTest sees output immediately
+Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+
 // Catch ILGPU assertion failures (CPU backend bounds checks) that would
 // otherwise show "unknown hard error" dialogs and kill the process.
 // Write a proper TEST: JSON line so PlaywrightMultiTest captures the error.

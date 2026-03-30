@@ -222,25 +222,24 @@ public class Conv2DKernel : IDisposable
 
         double sum = (double)bias[oc];
 
-        for (int ic = 0; ic < inC; ic++)
+        // Flattened single loop — avoids triple-nested loop that causes slow
+        // PTX JIT compilation on CUDA (same pattern as Conv1DKernel workaround).
+        int kernelSize = inC * kH * kW;
+        for (int k = 0; k < kernelSize; k++)
         {
-            for (int ky = 0; ky < kH; ky++)
-            {
-                int iy = oy * stride + ky - padding;
-                if (iy < 0 || iy >= inH) continue;
+            int ic = k / (kH * kW);
+            int rem2 = k % (kH * kW);
+            int ky = rem2 / kW;
+            int kx = rem2 % kW;
 
-                for (int kx = 0; kx < kW; kx++)
-                {
-                    int ix = ox * stride + kx - padding;
-                    if (ix < 0 || ix >= inW) continue;
+            int iy = oy * stride + ky - padding;
+            if (iy < 0 || iy >= inH) continue;
+            int ix = ox * stride + kx - padding;
+            if (ix < 0 || ix >= inW) continue;
 
-                    // NHWC input: [iy, ix, ic]
-                    int inIdx = (iy * inW + ix) * inC + ic;
-                    // NHWC weight (TFLite OHWI): [oc, ky, kx, ic]
-                    int wIdx = ((oc * kH + ky) * kW + kx) * inC + ic;
-                    sum += (double)input[inIdx] * (double)weight[wIdx];
-                }
-            }
+            int inIdx = (iy * inW + ix) * inC + ic;
+            int wIdx = ((oc * kH + ky) * kW + kx) * inC + ic;
+            sum += (double)input[inIdx] * (double)weight[wIdx];
         }
 
         output[idx] = (float)sum;
@@ -271,22 +270,20 @@ public class Conv2DKernel : IDisposable
 
         double sum = (double)bias[c];
 
-        for (int ky = 0; ky < kH; ky++)
+        // Flattened loop — avoids nested loops that cause slow PTX JIT
+        int kernelSize = kH * kW;
+        for (int k = 0; k < kernelSize; k++)
         {
+            int ky = k / kW;
+            int kx = k % kW;
             int iy = oy * stride + ky - padding;
             if (iy < 0 || iy >= inH) continue;
+            int ix = ox * stride + kx - padding;
+            if (ix < 0 || ix >= inW) continue;
 
-            for (int kx = 0; kx < kW; kx++)
-            {
-                int ix = ox * stride + kx - padding;
-                if (ix < 0 || ix >= inW) continue;
-
-                // NHWC input: [iy, ix, c]
-                int inIdx = (iy * inW + ix) * C + c;
-                // NHWC weight [1, kH, kW, C]: [ky, kx, c]
-                int wIdx = (ky * kW + kx) * C + c;
-                sum += (double)input[inIdx] * (double)weight[wIdx];
-            }
+            int inIdx = (iy * inW + ix) * C + c;
+            int wIdx = (ky * kW + kx) * C + c;
+            sum += (double)input[inIdx] * (double)weight[wIdx];
         }
 
         output[idx] = (float)sum;
