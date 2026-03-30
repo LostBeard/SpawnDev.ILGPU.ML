@@ -1,9 +1,12 @@
 using Microsoft.AspNetCore.Components.Web;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
+using SpawnDev.AsyncFileSystem;
+using SpawnDev.AsyncFileSystem.BrowserWASM;
 using SpawnDev.BlazorJS;
 using SpawnDev.ILGPU.ML.Demo;
 using SpawnDev.ILGPU.ML.Demo.UnitTests;
 using SpawnDev.UnitTesting;
+using SpawnDev.WebTorrent;
 using System.Reflection;
 
 // Print build timestamp so we can verify we're running the right build via browser console
@@ -11,6 +14,13 @@ Console.WriteLine($"[SpawnDev.ILGPU.ML.Demo] Build: {BuildTimestamp.Value}");
 
 var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddBlazorJSRuntime();
+
+// Cross-platform persistent file system (OPFS in browser, native on desktop)
+builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
+
+// WebTorrent services — singletons, start with app via IAsyncBackgroundService
+builder.Services.AddSingleton<ServiceWorkerStreamHandler>();
+builder.Services.AddSingleton<WebTorrentClient>();
 
 // Register test types as singletons for UnitTestsView discovery
 // DumpFolder test runs FIRST — verifies results can be written
@@ -24,6 +34,10 @@ builder.Services.AddSingleton<DefaultTests>();
 
 builder.Services.AddSingleton(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 builder.Services.AddSingleton<SpawnDev.ILGPU.Services.ShaderDebugService>();
+
+// Cross-platform persistent file system (required by SpawnDev.WebTorrent for OPFS persistence)
+if (OperatingSystem.IsBrowser())
+    builder.Services.AddSingleton<SpawnDev.AsyncFileSystem.IAsyncFS, SpawnDev.AsyncFileSystem.BrowserWASM.AsyncFSFileSystemDirectoryHandle>();
 
 builder.RootComponents.Add<App>("#app");
 builder.RootComponents.Add<HeadOutlet>("head::after");
