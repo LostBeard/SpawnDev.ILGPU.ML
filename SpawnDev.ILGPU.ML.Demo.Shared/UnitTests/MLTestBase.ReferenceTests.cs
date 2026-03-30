@@ -159,7 +159,9 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         // EfficientNet-Lite0 is TFLite format, NHWC input
+        Console.WriteLine("[EfficientNet] Downloading model..."); Console.Out.Flush();
         var modelBytes = await http.GetByteArrayAsync("models/efficientnet-lite0/model.tflite");
+        Console.WriteLine($"[EfficientNet] Model: {modelBytes.Length} bytes, compiling..."); Console.Out.Flush();
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
@@ -171,6 +173,7 @@ public abstract partial class MLTestBase
         var inputData = new float[inputBytes.Length / 4];
         Buffer.BlockCopy(inputBytes, 0, inputData, 0, inputBytes.Length);
 
+        Console.WriteLine($"[EfficientNet] Compiled: {session.InputNames.Length} inputs, running inference..."); Console.Out.Flush();
         using var inputBuf = accelerator.Allocate1D(inputData);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 224, 224, 3 });
 

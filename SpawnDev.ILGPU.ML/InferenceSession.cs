@@ -1099,6 +1099,7 @@ public class InferenceSession : IDisposable
     {
         _executor.Dispose();
         _pool.Dispose();
+        _registry.Dispose(); // Release kernel param buffers — prevents GPU memory leak
     }
 }
 

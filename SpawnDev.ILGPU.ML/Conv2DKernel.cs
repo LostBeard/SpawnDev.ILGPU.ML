@@ -14,7 +14,7 @@ namespace SpawnDev.ILGPU.ML;
 /// Parameters are packed into an ArrayView to avoid WebGPU uniform buffer
 /// packing issues with high scalar parameter counts.
 /// </summary>
-public class Conv2DKernel
+public class Conv2DKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -347,4 +347,6 @@ public class Conv2DKernel
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(DepthwiseConv2DImpl);
     }
+
+    public void Dispose() => _paramsBuf?.Dispose();
 }

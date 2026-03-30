@@ -9,7 +9,7 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// Automatically registers all built-in operators on construction.
 /// Custom operators can be added via Register().
 /// </summary>
-public class OperatorRegistry
+public class OperatorRegistry : IDisposable
 {
     private readonly Dictionary<string, IOnnxOperator> _ops = new(StringComparer.OrdinalIgnoreCase);
     private readonly Accelerator _accelerator;
@@ -168,5 +168,19 @@ public class OperatorRegistry
         // Fused operators (created by GraphOptimizer)
         Register(new FusedLinearOperator(this));
         Register(new FusedScaledMatMulOperator(this));
+    }
+
+    public void Dispose()
+    {
+        // Dispose kernel instances that hold GPU param buffers.
+        // Without this, every InferenceSession leaks param buffers on Dispose.
+        foreach (var op in _ops.Values)
+            if (op is IDisposable d) d.Dispose();
+        // Dispose kernels with persistent param buffers
+        try { (Conv2D as IDisposable)?.Dispose(); } catch { }
+        try { (Conv1D as IDisposable)?.Dispose(); } catch { }
+        try { (Gather as IDisposable)?.Dispose(); } catch { }
+        try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
+        try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
     }
 }
