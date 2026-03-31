@@ -56,7 +56,6 @@ public abstract partial class MLTestBase
         });
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, N * outC * spatial);
-        AssertClose(expected, actual, 0f, "Concat axis=1: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, N * outC * spatial), expected, 0f, "Concat axis=1: ");
     });
 }

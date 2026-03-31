@@ -22,8 +22,7 @@ public abstract partial class MLTestBase
         t.Transpose(inBuf.View, outBuf.View, shape, perm);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 12);
-        AssertClose(expected, actual, 0f, "Transpose 2D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 12), expected, 0f, "Transpose 2D: ");
     });
 
     [TestMethod]
@@ -48,8 +47,7 @@ public abstract partial class MLTestBase
         t.Transpose(inBuf.View, outBuf.View, shape, perm);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 24);
-        AssertClose(expected, actual, 0f, "Transpose 3D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 24), expected, 0f, "Transpose 3D: ");
     });
 
     [TestMethod]
@@ -78,7 +76,6 @@ public abstract partial class MLTestBase
         t.Transpose(inBuf.View, outBuf.View, shape, perm);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 12);
-        AssertClose(expected, actual, 0f, "Transpose 4D NCHW→NHWC: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 12), expected, 0f, "Transpose 4D NCHW→NHWC: ");
     });
 }

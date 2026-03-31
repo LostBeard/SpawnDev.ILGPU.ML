@@ -21,8 +21,7 @@ public abstract partial class MLTestBase
         act.SigmoidInPlace(buf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "Sigmoid: ");
+        await AssertCloseGpu(accelerator, buf.View.SubView(0, count), expected, 1e-5f, "Sigmoid: ");
     });
 
     [TestMethod]
@@ -39,8 +38,7 @@ public abstract partial class MLTestBase
         act.TanhInPlace(buf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "Tanh: ");
+        await AssertCloseGpu(accelerator, buf.View.SubView(0, count), expected, 1e-5f, "Tanh: ");
     });
 
     [TestMethod]
@@ -60,8 +58,7 @@ public abstract partial class MLTestBase
         act.SiLUInPlace(buf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "SiLU: ");
+        await AssertCloseGpu(accelerator, buf.View.SubView(0, count), expected, 1e-5f, "SiLU: ");
     });
 
     [TestMethod]
@@ -78,8 +75,7 @@ public abstract partial class MLTestBase
         act.HardSigmoidInPlace(buf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "HardSigmoid: ");
+        await AssertCloseGpu(accelerator, buf.View.SubView(0, count), expected, 1e-5f, "HardSigmoid: ");
     });
 
     [TestMethod]
@@ -99,7 +95,6 @@ public abstract partial class MLTestBase
         act.HardSwishInPlace(buf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "HardSwish: ");
+        await AssertCloseGpu(accelerator, buf.View.SubView(0, count), expected, 1e-5f, "HardSwish: ");
     });
 }

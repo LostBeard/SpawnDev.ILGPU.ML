@@ -27,8 +27,7 @@ public abstract partial class MLTestBase
         red.ReduceSum(inBuf.View, outBuf.View, outer, reduce, inner);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outer);
-        AssertClose(expected, actual, reduce * 1e-5f, "ReduceSum last axis: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outer), expected, reduce * 1e-5f, "ReduceSum last axis: ");
     });
 
     [TestMethod]
@@ -53,8 +52,7 @@ public abstract partial class MLTestBase
         red.ReduceMean(inBuf.View, outBuf.View, outer, reduce, inner);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outer * inner);
-        AssertClose(expected, actual, reduce * 1e-5f, "ReduceMean middle axis: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outer * inner), expected, reduce * 1e-5f, "ReduceMean middle axis: ");
     });
 
     [TestMethod]
@@ -76,7 +74,6 @@ public abstract partial class MLTestBase
         red.ReduceMax(inBuf.View, outBuf.View, outer, reduce, inner);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outer);
-        AssertClose(expected, actual, 1e-6f, "ReduceMax: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outer), expected, 1e-6f, "ReduceMax: ");
     });
 }

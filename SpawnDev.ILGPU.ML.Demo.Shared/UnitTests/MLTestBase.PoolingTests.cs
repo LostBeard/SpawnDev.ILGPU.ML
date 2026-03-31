@@ -40,8 +40,7 @@ public abstract partial class MLTestBase
         pool.MaxPool2D(inBuf.View, outBuf.View, N, C, inH, inW, kH, kW, sH, sW, pH, pW);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, N * C * outH * outW);
-        AssertClose(expected, actual, 1e-5f, "MaxPool2D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, N * C * outH * outW), expected, 1e-5f, "MaxPool2D: ");
     });
 
     [TestMethod]
@@ -65,7 +64,6 @@ public abstract partial class MLTestBase
         pool.GlobalAvgPool(inBuf.View, outBuf.View, N, C, spatial);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, N * C);
-        AssertClose(expected, actual, spatial * 1e-6f, "GlobalAvgPool: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, N * C), expected, spatial * 1e-6f, "GlobalAvgPool: ");
     });
 }

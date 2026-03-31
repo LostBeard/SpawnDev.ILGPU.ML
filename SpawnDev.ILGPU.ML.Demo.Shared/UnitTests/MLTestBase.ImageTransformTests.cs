@@ -95,8 +95,7 @@ public abstract partial class MLTestBase
         color.RGBAToGrayscale(inBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-3f, "RGB→Gray: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-3f, "RGB→Gray: ");
     });
 
     private static float Lerp(float a, float b, float t) => a + (b - a) * t;

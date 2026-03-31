@@ -57,8 +57,7 @@ public abstract partial class MLTestBase
         conv.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, 1, 0);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outC * inH * inW);
-        AssertClose(expected, actual, inC * 2e-5f, "Conv2D 1x1: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * inH * inW), expected, inC * 2e-5f, "Conv2D 1x1: ");
     });
 
     [TestMethod]
@@ -80,8 +79,7 @@ public abstract partial class MLTestBase
         conv.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, 1, 1);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outC * inH * inW);
-        AssertClose(expected, actual, inC * kH * kW * 2e-5f, "Conv2D 3x3 pad=1: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * inH * inW), expected, inC * kH * kW * 2e-5f, "Conv2D 3x3 pad=1: ");
     });
 
     [TestMethod]
@@ -106,8 +104,7 @@ public abstract partial class MLTestBase
         conv.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride, 0);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
-        AssertClose(expected, actual, inC * kH * kW * 2e-5f, "Conv2D 14x14 patch: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * outH * outW), expected, inC * kH * kW * 2e-5f, "Conv2D 14x14 patch: ");
     });
 
     [TestMethod]
@@ -131,8 +128,7 @@ public abstract partial class MLTestBase
         conv.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, 1, 0);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
-        AssertClose(expected, actual, inC * kH * kW * 2e-5f, "Conv2D 3x3 no-pad: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * outH * outW), expected, inC * kH * kW * 2e-5f, "Conv2D 3x3 no-pad: ");
     });
 
     [TestMethod]
@@ -156,8 +152,7 @@ public abstract partial class MLTestBase
         conv.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride, padding);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
-        AssertClose(expected, actual, inC * kH * kW * 2e-5f, "Conv2D 3x3 s2p1: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * outH * outW), expected, inC * kH * kW * 2e-5f, "Conv2D 3x3 s2p1: ");
     });
 
     [TestMethod]
@@ -196,8 +191,7 @@ public abstract partial class MLTestBase
         conv.ForwardDepthwise(inBuf.View, wBuf.View, bBuf.View, outBuf.View, C, inH, inW, kH, kW, stride, padding);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, C * outH * outW);
-        AssertClose(expected, actual, kH * kW * 2e-5f, "Depthwise Conv2D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, C * outH * outW), expected, kH * kW * 2e-5f, "Depthwise Conv2D: ");
     });
 
     [TestMethod]
@@ -247,8 +241,7 @@ public abstract partial class MLTestBase
         convT.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride, padding);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
-        AssertClose(expected, actual, inC * kH * kW * 2e-5f, "ConvTranspose2D s4: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * outH * outW), expected, inC * kH * kW * 2e-5f, "ConvTranspose2D s4: ");
     });
 
     [TestMethod]
@@ -274,12 +267,11 @@ public abstract partial class MLTestBase
         await accelerator.SynchronizeAsync();
 
         // Expected: merged[t, c] = qkv[t, c] for c in [0, C) (Q portion)
-        var merged = await mergedBuf.CopyToHostAsync<float>(0, T * C);
         var expected = new float[T * C];
         for (int t = 0; t < T; t++)
             for (int c = 0; c < C; c++)
                 expected[t * C + c] = qkvData[t * 3 * C + c]; // Q is first C values per row
 
-        AssertClose(expected, merged, 0f, "Attention split/merge round-trip: ");
+        await AssertCloseGpu(accelerator, mergedBuf.View.SubView(0, T * C), expected, 0f, "Attention split/merge round-trip: ");
     });
 }

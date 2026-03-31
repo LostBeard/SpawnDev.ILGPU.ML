@@ -39,8 +39,7 @@ public abstract partial class MLTestBase
         fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.ReLU);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, M * N);
-        AssertClose(expected, actual, 1e-3f, "FusedLinear+ReLU: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-3f, "FusedLinear+ReLU: ");
     });
 
     /// <summary>
@@ -78,8 +77,7 @@ public abstract partial class MLTestBase
         fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.GELU);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, M * N);
-        AssertClose(expected, actual, 1e-2f, "FusedLinear+GELU: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-2f, "FusedLinear+GELU: ");
     });
 
     /// <summary>
@@ -108,7 +106,6 @@ public abstract partial class MLTestBase
         fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.None);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, M * N);
-        AssertClose(expected, actual, 1e-3f, "FusedLinear+None: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-3f, "FusedLinear+None: ");
     });
 }

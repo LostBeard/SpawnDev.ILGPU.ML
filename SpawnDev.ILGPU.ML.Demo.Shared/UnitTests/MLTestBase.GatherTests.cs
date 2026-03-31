@@ -27,7 +27,6 @@ public abstract partial class MLTestBase
         gather.GatherAxis0(dataBuf.View, idxBuf.View, outBuf.View, numIndices, embedDim);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, numIndices * embedDim);
-        AssertClose(expected, actual, 0f, "Gather embedding: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, numIndices * embedDim), expected, 0f, "Gather embedding: ");
     });
 }

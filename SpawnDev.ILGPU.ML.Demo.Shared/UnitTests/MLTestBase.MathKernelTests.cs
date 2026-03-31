@@ -23,8 +23,7 @@ public abstract partial class MLTestBase
         ew.Sqrt(inBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "Sqrt: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-5f, "Sqrt: ");
     });
 
     [TestMethod]
@@ -41,8 +40,7 @@ public abstract partial class MLTestBase
         ew.Exp(inBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-3f, "Exp: "); // Exp amplifies errors
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-3f, "Exp: "); // Exp amplifies errors
     });
 
     [TestMethod]
@@ -63,8 +61,7 @@ public abstract partial class MLTestBase
         ew.Div(aBuf.View, bBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-4f, "Div: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-4f, "Div: ");
     });
 
     [TestMethod]
@@ -92,8 +89,7 @@ public abstract partial class MLTestBase
         ew.Erf(inBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "Erf: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-5f, "Erf: ");
     });
 
     [TestMethod]
@@ -110,7 +106,6 @@ public abstract partial class MLTestBase
         ew.Abs(inBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 0f, "Abs: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 0f, "Abs: ");
     });
 }

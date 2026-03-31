@@ -40,8 +40,7 @@ public abstract partial class MLTestBase
         pad.Forward(inBuf.View, outBuf.View, inputShape, pads, mode: 0, constantValue: 0f);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, expected.Length);
-        AssertClose(expected, actual, 1e-6f, "Pad constant 2D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, expected.Length), expected, 1e-6f, "Pad constant 2D: ");
     });
 
     [TestMethod]
@@ -89,8 +88,7 @@ public abstract partial class MLTestBase
         pad.Forward(inBuf.View, outBuf.View, inputShape, pads, mode: 2);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, totalOut);
-        AssertClose(expected, actual, 1e-6f, "Pad reflect 4D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, totalOut), expected, 1e-6f, "Pad reflect 4D: ");
     });
 
     [TestMethod]
@@ -123,8 +121,7 @@ public abstract partial class MLTestBase
         pad.Forward(inBuf.View, outBuf.View, inputShape, pads, mode: 1);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 25);
-        AssertClose(expected, actual, 1e-6f, "Pad edge 2D: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 25), expected, 1e-6f, "Pad edge 2D: ");
     });
 
     [TestMethod]
@@ -160,8 +157,7 @@ public abstract partial class MLTestBase
         ew.NearestUpsample(inBuf.View, outBuf.View, inputShape, outputShape);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, totalOut);
-        AssertClose(expected, actual, 1e-6f, "NearestUpsample 2x: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, totalOut), expected, 1e-6f, "NearestUpsample 2x: ");
     });
 
     [TestMethod]
@@ -195,8 +191,7 @@ public abstract partial class MLTestBase
             new[] { N, C, inH, inW }, new[] { N, C, outH, outW });
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, totalOut);
-        AssertClose(expected, actual, 1e-6f, "NearestUpsample 56→112: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, totalOut), expected, 1e-6f, "NearestUpsample 56→112: ");
     });
 
     [TestMethod]
@@ -221,8 +216,7 @@ public abstract partial class MLTestBase
         ew.Div(aBuf.View, bBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-4f, "Div element-wise: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-4f, "Div element-wise: ");
     });
 
     [TestMethod]
@@ -242,7 +236,6 @@ public abstract partial class MLTestBase
         ew.Floor(inBuf.View, outBuf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-6f, "Floor: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, count), expected, 1e-6f, "Floor: ");
     });
 }

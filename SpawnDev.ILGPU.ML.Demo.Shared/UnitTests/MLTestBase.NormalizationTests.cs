@@ -40,8 +40,7 @@ public abstract partial class MLTestBase
         norm.BatchNorm(inBuf.View, outBuf.View, sBuf.View, bBuf.View, mBuf.View, vBuf.View, N, C, spatial);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, N * C * spatial);
-        AssertClose(expected, actual, 1e-4f, "BatchNorm: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, N * C * spatial), expected, 1e-4f, "BatchNorm: ");
     });
 
     [TestMethod]
@@ -87,8 +86,7 @@ public abstract partial class MLTestBase
         norm.InstanceNorm(inBuf.View, outBuf.View, sBuf.View, bBuf.View, N, C, spatial);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, total);
-        AssertClose(expected, actual, 1e-4f, "InstanceNorm small: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, total), expected, 1e-4f, "InstanceNorm small: ");
     });
 
     [TestMethod]
@@ -134,8 +132,7 @@ public abstract partial class MLTestBase
         norm.InstanceNorm(inBuf.View, outBuf.View, sBuf.View, bBuf.View, N, C, spatial);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, total);
-        AssertClose(expected, actual, 1e-3f, "InstanceNorm 224x224: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, total), expected, 1e-3f, "InstanceNorm 224x224: ");
     });
 
     [TestMethod]
@@ -171,7 +168,6 @@ public abstract partial class MLTestBase
         norm.RMSNorm(inBuf.View, outBuf.View, wBuf.View, rows, C);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, rows * C);
-        AssertClose(expected, actual, 1e-4f, "RMSNorm: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, rows * C), expected, 1e-4f, "RMSNorm: ");
     });
 }

@@ -23,8 +23,7 @@ public abstract partial class MLTestBase
         matMul.MatMul(aBuf.View, bBuf.View, cBuf.View, M, K, N);
         await accelerator.SynchronizeAsync();
 
-        var actual = await cBuf.CopyToHostAsync<float>(0, M * N);
-        AssertClose(expected, actual, K * 2e-6f, $"QKV MatMul [{M}x{K}]x[{K}x{N}]: ");
+        await AssertCloseGpu(accelerator, cBuf.View.SubView(0, M * N), expected, K * 2e-6f, $"QKV MatMul [{M}x{K}]x[{K}x{N}]: ");
     });
 
     [TestMethod]
@@ -43,8 +42,7 @@ public abstract partial class MLTestBase
         matMul.MatMul(aBuf.View, bBuf.View, cBuf.View, M, K, N);
         await accelerator.SynchronizeAsync();
 
-        var actual = await cBuf.CopyToHostAsync<float>(0, M * N);
-        AssertClose(expected, actual, K * 2e-6f, $"MLP fc2 [{M}x{K}]x[{K}x{N}]: ");
+        await AssertCloseGpu(accelerator, cBuf.View.SubView(0, M * N), expected, K * 2e-6f, $"MLP fc2 [{M}x{K}]x[{K}x{N}]: ");
     });
 
     [TestMethod]
@@ -73,8 +71,7 @@ public abstract partial class MLTestBase
         matMul.BatchedMatMul(aBuf.View, bBuf.View, cBuf.View, batch, M, K, N);
         await accelerator.SynchronizeAsync();
 
-        var actual = await cBuf.CopyToHostAsync<float>(0, batch * M * N);
-        AssertClose(expected, actual, K * 2e-6f, "Attention scores: ");
+        await AssertCloseGpu(accelerator, cBuf.View.SubView(0, batch * M * N), expected, K * 2e-6f, "Attention scores: ");
     });
 
     [TestMethod]
@@ -93,7 +90,6 @@ public abstract partial class MLTestBase
         matMul.MatMul(aBuf.View, bBuf.View, cBuf.View, M, K, N);
         await accelerator.SynchronizeAsync();
 
-        var actual = await cBuf.CopyToHostAsync<float>(0, M * N);
-        AssertClose(expected, actual, K * 2e-6f, "Non-aligned MatMul: ");
+        await AssertCloseGpu(accelerator, cBuf.View.SubView(0, M * N), expected, K * 2e-6f, "Non-aligned MatMul: ");
     });
 }

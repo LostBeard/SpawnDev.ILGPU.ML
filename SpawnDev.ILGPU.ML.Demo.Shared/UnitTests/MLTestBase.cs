@@ -162,5 +162,22 @@ public abstract partial class MLTestBase : IDisposable
             throw new Exception($"{label}Max error {maxErr:E3} at [{worstIdx}]: expected={expected[worstIdx]:F6}, actual={actual[worstIdx]:F6} (tol={tolerance:E1})");
     }
 
+    /// <summary>
+    /// GPU-side AssertClose — uploads expected to GPU, compares on GPU, reads back only 2 floats.
+    /// Use instead of CopyToHostAsync + AssertClose to avoid large GPU→CPU transfers.
+    /// </summary>
+    protected static async Task AssertCloseGpu(Accelerator accelerator,
+        ArrayView1D<float, Stride1D.Dense> actualGpu, float[] expected,
+        float tolerance, string label = "")
+    {
+        int count = Math.Min((int)actualGpu.Length, expected.Length);
+        using var expectedBuf = accelerator.Allocate1D(expected);
+        var ew = new ElementWiseKernels(accelerator);
+        var (meanErr, maxErr) = await ew.CompareOnGpuAsync(
+            actualGpu.SubView(0, count), expectedBuf.View.SubView(0, count), count);
+        if (maxErr > tolerance)
+            throw new Exception($"{label}GPU maxErr={maxErr:E3}, meanErr={meanErr:E3} (tol={tolerance:E1})");
+    }
+
     #endregion
 }

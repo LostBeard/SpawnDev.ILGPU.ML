@@ -106,9 +106,7 @@ public abstract partial class MLTestBase
         var ew = new ElementWiseKernels(accelerator);
         ew.Scale(outputTensor.Data.SubView(0, M * N), readBuf.View, M * N, 1f);
         await accelerator.SynchronizeAsync();
-        var actual = await readBuf.CopyToHostAsync<float>(0, M * N);
-
-        AssertClose(expected, actual, K * 2e-6f, "Graph MLP: ");
+        await AssertCloseGpu(accelerator, readBuf.View.SubView(0, M * N), expected, K * 2e-6f, "Graph MLP: ");
     });
 
     [TestMethod]

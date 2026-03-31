@@ -27,8 +27,7 @@ public abstract partial class MLTestBase
         layerNorm.Forward(inBuf.View, outBuf.View, gBuf.View, bBuf.View, rows, C);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, rows * C);
-        AssertClose(expected, actual, 1e-4f, "LayerNorm [1370x384]: ");
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "LayerNorm [1370x384]: ");
     });
 
     [TestMethod]
@@ -55,8 +54,7 @@ public abstract partial class MLTestBase
         ew.GELUInPlace(buf.View, count);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, count);
-        AssertClose(expected, actual, 1e-5f, "GELU erf: ");
+        await AssertCloseGpu(accelerator, buf.View, expected, 1e-5f, "GELU erf: ");
     });
 
     [TestMethod]
@@ -78,8 +76,7 @@ public abstract partial class MLTestBase
         ew.BroadcastMul(inBuf.View, gBuf.View, outBuf.View, T * C, C);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, T * C);
-        AssertClose(expected, actual, 1e-5f, "BroadcastMul: ");
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-5f, "BroadcastMul: ");
     });
 
     [TestMethod]
@@ -103,8 +100,7 @@ public abstract partial class MLTestBase
         softmax.Forward(buf.View, rows, cols);
         await accelerator.SynchronizeAsync();
 
-        var actual = await buf.CopyToHostAsync<float>(0, rows * cols);
-        AssertClose(expected, actual, 1e-5f, "Softmax: ");
+        await AssertCloseGpu(accelerator, buf.View, expected, 1e-5f, "Softmax: ");
     });
 
     [TestMethod]
@@ -122,7 +118,6 @@ public abstract partial class MLTestBase
         ew.TransposeLastTwo(transBuf.View, roundBuf.View, batch, cols, rows);
         await accelerator.SynchronizeAsync();
 
-        var actual = await roundBuf.CopyToHostAsync<float>(0, batch * rows * cols);
-        AssertClose(input, actual, 0f, "Transpose round-trip: ");
+        await AssertCloseGpu(accelerator, roundBuf.View, input, 0f, "Transpose round-trip: ");
     });
 }

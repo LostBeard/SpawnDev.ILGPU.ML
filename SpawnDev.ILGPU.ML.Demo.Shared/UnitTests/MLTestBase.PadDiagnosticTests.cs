@@ -32,8 +32,7 @@ public abstract partial class MLTestBase
         pad.Forward(inBuf.View, outBuf.View, inputShape, pads, mode: 0, constantValue: 0f);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 6);
-        AssertClose(expected, actual, 1e-6f, "PadDiag rank1 constant: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 6), expected, 1e-6f, "PadDiag rank1 constant: ");
     });
 
     /// <summary>
@@ -58,10 +57,9 @@ public abstract partial class MLTestBase
         kernel(4, outBuf.View, paramsBuf.View);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 4);
         // Every thread should compute 60.0
         var expected = new float[] { 60, 60, 60, 60 };
-        AssertClose(expected, actual, 1e-6f, "BufferLoopBound: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 4), expected, 1e-6f, "BufferLoopBound: ");
     });
 
     private static void BufferLoopBoundKernel(Index1D idx,
@@ -97,11 +95,10 @@ public abstract partial class MLTestBase
         kernel(2, outBuf.View, paramsBuf.View);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 2);
         // Thread 0: sum p[2+2*2+0] + p[2+2*2+1] = 10 + 20 = 30
         // Thread 1: same = 30
         var expected = new float[] { 30, 30 };
-        AssertClose(expected, actual, 1e-6f, "ComputedBufferIndex: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 2), expected, 1e-6f, "ComputedBufferIndex: ");
     });
 
     private static void ComputedIndexKernel(Index1D idx,
@@ -136,11 +133,10 @@ public abstract partial class MLTestBase
         kernel(2, outBuf.View, paramsBuf.View);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 2);
         // Each thread: 10 + 20 = 30 (breaks before 30)
         // broken flag is true → output = -sum = -30
         var expected = new float[] { -30, -30 };
-        AssertClose(expected, actual, 1e-6f, "BreakInsideLoop: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 2), expected, 1e-6f, "BreakInsideLoop: ");
     });
 
     private static void BreakInsideLoopKernel(Index1D idx,
@@ -186,12 +182,11 @@ public abstract partial class MLTestBase
         kernel(4, inBuf.View, outBuf.View, -99f);
         await accelerator.SynchronizeAsync();
 
-        var actual = await outBuf.CopyToHostAsync<float>(0, 4);
         // idx 0,1: even → flag=true → output=-99
         // idx 2,3: even → flag=true → output=-99
         // Actually: 0%2=0(true), 1%2=1(false), 2%2=0(true), 3%2=1(false)
         var expected = new float[] { -99, 2, -99, 4 };
-        AssertClose(expected, actual, 1e-6f, "TernaryBool: ");
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, 4), expected, 1e-6f, "TernaryBool: ");
     });
 
     private static void TernaryBoolKernel(Index1D idx,
