@@ -172,7 +172,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         var fmt = attrs.ContainsKey("_data_format") && attrs["_data_format"].ToString() == "NHWC"
             ? DataFormat.NHWC : DataFormat.NCHW;
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
-        var (_, _, _, _) = x.Length >= 4 ? LayoutHelper.GetDims(x, fmt) : (1, 1, 1, 1);
+        var (_, _, xH_dim, xW_dim) = x.Length >= 4 ? LayoutHelper.GetDims(x, fmt) : (1, 1, 1, 1);
         var (wOutC, _, wKH, wKW) = w.Length >= 4 ? LayoutHelper.GetWeightDims(w, fmt) : (w[0], 1, w.Length > 2 ? w[2] : 1, w.Length > 3 ? w[3] : 1);
         int outC = wOutC;
 
@@ -189,11 +189,17 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             }
             else
             {
+                // Use layout-aware dims — x[2]/x[3] are H/W only in NCHW, not NHWC
+                var sameDilations = attrs.ContainsKey("dilations") ? ((long[])attrs["dilations"]).Select(d => (int)d).ToArray() : new[] { 1, 1 };
+                int sdH = sameDilations.Length > 0 ? sameDilations[0] : 1;
+                int sdW = sameDilations.Length > 1 ? sameDilations[1] : sdH;
+                int sameEffKH = sdH * (wKH - 1) + 1;
+                int sameEffKW = sdW * (wKW - 1) + 1;
                 int sH = strides[0], sW = strides.Length > 1 ? strides[1] : 1;
-                int outH = (int)Math.Ceiling((double)x[2] / sH);
-                int outW = (int)Math.Ceiling((double)x[3] / sW);
-                int padH = Math.Max(0, (outH - 1) * sH + w[2] - x[2]);
-                int padW = Math.Max(0, (outW - 1) * sW + w[3] - x[3]);
+                int targetOutH = (int)Math.Ceiling((double)xH_dim / sH);
+                int targetOutW = (int)Math.Ceiling((double)xW_dim / sW);
+                int padH = Math.Max(0, (targetOutH - 1) * sH + sameEffKH - xH_dim);
+                int padW = Math.Max(0, (targetOutW - 1) * sW + sameEffKW - xW_dim);
                 pads = autoPad == "SAME_UPPER"
                     ? new[] { padH / 2, padW / 2, padH - padH / 2, padW - padW / 2 }
                     : new[] { padH - padH / 2, padW - padW / 2, padH / 2, padW / 2 };
@@ -215,8 +221,13 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         else
         {
             var (_, _, xH, xW) = LayoutHelper.GetDims(x, fmt);
-            int outH = (xH + pads[0] + (pads.Length > 2 ? pads[2] : 0) - wKH) / strides[0] + 1;
-            int outW = (xW + (pads.Length > 1 ? pads[1] : 0) + (pads.Length > 3 ? pads[3] : 0) - wKW) / (strides.Length > 1 ? strides[1] : 1) + 1;
+            var dilations2d = attrs.ContainsKey("dilations") ? ((long[])attrs["dilations"]).Select(d => (int)d).ToArray() : new[] { 1, 1 };
+            int dH = dilations2d.Length > 0 ? dilations2d[0] : 1;
+            int dW = dilations2d.Length > 1 ? dilations2d[1] : dH;
+            int effectiveKH = dH * (wKH - 1) + 1;
+            int effectiveKW = dW * (wKW - 1) + 1;
+            int outH = (xH + pads[0] + (pads.Length > 2 ? pads[2] : 0) - effectiveKH) / strides[0] + 1;
+            int outW = (xW + (pads.Length > 1 ? pads[1] : 0) + (pads.Length > 3 ? pads[3] : 0) - effectiveKW) / (strides.Length > 1 ? strides[1] : 1) + 1;
             return fmt == DataFormat.NHWC
                 ? new[] { new[] { x[0], outH, outW, outC } }
                 : new[] { new[] { x[0], outC, outH, outW } };
@@ -1128,8 +1139,9 @@ public class MaxPoolOperator(OperatorRegistry reg) : IOnnxOperator
         if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
         {
             int padH = Math.Max(0, ((int)Math.Ceiling((double)H / sH) - 1) * sH + kH - H);
+            int padW = Math.Max(0, ((int)Math.Ceiling((double)W / sW) - 1) * sW + kW - W);
             pH = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
-            pW = pH; // Assume square padding for now
+            pW = autoPad == "SAME_UPPER" ? padW / 2 : padW - padW / 2;
         }
         reg.Pooling.MaxPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
     }
@@ -1153,8 +1165,9 @@ public class AveragePoolOperator(OperatorRegistry reg) : IOnnxOperator
         if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
         {
             int padH = Math.Max(0, ((int)Math.Ceiling((double)H / sH) - 1) * sH + kH - H);
+            int padW = Math.Max(0, ((int)Math.Ceiling((double)W / sW) - 1) * sW + kW - W);
             pH = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
-            pW = pH;
+            pW = autoPad == "SAME_UPPER" ? padW / 2 : padW - padW / 2;
         }
         reg.Pooling.AvgPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
     }

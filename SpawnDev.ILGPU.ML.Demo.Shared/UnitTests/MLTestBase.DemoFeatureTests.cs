@@ -62,11 +62,11 @@ public abstract partial class MLTestBase
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["input"] = new[] { 1, 3, 320, 320 }
+                ["input"] = new[] { 1, 3, 1024, 1024 }
             });
 
         // Create test image: left half white, right half dark (simulates foreground/background)
-        int w = 320, h = 320;
+        int w = 1024, h = 1024;
         var pixels = new int[w * h];
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)

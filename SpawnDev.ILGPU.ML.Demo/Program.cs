@@ -18,8 +18,7 @@ builder.Services.AddBlazorJSRuntime();
 // Cross-platform persistent file system (OPFS in browser, native on desktop)
 builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
 
-// WebTorrent services — singletons, start with app via IAsyncBackgroundService
-builder.Services.AddSingleton<ServiceWorkerStreamHandler>();
+// WebTorrent client for P2P model delivery (direct stream access, no service worker needed)
 builder.Services.AddSingleton<WebTorrentClient>();
 
 // Register test types as singletons for UnitTestsView discovery
@@ -34,10 +33,6 @@ builder.Services.AddSingleton<DefaultTests>();
 
 builder.Services.AddSingleton(sp => new HttpClient { BaseAddress = new Uri(builder.HostEnvironment.BaseAddress) });
 builder.Services.AddSingleton<SpawnDev.ILGPU.Services.ShaderDebugService>();
-
-// Cross-platform persistent file system (required by SpawnDev.WebTorrent for OPFS persistence)
-if (OperatingSystem.IsBrowser())
-    builder.Services.AddSingleton<SpawnDev.AsyncFileSystem.IAsyncFS, SpawnDev.AsyncFileSystem.BrowserWASM.AsyncFSFileSystemDirectoryHandle>();
 
 builder.RootComponents.Add<App>("#app");
 builder.RootComponents.Add<HeadOutlet>("head::after");

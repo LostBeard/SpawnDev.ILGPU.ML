@@ -941,9 +941,57 @@ public class ElementWiseKernels : IDisposable
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[GELU] Validate {count} elements: maxErr={maxErr:E3}");
     }
 
+    // ─────────────────────────────────────────────────────────────
+    //  GPU-side verification (no large CPU readbacks)
+    // ─────────────────────────────────────────────────────────────
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _compareReduceKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _compareResultBuf;
+
+    /// <summary>
+    /// GPU kernel: compute |actual[i] - expected[i]|, atomically accumulate sum and max
+    /// into results[0] (sum) and results[1] (max). Results buffer must be zeroed first.
+    /// </summary>
+    private static void CompareReduceImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> actual,
+        ArrayView1D<float, Stride1D.Dense> expected,
+        ArrayView1D<float, Stride1D.Dense> results)
+    {
+        float diff = actual[idx] - expected[idx];
+        float absDiff = diff < 0f ? -diff : diff;
+        Atomic.Add(ref results[0], absDiff);
+        Atomic.Max(ref results[1], absDiff);
+    }
+
+    /// <summary>
+    /// Compare two GPU buffers and return (meanError, maxError).
+    /// Entire comparison runs on GPU — only 2 floats read back to CPU.
+    /// </summary>
+    public async Task<(float meanError, float maxError)> CompareOnGpuAsync(
+        ArrayView1D<float, Stride1D.Dense> actual,
+        ArrayView1D<float, Stride1D.Dense> expected,
+        int count)
+    {
+        _compareReduceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(CompareReduceImpl);
+
+        // Allocate or reuse 2-element results buffer [sum, max], zero it
+        _compareResultBuf ??= _accelerator.Allocate1D<float>(2);
+        _compareResultBuf.CopyFromCPU(new float[] { 0f, 0f });
+
+        _compareReduceKernel(count, actual, expected, _compareResultBuf.View);
+        await _accelerator.SynchronizeAsync();
+
+        var results = await _compareResultBuf.CopyToHostAsync<float>(0, 2);
+        return (results[0] / count, results[1]);
+    }
+
     public void Dispose()
     {
         _lastStridesBuf?.Dispose();
         _broadcastStridesBuf?.Dispose();
+        _compareResultBuf?.Dispose();
     }
 }

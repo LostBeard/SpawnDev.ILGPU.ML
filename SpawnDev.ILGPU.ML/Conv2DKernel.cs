@@ -115,6 +115,11 @@ public class Conv2DKernel : IDisposable
 
         int outH = (inH + 2 * padding - kH) / stride + 1;
         int outW = (inW + 2 * padding - kW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"Conv2D output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, padding={padding}). " +
+                $"This usually means SAME padding was not applied correctly.");
         int totalOutputElements = outC * outH * outW;
 
         // Pack params into persistent buffer. WebGPU guarantees writeBuffer→dispatch
@@ -186,6 +191,11 @@ public class Conv2DKernel : IDisposable
         EnsureLoaded();
         int outH = (inH + 2 * padding - kH) / stride + 1;
         int outW = (inW + 2 * padding - kW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"DepthwiseConv2D output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, padding={padding}). " +
+                $"This usually means SAME padding was not applied correctly.");
 
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
         _paramsBuf.CopyFromCPU(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
@@ -308,6 +318,11 @@ public class Conv2DKernel : IDisposable
             ArrayView1D<int, Stride1D.Dense>>(Conv2DNHWCImpl);
         int outH = (inH + 2 * padding - kH) / stride + 1;
         int outW = (inW + 2 * padding - kW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"Conv2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(inC={inC}, inH={inH}, inW={inW}, outC={outC}, kH={kH}, kW={kW}, stride={stride}, padding={padding}). " +
+                $"This usually means SAME padding was not applied correctly.");
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
         _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
         _conv2dNHWCKernel(outH * outW * outC, input, weight, bias, output, _paramsBuf.View);
@@ -324,6 +339,11 @@ public class Conv2DKernel : IDisposable
             ArrayView1D<int, Stride1D.Dense>>(DepthwiseConv2DNHWCImpl);
         int outH = (inH + 2 * padding - kH) / stride + 1;
         int outW = (inW + 2 * padding - kW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"DepthwiseConv2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, padding={padding}). " +
+                $"This usually means SAME padding was not applied correctly.");
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
         _paramsBuf.CopyFromCPU(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
         _depthwiseNHWCKernel(outH * outW * C, input, weight, bias, output, _paramsBuf.View);

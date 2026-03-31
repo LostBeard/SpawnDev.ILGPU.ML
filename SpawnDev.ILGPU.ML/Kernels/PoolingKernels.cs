@@ -107,6 +107,10 @@ public class PoolingKernels
         EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"MaxPool2D output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
         _poolParams ??= _accelerator.Allocate1D<int>(10);
         _poolParams.CopyFromCPU(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
         _maxPool2d!(N * C * outH * outW, input, output, _poolParams.View);
@@ -119,6 +123,10 @@ public class PoolingKernels
         EnsureLoaded();
         int outH = (inH + 2 * padH - kH) / strideH + 1;
         int outW = (inW + 2 * padW - kW) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"AvgPool2D output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
         _poolParams ??= _accelerator.Allocate1D<int>(10);
         _poolParams.CopyFromCPU(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
         _avgPool2d!(N * C * outH * outW, input, output, _poolParams.View);

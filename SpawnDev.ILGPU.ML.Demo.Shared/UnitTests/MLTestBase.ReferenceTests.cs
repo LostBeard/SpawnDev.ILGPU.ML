@@ -49,6 +49,40 @@ public abstract partial class MLTestBase
         return (actual, expected);
     }
 
+    /// <summary>
+    /// GPU-side reference comparison — keeps all data on GPU. Only 2 floats read back to CPU.
+    /// </summary>
+    private async Task RunReferenceComparisonGpu(
+        Accelerator accelerator, string modelPath, string inputRefPath, string outputRefPath,
+        int[] inputShape, float maxMeanErr, string name)
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var inputBytes = await http.GetByteArrayAsync(inputRefPath);
+        var inputFloats = new float[inputBytes.Length / 4];
+        Buffer.BlockCopy(inputBytes, 0, inputFloats, 0, inputBytes.Length);
+
+        var outputBytes = await http.GetByteArrayAsync(outputRefPath);
+        var expected = new float[outputBytes.Length / 4];
+        Buffer.BlockCopy(outputBytes, 0, expected, 0, outputBytes.Length);
+
+        var session = await InferenceSession.CreateFromFileAsync(accelerator, http, modelPath);
+        using var inputBuf = accelerator.Allocate1D(inputFloats);
+        var inputTensor = new Tensor(inputBuf.View, inputShape);
+
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = inputTensor
+        });
+
+        // Compare on GPU — expected stays on GPU, actual stays on GPU, only 2 floats come back
+        var output = outputs[session.OutputNames[0]];
+        int elems = Math.Min(output.ElementCount, expected.Length);
+        using var expectedBuf = accelerator.Allocate1D(expected);
+        await AssertReferenceMatchGpu(accelerator, output.Data.SubView(0, elems), expectedBuf.View.SubView(0, elems), elems, maxMeanErr, name);
+    }
+
     /// <summary>Helper: assert mean error within threshold.</summary>
     private static void AssertReferenceMatch(float[] actual, float[] expected, float maxMeanErr, string name)
     {
@@ -73,61 +107,73 @@ public abstract partial class MLTestBase
         }
     }
 
+    /// <summary>
+    /// GPU-side reference match — compares two GPU buffers entirely on-device.
+    /// Only 2 floats read back to CPU (meanError, maxError). No large readbacks.
+    /// </summary>
+    private static async Task AssertReferenceMatchGpu(
+        Accelerator accelerator,
+        ArrayView1D<float, Stride1D.Dense> actual,
+        ArrayView1D<float, Stride1D.Dense> expected,
+        int count, float maxMeanErr, string name)
+    {
+        var ew = new ElementWiseKernels(accelerator);
+        var (meanErr, maxErr) = await ew.CompareOnGpuAsync(actual, expected, count);
+        Console.WriteLine($"[{name}] GPU verify: meanErr={meanErr:F4}, maxErr={maxErr:F4}");
+        if (meanErr > maxMeanErr)
+            throw new Exception($"[{name}] Mean error {meanErr:F4} > {maxMeanErr}");
+    }
+
     // ── Style Transfer Reference Tests ──
 
     [TestMethod(Timeout = 120000)]
     public async Task Reference_StyleMosaic_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/style-mosaic/model.onnx",
             "references/style-mosaic/cat_input_nchw.bin",
             "references/style-mosaic/cat_output_nchw.bin",
-            new[] { 1, 3, 224, 224 });
-        AssertReferenceMatch(actual, expected, 5.0f, "StyleMosaic");
+            new[] { 1, 3, 224, 224 }, 5.0f, "StyleMosaic");
     });
 
     [TestMethod(Timeout = 120000)]
     public async Task Reference_StyleCandy_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/style-candy/model.onnx",
             "references/style-candy/cat_input_nchw.bin",
             "references/style-candy/cat_output_nchw.bin",
-            new[] { 1, 3, 224, 224 });
-        AssertReferenceMatch(actual, expected, 5.0f, "StyleCandy");
+            new[] { 1, 3, 224, 224 }, 5.0f, "StyleCandy");
     });
 
     [TestMethod(Timeout = 120000)]
     public async Task Reference_StyleRainPrincess_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/style-rain-princess/model.onnx",
             "references/style-rain-princess/cat_input_nchw.bin",
             "references/style-rain-princess/cat_output_nchw.bin",
-            new[] { 1, 3, 224, 224 });
-        AssertReferenceMatch(actual, expected, 5.0f, "StyleRainPrincess");
+            new[] { 1, 3, 224, 224 }, 5.0f, "StyleRainPrincess");
     });
 
     [TestMethod(Timeout = 120000)]
     public async Task Reference_StyleUdnie_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/style-udnie/model.onnx",
             "references/style-udnie/cat_input_nchw.bin",
             "references/style-udnie/cat_output_nchw.bin",
-            new[] { 1, 3, 224, 224 });
-        AssertReferenceMatch(actual, expected, 5.0f, "StyleUdnie");
+            new[] { 1, 3, 224, 224 }, 5.0f, "StyleUdnie");
     });
 
     [TestMethod(Timeout = 120000)]
     public async Task Reference_StylePointilism_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/style-pointilism/model.onnx",
             "references/style-pointilism/cat_input_nchw.bin",
             "references/style-pointilism/cat_output_nchw.bin",
-            new[] { 1, 3, 224, 224 });
-        AssertReferenceMatch(actual, expected, 5.0f, "StylePointilism");
+            new[] { 1, 3, 224, 224 }, 5.0f, "StylePointilism");
     });
 
     // ── Classification Reference Test ──
@@ -214,13 +260,11 @@ public abstract partial class MLTestBase
         if (accelerator.AcceleratorType == AcceleratorType.CPU)
             throw new UnsupportedTestException("ESPCN too slow on CPU");
 
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/super-resolution/model.onnx",
             "references/super-resolution/cat_input_y.bin",
             "references/super-resolution/cat_output_y.bin",
-            new[] { 1, 1, 224, 224 });
-        // ESPCN output is Y-channel [0,1] — tighter tolerance
-        AssertReferenceMatch(actual, expected, 0.01f, "ESPCN");
+            new[] { 1, 1, 224, 224 }, 0.01f, "ESPCN");
     });
 
     // ── Object Detection Reference Test ──
@@ -228,12 +272,11 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 120000)]
     public async Task Reference_YOLOv8_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
-        var (actual, expected) = await RunReferenceComparison(accelerator,
+        await RunReferenceComparisonGpu(accelerator,
             "models/yolov8n/model.onnx",
             "references/yolov8n/cat_input_nchw.bin",
             "references/yolov8n/cat_output.bin",
-            new[] { 1, 3, 640, 640 });
-        AssertReferenceMatch(actual, expected, 1.0f, "YOLOv8");
+            new[] { 1, 3, 640, 640 }, 1.0f, "YOLOv8");
     });
 
     // ── Text Classification Reference Test (256MB model — may OOM in browser) ──
