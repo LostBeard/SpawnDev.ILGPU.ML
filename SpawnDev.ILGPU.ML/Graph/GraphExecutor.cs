@@ -20,10 +20,12 @@ public class GraphExecutor : IDisposable
     private readonly Dictionary<string, Tensor> _weights;
     private readonly Dictionary<string, float[]>? _constantValues;
     private readonly ElementWiseKernels _ew;
+    private readonly Operators.OperatorRegistry? _registry;
 
     // TurboQuant KV cache (auto-detected)
     private readonly KVCacheAnalyzer.KVCacheInfo? _kvCacheInfo;
     private QuantizedKVCache? _kvCache;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _kvCacheFlagBuf;
     private readonly Dictionary<string, int>? _presentKeyOutputToLayer;
     private readonly Dictionary<string, int>? _presentValueOutputToLayer;
 
@@ -51,7 +53,8 @@ public class GraphExecutor : IDisposable
 
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
-        Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null)
+        Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null,
+        Operators.OperatorRegistry? registry = null)
     {
         _accelerator = accelerator;
         _graph = graph;
@@ -59,6 +62,7 @@ public class GraphExecutor : IDisposable
         _weights = weights;
         _constantValues = constantValues;
         _quantizedWeights = quantizedWeights;
+        _registry = registry;
         _ew = new ElementWiseKernels(accelerator);
 
         // Auto-detect KV cache pattern
@@ -326,6 +330,7 @@ public class GraphExecutor : IDisposable
                 InputNames = node.InputNames,
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
+                Registry = _registry,
             };
             var nodeSw = VerboseLogging ? System.Diagnostics.Stopwatch.StartNew() : null;
             node.Operator.Execute(ctx);
@@ -609,6 +614,7 @@ public class GraphExecutor : IDisposable
                 InputNames = node.InputNames,
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
+                Registry = _registry,
             };
             try
             {
@@ -621,7 +627,7 @@ public class GraphExecutor : IDisposable
                 var msg = $"Node {nodeIdx}/{_graph.Nodes.Length} '{node.OpType}' failed: {ex.Message} | " +
                     $"Inputs: [{string.Join(",", node.InputNames)}] shapes=({inputInfo}), " +
                     $"Outputs: [{string.Join(",", node.OutputNames)}] shapes=({outputInfo})";
-                Console.WriteLine($"[GraphExecutor] ERROR: {msg}");
+                if (InferenceSession.VerboseLogging) Console.WriteLine($"[GraphExecutor] ERROR: {msg}");
                 throw new InvalidOperationException(msg, ex);
             }
 
@@ -668,8 +674,7 @@ public class GraphExecutor : IDisposable
                     {
                         await _accelerator.SynchronizeAsync();
                         using var capBuf = _accelerator.Allocate1D<float>(captureCount);
-                        new ElementWiseKernels(_accelerator).Scale(
-                            captureOutput.Data.SubView(0, captureCount), capBuf.View, captureCount, 1f);
+                        _ew.Scale(captureOutput.Data.SubView(0, captureCount), capBuf.View, captureCount, 1f);
                         await _accelerator.SynchronizeAsync();
                         var vals = await capBuf.CopyToHostAsync<float>(0, captureCount);
                         var key = $"{nodeIdx:D3}_{node.OpType}_{node.OutputNames[0]}";
@@ -769,10 +774,13 @@ public class GraphExecutor : IDisposable
         }
 
         // Set use_cache_branch if the model has it
+        // NOTE: Do NOT use 'using' here — the buffer must survive until RunAsync reads it.
+        // It is tracked by _kvCacheFlagBuf and disposed on next call or in Dispose().
         if (_kvCacheInfo.UseCacheBranchInput != null)
         {
-            using var flagBuf = _accelerator.Allocate1D(new float[] { 1f });
-            inputs[_kvCacheInfo.UseCacheBranchInput] = new Tensor(flagBuf.View, new[] { 1 });
+            _kvCacheFlagBuf?.Dispose();
+            _kvCacheFlagBuf = _accelerator.Allocate1D(new float[] { 1f });
+            inputs[_kvCacheInfo.UseCacheBranchInput] = new Tensor(_kvCacheFlagBuf.View, new[] { 1 });
         }
     }
 
@@ -792,6 +800,8 @@ public class GraphExecutor : IDisposable
     {
         _pool.Dispose();
         _kvCache?.Dispose();
+        _kvCacheFlagBuf?.Dispose();
+        _ew.Dispose();
     }
 
     /// <summary>

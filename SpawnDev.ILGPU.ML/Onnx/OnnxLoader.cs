@@ -332,6 +332,9 @@ public static class OnnxLoader
         return weights;
     }
 
+    /// <summary>Convert an ONNX attribute to a typed object for operator execution.</summary>
+    public static object ConvertAttributePublic(OnnxAttributeProto attr) => ConvertAttribute(attr);
+
     private static object ConvertAttribute(OnnxAttributeProto attr)
     {
         return attr.Type switch
@@ -340,6 +343,7 @@ public static class OnnxLoader
             OnnxAttributeType.INT => attr.I,
             OnnxAttributeType.STRING => attr.StringValue,
             OnnxAttributeType.TENSOR => ExtractTensorScalar(attr.T),
+            OnnxAttributeType.GRAPH => attr.G ?? (object)attr.I, // Pass through GraphProto for If/Loop/Scan subgraphs
             OnnxAttributeType.FLOATS => attr.Floats ?? Array.Empty<float>(),
             OnnxAttributeType.INTS => attr.Ints ?? Array.Empty<long>(),
             OnnxAttributeType.STRINGS => attr.Strings?.Select(s => System.Text.Encoding.UTF8.GetString(s)).ToArray() ?? Array.Empty<string>(),

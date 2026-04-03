@@ -71,18 +71,66 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        // CPU fallback for general equations (reads GPU→CPU — not supported on WebGPU).
+        // GPU fast path: batched matmul (e.g., "bnij,bnjd->bnid" or "ij,jk->ik")
+        if (ctx.Inputs.Length == 2)
+        {
+            var aLabels = parsed.InputLabels[0];
+            var bLabels = parsed.InputLabels[1];
+            var oLabels = parsed.OutputLabels;
+
+            // Find contracted dimensions (in both inputs, not in output)
+            var contractedDims = aLabels.Intersect(bLabels).Except(oLabels).ToArray();
+            var batchLabels = aLabels.Intersect(bLabels).Intersect(oLabels).ToArray();
+
+            if (contractedDims.Length == 1)
+            {
+                // Single contraction → matmul pattern
+                char k = contractedDims[0];
+                var aFree = aLabels.Except(bLabels).Concat(aLabels.Intersect(bLabels).Intersect(oLabels)).ToArray();
+                var bFree = bLabels.Except(aLabels).Concat(bLabels.Intersect(aLabels).Intersect(oLabels)).ToArray();
+
+                // Check if this is a standard matmul: batch dims + M + K × batch dims + K + N → batch dims + M + N
+                int K = dimSizes.GetValueOrDefault(k, 1);
+                int batchSize = 1;
+                foreach (var bl in batchLabels) batchSize *= dimSizes.GetValueOrDefault(bl, 1);
+
+                // Compute M (A's free dims) and N (B's free dims)
+                var aFreeDims = aLabels.Where(c => !bLabels.Contains(c)).ToArray();
+                var bFreeDims = bLabels.Where(c => !aLabels.Contains(c)).ToArray();
+                int M = 1; foreach (var d in aFreeDims) M *= dimSizes.GetValueOrDefault(d, 1);
+                int N = 1; foreach (var d in bFreeDims) N *= dimSizes.GetValueOrDefault(d, 1);
+
+                if (batchSize * M * K == ctx.Inputs[0].ElementCount &&
+                    batchSize * K * N == ctx.Inputs[1].ElementCount &&
+                    batchSize * M * N == ctx.Outputs[0].ElementCount)
+                {
+                    // Batched matmul: treat batch dims as outer, contract K
+                    for (int b = 0; b < batchSize; b++)
+                    {
+                        reg.MatMul.MatMul(
+                            ctx.Inputs[0].Data.SubView(b * M * K, M * K),
+                            ctx.Inputs[1].Data.SubView(b * K * N, K * N),
+                            ctx.Outputs[0].Data.SubView(b * M * N, M * N),
+                            M, K, N);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // CPU fallback for general equations.
+        // Read inputs from pre-read constants (avoids GPU→CPU readback on browser backends).
         int outputSize = ctx.Outputs[0].ElementCount;
         var result = new float[outputSize];
         var outLabels = parsed.OutputLabels;
         var outShape = ctx.Outputs[0].Shape;
 
-        // Read all inputs to CPU
+        // Read all inputs to CPU — use constant values (pre-read during session creation)
+        // to avoid sync GPU→CPU which throws on WebGPU/WebGL/Wasm.
         var inputArrays = new float[ctx.Inputs.Length][];
+        bool allAvailable = true;
         for (int i = 0; i < ctx.Inputs.Length; i++)
         {
-            int count = ctx.Inputs[i].ElementCount;
-            // Try constant values first (avoids GPU readback)
             var constVals = ctx.TryGetInputValues(i);
             if (constVals != null)
             {
@@ -90,12 +138,27 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
             }
             else
             {
-                using var readBuf = reg.Accelerator.Allocate1D<float>(count);
-                reg.ElementWise.Scale(ctx.Inputs[i].Data.SubView(0, count), readBuf.View, count, 1f);
-                reg.Accelerator.Synchronize();
-                inputArrays[i] = readBuf.GetAsArray1D();
+                // Try CopyFrom to staging buffer + sync readback (works on desktop, throws on browser)
+                try
+                {
+                    int count = ctx.Inputs[i].ElementCount;
+                    using var readBuf = reg.Accelerator.Allocate1D<float>(count);
+                    readBuf.View.SubView(0, count).CopyFrom(ctx.Inputs[i].Data.SubView(0, count));
+                    reg.Accelerator.Synchronize();
+                    inputArrays[i] = readBuf.GetAsArray1D();
+                }
+                catch (NotSupportedException)
+                {
+                    // Browser backend — can't do sync GPU→CPU. Fall back to zero.
+                    // This Einsum equation needs a GPU kernel (not just broadcast multiply).
+                    inputArrays[i] = new float[ctx.Inputs[i].ElementCount];
+                    allAvailable = false;
+                }
             }
         }
+
+        if (!allAvailable && InferenceSession.VerboseLogging)
+            Console.WriteLine($"[Einsum] WARNING: equation '{equation}' has non-constant inputs on browser backend — GPU fast path needed");
 
         // Identify contracted dimensions (in inputs but not in output)
         var allInputLabels = new HashSet<char>();

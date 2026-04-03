@@ -49,6 +49,10 @@ public class OnnxOpContext
     /// kernels instead of regular float operations. Maps tensor name → byte ArrayView.</summary>
     public Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? QuantizedWeights { get; init; }
 
+    /// <summary>Operator registry for subgraph execution (If/Loop/Scan).
+    /// Allows control flow operators to compile and execute embedded ONNX subgraphs.</summary>
+    public OperatorRegistry? Registry { get; init; }
+
     /// <summary>Try to get pre-read float values for an input tensor (by index).
     /// Returns null if not available (tensor is dynamic, not pre-read).</summary>
     public float[]? TryGetInputValues(int inputIndex)

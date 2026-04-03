@@ -13,6 +13,9 @@ public class OnnxModelProto
     public List<OnnxOpsetImport> OpsetImports { get; set; } = new();
     public string ProducerName { get; set; } = "";
     public string ProducerVersion { get; set; } = "";
+    public string Domain { get; set; } = "";
+    public long ModelVersion { get; set; }
+    public string DocString { get; set; } = "";
 }
 
 /// <summary>The computation graph containing nodes, weights, and I/O specs.</summary>

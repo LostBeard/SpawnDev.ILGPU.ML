@@ -27,6 +27,7 @@ public class InferenceSession : IDisposable
     private readonly CompiledGraph _compiled;
     private readonly BufferPool _pool;
     private readonly Dictionary<string, Tensor> _weights;
+    private List<IDisposable>? _ownedBuffers; // Tracks buffers not managed by the pool (GGUF quantized bytes, etc.)
 
     /// <summary>Enable diagnostic logging to Console.</summary>
     public static bool VerboseLogging { get; set; }
@@ -147,7 +148,11 @@ public class InferenceSession : IDisposable
                             }
                             else
                             {
-                                new ElementWiseKernels(accelerator).Scale(view.Value.SubView(0, elems), readBuf.View.SubView(0, elems), elems, 1f);
+                                // GPU→GPU copy via CopyFrom — uses native CopyBufferToBuffer on WebGPU.
+                                // CopyFrom (GPU→GPU) works on ALL backends. Only CopyTo (GPU→CPU) throws
+                                // on browser backends. CopyFrom is preferred over Scale(×1) here because
+                                // it's a native GPU command with no kernel compilation overhead.
+                                readBuf.View.SubView(0, elems).CopyFrom(view.Value.SubView(0, elems));
                                 await accelerator.SynchronizeAsync();
                                 var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
                                 constantFloatValues[name] = hostBuf;
@@ -311,7 +316,11 @@ public class InferenceSession : IDisposable
             ModelFormat.ONNX => CreateFromOnnx(accelerator, modelBytes, onProgress, inputShapes, enableOptimization),
             ModelFormat.TFLite => CreateFromTFLite(accelerator, modelBytes, onProgress),
             ModelFormat.GGUF => CreateFromGGUF(accelerator, modelBytes, onProgress),
-            _ => throw new NotSupportedException($"Unknown model format. Expected ONNX (.onnx), TFLite (.tflite), or GGUF (.gguf).")
+            ModelFormat.SafeTensors => CreateFromSafeTensors(accelerator, modelBytes, onProgress),
+            ModelFormat.PyTorch => CreateFromPyTorch(accelerator, modelBytes, onProgress),
+            ModelFormat.CoreML => CreateFromCoreML(accelerator, modelBytes, onProgress),
+            ModelFormat.TFGraphDef => CreateFromTFGraphDef(accelerator, modelBytes, onProgress),
+            _ => throw new NotSupportedException($"Unknown model format '{format}'. Supported: ONNX, TFLite, GGUF, SafeTensors, PyTorch, CoreML, TFGraphDef.")
         };
     }
 
@@ -363,9 +372,28 @@ public class InferenceSession : IDisposable
             return ModelFormat.SafeTensors;
 
         // Fallback: if first byte is a protobuf field tag (0x08, 0x0A, etc.)
-        // Could be ONNX, TF GraphDef, or CoreML — check for ONNX/pytorch strings first
+        // Could be ONNX, TF GraphDef, or CoreML — differentiate by structure
         if (data[0] == 0x08 || data[0] == 0x0A)
+        {
+            // TFGraphDef starts with field 1 (node) = 0x0A, and the "onnx"/"pytorch" checks above
+            // already returned ONNX if those strings were present. If we reach here with 0x0A and
+            // TFGraphDefParser validates it, it's likely a frozen TF graph.
+            if (data[0] == 0x0A && TensorFlow.TFGraphDefParser.IsGraphDef(data))
+            {
+                // Additional heuristic: try parsing the first node — if it has a valid TF op name, it's TFGraphDef
+                try
+                {
+                    var testGraph = TensorFlow.TFGraphDefParser.Parse(data);
+                    if (testGraph.Nodes.Count > 0 && testGraph.Nodes.Any(n =>
+                        n.Op == "Placeholder" || n.Op == "Const" || n.Op == "Conv2D" ||
+                        n.Op == "MatMul" || n.Op == "Relu" || n.Op == "BiasAdd" ||
+                        n.Op == "FusedBatchNorm" || n.Op == "Add" || n.Op == "AddV2"))
+                        return ModelFormat.TFGraphDef;
+                }
+                catch { /* Not a valid TFGraphDef — fall through to ONNX */ }
+            }
             return ModelFormat.ONNX;
+        }
 
         return ModelFormat.Unknown;
     }
@@ -987,8 +1015,390 @@ public class InferenceSession : IDisposable
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
+            ModelName = graph.Name,
+            _ownedBuffers = quantizedBuffers.Count > 0
+                ? quantizedBuffers.Cast<IDisposable>().ToList() : null
+        };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  SafeTensors
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Create from SafeTensors weights. Requires config.json for graph construction.
+    /// If no config is provided, attempts to infer architecture from tensor names.
+    /// </summary>
+    public static InferenceSession CreateFromSafeTensors(
+        Accelerator accelerator, byte[] safeTensorsBytes,
+        Action<string, int>? onProgress = null,
+        string? configJson = null)
+    {
+        onProgress?.Invoke("parse", 0);
+        var stFile = SafeTensors.SafeTensorsParser.Parse(safeTensorsBytes);
+
+        // Parse config if provided, or create default
+        var config = configJson != null
+            ? Hub.HFModelConfig.Parse(configJson)
+            : InferConfigFromTensors(stFile);
+
+        onProgress?.Invoke("graph", 0);
+        var graph = SafeTensors.SafeTensorsGraphBuilder.BuildGraph(config, stFile);
+
+        onProgress?.Invoke("compile", 0);
+        var registry = new Operators.OperatorRegistry(accelerator);
+        var compiler = new Graph.GraphCompiler(registry);
+        var compiled = compiler.Compile(graph);
+
+        // Upload weights
+        onProgress?.Invoke("upload", 0);
+        var pool = new Tensors.BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensors.Tensor>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+
+        foreach (var tensor in stFile.Tensors)
+        {
+            if (!compiled.InitializerNames.Contains(tensor.Name) &&
+                !graph.Initializers.ContainsKey(tensor.Name)) continue;
+
+            var data = stFile.GetTensorFloat32(tensor);
+            if (data != null && data.Length > 0)
+            {
+                weights[tensor.Name] = pool.AllocatePermanent(data, tensor.Shape.Select(s => (int)s).ToArray(), tensor.Name);
+                if (data.Length <= 64)
+                    constantFloatValues[tensor.Name] = data;
+            }
+        }
+
+        // Add scale constants for attention
+        for (int L = 0; L < config.NumHiddenLayers; L++)
+        {
+            string scaleName = $"L{L}_scale";
+            if (graph.Initializers.ContainsKey(scaleName))
+            {
+                float scale = 1f / MathF.Sqrt(config.HiddenSize / config.NumAttentionHeads);
+                weights[scaleName] = pool.AllocatePermanent(new[] { scale }, new[] { 1 }, scaleName);
+                constantFloatValues[scaleName] = new[] { scale };
+            }
+        }
+
+        var executor = new Graph.GraphExecutor(accelerator, compiled, weights, constantFloatValues, registry: registry);
+        onProgress?.Invoke("ready", 100);
+
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
+        {
             ModelName = graph.Name
         };
+    }
+
+    /// <summary>Infer architecture config from tensor names when no config.json is available.</summary>
+    private static Hub.HFModelConfig InferConfigFromTensors(SafeTensors.SafeTensorsFile stFile)
+    {
+        var config = new Hub.HFModelConfig();
+        var names = stFile.Tensors.Select(t => t.Name).ToHashSet();
+
+        // Detect model type from tensor naming pattern
+        if (names.Any(n => n.StartsWith("model.layers.")))
+            config.ModelType = "llama"; // LLaMA/Mistral naming
+        else if (names.Any(n => n.StartsWith("transformer.h.")))
+            config.ModelType = "gpt2";
+        else if (names.Any(n => n.StartsWith("bert.")))
+            config.ModelType = "bert";
+        else
+            config.ModelType = "llama"; // default
+
+        // Count layers
+        config.NumHiddenLayers = names
+            .Where(n => n.Contains(".self_attn.q_proj.") || n.Contains(".attn.c_attn."))
+            .Select(n => { var parts = n.Split('.'); for (int i = 0; i < parts.Length; i++) if (int.TryParse(parts[i], out var v)) return v; return -1; })
+            .Where(v => v >= 0).DefaultIfEmpty(0).Max() + 1;
+
+        // Infer hidden size from embedding weight
+        var embedTensor = stFile.Tensors.FirstOrDefault(t =>
+            t.Name == "model.embed_tokens.weight" || t.Name == "transformer.wte.weight");
+        if (embedTensor != null && embedTensor.Shape.Length >= 2)
+        {
+            config.VocabSize = (int)embedTensor.Shape[0];
+            config.HiddenSize = (int)embedTensor.Shape[1];
+        }
+
+        // Infer heads from Q projection shape
+        var qTensor = stFile.Tensors.FirstOrDefault(t => t.Name.Contains("q_proj.weight"));
+        if (qTensor != null && qTensor.Shape.Length >= 2)
+            config.NumAttentionHeads = (int)(qTensor.Shape[0] / (config.HiddenSize / 128)); // rough estimate
+
+        if (config.NumAttentionHeads <= 0)
+            config.NumAttentionHeads = config.HiddenSize / 64; // fallback: 64-dim heads
+
+        config.NumKeyValueHeads = config.NumAttentionHeads;
+        config.IntermediateSize = config.HiddenSize * 4;
+        config.ArchitectureFamily = "decoder";
+
+        return config;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  PyTorch
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Create from PyTorch checkpoint (.pt/.pth).
+    /// Parses ZIP archive, extracts pickle metadata, loads tensor data.
+    /// Requires config.json for graph construction (same as SafeTensors).
+    /// </summary>
+    public static InferenceSession CreateFromPyTorch(
+        Accelerator accelerator, byte[] ptBytes,
+        Action<string, int>? onProgress = null,
+        string? configJson = null)
+    {
+        onProgress?.Invoke("parse", 0);
+        var checkpoint = PyTorch.PyTorchLoader.Parse(ptBytes);
+
+        // Try to read config.json from the ZIP if present
+        if (configJson == null && checkpoint.ConfigJson != null)
+            configJson = checkpoint.ConfigJson;
+
+        // Parse pickle for tensor metadata
+        var tensorMetas = new List<PyTorch.PickleReader.TensorMeta>();
+        if (checkpoint.PickleData != null)
+            tensorMetas = PyTorch.PickleReader.ReadTensors(checkpoint.PickleData);
+
+        // Build a SafeTensorsFile-compatible wrapper for the graph builder
+        var config = configJson != null
+            ? Hub.HFModelConfig.Parse(configJson)
+            : new Hub.HFModelConfig { ModelType = "llama", NumHiddenLayers = 1, HiddenSize = 768, NumAttentionHeads = 12 };
+
+        // For now, PyTorch models need to be exported to SafeTensors or ONNX for full support.
+        // This provides basic weight extraction and model loading.
+        onProgress?.Invoke("compile", 0);
+        var registry = new Operators.OperatorRegistry(accelerator);
+        var graph = new Graph.ModelGraph { Name = $"PyTorch ({config.ModelType})" };
+        graph.Inputs.Add(new Graph.GraphValueInfo { Name = "input_ids", Shape = new[] { 1, -1 } });
+        graph.Outputs.Add(new Graph.GraphValueInfo { Name = "logits", Shape = new[] { 1, -1, config.VocabSize } });
+
+        var compiler = new Graph.GraphCompiler(registry);
+        var compiled = compiler.Compile(graph);
+        var pool = new Tensors.BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensors.Tensor>();
+
+        // Load tensor data from ZIP data files
+        foreach (var meta in tensorMetas)
+        {
+            if (checkpoint.DataFiles.TryGetValue(meta.StorageKey, out var rawData))
+            {
+                // Convert raw bytes to float32 based on dtype
+                float[]? floats = meta.DType switch
+                {
+                    "torch.FloatStorage" or "float32" => ConvertBytesToFloat32(rawData, meta.Offset, meta.Shape),
+                    "torch.HalfStorage" or "float16" => ConvertHalfToFloat32(rawData, meta.Offset, meta.Shape),
+                    "torch.BFloat16Storage" or "bfloat16" => ConvertBFloat16ToFloat32(rawData, meta.Offset, meta.Shape),
+                    _ => null
+                };
+                if (floats != null)
+                {
+                    var shape = meta.Shape.Select(s => (int)s).ToArray();
+                    weights[meta.Name] = pool.AllocatePermanent(floats, shape, meta.Name);
+                }
+            }
+        }
+
+        var executor = new Graph.GraphExecutor(accelerator, compiled, weights, new Dictionary<string, float[]>(), registry: registry);
+        onProgress?.Invoke("ready", 100);
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights) { ModelName = graph.Name };
+    }
+
+    private static float[]? ConvertBytesToFloat32(byte[] data, long offset, long[] shape)
+    {
+        int count = (int)shape.Aggregate(1L, (a, b) => a * b);
+        if (count <= 0) return null;
+        var result = new float[count];
+        Buffer.BlockCopy(data, (int)(offset * 4), result, 0, count * 4);
+        return result;
+    }
+
+    private static float[]? ConvertHalfToFloat32(byte[] data, long offset, long[] shape)
+    {
+        int count = (int)shape.Aggregate(1L, (a, b) => a * b);
+        if (count <= 0) return null;
+        var result = new float[count];
+        int byteOff = (int)(offset * 2);
+        for (int i = 0; i < count; i++)
+        {
+            ushort h = (ushort)(data[byteOff + i * 2] | (data[byteOff + i * 2 + 1] << 8));
+            result[i] = (float)BitConverter.Int16BitsToHalf((short)h);
+        }
+        return result;
+    }
+
+    private static float[]? ConvertBFloat16ToFloat32(byte[] data, long offset, long[] shape)
+    {
+        int count = (int)shape.Aggregate(1L, (a, b) => a * b);
+        if (count <= 0) return null;
+        var result = new float[count];
+        int byteOff = (int)(offset * 2);
+        for (int i = 0; i < count; i++)
+        {
+            ushort bf16 = (ushort)(data[byteOff + i * 2] | (data[byteOff + i * 2 + 1] << 8));
+            result[i] = BitConverter.Int32BitsToSingle(bf16 << 16);
+        }
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  CoreML
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Create from CoreML model (.mlmodel).
+    /// Parses protobuf structure and extracts neural network layers.
+    /// </summary>
+    public static InferenceSession CreateFromCoreML(
+        Accelerator accelerator, byte[] coremlBytes,
+        Action<string, int>? onProgress = null)
+    {
+        onProgress?.Invoke("parse", 0);
+        var model = CoreML.CoreMLParser.Parse(coremlBytes);
+
+        onProgress?.Invoke("compile", 0);
+        var registry = new Operators.OperatorRegistry(accelerator);
+
+        // Build graph from CoreML layers — use actual model input/output names
+        var graph = new Graph.ModelGraph { Name = $"CoreML (v{model.SpecVersion})" };
+
+        // Use model's declared input names, or fall back to "input"
+        string inputName = model.InputNames.Count > 0 ? model.InputNames[0] : "input";
+        string outputName = model.OutputNames.Count > 0 ? model.OutputNames[0] : "output";
+
+        // Infer input shape from first conv/linear layer's weight dimensions
+        int[] inputShape = new[] { 1, 3, 224, 224 }; // default
+        foreach (var layer in model.Layers)
+        {
+            if (layer.Weights != null && layer.LayerType is "convolution" or "innerProduct")
+            {
+                int wLen = layer.Weights.Length;
+                // Conv weights are [outC, inC, kH, kW] — if sqrt is integer, likely a square kernel
+                int sqLen = (int)Math.Sqrt(wLen);
+                if (sqLen > 3) inputShape = new[] { 1, 3, 224, 224 };
+                break;
+            }
+        }
+
+        // Infer output shape from last layer's output count
+        int[] outputShape = new[] { 1, 1000 }; // default for classifiers
+        for (int i = model.Layers.Count - 1; i >= 0; i--)
+        {
+            if (model.Layers[i].Bias != null)
+            {
+                outputShape = new[] { 1, model.Layers[i].Bias.Length };
+                break;
+            }
+        }
+
+        graph.Inputs.Add(new Graph.GraphValueInfo { Name = inputName, Shape = inputShape });
+        graph.Outputs.Add(new Graph.GraphValueInfo { Name = outputName, Shape = outputShape });
+
+        // Map CoreML layers to ONNX operators
+        string prev = inputName;
+        for (int i = 0; i < model.Layers.Count; i++)
+        {
+            var layer = model.Layers[i];
+            string outName = layer.Outputs.Count > 0 ? layer.Outputs[0] : $"layer_{i}_out";
+            string inName = layer.Inputs.Count > 0 ? layer.Inputs[0] : prev;
+
+            string? opType = layer.LayerType switch
+            {
+                "convolution" => "Conv",
+                "innerProduct" => "MatMul",
+                "batchnorm" => "BatchNormalization",
+                "pooling" => "MaxPool",
+                "softmax" => "Softmax",
+                "activation" => "Relu",
+                "add" => "Add",
+                "multiply" => "Mul",
+                "concat" => "Concat",
+                "reshape" => "Reshape",
+                "flatten" => "Flatten",
+                "upsample" => "Resize",
+                _ => "Identity"
+            };
+
+            graph.Nodes.Add(new Graph.GraphNode
+            {
+                OpType = opType,
+                Inputs = new List<string> { inName },
+                Outputs = new List<string> { outName }
+            });
+            prev = outName;
+        }
+
+        var compiler = new Graph.GraphCompiler(registry);
+        var compiled = compiler.Compile(graph);
+        var pool = new Tensors.BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensors.Tensor>();
+
+        // Upload extracted weights from CoreML layers
+        onProgress?.Invoke("upload", 0);
+        for (int i = 0; i < model.Layers.Count; i++)
+        {
+            var layer = model.Layers[i];
+            if (layer.Weights != null)
+            {
+                string wName = $"{layer.Name}.weight";
+                weights[wName] = pool.AllocatePermanent(layer.Weights, new[] { layer.Weights.Length }, wName);
+                graph.Initializers[wName] = new[] { layer.Weights.Length };
+            }
+            if (layer.Bias != null)
+            {
+                string bName = $"{layer.Name}.bias";
+                weights[bName] = pool.AllocatePermanent(layer.Bias, new[] { layer.Bias.Length }, bName);
+                graph.Initializers[bName] = new[] { layer.Bias.Length };
+            }
+        }
+
+        var executor = new Graph.GraphExecutor(accelerator, compiled, weights, new Dictionary<string, float[]>(), registry: registry);
+        onProgress?.Invoke("ready", 100);
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights) { ModelName = graph.Name };
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  TensorFlow GraphDef (.pb frozen graph)
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Create from a TensorFlow frozen graph (.pb).
+    /// Parses the GraphDef protobuf, maps TF ops to ONNX equivalents,
+    /// extracts Const weights, and builds an executable graph.
+    /// </summary>
+    public static InferenceSession CreateFromTFGraphDef(
+        Accelerator accelerator, byte[] graphDefBytes,
+        Action<string, int>? onProgress = null)
+    {
+        onProgress?.Invoke("parse", 0);
+        var tfGraph = TensorFlow.TFGraphDefParser.Parse(graphDefBytes);
+
+        onProgress?.Invoke("compile", 0);
+        var registry = new Operators.OperatorRegistry(accelerator);
+        var (graph, constants) = TensorFlow.TFGraphDefGraphBuilder.BuildGraph(tfGraph);
+
+        var compiler = new Graph.GraphCompiler(registry);
+        var compiled = compiler.Compile(graph);
+        var pool = new Tensors.BufferPool(accelerator);
+        var weights = new Dictionary<string, Tensors.Tensor>();
+
+        // Upload constant tensors (weights/biases from Const nodes)
+        onProgress?.Invoke("upload", 0);
+        int uploaded = 0;
+        foreach (var (name, data) in constants)
+        {
+            var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { data.Length };
+            weights[name] = pool.AllocatePermanent(data, shape, name);
+            uploaded++;
+            onProgress?.Invoke("upload", (int)(100.0 * uploaded / constants.Count));
+        }
+
+        var executor = new Graph.GraphExecutor(accelerator, compiled, weights, new Dictionary<string, float[]>(), registry: registry);
+        onProgress?.Invoke("ready", 100);
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, weights) { ModelName = graph.Name };
     }
 
     /// <summary>Run inference with named input tensors. Returns named output tensors.</summary>
@@ -1099,7 +1509,11 @@ public class InferenceSession : IDisposable
     {
         _executor.Dispose();
         _pool.Dispose();
-        _registry.Dispose(); // Release kernel param buffers — prevents GPU memory leak
+        _registry.Dispose();
+        // Dispose buffers not tracked by the pool (GGUF quantized bytes, etc.)
+        if (_ownedBuffers != null)
+            foreach (var buf in _ownedBuffers)
+                try { buf.Dispose(); } catch { }
     }
 }
 

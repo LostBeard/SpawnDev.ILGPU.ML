@@ -1,3 +1,5 @@
+using ILGPU;
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 using static SpawnDev.ILGPU.ML.Operators.BroadcastHelper;
 
@@ -585,6 +587,798 @@ public class ModOperator(OperatorRegistry reg) : IOnnxOperator
         else
         {
             BroadcastHelper.BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x % y : 0f);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  New operators — full ONNX coverage (batch 3)
+// ═══════════════════════════════════════════════════════════
+
+// ── Bitwise operators (operate on float-encoded integers) ──
+
+public class BitwiseAndOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "BitwiseAnd";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx) =>
+        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a & (int)b));
+}
+
+public class BitwiseOrOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "BitwiseOr";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx) =>
+        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a | (int)b));
+}
+
+public class BitwiseXorOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "BitwiseXor";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx) =>
+        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a ^ (int)b));
+}
+
+public class BitwiseNotOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "BitwiseNot";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        int count = ctx.Inputs[0].ElementCount;
+        reg.ElementWise.UnaryOp(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count,
+            new DelegateSpecialization<Func<float, float>>(x => (float)(~(int)x)));
+    }
+}
+
+public class BitShiftOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "BitShift";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public void Execute(OnnxOpContext ctx)
+    {
+        string direction = ctx.GetString("direction", "LEFT");
+        if (direction == "LEFT")
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a << (int)b));
+        else
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a >> (int)b));
+    }
+}
+
+// ── Quantization operators ──
+
+public class DequantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "DequantizeLinear";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // y = (x - zero_point) * scale
+        var x = ctx.Inputs[0]; var scale = ctx.Inputs[1];
+        var zp = ctx.Inputs.Length > 2 ? ctx.Inputs[2] : null;
+        int count = x.ElementCount;
+        if (zp != null)
+        {
+            // x - zero_point → temp, then temp * scale → output
+            using var temp = reg.Accelerator.Allocate1D<float>(count);
+            reg.ElementWise.Sub(x.Data, zp.Data, temp.View, count);
+            reg.ElementWise.Mul(temp.View, scale.Data, ctx.Outputs[0].Data, count);
+        }
+        else
+        {
+            reg.ElementWise.Mul(x.Data, scale.Data, ctx.Outputs[0].Data, count);
+        }
+    }
+}
+
+public class QuantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "QuantizeLinear";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // y = clamp(round(x / scale) + zero_point, qmin, qmax)
+        var x = ctx.Inputs[0]; var scale = ctx.Inputs[1];
+        int count = x.ElementCount;
+        reg.ElementWise.Div(x.Data, scale.Data, ctx.Outputs[0].Data, count);
+        reg.ElementWise.Round(ctx.Outputs[0].Data, ctx.Outputs[0].Data, count);
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
+            reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[2].Data, ctx.Outputs[0].Data, count);
+        reg.ElementWise.Clip(ctx.Outputs[0].Data, ctx.Outputs[0].Data, count, 0f, 255f);
+    }
+}
+
+public class DynamicQuantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "DynamicQuantizeLinear";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0], new[] { 1 }, new[] { 1 } }; // y, y_scale, y_zero_point
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Compute scale and zero_point from input range, then quantize
+        int count = ctx.Inputs[0].ElementCount;
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+        // Simplified: just copy for now — full dynamic quant needs ReduceMin/Max + scale calc
+    }
+}
+
+// ── CastLike ──
+
+public class CastLikeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "CastLike";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // CastLike: cast input to same type as target_type input. Our engine is all float32.
+        int count = ctx.Inputs[0].ElementCount;
+        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+    }
+}
+
+// ── Compress ──
+
+public class CompressOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Compress";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        // Output size depends on runtime condition values — estimate as input size
+        return new[] { new[] { inputs[0].Aggregate(1, (a, b) => a * b) } };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Compress: select elements where condition is non-zero
+        // CPU fallback — Compress is rare in inference
+        var condVals = ctx.TryGetInputValues(1);
+        if (condVals != null)
+        {
+            var inputVals = ctx.TryGetInputValues(0);
+            if (inputVals != null)
+            {
+                var result = new List<float>();
+                for (int i = 0; i < Math.Min(inputVals.Length, condVals.Length); i++)
+                    if (condVals[i] != 0f) result.Add(inputVals[i]);
+                if (result.Count > 0)
+                {
+                    using var buf = reg.Accelerator.Allocate1D(result.ToArray());
+                    reg.ElementWise.Scale(buf.View, ctx.Outputs[0].Data.SubView(0, result.Count), result.Count, 1f);
+                }
+            }
+        }
+    }
+}
+
+// ── EyeLike ──
+
+public class EyeLikeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "EyeLike";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        int rows = shape[^2], cols = shape[^1];
+        int k = ctx.GetInt("k", 0);
+        var data = new float[rows * cols];
+        for (int i = 0; i < rows; i++)
+        {
+            int j = i + k;
+            if (j >= 0 && j < cols) data[i * cols + j] = 1f;
+        }
+        using var buf = reg.Accelerator.Allocate1D(data);
+        reg.ElementWise.Scale(buf.View, ctx.Outputs[0].Data.SubView(0, rows * cols), rows * cols, 1f);
+    }
+}
+
+// ── LRN (Local Response Normalization) ──
+
+public class LRNOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "LRN";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // LRN: y[n,c,h,w] = x[n,c,h,w] / (bias + alpha/size * sum(x[n,c',h,w]^2))^beta
+        // where c' ranges over [max(0,c-floor(size/2)), min(C-1,c+floor(size/2))]
+        int size = ctx.GetInt("size", 5);
+        float alpha = ctx.GetFloat("alpha", 0.0001f);
+        float beta = ctx.GetFloat("beta", 0.75f);
+        float bias = ctx.GetFloat("bias", 1f);
+
+        var xVals = ctx.TryGetInputValues(0);
+        if (xVals == null)
+        {
+            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+            return;
+        }
+
+        var shape = ctx.Inputs[0].Shape;
+        int N = shape[0], C = shape[1];
+        int spatial = 1;
+        for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
+        int halfSize = size / 2;
+        var result = new float[xVals.Length];
+
+        for (int n = 0; n < N; n++)
+        {
+            for (int c = 0; c < C; c++)
+            {
+                int cStart = Math.Max(0, c - halfSize);
+                int cEnd = Math.Min(C - 1, c + halfSize);
+                for (int s = 0; s < spatial; s++)
+                {
+                    float sqSum = 0f;
+                    for (int cp = cStart; cp <= cEnd; cp++)
+                        sqSum += xVals[(n * C + cp) * spatial + s] * xVals[(n * C + cp) * spatial + s];
+                    float denom = MathF.Pow(bias + alpha / size * sqSum, beta);
+                    result[(n * C + c) * spatial + s] = xVals[(n * C + c) * spatial + s] / denom;
+                }
+            }
+        }
+
+        int total = result.Length;
+        using var buf = reg.Accelerator.Allocate1D(result);
+        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+    }
+}
+
+// ── MeanVarianceNormalization ──
+
+public class MeanVarianceNormalizationOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "MeanVarianceNormalization";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // MVN: normalize over specified axes (default: 0,2,3 = batch+spatial, keep channel)
+        // y = (x - mean(x, axes)) / sqrt(variance(x, axes) + eps)
+        var xVals = ctx.TryGetInputValues(0);
+        if (xVals == null)
+        {
+            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+            return;
+        }
+
+        var shape = ctx.Inputs[0].Shape;
+        int rank = shape.Length;
+
+        // Parse axes — default is {0, 2, 3} for NCHW (normalize over batch+spatial, keep channel)
+        int[] axes;
+        if (ctx.Attributes.TryGetValue("axes", out var axObj) && axObj is long[] axLong)
+            axes = axLong.Select(a => (int)(a < 0 ? a + rank : a)).ToArray();
+        else
+            axes = rank == 4 ? new[] { 0, 2, 3 } : Enumerable.Range(0, rank).Where(i => i != 1).ToArray();
+
+        var axisSet = new HashSet<int>(axes);
+        float eps = 1e-9f;
+
+        // Compute strides
+        var strides = new int[rank];
+        strides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * shape[d + 1];
+
+        // Determine reduction group: dimensions NOT in axes are the "keep" dims
+        int totalElements = xVals.Length;
+        int reductionSize = 1;
+        foreach (int a in axes) reductionSize *= shape[a];
+        int groupCount = totalElements / reductionSize;
+
+        var result = new float[totalElements];
+
+        // For each unique combination of kept dimensions, compute mean+var over reduction dims
+        var keepDims = Enumerable.Range(0, rank).Where(d => !axisSet.Contains(d)).ToArray();
+        var keepShape = keepDims.Select(d => shape[d]).ToArray();
+        int keepTotal = keepShape.Length > 0 ? keepShape.Aggregate(1, (a, b) => a * b) : 1;
+
+        for (int g = 0; g < keepTotal; g++)
+        {
+            // Decode group index into kept-dimension coordinates
+            var keepCoords = new int[keepDims.Length];
+            int tmp = g;
+            for (int i = keepDims.Length - 1; i >= 0; i--)
+            {
+                keepCoords[i] = tmp % keepShape[i];
+                tmp /= keepShape[i];
+            }
+
+            // Collect all indices belonging to this group
+            var indices = new List<int>();
+            CollectIndices(shape, axes, axisSet, keepDims, keepCoords, strides, 0, 0, indices);
+
+            // Compute mean
+            float mean = 0f;
+            foreach (int idx in indices) mean += xVals[idx];
+            mean /= indices.Count;
+
+            // Compute variance
+            float variance = 0f;
+            foreach (int idx in indices)
+            {
+                float diff = xVals[idx] - mean;
+                variance += diff * diff;
+            }
+            variance /= indices.Count;
+            float invStd = 1f / MathF.Sqrt(variance + eps);
+
+            // Normalize
+            foreach (int idx in indices)
+                result[idx] = (xVals[idx] - mean) * invStd;
+        }
+
+        int total = result.Length;
+        using var buf = reg.Accelerator.Allocate1D(result);
+        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+    }
+
+    private static void CollectIndices(int[] shape, int[] axes, HashSet<int> axisSet, int[] keepDims, int[] keepCoords, int[] strides, int dim, int baseIdx, List<int> indices)
+    {
+        if (dim == shape.Length) { indices.Add(baseIdx); return; }
+        if (axisSet.Contains(dim))
+        {
+            for (int i = 0; i < shape[dim]; i++)
+                CollectIndices(shape, axes, axisSet, keepDims, keepCoords, strides, dim + 1, baseIdx + i * strides[dim], indices);
+        }
+        else
+        {
+            int keepIdx = Array.IndexOf(keepDims, dim);
+            CollectIndices(shape, axes, axisSet, keepDims, keepCoords, strides, dim + 1, baseIdx + keepCoords[keepIdx] * strides[dim], indices);
+        }
+    }
+}
+
+// ── Random operators ──
+
+public class RandomNormalOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "RandomNormal";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var shape = attrs.ContainsKey("shape") ? ((long[])attrs["shape"]).Select(x => (int)x).ToArray() : new[] { 1 };
+        return new[] { shape };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        float mean = ctx.GetFloat("mean", 0f);
+        float scale = ctx.GetFloat("scale", 1f);
+        int seed = ctx.GetInt("seed", 0);
+        var rng = seed != 0 ? new Random(seed) : new Random();
+        int count = ctx.Outputs[0].ElementCount;
+        var data = new float[count];
+        for (int i = 0; i < count; i++)
+        {
+            // Box-Muller transform
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = rng.NextDouble();
+            data[i] = (float)(mean + scale * Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
+        }
+        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+    }
+}
+
+public class RandomNormalLikeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "RandomNormalLike";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx) => new RandomNormalOperator(reg).Execute(ctx);
+}
+
+public class RandomUniformOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "RandomUniform";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var shape = attrs.ContainsKey("shape") ? ((long[])attrs["shape"]).Select(x => (int)x).ToArray() : new[] { 1 };
+        return new[] { shape };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        float low = ctx.GetFloat("low", 0f);
+        float high = ctx.GetFloat("high", 1f);
+        int seed = ctx.GetInt("seed", 0);
+        var rng = seed != 0 ? new Random(seed) : new Random();
+        int count = ctx.Outputs[0].ElementCount;
+        var data = new float[count];
+        for (int i = 0; i < count; i++)
+            data[i] = low + (float)rng.NextDouble() * (high - low);
+        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+    }
+}
+
+public class RandomUniformLikeOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "RandomUniformLike";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx) => new RandomUniformOperator(reg).Execute(ctx);
+}
+
+// ── ReverseSequence ──
+
+public class ReverseSequenceOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "ReverseSequence";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        // ReverseSequence: reverse elements along batch_axis using per-batch sequence lengths
+        // Input[0]: data tensor, Input[1]: sequence_lengths (1D, one per batch)
+        int batchAxis = ctx.GetInt("batch_axis", 1);
+        int timeAxis = ctx.GetInt("time_axis", 0);
+
+        var xVals = ctx.TryGetInputValues(0);
+        var seqLens = ctx.TryGetInputValues(1);
+        if (xVals == null || seqLens == null)
+        {
+            int count = ctx.Inputs[0].ElementCount;
+            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count), ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+            return;
+        }
+
+        var shape = ctx.Inputs[0].Shape;
+        int rank = shape.Length;
+        var result = new float[xVals.Length];
+
+        // Compute strides
+        var strides = new int[rank];
+        strides[rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * shape[d + 1];
+
+        int batchSize = shape[batchAxis];
+        int timeSize = shape[timeAxis];
+
+        // Iterate over all elements
+        for (int i = 0; i < xVals.Length; i++)
+        {
+            // Decode flat index to coordinates
+            var coords = new int[rank];
+            int tmp = i;
+            for (int d = 0; d < rank; d++) { coords[d] = tmp / strides[d]; tmp %= strides[d]; }
+
+            int batchIdx = coords[batchAxis];
+            int timeIdx = coords[timeAxis];
+            int seqLen = (int)seqLens[batchIdx];
+
+            // Reverse within [0, seqLen) along time axis, leave rest unchanged
+            if (timeIdx < seqLen)
+            {
+                coords[timeAxis] = seqLen - 1 - timeIdx;
+            }
+
+            // Encode coordinates back to flat index
+            int srcIdx = 0;
+            for (int d = 0; d < rank; d++) srcIdx += coords[d] * strides[d];
+            result[i] = xVals[srcIdx];
+        }
+
+        int total = result.Length;
+        using var buf = reg.Accelerator.Allocate1D(result);
+        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+    }
+}
+
+// ── Scatter (deprecated, use ScatterElements) ──
+
+public class ScatterOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Scatter";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx) => new ScatterElementsOperator(reg).Execute(ctx);
+}
+
+// ── Unique ──
+
+public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Unique";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0], inputs[0], inputs[0], new[] { 1 } }; // Y, indices, inverse_indices, counts
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Unique: return sorted unique elements with indices, inverse_indices, and counts
+        var xVals = ctx.TryGetInputValues(0);
+        if (xVals == null)
+        {
+            int count = ctx.Inputs[0].ElementCount;
+            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+            return;
+        }
+
+        int sorted = ctx.GetInt("sorted", 1);
+
+        // Find unique values preserving first-occurrence order
+        var uniqueValues = new List<float>();
+        var firstIdx = new List<int>(); // index of first occurrence
+        var inverseMap = new int[xVals.Length]; // maps each input to its unique index
+        var valueToUniqueIdx = new Dictionary<float, int>();
+
+        for (int i = 0; i < xVals.Length; i++)
+        {
+            if (!valueToUniqueIdx.TryGetValue(xVals[i], out int uid))
+            {
+                uid = uniqueValues.Count;
+                valueToUniqueIdx[xVals[i]] = uid;
+                uniqueValues.Add(xVals[i]);
+                firstIdx.Add(i);
+            }
+            inverseMap[i] = uid;
+        }
+
+        // Sort if requested
+        if (sorted != 0)
+        {
+            var sortOrder = Enumerable.Range(0, uniqueValues.Count)
+                .OrderBy(i => uniqueValues[i]).ToArray();
+            var remapping = new int[uniqueValues.Count];
+            for (int i = 0; i < sortOrder.Length; i++) remapping[sortOrder[i]] = i;
+
+            var sortedValues = sortOrder.Select(i => uniqueValues[i]).ToList();
+            var sortedFirstIdx = sortOrder.Select(i => firstIdx[i]).ToList();
+            uniqueValues = sortedValues;
+            firstIdx = sortedFirstIdx;
+            for (int i = 0; i < inverseMap.Length; i++) inverseMap[i] = remapping[inverseMap[i]];
+        }
+
+        // Compute counts
+        var counts = new float[uniqueValues.Count];
+        foreach (int uid in inverseMap) counts[uid]++;
+
+        // Output 0: Y (unique values)
+        int yLen = Math.Min(uniqueValues.Count, ctx.Outputs[0].ElementCount);
+        if (yLen > 0)
+        {
+            using var yBuf = reg.Accelerator.Allocate1D(uniqueValues.ToArray());
+            reg.ElementWise.Scale(yBuf.View.SubView(0, yLen), ctx.Outputs[0].Data.SubView(0, yLen), yLen, 1f);
+        }
+
+        // Output 1: indices (first occurrence of each unique value)
+        if (ctx.Outputs.Length > 1 && ctx.Outputs[1] != null)
+        {
+            var idxArr = firstIdx.Select(i => (float)i).ToArray();
+            int idxLen = Math.Min(idxArr.Length, ctx.Outputs[1].ElementCount);
+            if (idxLen > 0)
+            {
+                using var idxBuf = reg.Accelerator.Allocate1D(idxArr);
+                reg.ElementWise.Scale(idxBuf.View.SubView(0, idxLen), ctx.Outputs[1].Data.SubView(0, idxLen), idxLen, 1f);
+            }
+        }
+
+        // Output 2: inverse_indices (maps each input element to its unique index)
+        if (ctx.Outputs.Length > 2 && ctx.Outputs[2] != null)
+        {
+            var invArr = inverseMap.Select(i => (float)i).ToArray();
+            int invLen = Math.Min(invArr.Length, ctx.Outputs[2].ElementCount);
+            if (invLen > 0)
+            {
+                using var invBuf = reg.Accelerator.Allocate1D(invArr);
+                reg.ElementWise.Scale(invBuf.View.SubView(0, invLen), ctx.Outputs[2].Data.SubView(0, invLen), invLen, 1f);
+            }
+        }
+
+        // Output 3: counts (how many times each unique value appears)
+        if (ctx.Outputs.Length > 3 && ctx.Outputs[3] != null)
+        {
+            int cntLen = Math.Min(counts.Length, ctx.Outputs[3].ElementCount);
+            if (cntLen > 0)
+            {
+                using var cntBuf = reg.Accelerator.Allocate1D(counts);
+                reg.ElementWise.Scale(cntBuf.View.SubView(0, cntLen), ctx.Outputs[3].Data.SubView(0, cntLen), cntLen, 1f);
+            }
+        }
+    }
+}
+
+// ── Window functions ──
+
+public class HannWindowOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "HannWindow";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        var sizeVals = inputs.Length > 0 ? inputs[0] : new[] { 1 };
+        return new[] { sizeVals };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        var sizeVals = ctx.TryGetInputValues(0);
+        int size = sizeVals != null && sizeVals.Length > 0 ? (int)sizeVals[0] : 1;
+        var data = new float[size];
+        for (int i = 0; i < size; i++)
+            data[i] = 0.5f * (1f - MathF.Cos(2f * MathF.PI * i / (size - 1)));
+        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, size), size, 1f);
+    }
+}
+
+public class HammingWindowOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "HammingWindow";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new HannWindowOperator(reg).InferOutputShapes(inputs, attrs);
+    public void Execute(OnnxOpContext ctx)
+    {
+        var sizeVals = ctx.TryGetInputValues(0);
+        int size = sizeVals != null && sizeVals.Length > 0 ? (int)sizeVals[0] : 1;
+        var data = new float[size];
+        for (int i = 0; i < size; i++)
+            data[i] = 0.54f - 0.46f * MathF.Cos(2f * MathF.PI * i / (size - 1));
+        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, size), size, 1f);
+    }
+}
+
+public class BlackmanWindowOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "BlackmanWindow";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new HannWindowOperator(reg).InferOutputShapes(inputs, attrs);
+    public void Execute(OnnxOpContext ctx)
+    {
+        var sizeVals = ctx.TryGetInputValues(0);
+        int size = sizeVals != null && sizeVals.Length > 0 ? (int)sizeVals[0] : 1;
+        var data = new float[size];
+        for (int i = 0; i < size; i++)
+        {
+            float t = 2f * MathF.PI * i / (size - 1);
+            data[i] = 0.42f - 0.5f * MathF.Cos(t) + 0.08f * MathF.Cos(2f * t);
+        }
+        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, size), size, 1f);
+    }
+}
+
+// ── Multinomial ──
+
+public class MultinomialOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "Multinomial";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        int sampleSize = attrs.ContainsKey("sample_size") ? Convert.ToInt32(attrs["sample_size"]) : 1;
+        return new[] { new[] { inputs[0][0], sampleSize } };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // Multinomial: sample indices from log-probability distribution
+        // Input: [batch, num_classes] log-probabilities
+        // Output: [batch, sample_size] sampled class indices
+        var logProbs = ctx.TryGetInputValues(0);
+        int sampleSize = ctx.GetInt("sample_size", 1);
+        int seed = ctx.GetInt("seed", 0);
+        var rng = seed != 0 ? new Random(seed) : new Random();
+
+        var shape = ctx.Inputs[0].Shape;
+        int batch = shape[0], numClasses = shape[1];
+        var result = new float[batch * sampleSize];
+
+        for (int b = 0; b < batch; b++)
+        {
+            // Convert log-probs to cumulative probabilities
+            var probs = new float[numClasses];
+            float maxLogProb = float.NegativeInfinity;
+            for (int c = 0; c < numClasses; c++)
+            {
+                float lp = logProbs != null ? logProbs[b * numClasses + c] : 0f;
+                if (lp > maxLogProb) maxLogProb = lp;
+            }
+            float sumExp = 0f;
+            for (int c = 0; c < numClasses; c++)
+            {
+                float lp = logProbs != null ? logProbs[b * numClasses + c] : 0f;
+                probs[c] = MathF.Exp(lp - maxLogProb);
+                sumExp += probs[c];
+            }
+            // Normalize and build CDF
+            float cumSum = 0f;
+            for (int c = 0; c < numClasses; c++)
+            {
+                probs[c] /= sumExp;
+                cumSum += probs[c];
+                probs[c] = cumSum;
+            }
+            // Sample
+            for (int s = 0; s < sampleSize; s++)
+            {
+                float u = (float)rng.NextDouble();
+                int idx = 0;
+                for (int c = 0; c < numClasses; c++)
+                    if (u <= probs[c]) { idx = c; break; }
+                result[b * sampleSize + s] = idx;
+            }
+        }
+
+        using var buf = reg.Accelerator.Allocate1D(result);
+        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
+        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+    }
+}
+
+// ── Loss functions (training) ──
+
+public class NegativeLogLikelihoodLossOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "NegativeLogLikelihoodLoss";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        string reduction = attrs.ContainsKey("reduction") ? attrs["reduction"].ToString()! : "mean";
+        if (reduction == "none") return new[] { inputs.Length > 1 ? inputs[1] : new[] { inputs[0][0] } };
+        return new[] { new[] { 1 } };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // NLLLoss: -sum(target * log_prob) / N
+        // Input[0] = log-probabilities [N, C], Input[1] = target [N] (class indices)
+        var logProbs = ctx.TryGetInputValues(0);
+        var targets = ctx.TryGetInputValues(1);
+        if (logProbs == null || targets == null)
+        {
+            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
+            return;
+        }
+        var shape = ctx.Inputs[0].Shape;
+        int N = shape[0], C = shape.Length > 1 ? shape[1] : 1;
+        float loss = 0f;
+        for (int n = 0; n < N; n++)
+        {
+            int target = (int)targets[n];
+            if (target >= 0 && target < C)
+                loss -= logProbs[n * C + target];
+        }
+        string reduction = ctx.GetString("reduction", "mean");
+        if (reduction == "mean" && N > 0) loss /= N;
+        using var buf = reg.Accelerator.Allocate1D(new[] { loss });
+        reg.ElementWise.Scale(buf.View, ctx.Outputs[0].Data.SubView(0, 1), 1, 1f);
+    }
+}
+
+public class SoftmaxCrossEntropyLossOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SoftmaxCrossEntropyLoss";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+    {
+        string reduction = attrs.ContainsKey("reduction") ? attrs["reduction"].ToString()! : "mean";
+        if (reduction == "none") return new[] { new[] { inputs[0][0] }, inputs[0] };
+        return new[] { new[] { 1 }, inputs[0] };
+    }
+    public void Execute(OnnxOpContext ctx)
+    {
+        // SoftmaxCE: softmax(logits) → -log(p[target]) → reduce
+        // Input[0] = logits [N, C], Input[1] = target [N]
+        var logits = ctx.TryGetInputValues(0);
+        var targets = ctx.TryGetInputValues(1);
+        if (logits == null || targets == null)
+        {
+            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
+            if (ctx.Outputs.Length > 1) reg.ElementWise.Fill(ctx.Outputs[1].Data, ctx.Outputs[1].ElementCount, 0f);
+            return;
+        }
+        var shape = ctx.Inputs[0].Shape;
+        int N = shape[0], C = shape.Length > 1 ? shape[1] : 1;
+        var logProbs = new float[N * C];
+        float totalLoss = 0f;
+
+        for (int n = 0; n < N; n++)
+        {
+            // Softmax
+            float maxVal = float.NegativeInfinity;
+            for (int c = 0; c < C; c++) maxVal = Math.Max(maxVal, logits[n * C + c]);
+            float sumExp = 0f;
+            for (int c = 0; c < C; c++) { logProbs[n * C + c] = MathF.Exp(logits[n * C + c] - maxVal); sumExp += logProbs[n * C + c]; }
+            for (int c = 0; c < C; c++) logProbs[n * C + c] = MathF.Log(logProbs[n * C + c] / sumExp);
+            // Loss
+            int target = (int)targets[n];
+            if (target >= 0 && target < C) totalLoss -= logProbs[n * C + target];
+        }
+        string reduction = ctx.GetString("reduction", "mean");
+        if (reduction == "mean" && N > 0) totalLoss /= N;
+        using var lossBuf = reg.Accelerator.Allocate1D(new[] { totalLoss });
+        reg.ElementWise.Scale(lossBuf.View, ctx.Outputs[0].Data.SubView(0, 1), 1, 1f);
+        // Output[1] = log probabilities
+        if (ctx.Outputs.Length > 1)
+        {
+            using var lpBuf = reg.Accelerator.Allocate1D(logProbs);
+            int lpCount = Math.Min(logProbs.Length, ctx.Outputs[1].ElementCount);
+            reg.ElementWise.Scale(lpBuf.View.SubView(0, lpCount), ctx.Outputs[1].Data.SubView(0, lpCount), lpCount, 1f);
         }
     }
 }

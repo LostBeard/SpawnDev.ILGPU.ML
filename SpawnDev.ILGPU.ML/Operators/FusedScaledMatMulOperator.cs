@@ -66,12 +66,12 @@ public class FusedScaledMatMulOperator : IOnnxOperator
             _registry.MatMul.BatchedMatMul(A.Data, B.Data, output.Data, batch, M, K, N);
         }
 
-        // Apply scale to ALL elements (not just first batch)
+        // Apply scale in-place — do NOT use Scale(output, output) which violates WebGPU aliasing
         int totalElements = output.ElementCount;
         if (MathF.Abs(scaleValue - 1f) > 1e-7f)
         {
-            _registry.ElementWise.Scale(output.Data.SubView(0, totalElements),
-                output.Data.SubView(0, totalElements), totalElements, scaleValue);
+            _registry.ElementWise.ScaleInPlace(output.Data.SubView(0, totalElements),
+                totalElements, scaleValue);
         }
     }
 }

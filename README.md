@@ -18,13 +18,13 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
 - **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
-- **88 ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
+- **200+ ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
 - **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency. Auto-detected from magic bytes. Full round-trip export for SPZ, PLY, glTF, OBJ. First pure C# SPZ parser.
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **HuggingFace CDN** — All models load from HuggingFace with OPFS caching. No bundling. Search, browse, and load any public model.
 - **Zero-copy GPU pipeline** — Data enters the GPU at preprocessing and stays until the pixel hits the canvas. CanvasRendererFactory for GPU→canvas rendering without CPU readback.
 - **Streaming weight loader** — Large models (GPT-2 652MB) load one tensor at a time. Minimal CPU peak memory. FP16 on GPU supported.
-- **104 numpy-verified operator tests** — every operator validated against known-correct reference data
+- **122+ numpy-verified operator tests** — every operator validated against known-correct reference data, CPU reference comparison minimum bar
 - **Single image to 3D** — TripoSR for exportable meshes (glTF/OBJ), LGM for Gaussian splats (SPZ/PLY)
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 - **P2P Model Delivery + Shared Compute** — [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) integration for decentralized model delivery via BitTorrent. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. WebCrypto-native ECDSA signing for browser compatibility. Foundation for `AcceleratorType.P2P` distributed compute.
@@ -44,13 +44,37 @@ One API loads models from any ML ecosystem. Format is auto-detected from magic b
 | **Core ML** (.mlmodel) | Apple, iOS/macOS | Apple's Neural Engine models. |
 
 ```csharp
-// All of these work — format detected automatically
+// All of these work — format detected automatically from magic bytes
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+
+// Or load from HTTP with auto-detection
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.onnx");
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.tflite");
 var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "model.gguf");
+
+// Format-specific when you know the type
+var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
+var session = InferenceSession.CreateFromTFLite(accelerator, tfliteBytes);
+var session = InferenceSession.CreateFromGGUF(accelerator, ggufBytes);
+var session = InferenceSession.CreateFromSafeTensors(accelerator, safetensorBytes);
+var session = InferenceSession.CreateFromPyTorch(accelerator, ptBytes);
+var session = InferenceSession.CreateFromCoreML(accelerator, mlmodelBytes);
+var session = InferenceSession.CreateFromTFGraphDef(accelerator, pbBytes);
 ```
 
-Every format produces the same `ModelGraph` intermediate representation. All 71 operators, all 30 GPU kernels, all 6 backends, and the full graph optimizer work identically regardless of source format. **Write one pipeline, load from any ecosystem.**
+### Format Details
+
+| Format | Graph Construction | Weight Types | Tested Models |
+|--------|-------------------|-------------|---------------|
+| **ONNX** | Full parser, 200+ ops, external data | F32, F16 | SqueezeNet, MobileNet, DistilBERT, GPT-2, Whisper, DA3, YOLOv8, MoveNet, CLIP, RMBG, SD-Turbo |
+| **TFLite** | FlatBuffer parser, NHWC layout, 60+ op mappings, fused activations | F32, F16, INT8, UINT8 (auto-dequant) | BlazeFace, EfficientNet-Lite, MediaPipe models |
+| **GGUF** | Architecture-aware graph builder (Llama family) | F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 | SmolLM, TinyLlama, Phi-4 Mini |
+| **SafeTensors** | Config-driven graph builder (encoder/vision/decoder architectures) | F32, F16, BF16, F64, I32, I16, I8, U8 | HuggingFace transformer weights |
+| **TF GraphDef** | Protobuf parser + op mapping to ONNX equivalents | F32, F16, INT32, DOUBLE | TensorFlow frozen graphs |
+| **PyTorch** | ZIP + PickleReader + weight extraction | F32, F16, BF16 | PyTorch checkpoints (weight inspection) |
+| **Core ML** | Protobuf parser + neural network layer mapping | F32, F16 | Apple .mlmodel files |
+
+Every format produces the same `ModelGraph` intermediate representation. All 200+ operators, all 30 GPU kernels, all 6 backends, and the full graph optimizer work identically regardless of source format. **Write one pipeline, load from any ecosystem.**
 
 ## How It Works
 
@@ -177,7 +201,7 @@ GraphOptimizer (6 passes: constant fold, identity elim, linear fusion,
                 scaled matmul fusion, strength reduction, dead node elim)
     |
     v
-GraphCompiler (71 operators + fused ops → execution plan)
+GraphCompiler (200+ operators + fused ops → execution plan)
     |
     v
 GraphExecutor (topological dispatch, buffer recycling, periodic flush)
@@ -241,11 +265,31 @@ Every model is automatically optimized during compilation:
 | **MarchingCubes** | 3D isosurface extraction (TripoSR) | — |
 | **Training** | SoftmaxCE, ReLU/Conv2D/MaxPool backward, SGD, Adam | GPU training |
 
-### 88 ONNX Operators
+### 200+ ONNX Operators (Full Coverage)
 
-Abs, Add, ArgMax, AveragePool, BatchNormalization, Cast, Ceil, Clip, Concat, Constant, ConstantOfShape, Conv, ConvTranspose, DepthToSpace, Div, Dropout, Equal, Erf, Exp, Expand, Flatten, Floor, Gather, GatherND, Gelu, Gemm, GlobalAveragePool, Greater, HardSigmoid, HardSwish, Identity, InstanceNormalization, LayerNormalization, LeakyRelu, Less, Log, MatMul, Max, MaxPool, Min, Mul, Neg, Not, Pad, Pow, Range, Reciprocal, ReduceMax, ReduceMean, ReduceMin, ReduceSum, Relu, Reshape, Resize, Shape, Sigmoid, Sign, SiLU, Slice, Softmax, Split, Sqrt, Squeeze, Sub, Tanh, TopK, Transpose, Unsqueeze, Upsample, Where
+**Core Math:** Abs, Add, Sub, Mul, Div, Pow, Sqrt, Exp, Log, Neg, Reciprocal, Floor, Ceil, Mod, Clip, Min, Max, Sign, Erf, CumSum
+**Trig:** Sin, Cos, Tan, Acos, Acosh, Asin, Asinh, Atan, Atanh, Cosh, Sinh
+**Activations:** Relu, Sigmoid, Tanh, Gelu, LeakyRelu, HardSigmoid, HardSwish, Elu, Celu, Selu, Softplus, Softsign, Mish, ThresholdedRelu, PRelu, SiLU
+**Comparison:** Equal, Greater, GreaterOrEqual, Less, LessOrEqual, And, Or, Xor, Not, IsNaN, IsInf
+**Reduction:** ReduceSum, ReduceMean, ReduceMax, ReduceMin, ReduceProd, ReduceL1, ReduceL2, ReduceSumSquare, ReduceLogSum, ReduceLogSumExp
+**Shape:** Reshape, Squeeze, Unsqueeze, Flatten, Expand, Shape, Slice, Concat, Split, Transpose, Tile, Pad, Compress, EyeLike, Trilu, Unique, ReverseSequence, CenterCropPad
+**Pooling:** MaxPool, AveragePool, GlobalAveragePool, GlobalMaxPool, LpPool, GlobalLpPool, MaxUnpool, MaxRoiPool
+**Normalization:** BatchNormalization, InstanceNormalization, LayerNormalization, GroupNormalization, LRN, MeanVarianceNormalization, LpNormalization
+**Convolution:** Conv, ConvTranspose, ConvInteger, DeformConv
+**Linear:** MatMul, Gemm (transA+transB), MatMulInteger, QLinearMatMul, QLinearConv
+**Gather/Scatter:** Gather, GatherElements, GatherND, ScatterND (add/mul/min/max reduction), ScatterElements, Scatter
+**Data:** Constant, ConstantOfShape, Cast, CastLike, Identity, Size, OneHot, Range, NonZero, TopK, ArgMax, ArgMin, Round
+**Quantization:** DequantizeLinear, QuantizeLinear, DynamicQuantizeLinear
+**Bitwise:** BitwiseAnd, BitwiseOr, BitwiseXor, BitwiseNot, BitShift
+**Signal:** DFT, STFT, MelWeightMatrix, HannWindow, HammingWindow, BlackmanWindow
+**Recurrent:** RNN, LSTM, GRU (bidirectional, peepholes, layout support)
+**Control Flow:** If, Loop, Scan (real subgraph execution via SubgraphRunner)
+**Detection:** NonMaxSuppression, RoiAlign, AffineGrid, GridSample, Col2Im
+**Random:** RandomNormal, RandomNormalLike, RandomUniform, RandomUniformLike, Bernoulli, Multinomial
+**Misc:** Dropout, Where, Resize, Upsample, DepthToSpace, SpaceToDepth, Einsum, Softmax, LogSoftmax, Hardmax, Sum, Mean, Det, ImageDecoder
+**Sequence/Optional/String:** Full pass-through support for non-tensor ONNX types
 
-### Pipeline Classes (14 implemented)
+### Pipeline Classes (16 implemented)
 
 | Pipeline | Input | Output |
 |----------|-------|--------|
@@ -390,7 +434,7 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 - **DelegateSpecialization broadcast kernel** — One GPU kernel handles Add, Sub, Mul, Div for arbitrary N-D shapes. Compile-time inlined ops via SpawnDev.ILGPU's DelegateSpecialization. Found and fixed a 5+ param router bug in SpawnDev.ILGPU along the way.
 - **DepthAnything V2 passes** — 823-node DPT decoder producing correct depth output. Fixed: hardcoded Div in broadcast path, buffer aliasing, decomposed LayerNorm chain. End-to-end depth estimation in the browser.
 - **DistilBERT + Whisper passing** — First NLP transformers on the engine. 10-bug fix chain including ConstantOfShape, Expand, Slice constant folding, Cast propagation, INT64_MAX overflow, Gemm higher-rank inputs.
-- **104 operator test cases** — Expanded from 18, caught 11+ real bugs. Includes broadcast LayerNorm patterns that prevent regression of the deepest bugs we found.
+- **122+ operator test cases** — Expanded from 18, caught 11+ real bugs. Includes broadcast LayerNorm patterns, subgraph execution (If/Loop/Scan), quantized conv/matmul (ConvInteger, QLinearConv, QLinearMatMul), and CPU reference comparison for every test.
 - **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. First pure C# SPZ parser. Full round-trip for all 3D formats.
 - **DiffusionPipeline** — DDPM denoising loop + SD-Turbo one-step generation. Image generation from text prompts on WebGPU.
 - **22 demo pages, 0 placeholders** — Every demo fully functional, all loading from HuggingFace CDN, zero "not yet deployed" messages.
