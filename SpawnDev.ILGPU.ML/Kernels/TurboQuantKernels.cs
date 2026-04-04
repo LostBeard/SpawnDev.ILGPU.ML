@@ -16,6 +16,7 @@ public class TurboQuantKernels
     private readonly Accelerator _accelerator;
     private MemoryBuffer1D<int, Stride1D.Dense>? _fusedParamsBuf;
     private MemoryBuffer1D<int, Stride1D.Dense>? _flashParamsBuf;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
     private readonly FWHTKernel _fwht;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -364,7 +365,8 @@ public class TurboQuantKernels
         // params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*10000, params[4]=valuesPerInt
         int valuesPerInt = K_codebook.Length <= 8 ? 10 : 8; // 3-bit=8 centroids→10 per int, 4-bit=16→8 per int
         var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt };
-        _fusedParamsBuf?.Dispose();
+        // Don't dispose previous — it may still be in the WebGPU command encoder
+        if (_fusedParamsBuf != null) _oldParamsBufs.Add(_fusedParamsBuf);
         _fusedParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _fusedAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
@@ -503,7 +505,7 @@ public class TurboQuantKernels
     {
         int valuesPerInt = K_codebook.Length <= 8 ? 10 : 8; // 3-bit=8 centroids→10 per int, 4-bit=16→8 per int
         var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt };
-        _flashParamsBuf?.Dispose();
+        if (_flashParamsBuf != null) _oldParamsBufs.Add(_flashParamsBuf);
         _flashParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _flashAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,

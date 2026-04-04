@@ -1848,9 +1848,9 @@ public class TriluOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        using var buf = reg.Accelerator.Allocate1D(result);
         int count = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(buf.View.SubView(0, count), ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+        if (count < result.Length) { var t = new float[count]; Array.Copy(result, t, count); ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
     }
 }
 
@@ -1919,8 +1919,7 @@ public class ScatterElementsOperator(OperatorRegistry reg) : IOnnxOperator
                 result[outIdx] = updateVals[i];
         }
 
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
     }
 }
 
@@ -2007,8 +2006,9 @@ public class NonMaxSuppressionOperator(OperatorRegistry reg) : IOnnxOperator
         int resultCount = Math.Min(selected.Count, ctx.Outputs[0].ElementCount);
         if (resultCount > 0)
         {
-            using var buf = reg.Accelerator.Allocate1D(selected.ToArray());
-            reg.ElementWise.Scale(buf.View.SubView(0, resultCount), ctx.Outputs[0].Data.SubView(0, resultCount), resultCount, 1f);
+            var selArr = selected.ToArray();
+            if (resultCount < selArr.Length) { var t = new float[resultCount]; Array.Copy(selArr, t, resultCount); ctx.Outputs[0].Data.SubView(0, resultCount).CopyFromCPU(t); }
+            else ctx.Outputs[0].Data.SubView(0, resultCount).CopyFromCPU(selArr);
         }
         else
         {

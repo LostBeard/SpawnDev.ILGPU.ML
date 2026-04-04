@@ -34,6 +34,7 @@ public class ElementWiseKernels : IDisposable
     // finished reading the previous strides buffer.
     private MemoryBuffer1D<int, Stride1D.Dense>? _lastStridesBuf;
     private MemoryBuffer1D<int, Stride1D.Dense>? _broadcastStridesBuf;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldStridesBufs = new();
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
@@ -485,12 +486,10 @@ public class ElementWiseKernels : IDisposable
         // BroadcastBinaryOpND calls are queued (e.g., decomposed LayerNorm:
         // Sub, Pow, Div, Mul all dispatch in sequence without sync).
         int paramsSize = 1 + 3 * rank;
-        // Double-buffer: dispose the PREVIOUS-previous buffer (2 calls ago), keep the
-        // previous one alive. On WebGPU, command batching means the previous dispatch
-        // may still be pending in the command encoder. Two-deep buffering ensures the
-        // GPU has had at least one full dispatch cycle to read the strides.
-        _broadcastStridesBuf?.Dispose();
-        _broadcastStridesBuf = _lastStridesBuf; // promote previous to "old"
+        // Accumulate stride buffers — disposal happens in Dispose().
+        // On WebGPU/WebGL/Wasm, inline disposal causes ObjectDisposedException because
+        // the buffer may still be referenced by pending dispatches in the command encoder.
+        if (_lastStridesBuf != null) _oldStridesBufs.Add(_lastStridesBuf);
         _lastStridesBuf = _accelerator.Allocate1D<int>(paramsSize);
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
@@ -703,7 +702,11 @@ public class ElementWiseKernels : IDisposable
     { output[idx] = MathF.Log(input[idx]); }
 
     private static void RoundImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
-    { output[idx] = MathF.Round(input[idx]); }
+    {
+        // Use Floor(x + 0.5f) — MathF.Round may not map to ILGPU intrinsic on all backends
+        float x = input[idx];
+        output[idx] = MathF.Floor(x + 0.5f);
+    }
 
     /// <summary>Truncate: round toward zero (C-style cast from float to int).</summary>
     private static void TruncateImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
@@ -948,7 +951,8 @@ public class ElementWiseKernels : IDisposable
     private static float MishOp(float x) => x * MathF.Tanh(MathF.Log(1f + MathF.Exp(x)));
     private static float ThresholdedReluOp(float x) => x > 1f ? x : 0f; // default alpha=1
     internal static float ShrinkOp(float x) => x > 0.5f ? x - 0.5f : x < -0.5f ? x + 0.5f : 0f; // default bias=0, lambd=0.5
-    private static float IsInfOp(float x) => float.IsInfinity(x) ? 1f : 0f;
+    // float.IsInfinity generates invalid GLSL on WebGL — use comparison instead
+    private static float IsInfOp(float x) => (x == float.PositiveInfinity || x == float.NegativeInfinity) ? 1f : 0f;
 
     public void Acos(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
         => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AcosOp));
@@ -1078,6 +1082,8 @@ public class ElementWiseKernels : IDisposable
     {
         _lastStridesBuf?.Dispose();
         _broadcastStridesBuf?.Dispose();
+        foreach (var buf in _oldStridesBufs) buf.Dispose();
+        _oldStridesBufs.Clear();
         _compareResultBuf?.Dispose();
         _nearestParamsBuf?.Dispose();
     }

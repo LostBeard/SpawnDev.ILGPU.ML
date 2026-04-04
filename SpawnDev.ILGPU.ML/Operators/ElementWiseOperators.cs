@@ -1173,8 +1173,7 @@ public class ThresholdedReluOperator(OperatorRegistry reg) : IOnnxOperator
         if (xVals != null)
         {
             var result = xVals.Select(x => x > alpha ? x : 0f).ToArray();
-            using var buf = reg.Accelerator.Allocate1D(result);
-            reg.ElementWise.Scale(buf.View.SubView(0, count), ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+            ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
         }
         else
         {
@@ -1243,8 +1242,7 @@ public class HardmaxOperator(OperatorRegistry reg) : IOnnxOperator
                     result[(o * axisSize + maxIdx) * inner + inn] = 1f;
                 }
             }
-            using var buf = reg.Accelerator.Allocate1D(result);
-            reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+            ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
         }
     }
 }
@@ -1260,11 +1258,13 @@ public class LogSoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         if (axis < 0) axis += shape.Length;
         int rows = 1, cols = shape[axis];
         for (int i = 0; i < axis; i++) rows *= shape[i];
-        // Copy input to output, run softmax, then log
+        // Copy input to output, run softmax, then log (using temp to avoid aliasing)
         int total = ctx.Inputs[0].ElementCount;
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, total, 1f);
         reg.Softmax.Forward(ctx.Outputs[0].Data, rows, cols);
-        reg.ElementWise.Log(ctx.Outputs[0].Data, ctx.Outputs[0].Data, total);
+        using var tempBuf = reg.Accelerator.Allocate1D<float>(total);
+        reg.ElementWise.Log(ctx.Outputs[0].Data, tempBuf.View, total);
+        reg.ElementWise.Scale(tempBuf.View, ctx.Outputs[0].Data, total, 1f);
     }
 }
 
@@ -1293,9 +1293,16 @@ public class SumOperator(OperatorRegistry reg) : IOnnxOperator
         int count = ctx.Outputs[0].ElementCount;
         // Copy first input to output
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
-        // Add remaining inputs
-        for (int i = 1; i < ctx.Inputs.Length; i++)
-            reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, ctx.Outputs[0].Data, count);
+        // Add remaining inputs using temp buffer to avoid aliasing (output as both input and output)
+        if (ctx.Inputs.Length > 1)
+        {
+            using var tempBuf = reg.Accelerator.Allocate1D<float>(count);
+            for (int i = 1; i < ctx.Inputs.Length; i++)
+            {
+                reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.View, count);
+                reg.ElementWise.Scale(tempBuf.View, ctx.Outputs[0].Data, count, 1f);
+            }
+        }
     }
 }
 
@@ -1307,8 +1314,15 @@ public class MeanOperator(OperatorRegistry reg) : IOnnxOperator
     {
         int count = ctx.Outputs[0].ElementCount;
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
-        for (int i = 1; i < ctx.Inputs.Length; i++)
-            reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, ctx.Outputs[0].Data, count);
+        if (ctx.Inputs.Length > 1)
+        {
+            using var tempBuf = reg.Accelerator.Allocate1D<float>(count);
+            for (int i = 1; i < ctx.Inputs.Length; i++)
+            {
+                reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.View, count);
+                reg.ElementWise.Scale(tempBuf.View, ctx.Outputs[0].Data, count, 1f);
+            }
+        }
         reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, count, 1f / ctx.Inputs.Length);
     }
 }

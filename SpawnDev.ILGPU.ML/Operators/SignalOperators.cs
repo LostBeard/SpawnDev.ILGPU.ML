@@ -94,8 +94,8 @@ public class DFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 
         // Upload to GPU
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 
@@ -189,8 +189,8 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         }
 
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 
@@ -275,7 +275,7 @@ public class MelWeightMatrixOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 
         // Upload to GPU
         int copyLen = Math.Min(matrix.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(matrix);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < matrix.Length) { var t = new float[copyLen]; Array.Copy(matrix, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(matrix);
     }
 }

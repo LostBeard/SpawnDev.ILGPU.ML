@@ -747,8 +747,7 @@ public class CompressOperator(OperatorRegistry reg) : IOnnxOperator
                     if (condVals[i] != 0f) result.Add(inputVals[i]);
                 if (result.Count > 0)
                 {
-                    using var buf = reg.Accelerator.Allocate1D(result.ToArray());
-                    reg.ElementWise.Scale(buf.View, ctx.Outputs[0].Data.SubView(0, result.Count), result.Count, 1f);
+                    ctx.Outputs[0].Data.SubView(0, result.Count).CopyFromCPU(result.ToArray());
                 }
             }
         }
@@ -772,8 +771,7 @@ public class EyeLikeOperator(OperatorRegistry reg) : IOnnxOperator
             int j = i + k;
             if (j >= 0 && j < cols) data[i * cols + j] = 1f;
         }
-        using var buf = reg.Accelerator.Allocate1D(data);
-        reg.ElementWise.Scale(buf.View, ctx.Outputs[0].Data.SubView(0, rows * cols), rows * cols, 1f);
+        ctx.Outputs[0].Data.SubView(0, rows * cols).CopyFromCPU(data);
     }
 }
 
@@ -824,8 +822,7 @@ public class LRNOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         int total = result.Length;
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
     }
 }
 
@@ -913,8 +910,7 @@ public class MeanVarianceNormalizationOperator(OperatorRegistry reg) : IOnnxOper
         }
 
         int total = result.Length;
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
     }
 
     private static void CollectIndices(int[] shape, int[] axes, HashSet<int> axisSet, int[] keepDims, int[] keepCoords, int[] strides, int dim, int baseIdx, List<int> indices)
@@ -1057,8 +1053,7 @@ public class ReverseSequenceOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         int total = result.Length;
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
     }
 }
 
@@ -1287,9 +1282,9 @@ public class MultinomialOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        using var buf = reg.Accelerator.Allocate1D(result);
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 
@@ -1326,8 +1321,7 @@ public class NegativeLogLikelihoodLossOperator(OperatorRegistry reg) : IOnnxOper
         }
         string reduction = ctx.GetString("reduction", "mean");
         if (reduction == "mean" && N > 0) loss /= N;
-        using var buf = reg.Accelerator.Allocate1D(new[] { loss });
-        reg.ElementWise.Scale(buf.View, ctx.Outputs[0].Data.SubView(0, 1), 1, 1f);
+        ctx.Outputs[0].Data.SubView(0, 1).CopyFromCPU(new[] { loss });
     }
 }
 

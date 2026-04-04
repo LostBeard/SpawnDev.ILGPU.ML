@@ -311,23 +311,23 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         // Upload Y
         if (ctx.Outputs.Length > 0 && ctx.Outputs[0] != null)
         {
-            using var buf = reg.Accelerator.Allocate1D(yData);
             int n = Math.Min(yTotal, ctx.Outputs[0].ElementCount);
-            reg.ElementWise.Scale(buf.View.SubView(0, n), ctx.Outputs[0].Data.SubView(0, n), n, 1f);
+            if (n < yData.Length) { var t = new float[n]; Array.Copy(yData, t, n); ctx.Outputs[0].Data.SubView(0, n).CopyFromCPU(t); }
+            else ctx.Outputs[0].Data.SubView(0, n).CopyFromCPU(yData);
         }
         // Upload Y_h
         if (ctx.Outputs.Length > 1 && ctx.Outputs[1] != null)
         {
-            using var buf = reg.Accelerator.Allocate1D(yhData);
             int n = Math.Min(yhData.Length, ctx.Outputs[1].ElementCount);
-            reg.ElementWise.Scale(buf.View.SubView(0, n), ctx.Outputs[1].Data.SubView(0, n), n, 1f);
+            if (n < yhData.Length) { var t = new float[n]; Array.Copy(yhData, t, n); ctx.Outputs[1].Data.SubView(0, n).CopyFromCPU(t); }
+            else ctx.Outputs[1].Data.SubView(0, n).CopyFromCPU(yhData);
         }
         // Upload Y_c (LSTM only)
         if (ctx.Outputs.Length > 2 && ctx.Outputs[2] != null)
         {
-            using var buf = reg.Accelerator.Allocate1D(ycData);
             int n = Math.Min(ycData.Length, ctx.Outputs[2].ElementCount);
-            reg.ElementWise.Scale(buf.View.SubView(0, n), ctx.Outputs[2].Data.SubView(0, n), n, 1f);
+            if (n < ycData.Length) { var t = new float[n]; Array.Copy(ycData, t, n); ctx.Outputs[2].Data.SubView(0, n).CopyFromCPU(t); }
+            else ctx.Outputs[2].Data.SubView(0, n).CopyFromCPU(ycData);
         }
     }
 }
@@ -491,15 +491,15 @@ public class GRUOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 
         if (ctx.Outputs.Length > 0 && ctx.Outputs[0] != null)
         {
-            using var buf = reg.Accelerator.Allocate1D(yData);
             int n = Math.Min(yTotal, ctx.Outputs[0].ElementCount);
-            reg.ElementWise.Scale(buf.View.SubView(0, n), ctx.Outputs[0].Data.SubView(0, n), n, 1f);
+            if (n < yData.Length) { var t = new float[n]; Array.Copy(yData, t, n); ctx.Outputs[0].Data.SubView(0, n).CopyFromCPU(t); }
+            else ctx.Outputs[0].Data.SubView(0, n).CopyFromCPU(yData);
         }
         if (ctx.Outputs.Length > 1 && ctx.Outputs[1] != null)
         {
-            using var buf = reg.Accelerator.Allocate1D(yhData);
             int n = Math.Min(yhData.Length, ctx.Outputs[1].ElementCount);
-            reg.ElementWise.Scale(buf.View.SubView(0, n), ctx.Outputs[1].Data.SubView(0, n), n, 1f);
+            if (n < yhData.Length) { var t = new float[n]; Array.Copy(yhData, t, n); ctx.Outputs[1].Data.SubView(0, n).CopyFromCPU(t); }
+            else ctx.Outputs[1].Data.SubView(0, n).CopyFromCPU(yhData);
         }
     }
 }

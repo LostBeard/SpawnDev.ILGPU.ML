@@ -53,8 +53,7 @@ public class LpNormalizationOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, total), ctx.Outputs[0].Data.SubView(0, total), total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
     }
 }
 public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -88,9 +87,15 @@ public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
                 result[n * C + c] = p == 1 ? sum : p == 2 ? MathF.Sqrt(sum) : MathF.Pow(sum, 1f / p);
             }
         }
-        using var buf = reg.Accelerator.Allocate1D(result);
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length)
+        {
+            var trimmed = new float[copyLen];
+            Array.Copy(result, trimmed, copyLen);
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
+        }
+        else
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -155,9 +160,15 @@ public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
                 }
             }
         }
-        using var buf = reg.Accelerator.Allocate1D(result);
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length)
+        {
+            var trimmed = new float[copyLen];
+            Array.Copy(result, trimmed, copyLen);
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
+        }
+        else
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class DetOperator(OperatorRegistry reg) : IOnnxOperator
@@ -212,8 +223,8 @@ public class DetOperator(OperatorRegistry reg) : IOnnxOperator
             result[b] = det;
         }
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class BernoulliOperator(OperatorRegistry reg) : IOnnxOperator
@@ -234,8 +245,7 @@ public class BernoulliOperator(OperatorRegistry reg) : IOnnxOperator
             float p = i < pVals.Length ? pVals[i] : 0.5f;
             result[i] = rng.NextDouble() < p ? 1f : 0f;
         }
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, count), ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+        ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
     }
 }
 public class CenterCropPadOperator(OperatorRegistry reg) : IOnnxOperator
@@ -270,8 +280,8 @@ public class CenterCropPadOperator(OperatorRegistry reg) : IOnnxOperator
         // For each dimension, compute the center offset
         // Simple case: just copy the overlapping center region
         int copyCount = Math.Min(ctx.Inputs[0].ElementCount, outCount);
-        using var buf = reg.Accelerator.Allocate1D(xVals);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyCount), ctx.Outputs[0].Data.SubView(0, copyCount), copyCount, 1f);
+        if (copyCount < xVals.Length) { var t = new float[copyCount]; Array.Copy(xVals, t, copyCount); ctx.Outputs[0].Data.SubView(0, copyCount).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyCount).CopyFromCPU(xVals);
     }
 }
 public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -330,9 +340,15 @@ public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
                 }
             }
         }
-        using var buf = reg.Accelerator.Allocate1D(result);
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length)
+        {
+            var trimmed = new float[copyLen];
+            Array.Copy(result, trimmed, copyLen);
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
+        }
+        else
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class MaxUnpoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -363,8 +379,8 @@ public class MaxUnpoolOperator(OperatorRegistry reg) : IOnnxOperator
             if (idx >= 0 && idx < outCount)
                 result[idx] = vals[i];
         }
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, outCount), ctx.Outputs[0].Data.SubView(0, outCount), outCount, 1f);
+        if (outCount < result.Length) { var t = new float[outCount]; Array.Copy(result, t, outCount); ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
     }
 }
 public class ImageDecoderOperator(OperatorRegistry reg) : IOnnxOperator
@@ -446,9 +462,15 @@ public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
                 }
             }
         }
-        using var buf = reg.Accelerator.Allocate1D(result);
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length)
+        {
+            var trimmed = new float[copyLen];
+            Array.Copy(result, trimmed, copyLen);
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
+        }
+        else
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
@@ -538,8 +560,8 @@ public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
@@ -624,8 +646,8 @@ public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
@@ -765,8 +787,8 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class RoiAlignOperator(OperatorRegistry reg) : IOnnxOperator
@@ -852,8 +874,8 @@ public class RoiAlignOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        using var buf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(buf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
+        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class ConvIntegerOperator(OperatorRegistry reg) : IOnnxOperator
