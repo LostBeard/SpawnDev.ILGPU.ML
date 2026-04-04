@@ -168,9 +168,8 @@ public class AsyncDepthPipeline : IDisposable
 
         // Blend: output = 0.5 * memory + 0.5 * fastPath via EMA
         _smu.EMAUpdate(_memoryCache!.View, fastPathOutput, pixels, 0.5f);
-        // Copy memory to output using Scale(1.0) to avoid sync CopyTo on WebGPU
-        var ew = new ElementWiseKernels(_accelerator);
-        ew.Scale(_memoryCache.View.SubView(0, pixels), output.SubView(0, pixels), pixels, 1f);
+        // Copy memory to output — use cached _ew, not a new instance per frame
+        _ew.Scale(_memoryCache.View.SubView(0, pixels), output.SubView(0, pixels), pixels, 1f);
 
         await _accelerator.SynchronizeAsync();
         sw.Stop();

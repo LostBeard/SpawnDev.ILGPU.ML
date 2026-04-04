@@ -54,11 +54,11 @@ public class FusedDequantMatMul : IDisposable
         _lastParamsBuf?.Dispose();
         _lastParamsBuf = _accelerator.Allocate1D(paramsData);
 
-        // Use int-packed kernel on backends where ArrayView<byte> transpilation
-        // is broken (WebGPU WGSL reads bytes from packed u32 words incorrectly).
-        bool usePacked = _accelerator.AcceleratorType.ToString().Contains("WebGPU")
-            || _accelerator.AcceleratorType.ToString().Contains("WebGL")
-            || _accelerator.AcceleratorType.ToString().Contains("Wasm");
+        // Use int-packed kernel on browser backends where ArrayView<byte> transpilation
+        // reads bytes from packed u32 words differently.
+        bool usePacked = _accelerator.AcceleratorType == AcceleratorType.WebGPU
+            || _accelerator.AcceleratorType == AcceleratorType.WebGL
+            || _accelerator.AcceleratorType == AcceleratorType.Wasm;
 
         if (usePacked)
         {

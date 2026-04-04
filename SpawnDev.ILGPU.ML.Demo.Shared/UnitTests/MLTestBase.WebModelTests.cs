@@ -23,7 +23,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         // Load model via InferenceSession.CreateAsync (the browser path)
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
         Console.WriteLine($"[WebModel] {session}");
         Console.WriteLine($"[WebModel] Input names: {string.Join(", ", session.InputNames)}");
         Console.WriteLine($"[WebModel] Output names: {string.Join(", ", session.OutputNames)}");

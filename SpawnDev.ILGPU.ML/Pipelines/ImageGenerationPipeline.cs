@@ -239,8 +239,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         //  Step 5: Scale latent for VAE (1 / 0.18215)
         // ═══════════════════════════════════════════════════════════
         const float vaeScaleFactor = 1f / 0.18215f;
-        new ElementWiseKernels(_accelerator).Scale(
-            latentTensor.Data.SubView(0, noiseData.Length),
+        new ElementWiseKernels(_accelerator).ScaleInPlace(
             latentTensor.Data.SubView(0, noiseData.Length),
             noiseData.Length, vaeScaleFactor);
         await _accelerator.SynchronizeAsync();

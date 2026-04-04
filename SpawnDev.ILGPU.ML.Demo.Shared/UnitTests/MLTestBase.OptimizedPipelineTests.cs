@@ -32,7 +32,7 @@ public abstract partial class MLTestBase
         ClassificationResult[] optimizedResults;
         try
         {
-            var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
+            using var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
             var pipeline = new ClassificationPipeline(session, accelerator);
             optimizedResults = await pipeline.ClassifyAsync(pixels, w, h, 5);
             Console.WriteLine($"[OptPipeline] Optimized: {optimizedResults[0].Label} ({optimizedResults[0].Confidence:P2})");

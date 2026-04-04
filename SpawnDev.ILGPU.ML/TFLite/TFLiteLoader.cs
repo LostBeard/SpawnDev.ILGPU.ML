@@ -195,6 +195,71 @@ public static class TFLiteLoader
                 continue;
             }
 
+            // ── Multi-node decompositions for ops that don't map 1:1 ──
+
+            // RSQRT (76): 1/sqrt(x) → Sqrt then Reciprocal
+            if (builtinCodeForNode == 76)
+            {
+                string sqrtOut = tensorNames[op.Outputs[0]] + "_sqrt";
+                graph.Nodes.Add(new GraphNode { OpType = "Sqrt",
+                    Inputs = op.Inputs.Where(i => i >= 0).Select(i => tensorNames[i]).ToList(),
+                    Outputs = new List<string> { sqrtOut } });
+                graph.Nodes.Add(new GraphNode { OpType = "Reciprocal",
+                    Inputs = new List<string> { sqrtOut },
+                    Outputs = op.Outputs.Select(i => tensorNames[i]).ToList() });
+                HandleFusedActivation(graph, model, op, tensorNames, builtinCodeForNode == 3 || builtinCodeForNode == 4 ? 6 : 3);
+                continue;
+            }
+
+            // SQUARE (90): x*x → Mul(x, x)
+            if (builtinCodeForNode == 90)
+            {
+                var inputs = op.Inputs.Where(i => i >= 0).Select(i => tensorNames[i]).ToList();
+                graph.Nodes.Add(new GraphNode { OpType = "Mul",
+                    Inputs = new List<string> { inputs[0], inputs[0] },
+                    Outputs = op.Outputs.Select(i => tensorNames[i]).ToList() });
+                continue;
+            }
+
+            // NOT_EQUAL (72): Equal(a,b) then Not → but we map to Not which is unary.
+            // Decompose: Equal then Sub from 1 (1 - Equal = NotEqual)
+            if (builtinCodeForNode == 72)
+            {
+                var inputs = op.Inputs.Where(i => i >= 0).Select(i => tensorNames[i]).ToList();
+                string eqOut = tensorNames[op.Outputs[0]] + "_eq";
+                graph.Nodes.Add(new GraphNode { OpType = "Equal",
+                    Inputs = inputs,
+                    Outputs = new List<string> { eqOut } });
+                // 1 - Equal = NotEqual (using Sub with a ones constant)
+                string onesName = $"_ones_{op.Outputs[0]}";
+                weights[onesName] = new float[] { 1f };
+                graph.Initializers[onesName] = new[] { 1 };
+                graph.Nodes.Add(new GraphNode { OpType = "Sub",
+                    Inputs = new List<string> { onesName, eqOut },
+                    Outputs = op.Outputs.Select(i => tensorNames[i]).ToList() });
+                continue;
+            }
+
+            // EXPAND_DIMS (70): Unsqueeze with axis from second input
+            if (builtinCodeForNode == 70 && onnxOpType == "Unsqueeze")
+            {
+                // The axis comes from the second input tensor (constant)
+                var inputs = op.Inputs.Where(i => i >= 0).Select(i => tensorNames[i]).ToList();
+                var attrs2 = ExtractAttributes(model, op, sg);
+                if (op.Inputs.Length > 1 && op.Inputs[1] >= 0)
+                {
+                    var axisTensor = sg.Tensors[op.Inputs[1]];
+                    var axisData = model.GetTensorData(axisTensor);
+                    if (axisData != null && axisData.Length > 0)
+                        attrs2["axes"] = System.Text.Json.JsonSerializer.SerializeToElement(new long[] { (long)axisData[0] });
+                }
+                graph.Nodes.Add(new GraphNode { OpType = "Unsqueeze",
+                    Inputs = new List<string> { inputs[0] },
+                    Outputs = op.Outputs.Select(i => tensorNames[i]).ToList(),
+                    Attributes = attrs2 });
+                continue;
+            }
+
             var node = new GraphNode
             {
                 OpType = onnxOpType,
@@ -240,55 +305,6 @@ public static class TFLiteLoader
     /// <summary>
     /// Transpose depthwise conv weights: [1, kH, kW, outC] → [outC, 1, kH, kW]
     /// </summary>
-    private static float[] TransposeDepthwiseWeight(float[] data, int[] shape)
-    {
-        int kH = shape[1], kW = shape[2], outC = shape[3];
-        var result = new float[data.Length];
-        for (int oc = 0; oc < outC; oc++)
-            for (int h = 0; h < kH; h++)
-                for (int w = 0; w < kW; w++)
-                {
-                    int srcIdx = (h * kW + w) * outC + oc;
-                    int dstIdx = (oc * kH + h) * kW + w;
-                    if (srcIdx < data.Length && dstIdx < result.Length)
-                        result[dstIdx] = data[srcIdx];
-                }
-        return result;
-    }
-
-    /// <summary>
-    /// Transpose 4D float data from NHWC to NCHW layout.
-    /// </summary>
-    private static float[] TransposeNHWCtoNCHW(float[] data, int[] nhwcShape)
-    {
-        int N = nhwcShape[0], H = nhwcShape[1], W = nhwcShape[2], C = nhwcShape[3];
-        var result = new float[data.Length];
-        for (int n = 0; n < N; n++)
-            for (int h = 0; h < H; h++)
-                for (int w = 0; w < W; w++)
-                    for (int c = 0; c < C; c++)
-                    {
-                        int srcIdx = ((n * H + h) * W + w) * C + c;
-                        int dstIdx = ((n * C + c) * H + h) * W + w;
-                        if (srcIdx < data.Length && dstIdx < result.Length)
-                            result[dstIdx] = data[srcIdx];
-                    }
-        return result;
-    }
-
-    /// <summary>
-    /// Convert TFLite shape to ONNX-style shape.
-    /// TFLite uses NHWC by default, ONNX uses NCHW.
-    /// For 4D tensors, transpose the shape.
-    /// </summary>
-    private static int[] ConvertShape(int[] tfliteShape, TFLiteTensorType type)
-    {
-        // TFLite 4D: [N, H, W, C] → ONNX 4D: [N, C, H, W]
-        if (tfliteShape.Length == 4)
-            return new[] { tfliteShape[0], tfliteShape[3], tfliteShape[1], tfliteShape[2] };
-        return tfliteShape;
-    }
-
     /// <summary>
     /// Extract operator attributes from TFLite builtin options.
     /// Maps TFLite-specific attributes to ONNX-equivalent attribute names.
@@ -324,8 +340,59 @@ public static class TFLiteLoader
                 }
                 break;
             case 25: // SOFTMAX
-                // Softmax axis — TFLite defaults to -1
                 attrs["axis"] = JsonSerializer.SerializeToElement(-1L);
+                break;
+            case 45: // STRIDED_SLICE
+                // StridedSlice has begin_mask, end_mask, etc.
+                attrs["begin_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
+                attrs["end_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 1, 0));
+                attrs["ellipsis_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 2, 0));
+                attrs["new_axis_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 3, 0));
+                attrs["shrink_axis_mask"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 4, 0));
+                break;
+            case 49: // SPLIT
+                attrs["num_outputs"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 2));
+                break;
+            case 36: // GATHER
+                attrs["axis"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
+                break;
+            case 56: // ARG_MAX
+                attrs["axis"] = JsonSerializer.SerializeToElement(-1L); // default
+                attrs["keepdims"] = JsonSerializer.SerializeToElement(0L);
+                break;
+            case 53: // CAST
+                attrs["to"] = JsonSerializer.SerializeToElement(1L); // float32
+                break;
+            case 23: // RESIZE_BILINEAR
+                attrs["mode"] = JsonSerializer.SerializeToElement("linear");
+                break;
+            case 95: // RESIZE_NEAREST_NEIGHBOR
+                attrs["mode"] = JsonSerializer.SerializeToElement("nearest");
+                break;
+            case 39: // TRANSPOSE
+                // perm comes from second input tensor
+                if (op.Inputs.Length > 1 && op.Inputs[1] >= 0)
+                {
+                    var permTensor = sg.Tensors[op.Inputs[1]];
+                    var permData = model.GetTensorData(permTensor);
+                    if (permData != null)
+                        attrs["perm"] = JsonSerializer.SerializeToElement(permData.Select(v => (long)v).ToArray());
+                }
+                break;
+            case 96: // LEAKY_RELU
+                // alpha from builtin options field 0
+                {
+                    float alpha = fb.ReadFieldFloat(optOffset, 0, 0.01f);
+                    attrs["alpha"] = JsonSerializer.SerializeToElement((double)alpha);
+                }
+                break;
+            case 20: // RELU_N1_TO_1
+                attrs["min"] = JsonSerializer.SerializeToElement(-1.0);
+                attrs["max"] = JsonSerializer.SerializeToElement(1.0);
+                break;
+            case 21: // RELU6
+                attrs["min"] = JsonSerializer.SerializeToElement(0.0);
+                attrs["max"] = JsonSerializer.SerializeToElement(6.0);
                 break;
         }
 

@@ -19,7 +19,7 @@ public abstract partial class MLTestBase
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/style-mosaic");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/style-mosaic");
         Console.WriteLine($"[StyleTest] Model: {session}");
 
         // Small gradient test image (64x64)
@@ -70,7 +70,7 @@ public abstract partial class MLTestBase
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/super-resolution");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/super-resolution");
         Console.WriteLine($"[SRTest] Model: {session}");
 
         // Small test image (32x32 gradient)
@@ -131,7 +131,7 @@ public abstract partial class MLTestBase
         Buffer.BlockCopy(binData, 8, pixels, 0, width * height * 4);
         Console.WriteLine($"[StyleCatTest] Loaded cat image: {width}x{height}");
 
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/style-mosaic");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/style-mosaic");
         var pipeline = new StyleTransferPipeline(session, accelerator);
         var result = await pipeline.TransferAsync(pixels, width, height);
 
@@ -182,7 +182,7 @@ public abstract partial class MLTestBase
             for (int x = 0; x < cropW; x++)
                 cropped[y * cropW + x] = pixels[(startY + y) * width + (startX + x)];
 
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/super-resolution");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/super-resolution");
         var pipeline = new SuperResolutionPipeline(session, accelerator, upscaleFactor: 3);
         var result = await pipeline.UpscaleAsync(cropped, cropW, cropH);
 

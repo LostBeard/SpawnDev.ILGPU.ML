@@ -71,6 +71,7 @@ public static class SafeTensorsParser
             Tensors = tensors.ToArray(),
             Metadata = metadata ?? new Dictionary<string, object>(),
             RawData = data,
+            DataOffset = dataStartOffset,
         };
     }
 
@@ -82,6 +83,33 @@ public static class SafeTensorsParser
         // Header size should be reasonable (< 100MB) and data should start with '{'
         return headerSize > 0 && headerSize < 100_000_000 && headerSize < data.Length - 8
             && data[8] == '{';
+    }
+
+    /// <summary>
+    /// Parse and merge multiple SafeTensors shard files into one.
+    /// HuggingFace shards: model-00001-of-00005.safetensors, etc.
+    /// </summary>
+    public static SafeTensorsFile ParseShards(byte[][] shardBytes)
+    {
+        var merged = new SafeTensorsFile();
+        var allTensors = new List<SafeTensorInfo>();
+
+        foreach (var shard in shardBytes)
+        {
+            var file = Parse(shard);
+            // Each tensor's data offset is relative to its own shard's data section.
+            // We need to keep a reference to the shard's raw data.
+            foreach (var tensor in file.Tensors)
+            {
+                // Store the shard reference so GetTensorFloat32 works
+                tensor.ShardData = file.RawData;
+                tensor.ShardDataOffset = file.DataOffset;
+                allTensors.Add(tensor);
+            }
+        }
+
+        merged.Tensors = allTensors.ToArray();
+        return merged;
     }
 
     /// <summary>Get a quick summary string.</summary>

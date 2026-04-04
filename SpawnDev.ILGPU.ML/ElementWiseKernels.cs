@@ -485,10 +485,12 @@ public class ElementWiseKernels : IDisposable
         // BroadcastBinaryOpND calls are queued (e.g., decomposed LayerNorm:
         // Sub, Pow, Div, Mul all dispatch in sequence without sync).
         int paramsSize = 1 + 3 * rank;
-        // Dispose previous strides buffer — by now the GPU has finished reading it
-        // (at least one kernel dispatch + any sync has occurred since last call).
-        // This avoids synchronous Synchronize() which deadlocks on WebGPU/WebGL/Wasm.
-        _lastStridesBuf?.Dispose();
+        // Double-buffer: dispose the PREVIOUS-previous buffer (2 calls ago), keep the
+        // previous one alive. On WebGPU, command batching means the previous dispatch
+        // may still be pending in the command encoder. Two-deep buffering ensures the
+        // GPU has had at least one full dispatch cycle to read the strides.
+        _broadcastStridesBuf?.Dispose();
+        _broadcastStridesBuf = _lastStridesBuf; // promote previous to "old"
         _lastStridesBuf = _accelerator.Allocate1D<int>(paramsSize);
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
@@ -895,6 +897,90 @@ public class ElementWiseKernels : IDisposable
             int, int, int, int, int>(BilinearUpsampleACImpl);
     }
 
+    // ─────────────────────────────────────────────────────────────
+    //  Generic unary op via DelegateSpecialization (trig, activation, etc.)
+    // ─────────────────────────────────────────────────────────────
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        DelegateSpecialization<Func<float, float>>>? _unaryOpKernel;
+
+    private static void UnaryOpKernel(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        DelegateSpecialization<Func<float, float>> op)
+    {
+        output[idx] = op.Value(input[idx]);
+    }
+
+    private void EnsureUnaryLoaded()
+    {
+        _unaryOpKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            DelegateSpecialization<Func<float, float>>>(UnaryOpKernel);
+    }
+
+    /// <summary>Apply a generic unary function element-wise via DelegateSpecialization.</summary>
+    public void UnaryOp(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, int count,
+        DelegateSpecialization<Func<float, float>> op)
+    {
+        EnsureUnaryLoaded();
+        _unaryOpKernel!(count, input, output, op);
+    }
+
+    // Trig functions
+    private static float AcosOp(float x) => MathF.Acos(x);
+    // Acosh/Asinh/Atanh use mathematical identities — MathF.Acosh etc. cause PTX JIT failure on CUDA
+    private static float AcoshOp(float x) => MathF.Log(x + MathF.Sqrt(x * x - 1f));
+    private static float AsinOp(float x) => MathF.Asin(x);
+    private static float AsinhOp(float x) => MathF.Log(x + MathF.Sqrt(x * x + 1f));
+    private static float AtanOp(float x) => MathF.Atan(x);
+    private static float AtanhOp(float x) => 0.5f * MathF.Log((1f + x) / (1f - x));
+    private static float CoshOp(float x) => MathF.Cosh(x);
+    private static float SinhOp(float x) => MathF.Sinh(x);
+
+    // Activations
+    private static float EluOp(float x) => x >= 0f ? x : MathF.Exp(x) - 1f;
+    private static float CeluOp(float x) => MathF.Max(0f, x) + MathF.Min(0f, MathF.Exp(x) - 1f);
+    private static float SeluOp(float x) => x > 0f ? 1.0507f * x : 1.0507f * 1.67326f * (MathF.Exp(x) - 1f);
+    private static float SoftplusOp(float x) => MathF.Log(1f + MathF.Exp(x));
+    private static float SoftsignOp(float x) => x / (1f + MathF.Abs(x));
+    private static float MishOp(float x) => x * MathF.Tanh(MathF.Log(1f + MathF.Exp(x)));
+    private static float ThresholdedReluOp(float x) => x > 1f ? x : 0f; // default alpha=1
+    internal static float ShrinkOp(float x) => x > 0.5f ? x - 0.5f : x < -0.5f ? x + 0.5f : 0f; // default bias=0, lambd=0.5
+    private static float IsInfOp(float x) => float.IsInfinity(x) ? 1f : 0f;
+
+    public void Acos(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AcosOp));
+    public void Acosh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AcoshOp));
+    public void Asin(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AsinOp));
+    public void Asinh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AsinhOp));
+    public void Atan(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AtanOp));
+    public void Atanh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(AtanhOp));
+    public void Cosh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(CoshOp));
+    public void Sinh(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SinhOp));
+    public void Elu(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(EluOp));
+    public void Celu(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(CeluOp));
+    public void Selu(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SeluOp));
+    public void Softplus(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SoftplusOp));
+    public void Softsign(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(SoftsignOp));
+    public void Mish(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(MishOp));
+    public void IsInf(ArrayView1D<float, Stride1D.Dense> i, ArrayView1D<float, Stride1D.Dense> o, int n)
+        => UnaryOp(i, o, n, new DelegateSpecialization<Func<float, float>>(IsInfOp));
+
     /// <summary>Validate GELU against CPU reference.</summary>
     public async Task ValidateGELUAsync(int count = 1000)
     {
@@ -993,5 +1079,6 @@ public class ElementWiseKernels : IDisposable
         _lastStridesBuf?.Dispose();
         _broadcastStridesBuf?.Dispose();
         _compareResultBuf?.Dispose();
+        _nearestParamsBuf?.Dispose();
     }
 }

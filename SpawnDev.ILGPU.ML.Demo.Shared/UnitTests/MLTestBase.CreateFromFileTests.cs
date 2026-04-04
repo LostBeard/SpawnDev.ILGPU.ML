@@ -24,7 +24,7 @@ public abstract partial class MLTestBase
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/squeezenet/model.onnx");
         Console.WriteLine($"[CreateFromFile_SN] {session}");
 
@@ -61,7 +61,7 @@ public abstract partial class MLTestBase
         var (pixels, width, height) = await LoadCatImage(http);
         Console.WriteLine($"[CreateFromFile_Cat] Cat image: {width}x{height}");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/squeezenet/model.onnx");
         var pipeline = new ClassificationPipeline(session, accelerator);
         var results = await pipeline.ClassifyAsync(pixels, width, height, 10);
@@ -91,7 +91,7 @@ public abstract partial class MLTestBase
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/style-mosaic/model.onnx");
         Console.WriteLine($"[CreateFromFile_Style] {session}");
 
@@ -137,7 +137,7 @@ public abstract partial class MLTestBase
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/super-resolution/model.onnx");
         Console.WriteLine($"[CreateFromFile_SR] {session}");
 
@@ -182,7 +182,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         Console.WriteLine("[CreateFromFile_Depth] Downloading Depth Anything V2 Small (95MB)...");
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/depth-anything-v2-small/model.onnx",
             inputShapes: new Dictionary<string, int[]>
             {
@@ -326,7 +326,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/movenet-lightning/model.onnx");
         Console.WriteLine($"[MoveNet] {session}");
 
@@ -343,7 +343,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/efficientnet-lite0/model.tflite");
         Console.WriteLine($"[EfficientNet] {session}");
 
@@ -360,7 +360,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var session = await InferenceSession.CreateFromFileAsync(
+        using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/yolov8n/model.onnx");
         Console.WriteLine($"[YOLOv8n] {session}");
 

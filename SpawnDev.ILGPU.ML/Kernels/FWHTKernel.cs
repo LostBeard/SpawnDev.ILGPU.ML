@@ -19,8 +19,7 @@ public class FWHTKernel
     private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _fwhtKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        int>? _fwhtBatchKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _fwhtBatchInPlaceKernel;
 
     public FWHTKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -102,10 +101,9 @@ public class FWHTKernel
             for (int stage = 0; stage < numStagesPad; stage++)
             {
                 int halfSize = 1 << stage;
-                _fwhtBatchKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    int>(FWHTBatchStageImpl);
-                _fwhtBatchKernel(batchSize * dPad / 2, padBuf.View, padBuf.View, halfSize);
+                _fwhtBatchInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                    ArrayView1D<float, Stride1D.Dense>, int>(FWHTBatchStageInPlaceImpl);
+                _fwhtBatchInPlaceKernel(batchSize * dPad / 2, padBuf.View, halfSize);
             }
 
             // Copy first d elements of each padded row to output, with normalization
@@ -115,8 +113,9 @@ public class FWHTKernel
             return;
         }
 
-        // Power-of-2: in-place butterfly
-        ew.Scale(input.SubView(0, batchSize * d), output.SubView(0, batchSize * d), batchSize * d, 1f);
+        // Power-of-2: copy input → output, then in-place butterfly
+        int total = batchSize * d;
+        ew.Scale(input.SubView(0, total), output.SubView(0, total), total, 1f);
 
         int numStages = 0;
         for (int s = d; s > 1; s >>= 1) numStages++;
@@ -124,15 +123,16 @@ public class FWHTKernel
         for (int stage = 0; stage < numStages; stage++)
         {
             int halfSize = 1 << stage;
-            _fwhtBatchKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                int>(FWHTBatchStageImpl);
-            _fwhtBatchKernel(batchSize * d / 2, output, output, halfSize);
+            _fwhtBatchInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, int>(FWHTBatchStageInPlaceImpl);
+            _fwhtBatchInPlaceKernel(total / 2, output, halfSize);
         }
 
-        // Normalize
+        // Normalize in-place
         float scale = 1f / MathF.Sqrt(d);
-        ew.Scale(output, output, batchSize * d, scale);
+        _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+        _scaleInPlaceKernel(total, output, scale);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -239,11 +239,11 @@ public class FWHTKernel
     }
 
     /// <summary>
-    /// Batched butterfly stage. Handles multiple vectors at once.
+    /// In-place batched butterfly stage. Single buffer — avoids WebGPU aliasing detection.
+    /// Butterfly reads both values before writing, so in-place is correct.
     /// </summary>
-    private static void FWHTBatchStageImpl(Index1D globalPairIdx,
-        ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output,
+    private static void FWHTBatchStageInPlaceImpl(Index1D globalPairIdx,
+        ArrayView1D<float, Stride1D.Dense> data,
         int halfSize)
     {
         int blockSize = halfSize * 2;
@@ -252,9 +252,9 @@ public class FWHTKernel
         int i = block * blockSize + offset;
         int j = i + halfSize;
 
-        float a = input[i];
-        float b = input[j];
-        output[i] = a + b;
-        output[j] = a - b;
+        float a = data[i];
+        float b = data[j];
+        data[i] = a + b;
+        data[j] = a - b;
     }
 }

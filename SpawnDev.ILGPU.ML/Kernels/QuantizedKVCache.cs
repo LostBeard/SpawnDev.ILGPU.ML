@@ -299,7 +299,7 @@ public class QuantizedKVCache : IDisposable
         // Do NOT apply Q_norm — the output is V-domain, not Q-domain.
         // The kernel already multiplied by V_norms inside the attention loop.
         float invSqrtD = 1f / MathF.Sqrt(vecDim);
-        new ElementWiseKernels(_accelerator).Scale(attnOut.View, attnOut.View, numQueries * vecDim, invSqrtD);
+        new ElementWiseKernels(_accelerator).ScaleInPlace(attnOut.View, numQueries * vecDim, invSqrtD);
         using var invFWHT = _accelerator.Allocate1D<float>(numQueries * vecDim);
         _quant.FWHT.ForwardBatch(attnOut.View, invFWHT.View, numQueries, vecDim);
         _quant.SignFlip(invFWHT.View, output, _signs!.View, numQueries * vecDim);
@@ -337,8 +337,7 @@ public class QuantizedKVCache : IDisposable
         // FWHT normalizes by 1/√d, so output of unit vector has variance ~1/d.
         // The codebook expects N(0,1) variance. Multiply by √d to restore.
         float sqrtD = MathF.Sqrt(vecDim);
-        new ElementWiseKernels(_accelerator).Scale(
-            _tempTransformed!.View.SubView(0, vecDim),
+        new ElementWiseKernels(_accelerator).ScaleInPlace(
             _tempTransformed!.View.SubView(0, vecDim), vecDim, sqrtD);
 
         // Step 4: Quantize to nearest codebook centroid
@@ -395,8 +394,7 @@ public class QuantizedKVCache : IDisposable
 
             // Step 2b: Scale by 1/√d to undo the pre-quantization √d scaling
             float invSqrtD = 1f / MathF.Sqrt(vecDim);
-            new ElementWiseKernels(_accelerator).Scale(
-                tempDequant.View.SubView(0, vecDim),
+            new ElementWiseKernels(_accelerator).ScaleInPlace(
                 tempDequant.View.SubView(0, vecDim), vecDim, invSqrtD);
 
             // Step 3: Inverse FWHT

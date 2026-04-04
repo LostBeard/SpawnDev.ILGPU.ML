@@ -12,7 +12,7 @@ namespace SpawnDev.ILGPU.ML;
 ///   Pass 1: One thread per row — compute mean and invStd via Welford. Write to temp buffers.
 ///   Pass 2: One thread per element — apply normalization using pre-computed stats.
 /// </summary>
-public class LayerNormKernel
+public class LayerNormKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -198,5 +198,11 @@ public class LayerNormKernel
         }
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[LayerNorm] Validate {rows}x{C}: maxErr={maxErr:E3}, avgErr={sumErr / cpuOut.Length:E3}");
         return (maxErr, sumErr / cpuOut.Length);
+    }
+
+    public void Dispose()
+    {
+        _means?.Dispose();
+        _invStds?.Dispose();
     }
 }

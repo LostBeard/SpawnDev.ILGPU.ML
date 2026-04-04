@@ -30,7 +30,7 @@ public abstract partial class MLTestBase
         var expected = new float[outputBytes.Length / 4];
         Buffer.BlockCopy(outputBytes, 0, expected, 0, outputBytes.Length);
 
-        var session = await InferenceSession.CreateFromFileAsync(accelerator, http, modelPath);
+        using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, modelPath);
         using var inputBuf = accelerator.Allocate1D(inputFloats);
         var inputTensor = new Tensor(inputBuf.View, inputShape);
 
@@ -67,7 +67,7 @@ public abstract partial class MLTestBase
         var expected = new float[outputBytes.Length / 4];
         Buffer.BlockCopy(outputBytes, 0, expected, 0, outputBytes.Length);
 
-        var session = await InferenceSession.CreateFromFileAsync(accelerator, http, modelPath);
+        using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, modelPath);
         using var inputBuf = accelerator.Allocate1D(inputFloats);
         var inputTensor = new Tensor(inputBuf.View, inputShape);
 
@@ -374,7 +374,7 @@ public abstract partial class MLTestBase
         // Use HuggingFace onnx-community export (proper weight naming).
         // DistilGPT-2 (330MB) — smaller, faster, uses standard HF naming convention.
         var gpt2Url = "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
-        var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
+        using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
             inputShapes: new Dictionary<string, int[]>
             {
                 ["input_ids"] = new[] { 1, 5 },
@@ -444,7 +444,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var session = await InferenceSession.CreateFromFileAsync(accelerator, http,
+        using var session = await InferenceSession.CreateFromFileAsync(accelerator, http,
             "models/whisper-tiny/encoder_model.onnx");
 
         // Load mel spectrogram reference

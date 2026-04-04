@@ -20,7 +20,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         // Load model directly from .onnx via HTTP (no JSON extraction)
-        var session = await InferenceSession.CreateFromOnnxAsync(accelerator, http, "models/squeezenet/model.onnx");
+        using var session = await InferenceSession.CreateFromOnnxAsync(accelerator, http, "models/squeezenet/model.onnx");
         Console.WriteLine($"[DirectOnnxHttp] {session}");
 
         // Gradient test image

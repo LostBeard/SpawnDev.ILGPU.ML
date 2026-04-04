@@ -8,8 +8,13 @@ namespace SpawnDev.ILGPU.ML.SafeTensors;
 public class SafeTensorsFile
 {
     public SafeTensorInfo[] Tensors { get; set; } = Array.Empty<SafeTensorInfo>();
+
+    /// <summary>Check if a tensor with the given name exists.</summary>
+    public bool HasTensor(string name) => Tensors.Any(t => t.Name == name);
     public Dictionary<string, object> Metadata { get; set; } = new();
     public byte[] RawData { get; set; } = Array.Empty<byte>();
+    /// <summary>Offset of tensor data section within RawData (after header).</summary>
+    public long DataOffset { get; set; }
 
     /// <summary>Get tensor data as float32 (converts from stored dtype).</summary>
     public float[]? GetTensorFloat32(SafeTensorInfo tensor)
@@ -27,6 +32,12 @@ public class SafeTensorsFile
             "I16" => ReadI16AsFloat(tensor),
             "I8" => ReadI8AsFloat(tensor),
             "U8" => ReadU8AsFloat(tensor),
+            "I64" => ReadI64AsFloat(tensor),
+            "BOOL" => ReadBoolAsFloat(tensor),
+            "U16" => ReadU16AsFloat(tensor),
+            "U32" => ReadU32AsFloat(tensor),
+            "F8_E4M3" => ReadF16(tensor), // Approximate as F16 (same size)
+            "F8_E5M2" => ReadF16(tensor), // Approximate as F16 (same size)
             _ => null
         };
     }
@@ -53,11 +64,15 @@ public class SafeTensorsFile
         return shapes;
     }
 
+    /// <summary>Get the raw data bytes for a tensor (handles multi-shard models).</summary>
+    private byte[] GetData(SafeTensorInfo t) => t.ShardData ?? RawData;
+    private long GetDataStart(SafeTensorInfo t) => t.ShardData != null ? t.ShardDataOffset + t.DataOffset : t.DataOffset;
+
     private float[] ReadF32(SafeTensorInfo t)
     {
         int count = (int)(t.DataLength / 4);
         var result = new float[count];
-        Buffer.BlockCopy(RawData, (int)t.DataOffset, result, 0, count * 4);
+        Buffer.BlockCopy(GetData(t), (int)GetDataStart(t), result, 0, count * 4);
         return result;
     }
 
@@ -95,7 +110,7 @@ public class SafeTensorsFile
         int count = (int)(t.DataLength / 8);
         var result = new float[count];
         for (int i = 0; i < count; i++)
-            result[i] = (float)BitConverter.ToDouble(RawData, (int)t.DataOffset + i * 8);
+            result[i] = (float)BitConverter.ToDouble(GetData(t), (int)GetDataStart(t) + i * 8);
         return result;
     }
 
@@ -104,7 +119,7 @@ public class SafeTensorsFile
         int count = (int)(t.DataLength / 4);
         var result = new float[count];
         for (int i = 0; i < count; i++)
-            result[i] = BitConverter.ToInt32(RawData, (int)t.DataOffset + i * 4);
+            result[i] = BitConverter.ToInt32(GetData(t), (int)GetDataStart(t) + i * 4);
         return result;
     }
 
@@ -113,7 +128,7 @@ public class SafeTensorsFile
         int count = (int)(t.DataLength / 2);
         var result = new float[count];
         for (int i = 0; i < count; i++)
-            result[i] = BitConverter.ToInt16(RawData, (int)t.DataOffset + i * 2);
+            result[i] = BitConverter.ToInt16(GetData(t), (int)GetDataStart(t) + i * 2);
         return result;
     }
 
@@ -122,7 +137,7 @@ public class SafeTensorsFile
         int count = (int)t.DataLength;
         var result = new float[count];
         for (int i = 0; i < count; i++)
-            result[i] = (sbyte)RawData[(int)t.DataOffset + i];
+            result[i] = (sbyte)GetData(t)[(int)GetDataStart(t) + i];
         return result;
     }
 
@@ -131,7 +146,43 @@ public class SafeTensorsFile
         int count = (int)t.DataLength;
         var result = new float[count];
         for (int i = 0; i < count; i++)
-            result[i] = RawData[(int)t.DataOffset + i];
+            result[i] = GetData(t)[(int)GetDataStart(t) + i];
+        return result;
+    }
+
+    private float[] ReadI64AsFloat(SafeTensorInfo t)
+    {
+        int count = (int)(t.DataLength / 8);
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = BitConverter.ToInt64(GetData(t), (int)GetDataStart(t) + i * 8);
+        return result;
+    }
+
+    private float[] ReadBoolAsFloat(SafeTensorInfo t)
+    {
+        int count = (int)t.DataLength;
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = GetData(t)[(int)GetDataStart(t) + i] != 0 ? 1f : 0f;
+        return result;
+    }
+
+    private float[] ReadU16AsFloat(SafeTensorInfo t)
+    {
+        int count = (int)(t.DataLength / 2);
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = BitConverter.ToUInt16(GetData(t), (int)GetDataStart(t) + i * 2);
+        return result;
+    }
+
+    private float[] ReadU32AsFloat(SafeTensorInfo t)
+    {
+        int count = (int)(t.DataLength / 4);
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = BitConverter.ToUInt32(GetData(t), (int)GetDataStart(t) + i * 4);
         return result;
     }
 
@@ -155,4 +206,8 @@ public class SafeTensorInfo
     public int[] Shape { get; set; } = Array.Empty<int>();
     public long DataOffset { get; set; }
     public long DataLength { get; set; }
+    /// <summary>For multi-shard models: the shard's raw data bytes. Null for single-file models.</summary>
+    public byte[]? ShardData { get; set; }
+    /// <summary>For multi-shard models: offset of tensor data section in ShardData.</summary>
+    public long ShardDataOffset { get; set; }
 }

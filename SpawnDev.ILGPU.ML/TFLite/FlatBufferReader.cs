@@ -80,6 +80,13 @@ public class FlatBufferReader
         return fieldOff == 0 ? defaultValue : ReadByte(tableOffset + fieldOff);
     }
 
+    public float ReadFieldFloat(int tableOffset, int fieldIndex, float defaultValue = 0f)
+    {
+        int vtable = GetVTableOffset(tableOffset);
+        int fieldOff = GetFieldOffset(vtable, fieldIndex);
+        return fieldOff == 0 ? defaultValue : BitConverter.ToSingle(_data, tableOffset + fieldOff);
+    }
+
     public sbyte ReadFieldSByte(int tableOffset, int fieldIndex, sbyte defaultValue = 0)
     {
         int vtable = GetVTableOffset(tableOffset);

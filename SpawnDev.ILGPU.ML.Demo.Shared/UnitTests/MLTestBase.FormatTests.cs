@@ -21,7 +21,7 @@ public abstract partial class MLTestBase
         // Try to load BlazeFace TFLite model
         try
         {
-            var session = await InferenceSession.CreateFromTFLiteAsync(
+            using var session = await InferenceSession.CreateFromTFLiteAsync(
                 accelerator, http, "models/blaze-face/model.tflite");
 
             Console.WriteLine($"[TFLite] Session: {session}");

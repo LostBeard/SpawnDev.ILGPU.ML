@@ -47,6 +47,13 @@ public static class PyTorchLoader
                 checkpoint.PickleData = pklMs.ToArray();
                 ExtractTensorMetadataFromPickle(checkpoint);
             }
+            else if (path.EndsWith("config.json"))
+            {
+                // HuggingFace config.json — extract for graph construction
+                using var stream = entry.Open();
+                using var reader = new StreamReader(stream);
+                checkpoint.ConfigJson = reader.ReadToEnd();
+            }
             else if (path.Contains("/data/") && !path.EndsWith("/"))
             {
                 // Raw tensor data file (e.g., "archive/data/0")
@@ -126,6 +133,7 @@ public class PyTorchCheckpoint
 {
     public byte[] RawData { get; set; } = Array.Empty<byte>();
     public byte[]? PickleData { get; set; }
+    public string? ConfigJson { get; set; }
     public Dictionary<string, byte[]> DataFiles { get; set; } = new();
     public List<string> TensorNames { get; set; } = new();
 }

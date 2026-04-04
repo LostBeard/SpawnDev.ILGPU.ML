@@ -156,14 +156,109 @@ public static class CoreMLParser
                     break;
                 default:
                     // The layer type is a oneof with field numbers 100+ for each type
-                    // (convolution=100, innerProduct=101, pooling=120, etc.)
-                    if (fieldNumber >= 100 && layer.LayerType == null)
-                        layer.LayerType = CoreMLLayerTypeNames.GetName(fieldNumber);
-                    reader.SkipField(wireType);
+                    if (fieldNumber >= 100)
+                    {
+                        if (layer.LayerType == null)
+                            layer.LayerType = CoreMLLayerTypeNames.GetName(fieldNumber);
+                        // Try to extract weight params from the layer data
+                        if (wireType == 2) // length-delimited (submessage)
+                        {
+                            var layerBytes = reader.ReadBytes().ToArray();
+                            ExtractWeightsFromLayerParams(layerBytes, layer);
+                        }
+                        else
+                        {
+                            reader.SkipField(wireType);
+                        }
+                    }
+                    else
+                    {
+                        reader.SkipField(wireType);
+                    }
                     break;
             }
         }
         return layer.Name.Length > 0 ? layer : null;
+    }
+
+    /// <summary>
+    /// Extract weight data from layer parameter submessages.
+    /// CoreML embeds weights inside each layer as WeightParams:
+    ///   field 1 (repeated float) = float32 values
+    ///   field 2 (bytes) = float16 values
+    ///   field 65 (bytes) = quantized values
+    /// We scan for WeightParams in the layer's protobuf fields.
+    /// </summary>
+    private static void ExtractWeightsFromLayerParams(byte[] data, CoreMLLayer layer)
+    {
+        try
+        {
+            var reader = new ProtobufReader(data);
+            while (reader.HasMore)
+            {
+                var (fn, wt) = reader.ReadTag();
+                if (wt == 2) // submessage — might be WeightParams
+                {
+                    var subData = reader.ReadBytes().ToArray();
+                    var floats = TryReadWeightParams(subData);
+                    if (floats != null && floats.Length > 0)
+                    {
+                        if (layer.Weights == null)
+                            layer.Weights = floats;
+                        else if (layer.Bias == null)
+                            layer.Bias = floats;
+                    }
+                }
+                else
+                {
+                    reader.SkipField(wt);
+                }
+            }
+        }
+        catch { /* Ignore parse errors in weight extraction */ }
+    }
+
+    /// <summary>Try to read a WeightParams submessage and return float32 data.</summary>
+    private static float[]? TryReadWeightParams(byte[] data)
+    {
+        try
+        {
+            var reader = new ProtobufReader(data);
+            while (reader.HasMore)
+            {
+                var (fn, wt) = reader.ReadTag();
+                if (fn == 1 && wt == 2) // field 1 = floatValue (packed repeated float)
+                {
+                    var bytes = reader.ReadBytes().ToArray();
+                    if (bytes.Length >= 4 && bytes.Length % 4 == 0)
+                    {
+                        var result = new float[bytes.Length / 4];
+                        Buffer.BlockCopy(bytes, 0, result, 0, bytes.Length);
+                        return result;
+                    }
+                }
+                else if (fn == 2 && wt == 2) // field 2 = float16Value (bytes)
+                {
+                    var bytes = reader.ReadBytes().ToArray();
+                    if (bytes.Length >= 2 && bytes.Length % 2 == 0)
+                    {
+                        var result = new float[bytes.Length / 2];
+                        for (int i = 0; i < result.Length; i++)
+                        {
+                            ushort h = (ushort)(bytes[i * 2] | (bytes[i * 2 + 1] << 8));
+                            result[i] = (float)BitConverter.Int16BitsToHalf((short)h);
+                        }
+                        return result;
+                    }
+                }
+                else
+                {
+                    reader.SkipField(wt);
+                }
+            }
+        }
+        catch { }
+        return null;
     }
 }
 
@@ -184,6 +279,10 @@ public class CoreMLLayer
     public string? LayerType { get; set; }
     public List<string> Inputs { get; set; } = new();
     public List<string> Outputs { get; set; } = new();
+    /// <summary>Weight data extracted from layer params (first WeightParams found).</summary>
+    public float[]? Weights { get; set; }
+    /// <summary>Bias data extracted from layer params (second WeightParams found).</summary>
+    public float[]? Bias { get; set; }
 }
 
 /// <summary>Maps Core ML layer type field numbers to names.</summary>

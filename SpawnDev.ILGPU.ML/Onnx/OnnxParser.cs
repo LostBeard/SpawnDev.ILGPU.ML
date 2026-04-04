@@ -61,6 +61,9 @@ public static class OnnxParser
                 case 1: model.IrVersion = r.ReadInt64(); break;              // ir_version
                 case 2: model.ProducerName = r.ReadString(); break;          // producer_name
                 case 3: model.ProducerVersion = r.ReadString(); break;       // producer_version
+                case 4: model.Domain = r.ReadString(); break;                // domain
+                case 5: model.ModelVersion = r.ReadInt64(); break;           // model_version
+                case 6: model.DocString = r.ReadString(); break;             // doc_string
                 case 7:                                                       // graph
                     var sub = r.ReadSubMessage();
                     model.Graph = ParseGraphProto(ref sub);
@@ -69,7 +72,10 @@ public static class OnnxParser
                     var opSub = r.ReadSubMessage();
                     model.OpsetImports.Add(ParseOpsetImport(ref opSub));
                     break;
-                default: r.SkipField(wire); break;                           // Skip everything else
+                case 14: r.SkipField(wire); break;                           // metadata_props (repeated StringStringEntryProto)
+                case 15: r.SkipField(wire); break;                           // training_info (repeated TrainingInfoProto)
+                case 20: r.SkipField(wire); break;                           // functions (repeated FunctionProto)
+                default: r.SkipField(wire); break;
             }
         }
         return model;
@@ -200,6 +206,9 @@ public static class OnnxParser
                         int64s.Add(r.ReadInt64());
                     }
                     break;
+                case 6: // string_data (repeated bytes — string tensors)
+                    r.SkipField(wire); // String tensors stored as bytes — skip for float inference
+                    break;
                 case 8: tensor.Name = r.ReadString(); break;                 // name
                 case 9: // raw_data
                     if (_zeroCopySource != null)
@@ -243,6 +252,12 @@ public static class OnnxParser
                     tensor.ExternalData[key] = val;
                     break;
                 case 14: tensor.DataLocation = r.ReadInt32(); break;         // data_location
+                case 11: // uint64_data (packed repeated uint64)
+                    r.SkipField(wire); // uint64 tensors — skip for float inference
+                    break;
+                case 12: // doc_string
+                    r.SkipField(wire); // documentation — skip
+                    break;
                 default: r.SkipField(wire); break;
             }
         }

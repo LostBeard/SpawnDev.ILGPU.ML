@@ -102,7 +102,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available");
 
         // Run SqueezeNet (66 nodes) — this works
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
 
         int w = 32; int h = 32;
         var pixels = new int[(int)(w * h)];

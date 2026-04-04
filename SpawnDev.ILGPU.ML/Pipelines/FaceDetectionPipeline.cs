@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
 using System.Diagnostics;
@@ -50,18 +51,12 @@ public class FaceDetectionPipeline : IDisposable
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
         _preprocess.ForwardNormalized01(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize);
 
-        // BlazeFace expects NHWC — transpose NCHW→NHWC on CPU for simplicity
-        await _accelerator.SynchronizeAsync();
-        var nchwData = await preprocessed.CopyToHostAsync<float>(0, 3 * _inputSize * _inputSize);
-        var nhwcData = new float[3 * _inputSize * _inputSize];
+        // BlazeFace expects NHWC — transpose NCHW→NHWC on GPU (no CPU round-trip)
         int H = _inputSize, W = _inputSize;
-        for (int y = 0; y < H; y++)
-            for (int x = 0; x < W; x++)
-                for (int c = 0; c < 3; c++)
-                    nhwcData[(y * W + x) * 3 + c] = nchwData[c * H * W + y * W + x];
-
-        using var nhwcBuf = _accelerator.Allocate1D(nhwcData);
-        var inputTensor = new Tensor(nhwcBuf.View, new[] { 1, _inputSize, _inputSize, 3 });
+        using var nhwcBuf = _accelerator.Allocate1D<float>(3 * H * W);
+        new TransposeKernel(_accelerator).Transpose(preprocessed.View, nhwcBuf.View,
+            new[] { 3, H, W }, new[] { 1, 2, 0 }); // CHW → HWC
+        var inputTensor = new Tensor(nhwcBuf.View, new[] { 1, H, W, 3 });
 
         // Run inference — BlazeFace has 2 outputs: regressors [1,896,16] and classificators [1,896,1]
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>

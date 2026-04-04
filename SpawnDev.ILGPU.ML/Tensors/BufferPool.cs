@@ -18,8 +18,6 @@ public class BufferPool : IDisposable
     private readonly Accelerator _accelerator;
     private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allBuffers = new();
-    // Maps tensor data pointer → parent buffer for proper return-to-pool
-    private readonly Dictionary<long, MemoryBuffer1D<float, Stride1D.Dense>> _tensorBufferMap = new();
 
     /// <summary>Total number of GPU buffers allocated by this pool.</summary>
     public int AllocatedBufferCount => _allBuffers.Count;
@@ -29,8 +27,6 @@ public class BufferPool : IDisposable
     public BufferPool(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
-    // Track latest buffer for each bucket size for Return
-    private MemoryBuffer1D<float, Stride1D.Dense>? _lastRentedBuffer;
     private readonly Dictionary<string, MemoryBuffer1D<float, Stride1D.Dense>> _namedBuffers = new();
 
     public Tensor Rent(int[] shape, string? name = null)
@@ -43,7 +39,6 @@ public class BufferPool : IDisposable
             var buffer = stack.Pop();
             var tensor = new Tensor(buffer.View, shape, name);
             if (name != null) _namedBuffers[name] = buffer;
-            _lastRentedBuffer = buffer;
             return tensor;
         }
 
@@ -51,7 +46,6 @@ public class BufferPool : IDisposable
         _allBuffers.Add(newBuffer);
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) _namedBuffers[name] = newBuffer;
-        _lastRentedBuffer = newBuffer;
         return newTensor;
     }
 
@@ -115,15 +109,17 @@ public class BufferPool : IDisposable
         // Uses Scale(1.0f) for GPU→GPU copy — CopyTo is not supported on WebGPU.
         if (rawBytes != null && rawBytes.Length > 0 && tensor.DataType == 1)
         {
-            var ew = new ElementWiseKernels(_accelerator);
+            // Upload chunks directly via CopyFromCPU (queue.writeBuffer on WebGPU).
+            // Do NOT use Scale kernel + temp buffer: on WebGPU, the temp buffer is
+            // destroyed before the batched command encoder submits, causing use-after-free
+            // (all weights read as zeros). CopyFromCPU is immediate — no temp buffer needed.
             int offset = 0;
             while (offset < count)
             {
                 int n = Math.Min(CHUNK, count - offset);
                 var chunkSlice = new float[n];
                 Buffer.BlockCopy(rawBytes, rawOffset + offset * 4, chunkSlice, 0, n * 4);
-                using var tempBuf = _accelerator.Allocate1D(chunkSlice);
-                ew.Scale(tempBuf.View, buffer.View.SubView(offset, n), n, 1f);
+                buffer.View.SubView(offset, n).CopyFromCPU(chunkSlice);
                 offset += n;
             }
         }
@@ -144,28 +140,6 @@ public class BufferPool : IDisposable
         var buffer = _accelerator.Allocate1D<float>(count);
         _allBuffers.Add(buffer);
         return new Tensor(buffer.View, shape, name);
-    }
-
-    /// <summary>Force-dispose the GPU buffer backing a tensor. Removes from tracking.</summary>
-    public void ForceDispose(Tensor tensor)
-    {
-        // Find and dispose the buffer that contains this tensor's view
-        for (int i = _allBuffers.Count - 1; i >= 0; i--)
-        {
-            var buf = _allBuffers[i];
-            // Match by checking if the tensor's element count fits in this buffer's size
-            // and the buffer isn't already disposed
-            if (buf.Length >= tensor.ElementCount)
-            {
-                try
-                {
-                    buf.Dispose();
-                    _allBuffers.RemoveAt(i);
-                    return;
-                }
-                catch { }
-            }
-        }
     }
 
     public void Dispose()

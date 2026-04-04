@@ -30,7 +30,7 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[CatTest] Loaded cat image: {width}x{height}, {pixels.Length} pixels");
 
         // Load model
-        var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
+        using var session = await InferenceSession.CreateAsync(accelerator, http, "models/squeezenet");
         Console.WriteLine($"[CatTest] Model: {session}");
 
         // Run classification

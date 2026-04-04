@@ -166,13 +166,25 @@ public abstract partial class MLTestBase : IDisposable
     /// GPU-side AssertClose — uploads expected to GPU, compares on GPU, reads back only 2 floats.
     /// Use instead of CopyToHostAsync + AssertClose to avoid large GPU→CPU transfers.
     /// </summary>
+    // Cached ElementWiseKernels per accelerator — avoids creating 50+ instances across tests
+    private static readonly Dictionary<Accelerator, ElementWiseKernels> _ewCache = new();
+    private static ElementWiseKernels GetOrCreateEW(Accelerator accelerator)
+    {
+        if (!_ewCache.TryGetValue(accelerator, out var ew))
+        {
+            ew = new ElementWiseKernels(accelerator);
+            _ewCache[accelerator] = ew;
+        }
+        return ew;
+    }
+
     protected static async Task AssertCloseGpu(Accelerator accelerator,
         ArrayView1D<float, Stride1D.Dense> actualGpu, float[] expected,
         float tolerance, string label = "")
     {
         int count = Math.Min((int)actualGpu.Length, expected.Length);
         using var expectedBuf = accelerator.Allocate1D(expected);
-        var ew = new ElementWiseKernels(accelerator);
+        var ew = GetOrCreateEW(accelerator);
         var (meanErr, maxErr) = await ew.CompareOnGpuAsync(
             actualGpu.SubView(0, count), expectedBuf.View.SubView(0, count), count);
         if (maxErr > tolerance)

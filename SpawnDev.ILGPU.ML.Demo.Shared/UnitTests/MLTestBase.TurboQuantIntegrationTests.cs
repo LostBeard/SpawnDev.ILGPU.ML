@@ -522,7 +522,7 @@ public abstract partial class MLTestBase
             tq.FWHT.ForwardBatch(flipped.View, transformed.View, numVecs, d);
             // Scale by √d: FWHT normalizes by 1/√d, but codebook expects N(0,1) variance
             float sqrtD = MathF.Sqrt(d);
-            new ElementWiseKernels(accelerator).Scale(transformed.View, transformed.View, numVecs * d, sqrtD);
+            new ElementWiseKernels(accelerator).ScaleInPlace(transformed.View, numVecs * d, sqrtD);
             tq.Quantize(transformed.View, codebookBuf.View, indices.View, numVecs * d, numCentroids);
 
             // Pack

@@ -125,6 +125,35 @@ public class ReductionKernels
         _reduceMinKernel!(outerSize * innerSize, input, output, outerSize, reduceSize, innerSize);
     }
 
+    // ── ReduceProd ──
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int>? _reduceProdKernel;
+
+    private static void ReduceProdImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int outerSize, int reduceSize, int innerSize)
+    {
+        int outer = idx / innerSize;
+        int inner = idx % innerSize;
+        int baseIdx = outer * reduceSize * innerSize + inner;
+        float prod = 1f;
+        for (int r = 0; r < reduceSize; r++)
+            prod *= input[baseIdx + r * innerSize];
+        output[idx] = prod;
+    }
+
+    public void ReduceProd(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int outerSize, int reduceSize, int innerSize)
+    {
+        _reduceProdKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int>(ReduceProdImpl);
+        _reduceProdKernel(outerSize * innerSize, input, output, outerSize, reduceSize, innerSize);
+    }
+
     private void EnsureLoaded()
     {
         var a = _accelerator;

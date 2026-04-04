@@ -14,7 +14,8 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 public class TurboQuantKernels
 {
     private readonly Accelerator _accelerator;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParamsBuf;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _fusedParamsBuf;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _flashParamsBuf;
     private readonly FWHTKernel _fwht;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -360,10 +361,11 @@ public class TurboQuantKernels
         int numQueries, int numKV, int headDim, float scale)
     {
         // Pack scalars into int buffer to reduce kernel param count
-        // params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*1000 (as int)
-        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f) };
-        _lastParamsBuf?.Dispose();
-        _lastParamsBuf = _accelerator.Allocate1D(paramsData);
+        // params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*10000, params[4]=valuesPerInt
+        int valuesPerInt = K_codebook.Length <= 8 ? 10 : 8; // 3-bit=8 centroids→10 per int, 4-bit=16→8 per int
+        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt };
+        _fusedParamsBuf?.Dispose();
+        _fusedParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _fusedAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -373,7 +375,7 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
         _fusedAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, _lastParamsBuf.View);
+            K_norms, V_norms, output, _fusedParamsBuf.View);
     }
 
     /// <summary>
@@ -395,7 +397,8 @@ public class TurboQuantKernels
         int numKV = paramsArr[1];
         int D = paramsArr[2];
         float scale = paramsArr[3] / 10000f;
-        int packedDim = D / 8; // 4-bit: 8 values per int
+        int valuesPerInt = paramsArr[4]; // 8 for 4-bit, 10 for 3-bit
+        int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
 
         // Step 1: Compute attention scores QK^T (dequantize K on-the-fly)
         // Use a fixed-size local array for scores (max 1024 KV positions)
@@ -498,9 +501,10 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> output,
         int numQueries, int numKV, int headDim, float scale)
     {
-        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f) };
-        _lastParamsBuf?.Dispose();
-        _lastParamsBuf = _accelerator.Allocate1D(paramsData);
+        int valuesPerInt = K_codebook.Length <= 8 ? 10 : 8; // 3-bit=8 centroids→10 per int, 4-bit=16→8 per int
+        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt };
+        _flashParamsBuf?.Dispose();
+        _flashParamsBuf = _accelerator.Allocate1D(paramsData);
 
         _flashAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -510,7 +514,7 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlashAttentionImpl);
         _flashAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, _lastParamsBuf.View);
+            K_norms, V_norms, output, _flashParamsBuf.View);
     }
 
     /// <summary>
@@ -544,7 +548,8 @@ public class TurboQuantKernels
         int numKV = paramsArr[1];
         int D = paramsArr[2];
         float scale = paramsArr[3] / 10000f;
-        int packedDim = D / 8; // 4-bit: 8 values per int
+        int valuesPerInt = paramsArr[4]; // 8 for 4-bit, 10 for 3-bit
+        int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
 
         // Initialize Online Softmax state
         float runningMax = -1e10f;

@@ -140,7 +140,7 @@ public class GraphCompiler
                 var shapeMsg = $"[GraphCompiler] Shape inference failed at node {nodeCompileIdx} '{node.OpType}' " +
                     $"inputs=[{string.Join("; ", inputShapes.Select(s => $"[{string.Join(",", s)}]"))}] " +
                     $"inputNames=[{string.Join(",", node.Inputs)}] outputs=[{string.Join(",", node.Outputs)}]: {shapeEx.Message}";
-                Console.WriteLine(shapeMsg);
+                if (InferenceSession.VerboseLogging) Console.WriteLine(shapeMsg);
                 // Log for debugging but allow fallback (many models work despite imperfect shapes)
                 // Fallback: try known output shape (from Initializers), then first input shape
                 if (node.Outputs.Count > 0 && knownShapes.TryGetValue(node.Outputs[0], out var fallbackShape))
