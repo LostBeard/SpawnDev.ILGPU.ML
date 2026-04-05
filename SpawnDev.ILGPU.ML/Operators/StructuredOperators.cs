@@ -870,8 +870,7 @@ public class ScatterNDOperator(OperatorRegistry reg) : IOnnxOperator
                         _ => upd
                     };
                 }
-                using var sliceBuf = reg.Accelerator.Allocate1D(resultSlice);
-                reg.ElementWise.Scale(sliceBuf.View.SubView(0, sliceSize), output.Data.SubView(flatOffset, sliceSize), sliceSize, 1f);
+                output.Data.SubView(flatOffset, sliceSize).CopyFromCPU(resultSlice.AsSpan(0, sliceSize).ToArray());
             }
             else
             {
@@ -1816,41 +1815,17 @@ public class TriluOperator(OperatorRegistry reg) : IOnnxOperator
             if (kVals != null && kVals.Length > 0) k = (int)kVals[0];
         }
 
-        // Read input, apply triangular mask, upload
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null)
-        {
-            // Can't read — just copy (CopyFrom works on all backends for GPU→GPU)
-            int total = ctx.Inputs[0].ElementCount;
-            ctx.Outputs[0].Data.SubView(0, total).CopyFrom(ctx.Inputs[0].Data.SubView(0, total));
-            return;
-        }
-
         var shape = ctx.Inputs[0].Shape;
         int rows = shape[^2], cols = shape[^1];
-        int batch = ctx.Inputs[0].ElementCount / (rows * cols);
-        var result = (float[])xVals.Clone();
+        int total = ctx.Inputs[0].ElementCount;
+        int batchStride = rows * cols;
 
-        for (int b = 0; b < batch; b++)
-        {
-            int off = b * rows * cols;
-            for (int r = 0; r < rows; r++)
-            {
-                for (int c = 0; c < cols; c++)
-                {
-                    bool zero;
-                    if (upper != 0)
-                        zero = c < r + k; // zero below the k-th diagonal (upper triangle)
-                    else
-                        zero = c > r + k; // zero above the k-th diagonal (lower triangle)
-                    if (zero) result[off + r * cols + c] = 0f;
-                }
-            }
-        }
-
-        int count = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (count < result.Length) { var t = new float[count]; Array.Copy(result, t, count); ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
+        // GPU path: params buffer [rows, cols, k, upper, batchStride]
+        var paramsData = new int[] { rows, cols, k, upper, batchStride };
+        var paramsBuf = reg.Accelerator.Allocate1D(paramsData);
+        reg.ElementWise.Trilu(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, total);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 

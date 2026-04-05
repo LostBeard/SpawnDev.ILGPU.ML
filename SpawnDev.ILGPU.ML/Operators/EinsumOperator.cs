@@ -242,8 +242,7 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         // Upload result to GPU
-        using var resultBuf = reg.Accelerator.Allocate1D(result);
-        reg.ElementWise.Scale(resultBuf.View, ctx.Outputs[0].Data.SubView(0, outputSize), outputSize, 1f);
+        ctx.Outputs[0].Data.SubView(0, outputSize).CopyFromCPU(result);
     }
 
     // ═══════════════════════════════════════════════════════════

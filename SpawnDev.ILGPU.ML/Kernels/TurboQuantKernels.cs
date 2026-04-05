@@ -359,12 +359,12 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> K_norms,
         ArrayView1D<float, Stride1D.Dense> V_norms,
         ArrayView1D<float, Stride1D.Dense> output,
-        int numQueries, int numKV, int headDim, float scale)
+        int numQueries, int numKV, int headDim, float scale,
+        int bitsPerValue = 4, int valuesPerInt = 8)
     {
         // Pack scalars into int buffer to reduce kernel param count
-        // params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*10000, params[4]=valuesPerInt
-        int valuesPerInt = K_codebook.Length <= 8 ? 10 : 8; // 3-bit=8 centroids→10 per int, 4-bit=16→8 per int
-        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt };
+        int indexMask = (1 << bitsPerValue) - 1; // 0x7 for 3-bit, 0xF for 4-bit
+        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt, bitsPerValue, indexMask };
         // Don't dispose previous — it may still be in the WebGPU command encoder
         if (_fusedParamsBuf != null) _oldParamsBufs.Add(_fusedParamsBuf);
         _fusedParamsBuf = _accelerator.Allocate1D(paramsData);
@@ -399,15 +399,14 @@ public class TurboQuantKernels
         int numKV = paramsArr[1];
         int D = paramsArr[2];
         float scale = paramsArr[3] / 10000f;
-        int valuesPerInt = paramsArr[4]; // 8 for 4-bit, 10 for 3-bit
+        int valuesPerInt = paramsArr[4]; // 8 for 4-bit/3BitQJL, 10 for pure 3-bit
+        int bitsPerValue = paramsArr[5]; // 3 for pure 3-bit, 4 for 4-bit/3BitQJL
+        int indexMask = paramsArr[6];    // 0x7 for 3-bit codebook, 0xF for 4-bit codebook
         int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
 
         // Step 1: Compute attention scores QK^T (dequantize K on-the-fly)
-        // Use a fixed-size local array for scores (max 1024 KV positions)
         float maxScore = -1e10f;
 
-        // First pass: compute scores and find max
-        // We'll do two passes to avoid needing a large local array
         // Pass 1: find max score
         for (int kv = 0; kv < numKV; kv++)
         {
@@ -416,11 +415,11 @@ public class TurboQuantKernels
             for (int p = 0; p < packedDim; p++)
             {
                 int packed = K_packed[kv * packedDim + p];
-                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * 4)) & 0xF;
+                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
                     float kVal = K_codebook[idx] * kNorm;
-                    dot += Q[queryIdx * D + p * 8 + b] * kVal;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
                 }
             }
             float score = dot * scale;
@@ -429,7 +428,6 @@ public class TurboQuantKernels
 
         // Pass 2: compute exp(score - max) and sum for softmax, and accumulate weighted V
         float sumExp = 0f;
-        // Zero the output
         for (int d = 0; d < D; d++)
             output[queryIdx * D + d] = 0f;
 
@@ -441,11 +439,11 @@ public class TurboQuantKernels
             for (int p = 0; p < packedDim; p++)
             {
                 int packed = K_packed[kv * packedDim + p];
-                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * 4)) & 0xF;
+                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
                     float kVal = K_codebook[idx] * kNorm;
-                    dot += Q[queryIdx * D + p * 8 + b] * kVal;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
                 }
             }
             float weight = MathF.Exp(dot * scale - maxScore);
@@ -456,11 +454,11 @@ public class TurboQuantKernels
             for (int p = 0; p < packedDim; p++)
             {
                 int packed = V_packed[kv * packedDim + p];
-                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * 4)) & 0xF;
+                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
                     float vVal = V_codebook[idx] * vNorm;
-                    output[queryIdx * D + p * 8 + b] += weight * vVal;
+                    output[queryIdx * D + p * valuesPerInt + b] += weight * vVal;
                 }
             }
         }
@@ -501,10 +499,13 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> K_norms,
         ArrayView1D<float, Stride1D.Dense> V_norms,
         ArrayView1D<float, Stride1D.Dense> output,
-        int numQueries, int numKV, int headDim, float scale)
+        int numQueries, int numKV, int headDim, float scale,
+        int bitsPerValue = 4, int valuesPerInt = 8)
     {
-        int valuesPerInt = K_codebook.Length <= 8 ? 10 : 8; // 3-bit=8 centroids→10 per int, 4-bit=16→8 per int
-        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt };
+        // bitsPerValue: 3 for pure 3Bit (10 per int), 4 for 4Bit and 3BitQJL (8 per int)
+        // valuesPerInt: 10 for pure 3Bit, 8 for 4Bit and 3BitQJL
+        int indexMask = (1 << bitsPerValue) - 1; // 0x7 for 3-bit, 0xF for 4-bit
+        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt, bitsPerValue, indexMask };
         if (_flashParamsBuf != null) _oldParamsBufs.Add(_flashParamsBuf);
         _flashParamsBuf = _accelerator.Allocate1D(paramsData);
 
@@ -550,7 +551,9 @@ public class TurboQuantKernels
         int numKV = paramsArr[1];
         int D = paramsArr[2];
         float scale = paramsArr[3] / 10000f;
-        int valuesPerInt = paramsArr[4]; // 8 for 4-bit, 10 for 3-bit
+        int valuesPerInt = paramsArr[4]; // 8 for 4-bit/3BitQJL, 10 for pure 3-bit
+        int bitsPerValue = paramsArr[5]; // 3 for pure 3-bit, 4 for 4-bit/3BitQJL
+        int indexMask = paramsArr[6];    // 0x7 for 3-bit codebook, 0xF for 4-bit codebook
         int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
 
         // Initialize Online Softmax state
@@ -570,11 +573,11 @@ public class TurboQuantKernels
             for (int p = 0; p < packedDim; p++)
             {
                 int packed = K_packed[kv * packedDim + p];
-                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * 4)) & 0xF;
+                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
                     float kVal = K_codebook[idx] * kNorm;
-                    dot += Q[queryIdx * D + p * 8 + b] * kVal;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
                 }
             }
             float score = dot * scale;
@@ -598,11 +601,11 @@ public class TurboQuantKernels
             for (int p = 0; p < packedDim; p++)
             {
                 int packed = V_packed[kv * packedDim + p];
-                for (int b = 0; b < 8 && p * 8 + b < D; b++)
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * 4)) & 0xF;
+                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
                     float vVal = V_codebook[idx] * vNorm;
-                    output[queryIdx * D + p * 8 + b] += weight * vVal;
+                    output[queryIdx * D + p * valuesPerInt + b] += weight * vVal;
                 }
             }
         }

@@ -451,12 +451,11 @@ public class CumSumOperator(OperatorRegistry reg) : IOnnxOperator
                     }
                 }
 
-            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
-            reg.ElementWise.Scale(temp.Data, output.Data, count, 1f);
+            output.Data.SubView(0, count).CopyFromCPU(result);
         }
         else
         {
-            reg.ElementWise.Scale(input.Data, output.Data, count, 1f);
+            output.Data.SubView(0, count).CopyFrom(input.Data.SubView(0, count));
         }
     }
 }
@@ -495,8 +494,7 @@ public class OneHotOperator(OperatorRegistry reg) : IOnnxOperator
                     result[i * depth + idx] = onValue;
             }
 
-            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
-            reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+            output.Data.SubView(0, outCount).CopyFromCPU(result);
         }
     }
 }
@@ -547,14 +545,12 @@ public class GatherElementsOperator(OperatorRegistry reg) : IOnnxOperator
                 }
                 result[i] = srcIdx >= 0 && srcIdx < dataVals.Length ? dataVals[srcIdx] : 0f;
             }
-            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
-            reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+            output.Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else
         {
             int copyCount = Math.Min(data.ElementCount, outCount);
-            reg.ElementWise.Scale(data.Data.SubView(0, copyCount),
-                output.Data.SubView(0, copyCount), copyCount, 1f);
+            output.Data.SubView(0, copyCount).CopyFrom(data.Data.SubView(0, copyCount));
         }
     }
 }
@@ -581,8 +577,7 @@ public class ModOperator(OperatorRegistry reg) : IOnnxOperator
                 float bv = i < bVals.Length ? bVals[i % bVals.Length] : 1f;
                 result[i] = fmod != 0 ? av % bv : (bv != 0 ? (int)av % (int)bv : 0f);
             }
-            var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
-            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+            ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else
         {
@@ -701,10 +696,37 @@ public class DynamicQuantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0], new[] { 1 }, new[] { 1 } }; // y, y_scale, y_zero_point
     public void Execute(OnnxOpContext ctx)
     {
-        // Compute scale and zero_point from input range, then quantize
+        // ONNX DynamicQuantizeLinear: compute uint8 quantization from input range
+        // y_scale = (max(0, max(x)) - min(0, min(x))) / 255
+        // y_zero_point = saturate(round(-min(0, min(x)) / y_scale))
+        // y = saturate(round(x / y_scale) + y_zero_point, 0, 255)
         int count = ctx.Inputs[0].ElementCount;
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
-        // Simplified: just copy for now — full dynamic quant needs ReduceMin/Max + scale calc
+        var input = ctx.Inputs[0].Data;
+
+        // Try constant path first (avoids GPU→CPU readback, works on all backends)
+        var xVals = ctx.TryGetInputValues(0);
+        if (xVals != null)
+        {
+            float xMax = Math.Max(0f, xVals.Max());
+            float xMin = Math.Min(0f, xVals.Min());
+            float yScale = (xMax - xMin) / 255f;
+            if (yScale == 0f) yScale = 1f;
+            float yZeroPoint = MathF.Max(0f, MathF.Min(255f, MathF.Round(-xMin / yScale)));
+            var result = xVals.Select(x => MathF.Max(0f, MathF.Min(255f, MathF.Round(x / yScale) + yZeroPoint))).ToArray();
+            ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
+            ctx.Outputs[1].Data.SubView(0, 1).CopyFromCPU(new[] { yScale });
+            ctx.Outputs[2].Data.SubView(0, 1).CopyFromCPU(new[] { yZeroPoint });
+            return;
+        }
+
+        // GPU path: reductions for min/max, then fused quantize kernel
+        using var maxBuf = reg.Accelerator.Allocate1D<float>(1);
+        using var minBuf = reg.Accelerator.Allocate1D<float>(1);
+        reg.Reductions.ReduceMax(input, maxBuf.View, 1, count, 1);
+        reg.Reductions.ReduceMin(input, minBuf.View, 1, count, 1);
+        // Fused kernel: reads max/min scalars on GPU, computes scale/zp/quantized output
+        reg.ElementWise.DynamicQuantize(input, ctx.Outputs[0].Data, ctx.Outputs[1].Data,
+            ctx.Outputs[2].Data, maxBuf.View, minBuf.View, count);
     }
 }
 
@@ -784,45 +806,25 @@ public class LRNOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         // LRN: y[n,c,h,w] = x[n,c,h,w] / (bias + alpha/size * sum(x[n,c',h,w]^2))^beta
-        // where c' ranges over [max(0,c-floor(size/2)), min(C-1,c+floor(size/2))]
         int size = ctx.GetInt("size", 5);
         float alpha = ctx.GetFloat("alpha", 0.0001f);
         float beta = ctx.GetFloat("beta", 0.75f);
         float bias = ctx.GetFloat("bias", 1f);
 
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null)
-        {
-            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-            return;
-        }
-
         var shape = ctx.Inputs[0].Shape;
-        int N = shape[0], C = shape[1];
+        int C = shape[1];
         int spatial = 1;
         for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
         int halfSize = size / 2;
-        var result = new float[xVals.Length];
+        int total = ctx.Inputs[0].ElementCount;
 
-        for (int n = 0; n < N; n++)
-        {
-            for (int c = 0; c < C; c++)
-            {
-                int cStart = Math.Max(0, c - halfSize);
-                int cEnd = Math.Min(C - 1, c + halfSize);
-                for (int s = 0; s < spatial; s++)
-                {
-                    float sqSum = 0f;
-                    for (int cp = cStart; cp <= cEnd; cp++)
-                        sqSum += xVals[(n * C + cp) * spatial + s] * xVals[(n * C + cp) * spatial + s];
-                    float denom = MathF.Pow(bias + alpha / size * sqSum, beta);
-                    result[(n * C + c) * spatial + s] = xVals[(n * C + c) * spatial + s] / denom;
-                }
-            }
-        }
-
-        int total = result.Length;
-        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
+        // GPU path: params buffer [C, spatial, halfSize, size], fparams [alpha, beta, bias]
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, spatial, halfSize, size });
+        var fparamsBuf = reg.Accelerator.Allocate1D(new float[] { alpha, beta, bias });
+        reg.ElementWise.LRN(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, fparamsBuf.View, total);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
+        fparamsBuf.Dispose();
     }
 }
 
@@ -954,7 +956,7 @@ public class RandomNormalOperator(OperatorRegistry reg) : IOnnxOperator
             double u2 = rng.NextDouble();
             data[i] = (float)(mean + scale * Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
         }
-        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+        ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(data);
     }
 }
 
@@ -983,7 +985,7 @@ public class RandomUniformOperator(OperatorRegistry reg) : IOnnxOperator
         var data = new float[count];
         for (int i = 0; i < count; i++)
             data[i] = low + (float)rng.NextDouble() * (high - low);
-        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+        ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(data);
     }
 }
 
@@ -1126,10 +1128,7 @@ public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
         // Output 0: Y (unique values)
         int yLen = Math.Min(uniqueValues.Count, ctx.Outputs[0].ElementCount);
         if (yLen > 0)
-        {
-            using var yBuf = reg.Accelerator.Allocate1D(uniqueValues.ToArray());
-            reg.ElementWise.Scale(yBuf.View.SubView(0, yLen), ctx.Outputs[0].Data.SubView(0, yLen), yLen, 1f);
-        }
+            ctx.Outputs[0].Data.SubView(0, yLen).CopyFromCPU(uniqueValues.ToArray().AsSpan(0, yLen).ToArray());
 
         // Output 1: indices (first occurrence of each unique value)
         if (ctx.Outputs.Length > 1 && ctx.Outputs[1] != null)
@@ -1137,10 +1136,7 @@ public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
             var idxArr = firstIdx.Select(i => (float)i).ToArray();
             int idxLen = Math.Min(idxArr.Length, ctx.Outputs[1].ElementCount);
             if (idxLen > 0)
-            {
-                using var idxBuf = reg.Accelerator.Allocate1D(idxArr);
-                reg.ElementWise.Scale(idxBuf.View.SubView(0, idxLen), ctx.Outputs[1].Data.SubView(0, idxLen), idxLen, 1f);
-            }
+                ctx.Outputs[1].Data.SubView(0, idxLen).CopyFromCPU(idxArr.AsSpan(0, idxLen).ToArray());
         }
 
         // Output 2: inverse_indices (maps each input element to its unique index)
@@ -1149,10 +1145,7 @@ public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
             var invArr = inverseMap.Select(i => (float)i).ToArray();
             int invLen = Math.Min(invArr.Length, ctx.Outputs[2].ElementCount);
             if (invLen > 0)
-            {
-                using var invBuf = reg.Accelerator.Allocate1D(invArr);
-                reg.ElementWise.Scale(invBuf.View.SubView(0, invLen), ctx.Outputs[2].Data.SubView(0, invLen), invLen, 1f);
-            }
+                ctx.Outputs[2].Data.SubView(0, invLen).CopyFromCPU(invArr.AsSpan(0, invLen).ToArray());
         }
 
         // Output 3: counts (how many times each unique value appears)
@@ -1160,10 +1153,7 @@ public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
         {
             int cntLen = Math.Min(counts.Length, ctx.Outputs[3].ElementCount);
             if (cntLen > 0)
-            {
-                using var cntBuf = reg.Accelerator.Allocate1D(counts);
-                reg.ElementWise.Scale(cntBuf.View.SubView(0, cntLen), ctx.Outputs[3].Data.SubView(0, cntLen), cntLen, 1f);
-            }
+                ctx.Outputs[3].Data.SubView(0, cntLen).CopyFromCPU(counts.AsSpan(0, cntLen).ToArray());
         }
     }
 }
@@ -1185,7 +1175,7 @@ public class HannWindowOperator(OperatorRegistry reg) : IOnnxOperator
         var data = new float[size];
         for (int i = 0; i < size; i++)
             data[i] = 0.5f * (1f - MathF.Cos(2f * MathF.PI * i / (size - 1)));
-        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, size), size, 1f);
+        ctx.Outputs[0].Data.SubView(0, size).CopyFromCPU(data);
     }
 }
 
@@ -1200,7 +1190,7 @@ public class HammingWindowOperator(OperatorRegistry reg) : IOnnxOperator
         var data = new float[size];
         for (int i = 0; i < size; i++)
             data[i] = 0.54f - 0.46f * MathF.Cos(2f * MathF.PI * i / (size - 1));
-        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, size), size, 1f);
+        ctx.Outputs[0].Data.SubView(0, size).CopyFromCPU(data);
     }
 }
 
@@ -1218,7 +1208,7 @@ public class BlackmanWindowOperator(OperatorRegistry reg) : IOnnxOperator
             float t = 2f * MathF.PI * i / (size - 1);
             data[i] = 0.42f - 0.5f * MathF.Cos(t) + 0.08f * MathF.Cos(2f * t);
         }
-        using var _tmpBuf = reg.Accelerator.Allocate1D(data); reg.ElementWise.Scale(_tmpBuf.View, ctx.Outputs[0].Data.SubView(0, size), size, 1f);
+        ctx.Outputs[0].Data.SubView(0, size).CopyFromCPU(data);
     }
 }
 
@@ -1365,14 +1355,12 @@ public class SoftmaxCrossEntropyLossOperator(OperatorRegistry reg) : IOnnxOperat
         }
         string reduction = ctx.GetString("reduction", "mean");
         if (reduction == "mean" && N > 0) totalLoss /= N;
-        using var lossBuf = reg.Accelerator.Allocate1D(new[] { totalLoss });
-        reg.ElementWise.Scale(lossBuf.View, ctx.Outputs[0].Data.SubView(0, 1), 1, 1f);
+        ctx.Outputs[0].Data.SubView(0, 1).CopyFromCPU(new[] { totalLoss });
         // Output[1] = log probabilities
         if (ctx.Outputs.Length > 1)
         {
-            using var lpBuf = reg.Accelerator.Allocate1D(logProbs);
             int lpCount = Math.Min(logProbs.Length, ctx.Outputs[1].ElementCount);
-            reg.ElementWise.Scale(lpBuf.View.SubView(0, lpCount), ctx.Outputs[1].Data.SubView(0, lpCount), lpCount, 1f);
+            ctx.Outputs[1].Data.SubView(0, lpCount).CopyFromCPU(logProbs.AsSpan(0, lpCount).ToArray());
         }
     }
 }

@@ -15,45 +15,20 @@ public class LpNormalizationOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // LpNormalization: normalize along axis using Lp norm
         int p = ctx.GetInt("p", 2);
         int axis = ctx.GetInt("axis", -1);
         var shape = ctx.Inputs[0].Shape;
         if (axis < 0) axis += shape.Length;
 
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) { reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f); return; }
-
         int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
         int axisSize = shape[axis];
         int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
-        int total = xVals.Length;
-        var result = new float[total];
 
-        for (int o = 0; o < outer; o++)
-        {
-            for (int inn = 0; inn < inner; inn++)
-            {
-                // Compute Lp norm along axis
-                float norm = 0f;
-                for (int a = 0; a < axisSize; a++)
-                {
-                    int idx = (o * axisSize + a) * inner + inn;
-                    float v = MathF.Abs(xVals[idx]);
-                    norm += p == 1 ? v : v * v;
-                }
-                norm = p == 1 ? Math.Max(norm, 1e-10f) : MathF.Sqrt(Math.Max(norm, 1e-10f));
-
-                // Normalize
-                for (int a = 0; a < axisSize; a++)
-                {
-                    int idx = (o * axisSize + a) * inner + inn;
-                    result[idx] = xVals[idx] / norm;
-                }
-            }
-        }
-
-        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
+        // GPU path: one thread per (outer, inner) pair, iterates axisSize
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { axisSize, inner, p });
+        reg.ElementWise.LpNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, outer * inner);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -65,37 +40,16 @@ public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // GlobalLpPool: (sum(|x|^p))^(1/p) over spatial dimensions
         int p = ctx.GetInt("p", 2);
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) { reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f); return; }
         var shape = ctx.Inputs[0].Shape;
         int N = shape[0], C = shape[1];
         int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
-        var result = new float[N * C];
-        for (int n = 0; n < N; n++)
-        {
-            for (int c = 0; c < C; c++)
-            {
-                float sum = 0f;
-                int off = (n * C + c) * spatial;
-                for (int s = 0; s < spatial; s++)
-                {
-                    float v = MathF.Abs(xVals[off + s]);
-                    sum += p == 1 ? v : p == 2 ? v * v : MathF.Pow(v, p);
-                }
-                result[n * C + c] = p == 1 ? sum : p == 2 ? MathF.Sqrt(sum) : MathF.Pow(sum, 1f / p);
-            }
-        }
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length)
-        {
-            var trimmed = new float[copyLen];
-            Array.Copy(result, trimmed, copyLen);
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
-        }
-        else
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+
+        // GPU path: one thread per (N, C) pair, iterates spatial
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, spatial, p });
+        reg.ElementWise.GlobalLpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, N * C);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -422,55 +376,20 @@ public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // AffineGrid: generate sampling grid from affine transform matrix
-        var thetaVals = ctx.TryGetInputValues(0); // [N, 2, 3]
-        var sizeVals = ctx.TryGetInputValues(1);   // [N, C, H, W]
-        if (thetaVals == null || sizeVals == null)
+        var sizeVals = ctx.TryGetInputValues(1); // [N, C, H, W]
+        if (sizeVals == null)
         {
             reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
             return;
         }
         int N = (int)sizeVals[0], H = (int)sizeVals[2], W = (int)sizeVals[3];
         int alignCorners = ctx.GetInt("align_corners", 0);
-        var result = new float[N * H * W * 2];
 
-        for (int n = 0; n < N; n++)
-        {
-            int tOff = n * 6; // theta is [2, 3] flattened
-            for (int h = 0; h < H; h++)
-            {
-                for (int w = 0; w < W; w++)
-                {
-                    // Normalized coordinates [-1, 1]
-                    float ny, nx;
-                    if (alignCorners != 0)
-                    {
-                        ny = H > 1 ? 2f * h / (H - 1) - 1f : 0f;
-                        nx = W > 1 ? 2f * w / (W - 1) - 1f : 0f;
-                    }
-                    else
-                    {
-                        ny = (2f * h + 1f) / H - 1f;
-                        nx = (2f * w + 1f) / W - 1f;
-                    }
-                    // Apply affine: [x', y'] = theta * [nx, ny, 1]^T
-                    float gx = thetaVals[tOff + 0] * nx + thetaVals[tOff + 1] * ny + thetaVals[tOff + 2];
-                    float gy = thetaVals[tOff + 3] * nx + thetaVals[tOff + 4] * ny + thetaVals[tOff + 5];
-                    int idx = ((n * H + h) * W + w) * 2;
-                    result[idx] = gx;
-                    result[idx + 1] = gy;
-                }
-            }
-        }
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length)
-        {
-            var trimmed = new float[copyLen];
-            Array.Copy(result, trimmed, copyLen);
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
-        }
-        else
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        // GPU path: theta is on GPU, one thread per pixel
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { H, W, alignCorners });
+        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, N * H * W);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
@@ -1093,8 +1012,11 @@ public class QLinearConvOperator(OperatorRegistry reg) : IOnnxOperator
                 reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, outCount, 1f / ySc);
             if (yZp != 0f)
             {
-                using var zpMem = reg.Accelerator.Allocate1D(new[] { yZp });
+                var zpData = new[] { yZp };
+                var zpMem = reg.Accelerator.Allocate1D(zpData);
                 reg.ElementWise.AddBias(ctx.Outputs[0].Data, zpMem.View, outCount, 1);
+                reg.Accelerator.Synchronize();
+                zpMem.Dispose();
             }
         }
     }

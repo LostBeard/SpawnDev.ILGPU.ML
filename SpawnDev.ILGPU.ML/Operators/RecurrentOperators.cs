@@ -131,15 +131,13 @@ public class RNNOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         // Upload results to GPU
         if (ctx.Outputs.Length > 0 && ctx.Outputs[0] != null)
         {
-            using var yBuf = reg.Accelerator.Allocate1D(yData);
             int copyLen = Math.Min(yTotal, ctx.Outputs[0].ElementCount);
-            reg.ElementWise.Scale(yBuf.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(yData.AsSpan(0, copyLen).ToArray());
         }
         if (ctx.Outputs.Length > 1 && ctx.Outputs[1] != null)
         {
-            using var yhBuf = reg.Accelerator.Allocate1D(yhData);
             int copyLen = Math.Min(yhData.Length, ctx.Outputs[1].ElementCount);
-            reg.ElementWise.Scale(yhBuf.View.SubView(0, copyLen), ctx.Outputs[1].Data.SubView(0, copyLen), copyLen, 1f);
+            ctx.Outputs[1].Data.SubView(0, copyLen).CopyFromCPU(yhData.AsSpan(0, copyLen).ToArray());
         }
     }
 }

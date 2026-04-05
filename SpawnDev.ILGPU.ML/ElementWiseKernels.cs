@@ -703,9 +703,17 @@ public class ElementWiseKernels : IDisposable
 
     private static void RoundImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     {
-        // Use Floor(x + 0.5f) — MathF.Round may not map to ILGPU intrinsic on all backends
+        // ONNX Round = round-half-to-even (banker's rounding).
+        // MathF.Round doesn't map to ILGPU intrinsic on all backends.
+        // Implement using only Floor + arithmetic (works on all backends):
         float x = input[idx];
-        output[idx] = MathF.Floor(x + 0.5f);
+        float rounded = MathF.Floor(x + 0.5f);
+        // If exactly halfway (x+0.5 is integer), round to even:
+        // check if rounded is odd via Floor(r/2)*2 != r
+        float xp = x + 0.5f;
+        if (xp == rounded && MathF.Floor(rounded * 0.5f) * 2f != rounded)
+            rounded -= 1f;
+        output[idx] = rounded;
     }
 
     /// <summary>Truncate: round toward zero (C-style cast from float to int).</summary>
@@ -735,6 +743,168 @@ public class ElementWiseKernels : IDisposable
         output[idx] = x;
     }
 
+    private static void ThresholdedReluImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, float alpha)
+    { output[idx] = input[idx] > alpha ? input[idx] : 0f; }
+
+    private static void IsNaNImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    { float x = input[idx]; output[idx] = (x != x) ? 1f : 0f; }
+
+    private static void TriluImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [rows, cols, k, upper, batchStride]
+        int rows = paramsArr[0]; int cols = paramsArr[1]; int k = paramsArr[2];
+        int upper = paramsArr[3]; int batchStride = paramsArr[4];
+        int inBatch = idx / batchStride;
+        int posInBatch = idx - inBatch * batchStride;
+        int r = posInBatch / cols;
+        int c = posInBatch - r * cols;
+        bool keep = upper != 0 ? (c >= r + k) : (c <= r + k);
+        output[idx] = keep ? input[idx] : 0f;
+    }
+
+    private static void LRNImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr,
+        ArrayView1D<float, Stride1D.Dense> fparams)
+    {
+        // int params: [C, spatial, halfSize, size]
+        // float params: [alpha, beta, bias]
+        int C = paramsArr[0]; int spatial = paramsArr[1]; int halfSize = paramsArr[2]; int size = paramsArr[3];
+        float alpha = fparams[0]; float beta = fparams[1]; float bias = fparams[2];
+        // idx = n * C * spatial + c * spatial + s
+        int n_cs = idx;
+        int s = n_cs % spatial; n_cs /= spatial;
+        int c = n_cs % C; int n = n_cs / C;
+        int cStart = c - halfSize; if (cStart < 0) cStart = 0;
+        int cEnd = c + halfSize; if (cEnd >= C) cEnd = C - 1;
+        float sqSum = 0f;
+        int nOff = n * C * spatial;
+        for (int cp = cStart; cp <= cEnd; cp++)
+        {
+            float v = input[nOff + cp * spatial + s];
+            sqSum += v * v;
+        }
+        float denom = MathF.Pow(bias + alpha / size * sqSum, beta);
+        output[idx] = input[idx] / denom;
+    }
+
+    private static void LpNormImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [axisSize, inner, p]
+        // idx ranges over outer * inner
+        int axisSize = paramsArr[0]; int inner = paramsArr[1]; int p = paramsArr[2];
+        int o = idx / inner;
+        int inn = idx - o * inner;
+        // Compute Lp norm along axis for this (outer, inner) position
+        float norm = 0f;
+        for (int a = 0; a < axisSize; a++)
+        {
+            int srcIdx = (o * axisSize + a) * inner + inn;
+            float v = input[srcIdx]; if (v < 0f) v = -v;
+            norm += p == 1 ? v : v * v;
+        }
+        if (norm < 1e-10f) norm = 1e-10f;
+        if (p != 1) norm = MathF.Sqrt(norm);
+        // Write normalized values
+        for (int a = 0; a < axisSize; a++)
+        {
+            int srcIdx = (o * axisSize + a) * inner + inn;
+            output[srcIdx] = input[srcIdx] / norm;
+        }
+    }
+
+    private static void GlobalLpPoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [C, spatial, p]
+        // idx = n * C + c (one thread per channel per batch)
+        int C = paramsArr[0]; int spatial = paramsArr[1]; int p = paramsArr[2];
+        int n = idx / C; int c = idx - n * C;
+        float sum = 0f;
+        int off = (n * C + c) * spatial;
+        for (int s = 0; s < spatial; s++)
+        {
+            float v = input[off + s]; if (v < 0f) v = -v;
+            sum += p == 1 ? v : v * v;
+        }
+        output[idx] = p == 1 ? sum : MathF.Sqrt(sum);
+    }
+
+    private static void AffineGridImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> theta,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [H, W, alignCorners]
+        int H = paramsArr[0]; int W = paramsArr[1]; int alignCorners = paramsArr[2];
+        // idx = n * H * W + pixel_idx
+        int hw = H * W;
+        int n = idx / hw;
+        int pixelIdx = idx - n * hw;
+        int iy = pixelIdx / W;
+        int ix = pixelIdx - iy * W;
+        // Compute normalized coordinates
+        float nx, ny;
+        if (alignCorners != 0)
+        {
+            nx = W > 1 ? 2f * ix / (W - 1) - 1f : 0f;
+            ny = H > 1 ? 2f * iy / (H - 1) - 1f : 0f;
+        }
+        else
+        {
+            nx = (2f * ix + 1f) / W - 1f;
+            ny = (2f * iy + 1f) / H - 1f;
+        }
+        // theta[n] is [2,3]: [[a,b,c],[d,e,f]]
+        int tOff = n * 6;
+        float ox = theta[tOff + 0] * nx + theta[tOff + 1] * ny + theta[tOff + 2];
+        float oy = theta[tOff + 3] * nx + theta[tOff + 4] * ny + theta[tOff + 5];
+        int outOff = (n * H * W + pixelIdx) * 2;
+        output[outOff] = ox;
+        output[outOff + 1] = oy;
+    }
+
+    private static void HardmaxImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, int axisSize)
+    {
+        // idx = outer batch index, each batch has axisSize elements
+        int offset = idx * axisSize;
+        float maxVal = input[offset];
+        int maxIdx = 0;
+        for (int i = 1; i < axisSize; i++)
+        {
+            float v = input[offset + i];
+            if (v > maxVal) { maxVal = v; maxIdx = i; }
+        }
+        for (int i = 0; i < axisSize; i++)
+            output[offset + i] = (i == maxIdx) ? 1f : 0f;
+    }
+
+    private static void DynamicQuantizeImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> scaleOut, ArrayView1D<float, Stride1D.Dense> zpOut,
+        ArrayView1D<float, Stride1D.Dense> maxBuf, ArrayView1D<float, Stride1D.Dense> minBuf)
+    {
+        // Compute scale and zero_point from pre-reduced max/min (read from GPU buffers)
+        float xMax = maxBuf[0]; if (xMax < 0f) xMax = 0f;
+        float xMin = minBuf[0]; if (xMin > 0f) xMin = 0f;
+        float yScale = (xMax - xMin) / 255f;
+        if (yScale == 0f) yScale = 1f;
+        float yZeroPoint = MathF.Floor(-xMin / yScale + 0.5f);
+        if (yZeroPoint < 0f) yZeroPoint = 0f;
+        if (yZeroPoint > 255f) yZeroPoint = 255f;
+        // First thread writes scale and zero_point
+        if (idx == 0)
+        {
+            scaleOut[0] = yScale;
+            zpOut[0] = yZeroPoint;
+        }
+        // Quantize: y = clamp(round(x / scale) + zero_point, 0, 255)
+        float val = MathF.Floor(input[idx] / yScale + 0.5f) + yZeroPoint;
+        if (val < 0f) val = 0f;
+        if (val > 255f) val = 255f;
+        output[idx] = val;
+    }
+
     /// <summary>Where: output[i] = condition[i] != 0 ? x[i] : y[i].</summary>
     private static void WhereImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> cond,
         ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> y,
@@ -762,6 +932,22 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _minKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _maxKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _clipKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _thresholdedReluKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _dynamicQuantizeKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _isNaNKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _triluKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _lrnKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _hardmaxKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _lpNormKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _globalLpPoolKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _affineGridKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _equalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _greaterKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _lessKernel;
@@ -809,6 +995,32 @@ public class ElementWiseKernels : IDisposable
     { EnsureLoaded2(); _maxKernel!(count, a, b, output); }
     public void Clip(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float minVal, float maxVal)
     { EnsureLoaded2(); _clipKernel!(count, input, output, minVal, maxVal); }
+    public void ThresholdedRelu(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float alpha)
+    { EnsureLoaded2(); _thresholdedReluKernel!(count, input, output, alpha); }
+    public void DynamicQuantize(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> scaleOut, ArrayView1D<float, Stride1D.Dense> zpOut,
+        ArrayView1D<float, Stride1D.Dense> maxBuf, ArrayView1D<float, Stride1D.Dense> minBuf, int count)
+    { EnsureLoaded2(); _dynamicQuantizeKernel!(count, input, output, scaleOut, zpOut, maxBuf, minBuf); }
+    public void IsNaN(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded2(); _isNaNKernel!(count, input, output); }
+    public void Trilu(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int count)
+    { EnsureLoaded2(); _triluKernel!(count, input, output, paramsBuf); }
+    public void LRN(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, ArrayView1D<float, Stride1D.Dense> fparamsBuf, int count)
+    { EnsureLoaded2(); _lrnKernel!(count, input, output, paramsBuf, fparamsBuf); }
+    public void Hardmax(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        int outerSize, int axisSize)
+    { EnsureLoaded2(); _hardmaxKernel!(outerSize, input, output, axisSize); }
+    public void LpNorm(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int outerTimesInner)
+    { EnsureLoaded2(); _lpNormKernel!(outerTimesInner, input, output, paramsBuf); }
+    public void GlobalLpPool(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int nTimesC)
+    { EnsureLoaded2(); _globalLpPoolKernel!(nTimesC, input, output, paramsBuf); }
+    public void AffineGrid(ArrayView1D<float, Stride1D.Dense> theta, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalPixels)
+    { EnsureLoaded2(); _affineGridKernel!(totalPixels, theta, output, paramsBuf); }
     public void Equal(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _equalKernel!(count, a, b, output); }
     public void Greater(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
@@ -844,6 +1056,22 @@ public class ElementWiseKernels : IDisposable
         _minKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MinImpl);
         _maxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
         _clipKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);
+        _thresholdedReluKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(ThresholdedReluImpl);
+        _dynamicQuantizeKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DynamicQuantizeImpl);
+        _isNaNKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(IsNaNImpl);
+        _triluKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(TriluImpl);
+        _lrnKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LRNImpl);
+        _hardmaxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(HardmaxImpl);
+        _lpNormKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(LpNormImpl);
+        _globalLpPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(GlobalLpPoolImpl);
+        _affineGridKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(AffineGridImpl);
         _equalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
         _greaterKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
         _lessKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);

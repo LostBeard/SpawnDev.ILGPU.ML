@@ -290,7 +290,8 @@ public class QuantizedKVCache : IDisposable
             qTransformed.View, kPacked.packed, _codebook!.View,
             vPacked.packed, _vCodebookCopy.View,
             kPacked.norms, vPacked.norms, attnOut.View,
-            numQueries, CurrentSeqLen, vecDim, scale);
+            numQueries, CurrentSeqLen, vecDim, scale,
+            bitsPerValue: _bitsPerValue, valuesPerInt: _valuesPerInt);
 
         // Inverse-transform the output back to original domain.
         // The attention output is a weighted sum of V values in the scaled Hadamard domain.

@@ -554,8 +554,7 @@ public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
         var output = ctx.Outputs[0];
         if (output.ElementCount >= count)
         {
-            using var tmpBuf = reg.Accelerator.Allocate1D(data);
-            reg.ElementWise.Scale(tmpBuf.View, output.Data.SubView(0, count), count, 1f);
+            output.Data.SubView(0, count).CopyFromCPU(data);
         }
     }
 }
@@ -614,8 +613,7 @@ public class NonZeroOperator(OperatorRegistry reg) : IOnnxOperator
         int copyLen = Math.Min(result.Length, output.ElementCount);
         if (copyLen > 0)
         {
-            using var tmpBuf = reg.Accelerator.Allocate1D(result);
-            reg.ElementWise.Scale(tmpBuf.View.SubView(0, copyLen), output.Data.SubView(0, copyLen), copyLen, 1f);
+            output.Data.SubView(0, copyLen).CopyFromCPU(result.AsSpan(0, copyLen).ToArray());
         }
     }
 }
@@ -912,23 +910,8 @@ public class IsNaNOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // IsNaN: output 1.0 where input is NaN, 0.0 otherwise
-        // For well-behaved models, this should produce all zeros
-        var inVals = ctx.TryGetInputValues(0);
-        if (inVals != null)
-        {
-            var result = new float[inVals.Length];
-            for (int i = 0; i < inVals.Length; i++)
-                result[i] = float.IsNaN(inVals[i]) ? 1f : 0f;
-            var temp = ctx.Pool.AllocatePermanent(result, ctx.Inputs[0].Shape);
-            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, result.Length, 1f);
-        }
-        else
-        {
-            // GPU path: assume no NaN — fill with zeros
-            // Real models use IsNaN as a guard, and our kernels don't produce NaN
-            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 0f);
-        }
+        int count = ctx.Inputs[0].ElementCount;
+        reg.ElementWise.IsNaN(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count);
     }
 }
 
@@ -1167,20 +1150,8 @@ public class ThresholdedReluOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         float alpha = ctx.GetFloat("alpha", 1f);
-        // ThresholdedRelu: output = x if x > alpha, else 0
-        var xVals = ctx.TryGetInputValues(0);
         int count = ctx.Inputs[0].ElementCount;
-        if (xVals != null)
-        {
-            var result = xVals.Select(x => x > alpha ? x : 0f).ToArray();
-            ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
-        }
-        else
-        {
-            // GPU path: copy then threshold would need a custom kernel.
-            // For now, use the generic unary op with alpha=1 default.
-            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
-        }
+        reg.ElementWise.ThresholdedRelu(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, alpha);
     }
 }
 
@@ -1221,28 +1192,35 @@ public class HardmaxOperator(OperatorRegistry reg) : IOnnxOperator
         int outer = 1, inner = 1, axisSize = shape[axis];
         for (int i = 0; i < axis; i++) outer *= shape[i];
         for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
-        // Compute argmax indices on CPU, then build one-hot output
-        var xVals = ctx.TryGetInputValues(0);
         int total = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Fill(ctx.Outputs[0].Data, total, 0f);
-        if (xVals != null)
+
+        if (inner == 1)
         {
-            var result = new float[total];
-            for (int o = 0; o < outer; o++)
+            // GPU path: each thread handles one outer×inner batch, argmax across axisSize
+            reg.ElementWise.Hardmax(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, axisSize);
+        }
+        else
+        {
+            // General case with inner dims — CPU fallback
+            reg.ElementWise.Fill(ctx.Outputs[0].Data, total, 0f);
+            var xVals = ctx.TryGetInputValues(0);
+            if (xVals != null)
             {
-                for (int inn = 0; inn < inner; inn++)
-                {
-                    float maxVal = float.NegativeInfinity;
-                    int maxIdx = 0;
-                    for (int a = 0; a < axisSize; a++)
+                var result = new float[total];
+                for (int o = 0; o < outer; o++)
+                    for (int inn = 0; inn < inner; inn++)
                     {
-                        float v = xVals[(o * axisSize + a) * inner + inn];
-                        if (v > maxVal) { maxVal = v; maxIdx = a; }
+                        float maxVal = float.NegativeInfinity;
+                        int maxIdx = 0;
+                        for (int a = 0; a < axisSize; a++)
+                        {
+                            float v = xVals[(o * axisSize + a) * inner + inn];
+                            if (v > maxVal) { maxVal = v; maxIdx = a; }
+                        }
+                        result[(o * axisSize + maxIdx) * inner + inn] = 1f;
                     }
-                    result[(o * axisSize + maxIdx) * inner + inn] = 1f;
-                }
+                ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
             }
-            ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
         }
     }
 }
@@ -1387,8 +1365,7 @@ public class ShrinkOperator(OperatorRegistry reg) : IOnnxOperator
             if (vals != null)
             {
                 var result = vals.Select(x => x > lambd ? x - bias : x < -lambd ? x + bias : 0f).ToArray();
-                using var tmp = reg.Accelerator.Allocate1D(result);
-                reg.ElementWise.Scale(tmp.View, ctx.Outputs[0].Data, count, 1f);
+                ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
             }
         }
     }
