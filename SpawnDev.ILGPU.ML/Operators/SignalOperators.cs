@@ -33,69 +33,24 @@ public class DFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         var shape = input.Shape;
         int inverse = ctx.GetInt("inverse", 0);
         int onesided = ctx.GetInt("onesided", 0);
-
-        // Determine dimensions
         int axis = ctx.GetInt("axis", 1);
         int batch = 1;
         for (int i = 0; i < axis; i++) batch *= shape[i];
-        int N = shape[axis]; // signal length
-        bool isComplex = shape[^1] == 2;
+        int N = shape[axis];
+        int isComplex = shape[^1] == 2 ? 1 : 0;
         int dftLength = N;
-
-        // Check for dft_length input
         if (ctx.Inputs.Length > 1 && ctx.Inputs[1] != null)
         {
             var dftLenVals = ctx.TryGetInputValues(1);
-            if (dftLenVals != null && dftLenVals.Length > 0)
-                dftLength = (int)dftLenVals[0];
+            if (dftLenVals != null && dftLenVals.Length > 0) dftLength = (int)dftLenVals[0];
         }
-
-        // Read input to CPU (DFT is compute-heavy but signal lengths are typically small)
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) return;
-
         int outputN = onesided != 0 ? dftLength / 2 + 1 : dftLength;
-        var result = new float[batch * outputN * 2];
 
-        float sign = inverse != 0 ? 1f : -1f;
-        float scale = inverse != 0 ? 1f / dftLength : 1f;
-
-        for (int b = 0; b < batch; b++)
-        {
-            for (int k = 0; k < outputN; k++)
-            {
-                float sumReal = 0f, sumImag = 0f;
-                for (int n = 0; n < Math.Min(N, dftLength); n++)
-                {
-                    float angle = sign * 2f * MathF.PI * k * n / dftLength;
-                    float cosA = MathF.Cos(angle);
-                    float sinA = MathF.Sin(angle);
-
-                    float xReal, xImag;
-                    if (isComplex)
-                    {
-                        xReal = xVals[(b * N + n) * 2];
-                        xImag = xVals[(b * N + n) * 2 + 1];
-                    }
-                    else
-                    {
-                        xReal = xVals[b * N + n];
-                        xImag = 0f;
-                    }
-
-                    // Complex multiply: (xReal + i*xImag) * (cosA + i*sinA)
-                    sumReal += xReal * cosA - xImag * sinA;
-                    sumImag += xReal * sinA + xImag * cosA;
-                }
-                result[(b * outputN + k) * 2] = sumReal * scale;
-                result[(b * outputN + k) * 2 + 1] = sumImag * scale;
-            }
-        }
-
-        // Upload to GPU
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        // GPU path: one thread per output frequency bin
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { N, dftLength, outputN, isComplex, inverse });
+        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf.View, batch * outputN);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 

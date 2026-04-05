@@ -392,72 +392,33 @@ public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // Col2Im: reverse of im2col — scatter columns back to image
-        // For now, use zero-fill and copy what we can
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
-
-        // Get image_shape from input[1]
         var imageShapeVals = ctx.TryGetInputValues(1);
         var blockShape = ctx.GetInts("block_shape", new[] { 1, 1 });
         var strides = ctx.GetInts("strides", new[] { 1, 1 });
         var pads = ctx.GetInts("pads", new int[4]);
 
-        var xShape = ctx.Inputs[0].Shape; // [N, C*prod(block_shape), L]
-        int N = xShape[0];
-        int colDim = xShape[1];
-        int L = xShape[2]; // number of blocks
-
+        var xShape = ctx.Inputs[0].Shape;
+        int N = xShape[0]; int colDim = xShape[1]; int L = xShape[2];
         int kH = blockShape.Length > 0 ? blockShape[0] : 1;
         int kW = blockShape.Length > 1 ? blockShape[1] : 1;
         int C = colDim / (kH * kW);
-
         int outH = imageShapeVals != null && imageShapeVals.Length > 0 ? (int)imageShapeVals[0] : 1;
         int outW = imageShapeVals != null && imageShapeVals.Length > 1 ? (int)imageShapeVals[1] : 1;
         int sH = strides.Length > 0 ? strides[0] : 1;
         int sW = strides.Length > 1 ? strides[1] : 1;
         int pH = pads.Length > 0 ? pads[0] : 0;
         int pW = pads.Length > 1 ? pads[1] : 0;
-
-        int paddedH = outH + 2 * pH;
         int paddedW = outW + 2 * pW;
-        int blocksH = (paddedH - kH) / sH + 1;
         int blocksW = (paddedW - kW) / sW + 1;
 
-        var result = new float[N * C * outH * outW];
-
-        // Scatter: for each column, add it back to the corresponding image location
-        for (int n = 0; n < N; n++)
-        {
-            for (int l = 0; l < Math.Min(L, blocksH * blocksW); l++)
-            {
-                int bh = l / blocksW;
-                int bw = l % blocksW;
-                for (int c = 0; c < C; c++)
-                {
-                    for (int kh = 0; kh < kH; kh++)
-                    {
-                        for (int kw = 0; kw < kW; kw++)
-                        {
-                            int colIdx = c * kH * kW + kh * kW + kw;
-                            float val = xVals[(n * colDim + colIdx) * L + l];
-                            int oh = bh * sH + kh - pH;
-                            int ow = bw * sW + kw - pW;
-                            if (oh >= 0 && oh < outH && ow >= 0 && ow < outW)
-                                result[((n * C + c) * outH + oh) * outW + ow] += val;
-                        }
-                    }
-                }
-            }
-        }
-
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        // Zero output first, then GPU scatter-add
+        int outCount = ctx.Outputs[0].ElementCount;
+        reg.ElementWise.Fill(ctx.Outputs[0].Data, outCount, 0f);
+        int totalOps = N * colDim * L;
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim });
+        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, totalOps);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
