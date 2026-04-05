@@ -27,6 +27,14 @@ public class GGUFModel
     public string[]? GetMetadataStringArray(string key) =>
         Metadata.TryGetValue(key, out var v) && v is string[] arr ? arr : null;
 
+    public float[]? GetMetadataFloatArray(string key)
+    {
+        if (!Metadata.TryGetValue(key, out var v)) return null;
+        if (v is float[] farr) return farr;
+        if (v is object[] oarr) return oarr.Select(o => Convert.ToSingle(o)).ToArray();
+        return null;
+    }
+
     // ── Architecture info ──
 
     /// <summary>Model architecture (llama, mistral, phi, qwen, gemma, etc.)</summary>

@@ -5,7 +5,7 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// Compatible with GPT-2/CLIP/Whisper tokenization.
 /// Loads vocabulary and merge rules from standard files.
 /// </summary>
-public class BPETokenizer
+public class BPETokenizer : ITokenizer
 {
     private readonly Dictionary<string, int> _encoder;
     private readonly Dictionary<int, string> _decoder;

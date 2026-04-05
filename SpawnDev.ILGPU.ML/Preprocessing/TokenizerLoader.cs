@@ -46,8 +46,9 @@ public static class TokenizerLoader
         try
         {
             var configJson = await http.GetStringAsync($"{basePath}/tokenizer_config.json");
-            // If we get here, there's a tokenizer config but no vocab — might be sentencepiece
-            throw new NotSupportedException("SentencePiece tokenizers are not yet supported. Only BPE (vocab.json + merges.txt) and HuggingFace fast tokenizer (tokenizer.json) formats are supported.");
+            // Tokenizer config exists but no vocab files — may be sentencepiece-only model.
+            // SentencePiece support is via GGUF metadata (FromGGUF) or tokenizer.json model.type="Unigram".
+            throw new NotSupportedException("No BPE vocabulary found. For SentencePiece models, load via GGUF format (SentencePieceTokenizer.FromGGUF) or use a tokenizer.json export.");
         }
         catch (NotSupportedException) { throw; }
         catch { }
@@ -203,8 +204,8 @@ public static class TokenizerLoader
 /// </summary>
 public class LoadedTokenizer
 {
-    /// <summary>The BPE tokenizer for encoding/decoding.</summary>
-    public BPETokenizer Tokenizer { get; init; } = null!;
+    /// <summary>The tokenizer for encoding/decoding (BPE, SentencePiece, etc.).</summary>
+    public ITokenizer Tokenizer { get; init; } = null!;
 
     /// <summary>Total vocabulary size.</summary>
     public int VocabSize { get; init; }
@@ -257,6 +258,14 @@ public class LoadedTokenizer
     /// </summary>
     public int[] EncodeForCLIP(string text, int maxLength = 77)
     {
-        return Tokenizer.EncodeCLIP(text, maxLength);
+        if (Tokenizer is BPETokenizer bpe)
+            return bpe.EncodeCLIP(text, maxLength);
+        // Fallback: standard encode with BOS/EOS wrapping and padding
+        var tokens = new List<int>();
+        if (BosTokenId >= 0) tokens.Add(BosTokenId);
+        tokens.AddRange(Tokenizer.Encode(text.ToLowerInvariant()));
+        if (EosTokenId >= 0) tokens.Add(EosTokenId);
+        while (tokens.Count < maxLength) tokens.Add(PadTokenId);
+        return tokens.Take(maxLength).ToArray();
     }
 }
