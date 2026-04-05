@@ -356,7 +356,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | Demo | What It Does |
 |------|-------------|
 | **Image Generation** | SD-Turbo: type a text prompt, get a 512x512 image in ONE inference step (~1 second). Real Stable Diffusion running on your GPU in the browser — no server, no API key. 2.5GB model streamed to GPU via HuggingFace CDN. Also includes DDPM MNIST (1MB) as lightweight fallback. |
-| **Image to 3D (TripoSR)** | Drop a photo, get a full 3D textured mesh in seconds. Export as glTF/OBJ for Blender, Unity, game engines, or 3D printing. Feed-forward (no diffusion) — DINOv1 encoder + Triplane transformer + Marching Cubes. |
+| **Image to 3D (TripoSR)** | *Planned for v4.1.0* — DINOv1 encoder + Triplane transformer + Marching Cubes. 3D format support (glTF/OBJ/SPZ/PLY) already implemented. Awaiting ONNX model conversion. |
 | **Image to Gaussian Splats (LGM)** | Drop a photo, generate 65,536 photorealistic Gaussian splats. Fly through the 3D scene in [SpawnScene](https://github.com/LostBeard/SpawnScene). Export as SPZ (15-20x compressed) or PLY. |
 | **Depth Voxel** | Live webcam depth → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
 
@@ -437,8 +437,8 @@ Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for
 - **122+ operator test cases** — Expanded from 18, caught 11+ real bugs. Includes broadcast LayerNorm patterns, subgraph execution (If/Loop/Scan), quantized conv/matmul (ConvInteger, QLinearConv, QLinearMatMul), and CPU reference comparison for every test.
 - **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. First pure C# SPZ parser. Full round-trip for all 3D formats.
 - **DiffusionPipeline** — DDPM denoising loop + SD-Turbo one-step generation. Image generation from text prompts on WebGPU.
-- **22 demo pages, 0 placeholders** — Every demo fully functional, all loading from HuggingFace CDN, zero "not yet deployed" messages.
-- **1300+ tests, 0 failures** — Full suite across WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU. Operator tests, reference model tests (vs ONNX Runtime), Blazing Edge GPU kernel tests, format round-trips, training engine tests, KV cache analysis tests, pipeline end-to-end tests. All passing.
+- **20+ demo pages** — Interactive demos loading from HuggingFace CDN. Image to 3D and Pipeline Composer planned for v4.1.0.
+- **500+ real GPU tests** — Full suite across WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU. Every test runs real GPU kernels with CPU reference verification. Operator tests, reference model tests (vs ONNX Runtime), Blazing Edge GPU kernel tests, format round-trips, training engine tests.
 
 ## Blazing Edge — v4.0.0
 

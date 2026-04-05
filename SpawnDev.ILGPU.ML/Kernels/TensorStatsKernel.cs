@@ -114,9 +114,9 @@ public class TensorStatsKernel
             Min = finalMin,
             Max = finalMax,
             Mean = mean,
-            Std = 0, // TODO: GPU variance pass
+            Std = float.NaN, // Not yet implemented — GPU variance pass needed
             NaNCount = totalNaN,
-            InfCount = 0, // TODO: detect inf in pass 1
+            InfCount = -1, // Not yet implemented — GPU inf detection needed
         };
     }
 
