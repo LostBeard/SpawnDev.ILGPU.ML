@@ -1360,13 +1360,11 @@ public class ShrinkOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Parameterized shrink — CPU fallback for custom lambd/bias
-            var vals = ctx.TryGetInputValues(0);
-            if (vals != null)
-            {
-                var result = vals.Select(x => x > lambd ? x - bias : x < -lambd ? x + bias : 0f).ToArray();
-                ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
-            }
+            // Parameterized shrink — GPU kernel with custom lambd/bias
+            var fparamsBuf = reg.Accelerator.Allocate1D(new float[] { lambd, bias });
+            reg.ElementWise.ShrinkParam(ctx.Inputs[0].Data, ctx.Outputs[0].Data, fparamsBuf.View, count);
+            reg.Accelerator.Synchronize();
+            fparamsBuf.Dispose();
         }
     }
 }

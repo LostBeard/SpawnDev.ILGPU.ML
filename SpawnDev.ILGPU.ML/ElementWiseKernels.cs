@@ -746,6 +746,14 @@ public class ElementWiseKernels : IDisposable
     private static void ThresholdedReluImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, float alpha)
     { output[idx] = input[idx] > alpha ? input[idx] : 0f; }
 
+    private static void ShrinkParamImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> fparams)
+    {
+        float lambd = fparams[0]; float bias = fparams[1];
+        float x = input[idx];
+        output[idx] = x > lambd ? x - bias : x < -lambd ? x + bias : 0f;
+    }
+
     private static void IsNaNImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     { float x = input[idx]; output[idx] = (x != x) ? 1f : 0f; }
 
@@ -1339,6 +1347,8 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _clipKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _thresholdedReluKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _shrinkParamKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _dynamicQuantizeKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _isNaNKernel;
@@ -1430,6 +1440,9 @@ public class ElementWiseKernels : IDisposable
     { EnsureLoaded2(); _clipKernel!(count, input, output, minVal, maxVal); }
     public void ThresholdedRelu(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float alpha)
     { EnsureLoaded2(); _thresholdedReluKernel!(count, input, output, alpha); }
+    public void ShrinkParam(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> fparamsBuf, int count)
+    { EnsureLoaded2(); _shrinkParamKernel!(count, input, output, fparamsBuf); }
     public void DynamicQuantize(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> scaleOut, ArrayView1D<float, Stride1D.Dense> zpOut,
         ArrayView1D<float, Stride1D.Dense> maxBuf, ArrayView1D<float, Stride1D.Dense> minBuf, int count)
@@ -1532,6 +1545,8 @@ public class ElementWiseKernels : IDisposable
         _maxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
         _clipKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);
         _thresholdedReluKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(ThresholdedReluImpl);
+        _shrinkParamKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(ShrinkParamImpl);
         _dynamicQuantizeKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(DynamicQuantizeImpl);
