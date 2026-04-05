@@ -1651,4 +1651,173 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[OperatorCoverage] All {requiredOps.Length} required ONNX operators registered.");
         await Task.CompletedTask;
     });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Additional operator tests — filling coverage gaps
+    // ════════��══════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task Op_DynamicQuantizeLinear_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        var input = new float[] { -1f, 0f, 0.5f, 1f, 2.5f };
+        float xMax = Math.Max(0f, input.Max()); float xMin = Math.Min(0f, input.Min());
+        float yScale = (xMax - xMin) / 255f; if (yScale == 0f) yScale = 1f;
+        float yZp = MathF.Max(0f, MathF.Min(255f, MathF.Round(-xMin / yScale)));
+        var expected = input.Select(x => MathF.Max(0f, MathF.Min(255f, MathF.Round(x / yScale) + yZp))).ToArray();
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var outBuf = accelerator.Allocate1D<float>(5);
+        using var scaleBuf = accelerator.Allocate1D<float>(1);
+        using var zpBuf = accelerator.Allocate1D<float>(1);
+        var inTensor = new Tensor(inBuf.View, new[] { 5 });
+        var outTensor = new Tensor(outBuf.View, new[] { 5 });
+        var scaleTensor = new Tensor(scaleBuf.View, new[] { 1 });
+        var zpTensor = new Tensor(zpBuf.View, new[] { 1 });
+        var ctx = MakeOpCtx(accelerator, new[] { inTensor }, new[] { outTensor, scaleTensor, zpTensor },
+            inputNames: new[] { "x" }, constants: new Dictionary<string, float[]> { ["x"] = input });
+        reg.Resolve("DynamicQuantizeLinear")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1f, "DynQuant y: ");
+        Console.WriteLine("[DynamicQuantizeLinear] PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_STFT_BasicFrame() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        // Simple signal: 4 samples, frame_step=2, frame_length=2 (2 frames, 2 freq bins)
+        var signal = new float[] { 1f, 0f, -1f, 0f };
+        using var sigBuf = accelerator.Allocate1D(signal);
+        int fftOutputLen = 2; int numFrames = 2;
+        using var outBuf = accelerator.Allocate1D<float>(numFrames * fftOutputLen * 2);
+        using var stepBuf = accelerator.Allocate1D(new float[] { 2f });
+        var sigTensor = new Tensor(sigBuf.View, new[] { 1, 4, 1 });
+        var stepTensor = new Tensor(stepBuf.View, new[] { 1 });
+        var outTensor = new Tensor(outBuf.View, new[] { 1, numFrames, fftOutputLen, 2 });
+        var ctx = MakeOpCtx(accelerator, new[] { sigTensor, stepTensor }, new[] { outTensor },
+            attrs: new Dictionary<string, object> { ["onesided"] = 0L },
+            inputNames: new[] { "signal", "frame_step" },
+            constants: new Dictionary<string, float[]> { ["frame_step"] = new[] { 2f } });
+        reg.Resolve("STFT")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        // Frame 0 = [1, 0], DFT bin 0 (DC) = 1+0i, bin 1 = 1+0i (for 2-point DFT of [1,0])
+        var result = await outBuf.CopyToHostAsync<float>(0, numFrames * fftOutputLen * 2);
+        if (MathF.Abs(result[0] - 1f) > 0.01f) throw new Exception($"STFT DC component expected ~1, got {result[0]}");
+        Console.WriteLine("[STFT] PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_SoftmaxCrossEntropyLoss_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        // logits [2, 3], labels [2]
+        var logits = new float[] { 1f, 2f, 3f, 1f, 1f, 1f };
+        var labels = new float[] { 2f, 0f }; // class indices
+        using var logitsBuf = accelerator.Allocate1D(logits);
+        using var labelsBuf = accelerator.Allocate1D(labels);
+        using var lossBuf = accelerator.Allocate1D<float>(1);
+        using var logProbsBuf = accelerator.Allocate1D<float>(6);
+        var logitsTensor = new Tensor(logitsBuf.View, new[] { 2, 3 });
+        var labelsTensor = new Tensor(labelsBuf.View, new[] { 2 });
+        var lossTensor = new Tensor(lossBuf.View, new[] { 1 });
+        var logProbsTensor = new Tensor(logProbsBuf.View, new[] { 2, 3 });
+        var ctx = MakeOpCtx(accelerator, new[] { logitsTensor, labelsTensor }, new[] { lossTensor, logProbsTensor },
+            inputNames: new[] { "scores", "labels" },
+            constants: new Dictionary<string, float[]> { ["scores"] = logits, ["labels"] = labels });
+        reg.Resolve("SoftmaxCrossEntropyLoss")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var lossResult = await lossBuf.CopyToHostAsync<float>(0, 1);
+        if (lossResult[0] <= 0f || float.IsNaN(lossResult[0]))
+            throw new Exception($"SoftmaxCrossEntropyLoss expected positive loss, got {lossResult[0]}");
+        Console.WriteLine($"[SoftmaxCrossEntropyLoss] loss={lossResult[0]:F4} PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_NegativeLogLikelihoodLoss_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        var logProbs = new float[] { -0.5f, -1.2f, -2.0f, -0.3f, -1.5f, -0.8f }; // [2, 3]
+        var labels = new float[] { 0f, 2f };
+        using var lpBuf = accelerator.Allocate1D(logProbs);
+        using var lblBuf = accelerator.Allocate1D(labels);
+        using var lossBuf = accelerator.Allocate1D<float>(1);
+        var lpTensor = new Tensor(lpBuf.View, new[] { 2, 3 });
+        var lblTensor = new Tensor(lblBuf.View, new[] { 2 });
+        var lossTensor = new Tensor(lossBuf.View, new[] { 1 });
+        var ctx = MakeOpCtx(accelerator, new[] { lpTensor, lblTensor }, new[] { lossTensor },
+            inputNames: new[] { "input", "target" },
+            constants: new Dictionary<string, float[]> { ["input"] = logProbs, ["target"] = labels });
+        reg.Resolve("NegativeLogLikelihoodLoss")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        // Expected: -(-0.5 + -0.8) / 2 = 0.65
+        float expected = (-logProbs[0] + -logProbs[5]) / 2f;
+        await AssertCloseGpu(accelerator, lossBuf.View, new[] { expected }, 0.01f, "NLLLoss: ");
+    });
+
+    [TestMethod]
+    public async Task Op_Multinomial_ProducesValidIndices() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        // Log-probabilities [1, 4]: heavily biased toward index 2
+        var logProbs = new float[] { -10f, -10f, 0f, -10f };
+        using var lpBuf = accelerator.Allocate1D(logProbs);
+        using var outBuf = accelerator.Allocate1D<float>(3);
+        var lpTensor = new Tensor(lpBuf.View, new[] { 1, 4 });
+        var outTensor = new Tensor(outBuf.View, new[] { 1, 3 });
+        var ctx = MakeOpCtx(accelerator, new[] { lpTensor }, new[] { outTensor },
+            attrs: new Dictionary<string, object> { ["sample_size"] = 3L, ["seed"] = 42L },
+            inputNames: new[] { "input" },
+            constants: new Dictionary<string, float[]> { ["input"] = logProbs });
+        reg.Resolve("Multinomial")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 3);
+        // All samples should be index 2 (probability ~99.99%)
+        for (int i = 0; i < 3; i++)
+            if (result[i] < 0 || result[i] >= 4)
+                throw new Exception($"Multinomial produced invalid index {result[i]}");
+        Console.WriteLine($"[Multinomial] indices: {string.Join(",", result.Select(v => v.ToString("F0")))} PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_RandomNormalLike_ProducesValues() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        var input = new float[] { 0, 0, 0, 0, 0 };
+        using var inBuf = accelerator.Allocate1D(input);
+        using var outBuf = accelerator.Allocate1D<float>(5);
+        var inTensor = new Tensor(inBuf.View, new[] { 5 });
+        var outTensor = new Tensor(outBuf.View, new[] { 5 });
+        var ctx = MakeOpCtx(accelerator, new[] { inTensor }, new[] { outTensor },
+            attrs: new Dictionary<string, object> { ["seed"] = 42L },
+            inputNames: new[] { "input" },
+            constants: new Dictionary<string, float[]> { ["input"] = input });
+        reg.Resolve("RandomNormalLike")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 5);
+        bool anyNonZero = result.Any(v => MathF.Abs(v) > 1e-6f);
+        if (!anyNonZero) throw new Exception("RandomNormalLike produced all zeros");
+        Console.WriteLine($"[RandomNormalLike] values: {string.Join(",", result.Take(3).Select(v => v.ToString("F4")))} PASS");
+    });
+
+    [TestMethod]
+    public async Task Op_RandomUniformLike_ProducesValues() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        var input = new float[] { 0, 0, 0, 0, 0 };
+        using var inBuf = accelerator.Allocate1D(input);
+        using var outBuf = accelerator.Allocate1D<float>(5);
+        var inTensor = new Tensor(inBuf.View, new[] { 5 });
+        var outTensor = new Tensor(outBuf.View, new[] { 5 });
+        var ctx = MakeOpCtx(accelerator, new[] { inTensor }, new[] { outTensor },
+            attrs: new Dictionary<string, object> { ["seed"] = 42L, ["low"] = 2f, ["high"] = 5f },
+            inputNames: new[] { "input" },
+            constants: new Dictionary<string, float[]> { ["input"] = input });
+        reg.Resolve("RandomUniformLike")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, 5);
+        bool allInRange = result.All(v => v >= 2f && v <= 5f);
+        if (!allInRange) throw new Exception($"RandomUniformLike out of range: {string.Join(",", result.Select(v => v.ToString("F4")))}");
+        Console.WriteLine("[RandomUniformLike] PASS");
+    });
 }
