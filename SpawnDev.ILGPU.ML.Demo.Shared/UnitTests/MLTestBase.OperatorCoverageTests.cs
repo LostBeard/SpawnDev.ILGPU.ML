@@ -449,11 +449,21 @@ public abstract partial class MLTestBase
         op.Execute(ctx);
         await accelerator.SynchronizeAsync();
 
-        // Verify output is non-zero (gates are active with input=1)
+        // CPU reference: input=[1,1], W=identity per gate, R=0, B=0, hidden_size=2
+        // Each gate pre-activation = 1.0 (from identity W * x)
+        // it = sigmoid(1) = 0.7311, ot = sigmoid(1) = 0.7311
+        // ft = sigmoid(1) = 0.7311, ct_candidate = tanh(1) = 0.7616
+        // Ct = 0 * ft + it * tanh(1) = 0.7311 * 0.7616 = 0.5569
+        // Ht = ot * tanh(Ct) = 0.7311 * tanh(0.5569)
+        float sigm1 = 1f / (1f + MathF.Exp(-1f));
+        float cell = sigm1 * MathF.Tanh(1f); // it * tanh(gc)
+        float expectedH = sigm1 * MathF.Tanh(cell); // ot * tanh(Ct)
         var yhResult = await yhBuf.CopyToHostAsync<float>(0, 2);
-        if (MathF.Abs(yhResult[0]) < 1e-6f && MathF.Abs(yhResult[1]) < 1e-6f)
-            throw new Exception($"LSTM output is zero — gates not working. Y_h=[{yhResult[0]:F4}, {yhResult[1]:F4}]");
-        Console.WriteLine($"[LSTM] Y_h=[{yhResult[0]:F4}, {yhResult[1]:F4}] — PASS (non-zero)");
+        // Both hidden units should have the same value (symmetric identity weights)
+        for (int i = 0; i < 2; i++)
+            if (MathF.Abs(yhResult[i] - expectedH) > 0.01f)
+                throw new Exception($"LSTM Y_h[{i}] expected {expectedH:F4}, got {yhResult[i]:F4}");
+        Console.WriteLine($"[LSTM] Y_h=[{yhResult[0]:F4}, {yhResult[1]:F4}] expected {expectedH:F4} — PASS");
     });
 
     // ═══════════════════════════════════════════════════════════
@@ -613,17 +623,24 @@ public abstract partial class MLTestBase
         await accelerator.SynchronizeAsync();
 
         var result = await outBuf.CopyToHostAsync<float>(0, numSpecBins * numMelBins);
-        // Verify: each mel bin should have non-negative weights that peak at center
+        // Verify: all weights non-negative, each filter has at least some weight, and filters are triangular
         int nonZeroFilters = 0;
         for (int m = 0; m < numMelBins; m++)
         {
             float sum = 0f;
-            for (int k = 0; k < numSpecBins; k++) sum += result[k * numMelBins + m];
+            bool anyNegative = false;
+            for (int k = 0; k < numSpecBins; k++)
+            {
+                float w = result[k * numMelBins + m];
+                sum += w;
+                if (w < -1e-6f) anyNegative = true;
+            }
             if (sum > 0.01f) nonZeroFilters++;
+            if (anyNegative) throw new Exception($"MelWeightMatrix: filter {m} has negative weight");
         }
-        if (nonZeroFilters < numMelBins / 2)
-            throw new Exception($"MelWeightMatrix: only {nonZeroFilters}/{numMelBins} filters have non-zero weights");
-        Console.WriteLine($"[MelWeightMatrix] {nonZeroFilters}/{numMelBins} active filters — PASS");
+        if (nonZeroFilters < numMelBins - 1)
+            throw new Exception($"MelWeightMatrix: only {nonZeroFilters}/{numMelBins} filters active — expected all");
+        Console.WriteLine($"[MelWeightMatrix] {nonZeroFilters}/{numMelBins} active, all non-negative — PASS");
     });
 
     // ═══════════════════════════════════════════════════════════
@@ -1025,11 +1042,21 @@ public abstract partial class MLTestBase
         op.Execute(ctx);
         await accelerator.SynchronizeAsync();
 
-        // Verify non-zero output
+        // CPU reference: x=[1,0], W=identity per gate, R=0, B=0, h0=0
+        // z = sigmoid(W_z * x) = [sigmoid(1), sigmoid(0)] = [0.7311, 0.5]
+        // r = sigmoid(W_r * x) = [sigmoid(1), sigmoid(0)] = [0.7311, 0.5]
+        // h_candidate = tanh(W_h * x + 0) = [tanh(1), tanh(0)] = [0.7616, 0]
+        // Ht = (1-z)*h_candidate + z*h0 = (1-z)*h_candidate (h0=0)
+        float sig1 = 1f / (1f + MathF.Exp(-1f));
+        float sig0 = 0.5f;
+        float expectedH0 = (1f - sig1) * MathF.Tanh(1f);
+        float expectedH1 = (1f - sig0) * 0f; // tanh(0)=0
         var yhResult = await yhBuf.CopyToHostAsync<float>(0, 2);
-        if (MathF.Abs(yhResult[0]) < 1e-6f && MathF.Abs(yhResult[1]) < 1e-6f)
-            throw new Exception($"GRU output is zero — gates not working. Y_h=[{yhResult[0]:F4}, {yhResult[1]:F4}]");
-        Console.WriteLine($"[GRU] Y_h=[{yhResult[0]:F4}, {yhResult[1]:F4}] — PASS (non-zero)");
+        if (MathF.Abs(yhResult[0] - expectedH0) > 0.01f)
+            throw new Exception($"GRU Y_h[0] expected {expectedH0:F4}, got {yhResult[0]:F4}");
+        if (MathF.Abs(yhResult[1] - expectedH1) > 0.01f)
+            throw new Exception($"GRU Y_h[1] expected {expectedH1:F4}, got {yhResult[1]:F4}");
+        Console.WriteLine($"[GRU] Y_h=[{yhResult[0]:F4}, {yhResult[1]:F4}] expected [{expectedH0:F4}, {expectedH1:F4}] — PASS");
     });
 
     // ═══════════════════════════════════════════════════════════
@@ -1189,8 +1216,9 @@ public abstract partial class MLTestBase
         var ctx = new OnnxOpContext { Inputs = new[] { new Tensor(inBuf.View, new[] { 5 }) }, Outputs = new[] { new Tensor(outBuf.View, new[] { 5 }) }, Attributes = new Dictionary<string, object>(), Pool = new BufferPool(accelerator), InputNames = new[] { "X" } };
         reg.Resolve("ThresholdedRelu")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
-        // At minimum, the operator should not crash
-        Console.WriteLine("[ThresholdedRelu] Execute completed without error — PASS");
+        // ThresholdedRelu with alpha=1: x>1 → x, else 0
+        var expected = new float[] { 0f, 0f, 0f, 0f, 2f };
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 0f, "ThresholdedRelu: ");
     });
 
     [TestMethod]
@@ -1203,7 +1231,8 @@ public abstract partial class MLTestBase
         var ctx = new OnnxOpContext { Inputs = new[] { new Tensor(inBuf.View, new[] { 1, 3 }) }, Outputs = new[] { new Tensor(outBuf.View, new[] { 1, 3 }) }, Attributes = new Dictionary<string, object> { ["axis"] = (long)1 }, Pool = new BufferPool(accelerator), InputNames = new[] { "input" } };
         reg.Resolve("Hardmax")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
-        Console.WriteLine("[Hardmax] Execute completed without error — PASS");
+        // input [1,3,2] → argmax at index 1 → one-hot [0, 1, 0]
+        await AssertCloseGpu(accelerator, outBuf.View, new float[] { 0f, 1f, 0f }, 0f, "Hardmax: ");
     });
 
     [TestMethod]
@@ -1481,38 +1510,45 @@ public abstract partial class MLTestBase
         };
         reg.Resolve("GlobalLpPool")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
-        var result = await outBuf.CopyToHostAsync<float>(0, 1);
-        // Should produce some non-zero value from the pool
-        if (result[0] <= 0f) throw new Exception($"GlobalLpPool produced {result[0]} — expected positive");
-        Console.WriteLine($"[GlobalLpPool] Result={result[0]:F4} — PASS (non-zero)");
+        // L2 pool of [1,2,3,4] = sqrt(1+4+9+16) = sqrt(30) ≈ 5.477
+        float expected = MathF.Sqrt(1 + 4 + 9 + 16);
+        await AssertCloseGpu(accelerator, outBuf.View, new[] { expected }, 0.01f, "GlobalLpPool L2: ");
     });
 
     [TestMethod]
-    public async Task Op_ReverseSequence_PassThrough() => await RunTest(async accelerator =>
+    public async Task Op_ReverseSequence_MatchesCpu() => await RunTest(async accelerator =>
     {
-        // ReverseSequence should at minimum copy input to output
-        var input = new float[] { 1f, 2f, 3f, 4f };
+        // Input [4, 2] (time=4, batch=2), batch_axis=1, time_axis=0, seq_lens=[4, 2]
+        // Batch 0: reverse all 4 → [4,3,2,1], Batch 1: reverse first 2 → [2,1,3,4]
+        var input = new float[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }; // [t0b0,t0b1,t1b0,t1b1,t2b0,t2b1,t3b0,t3b1]
+        var seqLens = new float[] { 4f, 2f };
+        // time_axis=0, batch_axis=1: reverse time for each batch independently
+        // Batch 0 (col 0): [1,3,5,7] → reversed all 4: [7,5,3,1]
+        // Batch 1 (col 1): [2,4,6,8] → reversed first 2: [4,2,6,8]
+        var expected = new float[] { 7f, 4f, 5f, 2f, 3f, 6f, 1f, 8f };
         using var inBuf = accelerator.Allocate1D(input);
-        using var outBuf = accelerator.Allocate1D<float>(4);
+        using var slBuf = accelerator.Allocate1D(seqLens);
+        using var outBuf = accelerator.Allocate1D<float>(8);
         var reg = new OperatorRegistry(accelerator);
         var ctx = new OnnxOpContext
         {
-            Inputs = new[] { new Tensor(inBuf.View, new[] { 2, 2 }) },
-            Outputs = new[] { new Tensor(outBuf.View, new[] { 2, 2 }) },
-            Attributes = new Dictionary<string, object>(),
+            Inputs = new[] { new Tensor(inBuf.View, new[] { 4, 2 }), new Tensor(slBuf.View, new[] { 2 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 4, 2 }) },
+            Attributes = new Dictionary<string, object> { ["batch_axis"] = (long)1, ["time_axis"] = (long)0 },
             Pool = new BufferPool(accelerator),
-            InputNames = new[] { "input" }
+            InputNames = new[] { "input", "sequence_lens" },
+            ConstantValues = new Dictionary<string, float[]> { ["sequence_lens"] = seqLens }
         };
         reg.Resolve("ReverseSequence")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
-        // At minimum should copy without crashing
-        Console.WriteLine("[ReverseSequence] Execute completed — PASS");
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 0f, "ReverseSequence: ");
     });
 
     [TestMethod]
-    public async Task Op_Unique_PassThrough() => await RunTest(async accelerator =>
+    public async Task Op_Unique_MatchesCpu() => await RunTest(async accelerator =>
     {
         var input = new float[] { 2f, 1f, 1f, 3f, 2f };
+        // Unique sorted: [1, 2, 3]
         using var inBuf = accelerator.Allocate1D(input);
         using var outBuf = accelerator.Allocate1D<float>(5);
         var reg = new OperatorRegistry(accelerator);
@@ -1520,13 +1556,18 @@ public abstract partial class MLTestBase
         {
             Inputs = new[] { new Tensor(inBuf.View, new[] { 5 }) },
             Outputs = new[] { new Tensor(outBuf.View, new[] { 5 }) },
-            Attributes = new Dictionary<string, object>(),
+            Attributes = new Dictionary<string, object> { ["sorted"] = (long)1 },
             Pool = new BufferPool(accelerator),
-            InputNames = new[] { "X" }
+            InputNames = new[] { "X" },
+            ConstantValues = new Dictionary<string, float[]> { ["X"] = input }
         };
         reg.Resolve("Unique")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
-        Console.WriteLine("[Unique] Execute completed — PASS");
+        var result = await outBuf.CopyToHostAsync<float>(0, 3);
+        // Expected sorted unique: [1, 2, 3]
+        if (result[0] != 1f || result[1] != 2f || result[2] != 3f)
+            throw new Exception($"Unique expected [1,2,3], got [{result[0]},{result[1]},{result[2]}]");
+        Console.WriteLine("[Unique] sorted values [1,2,3] — PASS");
     });
 
     [TestMethod]
