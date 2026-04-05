@@ -411,52 +411,22 @@ public class CumSumOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var input = ctx.Inputs[0];
         var output = ctx.Outputs[0];
-        int count = input.ElementCount;
-
-        // Get axis from second input (constant tensor)
+        var shape = input.Shape;
         var axisVals = ctx.TryGetInputValues(1);
         int axis = axisVals != null && axisVals.Length > 0 ? (int)axisVals[0] : 0;
-        if (axis < 0) axis += input.Shape.Length;
+        if (axis < 0) axis += shape.Length;
         int exclusive = ctx.GetInt("exclusive", 0);
         int reverse = ctx.GetInt("reverse", 0);
 
-        var inVals = ctx.TryGetInputValues(0);
-        if (inVals != null)
-        {
-            var result = new float[count];
-            var shape = input.Shape;
+        int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
+        int axisSize = shape[axis];
+        int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
 
-            int outer = 1; for (int i = 0; i < axis; i++) outer *= shape[i];
-            int axisSize = shape[axis];
-            int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
-
-            for (int o = 0; o < outer; o++)
-                for (int inn = 0; inn < inner; inn++)
-                {
-                    float sum = 0;
-                    for (int a = 0; a < axisSize; a++)
-                    {
-                        int ai = reverse != 0 ? axisSize - 1 - a : a;
-                        int idx = (o * axisSize + ai) * inner + inn;
-                        if (exclusive != 0)
-                        {
-                            result[idx] = sum;
-                            sum += inVals[idx];
-                        }
-                        else
-                        {
-                            sum += inVals[idx];
-                            result[idx] = sum;
-                        }
-                    }
-                }
-
-            output.Data.SubView(0, count).CopyFromCPU(result);
-        }
-        else
-        {
-            output.Data.SubView(0, count).CopyFrom(input.Data.SubView(0, count));
-        }
+        // GPU path: one thread per (outer, inner) scan line, each scans axisSize sequentially
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { axisSize, inner, exclusive, reverse });
+        reg.ElementWise.CumSum(input.Data, output.Data, paramsBuf.View, outer * inner);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 

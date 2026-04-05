@@ -153,19 +153,11 @@ public class BernoulliOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // Bernoulli: sample 0 or 1 with probability = input value
-        var pVals = ctx.TryGetInputValues(0);
         int count = ctx.Outputs[0].ElementCount;
-        if (pVals == null) { reg.ElementWise.Fill(ctx.Outputs[0].Data, count, 0f); return; }
         int seed = ctx.GetInt("seed", 0);
-        var rng = seed != 0 ? new Random(seed) : new Random();
-        var result = new float[count];
-        for (int i = 0; i < count; i++)
-        {
-            float p = i < pVals.Length ? pVals[i] : 0.5f;
-            result[i] = rng.NextDouble() < p ? 1f : 0f;
-        }
-        ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
+        if (seed == 0) seed = Environment.TickCount;
+        // GPU path: per-thread xorshift PRNG, reads probability from input
+        reg.ElementWise.Bernoulli(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, seed);
     }
 }
 public class CenterCropPadOperator(OperatorRegistry reg) : IOnnxOperator
@@ -179,29 +171,26 @@ public class CenterCropPadOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // CenterCropPad: crop or pad input to match target shape, centered
         int outCount = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Fill(ctx.Outputs[0].Data, outCount, 0f); // zero-pad first
-
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null)
-        {
-            // No constant values — use GPU-side copy for the overlapping region
-            int gpuCopy = Math.Min(ctx.Inputs[0].ElementCount, outCount);
-            if (gpuCopy > 0)
-                reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, gpuCopy),
-                    ctx.Outputs[0].Data.SubView(0, gpuCopy), gpuCopy, 1f);
-            return;
-        }
-
         var inShape = ctx.Inputs[0].Shape;
         var outShape = ctx.Outputs[0].Shape;
+        int rank = inShape.Length;
 
-        // For each dimension, compute the center offset
-        // Simple case: just copy the overlapping center region
-        int copyCount = Math.Min(ctx.Inputs[0].ElementCount, outCount);
-        if (copyCount < xVals.Length) { var t = new float[copyCount]; Array.Copy(xVals, t, copyCount); ctx.Outputs[0].Data.SubView(0, copyCount).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyCount).CopyFromCPU(xVals);
+        // Build params: [rank, inShape..., outShape..., inStrides...]
+        var paramsData = new int[1 + 3 * rank];
+        paramsData[0] = rank;
+        for (int d = 0; d < rank; d++) paramsData[1 + d] = inShape[d];
+        for (int d = 0; d < rank; d++) paramsData[1 + rank + d] = outShape[d];
+        // Compute input strides
+        paramsData[1 + 3 * rank - 1] = 1;
+        for (int d = rank - 2; d >= 0; d--)
+            paramsData[1 + 2 * rank + d] = paramsData[1 + 2 * rank + d + 1] * inShape[d + 1];
+
+        // GPU path: one thread per output element, reads centered input
+        var paramsBuf = reg.Accelerator.Allocate1D(paramsData);
+        reg.ElementWise.CenterCropPad(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, outCount);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -431,30 +420,10 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // DeformConv: convolution with learned sampling offsets
-        // Input[0]=X, Input[1]=W, Input[2]=offset, Input[3]=B(optional), Input[4]=mask(optional)
-        // Offset: [N, offset_group*kH*kW*2, outH, outW] — per-position dy,dx offsets
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
         if (x.Shape.Length < 4 || w.Shape.Length < 4)
         {
             reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
-
-        var xVals = ctx.TryGetInputValues(0);
-        var wVals = ctx.TryGetInputValues(1);
-        var offVals = ctx.Inputs.Length > 2 ? ctx.TryGetInputValues(2) : null;
-        var maskVals = ctx.Inputs.Length > 4 ? ctx.TryGetInputValues(4) : null;
-
-        // If we can't read values (large dynamic tensors), fall back to regular conv
-        if (xVals == null || wVals == null)
-        {
-            int stride = ctx.GetInts("strides", new[] { 1, 1 })[0];
-            int pad = ctx.GetInts("pads", new int[4])[0];
-            var bias = ctx.Inputs.Length > 3 && ctx.Inputs[3] != null ? ctx.Inputs[3].Data : default;
-            reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                x.Shape[1], x.Shape[2], x.Shape[3],
-                w.Shape[0], w.Shape[2], w.Shape[3], stride, pad);
             return;
         }
 
@@ -472,94 +441,28 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
 
         int outH = (H + 2 * pH - dH * (kH - 1) - 1) / sH + 1;
         int outW = (W + 2 * pW - dW * (kW - 1) - 1) / sW + 1;
-        int inCPerGroup = inC / group;
-        int outCPerGroup = outC / group;
-        int inCPerOffGroup = inC / offsetGroup;
+        int totalOutput = N * outC * outH * outW;
 
-        var result = new float[N * outC * outH * outW];
-
-        for (int n = 0; n < N; n++)
+        // GPU path: offsets tensor on GPU, one thread per output element
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
         {
-            for (int oc = 0; oc < outC; oc++)
-            {
-                int g = oc / outCPerGroup;
-                for (int oh = 0; oh < outH; oh++)
-                {
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        float sum = 0f;
-                        for (int ic = 0; ic < inCPerGroup; ic++)
-                        {
-                            int realIC = g * inCPerGroup + ic;
-                            int offG = realIC / inCPerOffGroup;
-
-                            for (int kh = 0; kh < kH; kh++)
-                            {
-                                for (int kw = 0; kw < kW; kw++)
-                                {
-                                    float baseH = oh * sH - pH + kh * dH;
-                                    float baseW = ow * sW - pW + kw * dW;
-
-                                    // Apply deformable offset
-                                    if (offVals != null)
-                                    {
-                                        int offIdx = kh * kW + kw;
-                                        int offChanY = (offG * kH * kW + offIdx) * 2;
-                                        int offChanX = offChanY + 1;
-                                        baseH += offVals[((n * offsetGroup * kH * kW * 2 + offChanY) * outH + oh) * outW + ow];
-                                        baseW += offVals[((n * offsetGroup * kH * kW * 2 + offChanX) * outH + oh) * outW + ow];
-                                    }
-
-                                    // Bilinear interpolation at fractional position
-                                    float wt = wVals[((oc * inCPerGroup + ic) * kH + kh) * kW + kw];
-
-                                    // Apply mask if provided
-                                    if (maskVals != null)
-                                    {
-                                        int maskIdx = (offG * kH * kW + kh * kW + kw);
-                                        wt *= maskVals[((n * offsetGroup * kH * kW + maskIdx) * outH + oh) * outW + ow];
-                                    }
-
-                                    int y0 = (int)MathF.Floor(baseH), x0 = (int)MathF.Floor(baseW);
-                                    int y1 = y0 + 1, x1 = x0 + 1;
-                                    float ty = baseH - y0, tx = baseW - x0;
-
-                                    float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
-                                    int chOff = (n * inC + realIC) * H;
-                                    if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) v00 = xVals[(chOff + y0) * W + x0];
-                                    if (y0 >= 0 && y0 < H && x1 >= 0 && x1 < W) v01 = xVals[(chOff + y0) * W + x1];
-                                    if (y1 >= 0 && y1 < H && x0 >= 0 && x0 < W) v10 = xVals[(chOff + y1) * W + x0];
-                                    if (y1 >= 0 && y1 < H && x1 >= 0 && x1 < W) v11 = xVals[(chOff + y1) * W + x1];
-
-                                    float interp = v00 * (1f - tx) * (1f - ty) + v01 * tx * (1f - ty)
-                                                 + v10 * (1f - tx) * ty + v11 * tx * ty;
-                                    sum += interp * wt;
-                                }
-                            }
-                        }
-                        result[((n * outC + oc) * outH + oh) * outW + ow] = sum;
-                    }
-                }
-            }
+            var paramsBuf = reg.Accelerator.Allocate1D(new int[] {
+                inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, group, offsetGroup });
+            reg.ElementWise.DeformConv(x.Data, w.Data, ctx.Inputs[2].Data,
+                ctx.Outputs[0].Data, paramsBuf.View, totalOutput);
+            // Add bias if provided
+            if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
+                reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[3].Data, totalOutput, outC);
+            reg.Accelerator.Synchronize();
+            paramsBuf.Dispose();
         }
-
-        // Add bias if provided
-        float[]? biasVals = ctx.Inputs.Length > 3 && ctx.Inputs[3] != null ? ctx.TryGetInputValues(3) : null;
-        if (biasVals != null)
+        else
         {
-            for (int n = 0; n < N; n++)
-                for (int oc = 0; oc < outC; oc++)
-                {
-                    float b = biasVals[oc];
-                    for (int oh = 0; oh < outH; oh++)
-                        for (int ow = 0; ow < outW; ow++)
-                            result[((n * outC + oc) * outH + oh) * outW + ow] += b;
-                }
+            // Fallback: regular conv without offsets
+            var bias = ctx.Inputs.Length > 3 && ctx.Inputs[3] != null ? ctx.Inputs[3].Data : default;
+            reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                inC, H, W, outC, kH, kW, sH, pH);
         }
-
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
     }
 }
 public class RoiAlignOperator(OperatorRegistry reg) : IOnnxOperator

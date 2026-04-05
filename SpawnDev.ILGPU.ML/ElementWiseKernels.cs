@@ -1076,6 +1076,151 @@ public class ElementWiseKernels : IDisposable
         }
     }
 
+    private static void STFTImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> signal,
+        ArrayView1D<float, Stride1D.Dense> window, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow]
+        int signalLength = paramsArr[0]; int frameStep = paramsArr[1]; int frameLength = paramsArr[2];
+        int fftOutputLen = paramsArr[3]; int numFrames = paramsArr[4]; int hasWindow = paramsArr[5];
+        // idx = b * numFrames * fftOutputLen + f * fftOutputLen + k
+        int tmp = idx;
+        int k = tmp % fftOutputLen; tmp /= fftOutputLen;
+        int f = tmp % numFrames; int b = tmp / numFrames;
+        int frameStart = f * frameStep;
+        float sumReal = 0f, sumImag = 0f;
+        for (int n = 0; n < frameLength; n++)
+        {
+            int sIdx = frameStart + n;
+            float x = sIdx < signalLength ? signal[b * signalLength + sIdx] : 0f;
+            if (hasWindow != 0 && n < frameLength) x *= window[n];
+            float angle = -2f * MathF.PI * k * n / frameLength;
+            sumReal += x * MathF.Cos(angle);
+            sumImag += x * MathF.Sin(angle);
+        }
+        int outIdx = ((b * numFrames + f) * fftOutputLen + k) * 2;
+        output[outIdx] = sumReal;
+        output[outIdx + 1] = sumImag;
+    }
+
+    private static void CumSumImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [axisSize, inner, exclusive, reverse]
+        // idx ranges over outer * inner (one thread per scan line)
+        int axisSize = paramsArr[0]; int inner = paramsArr[1];
+        int exclusive = paramsArr[2]; int reverse = paramsArr[3];
+        int o = idx / inner;
+        int inn = idx - o * inner;
+        float sum = 0f;
+        for (int a = 0; a < axisSize; a++)
+        {
+            int ai = reverse != 0 ? axisSize - 1 - a : a;
+            int srcIdx = (o * axisSize + ai) * inner + inn;
+            if (exclusive != 0)
+            {
+                output[srcIdx] = sum;
+                sum += input[srcIdx];
+            }
+            else
+            {
+                sum += input[srcIdx];
+                output[srcIdx] = sum;
+            }
+        }
+    }
+
+    private static void DeformConvImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weights, ArrayView1D<float, Stride1D.Dense> offsets,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, groups, offsetGroups]
+        int inC = paramsArr[0]; int H = paramsArr[1]; int W = paramsArr[2];
+        int outC = paramsArr[3]; int outH = paramsArr[4]; int outW = paramsArr[5];
+        int kH = paramsArr[6]; int kW = paramsArr[7];
+        int sH = paramsArr[8]; int sW = paramsArr[9];
+        int pH = paramsArr[10]; int pW = paramsArr[11];
+        int groups = paramsArr[12]; int offsetGroups = paramsArr[13];
+        // idx = n * outC * outH * outW + oc * outH * outW + oh * outW + ow
+        int tmp = idx;
+        int ow = tmp % outW; tmp /= outW;
+        int oh = tmp % outH; tmp /= outH;
+        int oc = tmp % outC; int n = tmp / outC;
+        int cPerGroup = inC / groups;
+        int ocPerGroup = outC / groups;
+        int g = oc / ocPerGroup;
+        int cPerOffGrp = inC / offsetGroups;
+        float sum = 0f;
+        for (int ic = g * cPerGroup; ic < (g + 1) * cPerGroup; ic++)
+        {
+            int offGrp = ic / cPerOffGrp;
+            for (int kh = 0; kh < kH; kh++)
+            {
+                for (int kw = 0; kw < kW; kw++)
+                {
+                    // Read learned offset for this position
+                    int offIdx = ((n * offsetGroups + offGrp) * kH * kW + kh * kW + kw) * 2;
+                    int offBase = offIdx * outH * outW + oh * outW + ow;
+                    float dy = offsets[offBase];
+                    float dx = offsets[offBase + outH * outW];
+                    float fy = oh * sH - pH + kh + dy;
+                    float fx = ow * sW - pW + kw + dx;
+                    // Bilinear interpolation
+                    int y0 = (int)MathF.Floor(fy); int x0 = (int)MathF.Floor(fx);
+                    float ty = fy - y0; float tx = fx - x0;
+                    int chOff = (n * inC + ic) * H;
+                    float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
+                    if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) v00 = input[(chOff + y0) * W + x0];
+                    if (y0 >= 0 && y0 < H && x0 + 1 < W) v01 = input[(chOff + y0) * W + x0 + 1];
+                    if (y0 + 1 < H && x0 >= 0 && x0 < W) v10 = input[(chOff + y0 + 1) * W + x0];
+                    if (y0 + 1 < H && x0 + 1 < W) v11 = input[(chOff + y0 + 1) * W + x0 + 1];
+                    float interp = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
+                        + v10 * ty * (1f - tx) + v11 * ty * tx;
+                    // Weight
+                    int wIdx = ((oc * cPerGroup + (ic - g * cPerGroup)) * kH + kh) * kW + kw;
+                    sum += interp * weights[wIdx];
+                }
+            }
+        }
+        output[idx] = sum;
+    }
+
+    private static void BernoulliImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> probs,
+        ArrayView1D<float, Stride1D.Dense> output, int seed)
+    {
+        // Per-thread xorshift32 PRNG seeded from global seed + thread index
+        uint state = (uint)(seed + idx * 2654435761); // golden ratio hash
+        if (state == 0) state = 1;
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5; // xorshift32
+        float u = (state & 0x7FFFFF) / (float)0x800000; // [0, 1)
+        output[idx] = u < probs[idx] ? 1f : 0f;
+    }
+
+    private static void CenterCropPadImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [rank, inShape..., outShape..., inStrides..., outStrides...]
+        int rank = paramsArr[0];
+        // Decode output flat index to coordinates
+        int tmp = idx;
+        float val = 0f;
+        bool inBounds = true;
+        int srcIdx = 0;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            int inSize = paramsArr[1 + d];
+            int outSize = paramsArr[1 + rank + d];
+            int inStride = paramsArr[1 + 2 * rank + d];
+            int outCoord = tmp % outSize;
+            tmp /= outSize;
+            // Center offset: input is centered within output (or vice versa)
+            int inCoord = outCoord - (outSize - inSize) / 2;
+            if (inCoord < 0 || inCoord >= inSize) { inBounds = false; break; }
+            srcIdx += inCoord * inStride;
+        }
+        output[idx] = inBounds ? input[srcIdx] : 0f;
+    }
+
     private static void MaxRoiPoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> rois, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<int, Stride1D.Dense> paramsArr, ArrayView1D<float, Stride1D.Dense> fparams)
@@ -1226,6 +1371,16 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>>? _maxRoiPoolKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _stftKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _cumSumKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _deformConvKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _bernoulliKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _centerCropPadKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _equalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _greaterKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _lessKernel;
@@ -1325,6 +1480,22 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsBuf,
         ArrayView1D<float, Stride1D.Dense> fparamsBuf, int totalOutput)
     { EnsureLoaded2(); _maxRoiPoolKernel!(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
+    public void STFT(ArrayView1D<float, Stride1D.Dense> signal, ArrayView1D<float, Stride1D.Dense> window,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalBins)
+    { EnsureLoaded2(); _stftKernel!(totalBins, signal, window, output, paramsBuf); }
+    public void CumSum(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int outerTimesInner)
+    { EnsureLoaded2(); _cumSumKernel!(outerTimesInner, input, output, paramsBuf); }
+    public void DeformConv(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weights,
+        ArrayView1D<float, Stride1D.Dense> offsets, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalOutput)
+    { EnsureLoaded2(); _deformConvKernel!(totalOutput, input, weights, offsets, output, paramsBuf); }
+    public void Bernoulli(ArrayView1D<float, Stride1D.Dense> probs, ArrayView1D<float, Stride1D.Dense> output,
+        int count, int seed)
+    { EnsureLoaded2(); _bernoulliKernel!(count, probs, output, seed); }
+    public void CenterCropPad(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalOutput)
+    { EnsureLoaded2(); _centerCropPadKernel!(totalOutput, input, output, paramsBuf); }
     public void Equal(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _equalKernel!(count, a, b, output); }
     public void Greater(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
@@ -1394,6 +1565,16 @@ public class ElementWiseKernels : IDisposable
         _maxRoiPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(MaxRoiPoolImpl);
+        _stftKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(STFTImpl);
+        _cumSumKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(CumSumImpl);
+        _deformConvKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(DeformConvImpl);
+        _bernoulliKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(BernoulliImpl);
+        _centerCropPadKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(CenterCropPadImpl);
         _equalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
         _greaterKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
         _lessKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);

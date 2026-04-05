@@ -85,67 +85,37 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 
     public void Execute(OnnxOpContext ctx)
     {
-        var signal = ctx.TryGetInputValues(0);
-        if (signal == null) return;
-
         var signalShape = ctx.Inputs[0].Shape;
         int batch = signalShape[0];
         int signalLength = signalShape[1];
-
-        // frame_step (input 1)
         int frameStep = 128;
         var frameStepVals = ctx.TryGetInputValues(1);
-        if (frameStepVals != null && frameStepVals.Length > 0)
-            frameStep = (int)frameStepVals[0];
-
-        // window (input 2) — optional
-        float[]? window = ctx.Inputs.Length > 2 ? ctx.TryGetInputValues(2) : null;
-        int frameLength = window?.Length ?? 256;
-
-        // frame_length (input 3) — optional override
+        if (frameStepVals != null && frameStepVals.Length > 0) frameStep = (int)frameStepVals[0];
+        float[]? windowVals = ctx.Inputs.Length > 2 ? ctx.TryGetInputValues(2) : null;
+        int frameLength = windowVals?.Length ?? 256;
         if (ctx.Inputs.Length > 3)
         {
             var flVals = ctx.TryGetInputValues(3);
-            if (flVals != null && flVals.Length > 0)
-                frameLength = (int)flVals[0];
+            if (flVals != null && flVals.Length > 0) frameLength = (int)flVals[0];
         }
-
         int onesided = ctx.GetInt("onesided", 1);
         int numFrames = Math.Max(1, (signalLength - frameLength) / frameStep + 1);
         int fftOutputLen = onesided != 0 ? frameLength / 2 + 1 : frameLength;
+        int totalBins = batch * numFrames * fftOutputLen;
 
-        var result = new float[batch * numFrames * fftOutputLen * 2];
+        // GPU path: upload window if available, one thread per output bin
+        int hasWindow = windowVals != null ? 1 : 0;
+        MemoryBuffer1D<float, Stride1D.Dense>? windowBuf = null;
+        if (windowVals != null)
+            windowBuf = reg.Accelerator.Allocate1D(windowVals);
+        else
+            windowBuf = reg.Accelerator.Allocate1D<float>(1); // dummy
 
-        for (int b = 0; b < batch; b++)
-        {
-            for (int f = 0; f < numFrames; f++)
-            {
-                int frameStart = f * frameStep;
-
-                // Apply window and compute DFT for this frame
-                for (int k = 0; k < fftOutputLen; k++)
-                {
-                    float sumReal = 0f, sumImag = 0f;
-                    for (int n = 0; n < frameLength; n++)
-                    {
-                        int sIdx = frameStart + n;
-                        float x = sIdx < signalLength ? signal[b * signalLength + sIdx] : 0f;
-                        if (window != null && n < window.Length) x *= window[n];
-
-                        float angle = -2f * MathF.PI * k * n / frameLength;
-                        sumReal += x * MathF.Cos(angle);
-                        sumImag += x * MathF.Sin(angle);
-                    }
-                    int outIdx = ((b * numFrames + f) * fftOutputLen + k) * 2;
-                    result[outIdx] = sumReal;
-                    result[outIdx + 1] = sumImag;
-                }
-            }
-        }
-
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow });
+        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowBuf.View, ctx.Outputs[0].Data, paramsBuf.View, totalBins);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
+        windowBuf.Dispose();
     }
 }
 
