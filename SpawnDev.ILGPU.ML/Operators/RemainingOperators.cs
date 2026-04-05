@@ -71,10 +71,7 @@ public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // LpPool: local (sum(|x|^p))^(1/p) over kernel window
         int p = ctx.GetInt("p", 2);
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) { reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f); return; }
         var inShape = ctx.Inputs[0].Shape;
         var outShape = ctx.Outputs[0].Shape;
         int N = inShape[0], C = inShape[1], H = inShape[2], W = inShape[3];
@@ -85,44 +82,13 @@ public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
         int kH = kernelShape[0], kW = kernelShape.Length > 1 ? kernelShape[1] : 1;
         int sH = strides[0], sW = strides.Length > 1 ? strides[1] : 1;
         int pH = pads.Length > 0 ? pads[0] : 0, pW = pads.Length > 1 ? pads[1] : 0;
+        int totalOutput = N * C * outH * outW;
 
-        var result = new float[N * C * outH * outW];
-        for (int n = 0; n < N; n++)
-        {
-            for (int c = 0; c < C; c++)
-            {
-                int chOff = (n * C + c) * H;
-                for (int oh = 0; oh < outH; oh++)
-                {
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        float sum = 0f;
-                        for (int kh = 0; kh < kH; kh++)
-                        {
-                            int ih = oh * sH + kh - pH;
-                            if (ih < 0 || ih >= H) continue;
-                            for (int kw = 0; kw < kW; kw++)
-                            {
-                                int iw = ow * sW + kw - pW;
-                                if (iw < 0 || iw >= W) continue;
-                                float v = MathF.Abs(xVals[(chOff + ih) * W + iw]);
-                                sum += p == 2 ? v * v : MathF.Pow(v, p);
-                            }
-                        }
-                        result[((n * C + c) * outH + oh) * outW + ow] = p == 2 ? MathF.Sqrt(sum) : MathF.Pow(sum, 1f / p);
-                    }
-                }
-            }
-        }
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length)
-        {
-            var trimmed = new float[copyLen];
-            Array.Copy(result, trimmed, copyLen);
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(trimmed);
-        }
-        else
-            ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        // GPU path: one thread per output element, iterates kernel window
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, H, W, outH, outW, kH, kW, sH, sW, pH, pW, p });
+        reg.ElementWise.LpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, totalOutput);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class DetOperator(OperatorRegistry reg) : IOnnxOperator
@@ -316,25 +282,15 @@ public class MaxUnpoolOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // MaxUnpool: scatter values back to positions indicated by indices from MaxPool
-        // Input[0] = values, Input[1] = indices (from MaxPool with indices output)
-        var vals = ctx.TryGetInputValues(0);
-        var indices = ctx.TryGetInputValues(1);
         int outCount = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Fill(ctx.Outputs[0].Data, outCount, 0f); // zero-fill first
-
-        if (vals == null || indices == null) return;
-
-        // Scatter values at index positions
-        var result = new float[outCount];
-        for (int i = 0; i < vals.Length; i++)
+        int inCount = ctx.Inputs[0].ElementCount;
+        reg.ElementWise.Fill(ctx.Outputs[0].Data, outCount, 0f);
+        if (inCount > 0 && ctx.Inputs.Length > 1)
         {
-            int idx = (int)indices[i];
-            if (idx >= 0 && idx < outCount)
-                result[idx] = vals[i];
+            // GPU scatter: each thread writes one value to its index position
+            reg.ElementWise.MaxUnpool(ctx.Inputs[0].Data, ctx.Inputs[1].Data,
+                ctx.Outputs[0].Data, inCount, outCount);
         }
-        if (outCount < result.Length) { var t = new float[outCount]; Array.Copy(result, t, outCount); ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
     }
 }
 public class ImageDecoderOperator(OperatorRegistry reg) : IOnnxOperator
@@ -404,83 +360,18 @@ public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // GridSample: bilinear interpolation at grid-specified coordinates
-        // Grid values are in [-1, 1] normalized coordinates
-        var xVals = ctx.TryGetInputValues(0);
-        var gridVals = ctx.TryGetInputValues(1);
-        if (xVals == null || gridVals == null)
-        {
-            reg.ElementWise.Fill(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, 0f);
-            return;
-        }
-
         var xShape = ctx.Inputs[0].Shape; // [N, C, Hin, Win]
         var gridShape = ctx.Inputs[1].Shape; // [N, Hout, Wout, 2]
         int N = xShape[0], C = xShape[1], Hin = xShape[2], Win = xShape[3];
         int Hout = gridShape[1], Wout = gridShape[2];
-        string mode = ctx.GetString("mode", "bilinear");
-        string paddingMode = ctx.GetString("padding_mode", "zeros");
         int alignCorners = ctx.GetInt("align_corners", 0);
+        int totalOutput = N * C * Hout * Wout;
 
-        var result = new float[N * C * Hout * Wout];
-
-        for (int n = 0; n < N; n++)
-        {
-            for (int h = 0; h < Hout; h++)
-            {
-                for (int w = 0; w < Wout; w++)
-                {
-                    int gridIdx = ((n * Hout + h) * Wout + w) * 2;
-                    float gx = gridVals[gridIdx];     // [-1, 1]
-                    float gy = gridVals[gridIdx + 1]; // [-1, 1]
-
-                    // Denormalize grid coordinates to input pixel space
-                    float ix, iy;
-                    if (alignCorners != 0)
-                    {
-                        ix = (gx + 1f) * 0.5f * (Win - 1);
-                        iy = (gy + 1f) * 0.5f * (Hin - 1);
-                    }
-                    else
-                    {
-                        ix = ((gx + 1f) * Win - 1f) * 0.5f;
-                        iy = ((gy + 1f) * Hin - 1f) * 0.5f;
-                    }
-
-                    for (int c = 0; c < C; c++)
-                    {
-                        float val = 0f;
-                        if (mode == "nearest")
-                        {
-                            int nx = (int)MathF.Round(ix), ny = (int)MathF.Round(iy);
-                            if (nx >= 0 && nx < Win && ny >= 0 && ny < Hin)
-                                val = xVals[((n * C + c) * Hin + ny) * Win + nx];
-                        }
-                        else // bilinear
-                        {
-                            int x0 = (int)MathF.Floor(ix), y0 = (int)MathF.Floor(iy);
-                            int x1 = x0 + 1, y1 = y0 + 1;
-                            float tx = ix - x0, ty = iy - y0;
-
-                            float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
-                            int chOff = (n * C + c) * Hin;
-                            if (x0 >= 0 && x0 < Win && y0 >= 0 && y0 < Hin) v00 = xVals[(chOff + y0) * Win + x0];
-                            if (x1 >= 0 && x1 < Win && y0 >= 0 && y0 < Hin) v01 = xVals[(chOff + y0) * Win + x1];
-                            if (x0 >= 0 && x0 < Win && y1 >= 0 && y1 < Hin) v10 = xVals[(chOff + y1) * Win + x0];
-                            if (x1 >= 0 && x1 < Win && y1 >= 0 && y1 < Hin) v11 = xVals[(chOff + y1) * Win + x1];
-
-                            val = v00 * (1f - tx) * (1f - ty) + v01 * tx * (1f - ty)
-                                + v10 * (1f - tx) * ty + v11 * tx * ty;
-                        }
-                        result[((n * C + c) * Hout + h) * Wout + w] = val;
-                    }
-                }
-            }
-        }
-
-        int copyLen = Math.Min(result.Length, ctx.Outputs[0].ElementCount);
-        if (copyLen < result.Length) { var t = new float[copyLen]; Array.Copy(result, t, copyLen); ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(t); }
-        else ctx.Outputs[0].Data.SubView(0, copyLen).CopyFromCPU(result);
+        // GPU path: bilinear interpolation, one thread per output element
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { N, C, Hin, Win, Hout, Wout, alignCorners });
+        reg.ElementWise.GridSample(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, paramsBuf.View, totalOutput);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator

@@ -1004,58 +1004,21 @@ public class ReverseSequenceOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // ReverseSequence: reverse elements along batch_axis using per-batch sequence lengths
-        // Input[0]: data tensor, Input[1]: sequence_lengths (1D, one per batch)
         int batchAxis = ctx.GetInt("batch_axis", 1);
         int timeAxis = ctx.GetInt("time_axis", 0);
-
-        var xVals = ctx.TryGetInputValues(0);
-        var seqLens = ctx.TryGetInputValues(1);
-        if (xVals == null || seqLens == null)
-        {
-            int count = ctx.Inputs[0].ElementCount;
-            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count), ctx.Outputs[0].Data.SubView(0, count), count, 1f);
-            return;
-        }
-
         var shape = ctx.Inputs[0].Shape;
-        int rank = shape.Length;
-        var result = new float[xVals.Length];
-
-        // Compute strides
-        var strides = new int[rank];
-        strides[rank - 1] = 1;
-        for (int d = rank - 2; d >= 0; d--) strides[d] = strides[d + 1] * shape[d + 1];
-
         int batchSize = shape[batchAxis];
         int timeSize = shape[timeAxis];
+        int innerSize = 1;
+        for (int d = Math.Max(batchAxis, timeAxis) + 1; d < shape.Length; d++) innerSize *= shape[d];
+        int total = ctx.Inputs[0].ElementCount;
 
-        // Iterate over all elements
-        for (int i = 0; i < xVals.Length; i++)
-        {
-            // Decode flat index to coordinates
-            var coords = new int[rank];
-            int tmp = i;
-            for (int d = 0; d < rank; d++) { coords[d] = tmp / strides[d]; tmp %= strides[d]; }
-
-            int batchIdx = coords[batchAxis];
-            int timeIdx = coords[timeAxis];
-            int seqLen = (int)seqLens[batchIdx];
-
-            // Reverse within [0, seqLen) along time axis, leave rest unchanged
-            if (timeIdx < seqLen)
-            {
-                coords[timeAxis] = seqLen - 1 - timeIdx;
-            }
-
-            // Encode coordinates back to flat index
-            int srcIdx = 0;
-            for (int d = 0; d < rank; d++) srcIdx += coords[d] * strides[d];
-            result[i] = xVals[srcIdx];
-        }
-
-        int total = result.Length;
-        ctx.Outputs[0].Data.SubView(0, total).CopyFromCPU(result);
+        // GPU path: one thread per element, reads seqLens from GPU
+        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { batchAxis, timeAxis, batchSize, timeSize, innerSize });
+        reg.ElementWise.ReverseSequence(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+            ctx.Inputs[1].Data, paramsBuf.View, total);
+        reg.Accelerator.Synchronize();
+        paramsBuf.Dispose();
     }
 }
 

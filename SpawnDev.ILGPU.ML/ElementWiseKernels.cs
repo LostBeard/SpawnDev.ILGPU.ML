@@ -863,6 +863,159 @@ public class ElementWiseKernels : IDisposable
         output[outOff + 1] = oy;
     }
 
+    private static void LpPoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [C, H, W, outH, outW, kH, kW, sH, sW, pH, pW, p]
+        int C = paramsArr[0]; int H = paramsArr[1]; int W = paramsArr[2];
+        int outH = paramsArr[3]; int outW = paramsArr[4];
+        int kH = paramsArr[5]; int kW = paramsArr[6];
+        int sH = paramsArr[7]; int sW = paramsArr[8];
+        int pH = paramsArr[9]; int pW = paramsArr[10]; int p = paramsArr[11];
+        // idx = n * C * outH * outW + c * outH * outW + oh * outW + ow
+        int tmp = idx;
+        int ow = tmp % outW; tmp /= outW;
+        int oh = tmp % outH; tmp /= outH;
+        int c = tmp % C; int n = tmp / C;
+        float sum = 0f;
+        int hStart = oh * sH - pH; int wStart = ow * sW - pW;
+        for (int kh = 0; kh < kH; kh++)
+        {
+            int ih = hStart + kh;
+            if (ih < 0 || ih >= H) continue;
+            for (int kw = 0; kw < kW; kw++)
+            {
+                int iw = wStart + kw;
+                if (iw < 0 || iw >= W) continue;
+                float v = input[((n * C + c) * H + ih) * W + iw];
+                if (v < 0f) v = -v;
+                sum += p == 2 ? v * v : (p == 1 ? v : MathF.Pow(v, p));
+            }
+        }
+        output[idx] = p == 2 ? MathF.Sqrt(sum) : (p == 1 ? sum : MathF.Pow(sum, 1f / p));
+    }
+
+    private static void GridSampleImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> grid, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [N, C, Hin, Win, Hout, Wout, alignCorners]
+        int C = paramsArr[1]; int Hin = paramsArr[2]; int Win = paramsArr[3];
+        int Hout = paramsArr[4]; int Wout = paramsArr[5]; int alignCorners = paramsArr[6];
+        // idx = n * C * Hout * Wout + c * Hout * Wout + h * Wout + w
+        int tmp = idx;
+        int w = tmp % Wout; tmp /= Wout;
+        int h = tmp % Hout; tmp /= Hout;
+        int c = tmp % C; int n = tmp / C;
+        // Read grid coords for this pixel
+        int gridIdx = ((n * Hout + h) * Wout + w) * 2;
+        float gx = grid[gridIdx]; float gy = grid[gridIdx + 1];
+        // Denormalize
+        float ix, iy;
+        if (alignCorners != 0)
+        {
+            ix = (gx + 1f) * 0.5f * (Win - 1);
+            iy = (gy + 1f) * 0.5f * (Hin - 1);
+        }
+        else
+        {
+            ix = ((gx + 1f) * Win - 1f) * 0.5f;
+            iy = ((gy + 1f) * Hin - 1f) * 0.5f;
+        }
+        // Bilinear interpolation
+        int x0 = (int)MathF.Floor(ix); int y0 = (int)MathF.Floor(iy);
+        int x1 = x0 + 1; int y1 = y0 + 1;
+        float tx = ix - x0; float ty = iy - y0;
+        int chOff = (n * C + c) * Hin;
+        float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
+        if (x0 >= 0 && x0 < Win && y0 >= 0 && y0 < Hin) v00 = input[(chOff + y0) * Win + x0];
+        if (x1 >= 0 && x1 < Win && y0 >= 0 && y0 < Hin) v01 = input[(chOff + y0) * Win + x1];
+        if (x0 >= 0 && x0 < Win && y1 >= 0 && y1 < Hin) v10 = input[(chOff + y1) * Win + x0];
+        if (x1 >= 0 && x1 < Win && y1 >= 0 && y1 < Hin) v11 = input[(chOff + y1) * Win + x1];
+        output[idx] = v00 * (1f - tx) * (1f - ty) + v01 * tx * (1f - ty)
+            + v10 * (1f - tx) * ty + v11 * tx * ty;
+    }
+
+    private static void RoiAlignImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> rois, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsArr, ArrayView1D<float, Stride1D.Dense> fparams)
+    {
+        // int params: [C, Hin, Win, outH, outW, samplingRatio]
+        // float params: [spatialScale]
+        // rois: [numRois, 4] (x1, y1, x2, y2) or [numRois, 5] (batchIdx, x1, y1, x2, y2)
+        int C = paramsArr[0]; int Hin = paramsArr[1]; int Win = paramsArr[2];
+        int outH = paramsArr[3]; int outW = paramsArr[4]; int samplingRatio = paramsArr[5];
+        float spatialScale = fparams[0];
+        // idx = r * C * outH * outW + c * outH * outW + oh * outW + ow
+        int tmp = idx;
+        int ow = tmp % outW; tmp /= outW;
+        int oh = tmp % outH; tmp /= outH;
+        int c = tmp % C; int r = tmp / C;
+        // Get ROI bounds
+        int roiOff = r * 4; // assume 4-element ROIs with batch_indices separate
+        float x1 = rois[roiOff] * spatialScale;
+        float y1 = rois[roiOff + 1] * spatialScale;
+        float x2 = rois[roiOff + 2] * spatialScale;
+        float y2 = rois[roiOff + 3] * spatialScale;
+        float roiW = x2 - x1; float roiH = y2 - y1;
+        if (roiW < 1f) roiW = 1f; if (roiH < 1f) roiH = 1f;
+        float binH = roiH / outH; float binW = roiW / outW;
+        int sH = samplingRatio > 0 ? samplingRatio : (int)MathF.Ceiling(binH);
+        int sW = samplingRatio > 0 ? samplingRatio : (int)MathF.Ceiling(binW);
+        if (sH < 1) sH = 1; if (sW < 1) sW = 1;
+        float sum = 0f;
+        int chOff = c * Hin; // batch index 0 for simplicity
+        for (int sh = 0; sh < sH; sh++)
+        {
+            float fy = y1 + binH * (oh + (sh + 0.5f) / sH);
+            for (int sw = 0; sw < sW; sw++)
+            {
+                float fx = x1 + binW * (ow + (sw + 0.5f) / sW);
+                // Bilinear
+                int x0i = (int)MathF.Floor(fx); int y0i = (int)MathF.Floor(fy);
+                float tx = fx - x0i; float ty = fy - y0i;
+                float v00 = 0f, v01 = 0f, v10 = 0f, v11 = 0f;
+                if (x0i >= 0 && x0i < Win && y0i >= 0 && y0i < Hin) v00 = input[(chOff + y0i) * Win + x0i];
+                if (x0i + 1 < Win && y0i >= 0 && y0i < Hin) v01 = input[(chOff + y0i) * Win + x0i + 1];
+                if (x0i >= 0 && x0i < Win && y0i + 1 < Hin) v10 = input[(chOff + y0i + 1) * Win + x0i];
+                if (x0i + 1 < Win && y0i + 1 < Hin) v11 = input[(chOff + y0i + 1) * Win + x0i + 1];
+                sum += v00 * (1f - tx) * (1f - ty) + v01 * tx * (1f - ty)
+                    + v10 * (1f - tx) * ty + v11 * tx * ty;
+            }
+        }
+        output[idx] = sum / (sH * sW);
+    }
+
+    private static void ReverseSequenceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> seqLens,
+        ArrayView1D<int, Stride1D.Dense> paramsArr)
+    {
+        // params: [batchAxis, timeAxis, batchSize, timeSize, innerSize]
+        int batchAxis = paramsArr[0]; int timeAxis = paramsArr[1];
+        int batchSize = paramsArr[2]; int timeSize = paramsArr[3]; int innerSize = paramsArr[4];
+        // Decode idx → (batch, time, inner) assuming shape [batch, time, inner] or [time, batch, inner]
+        int inn = idx % innerSize;
+        int tmp = idx / innerSize;
+        int timeIdx, batchIdx;
+        if (batchAxis == 0) { timeIdx = tmp % timeSize; batchIdx = tmp / timeSize; }
+        else { batchIdx = tmp % batchSize; timeIdx = tmp / batchSize; }
+        int seqLen = (int)seqLens[batchIdx];
+        int srcTime = (timeIdx < seqLen) ? (seqLen - 1 - timeIdx) : timeIdx;
+        int srcIdx;
+        if (batchAxis == 0) srcIdx = (batchIdx * timeSize + srcTime) * innerSize + inn;
+        else srcIdx = (srcTime * batchSize + batchIdx) * innerSize + inn;
+        output[idx] = input[srcIdx];
+    }
+
+    private static void MaxUnpoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> vals,
+        ArrayView1D<float, Stride1D.Dense> indices, ArrayView1D<float, Stride1D.Dense> output,
+        int outSize)
+    {
+        int targetIdx = (int)indices[idx];
+        if (targetIdx >= 0 && targetIdx < outSize)
+            output[targetIdx] = vals[idx];
+    }
+
     private static void HardmaxImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int axisSize)
     {
@@ -948,6 +1101,17 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<int, Stride1D.Dense>>? _globalLpPoolKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _affineGridKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _lpPoolKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gridSampleKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _roiAlignKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _reverseSequenceKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _maxUnpoolKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _equalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _greaterKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _lessKernel;
@@ -1021,6 +1185,22 @@ public class ElementWiseKernels : IDisposable
     public void AffineGrid(ArrayView1D<float, Stride1D.Dense> theta, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalPixels)
     { EnsureLoaded2(); _affineGridKernel!(totalPixels, theta, output, paramsBuf); }
+    public void LpPool(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalOutput)
+    { EnsureLoaded2(); _lpPoolKernel!(totalOutput, input, output, paramsBuf); }
+    public void GridSample(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> grid,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalOutput)
+    { EnsureLoaded2(); _gridSampleKernel!(totalOutput, input, grid, output, paramsBuf); }
+    public void RoiAlign(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> rois,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsBuf,
+        ArrayView1D<float, Stride1D.Dense> fparamsBuf, int totalOutput)
+    { EnsureLoaded2(); _roiAlignKernel!(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
+    public void ReverseSequence(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> seqLens, ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalElements)
+    { EnsureLoaded2(); _reverseSequenceKernel!(totalElements, input, output, seqLens, paramsBuf); }
+    public void MaxUnpool(ArrayView1D<float, Stride1D.Dense> vals, ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output, int inputCount, int outSize)
+    { EnsureLoaded2(); _maxUnpoolKernel!(inputCount, vals, indices, output, outSize); }
     public void Equal(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _equalKernel!(count, a, b, output); }
     public void Greater(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
@@ -1072,6 +1252,17 @@ public class ElementWiseKernels : IDisposable
             ArrayView1D<int, Stride1D.Dense>>(GlobalLpPoolImpl);
         _affineGridKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(AffineGridImpl);
+        _lpPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>(LpPoolImpl);
+        _gridSampleKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GridSampleImpl);
+        _roiAlignKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(RoiAlignImpl);
+        _reverseSequenceKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ReverseSequenceImpl);
+        _maxUnpoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int>(MaxUnpoolImpl);
         _equalKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(EqualImpl);
         _greaterKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(GreaterImpl);
         _lessKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LessImpl);
