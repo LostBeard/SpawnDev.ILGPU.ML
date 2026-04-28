@@ -671,6 +671,19 @@ public class GraphExecutor : IDisposable
                             runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
                         }
                         catch (NotSupportedException) { /* Backend doesn't support async readback */ }
+                        catch (Exception captureEx)
+                        {
+                            // The flush during runtime-const capture is the first sync after
+                            // a queued kernel might fire its trap (Wasm divide-by-zero, WebGPU
+                            // device error). Augment with the op log so the failing operator
+                            // is identified instead of just the cryptic backend error.
+                            var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
+                            var tailLen = LastRunOpLog.Count - tailStart;
+                            var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                            throw new InvalidOperationException(
+                                $"GraphExecutor const-capture sync at node {nodeIdx + 1} ('{node.OpType}') FAILED. Last {tailLen} ops: {tail}",
+                                captureEx);
+                        }
                     }
                 }
             }
