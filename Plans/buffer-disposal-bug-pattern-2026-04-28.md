@@ -151,4 +151,29 @@ A real chained-graph repro requires graph execution machinery; an alternative is
 
 ## What this is NOT
 
-NOT the IsInf bug. NOT the Wasm divide-by-zero. NOT the DA3Small Playwright timeouts. Each of those is a separate item in `Plans/v4.0.0-checklist.md`.
+NOT the IsInf bug (closed by `SpawnDev.ILGPU 4.9.2-rc.26` upstream + consumer bump in commit `1be5a2e`). NOT the Wasm divide-by-zero. NOT the DA3Small Playwright timeouts. Each of those is a separate item in `Plans/v4.0.0-checklist.md`.
+
+## Side-finding: AssertCloseGpu uses `Atomic.Max` (WebGL-incompatible) - 2026-04-28
+
+While verifying the rc.26 IsInf fix, WebGL.AllOps_IsInf failed at WGSL/GLSL codegen with `Atomic.Max is not supported on the WebGL backend`. Tracing the throw site:
+
+`SpawnDev.ILGPU.ML/ElementWiseKernels.cs:1799-1800` (in `CompareReduceImpl`, the kernel called by `CompareOnGpuAsync` and through it `AssertCloseGpu`):
+
+```csharp
+Atomic.Add(ref results[0], absDiff);
+Atomic.Max(ref results[1], absDiff);
+```
+
+WebGL fundamentally cannot implement `Atomic.Max` (per `SpawnDev.ILGPU/WebGL/CLAUDE.md`: "No shared memory, atomics, or barriers - fundamentally limited by WebGL 2.0 / GLSL ES 3.0"). rc.10 added `UnsupportedKernelFeatureException` typed throws at the codegen site so this now fails at compile time with a clean message instead of producing wrong output silently.
+
+Implications:
+- **Every ML test using `AssertCloseGpu` (~195 sites across 20 unit-test files) is fundamentally broken on WebGL.** The test fails at AssertCloseGpu's reduce-kernel compile step, not at the operator under test. Pre-existing on rc.25; not a rc.26 regression. Confirmed on both rc.25 and rc.26 with identical error.
+- All other backends (WebGPU/Wasm/OpenCL/CUDA/CPU) handle `Atomic.Max` natively and pass.
+
+Proposed fix paths (in order of preference):
+
+1. **Multi-pass tree reduction** (no atomics). One kernel writes per-element absDiff; subsequent kernels reduce 2-to-1 in O(log N) dispatches. WebGL-compatible (Transform Feedback friendly). The right long-term fix.
+2. **CPU-readback fallback for WebGL only** (`if (accelerator.AcceleratorType == WebGL) { CopyToHostAsync + CPU reduce } else { existing GPU path }`). Gates the cleanest performance regression to one backend.
+3. **`AcceleratorRequirements.RequiresAtomics = true` on the ML test class.** Skips AssertCloseGpu-dependent tests on WebGL with a clean reason. Doesn't fix the underlying problem but stops the noise.
+
+Logged here, not fixed today.
