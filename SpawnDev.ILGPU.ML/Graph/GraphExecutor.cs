@@ -673,16 +673,16 @@ public class GraphExecutor : IDisposable
                         catch (NotSupportedException) { /* Backend doesn't support async readback */ }
                         catch (Exception captureEx)
                         {
-                            // The flush during runtime-const capture is the first sync after
-                            // a queued kernel might fire its trap (Wasm divide-by-zero, WebGPU
-                            // device error). Augment with the op log so the failing operator
-                            // is identified instead of just the cryptic backend error.
+                            // The flush during runtime-const capture is the first sync after a
+                            // queued kernel might fire its trap (Wasm divide-by-zero, WebGPU
+                            // device error). Inline-augment with op log; no wrapping because
+                            // SpawnDev.UnitTesting.UnitTestRunner unwraps InnerException on
+                            // report and would lose the augmentation.
                             var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
                             var tailLen = LastRunOpLog.Count - tailStart;
                             var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
-                            throw new InvalidOperationException(
-                                $"GraphExecutor const-capture sync at node {nodeIdx + 1} ('{node.OpType}') FAILED. Last {tailLen} ops: {tail}",
-                                captureEx);
+                            throw new Exception(
+                                $"[GE capture-sync node {nodeIdx + 1} '{node.OpType}'] {captureEx.Message} || last {tailLen} ops: {tail}");
                         }
                     }
                 }
@@ -733,11 +733,13 @@ public class GraphExecutor : IDisposable
                 try { await _accelerator.SynchronizeAsync(); }
                 catch (Exception syncEx)
                 {
+                    // Inline augmentation (no InnerException) - SpawnDev.UnitTesting.UnitTestRunner
+                    // unwraps InnerException when reporting test errors, so wrapping loses our context.
                     var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
                     var tailLen = LastRunOpLog.Count - tailStart;
                     var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
-                    throw new InvalidOperationException(
-                        $"GraphExecutor sync at node {nodeIdx} FAILED. Last {tailLen} ops: {tail}", syncEx);
+                    throw new Exception(
+                        $"[GE node-{nodeIdx} sync] {syncEx.Message} || last {tailLen} ops: {tail}");
                 }
                 // Now safe to return deferred buffers — GPU has finished reading them
                 foreach (var t in pendingReleases)
@@ -758,8 +760,8 @@ public class GraphExecutor : IDisposable
             var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
             var tailLen = LastRunOpLog.Count - tailStart;
             var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
-            throw new InvalidOperationException(
-                $"GraphExecutor final sync FAILED. {LastRunOpLog.Count} ops total. Last {tailLen} ops: {tail}", syncEx);
+            throw new Exception(
+                $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || last {tailLen} ops: {tail}");
         }
         // Release any remaining deferred buffers
         foreach (var t in pendingReleases)
