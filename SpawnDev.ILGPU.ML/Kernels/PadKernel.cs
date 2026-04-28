@@ -7,7 +7,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// GPU padding kernel. Supports constant, edge, and reflect modes.
 /// Used by ONNX Pad operator and Conv padding.
 /// </summary>
-public class PadKernel
+public class PadKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -15,8 +15,18 @@ public class PadKernel
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, float>? _padKernel;
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    // Deferred disposal: see TransposeKernel for the rationale (WebGPU
+    // command-encoder may still reference the prior _paramsBuf at next sync).
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
 
     public PadKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    public void Dispose()
+    {
+        _paramsBuf?.Dispose();
+        foreach (var buf in _oldParamsBufs) buf.Dispose();
+        _oldParamsBufs.Clear();
+    }
 
     private static void PadImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -96,7 +106,7 @@ public class PadKernel
         int paramsSize = 2 + 5 * rank;
         if (_paramsBuf == null || _paramsBuf.Length < paramsSize)
         {
-            _paramsBuf?.Dispose();
+            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
             _paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
         }
         var paramsData = new int[paramsSize];

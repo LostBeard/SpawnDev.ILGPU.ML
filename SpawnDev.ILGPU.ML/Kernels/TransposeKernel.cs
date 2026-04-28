@@ -13,7 +13,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// This kernel handles arbitrary permutations up to 6 dimensions via a params
 /// buffer that encodes the shape and permutation.
 /// </summary>
-public class TransposeKernel
+public class TransposeKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -22,8 +22,20 @@ public class TransposeKernel
         ArrayView1D<int, Stride1D.Dense>>? _transposeKernel;
 
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    // Deferred-disposal list: when _paramsBuf needs to grow, the prior buffer
+    // may still be referenced by an in-flight WebGPU dispatch. Inline disposal
+    // would fire "Buffer used in submit while destroyed" at the next sync.
+    // Same pattern as ElementWiseKernels.BroadcastBinaryOpND.
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
 
     public TransposeKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    public void Dispose()
+    {
+        _paramsBuf?.Dispose();
+        foreach (var buf in _oldParamsBufs) buf.Dispose();
+        _oldParamsBufs.Clear();
+    }
 
     /// <summary>
     /// General transpose: for each output element, compute its source index
@@ -92,7 +104,11 @@ public class TransposeKernel
         int paramsSize = 1 + 4 * rank;
         if (_paramsBuf == null || _paramsBuf.Length < paramsSize)
         {
-            _paramsBuf?.Dispose();
+            // Defer disposal of the OLD paramsBuf until our own Dispose() runs.
+            // Inline _paramsBuf?.Dispose() fires "Buffer used in submit while
+            // destroyed" on WebGPU when a prior Transpose dispatch is still
+            // queued in the command encoder. (Pipeline_Diffusion_DDPM root cause.)
+            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
             _paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
         }
         var paramsData = new int[paramsSize];

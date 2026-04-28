@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// These supplement the existing ElementWiseKernels with operations needed
 /// by encoder-decoder models, attention masking, and text generation.
 /// </summary>
-public class MissingElementWiseKernels
+public class MissingElementWiseKernels : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -33,8 +33,18 @@ public class MissingElementWiseKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _topKKernel;
 
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    // Deferred disposal: see TransposeKernel for the rationale (WebGPU
+    // command-encoder may still reference the prior _paramsBuf at next sync).
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
 
     public MissingElementWiseKernels(Accelerator accelerator) => _accelerator = accelerator;
+
+    public void Dispose()
+    {
+        _paramsBuf?.Dispose();
+        foreach (var buf in _oldParamsBufs) buf.Dispose();
+        _oldParamsBufs.Clear();
+    }
 
     // ──────────────────────────────────────────────
     //  Unary ops
@@ -299,7 +309,7 @@ public class MissingElementWiseKernels
     {
         if (_paramsBuf == null || _paramsBuf.Length < minSize)
         {
-            _paramsBuf?.Dispose();
+            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
             _paramsBuf = _accelerator.Allocate1D<int>(minSize);
         }
     }

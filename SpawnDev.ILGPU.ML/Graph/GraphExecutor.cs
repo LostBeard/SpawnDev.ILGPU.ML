@@ -33,6 +33,19 @@ public class GraphExecutor : IDisposable
     public static bool VerboseLogging { get; set; }
 
     /// <summary>
+    /// DIAGNOSTIC: when set, RunAsync's main loop breaks after executing
+    /// `BreakAtNode` nodes (1-indexed). Used to bisect which operator triggers
+    /// WebGPU buffer-used-while-destroyed in Pipeline_Diffusion_DDPM.
+    /// </summary>
+    public static int? BreakAtNode { get; set; }
+
+    /// <summary>
+    /// DIAGNOSTIC: captures the OpType + node index of every operator run in
+    /// the most recent RunAsync invocation. Cleared at the start of each call.
+    /// </summary>
+    public static List<string> LastRunOpLog { get; } = new();
+
+    /// <summary>
     /// When non-null, captures first 10 values of each node's output for debugging.
     /// Performance cost: GPU sync + readback per node. Only use for diagnostics.
     /// </summary>
@@ -416,6 +429,7 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
+        LastRunOpLog.Clear();
         var tensors = new Dictionary<string, Tensor>();
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
@@ -697,22 +711,43 @@ public class GraphExecutor : IDisposable
             }
 
             nodeIdx++;
+            LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}");
 
             // Flush GPU command buffer periodically to prevent massive single submissions.
             // 64 nodes between syncs balances latency vs throughput (was 16, too many syncs for GPT-2's 2620 nodes).
             if (nodeIdx % 64 == 0)
             {
-                await _accelerator.SynchronizeAsync();
+                try { await _accelerator.SynchronizeAsync(); }
+                catch (Exception syncEx)
+                {
+                    var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
+                    var tailLen = LastRunOpLog.Count - tailStart;
+                    var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                    throw new InvalidOperationException(
+                        $"GraphExecutor sync at node {nodeIdx} FAILED. Last {tailLen} ops: {tail}", syncEx);
+                }
                 // Now safe to return deferred buffers — GPU has finished reading them
                 foreach (var t in pendingReleases)
                     _pool.Return(t);
                 pendingReleases.Clear();
             }
+
+            // DIAGNOSTIC: stop early at requested node count to bisect failures.
+            if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value)
+                break;
         }
 
         // Final yield + sync
         await Task.Yield();
-        await _accelerator.SynchronizeAsync();
+        try { await _accelerator.SynchronizeAsync(); }
+        catch (Exception syncEx)
+        {
+            var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
+            var tailLen = LastRunOpLog.Count - tailStart;
+            var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+            throw new InvalidOperationException(
+                $"GraphExecutor final sync FAILED. {LastRunOpLog.Count} ops total. Last {tailLen} ops: {tail}", syncEx);
+        }
         // Release any remaining deferred buffers
         foreach (var t in pendingReleases)
             _pool.Return(t);
