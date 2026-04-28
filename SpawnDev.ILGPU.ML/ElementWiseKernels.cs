@@ -1800,15 +1800,61 @@ public class ElementWiseKernels : IDisposable
         Atomic.Max(ref results[1], absDiff);
     }
 
+    // No-atomic per-element absDiff kernel. WebGL fallback - WebGL doesn't
+    // support Atomic.Max so the GPU reduction path can't compile there.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _compareDiffKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _compareDiffBuf;
+
+    private static void CompareDiffImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> actual,
+        ArrayView1D<float, Stride1D.Dense> expected,
+        ArrayView1D<float, Stride1D.Dense> diffs)
+    {
+        float diff = actual[idx] - expected[idx];
+        diffs[idx] = diff < 0f ? -diff : diff;
+    }
+
     /// <summary>
     /// Compare two GPU buffers and return (meanError, maxError).
-    /// Entire comparison runs on GPU — only 2 floats read back to CPU.
+    /// On atomics-capable backends (WebGPU/Wasm/CUDA/OpenCL/CPU) the reduction
+    /// runs on GPU via Atomic.Add+Atomic.Max and only 2 floats read back.
+    /// WebGL has no atomics so we use a per-element absDiff kernel + CPU
+    /// reduction over the readback array. Slower for large tensors but
+    /// correct (WebGL is a fallback backend; perf parity isn't expected).
     /// </summary>
     public async Task<(float meanError, float maxError)> CompareOnGpuAsync(
         ArrayView1D<float, Stride1D.Dense> actual,
         ArrayView1D<float, Stride1D.Dense> expected,
         int count)
     {
+        if (_accelerator.AcceleratorType == AcceleratorType.WebGL)
+        {
+            _compareDiffKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>>(CompareDiffImpl);
+
+            // Reuse buffer when same size; reallocate when size grows.
+            if (_compareDiffBuf == null || _compareDiffBuf.Length < count)
+            {
+                _compareDiffBuf?.Dispose();
+                _compareDiffBuf = _accelerator.Allocate1D<float>(count);
+            }
+
+            _compareDiffKernel(count, actual, expected, _compareDiffBuf.View);
+            await _accelerator.SynchronizeAsync();
+
+            var diffs = await _compareDiffBuf.CopyToHostAsync<float>(0, count);
+            float sumAbsDiff = 0f, maxAbsDiff = 0f;
+            for (int i = 0; i < count; i++)
+            {
+                float d = diffs[i];
+                sumAbsDiff += d;
+                if (d > maxAbsDiff) maxAbsDiff = d;
+            }
+            return (sumAbsDiff / count, maxAbsDiff);
+        }
+
         _compareReduceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(CompareReduceImpl);
@@ -1831,6 +1877,7 @@ public class ElementWiseKernels : IDisposable
         foreach (var buf in _oldStridesBufs) buf.Dispose();
         _oldStridesBufs.Clear();
         _compareResultBuf?.Dispose();
+        _compareDiffBuf?.Dispose();
         _nearestParamsBuf?.Dispose();
     }
 }
