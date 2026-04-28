@@ -181,6 +181,17 @@ Approach (A) is more pragmatic with limited diagnostic infrastructure - identifi
 
 NOT the IsInf bug (closed by `SpawnDev.ILGPU 4.9.2-rc.26` upstream + consumer bump in commit `1be5a2e`). NOT the Wasm divide-by-zero. NOT the DA3Small Playwright timeouts. Each of those is a separate item in `Plans/v4.0.0-checklist.md`.
 
+## Side-finding 2: Wasm Pipeline_Diffusion non-deterministic NaN (2026-04-28)
+
+After the BroadcastBinaryKernel `outStrides` dense-stride fix (commit `d3deb67`), Wasm Diffusion runs the full ~75s inference end-to-end. The next-tier failure is non-deterministic:
+
+- Default: failure ~75% of runs with `DDPM output contains NaN`.
+- With `Graph.GraphExecutor.CapturedOutputs` set (which forces `await SynchronizeAsync()` after each node's outputs[0]): PASSES.
+
+Same pattern as the Transpose paramsBuf fix on WebGPU - per-op sync masks a buffer-lifecycle race. Different manifestation though: this is Wasm-specific and persists with the Transpose/Pad/MissingElementWise fixes already in place. Likely a different buffer (or a Wasm-specific aspect of the same buffer's lifecycle), or a deeper Wasm dispatch coherence issue (`WasmAccelerator._pendingWork` / `Task.WhenAll` completing before all worker writes are visible).
+
+Filed to Geordi: `_DevComms/SpawnDev.ILGPU/data-to-geordi-wasm-buffer-race-non-deterministic-2026-04-28.md`. Tracked separately because the dispatch-internals investigation is in his lane; from this consumer side I've narrowed it to "per-op sync masks it", which is the right hand-off shape for a Wasm dispatch coherence look.
+
 ## Side-finding: AssertCloseGpu uses `Atomic.Max` (WebGL-incompatible) - 2026-04-28
 
 While verifying the rc.26 IsInf fix, WebGL.AllOps_IsInf failed at WGSL/GLSL codegen with `Atomic.Max is not supported on the WebGL backend`. Tracing the throw site:
