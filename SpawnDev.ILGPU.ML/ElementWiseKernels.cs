@@ -207,9 +207,16 @@ public class ElementWiseKernels : IDisposable
         int aIdx = 0, bIdx = 0, remaining = idx;
         for (int d = 0; d < rank; d++)
         {
+            // ComputeStrides emits stride=0 for any output dim of size 1 (broadcast position).
+            // ILGPU's Wasm codegen does NOT short-circuit `cond ? divide : 0` - both branches
+            // evaluate and the divide traps with "divide by zero" on Worker. Use stride=1 as
+            // a safe sentinel: when out-stride is 0 the matching a/b strides for the same d
+            // are ALSO 0 (broadcast or unit-dim source), so coord*aStride and coord*bStride
+            // are 0 either way. Math is equivalent; the trap is gone.
             int outStride = strides[1 + 2 * rank + d];
-            int coord = outStride > 0 ? remaining / outStride : 0;
-            remaining = outStride > 0 ? remaining % outStride : remaining;
+            int outStrideSafe = outStride == 0 ? 1 : outStride;
+            int coord = remaining / outStrideSafe;
+            remaining = remaining % outStrideSafe;
             aIdx += coord * strides[1 + d];
             bIdx += coord * strides[1 + rank + d];
         }
