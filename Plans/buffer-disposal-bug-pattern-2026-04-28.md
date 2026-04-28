@@ -149,6 +149,34 @@ A real chained-graph repro requires graph execution machinery; an alternative is
 4. Add a regression test that exercises chained operators with a single end-of-graph sync.
 5. Confirm WebGPU Pipeline_BackgroundRemoval and Pipeline_SemanticSearch behavior - they may share the same root cause (timeout because the post-error state hangs the Playwright UI sync).
 
+## Smoking gun: per-op SynchronizeAsync makes Pipeline_Diffusion pass (2026-04-28)
+
+Confirmed the bug class with a temporary diagnostic: `await _accelerator.SynchronizeAsync()` injected after every `node.Operator.Execute(ctx)` in `GraphExecutor.RunAsync`'s main loop.
+
+| Configuration | Pipeline_Diffusion_DDPM (WebGPU) | Duration |
+|---------------|----------------------------------|----------|
+| Default batched sync (every 64 nodes) | FAIL (`Buffer used in submit while destroyed`) | 7s |
+| Per-op SynchronizeAsync | **PASS** | 15s |
+
+Same model bytes, same kernels, same operators - the only difference is when buffers get a chance to flush before they go out of scope. This isolates the bug class definitively to "an operator's local using-var GPU buffer is `.Dispose()`d before the WebGPU command encoder it was queued into gets `queue.submit`ted."
+
+The diagnostic was reverted (commit pending) once confirmed. Per-op sync is NOT a viable production fix because it amplifies dispatch latency by a constant per-op cost (~150ms on this rig); a 2620-node GPT-2 graph would add 6+ minutes. The right fix is operator-level deferred disposal as already documented above (Pattern A / B).
+
+### What this means for the operator audit
+
+The using-var sites I identified are not the COMPLETE list - none of them are operators DDPM uses (Conv, GroupNorm, SiLU, Concat, Add, Resize). The bug must come from one or more of:
+
+- A using-var I missed in a kernel called by those operators
+- A buffer-disposal pattern that doesn't follow the literal `using var Allocate1D` form (e.g., `var x = Allocate(); ... x.Dispose();` written long-form)
+- `_pool.Return(...)` returning a buffer to the bucket where the next Rent reuses it for a different tensor while the old tensor's dispatches are still in flight (this would be a BufferPool design issue, not an operator-local one)
+- An ILGPU.WebGPU internal that allocates a temp during dispatch and disposes it before submit
+
+Next step is to identify the exact operator triggering the bug. Two approaches:
+(A) Bisect: add a static `BreakAtNode` to GraphExecutor; binary search to find the smallest N where the test still fails when stopped at node N.
+(B) Instrument: enrich GraphExecutor's per-node logging to flush via Console.Error.WriteLine (PMT captures) and capture stage timings + buffer allocation/disposal events around each op.
+
+Approach (A) is more pragmatic with limited diagnostic infrastructure - identifies the specific failing node without requiring console-message-routing changes.
+
 ## What this is NOT
 
 NOT the IsInf bug (closed by `SpawnDev.ILGPU 4.9.2-rc.26` upstream + consumer bump in commit `1be5a2e`). NOT the Wasm divide-by-zero. NOT the DA3Small Playwright timeouts. Each of those is a separate item in `Plans/v4.0.0-checklist.md`.
