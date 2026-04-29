@@ -45,10 +45,9 @@ public abstract partial class MLTestBase
         preprocess.ForwardRaw(rgbaBuf.View, nchwBuf.View, width, height, dstW, dstH);
         await accelerator.SynchronizeAsync();
 
-        var actual = await nchwBuf.CopyToHostAsync<float>(0, 3 * dstH * dstW);
-
-        // Compare first 100 values
-        int compareCount = Math.Min(100, actual.Length);
+        // Compare first 100 values - only read what we compare (was reading 150528 = 600KB to compare 100 = 400 bytes)
+        int compareCount = Math.Min(100, 3 * dstH * dstW);
+        var actual = await nchwBuf.CopyToHostAsync<float>(0, compareCount);
         float maxErr = 0;
         double sumErr = 0;
         for (int i = 0; i < compareCount; i++)
@@ -96,9 +95,9 @@ public abstract partial class MLTestBase
         preprocess.Forward(rgbaBuf.View, nchwBuf.View, width, height, dstW, dstH);
         await accelerator.SynchronizeAsync();
 
-        var actual = await nchwBuf.CopyToHostAsync<float>(0, 3 * dstH * dstW);
-
-        int compareCount = Math.Min(100, actual.Length);
+        // Compare first 100 values - only read what we compare (was reading 150528 = 600KB to compare 100 = 400 bytes)
+        int compareCount = Math.Min(100, 3 * dstH * dstW);
+        var actual = await nchwBuf.CopyToHostAsync<float>(0, compareCount);
         float maxErr = 0;
         double sumErr = 0;
         for (int i = 0; i < compareCount; i++)
