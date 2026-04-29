@@ -162,8 +162,8 @@ public class CastOperator(OperatorRegistry reg) : IOnnxOperator
                 result = inVals.Select(v => (float)Math.Truncate(v)).ToArray();
             else
                 result = inVals.ToArray();
-            var temp = ctx.Pool.AllocatePermanent(result, ctx.Outputs[0].Shape);
-            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, count, 1f);
+            // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
+            ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
             return;
         }
 
@@ -290,9 +290,8 @@ public class ShapeOperator(OperatorRegistry reg) : IOnnxOperator
         var shapeData = new float[shape.Length];
         for (int i = 0; i < shape.Length; i++)
             shapeData[i] = shape[i];
-        // Upload via pool
-        var temp = ctx.Pool.AllocatePermanent(shapeData, new[] { shape.Length });
-        reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, shape.Length, 1f);
+        // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
+        ctx.Outputs[0].Data.SubView(0, shape.Length).CopyFromCPU(shapeData);
     }
 }
 
@@ -379,8 +378,8 @@ public class TileOperator(OperatorRegistry reg) : IOnnxOperator
                         }
                         result[i] = inIdx < inVals.Length ? inVals[inIdx] : 0f;
                     }
-                    var temp = ctx.Pool.AllocatePermanent(result, outShape);
-                    reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+                    // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
+                    output.Data.SubView(0, outCount).CopyFromCPU(result);
                 }
                 else
                 {

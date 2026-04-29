@@ -40,8 +40,9 @@ internal static class BroadcastHelper
                     bIdx < bVals.Length ? bVals[bIdx] : 0f);
             }
 
-            var temp = ctx.Pool.AllocatePermanent(result, outShape);
-            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+            // Direct CPU->GPU upload to output (was AllocatePermanent + Scale, leaked
+            // a permanent buffer per call - see ExpandOperator for the same fix).
+            ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else if (bVals != null && a.ElementCount > b.ElementCount)
         {
@@ -484,8 +485,8 @@ public class NotOperator(OperatorRegistry reg) : IOnnxOperator
             var result = new float[inVals.Length];
             for (int i = 0; i < inVals.Length; i++)
                 result[i] = inVals[i] == 0f ? 1f : 0f;
-            var temp = ctx.Pool.AllocatePermanent(result, ctx.Inputs[0].Shape);
-            reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, result.Length, 1f);
+            // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
+            ctx.Outputs[0].Data.SubView(0, result.Length).CopyFromCPU(result);
         }
         else
         {
@@ -691,8 +692,8 @@ public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
                     }
                     result[i] = cVals[cIdx] != 0f ? xVals[xIdx] : yVals[yIdx];
                 }
-                var temp = ctx.Pool.AllocatePermanent(result, outShape);
-                reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+                // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
+                ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
             }
             else
             {
