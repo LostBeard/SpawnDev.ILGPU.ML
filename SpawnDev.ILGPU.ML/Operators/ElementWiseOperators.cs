@@ -735,8 +735,12 @@ public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
                 int inIdx = MapIndex(i, outStrides, inStrides, output.Shape.Length);
                 result[i] = inIdx < inVals.Length ? inVals[inIdx] : 0f;
             }
-            var temp = ctx.Pool.AllocatePermanent(result, output.Shape);
-            reg.ElementWise.Scale(temp.Data, output.Data, outCount, 1f);
+            // Direct CPU->GPU upload to output. Was: AllocatePermanent + Scale, which
+            // leaked a fresh GPU buffer per call (permanent buffers live until session
+            // dispose). DA3-Small inference exhausted Wasm 4GB memory on its 5+ Expand
+            // ops with this pattern. CopyFromCPU is the same GPU-resident write path
+            // (queue.writeBuffer on WebGPU, equivalent on other backends), no temp.
+            output.Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else
         {
