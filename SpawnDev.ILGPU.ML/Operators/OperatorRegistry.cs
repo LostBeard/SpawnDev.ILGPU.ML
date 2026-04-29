@@ -57,6 +57,23 @@ public class OperatorRegistry : IDisposable
         RegisterBuiltins();
     }
 
+    // Zero-bias cache for Conv ops without an explicit bias input.
+    // Keyed by outC so any number of biasless convs with the same channel count
+    // share a single GPU zero buffer. Lifetime is bound to the registry — buffers
+    // are disposed in Dispose(). This avoids leaking one permanent buffer per
+    // biasless-conv invocation through a multi-inference session.
+    private readonly Dictionary<int, MemoryBuffer1D<float, Stride1D.Dense>> _zeroBiasCache = new();
+
+    public ArrayView1D<float, Stride1D.Dense> GetOrCreateZeroBias(int outC)
+    {
+        if (!_zeroBiasCache.TryGetValue(outC, out var buf))
+        {
+            buf = _accelerator.Allocate1D(new float[outC]);
+            _zeroBiasCache[outC] = buf;
+        }
+        return buf.View;
+    }
+
     public void Register(IOnnxOperator op) => _ops[op.OpType] = op;
 
     public IOnnxOperator Resolve(string opType)
@@ -305,5 +322,9 @@ public class OperatorRegistry : IDisposable
         try { (Pad as IDisposable)?.Dispose(); } catch { }
         try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
         try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
+
+        // Dispose cached zero-bias buffers (one per distinct outC seen).
+        foreach (var b in _zeroBiasCache.Values) try { b.Dispose(); } catch { }
+        _zeroBiasCache.Clear();
     }
 }

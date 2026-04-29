@@ -269,8 +269,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Upload fresh zeros — Pool.Rent reuses buffers with stale data
-            bias = ctx.Pool.AllocatePermanent(new float[outC], new[] { outC }, "_conv_zero_bias").Data;
+            // Cached zero-bias buffer per outC, owned by the OperatorRegistry.
+            // Was: AllocatePermanent on every call — leaked one buffer per biasless-Conv invocation.
+            bias = reg.GetOrCreateZeroBias(outC);
         }
 
         // (Debug diagnostics removed)
@@ -1499,8 +1500,8 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
                 var result = new float[outCount];
                 int outIdx = 0;
                 SliceCPU(inVals, result, inShape, sliceStarts, sliceEnds, sliceSteps, inStrides, rank, 0, 0, ref outIdx);
-                var temp = ctx.Pool.AllocatePermanent(result, outShape);
-                reg.ElementWise.Scale(temp.Data, ctx.Outputs[0].Data, outCount, 1f);
+                // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
+                ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
                 return;
             }
         }
