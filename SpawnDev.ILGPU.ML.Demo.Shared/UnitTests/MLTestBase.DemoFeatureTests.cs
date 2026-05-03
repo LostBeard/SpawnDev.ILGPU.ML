@@ -89,22 +89,37 @@ public abstract partial class MLTestBase
         var output = outputs[session.OutputNames[0]];
         Console.WriteLine($"[RMBG] Output: shape=[{string.Join(",", output.Shape)}], elements={output.ElementCount}");
 
-        // Read mask values
-        int readCount = Math.Min(100, output.ElementCount);
-        using var readBuf = accelerator.Allocate1D<float>(readCount);
-        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, readCount), readBuf.View, readCount, 1f);
+        // Sample the mask at columns spanning BOTH halves so the segmentation check
+        // is actually informative. The test image is white left half / dark right half,
+        // so a working mask must have higher values on the left columns than the right.
+        // Reading only the first N contiguous elements (e.g. row 0 cols 0..N-1) sits
+        // entirely in the foreground half and produces near-zero variance regardless
+        // of whether the model worked - hence the dedicated foreground+background reads.
+        int outW = output.Shape[^1];
+        int sampleSize = Math.Min(64, outW / 4);
+        int foregroundStart = 0;                  // row 0, cols 0..sampleSize-1 (left half / white)
+        int backgroundStart = outW - sampleSize;  // row 0, cols outW-sampleSize..outW-1 (right half / dark)
+
+        using var fgBuf = accelerator.Allocate1D<float>(sampleSize);
+        using var bgBuf = accelerator.Allocate1D<float>(sampleSize);
+        var ewk = new ElementWiseKernels(accelerator);
+        ewk.Scale(output.Data.SubView(foregroundStart, sampleSize), fgBuf.View, sampleSize, 1f);
+        ewk.Scale(output.Data.SubView(backgroundStart, sampleSize), bgBuf.View, sampleSize, 1f);
         await accelerator.SynchronizeAsync();
-        var maskValues = await readBuf.CopyToHostAsync<float>(0, readCount);
+        var fgValues = await fgBuf.CopyToHostAsync<float>(0, sampleSize);
+        var bgValues = await bgBuf.CopyToHostAsync<float>(0, sampleSize);
 
-        float absMax = maskValues.Max(v => MathF.Abs(v));
-        float variance = maskValues.Select(v => v - maskValues.Average()).Select(d => d * d).Average();
+        float fgAvg = fgValues.Average();
+        float bgAvg = bgValues.Average();
+        float absMax = Math.Max(fgValues.Max(v => MathF.Abs(v)), bgValues.Max(v => MathF.Abs(v)));
+        float discrimination = MathF.Abs(fgAvg - bgAvg);
 
-        Console.WriteLine($"[RMBG] Mask: absMax={absMax:F3}, variance={variance:F4}");
+        Console.WriteLine($"[RMBG] Mask: absMax={absMax:F3}, fgAvg={fgAvg:F3}, bgAvg={bgAvg:F3}, discrimination={discrimination:F4}");
 
         if (absMax < 0.001f)
             throw new Exception("Background removal mask is all zeros");
-        if (variance < 1e-6f)
-            throw new Exception("Background removal mask is uniform (no segmentation)");
+        if (discrimination < 0.05f)
+            throw new Exception($"Background removal mask shows no foreground/background discrimination (fgAvg={fgAvg:F3}, bgAvg={bgAvg:F3})");
     });
 
     // ═══════════════════════════════════════════════════════════
