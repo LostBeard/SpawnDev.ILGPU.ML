@@ -31,13 +31,17 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests
                 .Wasm();
             var context = builder.ToContext();
             WasmBackend.VerboseLogging = false;
-            // NOTE: 4.9.4-rc.1 MaxLinearMemoryPages>16384 currently breaks ALL Wasm
-            // dispatches with "memory import has a larger maximum size 32768 than the
-            // module's declared maximum 16384" - the kernel WASM module's declared max
-            // doesn't track the option. Reported to Geordi 2026-05-03. Reverting to
-            // default (16384/1 GiB) until the kernel-codegen side of the fix lands;
-            // DA3-Small op 93 OOM stays open for now.
-            var accelerator = await context.CreateWasmAcceleratorAsync();
+            // 32768 pages = 2 GiB SharedArrayBuffer ceiling. DA3-Small graph executor's
+            // working set crosses the default 16384 (1 GiB) at op 93 and OOMs on grow().
+            // 4.9.4-rc.2 threads MaxLinearMemoryPages through both the host WebAssembly.Memory
+            // creation AND the kernel module's import.maximum declaration (rc.1 only updated
+            // the host side and instantiation rejected at any cap > 16384 due to import-vs-host
+            // max mismatch per WebAssembly spec). Bump to 65536 (4 GiB hard ceiling for
+            // SharedArrayBuffer per browser tab) if 2 GiB still hits.
+            var accelerator = await context.CreateWasmAcceleratorAsync(new WasmBackendOptions
+            {
+                MaxLinearMemoryPages = 32768,
+            });
             return (context, accelerator);
         }
 
