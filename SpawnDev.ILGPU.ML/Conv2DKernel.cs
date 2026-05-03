@@ -135,10 +135,11 @@ public class Conv2DKernel : IDisposable
         }
         catch (global::ILGPU.Runtime.OpenCL.CLException clEx)
         {
-            // Upstream CLException's bare ctor (CLException(CLError) -> base()) doesn't
-            // surface the CLError code in the Message - we catch + re-throw with the
-            // code visible. Reported to Geordi for an upstream Message-includes-Error
-            // fix; remove this catch when that lands.
+            // SpawnDev.ILGPU 4.9.5-rc.1 fixed the upstream CLException Message to include
+            // the CLError code; we keep this consumer-side wrap because it ALSO surfaces
+            // the call count + Conv params (input shape, kernel size, stride, padding,
+            // total output) which the bare exception doesn't have. Useful for narrowing
+            // OpenCL queue-state failures to the specific Conv layer that triggered them.
             throw new InvalidOperationException(
                 $"[Conv2DKernel.Forward call #{_convCallCount} {_accelerator.AcceleratorType}] "
                 + $"OpenCL {clEx.Error} (CLError) at "
