@@ -74,11 +74,18 @@ public abstract partial class MLTestBase
                     ? (255 | (255 << 8) | (255 << 16) | (0xFF << 24))  // white
                     : (30 | (30 << 8) | (30 << 16) | (0xFF << 24));    // dark
 
-        // Preprocess
+        // Preprocess - RMBG-specific normalization (mean=0.5, std=1.0 -> output in [-0.5, 0.5]).
+        // The default Forward() uses ImageNet normalization which would feed RMBG out-of-distribution
+        // input and produce garbage (near-zero) masks. BackgroundRemovalPipeline.cs already passes
+        // these correct values; the test was bypassing the pipeline and calling preprocess directly
+        // without them, which is why this test silently passed for years (paired with the
+        // foreground-only sampling bug that hid the resulting near-zero output).
         using var rgbaBuf = accelerator.Allocate1D(pixels);
         using var preprocessed = accelerator.Allocate1D<float>(3 * w * h);
         var preprocess = new Kernels.ImagePreprocessKernel(accelerator);
-        preprocess.Forward(rgbaBuf.View, preprocessed.View, w, h, w, h);
+        preprocess.Forward(rgbaBuf.View, preprocessed.View, w, h, w, h,
+            mean: new[] { 0.5f, 0.5f, 0.5f },
+            std: new[] { 1.0f, 1.0f, 1.0f });
 
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, h, w });
         var outputs = await session.RunAsync(new Dictionary<string, Tensor>
@@ -111,15 +118,21 @@ public abstract partial class MLTestBase
 
         float fgAvg = fgValues.Average();
         float bgAvg = bgValues.Average();
-        float absMax = Math.Max(fgValues.Max(v => MathF.Abs(v)), bgValues.Max(v => MathF.Abs(v)));
+        float fgMin = fgValues.Min(); float fgMax = fgValues.Max();
+        float bgMin = bgValues.Min(); float bgMax = bgValues.Max();
+        float absMax = Math.Max(MathF.Abs(fgMax), Math.Max(MathF.Abs(bgMax), Math.Max(MathF.Abs(fgMin), MathF.Abs(bgMin))));
         float discrimination = MathF.Abs(fgAvg - bgAvg);
 
-        Console.WriteLine($"[RMBG] Mask: absMax={absMax:F3}, fgAvg={fgAvg:F3}, bgAvg={bgAvg:F3}, discrimination={discrimination:F4}");
+        Console.WriteLine($"[RMBG] Mask sample (cols 0..{sampleSize - 1} fg / cols {backgroundStart}..{outW - 1} bg of row 0):");
+        Console.WriteLine($"[RMBG]   foreground (white input): min={fgMin:F4} max={fgMax:F4} avg={fgAvg:F4}");
+        Console.WriteLine($"[RMBG]   background (dark input):  min={bgMin:F4} max={bgMax:F4} avg={bgAvg:F4}");
+        Console.WriteLine($"[RMBG]   absMax={absMax:F4} discrimination(|fgAvg-bgAvg|)={discrimination:F4}");
 
         if (absMax < 0.001f)
-            throw new Exception("Background removal mask is all zeros");
+            throw new Exception($"Background removal mask is all zeros (fgMax={fgMax:F4}, bgMax={bgMax:F4})");
         if (discrimination < 0.05f)
-            throw new Exception($"Background removal mask shows no foreground/background discrimination (fgAvg={fgAvg:F3}, bgAvg={bgAvg:F3})");
+            throw new Exception($"Background removal mask shows no foreground/background discrimination "
+                + $"(fg avg={fgAvg:F4} range=[{fgMin:F4},{fgMax:F4}]; bg avg={bgAvg:F4} range=[{bgMin:F4},{bgMax:F4}])");
     });
 
     // ═══════════════════════════════════════════════════════════
