@@ -660,29 +660,62 @@ public class GraphExecutor : IDisposable
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
                     if (outName != null)
                     {
+                        // Defensive null-check: outTensor.Data can be null on backends where
+                        // BufferPool.Rent returned an empty tensor for a zero-or-degenerate
+                        // shape (replaced to size-1 above), or where SubView is unsupported.
+                        // Without this check, "outTensor.Data.SubView(...)" throws bare NRE
+                        // and the capture-sync catch reports "Arg_NullReferenceException"
+                        // with no clue which line trapped.
+                        string captureStage = "init";
                         try
                         {
                             int elCount = outTensor.ElementCount;
+                            captureStage = $"alloc[{elCount}]";
+                            using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
+                            captureStage = $"data-subview[{elCount}]";
+                            if (outTensor.Data.Length == 0)
+                                throw new InvalidOperationException("outTensor.Data has zero length");
+                            var srcView = outTensor.Data.SubView(0, elCount);
+                            captureStage = $"scale[{elCount}]";
                             // GPU→GPU copy via Scale kernel (works on all backends),
                             // then async readback via CopyToHostAsync(offset, count).
-                            using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
-                            _ew.Scale(outTensor.Data.SubView(0, elCount), tmpBuf.View, elCount, 1f);
+                            _ew.Scale(srcView, tmpBuf.View, elCount, 1f);
+                            captureStage = $"sync[{elCount}]";
                             await _accelerator.SynchronizeAsync();
+                            captureStage = $"copy-back[{elCount}]";
                             runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
                         }
                         catch (NotSupportedException) { /* Backend doesn't support async readback */ }
+                        catch (NullReferenceException) {
+                            // WORKAROUND: SpawnDev.ILGPU 4.9.4 WebGPU CopyToHostAsync NRE on tiny
+                            // (1-element / 4-byte) staging buffers. Tracked via
+                            // _DevComms/SpawnDev.ILGPU/data-to-geordi-webgpu-tiny-readback-nre-2026-05-03.md.
+                            // Cached runtime-constants are an OPTIMIZATION for downstream parameter
+                            // resolution (Slice starts/ends, Reshape dims) - swallowing a single
+                            // readback just means the downstream op reads the value from the GPU
+                            // view directly. Should NOT abort the whole graph run.
+                            // Repro: WebGPUTests.Pipeline_YOLOv8 node 227 'Div' shape=[1].
+                            // Remove this catch when upstream lands the fix in WebGPUMemoryBuffer.
+                        }
                         catch (Exception captureEx)
                         {
                             // The flush during runtime-const capture is the first sync after a
                             // queued kernel might fire its trap (Wasm divide-by-zero, WebGPU
-                            // device error). Inline-augment with op log; no wrapping because
+                            // device error). For non-NRE exceptions we still want the augmented
+                            // throw because they're real graph-execution failures, not optimization
+                            // hiccups. Inline-augment with op log; no wrapping because
                             // SpawnDev.UnitTesting.UnitTestRunner unwraps InnerException on
                             // report and would lose the augmentation.
                             var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
                             var tailLen = LastRunOpLog.Count - tailStart;
                             var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                            var exType = captureEx.GetType().Name;
+                            string dataLenStr;
+                            try { dataLenStr = outTensor.Data.Length.ToString(); } catch { dataLenStr = "(unreadable)"; }
+                            var shape = outTensor.Shape != null ? string.Join(",", outTensor.Shape) : "(null shape)";
                             throw new Exception(
-                                $"[GE capture-sync node {nodeIdx + 1} '{node.OpType}'] {captureEx.Message} || last {tailLen} ops: {tail}");
+                                $"[GE capture-sync node {nodeIdx + 1} '{node.OpType}' out '{outName}' shape=[{shape}] dataLen={dataLenStr} stage={captureStage}] "
+                                + $"{exType}: {captureEx.Message} || last {tailLen} ops: {tail}");
                         }
                     }
                 }
