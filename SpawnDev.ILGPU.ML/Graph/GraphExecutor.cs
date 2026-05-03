@@ -51,6 +51,21 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public static Dictionary<string, float[]>? CapturedOutputs { get; set; }
 
+    /// <summary>
+    /// DIAGNOSTIC: when true, calls await accelerator.SynchronizeAsync() after EVERY
+    /// node's Execute. Without this, async-dispatch backends (Wasm worker pool, WebGPU
+    /// command-encoder batches) only surface kernel traps at the next periodic sync
+    /// (every 64 nodes by default), so an OOB or remainder-by-zero in node 17 reads as
+    /// "node-64 sync caught Wasm Worker N error: memory access out of bounds" with no
+    /// way to identify the actual failing op. Per-op sync makes the augmented Execute
+    /// catch fire on the exact node that traps.
+    ///
+    /// Performance cost is significant - one full GPU flush per op, which serializes
+    /// what would otherwise be a batched submission. Only enable for kernel-bisection
+    /// debugging on small models.
+    /// </summary>
+    public static bool PerOpSync { get; set; }
+
     /// <summary>Data layout format (NCHW for ONNX, NHWC for TFLite).</summary>
     public DataFormat Format { get; set; } = DataFormat.NCHW;
 
@@ -633,6 +648,12 @@ public class GraphExecutor : IDisposable
             try
             {
                 node.Operator.Execute(ctx);
+                // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
+                // after every Execute so async-backend kernel traps (Wasm worker errors,
+                // WebGPU command-encoder errors) surface AT the failing node instead of
+                // being lumped into the next periodic 64-node sync. Significant perf cost;
+                // only useful for kernel-bisection debugging.
+                if (PerOpSync) await _accelerator.SynchronizeAsync();
             }
             catch (Exception ex)
             {
