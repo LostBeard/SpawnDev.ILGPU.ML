@@ -52,6 +52,16 @@ public class GraphExecutor : IDisposable
     public static Dictionary<string, float[]>? CapturedOutputs { get; set; }
 
     /// <summary>
+    /// DIAGNOSTIC sibling to <see cref="CapturedOutputs"/>: when CapturedOutputs is
+    /// non-null, this dictionary captures per-node metadata keyed identically -
+    /// OpType, input names + shapes, output names + shapes, and any stringified
+    /// attributes. Lets the test harness identify the EXACT op variant (axis,
+    /// dtype combo, broadcast pattern) when the captured float[] sample shows
+    /// the bug. Use the same key as CapturedOutputs to look up shape context.
+    /// </summary>
+    public static Dictionary<string, string>? CapturedNodeInfo { get; set; }
+
+    /// <summary>
     /// DIAGNOSTIC: when true, calls await accelerator.SynchronizeAsync() after EVERY
     /// node's Execute. Without this, async-dispatch backends (Wasm worker pool, WebGPU
     /// command-encoder batches) only surface kernel traps at the next periodic sync
@@ -760,6 +770,22 @@ public class GraphExecutor : IDisposable
                         var vals = await capBuf.CopyToHostAsync<float>(0, captureCount);
                         var key = $"{nodeIdx:D3}_{node.OpType}_{node.OutputNames[0]}";
                         CapturedOutputs[key] = vals;
+
+                        // Sibling capture: per-node metadata keyed identically. Surfaces the
+                        // op variant (input shapes, output shapes, attribute hints) that the
+                        // captured float[] alone doesn't carry.
+                        if (CapturedNodeInfo != null)
+                        {
+                            string FormatShapes(Tensor?[]? tensors) => tensors == null ? "null"
+                                : string.Join(",", tensors.Select(t => t == null ? "(null)" : "[" + string.Join(",", t.Shape) + "]"));
+                            string FormatOutShapes(int[][] shapes) => string.Join(",", shapes.Select(s => "[" + string.Join(",", s) + "]"));
+                            string attrHint = "";
+                            if (node.Attributes != null && node.Attributes.Count > 0)
+                            {
+                                attrHint = " | attrs: " + string.Join(",", node.Attributes.Take(8).Select(kv => kv.Key + "=" + (kv.Value?.ToString() ?? "null")));
+                            }
+                            CapturedNodeInfo[key] = $"in: [{string.Join(",", node.InputNames)}] shapes={FormatShapes(nodeInputs)} | out: [{string.Join(",", node.OutputNames)}] shapes={FormatOutShapes(node.OutputShapes)}{attrHint}";
+                        }
                     }
                     catch { /* Don't crash on capture failure */ }
                 }
