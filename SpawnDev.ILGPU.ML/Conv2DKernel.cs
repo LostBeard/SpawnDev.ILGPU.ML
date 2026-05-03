@@ -126,10 +126,28 @@ public class Conv2DKernel : IDisposable
         // ordering within the same queue, so reusing the buffer is safe.
         // Do NOT use 'using var' — the GPU reads the buffer asynchronously after dispatch.
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
-        _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
+        _convCallCount++;
+        try
+        {
+            _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
 
-        _conv2dKernel!(totalOutputElements, input, weight, bias, output, _paramsBuf.View);
+            _conv2dKernel!(totalOutputElements, input, weight, bias, output, _paramsBuf.View);
+        }
+        catch (global::ILGPU.Runtime.OpenCL.CLException clEx)
+        {
+            // Upstream CLException's bare ctor (CLException(CLError) -> base()) doesn't
+            // surface the CLError code in the Message - we catch + re-throw with the
+            // code visible. Reported to Geordi for an upstream Message-includes-Error
+            // fix; remove this catch when that lands.
+            throw new InvalidOperationException(
+                $"[Conv2DKernel.Forward call #{_convCallCount} {_accelerator.AcceleratorType}] "
+                + $"OpenCL {clEx.Error} (CLError) at "
+                + $"input=[{inC},{inH},{inW}] outC={outC} k={kH}x{kW} stride={stride} pad={padding} "
+                + $"totalOutput={totalOutputElements}", clEx);
+        }
     }
+
+    private static long _convCallCount;
 
     /// <summary>
     /// Depthwise Conv2D: each input channel convolved independently.
