@@ -325,6 +325,125 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ShapeGatherScale_AfterReuse_StyleMosaicShape_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Repro for Data's WebGL Gather bug (2026-05-04). His full-element capture pinned
+        // the divergence to Gather receiving a buffer-pool-reused buffer whose CopyFromCPU
+        // path on WebGL doesn't update the texture properly when followed by a SubView read
+        // at non-zero offset. My fresh-Allocate1D ShapeGatherScale test passed; this one
+        // mimics the pool reuse pattern: pre-fill the buffer (simulating a prior op),
+        // overwrite via CopyFromCPU (Shape's path), then Scale(SubView(2, 1), ...).
+        var op = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+
+        // Step 1: Allocate buffer and pre-populate with non-zero values (simulates a prior op
+        // having written data, possibly through a kernel dispatch + texture upload).
+        using var dataBuf = accelerator.Allocate1D(new float[] { 99f, 99f, 99f, 99f });
+        await accelerator.SynchronizeAsync(); // force the prior write/upload to settle
+
+        // Step 2: Write Shape's [1, 32, 56, 56] over the same buffer via CopyFromCPU.
+        var shapeData = new float[] { 1f, 32f, 56f, 56f };
+        dataBuf.View.SubView(0, 4).CopyFromCPU(shapeData);
+
+        using var outBuf = accelerator.Allocate1D<float>(1);
+
+        // Step 3: Mimic Gather: Scale(buf.SubView(2, 1), output, 1, 1f).
+        op.Scale(
+            dataBuf.View.SubView(2, 1),
+            outBuf.View.SubView(0, 1),
+            1, 1f);
+        await accelerator.SynchronizeAsync();
+
+        var got = await outBuf.CopyToHostAsync<float>();
+        if (Math.Abs(got[0] - 56f) > 1e-5f)
+            throw new Exception($"After CopyFromCPU over a pre-populated buffer, SubView Scale: " +
+                $"expected 56 got {got[0]}. " +
+                $"If WebGL returns 99 (stale), the texture upload after CopyFromCPU isn't firing. " +
+                $"If WebGL returns 0, the SubView elementOffset path is broken.");
+    });
+
+    [TestMethod]
+    public async Task ShapeGatherScale_AfterKernelWrite_StyleMosaicShape_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Tighter repro for Data's WebGL Gather bug. The pre-CopyFromCPU step here is
+        // a KERNEL DISPATCH that writes via Transform Feedback (the path Conv/Shape
+        // upstream of Gather actually exercises in production). After that the GL
+        // worker's entry.data + texture are populated by the worker-side TF readback.
+        // Then ShapeOp does CopyFromCPU which writes the .NET _backingArray and sets
+        // NeedsUpload=true, expecting the next EnsureBufferInWorker to re-upload.
+        // If the kernel-write + CopyFromCPU sequence breaks the texture state on
+        // WebGL, this reproduces the production bug.
+        var op = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+
+        // Step 1: Allocate buffer and pre-populate via KERNEL (Scale by 99 of zeros).
+        using var donor = accelerator.Allocate1D(new float[] { 1f, 1f, 1f, 1f });
+        using var dataBuf = accelerator.Allocate1D<float>(4);
+        op.Scale(donor.View, dataBuf.View, 4, 99f); // dataBuf = [99,99,99,99] via kernel
+        await accelerator.SynchronizeAsync();
+
+        // Step 2: ShapeOp's CopyFromCPU pattern — overwrite via .NET CPU path.
+        var shapeData = new float[] { 1f, 32f, 56f, 56f };
+        dataBuf.View.SubView(0, 4).CopyFromCPU(shapeData);
+
+        using var outBuf = accelerator.Allocate1D<float>(1);
+
+        // Step 3: GatherOp's Scale with non-zero SubView offset.
+        op.Scale(
+            dataBuf.View.SubView(2, 1),
+            outBuf.View.SubView(0, 1),
+            1, 1f);
+        await accelerator.SynchronizeAsync();
+
+        var got = await outBuf.CopyToHostAsync<float>();
+        if (Math.Abs(got[0] - 56f) > 1e-5f)
+            throw new Exception($"Kernel-write -> CopyFromCPU -> SubView Scale: " +
+                $"expected 56 got {got[0]}. " +
+                $"99 = stale kernel-write data; 0 = SubView offset path broken; other = surprise.");
+    });
+
+    [TestMethod]
+    public async Task SubViewOffset_NonZeroThenZero_NoLeakAcrossDispatches() => await RunTest(async accelerator =>
+    {
+        // Specific repro for the WebGL glWorker.js bug surfaced 2026-05-04 by Data's
+        // StyleMosaic node 55 Gather first-divergent capture. The dispatcher's offset
+        // uniform was only being set when elementOffset != 0; for elementOffset == 0
+        // it was skipped, leaving the uniform at whatever the previous dispatch with
+        // the same kernel program had set. Two same-program dispatches: first with
+        // SubView(2, 1) sets uniform to 2; second with SubView(0, 1) on a different
+        // buffer reads at offset 2 instead of 0 because the uniform leaked.
+        var op = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+
+        // Two distinct buffers, deterministic content.
+        using var bufA = accelerator.Allocate1D(new float[] { 100f, 200f, 300f, 400f });
+        using var bufB = accelerator.Allocate1D(new float[] { 11f, 22f, 33f, 44f });
+        using var outA = accelerator.Allocate1D<float>(1);
+        using var outB = accelerator.Allocate1D<float>(1);
+
+        // Dispatch 1: Scale(bufA.SubView(2, 1), outA, 1, 1f) — reads bufA[2]=300.
+        // Sets the Scale program's u_paramX_offset uniform to 2.
+        op.Scale(bufA.View.SubView(2, 1), outA.View.SubView(0, 1), 1, 1f);
+
+        // Dispatch 2: Scale(bufB.SubView(0, 1), outB, 1, 1f) — should read bufB[0]=11.
+        // If glWorker skips setting the offset uniform when elementOffset==0,
+        // the uniform retains 2 from Dispatch 1. The kernel then reads bufB[0+2]=33.
+        op.Scale(bufB.View.SubView(0, 1), outB.View.SubView(0, 1), 1, 1f);
+
+        await accelerator.SynchronizeAsync();
+
+        var gotA = await outA.CopyToHostAsync<float>();
+        var gotB = await outB.CopyToHostAsync<float>();
+
+        if (Math.Abs(gotA[0] - 300f) > 1e-5f)
+            throw new Exception($"Dispatch 1 (SubView(2,1) of bufA): expected 300 got {gotA[0]}");
+
+        if (Math.Abs(gotB[0] - 11f) > 1e-5f)
+            throw new Exception($"Dispatch 2 (SubView(0,1) of bufB) after a non-zero-offset dispatch: " +
+                $"expected 11 got {gotB[0]}. " +
+                $"If WebGL returns 33, the offset uniform from Dispatch 1 leaked into Dispatch 2 " +
+                $"because glWorker.js skipped setting u_paramX_offset when elementOffset==0. " +
+                $"Surfaced by Data 2026-05-04 in StyleMosaic Gather (node 55).");
+    });
+
+    [TestMethod]
     public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
     {
         int rows = 100, C = 384;
