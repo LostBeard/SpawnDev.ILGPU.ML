@@ -271,6 +271,60 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ShapeGatherScale_StyleMosaicShape_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Reproduces the StyleMosaic node 55 Gather_117 path that Data identified as
+        // first-divergent on WebGL (returns 0 instead of 56). The model:
+        //   Shape(input)        -> [1, 32, 56, 56]   stored as floats
+        //   Gather(shape, [2])  -> [56]              extracts H dim
+        // GatherOperator's CPU-index path calls Scale(data.SubView(srcOffset=2, 1),
+        // output.SubView(0, 1), 1, 1f) — a 1-element SubView read. If the SubView
+        // offset isn't applied to texelFetch on WebGL, the read returns data[0]=1
+        // (or, with stale texture data, 0).
+        var op = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+        var shapeData = new float[] { 1f, 32f, 56f, 56f };
+        using var dataBuf = accelerator.Allocate1D(shapeData);
+        using var outBuf = accelerator.Allocate1D<float>(1);
+
+        // Mimic GatherOperator inner loop for axis=0, idx=2.
+        op.Scale(
+            dataBuf.View.SubView(2, 1),
+            outBuf.View.SubView(0, 1),
+            1, 1f);
+        await accelerator.SynchronizeAsync();
+
+        var got = await outBuf.CopyToHostAsync<float>();
+        if (Math.Abs(got[0] - 56f) > 1e-5f)
+            throw new Exception($"SubView Scale: expected output[0]=56 got {got[0]}. " +
+                "If WebGL returns 0/1, the SubView elementOffset isn't being applied to the input texelFetch. " +
+                "Surfaced 2026-05-04 by Data's StyleMosaic node 55 Gather_117 first-divergent capture.");
+    });
+
+    [TestMethod]
+    public async Task ShapeGather_GpuRuntimeIdx_StyleMosaicPath_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Same StyleMosaic-shape Shape->Gather scenario, but exercising the GPU runtime-indices
+        // path (GatherAxis0Float) that fires when GatherOperator's TryGetInputValues(1) returns null
+        // (indices are runtime tensors, not pre-read constants). This is the path my 2026-05-03
+        // rc.2 view.Length fix targeted; verifying it still works for this specific shape combo.
+        var gather = new SpawnDev.ILGPU.ML.Kernels.GatherKernel(accelerator);
+        var shapeData = new float[] { 1f, 32f, 56f, 56f };
+        var indicesData = new float[] { 2f };
+        using var dataBuf = accelerator.Allocate1D(shapeData);
+        using var idxBuf = accelerator.Allocate1D(indicesData);
+        using var outBuf = accelerator.Allocate1D<float>(1);
+
+        gather.GatherAxis0Float(dataBuf.View, idxBuf.View, outBuf.View,
+            numIndices: 1, innerSize: 1, dataRows: 4);
+        await accelerator.SynchronizeAsync();
+
+        var got = await outBuf.CopyToHostAsync<float>();
+        if (Math.Abs(got[0] - 56f) > 1e-5f)
+            throw new Exception($"GatherAxis0Float (StyleMosaic-shape: data[4], idx[1]=2, axis=0): expected 56 got {got[0]}. " +
+                "If WebGL returns 0, view.Length is still returning 0 for this specific Dense-1D shape, OR float-to-int index cast breaks for this layout.");
+    });
+
+    [TestMethod]
     public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
     {
         int rows = 100, C = 384;
