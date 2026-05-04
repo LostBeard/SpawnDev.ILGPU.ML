@@ -62,6 +62,19 @@ public class GraphExecutor : IDisposable
     public static Dictionary<string, string>? CapturedNodeInfo { get; set; }
 
     /// <summary>
+    /// DIAGNOSTIC: when non-null, captures per-node Execute() wall-clock time in
+    /// milliseconds keyed by the same node key as <see cref="CapturedOutputs"/>.
+    /// Combined with <see cref="PerOpSync"/> the timing reflects each op's full
+    /// dispatch + sync cost, which surfaces slow kernels (e.g. why is WebGPU
+    /// SemanticSearch 5x slower than CUDA on the same model graph - is it a
+    /// specific MatMul / LayerNorm taking the bulk of the time, or is the cost
+    /// spread evenly?).
+    ///
+    /// Off by default; opt-in alongside CapturedOutputs / CapturedNodeInfo.
+    /// </summary>
+    public static Dictionary<string, double>? CapturedNodeTimingsMs { get; set; }
+
+    /// <summary>
     /// DIAGNOSTIC: when true, calls await accelerator.SynchronizeAsync() after EVERY
     /// node's Execute. Without this, async-dispatch backends (Wasm worker pool, WebGPU
     /// command-encoder batches) only surface kernel traps at the next periodic sync
@@ -655,6 +668,10 @@ public class GraphExecutor : IDisposable
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
             };
+            // CapturedNodeTimingsMs (opt-in): wall-clock time per Execute + optional sync.
+            // Captures via Stopwatch around node.Operator.Execute (and the PerOpSync sync
+            // when enabled). Pairs with CapturedOutputs key for cross-lookup.
+            var sw = CapturedNodeTimingsMs != null ? System.Diagnostics.Stopwatch.StartNew() : null;
             try
             {
                 node.Operator.Execute(ctx);
@@ -664,6 +681,13 @@ public class GraphExecutor : IDisposable
                 // being lumped into the next periodic 64-node sync. Significant perf cost;
                 // only useful for kernel-bisection debugging.
                 if (PerOpSync) await _accelerator.SynchronizeAsync();
+                if (sw != null && CapturedNodeTimingsMs != null && node.OutputNames.Length > 0)
+                {
+                    sw.Stop();
+                    // Match CapturedOutputs key format (nodeIdx is pre-increment here, same
+                    // as where CapturedOutputs is written downstream).
+                    CapturedNodeTimingsMs[$"{nodeIdx:D3}_{node.OpType}_{node.OutputNames[0]}"] = sw.Elapsed.TotalMilliseconds;
+                }
             }
             catch (Exception ex)
             {
