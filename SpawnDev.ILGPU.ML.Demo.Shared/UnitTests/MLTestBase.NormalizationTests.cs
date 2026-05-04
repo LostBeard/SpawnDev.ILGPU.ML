@@ -507,6 +507,133 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ScaleThenTranspose_LargeBuffer_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Bisect Data's Wasm Softmax-with-Scale failure (2026-05-04). Production
+        // SoftmaxOperator chains: Scale(input -> output) -> Transpose(output -> tmp) ->
+        // Softmax(tmp) -> Transpose(tmp -> output). The ExtraScale variant of my Softmax
+        // test FAILS on Wasm. This narrows further: skip the Softmax+secondTranspose,
+        // do JUST Scale + first Transpose. If THIS fails, the bug is in
+        // Wasm's Scale-then-Transpose sequencing on a shared buffer.
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 183, scale: 4f);
+
+        // CPU reference: identity Scale (1f) then transpose [outer, axisDim, inner] -> [outer, inner, axisDim]
+        var expected = new float[total];
+        for (int o = 0; o < outer; o++)
+            for (int a = 0; a < axisDim; a++)
+                for (int i = 0; i < inner; i++)
+                {
+                    int srcIdx = o * axisDim * inner + a * inner + i;
+                    int dstIdx = o * inner * axisDim + i * axisDim + a;
+                    expected[dstIdx] = input[srcIdx]; // Scale by 1 = identity
+                }
+
+        using var inputBuf = accelerator.Allocate1D((float[])input.Clone());
+        using var scaledBuf = accelerator.Allocate1D<float>(total);
+        using var transposedBuf = accelerator.Allocate1D<float>(total);
+
+        var ew = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+
+        ew.Scale(inputBuf.View, scaledBuf.View, total, 1f);
+        transpose.Transpose(scaledBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, transposedBuf.View.SubView(0, total), expected, 1e-5f,
+            "Scale-then-Transpose [4,16,8400]: ");
+    });
+
+    [TestMethod]
+    public async Task Scale_Transpose_Softmax_NoSecondTranspose_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Bisect step 2: Scale + Transpose1 + Softmax. Stops short of the second
+        // Transpose. If THIS fails on Wasm but ScaleThenTranspose passes, the bug is
+        // triggered by Softmax-after-Transpose. If THIS passes, the bug needs the
+        // second Transpose writing back to outputBuf (which is also Scale's output).
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 184, scale: 4f);
+
+        // CPU reference: transposed [outer, inner, axisDim] then row-wise softmax over axisDim.
+        var expected = new float[total];
+        for (int o = 0; o < outer; o++)
+            for (int i = 0; i < inner; i++)
+            {
+                int rowBase = o * inner * axisDim + i * axisDim;
+                float max = float.MinValue;
+                for (int a = 0; a < axisDim; a++)
+                    max = MathF.Max(max, input[o * axisDim * inner + a * inner + i]);
+                double sum = 0;
+                for (int a = 0; a < axisDim; a++)
+                    sum += MathF.Exp(input[o * axisDim * inner + a * inner + i] - max);
+                float invSum = (float)(1.0 / sum);
+                for (int a = 0; a < axisDim; a++)
+                    expected[rowBase + a] = MathF.Exp(input[o * axisDim * inner + a * inner + i] - max) * invSum;
+            }
+
+        using var inputBuf = accelerator.Allocate1D((float[])input.Clone());
+        using var scaledBuf = accelerator.Allocate1D<float>(total);
+        using var transposedBuf = accelerator.Allocate1D<float>(total);
+
+        var ew = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+        var sm = new SoftmaxKernel(accelerator);
+
+        ew.Scale(inputBuf.View, scaledBuf.View, total, 1f);
+        transpose.Transpose(scaledBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+        sm.Forward(transposedBuf.View, outer * inner, axisDim);
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, transposedBuf.View.SubView(0, total), expected, 1e-4f,
+            "Scale-Transpose-Softmax (no second Transpose) [4,16,8400]: ");
+    });
+
+    [TestMethod]
+    public async Task Scale_T1_T2_NoSoftmax_OutputBufReusedAcrossDispatches() => await RunTest(async accelerator =>
+    {
+        // Bisect step 3: Scale + T1 + T2 (no Softmax). All other variants narrowed:
+        //   Scale + T1 (no Softmax, no T2):       PASS — Scale-then-Transpose works
+        //   Scale + T1 + Softmax (no T2):         PASS — adding Softmax doesn't break it
+        //   Scale + T1 + Softmax + T2:            FAIL on Wasm — production triggers the bug
+        // If THIS variant (T2 directly after T1, no Softmax) FAILS, the bug is in
+        // two Transpose dispatches sharing outputBuf as both write target and prior input.
+        // If it PASSES, the bug needs Softmax-then-Transpose specifically.
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 185, scale: 4f);
+
+        // CPU reference: identity Scale, transpose [outer,axisDim,inner] -> [outer,inner,axisDim],
+        // then transpose back [outer,inner,axisDim] -> [outer,axisDim,inner] = identity overall.
+        // So expected = input.
+        var expected = (float[])input.Clone();
+
+        using var inputBuf = accelerator.Allocate1D((float[])input.Clone());
+        using var outputBuf = accelerator.Allocate1D<float>(total);
+        using var transposedBuf = accelerator.Allocate1D<float>(total);
+
+        var ew = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+
+        ew.Scale(inputBuf.View, outputBuf.View, total, 1f);
+        transpose.Transpose(outputBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+        // Skip Softmax — go directly to second Transpose
+        transpose.Transpose(transposedBuf.View, outputBuf.View,
+            new[] { outer, inner, axisDim }, new[] { 0, 2, 1 });
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outputBuf.View.SubView(0, total), expected, 1e-5f,
+            "Scale + T1 + T2 (no Softmax) [4,16,8400]: ");
+    });
+
+    [TestMethod]
     public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
     {
         int rows = 100, C = 384;
