@@ -444,6 +444,69 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Softmax_YOLOv8DflFullPathWithExtraScale_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // Data's verify experiment 2026-05-04 ~13:30: production `SoftmaxOperator.Execute` does
+        // an EXTRA `reg.ElementWise.Scale(inputs, outputs, count, 1f)` BEFORE the
+        // Transpose+Softmax+Transpose chain. My existing `Softmax_YOLOv8DflFullPath_MatchesCpu`
+        // test (which passed on Wasm) skipped that step. If the Scale leaves transient state
+        // that affects the subsequent Transpose dispatch on Wasm, this test reproduces the
+        // YOLOv8 Wasm node 220 first-divergent symptom Data captured.
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 182, scale: 4f);
+
+        // CPU reference: softmax over the axisDim axis (axis=1 for [outer,axisDim,inner]).
+        var expected = new float[total];
+        for (int o = 0; o < outer; o++)
+        {
+            for (int i = 0; i < inner; i++)
+            {
+                int baseIdx = o * axisDim * inner + i;
+                float max = float.MinValue;
+                for (int a = 0; a < axisDim; a++)
+                    max = MathF.Max(max, input[baseIdx + a * inner]);
+                double sum = 0;
+                for (int a = 0; a < axisDim; a++)
+                    sum += MathF.Exp(input[baseIdx + a * inner] - max);
+                float invSum = (float)(1.0 / sum);
+                for (int a = 0; a < axisDim; a++)
+                    expected[baseIdx + a * inner] = MathF.Exp(input[baseIdx + a * inner] - max) * invSum;
+            }
+        }
+
+        // Production-mimicking flow: separate `inputs` and `outputs` buffers (rented in real
+        // graph; here freshly-allocated to keep the bug surface narrow), Scale to copy
+        // input→output, then Transpose+Softmax+Transpose all over the SAME `outputs` buffer.
+        using var inputBuf = accelerator.Allocate1D((float[])input.Clone());
+        using var outputBuf = accelerator.Allocate1D<float>(total);
+        using var transposedBuf = accelerator.Allocate1D<float>(total);
+
+        var ew = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+        var sm = new SoftmaxKernel(accelerator);
+
+        // Step 1 — extra Scale that the production SoftmaxOperator does (line 82).
+        ew.Scale(inputBuf.View, outputBuf.View, total, 1f);
+
+        // Step 2 — first Transpose READS outputBuf (just-written by Scale).
+        transpose.Transpose(outputBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+
+        // Step 3 — Softmax on rows of axisDim.
+        sm.Forward(transposedBuf.View, outer * inner, axisDim);
+
+        // Step 4 — second Transpose WRITES outputBuf (same buffer the first Transpose read from).
+        transpose.Transpose(transposedBuf.View, outputBuf.View,
+            new[] { outer, inner, axisDim }, new[] { 0, 2, 1 });
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outputBuf.View.SubView(0, total), expected, 1e-4f,
+            "Softmax YOLOv8 DFL [4,16,8400] axis=1 with extra Scale: ");
+    });
+
+    [TestMethod]
     public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
     {
         int rows = 100, C = 384;
