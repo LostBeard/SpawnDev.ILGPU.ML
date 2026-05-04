@@ -173,9 +173,24 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         var fmt = attrs.ContainsKey("_data_format") && attrs["_data_format"].ToString() == "NHWC"
             ? DataFormat.NHWC : DataFormat.NCHW;
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
-        var (_, _, xH_dim, xW_dim) = x.Length >= 4 ? LayoutHelper.GetDims(x, fmt) : (1, 1, 1, 1);
+        var (_, xC_dim, xH_dim, xW_dim) = x.Length >= 4 ? LayoutHelper.GetDims(x, fmt) : (1, 1, 1, 1);
         var (wOutC, _, wKH, wKW) = w.Length >= 4 ? LayoutHelper.GetWeightDims(w, fmt) : (w[0], 1, w.Length > 2 ? w[2] : 1, w.Length > 3 ? w[3] : 1);
         int outC = wOutC;
+        // TFLite-style depthwise (NHWC weight [1, kH, kW, inC]) lands here as wOutC=1.
+        // Execute() detects depthwise via group==inC AND (outC==1 || group==outC) and
+        // dispatches inC*outH*outW threads writing to the output buffer. Without this
+        // override InferOutputShapes returns [N, outH, outW, 1] = inC-times-too-small
+        // and the dispatch OOBs (Wasm trap; CUDA/CPU silent overrun). Fix: when group
+        // attribute matches input channel count, treat as depthwise and report the
+        // actual output channel count (= inC) so the buffer pool allocates the right
+        // size.
+        int groupAttr = attrs.ContainsKey("group")
+            ? (int)((long)attrs["group"])
+            : 1;
+        // Resolve TFLite depthwise sentinel: group=-1 means group=inC (per ConvOperator.Execute).
+        if (groupAttr == -1) groupAttr = xC_dim;
+        if (groupAttr > 1 && groupAttr == xC_dim && (wOutC == 1 || wOutC == groupAttr))
+            outC = xC_dim;
 
         // Handle auto_pad (SAME_UPPER/SAME_LOWER from TFLite models)
         string autoPad = attrs.ContainsKey("auto_pad") ? attrs["auto_pad"].ToString()! : "NOTSET";

@@ -344,7 +344,13 @@ public class Conv2DKernel : IDisposable
                 $"This usually means SAME padding was not applied correctly.");
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
         _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
-        _conv2dNHWCKernel(outH * outW * outC, input, weight, bias, output, _paramsBuf.View);
+        long needed = (long)outH * outW * outC;
+        if (output.Length < needed)
+            throw new InvalidOperationException(
+                $"Conv2D NHWC output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
+                $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} padding={padding}). " +
+                $"Upstream shape inference allocated wrong size.");
+        _conv2dNHWCKernel((int)needed, input, weight, bias, output, _paramsBuf.View);
     }
 
     public void ForwardDepthwiseNHWC(
@@ -365,7 +371,13 @@ public class Conv2DKernel : IDisposable
                 $"This usually means SAME padding was not applied correctly.");
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
         _paramsBuf.CopyFromCPU(new int[] { C, inH, inW, kH, kW, stride, padding, 0 });
-        _depthwiseNHWCKernel(outH * outW * C, input, weight, bias, output, _paramsBuf.View);
+        long needed = (long)outH * outW * C;
+        if (output.Length < needed)
+            throw new InvalidOperationException(
+                $"DepthwiseConv2D NHWC output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
+                $"(outH={outH} outW={outW} C={C}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} padding={padding}). " +
+                $"Upstream shape inference allocated wrong size.");
+        _depthwiseNHWCKernel((int)needed, input, weight, bias, output, _paramsBuf.View);
     }
 
     private void EnsureLoaded()
