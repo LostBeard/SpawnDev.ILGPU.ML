@@ -270,6 +270,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             var pads = ctx.GetInts("pads");
             pad = pads.Length > 0 ? pads[0] : 0;
         }
+        var dilationsAttr = ctx.GetInts("dilations");
+        int dilationH = dilationsAttr.Length > 0 ? dilationsAttr[0] : 1;
+        int dilationW = dilationsAttr.Length > 1 ? dilationsAttr[1] : dilationH;
         int group = ctx.GetInt("group", 1);
         var (_, inC_from_x, _, _) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, fmt) : (1, x.Shape.Length > 1 ? x.Shape[1] : 1, 1, 1);
         // group = -1 is the TFLite depthwise sentinel — resolve to inC
@@ -311,19 +314,19 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
                 // Depthwise conv
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardDepthwiseNHWC(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, pad);
+                        inC, inH, inW, kH, kW, stride, pad, dilationH, dilationW);
                 else
                     reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, pad);
+                        inC, inH, inW, kH, kW, stride, pad, dilationH, dilationW);
             }
             else if (group == 1)
             {
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardNHWC(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, pad);
+                        inC, inH, inW, outC, kH, kW, stride, pad, dilationH, dilationW);
                 else
                     reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, pad);
+                        inC, inH, inW, outC, kH, kW, stride, pad, dilationH, dilationW);
             }
             else if (group > 1 && inC % group == 0 && outC % group == 0)
             {
@@ -341,7 +344,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
                         w.Data.SubView(wOffset, outCPerGroup * inCPerGroup * kH * kW),
                         bias.SubView(g * outCPerGroup, outCPerGroup),
                         ctx.Outputs[0].Data.SubView(outOffset, outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3]),
-                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, pad);
+                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, pad, dilationH, dilationW);
                 }
             }
             else
