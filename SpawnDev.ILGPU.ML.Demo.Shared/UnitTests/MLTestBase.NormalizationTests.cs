@@ -711,6 +711,44 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task CopyFromCPU_T1_T2_NoKernelBeforeT1() => await RunTest(async accelerator =>
+    {
+        // Bisect step 6: replace Scale with CopyFromCPU (host write), then T1 + T2.
+        //
+        // Prior:
+        //   T1 + T2 alone (T1 reads inputBuf, written via Allocate1D ctor):  PASS
+        //   Scale + T1 + T2 (T1 reads scaledBuf, written by Scale kernel):   FAIL maxErr 8.0
+        //
+        // If CopyFromCPU + T1 + T2 (host writes scaledBuf, T1 reads it) PASSES,
+        // the bug is specifically about KERNEL-WRITTEN buffer being read by next dispatch.
+        // If FAILS, the bug is just "3 dispatches with shared buffer state" regardless.
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 188, scale: 4f);
+
+        var expected = (float[])input.Clone();
+
+        using var scaledBuf = accelerator.Allocate1D<float>(total);
+        using var transposedBuf = accelerator.Allocate1D<float>(total);
+        using var outputBuf = accelerator.Allocate1D<float>(total);
+
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+
+        // Replace Scale with direct host CopyFromCPU
+        scaledBuf.View.CopyFromCPU(input);
+
+        transpose.Transpose(scaledBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+        transpose.Transpose(transposedBuf.View, outputBuf.View,
+            new[] { outer, inner, axisDim }, new[] { 0, 2, 1 });
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outputBuf.View.SubView(0, total), expected, 1e-5f,
+            "CopyFromCPU + T1 + T2 [4,16,8400]: ");
+    });
+
+    [TestMethod]
     public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
     {
         int rows = 100, C = 384;
