@@ -634,6 +634,83 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task T1_T2_SharedOutputBuf_NoScale() => await RunTest(async accelerator =>
+    {
+        // Bisect step 4: just T1 + T2 (no Scale, no Softmax). T1 reads inputBuf and
+        // writes transposedBuf. T2 reads transposedBuf and writes outputBuf. Different
+        // buffers all the way - no buffer is reused as input AND output across the chain.
+        // If THIS fails on Wasm, the bug is in two consecutive Transpose dispatches with
+        // shared paramsBuf (the only buffer touched by both).
+        // If THIS passes, the bug requires a buffer to be in BOTH dispatches' bufferInfos
+        // (the outputBuf in Scale + T1 + T2).
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 186, scale: 4f);
+
+        // CPU reference: transpose [outer, axisDim, inner] -> [outer, inner, axisDim] then
+        // transpose back -> identity.
+        var expected = (float[])input.Clone();
+
+        using var inputBuf = accelerator.Allocate1D((float[])input.Clone());
+        using var transposedBuf = accelerator.Allocate1D<float>(total);
+        using var outputBuf = accelerator.Allocate1D<float>(total);
+
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+
+        transpose.Transpose(inputBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+        transpose.Transpose(transposedBuf.View, outputBuf.View,
+            new[] { outer, inner, axisDim }, new[] { 0, 2, 1 });
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outputBuf.View.SubView(0, total), expected, 1e-5f,
+            "T1+T2 (no Scale, no shared buffer reuse) [4,16,8400]: ");
+    });
+
+    [TestMethod]
+    public async Task Scale_T1_T2_FreshOutput_NoSharedBuffer() => await RunTest(async accelerator =>
+    {
+        // Bisect step 5: Scale + T1 + T2 but T2 writes to a FRESH 4th buffer (not the
+        // Scale-output / T1-input buffer). All the same dispatches, but no buffer is
+        // shared across all 3.
+        //
+        // Prior bisect:
+        //   Scale + T1 + T2 (T2 -> outputBuf which is also Scale's output): FAIL maxErr 8.0
+        //   T1 + T2 alone (no Scale, no shared buffer): PASS
+        //
+        // If THIS variant (Scale + T1 + T2_to_fresh_buffer) PASSES, the bug REQUIRES
+        // T2 writing to outputBuf which is also in Scale's bufferInfos.
+        // If FAILS, the bug is just "3 dispatches sharing a buffer" regardless of
+        // where T2 writes.
+        int outer = 4, axisDim = 16, inner = 8400;
+        int total = outer * axisDim * inner;
+        var input = RandomFloats(total, seed: 187, scale: 4f);
+
+        var expected = (float[])input.Clone(); // identity
+
+        using var inputBuf = accelerator.Allocate1D((float[])input.Clone());
+        using var scaledBuf = accelerator.Allocate1D<float>(total);     // Scale writes here
+        using var transposedBuf = accelerator.Allocate1D<float>(total); // T1 writes here, T2 reads
+        using var freshOutBuf = accelerator.Allocate1D<float>(total);   // T2 writes HERE (NEW buffer)
+
+        var ew = new SpawnDev.ILGPU.ML.ElementWiseKernels(accelerator);
+        var transpose = new SpawnDev.ILGPU.ML.Kernels.TransposeKernel(accelerator);
+
+        ew.Scale(inputBuf.View, scaledBuf.View, total, 1f);
+        transpose.Transpose(scaledBuf.View, transposedBuf.View,
+            new[] { outer, axisDim, inner }, new[] { 0, 2, 1 });
+        // T2 writes to freshOutBuf instead of scaledBuf
+        transpose.Transpose(transposedBuf.View, freshOutBuf.View,
+            new[] { outer, inner, axisDim }, new[] { 0, 2, 1 });
+
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, freshOutBuf.View.SubView(0, total), expected, 1e-5f,
+            "Scale + T1 + T2(fresh output) [4,16,8400]: ");
+    });
+
+    [TestMethod]
     public async Task RMSNorm_MatchesCpu() => await RunTest(async accelerator =>
     {
         int rows = 100, C = 384;
