@@ -103,6 +103,83 @@ public abstract partial class MLTestBase
         var actual = await addOut.Data.SubView(0, count).CopyToAsync(accelerator, count);
         AssertClose(expected, actual, 1e-5f, "Relu+Add chain: ");
     });
+
+    [TestMethod]
+    public async Task Operator_Conv_TFLiteDepthwiseSentinel() => await RunTest(async accelerator =>
+    {
+        // Regression for commit ce836a0: ConvOperator.InferOutputShapes must resolve
+        // group=-1 (TFLite depthwise sentinel) by setting outC = inC. Before the fix,
+        // group=-1 triggered the default outC = wOutC = 1 path (because wOutC was 1
+        // for TFLite weight [1, kH, kW, inC] in NHWC), and the buffer pool allocated
+        // outH*outW*1 elements while the kernel dispatched outH*outW*inC threads -
+        // Wasm OOB; silent overrun on every other backend.
+        // BlazeFace (24-channel depthwise) was the canonical repro.
+        var registry = new OperatorRegistry(accelerator);
+        var convOp = registry.Resolve("Conv");
+
+        // BlazeFace ForwardDepthwiseNHWC #2 / #4 shape:
+        //   x.Shape = [1, 64, 64, 24] (NHWC: N, H, W, inC=24)
+        //   w.Shape = [1, 3, 3, 24]   (NHWC TFLite depthwise: [1, kH, kW, inC])
+        //   group = -1 (TFLite sentinel)
+        // Expected output: [1, 64, 64, 24] (98304 elements), NOT [1, 64, 64, 1] (4096).
+        var attrs = new Dictionary<string, object>
+        {
+            ["_data_format"] = "NHWC",
+            ["strides"] = new long[] { 1, 1 },
+            ["pads"] = new long[] { 1, 1, 1, 1 },
+            ["group"] = (long)-1,
+        };
+        var outShapes = convOp.InferOutputShapes(new[]
+        {
+            new[] { 1, 64, 64, 24 },
+            new[] { 1, 3, 3, 24 },
+        }, attrs);
+
+        if (outShapes.Length != 1)
+            throw new Exception($"Expected 1 output shape, got {outShapes.Length}");
+        var outShape = outShapes[0];
+        if (outShape.Length != 4)
+            throw new Exception($"Expected rank-4 output, got rank {outShape.Length}: [{string.Join(",", outShape)}]");
+        // NHWC: [N, outH, outW, outC]
+        if (outShape[3] != 24)
+            throw new Exception($"TFLite depthwise sentinel not resolved: outC={outShape[3]}, expected 24 (= inC). Output shape was [{string.Join(",", outShape)}]");
+        var totalElements = outShape[0] * outShape[1] * outShape[2] * outShape[3];
+        if (totalElements != 98304)
+            throw new Exception($"Wrong total output elements: {totalElements}, expected 98304 (=1*64*64*24). Output shape was [{string.Join(",", outShape)}]");
+
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Operator_Conv_NHWC_NonDepthwiseGroup1() => await RunTest(async accelerator =>
+    {
+        // Companion to the above: ensure the depthwise sentinel branch doesn't fire
+        // for regular (non-depthwise) NHWC convs. Standard Conv2D group=1 inC=3 outC=24.
+        var registry = new OperatorRegistry(accelerator);
+        var convOp = registry.Resolve("Conv");
+
+        var attrs = new Dictionary<string, object>
+        {
+            ["_data_format"] = "NHWC",
+            ["strides"] = new long[] { 2, 2 },
+            ["pads"] = new long[] { 1, 1, 1, 1 },
+            ["group"] = (long)1,
+        };
+        var outShapes = convOp.InferOutputShapes(new[]
+        {
+            new[] { 1, 128, 128, 3 },     // NHWC input
+            new[] { 24, 5, 5, 3 },        // NHWC weight [outC, kH, kW, inC]
+        }, attrs);
+
+        var outShape = outShapes[0];
+        // NHWC: [N, outH, outW, outC] — outH/outW = (128 + 2 - 5)/2 + 1 = 63
+        if (outShape[3] != 24)
+            throw new Exception($"Non-depthwise NHWC outC wrong: {outShape[3]}, expected 24 (=wOutC)");
+        if (outShape[1] != 63 || outShape[2] != 63)
+            throw new Exception($"Non-depthwise NHWC spatial wrong: outH={outShape[1]} outW={outShape[2]}, expected 63x63. Output shape was [{string.Join(",", outShape)}]");
+
+        await Task.CompletedTask;
+    });
 }
 
 // Helper extension for reading tensor data
