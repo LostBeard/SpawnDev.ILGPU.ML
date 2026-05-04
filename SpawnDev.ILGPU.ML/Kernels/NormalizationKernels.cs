@@ -169,18 +169,18 @@ public class NormalizationKernels
     {
         EnsureLoaded();
 
-        // Allocate/resize persistent temp buffer
-        if (_rmsInvRms == null || _rmsInvRms.Length < rows)
-        {
-            _rmsInvRms?.Dispose();
-            _rmsInvRms = _accelerator.Allocate1D<float>(rows);
-        }
+        // Per-call temp buffer — eliminates the same shared-state race documented on
+        // InstanceNorm. Stacked transformer blocks (LLaMA-style) issue many RMSNorm
+        // calls in flight; sharing the invRms buffer would let Pass 1 of call N+1
+        // clobber the data Pass 2 of call N is still reading.
+        var rmsInvRms = _accelerator.Allocate1D<float>(rows);
+        _allTempBufs.Add(rmsInvRms);
 
         // Pass 1: compute invRms per row
-        _rmsNormStatsKernel!(rows, input, _rmsInvRms.View, C, epsilon);
+        _rmsNormStatsKernel!(rows, input, rmsInvRms.View, C, epsilon);
 
         // Pass 2: apply normalization per element
-        _rmsNormApplyKernel!(rows * C, input, output, weight, _rmsInvRms.View, C);
+        _rmsNormApplyKernel!(rows * C, input, output, weight, rmsInvRms.View, C);
     }
 
     /// <summary>
@@ -201,28 +201,27 @@ public class NormalizationKernels
         EnsureLoaded();
         int numSlices = N * C;
 
-        // Allocate temp buffers for means and invStds
-        if (_inMeans == null || _inMeans.Length < numSlices)
-        {
-            _inMeans?.Dispose();
-            _inMeans = _accelerator.Allocate1D<float>(numSlices);
-        }
-        if (_inInvStds == null || _inInvStds.Length < numSlices)
-        {
-            _inInvStds?.Dispose();
-            _inInvStds = _accelerator.Allocate1D<float>(numSlices);
-        }
+        // Per-call temp buffers — eliminates the shared-state race under async dispatch
+        // on Wasm where Pass 1 of a subsequent call would overwrite means/invStds before
+        // the previous call's Pass 2 had finished reading them. Buffers stay alive in
+        // _allTempBufs until Dispose() (typical InferenceSession lifetime).
+        var inMeans = _accelerator.Allocate1D<float>(numSlices);
+        var inInvStds = _accelerator.Allocate1D<float>(numSlices);
+        _allTempBufs.Add(inMeans);
+        _allTempBufs.Add(inInvStds);
 
         // Pass 1: compute mean + invStd per slice
-        _instanceNormMeanVarKernel!(numSlices, input, _inMeans.View, _inInvStds.View, spatial, 1e-5f);
+        _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, 1e-5f);
 
         // Pass 2: apply normalization
-        _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, _inMeans.View, _inInvStds.View, N, C, spatial);
+        _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
-    private MemoryBuffer1D<float, Stride1D.Dense>? _inMeans;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _inInvStds;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _rmsInvRms;
+    // Per-call temp buffers for InstanceNorm and RMSNorm two-pass kernels.
+    // Sharing across calls would race: Pass 1 of call N+1 overwrites mean/invStd/invRms
+    // before Pass 2 of call N has finished reading. Buffers stay alive in this list
+    // until Dispose() (typical InferenceSession lifetime).
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allTempBufs = new();
 
     private void EnsureLoaded()
     {
