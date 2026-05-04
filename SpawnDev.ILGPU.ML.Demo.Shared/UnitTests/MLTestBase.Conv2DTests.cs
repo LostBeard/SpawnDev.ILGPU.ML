@@ -9,10 +9,13 @@ public abstract partial class MLTestBase
 {
     /// <summary>CPU reference Conv2D: output[oc, oy, ox] = bias[oc] + sum over ic,ky,kx.</summary>
     protected static float[] CpuConv2D(float[] input, float[] weight, float[] bias,
-        int inC, int inH, int inW, int outC, int kH, int kW, int stride, int padding)
+        int inC, int inH, int inW, int outC, int kH, int kW, int stride, int padding,
+        int dilationH = 1, int dilationW = 1)
     {
-        int outH = (inH + 2 * padding - kH) / stride + 1;
-        int outW = (inW + 2 * padding - kW) / stride + 1;
+        int effKH = dilationH * (kH - 1) + 1;
+        int effKW = dilationW * (kW - 1) + 1;
+        int outH = (inH + 2 * padding - effKH) / stride + 1;
+        int outW = (inW + 2 * padding - effKW) / stride + 1;
         var output = new float[outC * outH * outW];
         for (int oc = 0; oc < outC; oc++)
         {
@@ -25,8 +28,8 @@ public abstract partial class MLTestBase
                         for (int ky = 0; ky < kH; ky++)
                             for (int kx = 0; kx < kW; kx++)
                             {
-                                int iy = oy * stride + ky - padding;
-                                int ix = ox * stride + kx - padding;
+                                int iy = oy * stride + ky * dilationH - padding;
+                                int ix = ox * stride + kx * dilationW - padding;
                                 if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
                                     sum += (double)input[ic * inH * inW + iy * inW + ix]
                                          * (double)weight[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx];
@@ -35,6 +38,35 @@ public abstract partial class MLTestBase
                 }
             }
         }
+        return output;
+    }
+
+    /// <summary>CPU reference DepthwiseConv2D NCHW: weight [C, 1, kH, kW].</summary>
+    protected static float[] CpuDepthwiseConv2D(float[] input, float[] weight, float[] bias,
+        int C, int inH, int inW, int kH, int kW, int stride, int padding,
+        int dilationH = 1, int dilationW = 1)
+    {
+        int effKH = dilationH * (kH - 1) + 1;
+        int effKW = dilationW * (kW - 1) + 1;
+        int outH = (inH + 2 * padding - effKH) / stride + 1;
+        int outW = (inW + 2 * padding - effKW) / stride + 1;
+        var output = new float[C * outH * outW];
+        for (int c = 0; c < C; c++)
+            for (int oy = 0; oy < outH; oy++)
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    double sum = bias.Length > 0 ? (double)bias[c] : 0.0;
+                    for (int ky = 0; ky < kH; ky++)
+                        for (int kx = 0; kx < kW; kx++)
+                        {
+                            int iy = oy * stride + ky * dilationH - padding;
+                            int ix = ox * stride + kx * dilationW - padding;
+                            if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+                                sum += (double)input[c * inH * inW + iy * inW + ix]
+                                     * (double)weight[c * kH * kW + ky * kW + kx];
+                        }
+                    output[c * outH * outW + oy * outW + ox] = (float)sum;
+                }
         return output;
     }
 
@@ -273,5 +305,100 @@ public abstract partial class MLTestBase
                 expected[t * C + c] = qkvData[t * 3 * C + c]; // Q is first C values per row
 
         await AssertCloseGpu(accelerator, mergedBuf.View.SubView(0, T * C), expected, 0f, "Attention split/merge round-trip: ");
+    });
+
+    // ── Dilation regression tests (commit bbaca6d) ──
+    // Conv2DKernel.{Forward,ForwardNHWC,ForwardDepthwise,ForwardDepthwiseNHWC} did not
+    // honor dilations until 2026-05-04. RMBG, DDPM, DepthAnything, MoveNet, SqueezeNet,
+    // YOLOv8, Whisper-tiny, Style transfers, SuperResolution all use dilation>=2 convs.
+    // These tests lock down dilation correctness across all 4 kernel families.
+
+    [TestMethod]
+    public async Task Conv2D_NCHW_Dilation2() => await RunTest(async accelerator =>
+    {
+        // RMBG-style: Conv3x3 stride=1 padding=2 dilation=2 — outH = (inH + 4 - 5)/1 + 1 = inH
+        int inC = 32, inH = 16, inW = 16, outC = 32, kH = 3, kW = 3;
+        var input = RandomFloats(inC * inH * inW, seed: 110, scale: 0.5f);
+        var weight = RandomFloats(outC * inC * kH * kW, seed: 111, scale: 0.05f);
+        var bias = RandomFloats(outC, seed: 112, scale: 0.01f);
+        var expected = CpuConv2D(input, weight, bias, inC, inH, inW, outC, kH, kW, stride: 1, padding: 2, dilationH: 2, dilationW: 2);
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(outC * inH * inW);
+
+        var conv = new Conv2DKernel(accelerator);
+        conv.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride: 1, padding: 2, dilationH: 2, dilationW: 2);
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * inH * inW), expected, inC * 5e-5f, "Conv2D NCHW dilation=2: ");
+    });
+
+    [TestMethod]
+    public async Task Conv2D_NHWC_Dilation2() => await RunTest(async accelerator =>
+    {
+        // NHWC Conv3x3 stride=1 padding=2 dilation=2
+        int inC = 16, inH = 12, inW = 12, outC = 24, kH = 3, kW = 3;
+        // NHWC input layout: [N=1, H, W, inC]
+        var inputNHWC = RandomFloats(inH * inW * inC, seed: 113, scale: 0.5f);
+        // NHWC weight layout: [outC, kH, kW, inC]
+        var weightNHWC = RandomFloats(outC * kH * kW * inC, seed: 114, scale: 0.05f);
+        var bias = RandomFloats(outC, seed: 115, scale: 0.01f);
+
+        // CPU reference: convert to NCHW, run NCHW conv, convert back
+        var inputNCHW = new float[inC * inH * inW];
+        for (int h = 0; h < inH; h++)
+            for (int w = 0; w < inW; w++)
+                for (int c = 0; c < inC; c++)
+                    inputNCHW[c * inH * inW + h * inW + w] = inputNHWC[h * inW * inC + w * inC + c];
+        // weight NHWC [oc, kh, kw, ic] → NCHW [oc, ic, kh, kw]
+        var weightNCHW = new float[outC * inC * kH * kW];
+        for (int oc = 0; oc < outC; oc++)
+            for (int ky = 0; ky < kH; ky++)
+                for (int kx = 0; kx < kW; kx++)
+                    for (int ic = 0; ic < inC; ic++)
+                        weightNCHW[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx] = weightNHWC[oc * kH * kW * inC + ky * kW * inC + kx * inC + ic];
+        var expectedNCHW = CpuConv2D(inputNCHW, weightNCHW, bias, inC, inH, inW, outC, kH, kW, stride: 1, padding: 2, dilationH: 2, dilationW: 2);
+        // Convert expected back to NHWC
+        var expected = new float[outC * inH * inW];
+        for (int h = 0; h < inH; h++)
+            for (int w = 0; w < inW; w++)
+                for (int c = 0; c < outC; c++)
+                    expected[h * inW * outC + w * outC + c] = expectedNCHW[c * inH * inW + h * inW + w];
+
+        using var inBuf = accelerator.Allocate1D(inputNHWC);
+        using var wBuf = accelerator.Allocate1D(weightNHWC);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(outC * inH * inW);
+
+        var conv = new Conv2DKernel(accelerator);
+        conv.ForwardNHWC(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride: 1, padding: 2, dilationH: 2, dilationW: 2);
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, outC * inH * inW), expected, inC * 5e-5f, "Conv2D NHWC dilation=2: ");
+    });
+
+    [TestMethod]
+    public async Task DepthwiseConv2D_NCHW_Dilation2() => await RunTest(async accelerator =>
+    {
+        // Depthwise NCHW kernel 3x3 stride=1 padding=2 dilation=2
+        int C = 24, inH = 14, inW = 14, kH = 3, kW = 3;
+        var input = RandomFloats(C * inH * inW, seed: 116, scale: 0.5f);
+        // Weight [C, 1, kH, kW] = [C * kH * kW] flat
+        var weight = RandomFloats(C * kH * kW, seed: 117, scale: 0.1f);
+        var bias = RandomFloats(C, seed: 118, scale: 0.01f);
+        var expected = CpuDepthwiseConv2D(input, weight, bias, C, inH, inW, kH, kW, stride: 1, padding: 2, dilationH: 2, dilationW: 2);
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(C * inH * inW);
+
+        var conv = new Conv2DKernel(accelerator);
+        conv.ForwardDepthwise(inBuf.View, wBuf.View, bBuf.View, outBuf.View, C, inH, inW, kH, kW, stride: 1, padding: 2, dilationH: 2, dilationW: 2);
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, C * inH * inW), expected, kH * kW * 5e-5f, "DepthwiseConv2D NCHW dilation=2: ");
     });
 }
