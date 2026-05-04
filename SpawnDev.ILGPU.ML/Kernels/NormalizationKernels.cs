@@ -15,7 +15,7 @@ public class NormalizationKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _batchNormKernel;
+        int, int, int>? _batchNormKernel;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
@@ -32,9 +32,7 @@ public class NormalizationKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _instanceNormApplyKernel;
-
-    private MemoryBuffer1D<int, Stride1D.Dense>? _bnParams;
+        int, int, int>? _instanceNormApplyKernel;
 
     public NormalizationKernels(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -50,9 +48,8 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> mean,
         ArrayView1D<float, Stride1D.Dense> variance,
-        ArrayView1D<int, Stride1D.Dense> p)
+        int N, int C, int spatial)
     {
-        int C = p[1]; int spatial = p[2];
         float eps = 1e-5f;
 
         // Determine which channel this element belongs to
@@ -136,9 +133,8 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> means,
         ArrayView1D<float, Stride1D.Dense> invStds,
-        ArrayView1D<int, Stride1D.Dense> p)
+        int N, int C, int spatial)
     {
-        int C = p[1]; int spatial = p[2];
         int c = (idx / spatial) % C;
         int sliceIdx = idx / spatial;
         output[idx] = scale[c] * (input[idx] - means[sliceIdx]) * invStds[sliceIdx] + bias[c];
@@ -159,9 +155,7 @@ public class NormalizationKernels
         int N, int C, int spatial)
     {
         EnsureLoaded();
-        _bnParams ??= _accelerator.Allocate1D<int>(3);
-        _bnParams.CopyFromCPU(new int[] { N, C, spatial });
-        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, _bnParams.View);
+        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, N, C, spatial);
     }
 
     /// <summary>
@@ -223,9 +217,7 @@ public class NormalizationKernels
         _instanceNormMeanVarKernel!(numSlices, input, _inMeans.View, _inInvStds.View, spatial, 1e-5f);
 
         // Pass 2: apply normalization
-        _bnParams ??= _accelerator.Allocate1D<int>(3);
-        _bnParams.CopyFromCPU(new int[] { N, C, spatial });
-        _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, _inMeans.View, _inInvStds.View, _bnParams.View);
+        _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, _inMeans.View, _inInvStds.View, N, C, spatial);
     }
 
     private MemoryBuffer1D<float, Stride1D.Dense>? _inMeans;
@@ -239,7 +231,7 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(BatchNormImpl);
+            int, int, int>(BatchNormImpl);
         _instanceNormMeanVarKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
@@ -248,7 +240,7 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(InstanceNormApplyImpl);
+            int, int, int>(InstanceNormApplyImpl);
         _rmsNormStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

@@ -6,28 +6,27 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// <summary>
 /// GPU pooling kernels: MaxPool2D, AvgPool2D, GlobalAvgPool.
 /// Layout: NCHW. One thread per output element.
+/// Params are captured as scalars (Lambda Kernels) per CLAUDE.md guidance —
+/// no shared buffer state, no race risk under async dispatch.
 /// </summary>
 public class PoolingKernels
 {
     private readonly Accelerator _accelerator;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _maxPool2d;
+        int, int, int, int, int, int, int, int, int, int>? _maxPool2d;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _avgPool2d;
+        int, int, int, int, int, int, int, int, int, int>? _avgPool2d;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int>? _globalAvgPool;
 
     public PoolingKernels(Accelerator accelerator) => _accelerator = accelerator;
 
-    // params: [N, C, inH, inW, kH, kW, strideH, strideW, padH, padW]
     private static void MaxPool2DImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> p)
+        int N, int C, int inH, int inW, int kH, int kW, int sH, int sW, int pH, int pW)
     {
-        int N = p[0]; int C = p[1]; int inH = p[2]; int inW = p[3];
-        int kH = p[4]; int kW = p[5]; int sH = p[6]; int sW = p[7]; int pH = p[8]; int pW = p[9];
         int outH = (inH + 2 * pH - kH) / sH + 1;
         int outW = (inW + 2 * pW - kW) / sW + 1;
 
@@ -55,10 +54,8 @@ public class PoolingKernels
     private static void AvgPool2DImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> p)
+        int N, int C, int inH, int inW, int kH, int kW, int sH, int sW, int pH, int pW)
     {
-        int N = p[0]; int C = p[1]; int inH = p[2]; int inW = p[3];
-        int kH = p[4]; int kW = p[5]; int sH = p[6]; int sW = p[7]; int pH = p[8]; int pW = p[9];
         int outH = (inH + 2 * pH - kH) / sH + 1;
         int outW = (inW + 2 * pW - kW) / sW + 1;
 
@@ -98,8 +95,6 @@ public class PoolingKernels
 
     // ── Public API ──
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _poolParams;
-
     public void MaxPool2D(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
@@ -111,9 +106,7 @@ public class PoolingKernels
             throw new InvalidOperationException(
                 $"MaxPool2D output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
-        _poolParams ??= _accelerator.Allocate1D<int>(10);
-        _poolParams.CopyFromCPU(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
-        _maxPool2d!(N * C * outH * outW, input, output, _poolParams.View);
+        _maxPool2d!(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
     public void AvgPool2D(ArrayView1D<float, Stride1D.Dense> input,
@@ -127,9 +120,7 @@ public class PoolingKernels
             throw new InvalidOperationException(
                 $"AvgPool2D output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
-        _poolParams ??= _accelerator.Allocate1D<int>(10);
-        _poolParams.CopyFromCPU(new int[] { N, C, inH, inW, kH, kW, strideH, strideW, padH, padW });
-        _avgPool2d!(N * C * outH * outW, input, output, _poolParams.View);
+        _avgPool2d!(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
     public void GlobalAvgPool(ArrayView1D<float, Stride1D.Dense> input,
@@ -145,10 +136,10 @@ public class PoolingKernels
         var a = _accelerator;
         _maxPool2d ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(MaxPool2DImpl);
+            int, int, int, int, int, int, int, int, int, int>(MaxPool2DImpl);
         _avgPool2d ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(AvgPool2DImpl);
+            int, int, int, int, int, int, int, int, int, int>(AvgPool2DImpl);
         _globalAvgPool ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int>(GlobalAvgPoolImpl);

@@ -14,18 +14,17 @@ public class PadKernel : IDisposable
     // params: [rank, mode, inShape[rank], pads[2*rank], outShape[rank], inStrides[rank], outStrides[rank]]
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, float>? _padKernel;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
-    // Deferred disposal: see TransposeKernel for the rationale (WebGPU
-    // command-encoder may still reference the prior _paramsBuf at next sync).
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
+    // Per-call fresh allocations — eliminates shared-state race under async dispatch on Wasm.
+    // All allocations live until Dispose() (typical InferenceSession lifetime). Per-call cost
+    // is small (paramsSize is 2 + 5*rank ints, e.g. rank=4 → 22 ints = 88 bytes).
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _allParamsBufs = new();
 
     public PadKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose();
-        foreach (var buf in _oldParamsBufs) buf.Dispose();
-        _oldParamsBufs.Clear();
+        foreach (var buf in _allParamsBufs) buf.Dispose();
+        _allParamsBufs.Clear();
     }
 
     private static void PadImpl(Index1D idx,
@@ -102,13 +101,9 @@ public class PadKernel : IDisposable
         int totalOut = 1;
         for (int i = 0; i < rank; i++) totalOut *= outShape[i];
 
-        // Pack params
+        // Pack params - fresh allocation per call to eliminate the params-buffer race
+        // under async dispatch on Wasm. Buffer stays alive in _allParamsBufs until Dispose.
         int paramsSize = 2 + 5 * rank;
-        if (_paramsBuf == null || _paramsBuf.Length < paramsSize)
-        {
-            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-            _paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
-        }
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
         paramsData[1] = mode;
@@ -116,9 +111,11 @@ public class PadKernel : IDisposable
         for (int i = 0; i < 2 * rank; i++) paramsData[2 + rank + i] = pads[i];
         for (int i = 0; i < rank; i++) paramsData[2 + 3 * rank + i] = inStrides[i];
         for (int i = 0; i < rank; i++) paramsData[2 + 4 * rank + i] = outStrides[i];
-        _paramsBuf.CopyFromCPU(paramsData);
+        var paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
+        paramsBuf.CopyFromCPU(paramsData);
+        _allParamsBufs.Add(paramsBuf);
 
-        _padKernel!(totalOut, input, output, _paramsBuf.View, constantValue);
+        _padKernel!(totalOut, input, output, paramsBuf.View, constantValue);
     }
 
     private void EnsureLoaded()
