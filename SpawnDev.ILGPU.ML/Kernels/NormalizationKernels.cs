@@ -192,6 +192,18 @@ public class NormalizationKernels
     /// Pass 1: compute mean + invStd per (N,C) slice (N*C threads, each loops spatial).
     /// Pass 2: normalize each element (N*C*spatial threads, no loops).
     /// </summary>
+    /// <summary>
+    /// DIAGNOSTIC: when set, InstanceNorm Pass 1 GPU buffer pairs (means, invStds) for
+    /// the first few calls are appended here. Caller is responsible for async readback
+    /// (CopyToHostAsync) since this happens in a sync InstanceNorm path.
+    /// Only captures the first <see cref="CaptureInstanceNormMaxCalls"/> calls.
+    /// Off by default; opt-in for codegen bug investigation (e.g. WebGL Style transfer
+    /// mean error 36-56 vs WebGPU pass).
+    /// </summary>
+    public static List<(int callIdx, int N, int C, int spatial, MemoryBuffer1D<float, Stride1D.Dense> means, MemoryBuffer1D<float, Stride1D.Dense> invStds)>? CapturedInstanceNormPass1Outputs { get; set; }
+    public static int CaptureInstanceNormMaxCalls { get; set; } = 4;
+    private static int _instanceNormCallIdx;
+
     public void InstanceNorm(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> scale,
@@ -212,6 +224,21 @@ public class NormalizationKernels
 
         // Pass 1: compute mean + invStd per slice
         _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, 1e-5f);
+
+        // DIAGNOSTIC capture (opt-in): record buffer refs so caller can async-read.
+        // The temp buffers are held alive by _allTempBufs until Dispose, so it's
+        // safe for the caller to read them after the inference completes.
+        // Capture-cap is by list size so caller can reset between tests by setting
+        // CapturedInstanceNormPass1Outputs = new().
+        var capList = CapturedInstanceNormPass1Outputs;
+        if (capList != null)
+        {
+            lock (capList)
+            {
+                if (capList.Count < CaptureInstanceNormMaxCalls)
+                    capList.Add((capList.Count, N, C, spatial, inMeans, inInvStds));
+            }
+        }
 
         // Pass 2: apply normalization
         _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
