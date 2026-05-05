@@ -160,6 +160,7 @@ public class MatMulKernel
 
         int row = tileRow * TILE + tx;
         int col = tileCol * TILE + ty;
+        int txTimesT = tx * TILE;
 
         int aOffset = batch * M * K;
         int bOffset = batch * K * N;
@@ -171,15 +172,18 @@ public class MatMulKernel
         for (int t = 0; t < numKTiles; t++)
         {
             int aCol = t * TILE + ty;
-            aTile[tx * TILE + ty] = (row < M && aCol < K) ? A[aOffset + row * K + aCol] : 0f;
+            aTile[txTimesT + ty] = (row < M && aCol < K) ? A[aOffset + row * K + aCol] : 0f;
 
             int bRow = t * TILE + tx;
-            bTile[tx * TILE + ty] = (bRow < K && col < N) ? B[bOffset + bRow * N + col] : 0f;
+            bTile[txTimesT + ty] = (bRow < K && col < N) ? B[bOffset + bRow * N + col] : 0f;
 
             Group.Barrier();
 
-            for (int k = 0; k < TILE; k++)
-                sum += aTile[tx * TILE + k] * bTile[k * TILE + ty];
+            // Reuses TiledMatMulInnerAccumulate - same helper definition shared with the
+            // non-batched TiledMatMulImpl. Per the no-attribute compile bisect (2026-05-05
+            // commit b54f983), JIT-decides on this helper gives ~4x first-compile win
+            // on Wasm without breaking WebGPU's WGSL fn-definition path.
+            sum = TiledMatMulInnerAccumulate(aTile, bTile, txTimesT, ty, sum);
 
             Group.Barrier();
         }
