@@ -33,6 +33,7 @@ public class OperatorRegistry : IDisposable
     public Kernels.FusedDequantMatMul FusedDequant { get; }
     public Kernels.SliceKernel Slice { get; }
     public Kernels.ConcatKernel Concat { get; }
+    public Kernels.MissingElementWiseKernels MissingElementWise { get; }
 
     public OperatorRegistry(Accelerator accelerator)
     {
@@ -56,6 +57,7 @@ public class OperatorRegistry : IDisposable
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
         Slice = new Kernels.SliceKernel(accelerator);
         Concat = new Kernels.ConcatKernel(accelerator);
+        MissingElementWise = new Kernels.MissingElementWiseKernels(accelerator);
 
         // Register built-in operators
         RegisterBuiltins();
@@ -328,6 +330,7 @@ public class OperatorRegistry : IDisposable
         try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
         try { (Slice as IDisposable)?.Dispose(); } catch { }
         try { (Concat as IDisposable)?.Dispose(); } catch { }
+        try { (MissingElementWise as IDisposable)?.Dispose(); } catch { }
 
         // Dispose cached zero-bias buffers (one per distinct outC seen).
         foreach (var b in _zeroBiasCache.Values) try { b.Dispose(); } catch { }

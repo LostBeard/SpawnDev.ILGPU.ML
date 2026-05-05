@@ -745,23 +745,23 @@ public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // GPU broadcast: tile input data to fill output using stride-based copy.
-            // Common case: [1, C] → [N, C] = copy row N times
+            // GPU broadcast: use the dedicated Expand kernel - one parallel
+            // dispatch with packed broadcast strides instead of repeated
+            // per-row Scale calls. The prior per-row loop dispatched
+            // Scale `repeats` times (1 per output row), and on Wasm each
+            // dispatch pays worker-pool round-trip overhead. DA3-Small DPT
+            // head Expand nodes (1432_Expand_5, 1013_Expand_2) accumulated
+            // 59s + 44s respectively in the diagnostic 2026-05-05 -
+            // single-dispatch fix is ~hundreds-of-x speedup.
             int inCount = input.ElementCount;
-            if (inCount > 0 && outCount % inCount == 0)
+            if (inCount > 0)
             {
-                // Exact tiling: repeat input block to fill output
-                int repeats = outCount / inCount;
-                for (int r = 0; r < repeats; r++)
-                    reg.ElementWise.Scale(input.Data.SubView(0, inCount),
-                        output.Data.SubView(r * inCount, inCount), inCount, 1f);
+                reg.MissingElementWise.Expand(input.Data, output.Data, input.Shape, output.Shape);
             }
             else
             {
-                // Fallback: copy what we can
-                int copyCount = Math.Min(inCount, outCount);
-                reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
-                    output.Data.SubView(0, copyCount), copyCount, 1f);
+                // Empty input fallback: leave output zero-filled (matches existing semantics for
+                // the previous outCount=0/inCount=0 corner cases).
             }
         }
     }
