@@ -1884,6 +1884,99 @@ public class ElementWiseKernels : IDisposable
         return (results[0] / count, results[1]);
     }
 
+    // ─────────────────────────────────────────────────────────────
+    //  GPU-side finite-check verification (no large CPU readback)
+    // ─────────────────────────────────────────────────────────────
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _finiteCheckReduceKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _finiteCheckTagKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _finiteCheckResultBuf;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _finiteCheckTagBuf;
+
+    /// <summary>
+    /// GPU kernel: classify v as NaN/Inf/finite, atomically accumulate
+    /// nanCount(results[0]) + absSum(results[1]) + absMax(results[2]).
+    /// AggressiveInlining per `feedback_methodimpl_inlining_directives.md`.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void FiniteCheckReduceImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> results)
+    {
+        float v = data[idx];
+        bool isNaN = v != v;
+        bool isInf = v > 1.7e38f || v < -1.7e38f;
+        if (isNaN || isInf)
+        {
+            Atomic.Add(ref results[0], 1f);
+        }
+        else
+        {
+            float absV = v < 0f ? -v : v;
+            Atomic.Add(ref results[1], absV);
+            Atomic.Max(ref results[2], absV);
+        }
+    }
+
+    /// <summary>
+    /// WebGL fallback (no atomics): emit |v| or NaN-marker per element.
+    /// CPU side counts NaN + accumulates absSum + absMax from the tag buffer only.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void FiniteCheckTagImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> tags)
+    {
+        float v = data[idx];
+        bool isNaN = v != v;
+        bool isInf = v > 1.7e38f || v < -1.7e38f;
+        tags[idx] = (isNaN || isInf) ? float.NaN : (v < 0f ? -v : v);
+    }
+
+    /// <summary>
+    /// GPU-side finite check + reduction. Returns (nanCount, absSum, absMax).
+    /// Reads only 3 floats back on atomics-capable backends; falls back to a
+    /// per-element absV+NaN-tag kernel on WebGL with CPU reduction over the tag
+    /// buffer. Use this in tests instead of `CopyToHostAsync` + CPU loop per
+    /// the project CLAUDE.md "tests must not waste resources" rule.
+    /// </summary>
+    public async Task<(int nanCount, float absSum, float absMax)> FiniteCheckOnGpuAsync(
+        ArrayView1D<float, Stride1D.Dense> data, int count)
+    {
+        if (_accelerator.AcceleratorType == AcceleratorType.WebGL)
+        {
+            _finiteCheckTagKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FiniteCheckTagImpl);
+            if (_finiteCheckTagBuf == null || _finiteCheckTagBuf.Length < count)
+            {
+                _finiteCheckTagBuf?.Dispose();
+                _finiteCheckTagBuf = _accelerator.Allocate1D<float>(count);
+            }
+            _finiteCheckTagKernel(count, data, _finiteCheckTagBuf.View);
+            await _accelerator.SynchronizeAsync();
+            var tags = await _finiteCheckTagBuf.CopyToHostAsync<float>(0, count);
+            int nan = 0; float sumAbs = 0f, maxAbs = 0f;
+            for (int i = 0; i < count; i++)
+            {
+                float t = tags[i];
+                if (t != t) nan++;
+                else { sumAbs += t; if (t > maxAbs) maxAbs = t; }
+            }
+            return (nan, sumAbs, maxAbs);
+        }
+
+        _finiteCheckReduceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FiniteCheckReduceImpl);
+        _finiteCheckResultBuf ??= _accelerator.Allocate1D<float>(3);
+        _finiteCheckResultBuf.CopyFromCPU(new float[] { 0f, 0f, 0f });
+        _finiteCheckReduceKernel(count, data, _finiteCheckResultBuf.View);
+        await _accelerator.SynchronizeAsync();
+        var results = await _finiteCheckResultBuf.CopyToHostAsync<float>(0, 3);
+        return ((int)results[0], results[1], results[2]);
+    }
+
     public void Dispose()
     {
         _lastStridesBuf?.Dispose();
@@ -1893,5 +1986,7 @@ public class ElementWiseKernels : IDisposable
         _compareResultBuf?.Dispose();
         _compareDiffBuf?.Dispose();
         _nearestParamsBuf?.Dispose();
+        _finiteCheckResultBuf?.Dispose();
+        _finiteCheckTagBuf?.Dispose();
     }
 }

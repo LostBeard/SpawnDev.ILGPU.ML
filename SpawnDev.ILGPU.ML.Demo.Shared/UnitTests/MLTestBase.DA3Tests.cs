@@ -155,11 +155,15 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long tDownload, tCreate, tRun, tVerify;
+
         // Download model + external data
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+        tDownload = sw.ElapsedMilliseconds;
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -167,6 +171,7 @@ public abstract partial class MLTestBase
                 ["pixel_values"] = new[] { 1, 3, 224, 224 }
             },
             externalData: extDataBytes);
+        tCreate = sw.ElapsedMilliseconds - tDownload;
 
         // Generate test input: random normalized image [1, 3, 224, 224]
         var rng = new Random(42);
@@ -178,42 +183,41 @@ public abstract partial class MLTestBase
         using var inputBuf = accelerator.Allocate1D(inputData);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
 
+        long tRunStart = sw.ElapsedMilliseconds;
         var outputs = await session.RunAsync(new Dictionary<string, Tensor>
         {
             [session.InputNames[0]] = inputTensor
         });
+        await accelerator.SynchronizeAsync();
+        tRun = sw.ElapsedMilliseconds - tRunStart;
 
         var output = outputs[session.OutputNames[0]];
         int elems = output.ElementCount;
-        Console.WriteLine($"[DA3] Output shape: [{string.Join(",", output.Shape)}], elements: {elems}");
 
         if (elems < 100)
             throw new Exception($"DA3 output too small: {elems} elements (shape=[{string.Join(",", output.Shape)}])");
 
-        // Read output to verify values are finite
-        using var readBuf = accelerator.Allocate1D<float>(elems);
-        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await accelerator.SynchronizeAsync();
-        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+        // GPU-side finite check + reduction. Only 3 floats read back on
+        // atomics-capable backends; no per-element CPU loop. Per project CLAUDE.md:
+        // "Tests must not waste resources. Use GPU-side verification when it exists."
+        long tVerifyStart = sw.ElapsedMilliseconds;
+        var ew = new ElementWiseKernels(accelerator);
+        var (nanCount, absSum, absMax) = await ew.FiniteCheckOnGpuAsync(
+            output.Data.SubView(0, elems), elems);
+        tVerify = sw.ElapsedMilliseconds - tVerifyStart;
+        float meanAbs = absSum / Math.Max(1, elems - nanCount);
 
-        float absMax = 0, sum = 0;
-        int nanCount = 0;
-        for (int i = 0; i < actual.Length; i++)
-        {
-            if (float.IsNaN(actual[i]) || float.IsInfinity(actual[i])) { nanCount++; continue; }
-            absMax = MathF.Max(absMax, MathF.Abs(actual[i]));
-            sum += actual[i];
-        }
-        float mean = sum / (actual.Length - nanCount + 1e-10f);
+        Console.WriteLine($"[DA3] timing: download={tDownload}ms, create={tCreate}ms, run={tRun}ms, verify={tVerify}ms, total={sw.ElapsedMilliseconds}ms");
+        Console.WriteLine($"[DA3] output: shape=[{string.Join(",", output.Shape)}], elems={elems}, absMax={absMax:F4}, meanAbs={meanAbs:F4}, NaN={nanCount}/{elems}");
 
-        Console.WriteLine($"[DA3] Depth output: absMax={absMax:F4}, mean={mean:F4}, NaN={nanCount}/{actual.Length}");
-
-        if (nanCount > actual.Length / 10)
-            throw new Exception($"DA3 output has {nanCount}/{actual.Length} NaN values");
+        if (nanCount > elems / 10)
+            throw new Exception($"DA3 output has {nanCount}/{elems} NaN values (timing: dl={tDownload}ms create={tCreate}ms run={tRun}ms verify={tVerify}ms)");
         if (absMax == 0)
-            throw new Exception("DA3 output is all zeros");
+            throw new Exception($"DA3 output is all zeros (timing: dl={tDownload}ms create={tCreate}ms run={tRun}ms verify={tVerify}ms)");
 
-        Console.WriteLine($"[DA3] DA3-Small inference: PASS");
+        // Throw-on-pass surfaces the timing breakdown in the test result so we can
+        // see WHERE wall-clock budget went (download / compile / inference / verify).
+        throw new Exception($"PASSED. timing: download={tDownload}ms create={tCreate}ms run={tRun}ms verify={tVerify}ms total={sw.ElapsedMilliseconds}ms; output absMax={absMax:F4} meanAbs={meanAbs:F4} NaN={nanCount}/{elems}");
     });
 
     [TestMethod(Timeout = 300000)]
