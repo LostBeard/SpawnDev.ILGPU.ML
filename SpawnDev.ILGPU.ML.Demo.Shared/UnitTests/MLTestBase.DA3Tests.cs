@@ -288,4 +288,74 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DA3] DA3-Small depth map variation: PASS (range={range:F4})");
     });
+
+    /// <summary>
+    /// Diagnostic: run only the first N nodes of DA3-Small with PerOpSync, capturing
+    /// per-node Execute() wall-clock time. Surfaces which kernels are pathologically
+    /// expensive to JIT-compile (the suspected dominant cost on Wasm/WebGPU first
+    /// inference per Captain 2026-05-05: "kernel compiling is another bottleneck.
+    /// unrolling and method inlining of large methods called a lot can substantially
+    /// increase kernel compile time"). Bounds work via GraphExecutor.BreakAtNode
+    /// so the test fits in a reasonable budget even on a slow backend.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DA3Small_FirstNNodes_DiagnosticPerOpSync() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+        var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+        long tDownload = sw.ElapsedMilliseconds;
+
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]>
+            {
+                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+            },
+            externalData: extDataBytes);
+        long tCreate = sw.ElapsedMilliseconds - tDownload;
+        int totalNodes = session.NodeCount;
+
+        var inputData = new float[3 * 224 * 224];
+        // Deterministic input - constant gray (zeros pre-normalization).
+        using var inputBuf = accelerator.Allocate1D(inputData);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+
+        // Bound work to first 8 nodes. Compile cost dominates on first dispatch;
+        // 8 nodes is enough to surface several distinct kernel types without burning
+        // the full graph on a slow backend.
+        const int BREAK_AT = 8;
+        Graph.GraphExecutor.BreakAtNode = BREAK_AT;
+        Graph.GraphExecutor.PerOpSync = true;
+        Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+        Graph.GraphExecutor.LastRunOpLog.Clear();
+        try
+        {
+            long tRunStart = sw.ElapsedMilliseconds;
+            await session.RunAsync(new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = inputTensor
+            });
+            await accelerator.SynchronizeAsync();
+            long tRun = sw.ElapsedMilliseconds - tRunStart;
+
+            var timings = Graph.GraphExecutor.CapturedNodeTimingsMs;
+            var ordered = timings.OrderBy(kv => kv.Key).ToList();
+            var perNode = string.Join("|", ordered.Select(kv => $"{kv.Key}={kv.Value:F0}ms"));
+            throw new Exception(
+                $"PASSED first-{BREAK_AT}-nodes diagnostic. "
+                + $"download={tDownload}ms create={tCreate}ms run={tRun}ms ({timings.Count}/{totalNodes} nodes); "
+                + $"per-node: {perNode}");
+        }
+        finally
+        {
+            Graph.GraphExecutor.BreakAtNode = null;
+            Graph.GraphExecutor.PerOpSync = false;
+            Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+        }
+    });
 }
