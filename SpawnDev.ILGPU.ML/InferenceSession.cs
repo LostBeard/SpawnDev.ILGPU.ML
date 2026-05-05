@@ -1575,11 +1575,14 @@ public class InferenceSession : IDisposable
             }
 
             if (padsData == null) continue;
+            // Seed constantFloatValues only - that flows into runtimeConstants in GraphExecutor
+            // and lets the runtime Pad shape resolver hit path 1. Do NOT mirror to
+            // graph.ConstantData / graph.FloatConstantData; those feed the optimizer's
+            // compile-time fold pass which is tested for tensors that are also in
+            // graph.Initializers. Adding Constant-node-sourced entries there puts the
+            // optimizer in a state it has not been validated against and tripped
+            // StyleMosaic WebGPU regular-path execution at rc.24 (verified via bisect).
             constantFloatValues[padsName] = padsData;
-            graph.ConstantData ??= new Dictionary<string, int[]>();
-            graph.ConstantData[padsName] = padsData.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
-            graph.FloatConstantData ??= new Dictionary<string, float[]>();
-            graph.FloatConstantData[padsName] = padsData.ToArray();
         }
     }
 }
