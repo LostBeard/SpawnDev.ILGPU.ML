@@ -325,10 +325,13 @@ public abstract partial class MLTestBase
         using var inputBuf = accelerator.Allocate1D(inputData);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
 
-        // Bound work to first 8 nodes. Compile cost dominates on first dispatch;
-        // 8 nodes is enough to surface several distinct kernel types without burning
-        // the full graph on a slow backend.
-        const int BREAK_AT = 8;
+        // Bound work to first 200 nodes. Default for this committed diagnostic.
+        // Adjust BREAK_AT in working tree (don't commit) when bisecting deeper
+        // into the model. Empirical points captured 2026-05-05:
+        //   first 100: ~7.4s on Wasm (mostly shape ops + patch_embed)
+        //   first 200: ~13s   (covers 1st transformer block; node 146 qkv MatMul = 463ms post-extraction, was 4611ms)
+        //   first 800: ~82s   (rope blocks 4-5: 12+ Concat/Slice nodes at 700-2271ms each due to per-dispatch overhead, NOT compile time)
+        const int BREAK_AT = 200;
         Graph.GraphExecutor.BreakAtNode = BREAK_AT;
         Graph.GraphExecutor.PerOpSync = true;
         Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
