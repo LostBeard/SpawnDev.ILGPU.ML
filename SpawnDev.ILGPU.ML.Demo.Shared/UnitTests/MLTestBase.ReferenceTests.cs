@@ -279,6 +279,95 @@ public abstract partial class MLTestBase
             new[] { 1, 3, 640, 640 }, 1.0f, "YOLOv8");
     });
 
+    // 2026-05-04 Data: opt-in diagnostic dump for DistilBERT per-node absMax,
+    // intended to be enabled in BOTH WebGPU and WebGL runs so the dumps can be
+    // diffed offline to find first-divergent op. Test ALWAYS throws when this
+    // flag is true so the assertion message carries the diagnostic.
+    public static bool DistilBERTDumpAllAbsMax { get; set; } = true;
+
+    [TestMethod(Timeout = 120000)]
+    public async Task Reference_DistilBERT_DiagnosticDump() => await RunTest(async accelerator =>
+    {
+        if (!DistilBERTDumpAllAbsMax) throw new UnsupportedTestException("DistilBERTDumpAllAbsMax not enabled");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var shapes = new Dictionary<string, int[]>
+        {
+            ["input_ids"] = new[] { 1, 6 },
+            ["attention_mask"] = new[] { 1, 6 },
+        };
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model.onnx");
+
+        Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+        try
+        {
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes, inputShapes: shapes);
+            var tokenIds = new float[] { 101, 1045, 2293, 2023, 3185, 102 };
+            var attentionMask = new float[] { 1, 1, 1, 1, 1, 1 };
+            using var idsBuf = accelerator.Allocate1D(tokenIds);
+            using var maskBuf = accelerator.Allocate1D(attentionMask);
+            var inputs = new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 6 }),
+                [session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 6 }),
+            };
+            var outputs = await session.RunAsync(inputs);
+            await accelerator.SynchronizeAsync();
+
+            var captured = Graph.GraphExecutor.CapturedOutputs;
+            // Walk in topological order; find first node with NaN/Inf and report it
+            // plus 5 preceding nodes for context. Compact enough to fit in PMT's
+            // ~4KB error field. Earlier dump showed full-dump truncated badly.
+            int idx = 0;
+            int? firstNanIdx = null;
+            string firstNanKey = "(none)";
+            float firstNanInputAbsMax = 0;
+            var ordered = captured
+                .OrderBy(kv => int.TryParse(kv.Key.Split('_')[0], out var i) ? i : kv.Key.GetHashCode())
+                .ToList();
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                var vals = ordered[i].Value;
+                bool hasNan = false;
+                for (int k = 0; k < vals.Length; k++)
+                    if (float.IsNaN(vals[k]) || float.IsInfinity(vals[k])) { hasNan = true; break; }
+                if (hasNan) { firstNanIdx = i; firstNanKey = ordered[i].Key; break; }
+            }
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append("BACKEND=").Append(accelerator.AcceleratorType)
+              .Append(" TOTAL=").Append(captured.Count)
+              .Append(" FIRST_NAN=").Append(firstNanIdx?.ToString() ?? "none")
+              .Append(' ').Append(firstNanKey).Append('\n');
+            // Dump 5 nodes before first-NaN through 2 nodes after, with absMax + first 4 vals
+            int dumpStart = firstNanIdx.HasValue ? Math.Max(0, firstNanIdx.Value - 5) : 0;
+            int dumpEnd = firstNanIdx.HasValue ? Math.Min(ordered.Count, firstNanIdx.Value + 3) : Math.Min(20, ordered.Count);
+            for (int i = dumpStart; i < dumpEnd; i++)
+            {
+                var (key, vals) = (ordered[i].Key, ordered[i].Value);
+                float absMax = 0; bool anyNan = false;
+                for (int k = 0; k < vals.Length; k++)
+                {
+                    if (float.IsNaN(vals[k]) || float.IsInfinity(vals[k])) { anyNan = true; }
+                    else { var a = MathF.Abs(vals[k]); if (a > absMax) absMax = a; }
+                }
+                var first4 = string.Join(",", vals.Take(4).Select(v => v.ToString("F4")));
+                sb.Append(i).Append('|').Append(key).Append('|')
+                  .Append("absMax=").Append(absMax.ToString("E4"))
+                  .Append(anyNan ? " HAS_NAN" : "")
+                  .Append(" first4=[").Append(first4).Append("]\n");
+            }
+            throw new Exception(sb.ToString());
+        }
+        finally
+        {
+            Graph.GraphExecutor.CapturedOutputs = null;
+        }
+    });
+
     // ── Text Classification Reference Test (256MB model — may OOM in browser) ──
 
     [TestMethod(Timeout = 120000)]
