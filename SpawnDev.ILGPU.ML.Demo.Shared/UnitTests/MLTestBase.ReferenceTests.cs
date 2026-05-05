@@ -137,6 +137,40 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod(Timeout = 120000)]
+    public async Task Reference_StyleMosaic_DiagnosticPerOpSync() => await RunTest(async accelerator =>
+    {
+        // 2026-05-04 Data: PerOpSync diagnostic for StyleMosaic Wasm hang. Forces
+        // SynchronizeAsync after every node's Execute. CapturedOutputs records each
+        // node's first 1024 values. CapturedNodeTimingsMs records per-node ms.
+        // If StyleMosaic still hangs with PerOpSync on, the hang is INSIDE a single
+        // node's dispatch (not in the outer scheduling). The captured maps will tell
+        // us what the LAST completed node was. If PerOpSync makes it PASS, the bug
+        // is timing/scheduling — small added sync forces serialization that closes the race.
+        Graph.GraphExecutor.PerOpSync = true;
+        Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+        Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+        try
+        {
+            await RunReferenceComparisonGpu(accelerator,
+                "models/style-mosaic/model.onnx",
+                "references/style-mosaic/cat_input_nchw.bin",
+                "references/style-mosaic/cat_output_nchw.bin",
+                new[] { 1, 3, 224, 224 }, 5.0f, "StyleMosaic_PerOpSync");
+            // If we got here, throw with a summary of timings so we have data even on PASS
+            var timings = Graph.GraphExecutor.CapturedNodeTimingsMs;
+            var slow = timings.OrderByDescending(kv => kv.Value).Take(10).ToList();
+            var summary = string.Join("|", slow.Select(kv => $"{kv.Key}={kv.Value:F1}ms"));
+            throw new Exception($"PASSED with PerOpSync. Total nodes={timings.Count}, slowest 10: {summary}");
+        }
+        finally
+        {
+            Graph.GraphExecutor.PerOpSync = false;
+            Graph.GraphExecutor.CapturedOutputs = null;
+            Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+        }
+    });
+
+    [TestMethod(Timeout = 120000)]
     public async Task Reference_StyleCandy_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,
