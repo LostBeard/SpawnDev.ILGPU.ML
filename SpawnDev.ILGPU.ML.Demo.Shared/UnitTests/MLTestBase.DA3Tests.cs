@@ -158,12 +158,16 @@ public abstract partial class MLTestBase
         var sw = System.Diagnostics.Stopwatch.StartNew();
         long tDownload, tCreate, tRun, tVerify;
 
+        Console.WriteLine($"[DA3] start at t=0ms");
+
         // Download model + external data
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+        Console.WriteLine($"[DA3] onnx={onnxBytes.Length / 1024}KB downloaded at t={sw.ElapsedMilliseconds}ms");
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
         tDownload = sw.ElapsedMilliseconds;
+        Console.WriteLine($"[DA3] ext_data={extDataBytes.Length / 1024 / 1024}MB downloaded at t={tDownload}ms (download phase done)");
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -172,6 +176,7 @@ public abstract partial class MLTestBase
             },
             externalData: extDataBytes);
         tCreate = sw.ElapsedMilliseconds - tDownload;
+        Console.WriteLine($"[DA3] session created in {tCreate}ms (parse + compile + weight upload), nodes={session.NodeCount}");
 
         // Generate test input: random normalized image [1, 3, 224, 224]
         var rng = new Random(42);
@@ -184,12 +189,14 @@ public abstract partial class MLTestBase
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
 
         long tRunStart = sw.ElapsedMilliseconds;
+        Console.WriteLine($"[DA3] starting inference at t={tRunStart}ms");
         var outputs = await session.RunAsync(new Dictionary<string, Tensor>
         {
             [session.InputNames[0]] = inputTensor
         });
         await accelerator.SynchronizeAsync();
         tRun = sw.ElapsedMilliseconds - tRunStart;
+        Console.WriteLine($"[DA3] inference + sync done in {tRun}ms");
 
         var output = outputs[session.OutputNames[0]];
         int elems = output.ElementCount;
@@ -201,12 +208,14 @@ public abstract partial class MLTestBase
         // atomics-capable backends; no per-element CPU loop. Per project CLAUDE.md:
         // "Tests must not waste resources. Use GPU-side verification when it exists."
         long tVerifyStart = sw.ElapsedMilliseconds;
+        Console.WriteLine($"[DA3] starting GPU verify at t={tVerifyStart}ms (elems={elems})");
         var ew = new ElementWiseKernels(accelerator);
         var (nanCount, absSum, absMax) = await ew.FiniteCheckOnGpuAsync(
             output.Data.SubView(0, elems), elems);
         tVerify = sw.ElapsedMilliseconds - tVerifyStart;
         float meanAbs = absSum / Math.Max(1, elems - nanCount);
 
+        Console.WriteLine($"[DA3] verify done in {tVerify}ms");
         Console.WriteLine($"[DA3] timing: download={tDownload}ms, create={tCreate}ms, run={tRun}ms, verify={tVerify}ms, total={sw.ElapsedMilliseconds}ms");
         Console.WriteLine($"[DA3] output: shape=[{string.Join(",", output.Shape)}], elems={elems}, absMax={absMax:F4}, meanAbs={meanAbs:F4}, NaN={nanCount}/{elems}");
 
