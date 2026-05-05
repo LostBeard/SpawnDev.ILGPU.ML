@@ -89,6 +89,20 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public static bool PerOpSync { get; set; }
 
+    /// <summary>
+    /// DIAGNOSTIC: incremented each time the Pad readback fallback fires at execute time.
+    /// After session-init Pad pre-extraction (InferenceSession 2026-05-05), this should
+    /// remain 0 for every well-formed ONNX model. Tests assert == 0 after a Run/RunAsync
+    /// to verify pre-extraction covered every Pad node. Reset manually before a run.
+    /// </summary>
+    public static int PadReadbackFallbackFiredCount;
+
+    /// <summary>
+    /// DIAGNOSTIC: stringified info from the last fired Pad readback fallback (path + node + pads tensor name).
+    /// Use with <see cref="PadReadbackFallbackFiredCount"/> to identify which Pad node missed pre-extraction.
+    /// </summary>
+    public static string? LastPadReadbackFallbackInfo;
+
     /// <summary>Data layout format (NCHW for ONNX, NHWC for TFLite).</summary>
     public DataFormat Format { get; set; } = DataFormat.NCHW;
 
@@ -393,6 +407,11 @@ public class GraphExecutor : IDisposable
                 }
                 else if (node.InputNames.Length >= 2 && nodeInputs.Length > 1 && nodeInputs[1] != null)
                 {
+                    // DIAGNOSTIC: arriving here means session-init Pad pre-extraction missed this node.
+                    System.Threading.Interlocked.Increment(ref PadReadbackFallbackFiredCount);
+                    LastPadReadbackFallbackInfo = $"sync output={(node.OutputNames.Length > 0 ? node.OutputNames[0] : "?")} pads={node.InputNames[1]}";
+                    if (VerboseLogging) Console.WriteLine($"[GraphExecutor] PAD READBACK FALLBACK FIRED ({LastPadReadbackFallbackInfo}) - session-init pre-extraction missed this node");
+
                     // Sync path: try sync GPU readback for pads tensor. May NotSupported
                     // on browser backends — that's fine, the async RunAsync() path is what
                     // those backends use anyway.
@@ -744,6 +763,11 @@ public class GraphExecutor : IDisposable
                 }
                 else if (node.InputNames.Length >= 2 && nodeInputs.Length > 1 && nodeInputs[1] != null)
                 {
+                    // DIAGNOSTIC: arriving here means session-init Pad pre-extraction missed this node.
+                    System.Threading.Interlocked.Increment(ref PadReadbackFallbackFiredCount);
+                    LastPadReadbackFallbackInfo = $"async output={(node.OutputNames.Length > 0 ? node.OutputNames[0] : "?")} pads={node.InputNames[1]}";
+                    if (VerboseLogging) Console.WriteLine($"[GraphExecutor] PAD READBACK FALLBACK FIRED ({LastPadReadbackFallbackInfo}) - session-init pre-extraction missed this node");
+
                     // Pads tensor exists on GPU but wasn't pre-extracted as a runtime constant.
                     // Async readback (this is the async RunAsync path).
                     var padsTensor = nodeInputs[1]!;

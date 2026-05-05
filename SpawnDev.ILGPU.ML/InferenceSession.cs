@@ -558,6 +558,9 @@ public class InferenceSession : IDisposable
             }
         }
 
+        // Pre-extract Pad node pads tensors so GraphExecutor never falls back to GPU readback at execute time.
+        PreExtractPads(parsedModel, cpuSmallWeights, constantFloatValues, graph);
+
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
@@ -699,6 +702,9 @@ public class InferenceSession : IDisposable
                 graph.FloatConstantData[name] = data.ToArray();
             }
         }
+
+        // Pre-extract Pad node pads tensors so GraphExecutor never falls back to GPU readback at execute time.
+        PreExtractPads(parsedModel, cpuSmallWeights, constantFloatValues, graph);
 
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
@@ -1514,6 +1520,67 @@ public class InferenceSession : IDisposable
         if (_ownedBuffers != null)
             foreach (var buf in _ownedBuffers)
                 try { buf.Dispose(); } catch { }
+    }
+
+    // Pre-extract pads tensors (Pad opset >= 11) into runtime constants at session init.
+    // Without this, GraphExecutor must GPU-readback each Pad node's pads tensor at execute time
+    // (~50ms/Pad on Wasm) just to size the output buffer correctly. Pads are tiny (2*rank ints)
+    // so safe to cache once at session creation. Closes StyleMosaic Wasm 2GiB cap by removing
+    // per-execute readback allocation pressure. Geordi 2026-05-04 endorsed approach.
+    private static void PreExtractPads(
+        Onnx.OnnxModelProto parsedModel,
+        Dictionary<string, float[]> cpuSmallWeights,
+        Dictionary<string, float[]> constantFloatValues,
+        Graph.ModelGraph graph)
+    {
+        foreach (var node in parsedModel.Graph.Nodes)
+        {
+            if (node.OpType != "Pad" || node.Inputs.Count < 2) continue;
+            var padsName = node.Inputs[1];
+            if (string.IsNullOrEmpty(padsName) || constantFloatValues.ContainsKey(padsName)) continue;
+
+            float[]? padsData = null;
+            // Layer 1: cpuSmallWeights covers <=64-elem initializers + Constant-node outputs already populated upstream.
+            if (cpuSmallWeights.TryGetValue(padsName, out var fromSmall))
+            {
+                padsData = fromSmall;
+            }
+            else
+            {
+                // Layer 2: oversized initializer (defensive - pads are typically 2*rank ints, never >64 in practice).
+                Onnx.OnnxTensorProto? init = null;
+                foreach (var i in parsedModel.Graph.Initializers)
+                {
+                    if (i.Name == padsName) { init = i; break; }
+                }
+                if (init != null && init.DataLocation != 1)
+                {
+                    padsData = init.ToFloatArray();
+                }
+                else
+                {
+                    // Layer 3: Constant node output not captured upstream (defensive - Constant loop above already covers).
+                    Onnx.OnnxNodeProto? constNode = null;
+                    foreach (var n in parsedModel.Graph.Nodes)
+                    {
+                        if (n.OpType == "Constant" && n.Outputs.Count > 0 && n.Outputs[0] == padsName) { constNode = n; break; }
+                    }
+                    if (constNode != null)
+                    {
+                        var valueAttr = constNode.Attributes.FirstOrDefault(a => a.Name == "value");
+                        if (valueAttr?.T != null)
+                            padsData = valueAttr.T.ToFloatArray();
+                    }
+                }
+            }
+
+            if (padsData == null) continue;
+            constantFloatValues[padsName] = padsData;
+            graph.ConstantData ??= new Dictionary<string, int[]>();
+            graph.ConstantData[padsName] = padsData.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+            graph.FloatConstantData ??= new Dictionary<string, float[]>();
+            graph.FloatConstantData[padsName] = padsData.ToArray();
+        }
     }
 }
 

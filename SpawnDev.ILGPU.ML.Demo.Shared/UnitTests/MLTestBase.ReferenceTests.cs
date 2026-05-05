@@ -149,6 +149,10 @@ public abstract partial class MLTestBase
         Graph.GraphExecutor.PerOpSync = true;
         Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
         Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+        // Reset pad-fallback diagnostic so the throw-on-pass message reports this run only.
+        // After 2026-05-05 InferenceSession.PreExtractPads, this MUST be 0 for StyleMosaic.
+        Graph.GraphExecutor.PadReadbackFallbackFiredCount = 0;
+        Graph.GraphExecutor.LastPadReadbackFallbackInfo = null;
         try
         {
             await RunReferenceComparisonGpu(accelerator,
@@ -160,7 +164,9 @@ public abstract partial class MLTestBase
             var timings = Graph.GraphExecutor.CapturedNodeTimingsMs;
             var slow = timings.OrderByDescending(kv => kv.Value).Take(10).ToList();
             var summary = string.Join("|", slow.Select(kv => $"{kv.Key}={kv.Value:F1}ms"));
-            throw new Exception($"PASSED with PerOpSync. Total nodes={timings.Count}, slowest 10: {summary}");
+            var padFallback = Graph.GraphExecutor.PadReadbackFallbackFiredCount;
+            var padInfo = Graph.GraphExecutor.LastPadReadbackFallbackInfo ?? "(none)";
+            throw new Exception($"PASSED with PerOpSync. Total nodes={timings.Count}, padFallback={padFallback} (expect 0; lastInfo={padInfo}), slowest 10: {summary}");
         }
         finally
         {
