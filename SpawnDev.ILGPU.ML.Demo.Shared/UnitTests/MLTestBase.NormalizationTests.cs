@@ -241,6 +241,65 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[InstanceNorm_Chain24] passed without hang. firstFew=[{string.Join(",", firstFew.Take(4).Select(v => v.ToString("F4")))}]");
     });
 
+    [TestMethod(Timeout = 90000)]
+    public async Task ConvInstanceNormReluChain24_NoHang() => await RunTest(async accelerator =>
+    {
+        // 2026-05-04 Data: tighter repro for StyleMosaic Wasm hang at rc.16+.
+        // Chain24 of just InstanceNorm passes (3s on Wasm at full size). Adding
+        // Conv2D 3x3 + ReLU between InstanceNorms tests whether the bug is in
+        // the Conv2D + InstanceNorm + ReLU interaction at kernel level.
+        // If THIS hangs, kernel-level interaction is the issue. If passes,
+        // bug needs the GraphExecutor/InferenceSession/BufferPool runtime.
+        int N = 1, C = 32, H = 56, W = 56;  // smaller for faster verify, still triggering
+        int spatial = H * W;
+        int total = N * C * spatial;
+        int kSize = 9; // 3*3 kernel
+        int weightCount = C * C * kSize;
+
+        var input = RandomFloats(total, seed: 300, scale: 1f);
+        var convWeight = RandomFloats(weightCount, seed: 301, scale: 0.1f);
+        var convBias = RandomFloats(C, seed: 302, scale: 0.01f);
+        var scale = RandomFloats(C, seed: 303, scale: 1f);
+        var bias = RandomFloats(C, seed: 304, scale: 0.5f);
+        for (int i = 0; i < C; i++) scale[i] = MathF.Abs(scale[i]) + 0.5f;
+
+        using var bufA = accelerator.Allocate1D(input);
+        using var bufB = accelerator.Allocate1D<float>(total);
+        using var convOut = accelerator.Allocate1D<float>(total);
+        using var wBuf = accelerator.Allocate1D(convWeight);
+        using var convBiasBuf = accelerator.Allocate1D(convBias);
+        using var sBuf = accelerator.Allocate1D(scale);
+        using var bBuf = accelerator.Allocate1D(bias);
+
+        var conv = new Conv2DKernel(accelerator);
+        var norm = new NormalizationKernels(accelerator);
+        var ew = new ElementWiseKernels(accelerator);
+
+        var src = bufA.View;
+        var dst = bufB.View;
+        for (int iter = 0; iter < 24; iter++)
+        {
+            // Conv2D 3x3 stride=1 pad=1 (same-shape)
+            conv.Forward(src, wBuf.View, convBiasBuf.View, convOut.View,
+                C, H, W, C, 3, 3, 1, 1);
+            // InstanceNorm
+            norm.InstanceNorm(convOut.View, dst, sBuf.View, bBuf.View, N, C, spatial);
+            // ReLU in-place on dst
+            ew.ReLUInPlace(dst, total);
+            (src, dst) = (dst, src);
+        }
+        await accelerator.SynchronizeAsync();
+
+        var finalBuf = bufA;
+        var firstFew = await finalBuf.CopyToHostAsync<float>(0, 8);
+        bool anyFinite = false;
+        for (int i = 0; i < firstFew.Length; i++)
+            if (!float.IsNaN(firstFew[i]) && !float.IsInfinity(firstFew[i])) anyFinite = true;
+        if (!anyFinite)
+            throw new Exception($"Conv-IN-ReLU chain output all NaN/Inf: [{string.Join(",", firstFew)}]");
+        Console.WriteLine($"[ConvInstanceNormReluChain24] passed without hang. firstFew=[{string.Join(",", firstFew.Take(4).Select(v => v.ToString("F4")))}]");
+    });
+
     [TestMethod]
     public async Task Softmax_YOLOv8DflShape_MatchesCpu() => await RunTest(async accelerator =>
     {
