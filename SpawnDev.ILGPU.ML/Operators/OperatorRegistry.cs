@@ -31,6 +31,7 @@ public class OperatorRegistry : IDisposable
     public PadKernel Pad { get; }
     public ConvTranspose2DKernel ConvTranspose { get; }
     public Kernels.FusedDequantMatMul FusedDequant { get; }
+    public Kernels.SliceKernel Slice { get; }
 
     public OperatorRegistry(Accelerator accelerator)
     {
@@ -52,6 +53,7 @@ public class OperatorRegistry : IDisposable
         Pad = new PadKernel(accelerator);
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
+        Slice = new Kernels.SliceKernel(accelerator);
 
         // Register built-in operators
         RegisterBuiltins();
@@ -322,6 +324,7 @@ public class OperatorRegistry : IDisposable
         try { (Pad as IDisposable)?.Dispose(); } catch { }
         try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
         try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
+        try { (Slice as IDisposable)?.Dispose(); } catch { }
 
         // Dispose cached zero-bias buffers (one per distinct outC seen).
         foreach (var b in _zeroBiasCache.Values) try { b.Dispose(); } catch { }

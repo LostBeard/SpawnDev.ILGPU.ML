@@ -1524,7 +1524,23 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        // Fallback for large tensors: copy contiguous slices along last axis
+        // Fused-kernel fast path: ONE GPU dispatch instead of N recursive Scale
+        // calls per contiguous run. Engaged when all steps are positive and rank
+        // is within SliceKernel.MAX_RANK (covers the vast majority of ONNX
+        // slice patterns; transformer attention RoPE blocks specifically).
+        // 2026-05-05 diagnosis (commit `54d3eae`) showed Slice nodes 700-1100ms
+        // each on Wasm in DA3-Small RoPE blocks driven by per-dispatch overhead;
+        // this path collapses that to one dispatch + small param upload.
+        bool allPositiveSteps = true;
+        for (int d = 0; d < rank; d++) { if (sliceSteps[d] <= 0) { allPositiveSteps = false; break; } }
+        if (allPositiveSteps && rank <= Kernels.SliceKernel.MAX_RANK)
+        {
+            reg.Slice.Slice(input.Data, ctx.Outputs[0].Data,
+                sliceStarts, sliceSteps, outShape, inStrides, rank, outCount);
+            return;
+        }
+
+        // Fallback for negative steps or extreme rank: copy contiguous slices along last axis
         int outIdx2 = 0;
         SliceGPU(input.Data, ctx.Outputs[0].Data, inShape, sliceStarts, sliceEnds, sliceSteps, inStrides, rank, 0, 0, ref outIdx2, reg);
     }

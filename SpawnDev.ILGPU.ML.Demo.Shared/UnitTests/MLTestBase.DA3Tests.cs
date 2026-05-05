@@ -331,7 +331,7 @@ public abstract partial class MLTestBase
         //   first 100: ~7.4s on Wasm (mostly shape ops + patch_embed)
         //   first 200: ~13s   (covers 1st transformer block; node 146 qkv MatMul = 463ms post-extraction, was 4611ms)
         //   first 800: ~82s   (rope blocks 4-5: 12+ Concat/Slice nodes at 700-2271ms each due to per-dispatch overhead, NOT compile time)
-        const int BREAK_AT = 200;
+        const int BREAK_AT = 800;
         Graph.GraphExecutor.BreakAtNode = BREAK_AT;
         Graph.GraphExecutor.PerOpSync = true;
         Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
