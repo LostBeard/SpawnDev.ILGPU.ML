@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
+using System.Runtime.CompilerServices;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -62,6 +63,29 @@ public class MatMulKernel
     /// Each workgroup computes one TILE×TILE output tile.
     /// numTilesN passed as parameter for 2D tile index derivation from 1D grid.
     /// </summary>
+    /// <summary>
+    /// Inner k-tile accumulation, extracted as a helper. No explicit MethodImpl
+    /// attribute - JIT decides per call site. Direct attempt with NoInlining
+    /// produced a 11.6x first-compile win on Wasm (4611ms -> 396ms for the qkv
+    /// MatMul) but tripped a WGSL validation error on WebGPU at the Gemm
+    /// dispatch path (the fn-definition path bug flagged in
+    /// feedback_methodimpl_inlining_directives.md). Without the attribute the
+    /// helper still gets emitted as a separate method body that the JIT may
+    /// elect not to inline at large call sites - giving up the explicit lock
+    /// but keeping the structural separation that helps compile time on
+    /// backends where the JIT chooses fn-call form. Re-evaluate adding back
+    /// NoInlining when Geordi closes the WGSL fn-definition path.
+    /// </summary>
+    private static float TiledMatMulInnerAccumulate(
+        ArrayView1D<float, Stride1D.Dense> aTile,
+        ArrayView1D<float, Stride1D.Dense> bTile,
+        int aRowOffset, int ty, float sum)
+    {
+        for (int k = 0; k < TILE; k++)
+            sum += aTile[aRowOffset + k] * bTile[k * TILE + ty];
+        return sum;
+    }
+
     private static void TiledMatMulImpl(
         ArrayView1D<float, Stride1D.Dense> A,
         ArrayView1D<float, Stride1D.Dense> B,
@@ -84,6 +108,7 @@ public class MatMulKernel
 
         int row = tileRow * TILE + tx;
         int col = tileCol * TILE + ty;
+        int txTimesT = tx * TILE;
 
         float sum = 0f;
 
@@ -91,15 +116,14 @@ public class MatMulKernel
         for (int t = 0; t < numKTiles; t++)
         {
             int aCol = t * TILE + ty;
-            aTile[tx * TILE + ty] = (row < M && aCol < K) ? A[row * K + aCol] : 0f;
+            aTile[txTimesT + ty] = (row < M && aCol < K) ? A[row * K + aCol] : 0f;
 
             int bRow = t * TILE + tx;
-            bTile[tx * TILE + ty] = (bRow < K && col < N) ? B[bRow * N + col] : 0f;
+            bTile[txTimesT + ty] = (bRow < K && col < N) ? B[bRow * N + col] : 0f;
 
             Group.Barrier();
 
-            for (int k = 0; k < TILE; k++)
-                sum += aTile[tx * TILE + k] * bTile[k * TILE + ty];
+            sum = TiledMatMulInnerAccumulate(aTile, bTile, txTimesT, ty, sum);
 
             Group.Barrier();
         }
