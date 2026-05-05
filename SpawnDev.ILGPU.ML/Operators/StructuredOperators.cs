@@ -945,7 +945,6 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
         int outer = 1; for (int i = 0; i < axis; i++) outer *= shape0[i];
         int inner = 1; for (int i = axis + 1; i < shape0.Length; i++) inner *= shape0[i];
 
-        int outOffset = 0;
         int totalConcatDim = 0;
         for (int n = 0; n < ctx.Inputs.Length; n++)
         {
@@ -956,7 +955,40 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
             totalConcatDim += ctx.Inputs[n].Shape[axis];
         }
 
-        // For each outer block, copy each input's slice
+        // Fused-kernel fast path for 2/3/4-input concats: ONE GPU dispatch
+        // instead of N*outer separate Scale calls. 2026-05-05 diagnosis showed
+        // RoPE Concat nodes 1500-2271ms each on Wasm dominated by per-dispatch
+        // overhead; this path collapses to a single dispatch + zero param upload.
+        // Falls through to the per-pair Scale loop for >4 inputs (rare).
+        if (Kernels.ConcatKernel.CanHandle(ctx.Inputs.Length))
+        {
+            var output = ctx.Outputs[0].Data;
+            switch (ctx.Inputs.Length)
+            {
+                case 2:
+                    reg.Concat.Concat2(output,
+                        ctx.Inputs[0].Data, ctx.Inputs[1].Data,
+                        outer, inner,
+                        ctx.Inputs[0].Shape[axis], ctx.Inputs[1].Shape[axis]);
+                    return;
+                case 3:
+                    reg.Concat.Concat3(output,
+                        ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Inputs[2].Data,
+                        outer, inner,
+                        ctx.Inputs[0].Shape[axis], ctx.Inputs[1].Shape[axis], ctx.Inputs[2].Shape[axis]);
+                    return;
+                case 4:
+                    reg.Concat.Concat4(output,
+                        ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Inputs[2].Data, ctx.Inputs[3].Data,
+                        outer, inner,
+                        ctx.Inputs[0].Shape[axis], ctx.Inputs[1].Shape[axis],
+                        ctx.Inputs[2].Shape[axis], ctx.Inputs[3].Shape[axis]);
+                    return;
+            }
+        }
+
+        // Fallback: per-pair Scale dispatches (correct, but pays per-dispatch overhead)
+        int outOffset = 0;
         for (int n = 0; n < ctx.Inputs.Length; n++)
         {
             var inp = ctx.Inputs[n];
