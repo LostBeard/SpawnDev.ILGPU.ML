@@ -184,6 +184,63 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, outBuf.View.SubView(0, total), expected, 1e-3f, "InstanceNorm 1x32x224x224: ");
     });
 
+    [TestMethod(Timeout = 90000)]
+    public async Task InstanceNorm_Chain24_NoHang() => await RunTest(async accelerator =>
+    {
+        // 2026-05-04 Data: tight repro for StyleMosaic Wasm hang at rc.16+.
+        // StyleMosaic graph runs ~24 sequential InstanceNorm calls. Each call
+        // allocates fresh per-call mean/invStd temp buffers, runs Pass1 then Pass2.
+        //
+        // Geordi's generic Pass1-write/Pass2-read pattern test (Tests23_StyleMosaicShape_PairedDispatchesScale)
+        // PASSES on Wasm at rc.16 — so the GENERIC dispatch pattern is fine.
+        // This test calls the actual InstanceNorm operator in a 24-deep chain
+        // matching StyleMosaic. If THIS hangs on Wasm, the bug is specific to
+        // either NormalizationKernels.InstanceNorm itself or its per-call temp
+        // buffer allocation pattern (NOT the generic dispatcher).
+        //
+        // Full StyleMosaic spatial (224x224 = 50176) since 56x56 passed (2s) — testing
+        // size-dependence hypothesis. If 24 chained InstanceNorms at full size hangs
+        // on Wasm, the bug is shape/size scaling not pattern. If passes, the bug
+        // needs other ops (Conv2D / Pad / ReLU) interleaved.
+        int N = 1, C = 32, H = 224, W = 224;
+        int spatial = H * W;
+        int total = N * C * spatial;
+        var input = RandomFloats(total, seed: 200, scale: 1f);
+        var scale = RandomFloats(C, seed: 201, scale: 1f);
+        var bias = RandomFloats(C, seed: 202, scale: 0.5f);
+        for (int i = 0; i < C; i++) scale[i] = MathF.Abs(scale[i]) + 0.5f;
+
+        using var bufA = accelerator.Allocate1D(input);
+        using var bufB = accelerator.Allocate1D<float>(total);
+        using var sBuf = accelerator.Allocate1D(scale);
+        using var bBuf = accelerator.Allocate1D(bias);
+
+        var norm = new NormalizationKernels(accelerator);
+
+        // 24 sequential calls, ping-pong A↔B as input↔output. Track which buffer
+        // holds the final output via parity (24 swaps -> bufA holds the output)
+        var src = bufA.View;
+        var dst = bufB.View;
+        for (int iter = 0; iter < 24; iter++)
+        {
+            norm.InstanceNorm(src, dst, sBuf.View, bBuf.View, N, C, spatial);
+            (src, dst) = (dst, src); // swap
+        }
+        await accelerator.SynchronizeAsync();
+
+        // After 24 swaps the FINAL src points to the most recent output. With even
+        // iter count (24), src ends pointing to bufA.View (back to start). Confirm
+        // by reading bufA.
+        var finalBuf = bufA;
+        var firstFew = await finalBuf.CopyToHostAsync<float>(0, 8);
+        bool anyFinite = false;
+        for (int i = 0; i < firstFew.Length; i++)
+            if (!float.IsNaN(firstFew[i]) && !float.IsInfinity(firstFew[i])) anyFinite = true;
+        if (!anyFinite)
+            throw new Exception($"InstanceNorm chain output all NaN/Inf: [{string.Join(",", firstFew)}]");
+        Console.WriteLine($"[InstanceNorm_Chain24] passed without hang. firstFew=[{string.Join(",", firstFew.Take(4).Select(v => v.ToString("F4")))}]");
+    });
+
     [TestMethod]
     public async Task Softmax_YOLOv8DflShape_MatchesCpu() => await RunTest(async accelerator =>
     {

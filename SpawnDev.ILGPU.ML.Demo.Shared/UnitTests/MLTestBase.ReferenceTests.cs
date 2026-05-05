@@ -329,18 +329,25 @@ public abstract partial class MLTestBase
             await accelerator.SynchronizeAsync();
             var logits = await readBuf.CopyToHostAsync<float>(0, 2);
 
-            // Dump ALL captured node outputs for debugging — find where values diverge
+            // Dump ALL captured node outputs for debugging — find where values diverge.
+            // First-zero search: locate the FIRST node whose output is all-zero
+            // (first-divergent on WebGL pre-fix where Pow neg-base / Div unsigned
+            // collapsed downstream values to zero). Surface in the assertion message
+            // so PMT's latest.json captures it without needing browser-console scrape.
             var captured = Graph.GraphExecutor.CapturedOutputs;
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine($"Captured {captured.Count} nodes:");
-            foreach (var (key, vals) in captured.OrderBy(kv => kv.Key))
+            string firstZeroNode = "(none — all nodes have nonzero output)";
+            int orderedIdx = 0;
+            int? firstZeroIdx = null;
+            foreach (var (key, vals) in captured.OrderBy(kv => int.TryParse(kv.Key.Split('_')[0], out var i) ? i : kv.Key.GetHashCode()))
             {
                 float absMax = vals.Length > 0 ? vals.Max(v => MathF.Abs(v)) : 0;
-                var vStr = string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")));
-                sb.AppendLine($"  {key}: absMax={absMax:F4} [{vStr}]");
+                if (absMax == 0f && firstZeroIdx == null)
+                {
+                    firstZeroIdx = orderedIdx;
+                    firstZeroNode = $"node[{orderedIdx}] key='{key}' absMax=0 firstVals=[{string.Join(", ", vals.Take(5).Select(v => v.ToString("F4")))}]";
+                }
+                orderedIdx++;
             }
-            Console.WriteLine($"[DistilBERT] FINAL logits: [{logits[0]:F4}, {logits[1]:F4}]");
-            Console.WriteLine($"[DistilBERT] EXPECTED:     [-4.3237, 4.6761]");
 
             // Compare against ONNX Runtime reference
             var refBytes = await http.GetByteArrayAsync("references/distilbert-sst2-onnx/i_love_this_movie_i_logits.bin");
@@ -352,8 +359,8 @@ public abstract partial class MLTestBase
             int ourSentiment = logits[0] > logits[1] ? 0 : 1;
             int refSentiment = refLogits[0] > refLogits[1] ? 0 : 1;
             if (ourSentiment != refSentiment)
-                throw new Exception($"[DistilBERT] Sentiment MISMATCH: our={ourSentiment} ref={refSentiment} logits=[{logits[0]:F4},{logits[1]:F4}] ref=[{refLogits[0]:F4},{refLogits[1]:F4}]");
-            AssertReferenceMatch(logits, refLogits, 2.0f, $"DistilBERT logits=[{logits[0]:F4},{logits[1]:F4}] expected=[{refLogits[0]:F4},{refLogits[1]:F4}]");
+                throw new Exception($"[DistilBERT] Sentiment MISMATCH: our={ourSentiment} ref={refSentiment} logits=[{logits[0]:F4},{logits[1]:F4}] ref=[{refLogits[0]:F4},{refLogits[1]:F4}] | total_nodes={captured.Count} first_zero={firstZeroNode}");
+            AssertReferenceMatch(logits, refLogits, 2.0f, $"DistilBERT logits=[{logits[0]:F4},{logits[1]:F4}] expected=[{refLogits[0]:F4},{refLogits[1]:F4}] | total_nodes={captured.Count} first_zero={firstZeroNode}");
 
         }
         finally

@@ -21,20 +21,19 @@ public class TransposeKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _transposeKernel;
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
-    // Deferred-disposal list: when _paramsBuf needs to grow, the prior buffer
-    // may still be referenced by an in-flight WebGPU dispatch. Inline disposal
-    // would fire "Buffer used in submit while destroyed" at the next sync.
-    // Same pattern as ElementWiseKernels.BroadcastBinaryOpND.
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
+    // Per-call fresh paramsBuf - eliminates the shared-state race under async dispatch
+    // on Wasm where a queued dispatch could read paramsBuf.SharedBuffer AFTER a subsequent
+    // CopyFromCPU overwrites it. LOAD-BEARING for StyleMosaic Wasm even at rc.16 dispatcher
+    // - removing this workaround causes StyleMosaic to hang (verified 2026-05-04 bisect).
+    // Same pattern as PadKernel, Conv2DKernel, PoolingKernels, NormalizationKernels.
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _allParamsBufs = new();
 
     public TransposeKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose();
-        foreach (var buf in _oldParamsBufs) buf.Dispose();
-        _oldParamsBufs.Clear();
+        foreach (var buf in _allParamsBufs) buf.Dispose();
+        _allParamsBufs.Clear();
     }
 
     /// <summary>
@@ -101,25 +100,19 @@ public class TransposeKernel : IDisposable
         for (int i = 0; i < rank; i++) totalElements *= inputShape[i];
 
         // Pack params: [rank, inShape..., perm..., inStrides..., outStrides...]
+        // Fresh allocation per call - avoids the cross-call SharedBuffer race on Wasm.
         int paramsSize = 1 + 4 * rank;
-        if (_paramsBuf == null || _paramsBuf.Length < paramsSize)
-        {
-            // Defer disposal of the OLD paramsBuf until our own Dispose() runs.
-            // Inline _paramsBuf?.Dispose() fires "Buffer used in submit while
-            // destroyed" on WebGPU when a prior Transpose dispatch is still
-            // queued in the command encoder. (Pipeline_Diffusion_DDPM root cause.)
-            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-            _paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
-        }
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
         for (int i = 0; i < rank; i++) paramsData[1 + i] = inputShape[i];
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = perm[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = inStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 3 * rank + i] = outStrides[i];
-        _paramsBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+        var paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
+        paramsBuf.View.CopyFromCPU(paramsData);
+        _allParamsBufs.Add(paramsBuf);
 
-        _transposeKernel!(totalElements, input, output, _paramsBuf.View);
+        _transposeKernel!(totalElements, input, output, paramsBuf.View);
     }
 
     private void EnsureLoaded()
