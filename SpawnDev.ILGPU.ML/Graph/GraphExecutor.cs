@@ -356,6 +356,71 @@ public class GraphExecutor : IDisposable
                     runtimeOutputShapes = new[] { resolved };
                 }
             }
+            // Runtime Pad: opset >= 11 has pads as input[1] tensor, not as attribute.
+            // PadOperator.InferOutputShapes can't read the tensor value at compile time
+            // and returns inputs[0] unchanged — output buffer would be sized to INPUT,
+            // but the kernel writes to OUTPUT (input + pads) → OOB. Resolve here.
+            // 2026-05-04 Data: surfaced StyleMosaic Wasm hang via PerOpSync diag at
+            // disp=176 'Kernel_PadImpl' with items=108M into 102.7M-float V0 buffer.
+            if (node.OpType == "Pad")
+            {
+                // Try runtime constant first
+                int[]? padsResolved = null;
+                if (node.InputNames.Length >= 2
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var padsTensorRC)
+                    && padsTensorRC.Length > 0)
+                {
+                    padsResolved = padsTensorRC.Select(v => (int)v).ToArray();
+                }
+                // Fallback to attribute (opset < 11)
+                else if (node.Attributes.TryGetValue("pads", out var padsAttrObj) && padsAttrObj is long[] padsAttr)
+                {
+                    padsResolved = padsAttr.Select(v => (int)v).ToArray();
+                }
+
+                if (padsResolved != null)
+                {
+                    var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                    int rank = inShape.Length;
+                    if (padsResolved.Length == 2 * rank)
+                    {
+                        var resolved = new int[rank];
+                        for (int j = 0; j < rank; j++)
+                            resolved[j] = inShape[j] + padsResolved[j] + padsResolved[rank + j];
+                        if (resolved.All(d => d > 0))
+                            runtimeOutputShapes = new[] { resolved };
+                    }
+                }
+                else if (node.InputNames.Length >= 2 && nodeInputs.Length > 1 && nodeInputs[1] != null)
+                {
+                    // Sync path: try sync GPU readback for pads tensor. May NotSupported
+                    // on browser backends — that's fine, the async RunAsync() path is what
+                    // those backends use anyway.
+                    var padsTensor = nodeInputs[1]!;
+                    if (padsTensor.ElementCount > 0 && padsTensor.ElementCount <= 32)
+                    {
+                        try
+                        {
+                            using var tmp = _accelerator.Allocate1D<float>(padsTensor.ElementCount);
+                            _ew.Scale(padsTensor.Data.SubView(0, padsTensor.ElementCount), tmp.View, padsTensor.ElementCount, 1f);
+                            _accelerator.Synchronize();
+                            var padsHost = tmp.GetAsArray1D();
+                            runtimeConstants[node.InputNames[1]] = padsHost;
+                            var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                            int rank = inShape.Length;
+                            if (padsHost.Length == 2 * rank)
+                            {
+                                var resolved = new int[rank];
+                                for (int j = 0; j < rank; j++)
+                                    resolved[j] = inShape[j] + (int)padsHost[j] + (int)padsHost[rank + j];
+                                if (resolved.All(d => d > 0))
+                                    runtimeOutputShapes = new[] { resolved };
+                            }
+                        }
+                        catch { /* fall through to compiled shapes */ }
+                    }
+                }
+            }
 
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
@@ -640,6 +705,70 @@ public class GraphExecutor : IDisposable
                     for (int j = 0; j < inShape.Length; j++)
                         resolved[j] = j < scales.Length ? (int)MathF.Floor(inShape[j] * scales[j]) : inShape[j];
                     runtimeOutputShapes = new[] { resolved };
+                }
+            }
+            // Runtime Pad: opset >= 11 has pads as input[1] tensor, not as attribute.
+            // PadOperator.InferOutputShapes can't read the tensor value at compile time
+            // and returns inputs[0] unchanged — output buffer would be sized to INPUT,
+            // but the kernel writes to OUTPUT (input + pads) → OOB. Resolve here.
+            // 2026-05-04 Data: surfaced StyleMosaic Wasm hang via PerOpSync diag at
+            // disp=176 'Kernel_PadImpl' with items=108M into 102.7M-float V0 buffer.
+            if (node.OpType == "Pad")
+            {
+                // Try runtime constant first
+                int[]? padsResolved = null;
+                if (node.InputNames.Length >= 2
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var padsTensorRC)
+                    && padsTensorRC.Length > 0)
+                {
+                    padsResolved = padsTensorRC.Select(v => (int)v).ToArray();
+                }
+                // Fallback to attribute (opset < 11)
+                else if (node.Attributes.TryGetValue("pads", out var padsAttrObj) && padsAttrObj is long[] padsAttr)
+                {
+                    padsResolved = padsAttr.Select(v => (int)v).ToArray();
+                }
+
+                if (padsResolved != null)
+                {
+                    var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                    int rank = inShape.Length;
+                    if (padsResolved.Length == 2 * rank)
+                    {
+                        var resolved = new int[rank];
+                        for (int j = 0; j < rank; j++)
+                            resolved[j] = inShape[j] + padsResolved[j] + padsResolved[rank + j];
+                        if (resolved.All(d => d > 0))
+                            runtimeOutputShapes = new[] { resolved };
+                    }
+                }
+                else if (node.InputNames.Length >= 2 && nodeInputs.Length > 1 && nodeInputs[1] != null)
+                {
+                    // Pads tensor exists on GPU but wasn't pre-extracted as a runtime constant.
+                    // Async readback (this is the async RunAsync path).
+                    var padsTensor = nodeInputs[1]!;
+                    if (padsTensor.ElementCount > 0 && padsTensor.ElementCount <= 32)
+                    {
+                        try
+                        {
+                            using var tmp = _accelerator.Allocate1D<float>(padsTensor.ElementCount);
+                            _ew.Scale(padsTensor.Data.SubView(0, padsTensor.ElementCount), tmp.View, padsTensor.ElementCount, 1f);
+                            await _accelerator.SynchronizeAsync();
+                            var padsHost = await tmp.CopyToHostAsync<float>(0, padsTensor.ElementCount);
+                            runtimeConstants[node.InputNames[1]] = padsHost;
+                            var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
+                            int rank = inShape.Length;
+                            if (padsHost.Length == 2 * rank)
+                            {
+                                var resolved = new int[rank];
+                                for (int j = 0; j < rank; j++)
+                                    resolved[j] = inShape[j] + (int)padsHost[j] + (int)padsHost[rank + j];
+                                if (resolved.All(d => d > 0))
+                                    runtimeOutputShapes = new[] { resolved };
+                            }
+                        }
+                        catch { /* fall through to compiled shapes */ }
+                    }
                 }
             }
 
