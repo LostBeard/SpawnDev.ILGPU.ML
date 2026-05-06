@@ -761,26 +761,23 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < axis; i++) outerSize2 *= data.Shape[i];
         int axisSize2 = data.Shape[axis];
 
-        // CPU-side Gather with pre-read indices (for constant/small index tensors)
-        for (int o = 0; o < outerSize2; o++)
+        // Constant-indices path: use the fused GPU Gather kernel rather than a
+        // CPU-side loop dispatching one Scale per (outer, idx) pair. The
+        // existing per-pair loop pays Wasm worker-pool round-trip overhead per
+        // call and accumulates to >440s for a single Gather node in DA3-Small's
+        // depth head (node 2541 /head/Gather_57, identified via the
+        // BREAK_AT-based bisection 2026-05-05). The indices tensor is already
+        // GPU-resident on .Data; dispatch one parallel kernel covering all
+        // outer*numIdx*inner output elements.
+        if (axis == 0)
         {
-            for (int idx = 0; idx < numIdx2; idx++)
-            {
-                int srcIdx = (int)idxFloats[idx];
-                if (srcIdx < 0) srcIdx += axisSize2;
-                if (srcIdx < 0 || srcIdx >= axisSize2) srcIdx = 0;
-
-                int srcOffset = (o * axisSize2 + srcIdx) * innerSize2;
-                int dstOffset = (o * numIdx2 + idx) * innerSize2;
-                // Bounds check: skip if source or dest would exceed buffer
-                if (srcOffset + innerSize2 > data.ElementCount ||
-                    dstOffset + innerSize2 > ctx.Outputs[0].ElementCount)
-                    continue;
-                reg.ElementWise.Scale(
-                    data.Data.SubView(srcOffset, innerSize2),
-                    ctx.Outputs[0].Data.SubView(dstOffset, innerSize2),
-                    innerSize2, 1f);
-            }
+            reg.Gather.GatherAxis0Float(data.Data, indices.Data, ctx.Outputs[0].Data,
+                numIdx2, innerSize2, axisSize2);
+        }
+        else
+        {
+            reg.Gather.GatherGenericFloat(data.Data, indices.Data, ctx.Outputs[0].Data,
+                numIdx2, innerSize2, outerSize2, axisSize2);
         }
     }
 }

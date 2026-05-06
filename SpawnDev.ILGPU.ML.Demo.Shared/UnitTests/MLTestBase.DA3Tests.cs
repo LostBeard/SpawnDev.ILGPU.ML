@@ -298,7 +298,7 @@ public abstract partial class MLTestBase
     /// increase kernel compile time"). Bounds work via GraphExecutor.BreakAtNode
     /// so the test fits in a reasonable budget even on a slow backend.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 540000)]
     public async Task DA3Small_FirstNNodes_DiagnosticPerOpSync() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -331,13 +331,23 @@ public abstract partial class MLTestBase
         //   first 100: ~7.4s on Wasm (mostly shape ops + patch_embed)
         //   first 200: ~13s   (covers 1st transformer block; node 146 qkv MatMul = 463ms post-extraction, was 4611ms)
         //   first 800: ~82s   (rope blocks 4-5: 12+ Concat/Slice nodes at 700-2271ms each due to per-dispatch overhead, NOT compile time)
-        const int BREAK_AT = 800;
+        const int BREAK_AT = 2541;
         Graph.GraphExecutor.BreakAtNode = BREAK_AT;
         Graph.GraphExecutor.PerOpSync = true;
         Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
         Graph.GraphExecutor.LastRunOpLog.Clear();
         try
         {
+            // Peek at next 5 op types past BREAK_AT for bisection (when test times out
+            // mid-run, no per-node timings are emitted; this diagnostic at least tells
+            // us which op type was about to run).
+            var nextOps = new System.Text.StringBuilder();
+            for (int peek = 0; peek < 5 && BREAK_AT + peek < totalNodes; peek++)
+            {
+                var (op, name) = session.GetNodeInfo(BREAK_AT + peek);
+                nextOps.Append($"+{peek}=[{BREAK_AT + peek}]{op}({name}) ");
+            }
+
             long tRunStart = sw.ElapsedMilliseconds;
             await session.RunAsync(new Dictionary<string, Tensor>
             {
@@ -352,6 +362,7 @@ public abstract partial class MLTestBase
             throw new Exception(
                 $"PASSED first-{BREAK_AT}-nodes diagnostic. "
                 + $"download={tDownload}ms create={tCreate}ms run={tRun}ms ({timings.Count}/{totalNodes} nodes); "
+                + $"NEXT5: {nextOps}; "
                 + $"per-node: {perNode}");
         }
         finally

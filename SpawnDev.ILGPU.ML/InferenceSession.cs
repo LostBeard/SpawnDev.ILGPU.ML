@@ -59,6 +59,14 @@ public class InferenceSession : IDisposable
     /// <summary>Distinct operator types used in this model.</summary>
     public string[] OperatorTypes => _compiled.Nodes.Select(n => n.OpType).Distinct().OrderBy(s => s).ToArray();
 
+    /// <summary>Get the OpType + first output name for a node by index. Diagnostic only.</summary>
+    public (string opType, string outputName) GetNodeInfo(int idx)
+    {
+        if (idx < 0 || idx >= _compiled.Nodes.Length) return ("?", "?");
+        var n = _compiled.Nodes[idx];
+        return (n.OpType, n.OutputNames.Length > 0 ? n.OutputNames[0] : "?");
+    }
+
     /// <summary>Model name (from graph metadata).</summary>
     public string ModelName { get; private set; } = "";
 
