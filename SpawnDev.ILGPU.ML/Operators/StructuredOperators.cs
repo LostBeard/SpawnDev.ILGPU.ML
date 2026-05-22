@@ -1726,9 +1726,9 @@ public class ReduceL1Operator(OperatorRegistry reg) : IOnnxOperator
         int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         // Abs input into temp, then ReduceSum
         int count = ctx.Inputs[0].ElementCount;
-        using var absBuf = reg.Accelerator.Allocate1D<float>(count);
-        reg.ElementWise.Abs(ctx.Inputs[0].Data, absBuf.View, count);
-        reg.Reductions.ReduceSum(absBuf.View, ctx.Outputs[0].Data, outer, reduce, inner);
+        var absBuf = ctx.Pool.Rent(new[] { count });
+        reg.ElementWise.Abs(ctx.Inputs[0].Data, absBuf.Data, count);
+        reg.Reductions.ReduceSum(absBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
     }
 }
 
@@ -1752,9 +1752,9 @@ public class ReduceL2Operator(OperatorRegistry reg) : IOnnxOperator
         int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         // Square input, ReduceSum, then Sqrt
         int count = ctx.Inputs[0].ElementCount;
-        using var sqBuf = reg.Accelerator.Allocate1D<float>(count);
-        reg.ElementWise.Mul(ctx.Inputs[0].Data, ctx.Inputs[0].Data, sqBuf.View, count);
-        reg.Reductions.ReduceSum(sqBuf.View, ctx.Outputs[0].Data, outer, reduce, inner);
+        var sqBuf = ctx.Pool.Rent(new[] { count });
+        reg.ElementWise.Mul(ctx.Inputs[0].Data, ctx.Inputs[0].Data, sqBuf.Data, count);
+        reg.Reductions.ReduceSum(sqBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
         int outCount = ctx.Outputs[0].ElementCount;
         reg.ElementWise.Sqrt(ctx.Outputs[0].Data, ctx.Outputs[0].Data, outCount);
     }
@@ -1779,9 +1779,9 @@ public class ReduceSumSquareOperator(OperatorRegistry reg) : IOnnxOperator
         int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
         int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         int count = ctx.Inputs[0].ElementCount;
-        using var sqBuf = reg.Accelerator.Allocate1D<float>(count);
-        reg.ElementWise.Mul(ctx.Inputs[0].Data, ctx.Inputs[0].Data, sqBuf.View, count);
-        reg.Reductions.ReduceSum(sqBuf.View, ctx.Outputs[0].Data, outer, reduce, inner);
+        var sqBuf = ctx.Pool.Rent(new[] { count });
+        reg.ElementWise.Mul(ctx.Inputs[0].Data, ctx.Inputs[0].Data, sqBuf.Data, count);
+        reg.Reductions.ReduceSum(sqBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
     }
 }
 
@@ -1828,9 +1828,9 @@ public class ReduceLogSumExpOperator(OperatorRegistry reg) : IOnnxOperator
         int reduce = 1; for (int i = firstAxis; i <= lastAxis; i++) reduce *= shape[i];
         int inner = 1; for (int i = lastAxis + 1; i < shape.Length; i++) inner *= shape[i];
         int count = ctx.Inputs[0].ElementCount;
-        using var expBuf = reg.Accelerator.Allocate1D<float>(count);
-        reg.ElementWise.Exp(ctx.Inputs[0].Data, expBuf.View, count);
-        reg.Reductions.ReduceSum(expBuf.View, ctx.Outputs[0].Data, outer, reduce, inner);
+        var expBuf = ctx.Pool.Rent(new[] { count });
+        reg.ElementWise.Exp(ctx.Inputs[0].Data, expBuf.Data, count);
+        reg.Reductions.ReduceSum(expBuf.Data, ctx.Outputs[0].Data, outer, reduce, inner);
         int outCount = ctx.Outputs[0].ElementCount;
         reg.ElementWise.Log(ctx.Outputs[0].Data, ctx.Outputs[0].Data, outCount);
     }

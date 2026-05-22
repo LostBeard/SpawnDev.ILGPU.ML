@@ -603,20 +603,22 @@ public class ConvIntegerOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < xAdj.Length; i++) xAdj[i] -= xZp;
         for (int i = 0; i < wAdj.Length; i++) wAdj[i] -= wZp;
 
-        // Upload adjusted data to standalone buffers (not pool SubViews — Conv2D kernel
-        // needs contiguous buffers starting at offset 0 for correct index computation)
-        using var xBufMem = reg.Accelerator.Allocate1D(xAdj);
-        using var wBufMem = reg.Accelerator.Allocate1D(wAdj);
-        using var zeroBias = reg.Accelerator.Allocate1D(new float[wShape[0]]); // Conv2D always reads bias — must provide zero-filled buffer
+        // Upload adjusted data via Pool.Rent — buffers stay alive past the WebGPU command encoder flush
+        var xBufMem = ctx.Pool.Rent(new[] { xAdj.Length });
+        xBufMem.Data.SubView(0, xAdj.Length).CopyFromCPU(xAdj);
+        var wBufMem = ctx.Pool.Rent(new[] { wAdj.Length });
+        wBufMem.Data.SubView(0, wAdj.Length).CopyFromCPU(wAdj);
+        var zeroBias = ctx.Pool.Rent(new[] { wShape[0] }); // Conv2D always reads bias — must provide zero-filled buffer
+        zeroBias.Data.SubView(0, wShape[0]).CopyFromCPU(new float[wShape[0]]);
         int stride = ctx.GetInts("strides", new[] { 1, 1 })[0];
         int pad = ctx.GetInts("pads", new int[4])[0];
         int oH = (xShape[2] + 2 * pad - wShape[2]) / stride + 1;
         int oW = (xShape[3] + 2 * pad - wShape[3]) / stride + 1;
-        using var outBufMem = reg.Accelerator.Allocate1D<float>(xShape[0] * wShape[0] * oH * oW);
-        reg.Conv2D.Forward(xBufMem.View, wBufMem.View, zeroBias.View, outBufMem.View,
+        var outBufMem = ctx.Pool.Rent(new[] { xShape[0] * wShape[0] * oH * oW });
+        reg.Conv2D.Forward(xBufMem.Data, wBufMem.Data, zeroBias.Data, outBufMem.Data,
             xShape[1], xShape[2], xShape[3], wShape[0], wShape[2], wShape[3], stride, pad);
-        int copyLen = Math.Min((int)outBufMem.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(outBufMem.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        int copyLen = Math.Min(outBufMem.ElementCount, ctx.Outputs[0].ElementCount);
+        reg.ElementWise.Scale(outBufMem.Data.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
     }
 }
 
@@ -738,22 +740,33 @@ public class QLinearConvOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < xDequant.Length; i++) xDequant[i] = (xDequant[i] - xZp) * xSc;
         for (int i = 0; i < wDequant.Length; i++) wDequant[i] = (wDequant[i] - wZp) * wSc;
 
-        // Upload to standalone buffers and run conv — Conv2D needs offset-0 contiguous buffers
-        using var xBufMem = reg.Accelerator.Allocate1D(xDequant);
-        using var wBufMem = reg.Accelerator.Allocate1D(wDequant);
+        // Upload via Pool.Rent — buffers stay alive past the WebGPU command encoder flush
+        var xBufMem = ctx.Pool.Rent(new[] { xDequant.Length });
+        xBufMem.Data.SubView(0, xDequant.Length).CopyFromCPU(xDequant);
+        var wBufMem = ctx.Pool.Rent(new[] { wDequant.Length });
+        wBufMem.Data.SubView(0, wDequant.Length).CopyFromCPU(wDequant);
         int stride = ctx.GetInts("strides", new[] { 1, 1 })[0];
         int pad = ctx.GetInts("pads", new int[4])[0];
         int oH = (xShape[2] + 2 * pad - wShape[2]) / stride + 1;
         int oW = (xShape[3] + 2 * pad - wShape[3]) / stride + 1;
-        using var outBufMem = reg.Accelerator.Allocate1D<float>(xShape[0] * wShape[0] * oH * oW);
+        var outBufMem = ctx.Pool.Rent(new[] { xShape[0] * wShape[0] * oH * oW });
         // Conv2D always reads bias — must provide valid buffer. Zero-fill if no bias provided.
         var hasBias = ctx.Inputs.Length > 8 && ctx.Inputs[8] != null;
-        using var zeroBias = hasBias ? null : reg.Accelerator.Allocate1D<float>(wShape[0]);
-        var biasView = hasBias ? ctx.Inputs[8].Data : zeroBias!.View;
-        reg.Conv2D.Forward(xBufMem.View, wBufMem.View, biasView, outBufMem.View,
+        ArrayView1D<float, Stride1D.Dense> biasView;
+        if (hasBias)
+        {
+            biasView = ctx.Inputs[8].Data;
+        }
+        else
+        {
+            var zeroBias = ctx.Pool.Rent(new[] { wShape[0] });
+            zeroBias.Data.SubView(0, wShape[0]).CopyFromCPU(new float[wShape[0]]);
+            biasView = zeroBias.Data;
+        }
+        reg.Conv2D.Forward(xBufMem.Data, wBufMem.Data, biasView, outBufMem.Data,
             xShape[1], xShape[2], xShape[3], wShape[0], wShape[2], wShape[3], stride, pad);
-        int copyLen = Math.Min((int)outBufMem.Length, ctx.Outputs[0].ElementCount);
-        reg.ElementWise.Scale(outBufMem.View.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
+        int copyLen = Math.Min(outBufMem.ElementCount, ctx.Outputs[0].ElementCount);
+        reg.ElementWise.Scale(outBufMem.Data.SubView(0, copyLen), ctx.Outputs[0].Data.SubView(0, copyLen), copyLen, 1f);
 
         // Requantize output: y_quant = (y_float / y_scale) + y_zero
         var yScale = ctx.TryGetInputValues(6);

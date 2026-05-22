@@ -631,9 +631,10 @@ public class DequantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
         if (zp != null)
         {
             // x - zero_point → temp, then temp * scale → output
-            using var temp = reg.Accelerator.Allocate1D<float>(count);
-            reg.ElementWise.Sub(x.Data, zp.Data, temp.View, count);
-            reg.ElementWise.Mul(temp.View, scale.Data, ctx.Outputs[0].Data, count);
+            // Pool.Rent (no name) keeps buffer alive until session dispose — safe for WebGPU command batching
+            var temp = ctx.Pool.Rent(x.Shape);
+            reg.ElementWise.Sub(x.Data, zp.Data, temp.Data, count);
+            reg.ElementWise.Mul(temp.Data, scale.Data, ctx.Outputs[0].Data, count);
         }
         else
         {
@@ -690,13 +691,13 @@ public class DynamicQuantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         // GPU path: reductions for min/max, then fused quantize kernel
-        using var maxBuf = reg.Accelerator.Allocate1D<float>(1);
-        using var minBuf = reg.Accelerator.Allocate1D<float>(1);
-        reg.Reductions.ReduceMax(input, maxBuf.View, 1, count, 1);
-        reg.Reductions.ReduceMin(input, minBuf.View, 1, count, 1);
+        var maxBuf = ctx.Pool.Rent(new[] { 1 });
+        var minBuf = ctx.Pool.Rent(new[] { 1 });
+        reg.Reductions.ReduceMax(input, maxBuf.Data, 1, count, 1);
+        reg.Reductions.ReduceMin(input, minBuf.Data, 1, count, 1);
         // Fused kernel: reads max/min scalars on GPU, computes scale/zp/quantized output
         reg.ElementWise.DynamicQuantize(input, ctx.Outputs[0].Data, ctx.Outputs[1].Data,
-            ctx.Outputs[2].Data, maxBuf.View, minBuf.View, count);
+            ctx.Outputs[2].Data, maxBuf.Data, minBuf.Data, count);
     }
 }
 
