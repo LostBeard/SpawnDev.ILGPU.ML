@@ -226,7 +226,7 @@ public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
             float x2 = roiVals[r * 5 + 3] * spatialScale;
             float y2 = roiVals[r * 5 + 4] * spatialScale;
 
-            float roiH = Math.Max(y2 - y1, 1f), roiW = Math.Max(x2 - x1, 1f);
+            float roiH = Math.Max(y2 - y1 + 1f, 1f), roiW = Math.Max(x2 - x1 + 1f, 1f);
             float binH = roiH / pH, binW = roiW / pW;
 
             for (int c = 0; c < C; c++)

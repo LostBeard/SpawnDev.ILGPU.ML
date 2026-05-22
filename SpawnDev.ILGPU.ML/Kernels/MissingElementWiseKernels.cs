@@ -298,7 +298,17 @@ public class MissingElementWiseKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             int, int>(TopKImpl);
-        _topKKernel(rows, input, outputValues, outputIndices, cols, k);
+        if (outputIndices.Length >= rows * k)
+        {
+            _topKKernel(rows, input, outputValues, outputIndices, cols, k);
+        }
+        else
+        {
+            // Caller passed empty/default view — allocate a temporary indices buffer
+            using var idxBuf = _accelerator.Allocate1D<int>(rows * k);
+            _topKKernel(rows, input, outputValues, idxBuf.View, cols, k);
+            _accelerator.Synchronize();
+        }
     }
 
     /// <summary>

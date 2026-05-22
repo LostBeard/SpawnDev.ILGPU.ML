@@ -72,10 +72,10 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         int signalLength = signalShape[1];
 
         // frame_step from input[1], frame_length from input[2] or attribute
-        int frameLength = 256; // default
         int frameStep = 128; // default
+        int frameLength = frameStep; // ONNX spec: defaults to frame_step when not provided
         if (inputs.Length > 2 && inputs[2].Length > 0)
-            frameLength = inputs[2][0]; // approximate from shape
+            frameLength = inputs[2][0]; // approximate from shape (window length = frame_length)
 
         int numFrames = (signalLength - frameLength) / frameStep + 1;
         int fftLength = onesided != 0 ? frameLength / 2 + 1 : frameLength;
@@ -92,7 +92,8 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         var frameStepVals = ctx.TryGetInputValues(1);
         if (frameStepVals != null && frameStepVals.Length > 0) frameStep = (int)frameStepVals[0];
         float[]? windowVals = ctx.Inputs.Length > 2 ? ctx.TryGetInputValues(2) : null;
-        int frameLength = windowVals?.Length ?? 256;
+        // ONNX spec: frame_length defaults to frame_step when not provided
+        int frameLength = windowVals?.Length ?? frameStep;
         if (ctx.Inputs.Length > 3)
         {
             var flVals = ctx.TryGetInputValues(3);
