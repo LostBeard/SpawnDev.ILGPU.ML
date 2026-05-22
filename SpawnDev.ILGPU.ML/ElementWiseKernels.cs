@@ -1030,11 +1030,11 @@ public class ElementWiseKernels : IDisposable
     }
 
     private static void DFTImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsArr)
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
-        // params: [N, dftLength, outputN, isComplex, inverse]
-        int N = paramsArr[0]; int dftLength = paramsArr[1]; int outputN = paramsArr[2];
-        int isComplex = paramsArr[3]; int inverse = paramsArr[4];
+        // params: [N, dftLength, outputN, isComplex, inverse] (float-stored, cast to int)
+        int N = (int)paramsArr[0]; int dftLength = (int)paramsArr[1]; int outputN = (int)paramsArr[2];
+        int isComplex = (int)paramsArr[3]; int inverse = (int)paramsArr[4];
         // idx = b * outputN + k
         int k = idx % outputN;
         int b = idx / outputN;
@@ -1389,7 +1389,7 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int>? _maxUnpoolKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _dftKernel;
+        ArrayView1D<float, Stride1D.Dense>>? _dftKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _col2ImKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -1498,7 +1498,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output, int inputCount, int outSize)
     { EnsureLoaded2(); _maxUnpoolKernel!(inputCount, vals, indices, output, outSize); }
     public void DFT(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalOutputBins)
+        ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutputBins)
     { EnsureLoaded2(); _dftKernel!(totalOutputBins, input, output, paramsBuf); }
     public void Col2Im(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalScatterOps)
@@ -1588,7 +1588,7 @@ public class ElementWiseKernels : IDisposable
         _maxUnpoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int>(MaxUnpoolImpl);
         _dftKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(DFTImpl);
+            ArrayView1D<float, Stride1D.Dense>>(DFTImpl);
         _col2ImKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(Col2ImImpl);
         _maxRoiPoolKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,

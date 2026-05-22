@@ -46,11 +46,11 @@ public class DFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         }
         int outputN = onesided != 0 ? dftLength / 2 + 1 : dftLength;
 
-        // GPU path: one thread per output frequency bin
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { N, dftLength, outputN, isComplex, inverse });
-        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf.View, batch * outputN);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        // Pool-rented float params (cast to int in kernel) — avoids Wasm int-buffer allocation races
+        var paramsData = new float[] { N, dftLength, outputN, isComplex, inverse };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf.Data, batch * outputN);
     }
 }
 
