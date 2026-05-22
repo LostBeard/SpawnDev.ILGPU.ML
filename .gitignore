@@ -374,3 +374,4 @@ SpawnDev.ILGPU.ML.Demo/wwwroot/models/distilbert-sst2/
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/gpt2/
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-tiny/
 **/distilgpt2/
+.aider*
