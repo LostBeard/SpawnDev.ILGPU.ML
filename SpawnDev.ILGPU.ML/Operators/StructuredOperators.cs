@@ -960,23 +960,48 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
         if (Kernels.ConcatKernel.CanHandle(ctx.Inputs.Length))
         {
             var output = ctx.Outputs[0].Data;
+
+            // WebGPU forbids binding the same GPU buffer to multiple read_write storage
+            // slots in one dispatch. ONNX models can list the same tensor twice in a
+            // Concat input (e.g. DA3-Small node ~196). Detect aliasing by comparing
+            // Tensor object references; copy any duplicate to a fresh pool buffer.
+            // Pool.Rent without a name: buffer lives in pool._allBuffers until session
+            // end — never disposed early, so WebGPU command-encoder references stay valid.
+            var views = new ArrayView1D<float, Stride1D.Dense>[ctx.Inputs.Length];
+            for (int n = 0; n < ctx.Inputs.Length; n++)
+                views[n] = ctx.Inputs[n].Data;
+            for (int i = 1; i < ctx.Inputs.Length; i++)
+            {
+                for (int j = 0; j < i; j++)
+                {
+                    if (object.ReferenceEquals(ctx.Inputs[i], ctx.Inputs[j]))
+                    {
+                        var src = ctx.Inputs[i];
+                        var copy = ctx.Pool.Rent(src.Shape);
+                        copy.Data.SubView(0, src.ElementCount).CopyFrom(src.Data.SubView(0, src.ElementCount));
+                        views[i] = copy.Data;
+                        break;
+                    }
+                }
+            }
+
             switch (ctx.Inputs.Length)
             {
                 case 2:
                     reg.Concat.Concat2(output,
-                        ctx.Inputs[0].Data, ctx.Inputs[1].Data,
+                        views[0], views[1],
                         outer, inner,
                         ctx.Inputs[0].Shape[axis], ctx.Inputs[1].Shape[axis]);
                     return;
                 case 3:
                     reg.Concat.Concat3(output,
-                        ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Inputs[2].Data,
+                        views[0], views[1], views[2],
                         outer, inner,
                         ctx.Inputs[0].Shape[axis], ctx.Inputs[1].Shape[axis], ctx.Inputs[2].Shape[axis]);
                     return;
                 case 4:
                     reg.Concat.Concat4(output,
-                        ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Inputs[2].Data, ctx.Inputs[3].Data,
+                        views[0], views[1], views[2], views[3],
                         outer, inner,
                         ctx.Inputs[0].Shape[axis], ctx.Inputs[1].Shape[axis],
                         ctx.Inputs[2].Shape[axis], ctx.Inputs[3].Shape[axis]);
