@@ -1508,8 +1508,7 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             }
             axes = Enumerable.Range(0, rank).ToArray();
         }
-        else if (ctx.Inputs.Length >= 3 && ctx.Inputs[1] != null
-            && ctx.TryGetInputValues(1) is float[] startsF && ctx.TryGetInputValues(2) is float[] endsF)
+        else if (ctx.TryGetInputValues(1) is float[] startsF && ctx.TryGetInputValues(2) is float[] endsF)
         {
             // Path 2: runtime constant values from tensor inputs
             // Clamp to int range — ONNX uses INT64_MAX (9.2e18) as "to end" sentinel
