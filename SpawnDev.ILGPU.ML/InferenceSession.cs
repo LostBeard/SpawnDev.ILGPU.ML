@@ -335,7 +335,7 @@ public class InferenceSession : IDisposable
     /// <summary>Detect model format from magic bytes.</summary>
     public static ModelFormat DetectModelFormat(byte[] data)
     {
-        if (data.Length < 8) return ModelFormat.Unknown;
+        if (data.Length < 4) return ModelFormat.Unknown;
 
         // GGUF: bytes 0-3 = "GGUF"
         if (data[0] == 'G' && data[1] == 'G' && data[2] == 'U' && data[3] == 'F')
@@ -383,6 +383,10 @@ public class InferenceSession : IDisposable
         // Could be ONNX, TF GraphDef, or CoreML — differentiate by structure
         if (data[0] == 0x08 || data[0] == 0x0A)
         {
+            // CoreML: field 1 (specificationVersion) is varint tag 0x08, version in range 1-10
+            if (CoreML.CoreMLParser.IsCoreML(data))
+                return ModelFormat.CoreML;
+
             // TFGraphDef starts with field 1 (node) = 0x0A, and the "onnx"/"pytorch" checks above
             // already returned ONNX if those strings were present. If we reach here with 0x0A and
             // TFGraphDefParser validates it, it's likely a frozen TF graph.

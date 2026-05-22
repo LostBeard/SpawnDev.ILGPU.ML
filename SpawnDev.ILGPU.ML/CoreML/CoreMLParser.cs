@@ -62,7 +62,7 @@ public static class CoreMLParser
     /// <summary>Check if data looks like a Core ML model (protobuf with spec version).</summary>
     public static bool IsCoreML(byte[] data)
     {
-        if (data.Length < 4) return false;
+        if (data.Length < 2) return false;
         // Field 1 (specificationVersion), varint type: tag = 0x08
         // Spec versions are typically 1-8
         return data[0] == 0x08 && data[1] >= 1 && data[1] <= 10;
