@@ -650,13 +650,13 @@ public class QuantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         // y = clamp(round(x / scale) + zero_point, qmin, qmax)
-        // Scale is always a scalar initializer. Read it as a constant to avoid OOB reads
-        // when using element-wise Div with a 1-element buffer against count>1.
-        var x = ctx.Inputs[0];
+        var x = ctx.Inputs[0]; var scale = ctx.Inputs[1];
         int count = x.ElementCount;
-        var scaleVals = ctx.TryGetInputValues(1);
-        float scaleVal = scaleVals != null && scaleVals.Length > 0 ? scaleVals[0] : 1f;
-        reg.ElementWise.Scale(x.Data, ctx.Outputs[0].Data, count, 1f / scaleVal);
+        int scaleCount = scale.ElementCount;
+        // Use Reciprocal + BroadcastMul to divide by scale safely (Div reads OOB for 1-element scale against count>1)
+        var recipScale = ctx.Pool.Rent(scale.Shape);
+        reg.ElementWise.Reciprocal(scale.Data, recipScale.Data, scaleCount);
+        reg.ElementWise.BroadcastMul(x.Data, recipScale.Data, ctx.Outputs[0].Data, count, scaleCount);
         reg.ElementWise.Round(ctx.Outputs[0].Data, ctx.Outputs[0].Data, count);
         // AddBias broadcasts zp[i % C] so 1-element zp tensor adds correctly to all positions
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
