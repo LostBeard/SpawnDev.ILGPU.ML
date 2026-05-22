@@ -104,19 +104,18 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         int fftOutputLen = onesided != 0 ? frameLength / 2 + 1 : frameLength;
         int totalBins = batch * numFrames * fftOutputLen;
 
-        // GPU path: upload window if available, one thread per output bin
+        // Use pool for all temp buffers: avoids inline Synchronize-then-dispose which races on Wasm
         int hasWindow = windowVals != null ? 1 : 0;
-        MemoryBuffer1D<float, Stride1D.Dense>? windowBuf = null;
+        var windowBuf = ctx.Pool.Rent(new[] { windowVals?.Length ?? 1 });
         if (windowVals != null)
-            windowBuf = reg.Accelerator.Allocate1D(windowVals);
-        else
-            windowBuf = reg.Accelerator.Allocate1D<float>(1); // dummy
+            windowBuf.Data.SubView(0, windowVals.Length).CopyFromCPU(windowVals);
 
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow });
-        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowBuf.View, ctx.Outputs[0].Data, paramsBuf.View, totalBins);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
-        windowBuf.Dispose();
+        // Params as float (STFTImpl casts to int) — avoids Wasm Int32Array alignment issues
+        var paramsData = new float[] { signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+
+        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowBuf.Data, ctx.Outputs[0].Data, paramsBuf.Data, totalBins);
     }
 }
 

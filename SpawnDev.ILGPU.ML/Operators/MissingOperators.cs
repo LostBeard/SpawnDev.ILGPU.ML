@@ -64,7 +64,11 @@ public class TopKOperator : IOnnxOperator
         int lastDim = input.Shape[^1];
         int rows = input.ElementCount / lastDim;
         int k = outputValues.Shape[^1];
-        _kernels.TopK(input.Data, outputValues.Data, default, rows, lastDim, k);
+        // Pass indices output if present; kernel stores indices as float (avoids Wasm Int32Array issues)
+        var idxView = ctx.Outputs.Length > 1 && ctx.Outputs[1] != null
+            ? ctx.Outputs[1].Data
+            : default(ArrayView1D<float, Stride1D.Dense>);
+        _kernels.TopK(input.Data, outputValues.Data, idxView, rows, lastDim, k);
     }
 }
 

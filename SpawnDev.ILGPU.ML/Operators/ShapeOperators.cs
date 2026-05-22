@@ -654,14 +654,16 @@ public class QuantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
         int count = x.ElementCount;
         int scaleCount = scale.ElementCount;
         // Use Reciprocal + BroadcastMul to divide by scale safely (Div reads OOB for 1-element scale against count>1)
+        // temp avoids WebGPU aliasing: Round/Clip need separate input/output buffers (same buffer = validation error)
         var recipScale = ctx.Pool.Rent(scale.Shape);
+        var temp = ctx.Pool.Rent(x.Shape);
         reg.ElementWise.Reciprocal(scale.Data, recipScale.Data, scaleCount);
         reg.ElementWise.BroadcastMul(x.Data, recipScale.Data, ctx.Outputs[0].Data, count, scaleCount);
-        reg.ElementWise.Round(ctx.Outputs[0].Data, ctx.Outputs[0].Data, count);
+        reg.ElementWise.Round(ctx.Outputs[0].Data, temp.Data, count);
         // AddBias broadcasts zp[i % C] so 1-element zp tensor adds correctly to all positions
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
-            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[2].Data, count, ctx.Inputs[2].ElementCount);
-        reg.ElementWise.Clip(ctx.Outputs[0].Data, ctx.Outputs[0].Data, count, 0f, 255f);
+            reg.ElementWise.AddBias(temp.Data, ctx.Inputs[2].Data, count, ctx.Inputs[2].ElementCount);
+        reg.ElementWise.Clip(temp.Data, ctx.Outputs[0].Data, count, 0f, 255f);
     }
 }
 

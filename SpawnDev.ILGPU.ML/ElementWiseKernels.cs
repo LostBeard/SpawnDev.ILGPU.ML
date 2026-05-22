@@ -1100,11 +1100,11 @@ public class ElementWiseKernels : IDisposable
 
     private static void STFTImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> signal,
         ArrayView1D<float, Stride1D.Dense> window, ArrayView1D<float, Stride1D.Dense> output,
-        ArrayView1D<int, Stride1D.Dense> paramsArr)
+        ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
-        // params: [signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow]
-        int signalLength = paramsArr[0]; int frameStep = paramsArr[1]; int frameLength = paramsArr[2];
-        int fftOutputLen = paramsArr[3]; int numFrames = paramsArr[4]; int hasWindow = paramsArr[5];
+        // params: [signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow] (float-stored, cast to int)
+        int signalLength = (int)paramsArr[0]; int frameStep = (int)paramsArr[1]; int frameLength = (int)paramsArr[2];
+        int fftOutputLen = (int)paramsArr[3]; int numFrames = (int)paramsArr[4]; int hasWindow = (int)paramsArr[5];
         // idx = b * numFrames * fftOutputLen + f * fftOutputLen + k
         int tmp = idx;
         int k = tmp % fftOutputLen; tmp /= fftOutputLen;
@@ -1396,7 +1396,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>>? _maxRoiPoolKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _stftKernel;
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _stftKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _cumSumKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -1508,7 +1508,7 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> fparamsBuf, int totalOutput)
     { EnsureLoaded2(); _maxRoiPoolKernel!(totalOutput, input, rois, output, paramsBuf, fparamsBuf); }
     public void STFT(ArrayView1D<float, Stride1D.Dense> signal, ArrayView1D<float, Stride1D.Dense> window,
-        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<int, Stride1D.Dense> paramsBuf, int totalBins)
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalBins)
     { EnsureLoaded2(); _stftKernel!(totalBins, signal, window, output, paramsBuf); }
     public void CumSum(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<int, Stride1D.Dense> paramsBuf, int outerTimesInner)
@@ -1595,7 +1595,7 @@ public class ElementWiseKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(MaxRoiPoolImpl);
         _stftKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(STFTImpl);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(STFTImpl);
         _cumSumKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(CumSumImpl);
         _deformConvKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,

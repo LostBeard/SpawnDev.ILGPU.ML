@@ -29,8 +29,10 @@ public class MissingElementWiseKernels : IDisposable
     // Expand (broadcast copy)
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _expandKernel;
 
-    // TopK
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _topKKernel;
+    // TopK (indices stored as float to avoid Wasm Int32Array alignment issues)
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _topKKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _topKIdxBuf;
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldTopKIdxBufs = new();
 
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
     // Deferred disposal: see TransposeKernel for the rationale (WebGPU
@@ -44,6 +46,9 @@ public class MissingElementWiseKernels : IDisposable
         _paramsBuf?.Dispose();
         foreach (var buf in _oldParamsBufs) buf.Dispose();
         _oldParamsBufs.Clear();
+        _topKIdxBuf?.Dispose();
+        foreach (var buf in _oldTopKIdxBufs) buf.Dispose();
+        _oldTopKIdxBufs.Clear();
     }
 
     // ──────────────────────────────────────────────
@@ -244,10 +249,11 @@ public class MissingElementWiseKernels : IDisposable
     /// Input: [rows, cols], Output values: [rows, K], Output indices: [rows, K]
     /// Uses simple selection (fine for K ≤ ~50, which covers all ML use cases).
     /// </summary>
+    // Indices stored as float to avoid Wasm Int32Array alignment issues; caller gets float-cast ints
     private static void TopKImpl(Index1D rowIdx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> outputValues,
-        ArrayView1D<int, Stride1D.Dense> outputIndices,
+        ArrayView1D<float, Stride1D.Dense> outputIndices,
         int cols, int k)
     {
         int rowStart = rowIdx * cols;
@@ -264,11 +270,10 @@ public class MissingElementWiseKernels : IDisposable
                 float val = input[rowStart + c];
                 if (val > bestVal)
                 {
-                    // Check if this index was already selected
                     bool alreadySelected = false;
                     for (int prev = 0; prev < ki; prev++)
                     {
-                        if (outputIndices[outStart + prev] == c)
+                        if ((int)outputIndices[outStart + prev] == c)
                         {
                             alreadySelected = true;
                             break;
@@ -283,32 +288,39 @@ public class MissingElementWiseKernels : IDisposable
             }
 
             outputValues[outStart + ki] = bestVal;
-            outputIndices[outStart + ki] = bestIdx;
+            outputIndices[outStart + ki] = (float)bestIdx;
         }
     }
 
     public void TopK(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> outputValues,
-        ArrayView1D<int, Stride1D.Dense> outputIndices,
+        ArrayView1D<float, Stride1D.Dense> outputIndices,
         int rows, int cols, int k)
     {
         _topKKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
             int, int>(TopKImpl);
+
+        ArrayView1D<float, Stride1D.Dense> idxView;
         if (outputIndices.Length >= rows * k)
         {
-            _topKKernel(rows, input, outputValues, outputIndices, cols, k);
+            idxView = outputIndices;
         }
         else
         {
-            // Caller passed empty/default view — allocate a temporary indices buffer
-            using var idxBuf = _accelerator.Allocate1D<int>(rows * k);
-            _topKKernel(rows, input, outputValues, idxBuf.View, cols, k);
-            _accelerator.Synchronize();
+            // Persist the temp buffer — no using/Synchronize-inside-Execute (unsafe on Wasm async dispatch)
+            int needed = rows * k;
+            if (_topKIdxBuf == null || _topKIdxBuf.Length < needed)
+            {
+                if (_topKIdxBuf != null) _oldTopKIdxBufs.Add(_topKIdxBuf);
+                _topKIdxBuf = _accelerator.Allocate1D<float>(needed);
+            }
+            idxView = _topKIdxBuf.View;
         }
+        _topKKernel(rows, input, outputValues, idxView, cols, k);
     }
 
     /// <summary>
