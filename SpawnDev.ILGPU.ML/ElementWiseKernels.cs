@@ -1710,7 +1710,7 @@ public class ElementWiseKernels : IDisposable
     private static float SoftsignOp(float x) => x / (1f + MathF.Abs(x));
     private static float MishOp(float x) => x * MathF.Tanh(MathF.Log(1f + MathF.Exp(x)));
     private static float ThresholdedReluOp(float x) => x > 1f ? x : 0f; // default alpha=1
-    internal static float ShrinkOp(float x) => x > 0.5f ? x - 0.5f : x < -0.5f ? x + 0.5f : 0f; // default bias=0, lambd=0.5
+    internal static float ShrinkOp(float x) => x > 0.5f ? x : x < -0.5f ? x : 0f; // default lambd=0.5, bias=0 — output is x unchanged outside threshold
     // float.IsInfinity generates invalid GLSL on WebGL — use comparison instead
     private static float IsInfOp(float x) => (x == float.PositiveInfinity || x == float.NegativeInfinity) ? 1f : 0f;
 
