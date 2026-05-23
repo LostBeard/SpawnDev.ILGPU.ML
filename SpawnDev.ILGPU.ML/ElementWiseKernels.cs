@@ -1283,11 +1283,18 @@ public class ElementWiseKernels : IDisposable
 
     private static void MaxUnpoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> vals,
         ArrayView1D<float, Stride1D.Dense> indices, ArrayView1D<float, Stride1D.Dense> output,
-        int outSize)
+        int inputCount)
     {
-        int targetIdx = (int)indices[idx];
-        if (targetIdx >= 0 && targetIdx < outSize)
-            output[targetIdx] = vals[idx];
+        // One thread per output position (gather, not scatter — WebGL TF compatible).
+        // ONNX MaxUnpool guarantees each output position is the target of at most one
+        // input index (it's the inverse of MaxPool), so we can simply scan and overwrite.
+        // No early-break — keeps codegen uniform across WGSL / GLSL / Wasm.
+        float val = 0f;
+        for (int i = 0; i < inputCount; i++)
+        {
+            if ((int)indices[i] == idx) val = vals[i];
+        }
+        output[idx] = val;
     }
 
     private static void HardmaxImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
@@ -1496,7 +1503,7 @@ public class ElementWiseKernels : IDisposable
     { EnsureLoaded2(); _reverseSequenceKernel!(totalElements, input, output, seqLens, paramsBuf); }
     public void MaxUnpool(ArrayView1D<float, Stride1D.Dense> vals, ArrayView1D<float, Stride1D.Dense> indices,
         ArrayView1D<float, Stride1D.Dense> output, int inputCount, int outSize)
-    { EnsureLoaded2(); _maxUnpoolKernel!(inputCount, vals, indices, output, outSize); }
+    { EnsureLoaded2(); _maxUnpoolKernel!(outSize, vals, indices, output, inputCount); }
     public void DFT(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> paramsBuf, int totalOutputBins)
     { EnsureLoaded2(); _dftKernel!(totalOutputBins, input, output, paramsBuf); }
