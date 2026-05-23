@@ -65,7 +65,20 @@ public static class CoreMLParser
         if (data.Length < 2) return false;
         // Field 1 (specificationVersion), varint type: tag = 0x08
         // Spec versions are typically 1-8
-        return data[0] == 0x08 && data[1] >= 1 && data[1] <= 10;
+        if (!(data[0] == 0x08 && data[1] >= 1 && data[1] <= 10)) return false;
+
+        // Disambiguate from ONNX: ONNX ModelProto also starts with field 1 (ir_version),
+        // varint values 1-10, identical wire bytes. ONNX's defining structural marker is
+        // field 7 (graph, length-delimited) -> tag byte 0x3A, typically the next tag after
+        // ir_version. Refuse the CoreML verdict if 0x3A appears as the next protobuf tag
+        // (either at index 2 for a 1-byte version varint, or at index 3 if the version
+        // continued — though spec versions <128 always fit in 1 byte). Without this guard,
+        // many real-world ONNX models (those whose producer string sits past the 64-byte
+        // marker-scan window) were misclassified as CoreML and ended up with placeholder
+        // input/output names of "input"/"output", silently breaking inference.
+        if (data.Length >= 3 && data[2] == 0x3A) return false;
+
+        return true;
     }
 
     /// <summary>Get a summary string.</summary>
