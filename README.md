@@ -29,6 +29,22 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 - **P2P Model Delivery + Shared Compute** — [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) integration for decentralized model delivery via BitTorrent. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
 
+## What's verified in `4.0.0-preview.3`
+
+Five demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + OpenCL — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries:
+
+| Demo | Model | Pipeline |
+|------|-------|----------|
+| ![Classification — Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_Classification-Cat.jpg) | **Image classification** — SqueezeNet 1.1 | `ClassificationPipeline` |
+| ![Depth Anything V2 — House](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_DepthAnythingV2-House.jpg) | **Monocular depth estimation** — Depth Anything V2 Small (95MB) | `DepthEstimationPipeline` |
+| ![Style Transfer — Mosaic Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_StyleTransfer-CatMosaic.jpg) | **Neural style transfer** — Mosaic ONNX Model Zoo | `StyleTransferPipeline` |
+| ![Background Removal — Person](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_BackgroundRemoval-Person.jpg) | **Background removal** — RMBG-1.4 | `BackgroundRemovalPipeline` |
+| ![Super Resolution — Tree](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_SuperResolution-Tree.jpg) | **3x super-resolution** — ESPCN, tile-based with color and source-aspect preservation | `SuperResolutionPipeline` |
+
+Every result above is rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
+
+11 more pipelines exist in the codebase (object detection, pose, face, NLP, diffusion, TTS, 3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
+
 ## Universal Model Loading
 
 One API loads models from any ML ecosystem. Format is auto-detected from magic bytes — no configuration needed.
@@ -60,6 +76,51 @@ var session = InferenceSession.CreateFromSafeTensors(accelerator, safetensorByte
 var session = InferenceSession.CreateFromPyTorch(accelerator, ptBytes);
 var session = InferenceSession.CreateFromCoreML(accelerator, mlmodelBytes);
 var session = InferenceSession.CreateFromTFGraphDef(accelerator, pbBytes);
+```
+
+## Transformers.js-style API — `Tensor<T>`, `OwnedTensor<T>`, `RunOwnedAsync`
+
+If you've used [Transformers.js](https://huggingface.co/docs/transformers.js) or ONNX Runtime, the input/output ergonomics will feel familiar. Models accept named `Tensor<T>` inputs and return an `OwnedTensorMap<T>` — a disposable bag of named outputs. Caller owns every output buffer, and `using` cleans them up in one go.
+
+```csharp
+using var session = await InferenceSession.CreateFromFileAsync(
+    accelerator, http, "models/squeezenet/model.onnx");
+
+// Allocate the model input as an OwnedTensor — wraps a fresh GPU buffer.
+// FromHost copies the host pixels to the accelerator in one shot.
+using var input = OwnedTensor<float>.FromHost(
+    accelerator, pixels, new[] { 1, 3, 224, 224 });
+
+// Transformers.js-style call. Inputs are Tensor<float> (OwnedTensor converts
+// implicitly). Outputs come back as OwnedTensorMap<float> — each output tensor
+// is in its own freshly-allocated GPU buffer, independent of the session's
+// internal pool. Run B will not mutate Run A's outputs.
+using var outputs = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>>
+{
+    [session.InputNames[0]] = input,
+});
+
+var logits = outputs[session.OutputNames[0]]; // OwnedTensor<float>
+var hostLogits = await logits.ToHostAsync();   // copy back to CPU when needed
+```
+
+Under the hood there are three types, mirroring the split ILGPU itself uses between `MemoryBuffer<T>` (class, lifetime-managing) and `ArrayView<T>` (struct, kernel-passable):
+
+- **`Tensor<T>`** — host-side reference type, shape-tracked view over an `ArrayView1D<T, Stride1D.Dense>`. Reshape / Slice / SubTensor are zero-copy. Generic over `T : unmanaged` (float, int, Half, etc.).
+- **`OwnedTensor<T>`** — `IDisposable` wrapper that owns a `MemoryBuffer1D<T>`. What pipelines return. Implicit conversions to `Tensor<T>` and `TensorView<T>` mean you never have to write `.AsTensor` or `.View` at a call site.
+- **`TensorView<T>`** — blittable struct, passable directly to ILGPU kernels. Inline `D0..D3` + `Rank`. Replaces the old "pass an ArrayView + four shape ints" idiom. Kernel authors write `Get4D(n, c, h, w)` instead of doing manual row-major stride math.
+
+```csharp
+// Kernel takes the tensor directly — no scalar W/H parameters.
+private static void DoubleKernel(Index1D idx,
+    TensorView<float> input, TensorView<float> output)
+{
+    int w = idx % input.D3;
+    int h = (idx / input.D3) % input.D2;
+    int c = (idx / (input.D3 * input.D2)) % input.D1;
+    int n = idx / (input.D3 * input.D2 * input.D1);
+    output.Set4D(n, c, h, w, input.Get4D(n, c, h, w) * 2f);
+}
 ```
 
 ### Format Details
@@ -524,6 +585,18 @@ The P2P network we're building for model delivery creates a natural foundation f
 - **Volunteer compute pools** — Users opt in to donate idle GPU time. Like Folding@Home for ML inference in the browser.
 
 This is massive AI power brought into the home by utilizing every device you own.
+
+## Support this project — sponsor the crew
+
+This library exists because one person — [@LostBeard](https://github.com/LostBeard) — and a small team have spent months hand-writing native C# GPU kernels, six-backend transpilers, and ML pipelines while running on a **$20/month** budget.
+
+When the budget allows it, peak output looks like **410 commits in a single day** across SpawnDev.ILGPU, SpawnDev.ILGPU.ML, SpawnDev.BlazorJS, SpawnDev.RTC, SpawnDev.WebTorrent, and the rest of the SpawnDev stack. When the budget doesn't, work slows to whatever individual evenings can spare.
+
+**We're asking for $200/month total in GitHub Sponsorships to put the full crew back on the ship.** That's the difference between this preview release and the next ten — every operator family migrated to the new Tensor API, the remaining pipelines verified end-to-end on every backend, FP16 attention, Flash Attention on WebGPU, Llama and Phi-4 LLM inference, full text-to-image diffusion, voice-driven 3D generation, P2P distributed compute through SpawnDev.WebTorrent. It's all in flight; the bottleneck is hours, not ideas.
+
+[**→ Sponsor on GitHub**](https://github.com/sponsors/LostBeard) — any amount helps; $200/month total gets us back to warp speed.
+
+You can also star the repo, file issues from your own models, contribute kernel migrations, or talk about the project anywhere developers gather. Visibility is the second-most-valuable thing after sponsorship dollars.
 
 ## License
 

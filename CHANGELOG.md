@@ -2,6 +2,37 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.4 (2026-05-23) — Transformers.js-style Tensor API + /depth GPU-direct rendering + palette swap on accelerator
+
+### Headline: native C# Tensor types
+
+Three new types under `SpawnDev.ILGPU.ML.Tensors` give the library a Transformers.js / ONNX-Runtime-style API surface while preserving the zero-cost GPU paths C# can actually deliver:
+
+- **`Tensor<T>`** (class, generic over `T : unmanaged`) — host-side shape-tracked view over an accelerator buffer. Reshape / Slice / SubTensor zero-copy. The legacy non-generic `Tensor` stays for backwards compatibility and now exposes a `.View` property returning `TensorView<float>`.
+- **`OwnedTensor<T>`** (`IDisposable`) — owns a `MemoryBuffer1D<T>` and disposes it. Composition over inheritance: holds an internal `Tensor<T>`, exposes it through `.AsTensor`, exposes the kernel view through `.View`. Implicit conversions to both types so call sites stay clean. Factories `Allocate(accelerator, shape)` and `FromHost(accelerator, data, shape)`.
+- **`TensorView<T>`** (struct, blittable) — kernel-passable. Inline `D0..D3 + Rank` ints (no managed array). Generic over `T : unmanaged`. Indexers `Get1D..Get4D` / `Set1D..Set4D` compute row-major strides inline so kernels stop having to take a 6-parameter shape signature.
+- **`OwnedTensorMap<T>`** (`IDisposable`) — named-tensor output bag. Used as the return type of `InferenceSession.RunOwnedAsync`. `using var outputs = await session.RunOwnedAsync(...)` disposes every contained tensor in one go when the map goes out of scope.
+
+`InferenceSession.RunOwnedAsync(IDictionary<string, Tensor<float>>) → Task<OwnedTensorMap<float>>` is the headline new method. Inputs are `Tensor<float>` views (`OwnedTensor<float>` converts implicitly). Outputs are each copied off the executor's pool-managed buffer to a fresh caller-owned buffer (GPU-to-GPU `CopyFrom`, no host readback) so subsequent runs cannot mutate previously-returned tensors. The legacy `RunAsync(Dictionary<string, Tensor>)` is unchanged; migration is opt-in per consumer.
+
+### Phase 2 kernel migrations (proof-of-concept)
+
+`ImagePostprocessKernel.ResizeBilinear` and `ImagePostprocessKernel.DepthToColormapPalette` now both expose `TensorView<T>` overloads alongside their legacy raw-`ArrayView` signatures. Kernels read source/dest dimensions directly from the tensor view; the host-side call-site stops having to keep `(srcW, srcH, dstW, dstH)` straight. `DepthEstimationPipeline` migrated to both new overloads. Other shape-heavy kernels (`SuperResCompositeYCbCr`, `AccumulateYTile`, Conv2D, attention) follow in subsequent previews.
+
+### /depth: GPU-direct rendering via `ICanvasRenderer`
+
+The depth demo no longer produces a base64 PNG data URL for display. `DepthPage` instantiates `CanvasRendererFactory.Create(accelerator)` (backend-optimized: WebGPU texture copy / WebGL blit / CPU `putImageData`), attaches it to the `BeforeAfterSlider`'s After-side `<canvas>`, and calls `ICanvasRenderer.PresentAsync(buffer)` — the GPU buffer renders straight to the page with zero PNG encode, zero base64 string, zero `Blob` shuffling, zero host readback of any rendered pixel data.
+
+### /depth: palette swap is one kernel dispatch
+
+`ImagePostprocessKernel.DepthToColormapPalette` now takes a palette index parameter (plasma / viridis / inferno / grayscale) and branches into the appropriate piecewise-linear interpolation inline. `PaletteFromName(string)` does the UI-string → int translation. `DepthEstimationPipeline.EstimateGpuRawAsync` returns a raw depth GPU buffer + min/max scalars; `DepthEstimationPipeline.ApplyColormapGpuAsync` applies the colormap kernel with any palette against that cached raw depth. Result: the dropdown is one accelerator dispatch + one `PresentAsync`. No re-inference, no host readback of depth values.
+
+### Dependencies (unchanged from preview.2)
+
+- `SpawnDev.ILGPU` 4.9.8
+- `SpawnDev.WebTorrent` 2.3.1
+- `Microsoft.AspNetCore.Components.Web` 10.0.4
+
 ## 4.0.0-preview.3 (2026-05-23) — SuperResolutionPipeline: real tile-based super-resolution + /remove-bg slider rendering fix
 
 ### Fixes
