@@ -128,10 +128,19 @@ public class SelectiveScanKernel
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int>(MIMOScanImpl);
-        _mimoScanKernel(batchSize * dModel, x, A, B, C, output, state,
+        // One thread per (batch, t, dim) output position — gather-only, WebGL TF compatible.
+        _mimoScanKernel(batchSize * seqLen * dModel, x, A, B, C, output, state,
             batchSize, seqLen, dState, dModel);
     }
 
+    /// <summary>
+    /// One thread per (batch, t, dim) output position. Mirrors the SISO ScanImpl
+    /// gather rewrite but adds the dModel dimension. Each thread recomputes the
+    /// prefix scan from k=0..t for its (b, dim) lane and contracts against C at t.
+    /// O(seqLen²·dState) per (batch, dim) instead of O(seqLen·dState) sequential,
+    /// in exchange for correct output on WebGL Transform Feedback + far more
+    /// parallelism (seqLen× more threads).
+    /// </summary>
     private static void MIMOScanImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> x,
         ArrayView1D<float, Stride1D.Dense> A,
@@ -141,29 +150,26 @@ public class SelectiveScanKernel
         ArrayView1D<float, Stride1D.Dense> state,
         int batchSize, int seqLen, int dState, int dModel)
     {
-        int batch = idx / dModel;
+        // idx = (b * seqLen + t) * dModel + dim — matches the output layout, so
+        // output[idx] is the thread's own scalar position (no scatter).
         int dim = idx % dModel;
-        int stateOffset = (batch * dModel + dim) * dState;
+        int bsht = idx / dModel;
+        int t = bsht % seqLen;
+        int b = bsht / seqLen;
 
+        float y = 0f;
         for (int s = 0; s < dState; s++)
-            state[stateOffset + s] = 0f;
-
-        for (int t = 0; t < seqLen; t++)
         {
-            float xVal = x[(batch * seqLen + t) * dModel + dim];
-            for (int s = 0; s < dState; s++)
+            float a = A[s];
+            float h = 0f;
+            for (int k = 0; k <= t; k++)
             {
-                int bIdx = (batch * seqLen + t) * dState + s;
-                state[stateOffset + s] = A[s] * state[stateOffset + s] + B[bIdx] * xVal;
+                float xVal = x[(b * seqLen + k) * dModel + dim];
+                h = a * h + B[(b * seqLen + k) * dState + s] * xVal;
             }
-            float y = 0f;
-            for (int s = 0; s < dState; s++)
-            {
-                int cIdx = (batch * seqLen + t) * dState + s;
-                y += C[cIdx] * state[stateOffset + s];
-            }
-            output[(batch * seqLen + t) * dModel + dim] = y;
+            y += C[(b * seqLen + t) * dState + s] * h;
         }
+        output[idx] = y;
     }
 
     /// <summary>

@@ -34,15 +34,22 @@ public class GroupNormKernel
         int batchSize, int channels, int spatial, int numGroups,
         float epsilon = 1e-5f)
     {
-        // One thread per (batch, group) pair
+        // One thread per output element — gather-only, WebGL TF compatible.
         _groupNormKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int, float>(GroupNormImpl);
-        _groupNormKernel(batchSize * numGroups, input, output, weight, bias,
+        _groupNormKernel(batchSize * channels * spatial, input, output, weight, bias,
             batchSize, channels, spatial, numGroups, epsilon);
     }
 
+    /// <summary>
+    /// One thread per output position. Each thread recomputes its group's mean+variance
+    /// (groupSize reads) and produces its single scalar output. Replaces a scatter pattern
+    /// where one (batch, group) thread wrote (channelsPerGroup * spatial) outputs — that
+    /// pattern is silently dropped by WebGL Transform Feedback. Total work is the same
+    /// arithmetic intensity; just redistributed across many more threads.
+    /// </summary>
     private static void GroupNormImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
@@ -50,47 +57,32 @@ public class GroupNormKernel
         ArrayView1D<float, Stride1D.Dense> bias,
         int B, int C, int S, int G, float eps)
     {
-        int batch = idx / G;
-        int group = idx % G;
+        // Decode idx → (batch, channel, s)
+        int s = idx % S;
+        int bc = idx / S;
+        int channel = bc % C;
+        int batch = bc / C;
         int channelsPerGroup = C / G;
-        int groupSize = channelsPerGroup * S; // elements per group
+        int group = channel / channelsPerGroup;
+        int groupSize = channelsPerGroup * S;
+        int groupBase = batch * C * S + group * channelsPerGroup * S;
 
-        // Compute mean over group
+        // Compute mean over the whole (batch, group)
         float sum = 0f;
-        for (int c = 0; c < channelsPerGroup; c++)
-        {
-            int channelIdx = group * channelsPerGroup + c;
-            int offset = batch * C * S + channelIdx * S;
-            for (int s = 0; s < S; s++)
-                sum += input[offset + s];
-        }
+        for (int gi = 0; gi < groupSize; gi++)
+            sum += input[groupBase + gi];
         float mean = sum / groupSize;
 
-        // Compute variance over group
+        // Compute variance
         float varSum = 0f;
-        for (int c = 0; c < channelsPerGroup; c++)
+        for (int gi = 0; gi < groupSize; gi++)
         {
-            int channelIdx = group * channelsPerGroup + c;
-            int offset = batch * C * S + channelIdx * S;
-            for (int s = 0; s < S; s++)
-            {
-                float diff = input[offset + s] - mean;
-                varSum += diff * diff;
-            }
+            float diff = input[groupBase + gi] - mean;
+            varSum += diff * diff;
         }
         float invStd = 1f / MathF.Sqrt(varSum / groupSize + eps);
 
-        // Normalize + affine transform (per-channel weight and bias)
-        for (int c = 0; c < channelsPerGroup; c++)
-        {
-            int channelIdx = group * channelsPerGroup + c;
-            int offset = batch * C * S + channelIdx * S;
-            float w = weight[channelIdx];
-            float b = bias[channelIdx];
-            for (int s = 0; s < S; s++)
-            {
-                output[offset + s] = w * (input[offset + s] - mean) * invStd + b;
-            }
-        }
+        // Normalize + affine for this single element
+        output[idx] = weight[channel] * (input[idx] - mean) * invStd + bias[channel];
     }
 }

@@ -1201,8 +1201,8 @@ public class HardmaxOperator(OperatorRegistry reg) : IOnnxOperator
 
         if (inner == 1)
         {
-            // GPU path: each thread handles one outer×inner batch, argmax across axisSize
-            reg.ElementWise.Hardmax(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer, axisSize);
+            // GPU path: one thread per output element — gather, WebGL TF compatible
+            reg.ElementWise.Hardmax(ctx.Inputs[0].Data, ctx.Outputs[0].Data, outer * axisSize, axisSize);
         }
         else
         {

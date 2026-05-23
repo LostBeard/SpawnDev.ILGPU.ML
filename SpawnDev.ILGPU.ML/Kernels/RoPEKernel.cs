@@ -40,11 +40,13 @@ public class RoPEKernel
         ArrayView1D<float, Stride1D.Dense> output,
         int numPositions, int headDim, int startPosition = 0)
     {
-        int halfDim = headDim / 2;
+        // One thread per scalar output (gather, not scatter — WebGL TF compatible).
+        // idx = pos * headDim + k. Doubles the thread count vs the prior pair-per-thread
+        // launch, but each thread now writes exactly one position (its own idx).
         _ropeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, float>(RoPEImpl);
-        _ropeKernel(numPositions * halfDim, input, output,
+        _ropeKernel(numPositions * headDim, input, output,
             numPositions, headDim, startPosition, _base);
     }
 
@@ -63,26 +65,26 @@ public class RoPEKernel
         ArrayView1D<float, Stride1D.Dense> output,
         int numPos, int D, int startPos, float ropeBase)
     {
+        // idx = (pos * D + k)
         int halfD = D / 2;
-        int pos = idx / halfD + startPos;
-        int dimIdx = idx % halfD;
+        int k = idx % D;
+        int pos = idx / D + startPos;
+        // Both halves share the same dimIdx in [0, halfD); first-half outputs cos-sin,
+        // second-half outputs sin+cos. The two inputs needed are always at k_low and k_low+halfD.
+        bool secondHalf = k >= halfD;
+        int dimIdx = secondHalf ? k - halfD : k;
 
         // Frequency: θ = pos / base^(2*dimIdx/D)
         float freqExp = 2f * dimIdx / (float)D;
         float invFreq = 1f / MathF.Pow(ropeBase, freqExp);
         float theta = pos * invFreq;
-
         float cosTheta = MathF.Cos(theta);
         float sinTheta = MathF.Sin(theta);
 
-        // Half-split layout: pairs at [i] and [i + D/2]
-        // This matches PyTorch's standard apply_rotary_emb
-        int rowStart = (idx / halfD) * D;
-
-        float x0 = input[rowStart + dimIdx];           // first half
-        float x1 = input[rowStart + dimIdx + halfD];   // second half
-
-        output[rowStart + dimIdx]          = x0 * cosTheta - x1 * sinTheta;
-        output[rowStart + dimIdx + halfD]  = x0 * sinTheta + x1 * cosTheta;
+        int rowStart = (idx / D) * D;
+        float x0 = input[rowStart + dimIdx];          // first half
+        float x1 = input[rowStart + dimIdx + halfD];  // second half
+        output[idx] = secondHalf ? (x0 * sinTheta + x1 * cosTheta)
+                                 : (x0 * cosTheta - x1 * sinTheta);
     }
 }

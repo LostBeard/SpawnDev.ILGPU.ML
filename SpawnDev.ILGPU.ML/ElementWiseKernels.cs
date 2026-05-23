@@ -1323,17 +1323,21 @@ public class ElementWiseKernels : IDisposable
     private static void HardmaxImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int axisSize)
     {
-        // idx = outer batch index, each batch has axisSize elements
-        int offset = idx * axisSize;
+        // One thread per output element (gather, not scatter — WebGL TF compatible).
+        // idx = outer * axisSize + i.
+        int i = idx % axisSize;
+        int outerIdx = idx / axisSize;
+        int offset = outerIdx * axisSize;
+        // Re-find the argmax for this row (axisSize reads per thread — same arithmetic
+        // intensity as the prior single-thread-per-batch loop, but parallelized across i).
         float maxVal = input[offset];
         int maxIdx = 0;
-        for (int i = 1; i < axisSize; i++)
+        for (int j = 1; j < axisSize; j++)
         {
-            float v = input[offset + i];
-            if (v > maxVal) { maxVal = v; maxIdx = i; }
+            float v = input[offset + j];
+            if (v > maxVal) { maxVal = v; maxIdx = j; }
         }
-        for (int i = 0; i < axisSize; i++)
-            output[offset + i] = (i == maxIdx) ? 1f : 0f;
+        output[idx] = (i == maxIdx) ? 1f : 0f;
     }
 
     private static void DynamicQuantizeImpl(Index1D idx,
