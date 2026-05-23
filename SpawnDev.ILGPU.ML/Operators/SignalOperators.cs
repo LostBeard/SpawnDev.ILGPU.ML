@@ -50,7 +50,8 @@ public class DFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         var paramsData = new float[] { N, dftLength, outputN, isComplex, inverse };
         var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
         paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf.Data, batch * outputN);
+        // One thread per scalar output (real + imag interleaved) — gather, WebGL TF compatible
+        reg.ElementWise.DFT(input.Data, ctx.Outputs[0].Data, paramsBuf.Data, batch * outputN * 2);
     }
 }
 
@@ -115,7 +116,8 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
         paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
 
-        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowBuf.Data, ctx.Outputs[0].Data, paramsBuf.Data, totalBins);
+        // One thread per scalar output (real + imag interleaved) — gather, WebGL TF compatible
+        reg.ElementWise.STFT(ctx.Inputs[0].Data, windowBuf.Data, ctx.Outputs[0].Data, paramsBuf.Data, totalBins * 2);
     }
 }
 

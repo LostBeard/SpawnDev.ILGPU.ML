@@ -400,14 +400,14 @@ public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
         int paddedW = outW + 2 * pW;
         int blocksW = (paddedW - kW) / sW + 1;
 
-        // Zero output first, then GPU scatter-add
+        // One thread per output position — gather kernel writes every output unconditionally,
+        // so no Fill pre-pass needed. Also correct for overlapping kernels (the prior scatter-add
+        // had a race condition for stride < kernel).
         int outCount = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Fill(ctx.Outputs[0].Data, outCount, 0f);
-        int totalOps = N * colDim * L;
         var paramsData = new float[] { C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim };
         var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
         paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, totalOps);
+        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, outCount);
     }
 }
 public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator

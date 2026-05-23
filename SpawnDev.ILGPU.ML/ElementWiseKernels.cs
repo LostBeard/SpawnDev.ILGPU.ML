@@ -1032,11 +1032,14 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
         // params: [N, dftLength, outputN, isComplex, inverse] (float-stored, cast to int)
+        // One thread per scalar output: idx = ((b * outputN + k) * 2 + ri)
+        // where ri ∈ {0=real, 1=imag}. Gather-only — WebGL TF compatible.
         int N = (int)paramsArr[0]; int dftLength = (int)paramsArr[1]; int outputN = (int)paramsArr[2];
         int isComplex = (int)paramsArr[3]; int inverse = (int)paramsArr[4];
-        // idx = b * outputN + k
-        int k = idx % outputN;
-        int b = idx / outputN;
+        int ri = idx % 2;
+        int bk = idx / 2;
+        int k = bk % outputN;
+        int b = bk / outputN;
         float sign = inverse != 0 ? 1f : -1f;
         float scale = inverse != 0 ? 1f / dftLength : 1f;
         float sumReal = 0f, sumImag = 0f;
@@ -1060,15 +1063,15 @@ public class ElementWiseKernels : IDisposable
             sumReal += xReal * cosA - xImag * sinA;
             sumImag += xReal * sinA + xImag * cosA;
         }
-        int outIdx = (b * outputN + k) * 2;
-        output[outIdx] = sumReal * scale;
-        output[outIdx + 1] = sumImag * scale;
+        output[idx] = (ri == 0 ? sumReal : sumImag) * scale;
     }
 
     private static void Col2ImImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
-        // Each thread handles one scatter source position
+        // One thread per output position (n, c, oh, ow) — gather, not scatter.
+        // Replaces a scatter-add that was WebGL-broken AND race-prone for overlapping
+        // kernels on every backend. Now correct on all backends, all stride/kernel combos.
         // params: [C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim] (float-stored, cast to int)
         int C = (int)paramsArr[0]; int L = (int)paramsArr[1];
         int kH = (int)paramsArr[2]; int kW = (int)paramsArr[3];
@@ -1076,25 +1079,46 @@ public class ElementWiseKernels : IDisposable
         int sH = (int)paramsArr[6]; int sW = (int)paramsArr[7];
         int pH = (int)paramsArr[8]; int pW = (int)paramsArr[9];
         int blocksW = (int)paramsArr[10]; int colDim = (int)paramsArr[11];
-        // idx = n * colDim * L + colIdx * L + l
+        int blocksH = L / blocksW;
+
+        // Decode idx → (n, c, oh, ow)
         int tmp = idx;
-        int l = tmp % L; tmp /= L;
-        int colIdx = tmp % colDim; int n = tmp / colDim;
-        int bh = l / blocksW; int bw = l - bh * blocksW;
-        int c = colIdx / (kH * kW);
-        int rem = colIdx - c * kH * kW;
-        int kh = rem / kW; int kw = rem - kh * kW;
-        int oh = bh * sH + kh - pH;
-        int ow = bw * sW + kw - pW;
-        if (oh >= 0 && oh < outH && ow >= 0 && ow < outW)
+        int ow = tmp % outW; tmp /= outW;
+        int oh = tmp % outH; tmp /= outH;
+        int c = tmp % C; int n = tmp / C;
+
+        float sum = 0f;
+        int kHW = kH * kW;
+        // For every (kh, kw) in the kernel window: if the inverse-im2col mapping
+        // points to a valid (bh, bw) col block, accumulate that input entry.
+        for (int kh = 0; kh < kH; kh++)
         {
-            float val = input[(n * colDim + colIdx) * L + l];
-            // Atomic add not available in ILGPU for float — use non-atomic accumulation
-            // This is safe when each (oh, ow) position is written by at most one thread,
-            // which holds for non-overlapping kernels (stride >= kernel).
-            // For overlapping kernels, results may have race conditions — acceptable for now.
-            output[((n * C + c) * outH + oh) * outW + ow] += val;
+            int bhNum = oh + pH - kh;
+            if (bhNum >= 0)
+            {
+                int bh = bhNum / sH;
+                int bhRem = bhNum - bh * sH;
+                if (bhRem == 0 && bh < blocksH)
+                {
+                    for (int kw = 0; kw < kW; kw++)
+                    {
+                        int bwNum = ow + pW - kw;
+                        if (bwNum >= 0)
+                        {
+                            int bw = bwNum / sW;
+                            int bwRem = bwNum - bw * sW;
+                            if (bwRem == 0 && bw < blocksW)
+                            {
+                                int colIdx = c * kHW + kh * kW + kw;
+                                int l = bh * blocksW + bw;
+                                sum += input[(n * colDim + colIdx) * L + l];
+                            }
+                        }
+                    }
+                }
+            }
         }
+        output[idx] = sum;
     }
 
     private static void STFTImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> signal,
@@ -1102,10 +1126,12 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
         // params: [signalLength, frameStep, frameLength, fftOutputLen, numFrames, hasWindow] (float-stored, cast to int)
+        // One thread per scalar output: idx = (((b * numFrames + f) * fftOutputLen + k) * 2 + ri)
+        // where ri ∈ {0=real, 1=imag}. Gather-only — WebGL TF compatible.
         int signalLength = (int)paramsArr[0]; int frameStep = (int)paramsArr[1]; int frameLength = (int)paramsArr[2];
         int fftOutputLen = (int)paramsArr[3]; int numFrames = (int)paramsArr[4]; int hasWindow = (int)paramsArr[5];
-        // idx = b * numFrames * fftOutputLen + f * fftOutputLen + k
-        int tmp = idx;
+        int ri = idx % 2;
+        int tmp = idx / 2;
         int k = tmp % fftOutputLen; tmp /= fftOutputLen;
         int f = tmp % numFrames; int b = tmp / numFrames;
         int frameStart = f * frameStep;
@@ -1119,9 +1145,7 @@ public class ElementWiseKernels : IDisposable
             sumReal += x * MathF.Cos(angle);
             sumImag += x * MathF.Sin(angle);
         }
-        int outIdx = ((b * numFrames + f) * fftOutputLen + k) * 2;
-        output[outIdx] = sumReal;
-        output[outIdx + 1] = sumImag;
+        output[idx] = ri == 0 ? sumReal : sumImag;
     }
 
     private static void CumSumImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
