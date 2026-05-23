@@ -42,6 +42,14 @@ public class Tensor
     public int Rank => Shape.Length;
 
     /// <summary>
+    /// Kernel-passable snapshot of this tensor as a blittable <see cref="TensorView{T}"/>.
+    /// Phase 2+ kernels accept <c>TensorView&lt;float&gt;</c> instead of unpacking the
+    /// data view + scalar shape parameters at the call site. Constructing the view is
+    /// cheap (no managed allocations beyond the inline struct fields).
+    /// </summary>
+    public TensorView<float> View => new TensorView<float>(Data, Shape);
+
+    /// <summary>
     /// Zero-copy reshape. Validates element count matches.
     /// Use -1 for one inferred dimension.
     /// </summary>
