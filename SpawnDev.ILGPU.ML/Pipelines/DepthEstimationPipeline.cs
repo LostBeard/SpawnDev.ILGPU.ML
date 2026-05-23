@@ -131,9 +131,9 @@ public class DepthEstimationPipeline : IDisposable
 
     /// <summary>
     /// Estimate depth and return a plasma colormap as a GPU MemoryBuffer2D
-    /// for zero-copy presentation via ICanvasRenderer.
-    /// Entire pipeline stays on GPU — no CPU readback of the depth tensor itself
-    /// (only a small min/max readback for normalization).
+    /// for zero-copy presentation via ICanvasRenderer, alongside the normalized [0, 1]
+    /// depth values at the same resolution so callers can re-apply a different colormap
+    /// later without re-running inference.
     ///
     /// Output dimensions follow the same convention as <see cref="EstimateAsync"/>:
     ///   (0, 0) → match source (width, height), preserving aspect ratio.
@@ -142,7 +142,7 @@ public class DepthEstimationPipeline : IDisposable
     /// Resize is bilinear, executed on the accelerator before colormap.
     /// Caller owns the returned buffer and must dispose it.
     /// </summary>
-    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height, float[] NormalizedDepth)> EstimateGpuAsync(
         int[] rgbaPixels, int width, int height,
         int outputWidth = 0, int outputHeight = 0)
     {
@@ -188,7 +188,17 @@ public class DepthEstimationPipeline : IDisposable
         postprocess.DepthToColormap(resized.View, resultBuf.View.BaseView, outSize, minD, maxD);
         await _accelerator.SynchronizeAsync();
 
-        return (resultBuf, outW, outH);
+        // Normalize the host-side depth to [0, 1] so callers can swap colormaps
+        // (plasma / viridis / inferno / grayscale) without re-running inference.
+        var normalized = new float[outSize];
+        float range = maxD - minD;
+        if (range > 1e-6f)
+        {
+            for (int i = 0; i < outSize; i++)
+                normalized[i] = (resizedHost[i] - minD) / range;
+        }
+
+        return (resultBuf, outW, outH, normalized);
     }
 
     public void Dispose() { }

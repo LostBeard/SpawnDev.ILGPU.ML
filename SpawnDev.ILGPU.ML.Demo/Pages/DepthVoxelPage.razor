@@ -224,7 +224,7 @@
             // Run depth estimation — GPU plasma colormap stays on GPU
             _lastDepthBuffer?.Dispose();
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var (buffer, w, h) = await _pipeline.EstimateGpuAsync(rgbaPixels, 320, 240);
+            var (buffer, w, h, _) = await _pipeline.EstimateGpuAsync(rgbaPixels, 320, 240);
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
             _lastDepthBuffer = buffer;

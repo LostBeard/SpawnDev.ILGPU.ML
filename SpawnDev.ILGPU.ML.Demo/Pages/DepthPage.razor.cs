@@ -152,24 +152,34 @@ public partial class DepthPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
 
-            // GPU-direct: inference + plasma colormap on GPU → read final RGBA to CPU
-            // The GPU colormap kernel replaces the CPU DepthColorMaps.ApplyColorMap + PngEncoder path
+            // GPU-direct: inference + plasma colormap on GPU → read final RGBA to CPU.
+            // The pipeline also returns the normalized depth values so the palette dropdown
+            // can re-color without re-running inference.
             _gpuDepthBuffer?.Dispose();
-            var (buffer, w, h) = await _pipeline.EstimateGpuAsync(_rgbaPixels, _imageWidth, _imageHeight);
+            var (buffer, w, h, normalized) = await _pipeline.EstimateGpuAsync(_rgbaPixels, _imageWidth, _imageHeight);
             _gpuDepthBuffer = buffer;
             _depthWidth = w;
             _depthHeight = h;
+            _depthMap = normalized;
 
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
 
-            // Read GPU-colorized RGBA for BeforeAfterSlider display
-            // Use 1D copy from the 2D buffer's underlying linear storage
-            using var readBuf = _accelerator.Allocate1D<int>(w * h);
-            readBuf.View.CopyFrom(buffer.View.BaseView);
-            await _accelerator.SynchronizeAsync();
-            var pixels = await readBuf.CopyToHostAsync<int>(0, w * h);
-            _depthImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, pixels, w, h);
+            // First-time render uses the GPU-baked plasma colormap (zero extra work).
+            // Subsequent palette changes route through RecolorDepth() which uses the
+            // cached normalized depth + DepthColorMaps for any palette choice.
+            if (_colorPalette == "plasma")
+            {
+                using var readBuf = _accelerator.Allocate1D<int>(w * h);
+                readBuf.View.CopyFrom(buffer.View.BaseView);
+                await _accelerator.SynchronizeAsync();
+                var pixels = await readBuf.CopyToHostAsync<int>(0, w * h);
+                _depthImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, pixels, w, h);
+            }
+            else
+            {
+                RecolorDepth();
+            }
 
             _statusMessage = null;
         }
