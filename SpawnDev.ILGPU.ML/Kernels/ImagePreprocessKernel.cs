@@ -200,6 +200,50 @@ public class ImagePreprocessKernel
                     + y10 * ty * (1f - tx) + y11 * ty * tx;
     }
 
+    // ── Y-channel tile extraction (for tile-based super-resolution) ──
+
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int>? _yChannelTileKernel;
+
+    /// <summary>
+    /// Extract a Y luminance tile of size <c>modelW × modelH</c> from a sub-rect of the
+    /// source RGBA image starting at <c>(tileX, tileY)</c>. NO resize — one source pixel
+    /// per destination pixel. Out-of-bounds reads are clamped to the source edges
+    /// (replicate-edge), which only matters when the source is smaller than the model's
+    /// input tile size.
+    ///
+    /// Used by tile-based super-resolution to feed model-sized patches of the source
+    /// through the network; outputs are stitched back together at the destination plane.
+    /// </summary>
+    public void ExtractYTile(
+        ArrayView1D<int, Stride1D.Dense> rgba,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int srcW, int srcH, int tileX, int tileY, int modelW, int modelH)
+    {
+        _yChannelTileKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int, int>(ExtractYTileImpl);
+        _yChannelTileKernel(modelW * modelH, rgba, output,
+            srcW, srcH, tileX, tileY, modelW, modelH);
+    }
+
+    private static void ExtractYTileImpl(Index1D idx,
+        ArrayView1D<int, Stride1D.Dense> rgba,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int srcW, int srcH, int tileX, int tileY, int modelW, int modelH)
+    {
+        int ty = idx / modelW;
+        int tx = idx % modelW;
+        int sx = tileX + tx; int sy = tileY + ty;
+        if (sx < 0) sx = 0; if (sx >= srcW) sx = srcW - 1;
+        if (sy < 0) sy = 0; if (sy >= srcH) sy = srcH - 1;
+        int pixel = rgba[sy * srcW + sx];
+        float r = (pixel & 0xFF) / 255f;
+        float g = ((pixel >> 8) & 0xFF) / 255f;
+        float b = ((pixel >> 16) & 0xFF) / 255f;
+        output[idx] = 0.299f * r + 0.587f * g + 0.114f * b;
+    }
+
     /// <summary>BT.601 luminance from packed RGBA pixel.</summary>
     private static float PixelToY(int pixel)
     {

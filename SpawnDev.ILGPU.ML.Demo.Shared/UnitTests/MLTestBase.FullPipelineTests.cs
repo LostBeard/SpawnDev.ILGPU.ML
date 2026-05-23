@@ -60,7 +60,7 @@ public abstract partial class MLTestBase
     /// Super Resolution: load ESPCN model, upscale a small image 3x,
     /// verify output dimensions and non-zero content.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 300000)]
     public async Task WebModel_SuperResolution_ESPCN() => await RunTest(async accelerator =>
     {
         if (accelerator.AcceleratorType == AcceleratorType.CPU)
@@ -73,14 +73,20 @@ public abstract partial class MLTestBase
         using var session = await InferenceSession.CreateAsync(accelerator, http, "models/super-resolution");
         Console.WriteLine($"[SRTest] Model: {session}");
 
-        // Small test image (32x32 gradient)
-        int w = 32, h = 32;
+        // 240x240 RGB color gradient — exercises BOTH multi-tile behavior (each side >
+        // model tile size 224 so the pipeline anchors a 2nd tile) AND color reconstruction
+        // (varying R/G/B per pixel — a previous bug emitted grayscale R=G=B regardless of
+        // source color). Aspect ratio is preserved (output = 720x720) — a previous bug
+        // produced model-sized 672x672 output regardless of source shape.
+        int w = 240, h = 240;
         var pixels = new int[w * h];
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
-                int gray = (int)(x * 255f / w);
-                pixels[y * w + x] = gray | (gray << 8) | (gray << 16) | (0xFF << 24);
+                int r = (int)(x * 255f / w);    // red varies horizontally
+                int g = (int)(y * 255f / h);    // green varies vertically
+                int b = 128;                    // blue constant
+                pixels[y * w + x] = r | (g << 8) | (b << 16) | (0xFF << 24);
             }
 
         var pipeline = new SuperResolutionPipeline(session, accelerator, upscaleFactor: 3);
@@ -88,24 +94,52 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[SRTest] Output: {result.Width}x{result.Height} (factor={result.UpscaleFactor})");
 
-        // Output dimensions are based on model's declared input size (224x224) * upscale factor
-        // Not the test image size — pipeline resizes input to match model
-        if (result.Width < 3 || result.Height < 3)
-            throw new Exception($"Output too small: {result.Width}x{result.Height}");
+        // Aspect-ratio assertion: output dims must match source * scale exactly.
+        // Previously the pipeline emitted modelW*scale × modelH*scale (672x672) regardless
+        // of source shape, producing squished output on non-square inputs.
+        int expectW = w * result.UpscaleFactor;
+        int expectH = h * result.UpscaleFactor;
+        if (result.Width != expectW || result.Height != expectH)
+            throw new Exception($"Output dims wrong: expected {expectW}x{expectH}, got {result.Width}x{result.Height}");
 
-        // Verify output is not all zeros
-        bool allBlack = result.RgbaPixels.All(p => (p & 0x00FFFFFF) == 0);
-        if (allBlack)
+        if (result.RgbaPixels.All(p => (p & 0x00FFFFFF) == 0))
             throw new Exception("Output is all black");
 
-        // Verify output has variation (not flat)
-        var uniqueGrays = result.RgbaPixels.Select(p => p & 0xFF).Distinct().Count();
-        Console.WriteLine($"[SRTest] Unique gray levels: {uniqueGrays}");
+        // Color assertion: with R varying horizontally and G varying vertically, the result
+        // must NOT be grayscale. Previously the pipeline emitted (Y, Y, Y, 255) for every
+        // pixel, discarding the source's Cb/Cr — that produced a grayscale output even on
+        // a vivid color photo. Count pixels where R, G, B differ from each other.
+        int colorPixels = 0;
+        int sampleCount = 0;
+        for (int i = 0; i < result.RgbaPixels.Length; i += 17) // sample every 17th to keep fast
+        {
+            int p = result.RgbaPixels[i];
+            int r = p & 0xFF;
+            int g = (p >> 8) & 0xFF;
+            int b = (p >> 16) & 0xFF;
+            if (Math.Abs(r - g) > 5 || Math.Abs(g - b) > 5 || Math.Abs(r - b) > 5)
+                colorPixels++;
+            sampleCount++;
+        }
+        float colorPct = 100f * colorPixels / sampleCount;
+        Console.WriteLine($"[SRTest] {colorPixels}/{sampleCount} sampled pixels are non-grayscale ({colorPct:F1}%)");
+        if (colorPct < 50f)
+            throw new Exception($"Output is grayscale (only {colorPct:F1}% of pixels have R≠G≠B). Color reconstruction broken — Cb/Cr discarded.");
 
-        if (uniqueGrays < 10)
-            throw new Exception($"Output has only {uniqueGrays} unique values — too flat");
+        // Per-channel variation — output should have full red and green gradients reflected.
+        int rMin = 255, rMax = 0, gMin = 255, gMax = 0;
+        for (int i = 0; i < result.RgbaPixels.Length; i += 17)
+        {
+            int p = result.RgbaPixels[i];
+            int r = p & 0xFF; int g = (p >> 8) & 0xFF;
+            if (r < rMin) rMin = r; if (r > rMax) rMax = r;
+            if (g < gMin) gMin = g; if (g > gMax) gMax = g;
+        }
+        Console.WriteLine($"[SRTest] R range [{rMin},{rMax}]  G range [{gMin},{gMax}]");
+        if (rMax - rMin < 100 || gMax - gMin < 100)
+            throw new Exception($"Source gradient was lost: R range={rMax - rMin} G range={gMax - gMin}, expected wide");
 
-        Console.WriteLine("[SRTest] PASS");
+        Console.WriteLine($"[SRTest] PASS — {result.Width}x{result.Height} color output preserving source aspect");
         pipeline.Dispose();
     });
 

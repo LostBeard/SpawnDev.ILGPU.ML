@@ -217,6 +217,94 @@ public class ImagePostprocessKernel
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  Tile accumulation (for tile-based super-resolution)
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int>? _accumYTileKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>?
+        _normYAccKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _clearFloatKernel;
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>>? _clearIntKernel;
+
+    /// <summary>
+    /// Accumulate a super-resolved Y tile into a destination Y plane + per-pixel count
+    /// buffer. One thread per source pixel (srcW * srcH). The thread maps tile-local
+    /// (tx, ty) to destination (dstOffsetX + tx, dstOffsetY + ty); if that lands inside
+    /// the destination it adds the tile value to <c>dstY</c> and increments <c>dstCount</c>.
+    ///
+    /// Tile inferences run sequentially (with Synchronize between), so within a single
+    /// kernel invocation each thread writes to a unique destination pixel — no atomics
+    /// required (which keeps this WebGL-compatible).
+    /// </summary>
+    public void AccumulateYTile(
+        ArrayView1D<float, Stride1D.Dense> srcY,
+        ArrayView1D<float, Stride1D.Dense> dstY,
+        ArrayView1D<int, Stride1D.Dense> dstCount,
+        int srcW, int srcH, int dstOffsetX, int dstOffsetY, int dstW, int dstH)
+    {
+        _accumYTileKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int>(AccumulateYTileImpl);
+        _accumYTileKernel(srcW * srcH, srcY, dstY, dstCount,
+            srcW, srcH, dstOffsetX, dstOffsetY, dstW, dstH);
+    }
+
+    private static void AccumulateYTileImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> srcY,
+        ArrayView1D<float, Stride1D.Dense> dstY,
+        ArrayView1D<int, Stride1D.Dense> dstCount,
+        int srcW, int srcH, int dstOffsetX, int dstOffsetY, int dstW, int dstH)
+    {
+        int ty = idx / srcW;
+        int tx = idx % srcW;
+        int dx = dstOffsetX + tx;
+        int dy = dstOffsetY + ty;
+        if (dx < 0 || dx >= dstW || dy < 0 || dy >= dstH) return;
+        int dstIdx = dy * dstW + dx;
+        dstY[dstIdx] = dstY[dstIdx] + srcY[idx];
+        dstCount[dstIdx] = dstCount[dstIdx] + 1;
+    }
+
+    /// <summary>
+    /// Final pass for tile accumulation: divide each destination Y pixel by the number
+    /// of tiles that contributed to it. Pixels with count = 0 are left at 0 (should not
+    /// happen if tiles cover the destination).
+    /// </summary>
+    public void NormalizeYAccumulator(
+        ArrayView1D<float, Stride1D.Dense> dstY,
+        ArrayView1D<int, Stride1D.Dense> dstCount)
+    {
+        _normYAccKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(NormalizeYAccImpl);
+        _normYAccKernel((int)dstY.Length, dstY, dstCount);
+    }
+
+    private static void NormalizeYAccImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> dstY,
+        ArrayView1D<int, Stride1D.Dense> dstCount)
+    {
+        int n = dstCount[idx];
+        if (n > 0) dstY[idx] = dstY[idx] / n;
+    }
+
+    /// <summary>GPU-side clear of a float buffer to 0.</summary>
+    public void ClearFloat(ArrayView1D<float, Stride1D.Dense> buf)
+    {
+        _clearFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>>((Index1D i, ArrayView1D<float, Stride1D.Dense> b) => b[i] = 0f);
+        _clearFloatKernel((int)buf.Length, buf);
+    }
+
+    /// <summary>GPU-side clear of an int buffer to 0.</summary>
+    public void ClearInt(ArrayView1D<int, Stride1D.Dense> buf)
+    {
+        _clearIntKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>>((Index1D i, ArrayView1D<int, Stride1D.Dense> b) => b[i] = 0);
+        _clearIntKernel((int)buf.Length, buf);
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  Super-resolution composite (Y from model + Cb/Cr from source RGBA)
     // ═══════════════════════════════════════════════════════════
 

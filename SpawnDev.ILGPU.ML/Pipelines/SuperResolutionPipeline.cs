@@ -42,87 +42,162 @@ public class SuperResolutionPipeline : IDisposable
     }
 
     /// <summary>
-    /// Upscale an RGBA image using the super-resolution model.
+    /// Upscale an RGBA image using tile-based super-resolution.
     ///
-    /// Output dimensions are <c>width * upscaleFactor × height * upscaleFactor</c> — the
-    /// source aspect ratio is preserved. Color is reconstructed by combining the
-    /// super-resolved Y channel from the model with Cb/Cr bilinearly upsampled from the
-    /// original RGBA source.
+    /// The model processes fixed-size Y patches (typically 224×224 for ESPCN exports).
+    /// To honor the full source resolution and aspect, the pipeline tiles the source
+    /// into overlapping <c>modelW × modelH</c> patches, runs each through the model
+    /// independently, accumulates the super-resolved Y outputs into a single
+    /// <c>(width * upscaleFactor) × (height * upscaleFactor)</c> destination plane,
+    /// and finally combines that Y plane with source-derived Cb/Cr (bilinear up-
+    /// sampled in the composite kernel) to produce a color RGBA result.
+    ///
+    /// Overlap in source pixels is held in <see cref="TileOverlap"/>. In overlap
+    /// regions multiple tiles contribute to the same destination pixels; the
+    /// per-pixel count buffer is used to average them, smoothing tile-boundary
+    /// seams without requiring atomics (so the path works on WebGL too).
+    ///
+    /// Everything per-pixel runs on the accelerator. Only orchestration — tile
+    /// indices and coordinates — runs on CPU. The only host readback is the final
+    /// RGBA result.
     /// </summary>
     public async Task<SuperResResult> UpscaleAsync(int[] rgbaPixels, int width, int height)
     {
-        int modelH = _modelH, modelW = _modelW;
         int dstW = width * _upscaleFactor;
         int dstH = height * _upscaleFactor;
 
-        // GPU preprocessing: RGBA → bilinear resize → Y luminance channel
-        // BT.601: Y = 0.299*R + 0.587*G + 0.114*B — all on GPU, no CPU loops
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
-        using var inputBuf = _accelerator.Allocate1D<float>(modelH * modelW);
-        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
-        _preprocess.ForwardYChannel(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, modelH, modelW });
-
-        // Run inference — model produces a super-resolved Y plane at modelH*scale × modelW*scale
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
-        {
-            [_session.InputNames[0]] = inputTensor
-        });
-        await _accelerator.SynchronizeAsync();
-
-        var output = outputs[_session.OutputNames[0]];
-        int yH = output.Shape.Length >= 3 ? output.Shape[^2] : modelH * _upscaleFactor;
-        int yW = output.Shape.Length >= 3 ? output.Shape[^1] : modelW * _upscaleFactor;
-
-        // GPU: combine super-res Y + source Cb/Cr → color RGBA at source aspect ratio
         using var rgbaOutBuf = _accelerator.Allocate1D<int>(dstW * dstH);
-        var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
-        postprocess.SuperResCompositeYCbCr(
-            rgbaBuf.View, output.Data.SubView(0, yH * yW), rgbaOutBuf.View,
-            width, height, yW, yH, dstW, dstH);
-        await _accelerator.SynchronizeAsync();
+        await RunTiledAsync(rgbaBuf.View, rgbaOutBuf.View, width, height, dstW, dstH);
         var result = await rgbaOutBuf.CopyToHostAsync<int>(0, dstW * dstH);
-
         return new SuperResResult(result, dstW, dstH, _upscaleFactor);
     }
 
     /// <summary>
-    /// Upscale an RGBA image and return result as GPU MemoryBuffer2D
-    /// for zero-copy presentation via ICanvasRenderer.
-    /// Output dimensions preserve source aspect ratio (width * scale × height * scale)
-    /// and color is reconstructed via YCbCr composite.
+    /// Upscale an RGBA image and return result as GPU MemoryBuffer2D for zero-copy
+    /// presentation via ICanvasRenderer. Same tile-based algorithm as
+    /// <see cref="UpscaleAsync"/>, but the final RGBA stays on the GPU.
     /// Caller owns the returned buffer and must dispose it.
     /// </summary>
     public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
         int[] rgbaPixels, int width, int height)
     {
-        int modelH = _modelH, modelW = _modelW;
         int dstW = width * _upscaleFactor;
         int dstH = height * _upscaleFactor;
 
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
-        using var inputBuf = _accelerator.Allocate1D<float>(modelH * modelW);
-        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
-        _preprocess.ForwardYChannel(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, modelH, modelW });
-
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
-        {
-            [_session.InputNames[0]] = inputTensor
-        });
-
-        var output = outputs[_session.OutputNames[0]];
-        int yH = output.Shape.Length >= 3 ? output.Shape[^2] : modelH * _upscaleFactor;
-        int yW = output.Shape.Length >= 3 ? output.Shape[^1] : modelW * _upscaleFactor;
-
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(dstW, dstH));
+        await RunTiledAsync(rgbaBuf.View, resultBuf.View.BaseView, width, height, dstW, dstH);
+        return (resultBuf, dstW, dstH);
+    }
+
+    /// <summary>Source-pixel overlap between adjacent tiles. Larger = smoother boundaries
+    /// at the cost of more tile inferences. 16 source pixels = 48 destination pixels at
+    /// scale=3, which is enough to mask ESPCN's per-tile boundary differences.</summary>
+    public int TileOverlap { get; set; } = 16;
+
+    /// <summary>
+    /// Tile-based super-resolution core. Y plane is built up by accumulating tile model
+    /// outputs into a single destination Y buffer + per-pixel count buffer; counts are
+    /// divided out at the end so overlap regions are mean-averaged. The composite kernel
+    /// then combines that Y with source Cb/Cr to produce the final RGBA.
+    /// </summary>
+    private async Task RunTiledAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaSrc,
+        ArrayView1D<int, Stride1D.Dense> rgbaOut,
+        int width, int height, int dstW, int dstH)
+    {
+        int modelW = _modelW, modelH = _modelH;
+        int scale = _upscaleFactor;
+        int overlap = TileOverlap;
+        int strideX = Math.Max(1, modelW - overlap);
+        int strideY = Math.Max(1, modelH - overlap);
+
+        _preprocess ??= new Kernels.ImagePreprocessKernel(_accelerator);
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
-        postprocess.SuperResCompositeYCbCr(
-            rgbaBuf.View, output.Data.SubView(0, yH * yW), resultBuf.View.BaseView,
-            width, height, yW, yH, dstW, dstH);
+
+        // Persistent per-call accelerator buffers. Re-using these across tiles avoids
+        // alloc/free churn — ImagePreprocessKernel/InferenceSession internally bind
+        // these views to the model graph.
+        using var tileInBuf = _accelerator.Allocate1D<float>(modelW * modelH);
+        using var dstY = _accelerator.Allocate1D<float>(dstW * dstH);
+        using var dstCount = _accelerator.Allocate1D<int>(dstW * dstH);
+
+        // Zero accumulators on GPU (no CPU pass).
+        postprocess.ClearFloat(dstY.View);
+        postprocess.ClearInt(dstCount.View);
         await _accelerator.SynchronizeAsync();
 
-        return (resultBuf, dstW, dstH);
+        // Tile positions: stride by (modelW - overlap), last tile anchored to edge so the
+        // entire source is covered even when width / height aren't exact multiples.
+        var tileXs = BuildTilePositions(width, modelW, strideX);
+        var tileYs = BuildTilePositions(height, modelH, strideY);
+
+        foreach (int tileY in tileYs)
+        {
+            foreach (int tileX in tileXs)
+            {
+                // Extract Y patch from source at this tile rect (clamps to edges if
+                // source smaller than tile — happens for tiny inputs).
+                _preprocess.ExtractYTile(rgbaSrc, tileInBuf.View, width, height,
+                    tileX, tileY, modelW, modelH);
+
+                var inputTensor = new Tensor(tileInBuf.View, new[] { 1, 1, modelH, modelW });
+                var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+                {
+                    [_session.InputNames[0]] = inputTensor
+                });
+                await _accelerator.SynchronizeAsync();
+
+                var output = outputs[_session.OutputNames[0]];
+                int yH = output.Shape.Length >= 3 ? output.Shape[^2] : modelH * scale;
+                int yW = output.Shape.Length >= 3 ? output.Shape[^1] : modelW * scale;
+
+                // Accumulate this tile's super-res Y into the destination plane. Within
+                // one kernel invocation each thread writes to a unique dst pixel, so no
+                // atomics are required; sequential kernel invocations between tiles
+                // serialize the writes safely.
+                postprocess.AccumulateYTile(
+                    output.Data.SubView(0, yH * yW),
+                    dstY.View, dstCount.View,
+                    yW, yH,
+                    tileX * scale, tileY * scale,
+                    dstW, dstH);
+                await _accelerator.SynchronizeAsync();
+            }
+        }
+
+        // Divide accumulator by per-pixel tile-contribution count → final Y plane.
+        postprocess.NormalizeYAccumulator(dstY.View, dstCount.View);
+        await _accelerator.SynchronizeAsync();
+
+        // Combine super-res Y + source Cb/Cr → color RGBA at target dimensions.
+        postprocess.SuperResCompositeYCbCr(
+            rgbaSrc, dstY.View, rgbaOut,
+            width, height, dstW, dstH, dstW, dstH);
+        await _accelerator.SynchronizeAsync();
+    }
+
+    /// <summary>
+    /// Compute tile starting positions along one dimension. Uses stride <c>step</c> with
+    /// the last tile anchored to the edge so the full <c>length</c> is covered. When
+    /// <c>length &lt;= tile</c>, returns a single tile at position 0 (with model-side
+    /// clamping handling the partial coverage).
+    /// </summary>
+    private static int[] BuildTilePositions(int length, int tile, int step)
+    {
+        if (length <= tile) return new[] { 0 };
+        var positions = new System.Collections.Generic.List<int>();
+        int pos = 0;
+        while (pos + tile < length)
+        {
+            positions.Add(pos);
+            pos += step;
+        }
+        // Final tile anchored so its right edge meets the source edge exactly.
+        int last = length - tile;
+        if (positions.Count == 0 || positions[^1] != last) positions.Add(last);
+        return positions.ToArray();
     }
 
     public void Dispose() { }
