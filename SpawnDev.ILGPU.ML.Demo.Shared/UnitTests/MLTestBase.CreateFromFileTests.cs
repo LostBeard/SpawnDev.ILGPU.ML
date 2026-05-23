@@ -174,9 +174,6 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 300000)]
     public async Task CreateFromFile_DepthAnything_Load() => await RunTest(async accelerator =>
     {
-        if (accelerator.AcceleratorType == AcceleratorType.CPU)
-            throw new UnsupportedTestException("Depth Anything too large for CPU backend — skipped");
-
         var http = GetHttpClient();
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
