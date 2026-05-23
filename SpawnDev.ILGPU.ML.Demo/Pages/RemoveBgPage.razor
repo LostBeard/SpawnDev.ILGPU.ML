@@ -1,6 +1,8 @@
 @page "/remove-bg"
 @using SpawnDev.BlazorJS
 @using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.WebGPU
+@using SpawnDev.ILGPU.WebGPU.Backend
 @implements IDisposable
 
 <PageTitle>Background Removal — SpawnDev.ILGPU.ML</PageTitle>
@@ -24,9 +26,9 @@
     {
         <div class="rmbg-output-controls">
             <label class="bg-option-label">Background:</label>
-            <button class="bg-option @(_bgMode == "transparent" ? "active" : "")" @onclick='() => _bgMode = "transparent"'>Transparent</button>
-            <button class="bg-option @(_bgMode == "white" ? "active" : "")" @onclick='() => _bgMode = "white"'>White</button>
-            <button class="bg-option @(_bgMode == "blur" ? "active" : "")" @onclick='() => _bgMode = "blur"'>Blur</button>
+            <button class="bg-option @(_bgMode == "transparent" ? "active" : "")" @onclick='() => SetBgMode("transparent")'>Transparent</button>
+            <button class="bg-option @(_bgMode == "white" ? "active" : "")" @onclick='() => SetBgMode("white")'>White</button>
+            <button class="bg-option @(_bgMode == "blur" ? "active" : "")" @onclick='() => SetBgMode("blur")'>Blur</button>
         </div>
 
         <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
@@ -180,6 +182,9 @@
     private SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline? _pipeline;
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
+    // Cache last mask + cutout RGB so bg-mode buttons can re-composite without re-running inference.
+    private float[]? _lastMask;
+    private int _lastMaskWidth, _lastMaskHeight;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -201,8 +206,12 @@
                 _context = builder.ToContext();
             }
 
-            _accelerator = await _context.CreatePreferredAcceleratorAsync();
-            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+            _accelerator = await CreateAcceleratorForBackendAsync(_selectedBackend);
+            if (_accelerator == null)
+            {
+                Console.WriteLine($"[RemoveBg] No {_selectedBackend} device available");
+                _isModelLoading = false; StateHasChanged(); return;
+            }
 
             using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
             var modelBytes = await hub.LoadAsync(
@@ -224,7 +233,140 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task<global::ILGPU.Runtime.Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
+    {
+        if (_context == null) return null;
+        try
+        {
+            return backendId switch
+            {
+                "WebGPU" => await TryCreateAsync<WebGPUILGPUDevice>(),
+                "WebGL"  => await TryCreateAsync<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>(),
+                "Wasm"   => await TryCreateAsync<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>(),
+                _ => null,
+            };
+        }
+        catch { return null; }
+    }
+
+    private async Task<global::ILGPU.Runtime.Accelerator?> TryCreateAsync<TDevice>() where TDevice : global::ILGPU.Runtime.Device
+    {
+        var devices = _context!.GetDevices<TDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task HandleBackendChange(string backend)
+    {
+        if (backend == _selectedBackend && _isModelLoaded) return;
+        _selectedBackend = backend;
+        _resultImageUrl = null;
+        _lastMask = null;
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _pipeline = null;
+        _accelerator = null;
+        await LoadModelAsync();
+    }
+
+    private void SetBgMode(string mode)
+    {
+        if (_bgMode == mode) return;
+        _bgMode = mode;
+        // Re-composite from cached mask + source pixels — no inference re-run.
+        RebuildResultImage();
+        StateHasChanged();
+    }
+
+    private void RebuildResultImage()
+    {
+        if (_lastMask == null || _rgbaPixels == null) return;
+        int w = _lastMaskWidth, h = _lastMaskHeight;
+        int[] composed = _bgMode switch
+        {
+            "white" => CompositeOver(_rgbaPixels, _lastMask, w, h, 0xFFFFFF),
+            "blur"  => CompositeOverBlur(_rgbaPixels, _lastMask, w, h),
+            _        => ApplyAlpha(_rgbaPixels, _lastMask, w, h),
+        };
+        _resultImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, composed, w, h);
+    }
+
+    private static int[] ApplyAlpha(int[] src, float[] mask, int w, int h)
+    {
+        var dst = new int[w * h];
+        for (int i = 0; i < w * h; i++)
+        {
+            int p = src[i];
+            int a = (int)(mask[i] * 255f + 0.5f);
+            if (a < 0) a = 0; if (a > 255) a = 255;
+            dst[i] = (p & 0x00FFFFFF) | (a << 24);
+        }
+        return dst;
+    }
+
+    private static int[] CompositeOver(int[] src, float[] mask, int w, int h, int bgRgb)
+    {
+        int bgR = bgRgb & 0xFF, bgG = (bgRgb >> 8) & 0xFF, bgB = (bgRgb >> 16) & 0xFF;
+        var dst = new int[w * h];
+        for (int i = 0; i < w * h; i++)
+        {
+            int p = src[i];
+            float a = mask[i]; if (a < 0f) a = 0f; if (a > 1f) a = 1f;
+            int r = (int)((p & 0xFF) * a + bgR * (1f - a) + 0.5f);
+            int g = (int)(((p >> 8) & 0xFF) * a + bgG * (1f - a) + 0.5f);
+            int b = (int)(((p >> 16) & 0xFF) * a + bgB * (1f - a) + 0.5f);
+            dst[i] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (0xFF << 24);
+        }
+        return dst;
+    }
+
+    private static int[] CompositeOverBlur(int[] src, float[] mask, int w, int h)
+    {
+        // Cheap 5x5 box blur of source, then composite cutout over the blurred copy.
+        var blurred = BoxBlur5(src, w, h);
+        var dst = new int[w * h];
+        for (int i = 0; i < w * h; i++)
+        {
+            int p = src[i];
+            int bg = blurred[i];
+            float a = mask[i]; if (a < 0f) a = 0f; if (a > 1f) a = 1f;
+            int r = (int)((p & 0xFF) * a + (bg & 0xFF) * (1f - a) + 0.5f);
+            int g = (int)(((p >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * (1f - a) + 0.5f);
+            int b = (int)(((p >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * (1f - a) + 0.5f);
+            dst[i] = (r & 0xFF) | ((g & 0xFF) << 8) | ((b & 0xFF) << 16) | (0xFF << 24);
+        }
+        return dst;
+    }
+
+    private static int[] BoxBlur5(int[] src, int w, int h)
+    {
+        // 5x5 box blur — separable horizontal+vertical pass.
+        var tmp = new int[w * h]; var dst = new int[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int rS = 0, gS = 0, bS = 0, n = 0;
+                for (int k = -2; k <= 2; k++)
+                {
+                    int xs = x + k; if (xs < 0) xs = 0; if (xs >= w) xs = w - 1;
+                    int p = src[y * w + xs];
+                    rS += p & 0xFF; gS += (p >> 8) & 0xFF; bS += (p >> 16) & 0xFF; n++;
+                }
+                tmp[y * w + x] = (rS / n) | ((gS / n) << 8) | ((bS / n) << 16);
+            }
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int rS = 0, gS = 0, bS = 0, n = 0;
+                for (int k = -2; k <= 2; k++)
+                {
+                    int ys = y + k; if (ys < 0) ys = 0; if (ys >= h) ys = h - 1;
+                    int p = tmp[ys * w + x];
+                    rS += p & 0xFF; gS += (p >> 8) & 0xFF; bS += (p >> 16) & 0xFF; n++;
+                }
+                dst[y * w + x] = (rS / n) | ((gS / n) << 8) | ((bS / n) << 16) | (0xFF << 24);
+            }
+        return dst;
+    }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
@@ -265,7 +407,19 @@
         {
             var result = await _pipeline.RemoveBackgroundAsync(_rgbaPixels, _imageWidth, _imageHeight);
             _inferenceMs = result.InferenceTimeMs;
-            _resultImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.ResultPixels, result.Width, result.Height);
+            // Cache mask + dims so bg-mode toggles can re-composite without re-running inference.
+            _lastMask = result.Mask;
+            _lastMaskWidth = result.Width;
+            _lastMaskHeight = result.Height;
+            // Diagnostic: mask statistics — helps confirm whether the backend produced a real mask.
+            float min = float.PositiveInfinity, max = float.NegativeInfinity; double sum = 0;
+            for (int i = 0; i < result.Mask.Length; i++)
+            {
+                var v = result.Mask[i];
+                if (v < min) min = v; if (v > max) max = v; sum += v;
+            }
+            Console.WriteLine($"[RemoveBg] mask {_lastMaskWidth}x{_lastMaskHeight} min={min:F4} max={max:F4} avg={sum / result.Mask.Length:F4}");
+            RebuildResultImage();
         }
         catch (Exception ex)
         {
