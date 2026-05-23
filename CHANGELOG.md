@@ -2,6 +2,40 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.2 (2026-05-23) — dep bump + DepthEstimationPipeline aspect-ratio fix + /remove-bg demo cleanup
+
+### Fixes
+- **DepthEstimationPipeline.EstimateAsync / EstimateGpuAsync** gained optional
+  `outputWidth = 0, outputHeight = 0`. Default `(0, 0)` matches source image dimensions
+  (preserves aspect — previously the depth result came back at the model's square
+  input size and visibly squished against the source). `(w, 0)` and `(0, h)` fit
+  one axis and derive the other from source aspect; `(w, h)` is exact. Resize runs
+  on the accelerator via a new `ImagePostprocessKernel.ResizeBilinear` — no CPU
+  readback of the raw depth tensor.
+- **CoreML/ONNX format detection false positive** closed. `CoreMLParser.IsCoreML`
+  now refuses when the next protobuf tag after `specificationVersion` is `0x3A`
+  (the ONNX graph field-7 tag). Without this guard, ONNX models with no producer
+  string (e.g. SqueezeNet 1.1) were misclassified as CoreML and routed through
+  the CoreML placeholder graph — surfaced as `Inference failed: KeyNotFoundWithKey, output`
+  in the `/classify` demo.
+- **/remove-bg demo backend selector** now honors the dropdown (was always
+  WebGPU regardless of pick), and the **Transparent / White / Blur buttons** now
+  actually composite the result on mode change.
+
+### Dependency bumps
+- `SpawnDev.ILGPU` 4.9.7 → **4.9.8** — WebGL device probe no longer leaks an
+  `OffscreenCanvas` + `WebGL2RenderingContext` per registration. This is what
+  caused Chrome's "too many WebGL contexts" warning in v4.0.0-preview.1 even
+  when the WebGL backend was never selected.
+
+### Known rough edges (unchanged from preview.1)
+
+- RMBG-1.4 (`/remove-bg`) on WebGPU is sluggish during load + compile and the
+  output mask is still being investigated. WebGL works for this model. Other
+  pipelines (depth, classify, style) are smooth on WebGPU.
+- Wasm has a tighter memory ceiling than other backends; large models may exceed
+  it on Wasm.
+
 ## 4.0.0-preview.1 (2026-05-23) — first nuget.org preview
 
 First public preview. SpawnDev.ILGPU.ML provides native GPU neural-network inference
