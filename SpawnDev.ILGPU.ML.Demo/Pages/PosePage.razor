@@ -3,6 +3,8 @@
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.WebGPU
+@using SpawnDev.ILGPU.WebGPU.Backend
 @implements IDisposable
 
 <PageTitle>Pose Estimation — SpawnDev.ILGPU.ML</PageTitle>
@@ -30,39 +32,85 @@
         <button class="pose-variant-btn @(_modelVariant == "thunder" ? "active" : "")"
                 @onclick='() => _modelVariant = "thunder"'>Thunder (accurate)</button>
 
-        <label class="pose-label" style="margin-left: 1rem;">Trails:</label>
-        <input type="checkbox" @bind="_showTrails" class="pose-checkbox" />
+        <label class="pose-label" style="margin-left: 1rem;">Source:</label>
+        <button class="pose-variant-btn @(_inputMode == "webcam" ? "active" : "")"
+                @onclick='() => _inputMode = "webcam"'>Webcam (live)</button>
+        <button class="pose-variant-btn @(_inputMode == "image" ? "active" : "")"
+                @onclick='() => _inputMode = "image"'>Image (upload)</button>
     </div>
 
-    <div class="pose-viewport">
-        <WebcamCapture OnFrameCaptured="@HandleFrame"
-                       OnFrameDataUrl="@HandleFrameDataUrl"
-                       AutoCapture="true"
-                       CaptureIntervalMs="50"
-                       ShowCaptureButton="true" />
+    @if (_inputMode == "webcam")
+    {
+        <div class="pose-viewport">
+            <WebcamCapture OnFrameCaptured="@HandleFrame"
+                           OnFrameDataUrl="@HandleFrameDataUrl"
+                           AutoCapture="true"
+                           CaptureIntervalMs="50"
+                           ShowCaptureButton="true" />
 
-        @if (_keypoints?.Any() == true)
-        {
-            <svg class="pose-overlay" viewBox="0 0 640 480" preserveAspectRatio="xMidYMid meet">
-                @* Draw skeleton connections *@
-                @foreach (var conn in _connections)
-                {
-                    var from = _keypoints.ElementAtOrDefault(conn.From);
-                    var to = _keypoints.ElementAtOrDefault(conn.To);
-                    if (from != null && to != null && from.Confidence > 0.3f && to.Confidence > 0.3f)
+            @if (_keypoints?.Any() == true)
+            {
+                <svg class="pose-overlay" viewBox="0 0 640 480" preserveAspectRatio="xMidYMid meet">
+                    @foreach (var conn in _connections)
                     {
-                        <line x1="@from.X" y1="@from.Y" x2="@to.X" y2="@to.Y"
-                              stroke="#8b5cf6" stroke-width="3" stroke-linecap="round" opacity="0.8" />
+                        var from = _keypoints.ElementAtOrDefault(conn.From);
+                        var to = _keypoints.ElementAtOrDefault(conn.To);
+                        if (from != null && to != null && from.Confidence > 0.3f && to.Confidence > 0.3f)
+                        {
+                            <line x1="@from.X" y1="@from.Y" x2="@to.X" y2="@to.Y"
+                                  stroke="#8b5cf6" stroke-width="3" stroke-linecap="round" opacity="0.8" />
+                        }
                     }
-                }
-                @* Draw keypoints *@
-                @foreach (var kp in _keypoints.Where(k => k.Confidence > 0.3f))
+                    @foreach (var kp in _keypoints.Where(k => k.Confidence > 0.3f))
+                    {
+                        <circle cx="@kp.X" cy="@kp.Y" r="5" fill="#34d399" stroke="#0f172a" stroke-width="2" />
+                    }
+                </svg>
+            }
+        </div>
+    }
+    else
+    {
+        @* Still-image mode: file upload + sample images. Pose overlay scales to the image's
+           own width/height (saved on inference) so coordinates match regardless of source dims. *@
+        @if (_stillImageDataUrl != null)
+        {
+            <div class="pose-viewport pose-still">
+                <img src="@_stillImageDataUrl" class="pose-still-img" />
+                @if (_keypoints?.Any() == true)
                 {
-                    <circle cx="@kp.X" cy="@kp.Y" r="5" fill="#34d399" stroke="#0f172a" stroke-width="2" />
+                    <svg class="pose-overlay" viewBox="0 0 @_stillImageWidth @_stillImageHeight" preserveAspectRatio="xMidYMid meet">
+                        @foreach (var conn in _connections)
+                        {
+                            var from = _keypoints.ElementAtOrDefault(conn.From);
+                            var to = _keypoints.ElementAtOrDefault(conn.To);
+                            if (from != null && to != null && from.Confidence > 0.3f && to.Confidence > 0.3f)
+                            {
+                                <line x1="@from.X" y1="@from.Y" x2="@to.X" y2="@to.Y"
+                                      stroke="#8b5cf6" stroke-width="@(_stillImageWidth / 160)" stroke-linecap="round" opacity="0.8" />
+                            }
+                        }
+                        @foreach (var kp in _keypoints.Where(k => k.Confidence > 0.3f))
+                        {
+                            <circle cx="@kp.X" cy="@kp.Y" r="@(_stillImageWidth / 96)" fill="#34d399" stroke="#0f172a" stroke-width="@(_stillImageWidth / 320)" />
+                        }
+                    </svg>
                 }
-            </svg>
+            </div>
         }
-    </div>
+        else
+        {
+            <ImageDropZone @bind-ImageDataUrl="_stillImageDataUrl"
+                           OnImageLoaded="@HandleStillImageLoaded"
+                           SampleImages="@_poseSamples" />
+        }
+        @if (_stillImageDataUrl != null)
+        {
+            <div class="result-actions">
+                <button class="action-btn clear-btn" @onclick="ClearStillImage">Try Another Image</button>
+            </div>
+        }
+    }
 
     @if (_keypoints?.Any() == true)
     {
@@ -156,12 +204,39 @@
         font-size: 0.85rem;
         font-family: 'JetBrains Mono', 'Consolas', monospace;
     }
+
+    .pose-still {
+        position: relative;
+        width: 100%;
+        max-width: 800px;
+    }
+
+    .pose-still-img {
+        width: 100%;
+        height: auto;
+        display: block;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .pose-still .pose-overlay {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+    }
+
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease; }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
 </style>
 
 @code {
     private string _selectedBackend = "WebGPU";
     private string _modelVariant = "lightning";
-    private bool _showTrails;
+    private string _inputMode = "webcam"; // "webcam" or "image"
     private bool _isRunning;
     private bool _isModelLoading;
     private bool _isModelLoaded;
@@ -169,11 +244,20 @@
     private double _inferenceMs;
     private List<Keypoint>? _keypoints;
 
+    private string? _stillImageDataUrl;
+    private int _stillImageWidth = 640, _stillImageHeight = 480;
+
     private List<BackendSelector.BackendInfo> _backends = new()
     {
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
         new() { Id = "WebGL", DisplayName = "WebGL" },
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private List<ImageDropZone.SampleImage> _poseSamples = new()
+    {
+        new() { Label = "Portrait", Url = "samples/portrait.jpg" },
+        new() { Label = "Street", Url = "samples/street.jpg" },
     };
 
     // MoveNet COCO skeleton connections
@@ -213,8 +297,12 @@
                 _context = builder.ToContext();
             }
 
-            _accelerator = await _context.CreatePreferredAcceleratorAsync();
-            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+            _accelerator = await CreateAcceleratorForBackendAsync(_selectedBackend);
+            if (_accelerator == null)
+            {
+                Console.WriteLine($"[Pose] No {_selectedBackend} device available");
+                _isModelLoading = false; StateHasChanged(); return;
+            }
 
             using var hub = new Hub.ModelHub(JS);
             var modelBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.MoveNetLightning, Hub.ModelHub.KnownFiles.OnnxModel);
@@ -236,7 +324,40 @@
 
     private bool _processingFrame;
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task<global::ILGPU.Runtime.Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
+    {
+        if (_context == null) return null;
+        try
+        {
+            return backendId switch
+            {
+                "WebGPU" => await TryCreateAsync<WebGPUILGPUDevice>(),
+                "WebGL"  => await TryCreateAsync<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>(),
+                "Wasm"   => await TryCreateAsync<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>(),
+                _ => null,
+            };
+        }
+        catch { return null; }
+    }
+
+    private async Task<global::ILGPU.Runtime.Accelerator?> TryCreateAsync<TDevice>() where TDevice : global::ILGPU.Runtime.Device
+    {
+        var devices = _context!.GetDevices<TDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task HandleBackendChange(string backend)
+    {
+        if (backend == _selectedBackend && _isModelLoaded) return;
+        _selectedBackend = backend;
+        _keypoints = null;
+        _stillImageDataUrl = null;
+        _pipeline?.Dispose();
+        _accelerator?.Dispose();
+        _pipeline = null;
+        _accelerator = null;
+        await LoadModelAsync();
+    }
 
     private async Task HandleFrame(byte[] frameBytes)
     {
@@ -275,6 +396,59 @@
     }
 
     private Task HandleFrameDataUrl(string dataUrl) => Task.CompletedTask;
+
+    private async Task HandleStillImageLoaded(byte[] imageBytes)
+    {
+        if (_pipeline == null) return;
+        try
+        {
+            // Decode JPEG via the browser's CreateImageBitmap, then get raw RGBA via
+            // canvas getImageData. Same pattern as DepthPage / RemoveBgPage. Stash the
+            // bitmap dimensions so the SVG overlay's viewBox matches the source image.
+            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width; int h = (int)bitmap.Height;
+            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w; canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            var rgbaPixels = data.Read<int>();
+            _stillImageWidth = w;
+            _stillImageHeight = h;
+
+            _isRunning = true;
+            StateHasChanged();
+
+            var result = await _pipeline.EstimateAsync(rgbaPixels, w, h);
+            _inferenceMs = result.InferenceTimeMs;
+            _keypoints = result.Keypoints.Select(kp => new Keypoint
+            {
+                X = kp.X,
+                Y = kp.Y,
+                Confidence = kp.Confidence,
+            }).ToList();
+
+            _isRunning = false;
+            StateHasChanged();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Pose] Still image error: {ex.Message}");
+            _isRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private void ClearStillImage()
+    {
+        _stillImageDataUrl = null;
+        _keypoints = null;
+        StateHasChanged();
+    }
 
     public void Dispose()
     {
