@@ -2,6 +2,50 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.3 (2026-05-23) — SuperResolutionPipeline: real tile-based super-resolution + /remove-bg slider rendering fix
+
+### Fixes
+- **SuperResolutionPipeline** rewritten for proper tile-based super-resolution. The
+  prior pipeline emitted grayscale output (only the Y channel was used,
+  Cb/Cr discarded) at the model's fixed square output dimensions (e.g. 672×672 for
+  a 224×224 ESPCN @ 3×) regardless of source aspect. preview.3:
+  - Tiles the source into overlapping `modelW × modelH` patches (overlap defaults
+    to 16 source pixels) and runs each through the model independently.
+  - Accumulates super-resolved Y outputs on the accelerator into a single
+    `(sourceWidth * scale) × (sourceHeight * scale)` destination plane with a
+    per-pixel contribution count. Overlap regions are averaged (mean of all
+    contributing tiles) to smooth boundary seams.
+  - Composites the assembled Y with source-derived Cb/Cr (BT.601, bilinear) to
+    produce color RGBA at the correct aspect ratio.
+  - Sequential per-tile kernel dispatches mean no atomics are required — works
+    across all 6 backends including WebGL.
+  - All per-pixel work on the accelerator; CPU only does orchestration (which
+    tile index, what coordinates) and the final result readback in
+    `UpscaleAsync`. `UpscaleGpuAsync` keeps the result on the GPU.
+- **BeforeAfterSlider component** (demo): mirror the clip-path onto the Before
+  image so it only renders on the LEFT of the slider. The prior layout left the
+  Before image full-width underneath the After image — for opaque results that
+  was fine, but the background-removal demo's transparent RGBA After image let
+  the original brick wall show through the alpha-transparent areas, making the
+  result visually identical to the source even when the alpha mask was correct.
+  Demo only; library unchanged.
+- **`AfterHasTransparency` parameter** on `BeforeAfterSlider`: renders a 16×16
+  grey checkerboard behind the After image so transparent areas read as
+  "transparent" rather than blending with the page theme. `RemoveBgPage` opts in
+  when bg-mode is Transparent.
+
+### Dependencies (unchanged from preview.2)
+
+- `SpawnDev.ILGPU` 4.9.8
+- `SpawnDev.WebTorrent` 2.3.1
+- `Microsoft.AspNetCore.Components.Web` 10.0.4
+
+### Known rough edges
+
+- RMBG-1.4 (`/remove-bg`) inference itself is slow during load + compile on
+  WebGPU. The slider rendering bug above is fixed; once load + compile finishes
+  the actual segmentation works. Inference perf improvements are a follow-up.
+
 ## 4.0.0-preview.2 (2026-05-23) — dep bump + DepthEstimationPipeline aspect-ratio fix + /remove-bg demo cleanup
 
 ### Fixes
