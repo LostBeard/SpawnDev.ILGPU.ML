@@ -34,7 +34,8 @@
         <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
                            AfterImageUrl="@_resultImageUrl"
                            BeforeLabel="Original"
-                           AfterLabel="Removed" />
+                           AfterLabel="Removed"
+                           AfterHasTransparency="@(_bgMode == "transparent")" />
 
         <div class="rmbg-actions">
             <button class="download-btn" @onclick="DownloadResult">Download PNG</button>

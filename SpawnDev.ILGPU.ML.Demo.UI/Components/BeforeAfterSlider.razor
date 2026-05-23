@@ -1,5 +1,9 @@
-<div class="ba-container" @ref="_container">
-    <div class="ba-image ba-before">
+<div class="ba-container @(AfterHasTransparency ? "ba-checker" : "")" @ref="_container">
+    @* Before clip is mirrored to After's so they meet at the slider and never overlap.
+       Without this, a transparent After (e.g. background-removal RGBA) would show the
+       Before image *through* its alpha holes — the visible result would look identical
+       to the source even when the alpha mask is doing its job. *@
+    <div class="ba-image ba-before" style="clip-path: inset(0 @(100 - SliderPosition)% 0 0);">
         <img src="@BeforeImageUrl" alt="Before" />
         <span class="ba-label ba-label-before">@BeforeLabel</span>
     </div>
@@ -27,6 +31,14 @@
     [Parameter] public string AfterLabel { get; set; } = "Result";
     [Parameter] public double SliderPosition { get; set; } = 50;
 
+    /// <summary>
+    /// When true, the slider container shows a checkerboard pattern behind the After image
+    /// so transparent regions of an RGBA result (e.g. background removal) are visually
+    /// obvious instead of blending with the page background. Set this on pages whose After
+    /// image legitimately has transparency.
+    /// </summary>
+    [Parameter] public bool AfterHasTransparency { get; set; }
+
     private void HandleSliderInput(ChangeEventArgs e)
     {
         if (double.TryParse(e.Value?.ToString(), out var val))
@@ -45,6 +57,19 @@
         border: 1px solid rgba(255, 255, 255, 0.1);
         background: #0a0a0a;
         user-select: none;
+    }
+
+    /* Checkerboard for transparent-After demos (background removal). 16x16 squares,
+       two grey tones so it reads as "transparency" regardless of the page theme. */
+    .ba-checker {
+        background-color: #1a1a1a;
+        background-image:
+            linear-gradient(45deg, #2a2a2a 25%, transparent 25%),
+            linear-gradient(-45deg, #2a2a2a 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #2a2a2a 75%),
+            linear-gradient(-45deg, transparent 75%, #2a2a2a 75%);
+        background-size: 16px 16px;
+        background-position: 0 0, 0 8px, 8px -8px, -8px 0;
     }
 
     .ba-image {
