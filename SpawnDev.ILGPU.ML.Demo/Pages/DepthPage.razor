@@ -27,12 +27,18 @@
         </select>
     </div>
 
-    @if (_depthImageUrl != null && _imageDataUrl != null)
+    @if (_hasDepthResult && _imageDataUrl != null)
     {
+        @* Canvas-based After: BeforeAfterSlider renders a <canvas> for the After side and
+           hands its ElementReference to OnAfterCanvasReady. The page attaches an ILGPU
+           ICanvasRenderer to it and calls PresentAsync with the GPU buffer — zero PNG
+           encode, no data URL, backend-optimized GPU→canvas path. *@
         <BeforeAfterSlider BeforeImageUrl="@_imageDataUrl"
-                           AfterImageUrl="@_depthImageUrl"
                            BeforeLabel="Original"
-                           AfterLabel="@($"Depth ({_colorPalette})")" />
+                           AfterLabel="@($"Depth ({_colorPalette})")"
+                           CanvasWidth="@_depthWidth"
+                           CanvasHeight="@_depthHeight"
+                           AfterCanvasReady="OnAfterCanvasReady" />
 
         <div class="depth-stats">
             <span class="depth-stat">Min depth: @_minDepth.ToString("F3")</span>
@@ -56,7 +62,7 @@
                        SampleImages="@_samples" />
     }
 
-    @if (_imageDataUrl != null && _depthImageUrl == null && _isModelLoaded && !_isRunning)
+    @if (_imageDataUrl != null && !_hasDepthResult && _isModelLoaded && !_isRunning)
     {
         <button class="run-btn" @onclick="RunDepthEstimation">Estimate Depth</button>
     }
@@ -145,7 +151,6 @@
     // UI state — methods in DepthPage.razor.cs
     private string _selectedBackend = "WebGPU";
     private string? _imageDataUrl;
-    private string? _depthImageUrl;
     private string _colorPalette = "plasma";
     private bool _isRunning;
     private bool _isModelLoading;
@@ -156,6 +161,10 @@
     private float _maxDepth;
     private int _depthWidth;
     private int _depthHeight;
+    /// <summary>Set once inference has produced a depth result so the BeforeAfterSlider
+    /// mounts and the canvas-ready callback fires. The actual image lives in the
+    /// _gpuDepthBuffer GPU buffer — no CPU-side URL needed.</summary>
+    private bool _hasDepthResult;
     private string? _statusMessage;
 
     private List<BackendSelector.BackendInfo> _backends = new()

@@ -27,10 +27,17 @@ public partial class DepthPage : IDisposable
     private int _imageWidth, _imageHeight;
 
     // GPU-direct rendering. Raw depth stays on GPU so palette switches re-dispatch only
-    // the colormap kernel — no re-inference, no CPU readback of depth values.
+    // the colormap kernel; the colored GPU buffer renders straight to the slider's
+    // <canvas> via ICanvasRenderer — no PNG encode, no base64 data URL, no Blob/URL
+    // shuffling, no host readback of depth values.
     private MemoryBuffer2D<int, Stride2D.DenseX>? _gpuDepthBuffer;
     private MemoryBuffer1D<float, Stride1D.Dense>? _gpuRawDepth;
     private float _gpuRawMinDepth, _gpuRawMaxDepth;
+    private ICanvasRenderer? _canvasRenderer;
+    private bool _canvasReady;
+    /// <summary>Slider's After-side canvas. Saved on canvas-ready so DownloadResult can
+    /// pull a PNG blob URL from it on demand without holding a persistent data URL.</summary>
+    private ElementReference? _afterCanvasRef;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -113,7 +120,12 @@ public partial class DepthPage : IDisposable
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
-        _depthImageUrl = null;
+        // New image: drop any prior depth result so the slider unmounts; the canvas-ready
+        // callback will re-fire when the new result mounts the slider again.
+        _hasDepthResult = false;
+        _canvasReady = false;
+        _canvasRenderer?.Dispose();
+        _canvasRenderer = null;
         _statusMessage = null;
 
         try
@@ -157,7 +169,7 @@ public partial class DepthPage : IDisposable
             // GPU-direct: inference returns the raw depth on the accelerator + min/max.
             // The colormap is a separate accelerator-side step; on palette change we
             // re-dispatch ApplyColormapGpuAsync against the cached raw depth — no
-            // re-inference and no host readback of depth values.
+            // re-inference, no host readback of depth values.
             _gpuRawDepth?.Dispose();
             var (rawDepth, minD, maxD, w, h) = await _pipeline.EstimateGpuRawAsync(
                 _rgbaPixels, _imageWidth, _imageHeight);
@@ -170,7 +182,12 @@ public partial class DepthPage : IDisposable
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
 
-            await RecolorDepthGpuAsync();
+            // Setting _hasDepthResult mounts the BeforeAfterSlider; its canvas fires
+            // OnAfterCanvasReady on first render, which attaches the ICanvasRenderer
+            // and immediately presents the colored buffer. RecolorDepthGpuAsync
+            // builds the colored buffer first so it's ready when the canvas attaches.
+            await RecolorDepthGpuAsync(present: _canvasReady);
+            _hasDepthResult = true;
 
             _statusMessage = null;
         }
@@ -187,9 +204,14 @@ public partial class DepthPage : IDisposable
     {
         if (backend == _selectedBackend && _isModelLoaded) return;
         _selectedBackend = backend;
-        _depthImageUrl = null;
+        _hasDepthResult = false;
 
-        // Free cached GPU buffers tied to the old accelerator before tearing it down.
+        // Free cached GPU buffers + the canvas renderer tied to the old accelerator
+        // before tearing it down. The canvas-ready callback will fire again when the
+        // slider remounts with the new accelerator.
+        _canvasRenderer?.Dispose();
+        _canvasRenderer = null;
+        _canvasReady = false;
         _gpuDepthBuffer?.Dispose();
         _gpuDepthBuffer = null;
         _gpuRawDepth?.Dispose();
@@ -207,11 +229,16 @@ public partial class DepthPage : IDisposable
 
     /// <summary>
     /// Re-apply the colormap on the accelerator using the cached raw depth GPU buffer
-    /// and current <see cref="_colorPalette"/>. No inference re-run, no host readback of
-    /// depth values — only the final colored RGBA is read to CPU for the PNG data-URL
-    /// display path. Called on every inference completion and every palette change.
+    /// and the current <see cref="_colorPalette"/>. The colored GPU buffer is then
+    /// presented straight to the slider's <c>&lt;canvas&gt;</c> via
+    /// <see cref="ICanvasRenderer"/> (backend-optimized: WebGPU texture copy / WebGL
+    /// blit / Wasm putImageData — no PNG encode, no data URL, no Blob).
+    ///
+    /// When <paramref name="present"/> is false, the colored buffer is produced but
+    /// not presented — caller should present once the canvas is attached
+    /// (initial inference case where the slider hasn't mounted yet).
     /// </summary>
-    private async Task RecolorDepthGpuAsync()
+    private async Task RecolorDepthGpuAsync(bool present = true)
     {
         if (_gpuRawDepth == null || _accelerator == null || _pipeline == null) return;
 
@@ -221,19 +248,15 @@ public partial class DepthPage : IDisposable
             _gpuRawDepth.View, _depthWidth, _depthHeight,
             _gpuRawMinDepth, _gpuRawMaxDepth, paletteId);
 
-        // Read the colored RGBA buffer to CPU for the BeforeAfterSlider <img> data URL.
-        // This is the display path's required readback — it's just RGBA pixels, not the
-        // depth values themselves, so the depth data stays GPU-side end-to-end.
-        using var readBuf = _accelerator.Allocate1D<int>(_depthWidth * _depthHeight);
-        readBuf.View.CopyFrom(_gpuDepthBuffer.View.BaseView);
-        await _accelerator.SynchronizeAsync();
-        var pixels = await readBuf.CopyToHostAsync<int>(0, _depthWidth * _depthHeight);
-        _depthImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, pixels, _depthWidth, _depthHeight);
+        if (present && _canvasRenderer != null)
+        {
+            await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
+        }
     }
 
     /// <summary>
-    /// Razor dropdown handler — invoked via <c>@bind:after</c>. Fires the async GPU
-    /// colormap re-application and refreshes the UI when done.
+    /// Razor dropdown handler — invoked via <c>@bind:after</c>. Re-runs the GPU colormap
+    /// and presents to the canvas (no inference, no CPU readback).
     /// </summary>
     private async Task OnPaletteChangedAsync()
     {
@@ -241,14 +264,42 @@ public partial class DepthPage : IDisposable
         StateHasChanged();
     }
 
+    /// <summary>
+    /// Fires once when the BeforeAfterSlider's After-side canvas is rendered. Wraps the
+    /// ElementReference as an HTMLCanvasElement, creates the backend-appropriate
+    /// ICanvasRenderer, attaches it, and presents the colored buffer if inference has
+    /// already produced one. From this point on every palette switch / new inference just
+    /// dispatches one colormap kernel + one PresentAsync.
+    /// </summary>
+    private async Task OnAfterCanvasReady(ElementReference canvasRef)
+    {
+        if (_accelerator == null) return;
+        _canvasRenderer?.Dispose();
+        _canvasRenderer = CanvasRendererFactory.Create(_accelerator);
+        using var canvasEl = new HTMLCanvasElement(canvasRef);
+        _canvasRenderer.AttachCanvas(canvasEl);
+        _afterCanvasRef = canvasRef;
+        _canvasReady = true;
+
+        if (_gpuDepthBuffer != null)
+        {
+            await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
+        }
+    }
+
     private void DownloadResult()
     {
-        if (_depthImageUrl == null) return;
+        // The depth result lives on the slider's canvas (rendered there by
+        // ICanvasRenderer). Pull a PNG data URL from the canvas on demand for the
+        // anchor download — only happens on user click, not the per-frame path.
+        if (_afterCanvasRef == null) return;
         try
         {
+            using var canvasEl = new HTMLCanvasElement(_afterCanvasRef.Value);
+            var pngUrl = canvasEl.ToDataURL("image/png");
             using var document = JS.Get<SpawnDev.BlazorJS.JSObjects.Document>("document");
             using var link = document.CreateElement<SpawnDev.BlazorJS.JSObjects.HTMLAnchorElement>("a");
-            link.Href = _depthImageUrl;
+            link.Href = pngUrl;
             link.Download = $"depth-{_colorPalette}.png";
             using var body = document.Body!;
             body.AppendChild(link);
@@ -260,9 +311,13 @@ public partial class DepthPage : IDisposable
 
     private void ClearResult()
     {
-        _depthImageUrl = null;
+        _hasDepthResult = false;
         _imageDataUrl = null;
         _rgbaPixels = null;
+        _canvasRenderer?.Dispose();
+        _canvasRenderer = null;
+        _canvasReady = false;
+        _afterCanvasRef = null;
         _gpuDepthBuffer?.Dispose();
         _gpuDepthBuffer = null;
         _gpuRawDepth?.Dispose();
@@ -273,6 +328,7 @@ public partial class DepthPage : IDisposable
 
     public void Dispose()
     {
+        _canvasRenderer?.Dispose();
         _gpuDepthBuffer?.Dispose();
         _gpuRawDepth?.Dispose();
         _pipeline?.Dispose();

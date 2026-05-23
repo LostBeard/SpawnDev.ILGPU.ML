@@ -8,7 +8,19 @@
         <span class="ba-label ba-label-before">@BeforeLabel</span>
     </div>
     <div class="ba-image ba-after" style="clip-path: inset(0 0 0 @(SliderPosition)%);">
-        <img src="@AfterImageUrl" alt="After" />
+        @if (AfterCanvasReady.HasDelegate)
+        {
+            @* Canvas-based After: a Blazor consumer hooks an ICanvasRenderer to this
+               element via the AfterCanvasReady callback so the GPU buffer renders
+               directly — no PNG encode, no base64 data URL, no Blob shuffling. *@
+            <canvas @ref="_afterCanvas"
+                    width="@CanvasWidth"
+                    height="@CanvasHeight"></canvas>
+        }
+        else
+        {
+            <img src="@AfterImageUrl" alt="After" />
+        }
         <span class="ba-label ba-label-after">@AfterLabel</span>
     </div>
     <div class="ba-slider" style="left: @(SliderPosition)%;">
@@ -24,6 +36,8 @@
 
 @code {
     private ElementReference _container;
+    private ElementReference _afterCanvas;
+    private bool _canvasReadyFired;
 
     [Parameter] public string? BeforeImageUrl { get; set; }
     [Parameter] public string? AfterImageUrl { get; set; }
@@ -38,6 +52,34 @@
     /// image legitimately has transparency.
     /// </summary>
     [Parameter] public bool AfterHasTransparency { get; set; }
+
+    /// <summary>
+    /// When supplied, the After side renders a <c>&lt;canvas&gt;</c> element instead of an
+    /// <c>&lt;img&gt;</c>, and this callback fires once with the canvas's
+    /// <see cref="ElementReference"/> after first render. Consumers create an ILGPU
+    /// <c>ICanvasRenderer</c>, attach it to the element, and call
+    /// <c>PresentAsync</c> with a <c>MemoryBuffer2D&lt;int, Stride2D.DenseX&gt;</c> — the
+    /// GPU buffer renders straight to the page with no PNG encode, no base64 data URL,
+    /// and no extra Blob/URL shuffling. <see cref="AfterImageUrl"/> is ignored in this
+    /// mode. <see cref="CanvasWidth"/> / <see cref="CanvasHeight"/> set the canvas
+    /// backing-store dimensions; CSS scales the canvas to container width.
+    /// </summary>
+    [Parameter] public EventCallback<ElementReference> AfterCanvasReady { get; set; }
+
+    /// <summary>Canvas backing-store width (px) when <see cref="AfterCanvasReady"/> is set.</summary>
+    [Parameter] public int CanvasWidth { get; set; } = 512;
+
+    /// <summary>Canvas backing-store height (px) when <see cref="AfterCanvasReady"/> is set.</summary>
+    [Parameter] public int CanvasHeight { get; set; } = 512;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (AfterCanvasReady.HasDelegate && !_canvasReadyFired)
+        {
+            _canvasReadyFired = true;
+            await AfterCanvasReady.InvokeAsync(_afterCanvas);
+        }
+    }
 
     private void HandleSliderInput(ChangeEventArgs e)
     {
@@ -76,8 +118,12 @@
         width: 100%;
     }
 
-    .ba-image img {
+    /* Both img and canvas scale to container width; canvas keeps its aspect via the
+       backing-store dimensions set by CanvasWidth/CanvasHeight. */
+    .ba-image img,
+    .ba-image canvas {
         width: 100%;
+        height: auto;
         display: block;
     }
 
