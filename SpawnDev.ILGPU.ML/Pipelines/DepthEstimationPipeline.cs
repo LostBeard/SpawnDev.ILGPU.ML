@@ -83,9 +83,12 @@ public class DepthEstimationPipeline : IDisposable
         int outSize = outW * outH;
 
         // GPU-side bilinear resize from raw model output (rawW × rawH) → (outW × outH).
+        // TensorView<float> carries shape inline — no scalar W/H kernel params needed.
         var post = new Kernels.ImagePostprocessKernel(_accelerator);
         using var resized = _accelerator.Allocate1D<float>(outSize);
-        post.ResizeBilinear(output.Data.SubView(0, rawSize), resized.View, rawW, rawH, outW, outH);
+        var srcView = new Tensors.TensorView<float>(output.Data.SubView(0, rawSize), new[] { rawH, rawW });
+        var dstView = new Tensors.TensorView<float>(resized.View, new[] { outH, outW });
+        post.ResizeBilinear(srcView, dstView);
         await _accelerator.SynchronizeAsync();
 
         // Read resized depth to CPU for min/max + normalization.
@@ -205,7 +208,10 @@ public class DepthEstimationPipeline : IDisposable
         // raw path is entirely host-touch-free).
         int readRawSize = Math.Min(rawSize, (int)output.Data.Length);
         var rawDepth = _accelerator.Allocate1D<float>(outSize);
-        postprocess.ResizeBilinear(output.Data.SubView(0, readRawSize), rawDepth.View, rawW, rawH, outW, outH);
+        // TensorView<float> carries shape inline — kernel reads dims from D0/D1.
+        var srcView = new Tensors.TensorView<float>(output.Data.SubView(0, readRawSize), new[] { rawH, rawW });
+        var dstView = new Tensors.TensorView<float>(rawDepth.View, new[] { outH, outW });
+        postprocess.ResizeBilinear(srcView, dstView);
         await _accelerator.SynchronizeAsync();
 
         var resizedHost = await rawDepth.CopyToHostAsync<float>(0, outSize);

@@ -24,6 +24,7 @@ public class ImagePostprocessKernel
         float, float>? _normalizeKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int, int>? _resizeFloatKernel;
+    private Action<Index1D, Tensors.TensorView<float>, Tensors.TensorView<float>>? _resizeFloatTensorViewKernel;
 
     public ImagePostprocessKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -32,10 +33,28 @@ public class ImagePostprocessKernel
     // ═══════════════════════════════════════════════════════════
 
     /// <summary>
-    /// Bilinear-resize a single-channel float map [srcH * srcW] → [dstH * dstW] on GPU.
-    /// Used to upscale model outputs (518×518) back to source-image dimensions so
-    /// downstream rendering aligns 1:1 with the input image (depth maps, masks, etc).
+    /// Bilinear-resize a single-channel float map on GPU. Tensor shapes are
+    /// row-major <c>[H, W]</c> (D0 = height, D1 = width — PyTorch / numpy convention).
     /// One thread per destination pixel.
+    ///
+    /// <para>
+    /// Phase 2 of the Tensor refactor: this overload takes <see cref="Tensors.TensorView{T}"/>
+    /// directly instead of unpacking width / height to scalar kernel parameters. The
+    /// legacy <c>(ArrayView, srcW, srcH, dstW, dstH)</c> overload is kept for callers
+    /// that haven't migrated yet.
+    /// </para>
+    /// </summary>
+    public void ResizeBilinear(Tensors.TensorView<float> src, Tensors.TensorView<float> dst)
+    {
+        _resizeFloatTensorViewKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            Tensors.TensorView<float>, Tensors.TensorView<float>>(ResizeBilinearTensorViewImpl);
+        _resizeFloatTensorViewKernel(dst.ElementCount, src, dst);
+    }
+
+    /// <summary>
+    /// Bilinear-resize a single-channel float map <c>[srcH * srcW] → [dstH * dstW]</c>
+    /// on GPU. Legacy overload — prefer <see cref="ResizeBilinear(Tensors.TensorView{float}, Tensors.TensorView{float})"/>
+    /// for new code.
     /// </summary>
     public void ResizeBilinear(
         ArrayView1D<float, Stride1D.Dense> src,
@@ -46,6 +65,45 @@ public class ImagePostprocessKernel
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int>(ResizeBilinearImpl);
         _resizeFloatKernel(dstW * dstH, src, dst, srcW, srcH, dstW, dstH);
+    }
+
+    /// <summary>
+    /// Phase 2 implementation. Reads <c>src.D0 = srcH, src.D1 = srcW</c> and
+    /// <c>dst.D0 = dstH, dst.D1 = dstW</c> from the TensorView dimensions — no
+    /// scalar shape parameters needed.
+    /// </summary>
+    private static void ResizeBilinearTensorViewImpl(Index1D idx,
+        Tensors.TensorView<float> src,
+        Tensors.TensorView<float> dst)
+    {
+        int dstW = dst.D1;
+        int dy = idx / dstW;
+        int dx = idx % dstW;
+
+        float fy = ((dy + 0.5f) * src.D0 / dst.D0) - 0.5f;
+        float fx = ((dx + 0.5f) * src.D1 / dst.D1) - 0.5f;
+
+        // Two-statement floor: prevents ILGPU optimizer from eliding floor() before int
+        // cast. (int)x truncates toward zero — wrong for negative values.
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
+
+        int srcH = src.D0; int srcW = src.D1;
+        if (y0 < 0) y0 = 0; if (y0 >= srcH) y0 = srcH - 1;
+        if (y1 < 0) y1 = 0; if (y1 >= srcH) y1 = srcH - 1;
+        if (x0 < 0) x0 = 0; if (x0 >= srcW) x0 = srcW - 1;
+        if (x1 < 0) x1 = 0; if (x1 >= srcW) x1 = srcW - 1;
+
+        float v00 = src.Get2D(y0, x0);
+        float v01 = src.Get2D(y0, x1);
+        float v10 = src.Get2D(y1, x0);
+        float v11 = src.Get2D(y1, x1);
+
+        dst.Set2D(dy, dx,
+            v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
+          + v10 * ty * (1f - tx) + v11 * ty * tx);
     }
 
     private static void ResizeBilinearImpl(Index1D idx,

@@ -253,4 +253,176 @@ public abstract partial class MLTestBase
         catch (ArgumentException) { /* expected */ }
         await Task.CompletedTask;
     });
+
+    // ────────────────────────────────────────────────────────────────────────
+    //  Phase 1.5: OwnedTensor<T> — IDisposable wrapper that owns its buffer.
+    //  Pipelines that return tensors hand callers an OwnedTensor; callers
+    //  dispose it when finished. Implicit conversions to Tensor<T> and
+    //  TensorView<T> mean OwnedTensors pass into anything that accepts those.
+    // ────────────────────────────────────────────────────────────────────────
+
+    [TestMethod]
+    public async Task OwnedTensor_Allocate_FromHost_ImplicitConversions() => await RunTest(async accelerator =>
+    {
+        // Allocate factory produces an OwnedTensor wrapping a fresh accelerator buffer.
+        using var empty = OwnedTensor<float>.Allocate(accelerator, new[] { 4, 8 }, "empty");
+        if (empty.ElementCount != 32) throw new Exception($"Expected 32 got {empty.ElementCount}");
+        if (empty.Name != "empty") throw new Exception($"Name lost: {empty.Name}");
+        if (empty.Rank != 2) throw new Exception($"Rank: {empty.Rank}");
+
+        // FromHost factory: allocate + initial fill in one step.
+        var hostData = Enumerable.Range(0, 12).Select(i => (float)i).ToArray();
+        using var filled = OwnedTensor<float>.FromHost(accelerator, hostData, new[] { 3, 4 }, "filled");
+        var readback = await filled.ToHostAsync();
+        for (int i = 0; i < 12; i++)
+            if (Math.Abs(readback[i] - hostData[i]) > 1e-5f)
+                throw new Exception($"FromHost roundtrip mismatch at {i}: {readback[i]} vs {hostData[i]}");
+
+        // Implicit conversion to Tensor<T> — the non-owning view. The Tensor reference
+        // stays valid for the OwnedTensor's lifetime.
+        Tensor<float> asTensor = filled;
+        if (asTensor.ElementCount != 12) throw new Exception("Implicit Tensor<T> conversion broke ElementCount");
+        if (asTensor.Shape[0] != 3 || asTensor.Shape[1] != 4)
+            throw new Exception($"Implicit Tensor<T> shape: [{string.Join(",", asTensor.Shape)}]");
+
+        // Implicit conversion to TensorView<T> — kernel-passable.
+        TensorView<float> asView = filled;
+        if (asView.D0 != 3 || asView.D1 != 4)
+            throw new Exception($"Implicit TensorView shape: ({asView.D0}, {asView.D1})");
+
+        Console.WriteLine($"[OwnedTensor] Allocate + FromHost + implicit conversions verified");
+    });
+
+    [TestMethod]
+    public async Task OwnedTensor_PassesToKernel_ViaImplicitConversion() => await RunTest(async accelerator =>
+    {
+        // OwnedTensor pipes straight into a kernel taking TensorView<T> via the implicit
+        // operator. Caller never has to type .View or .AsTensor.
+        var hostA = Enumerable.Range(0, 20).Select(i => (float)i).ToArray();
+        using var a = OwnedTensor<float>.FromHost(accelerator, hostA, new[] { 4, 5 });
+        using var b = OwnedTensor<float>.Allocate(accelerator, new[] { 4, 5 });
+
+        // Note: passing OwnedTensor<float> directly — implicit conversion to TensorView<float>.
+        var kernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, TensorView<float>, TensorView<float>>(
+            (Index1D idx, TensorView<float> inp, TensorView<float> outp) =>
+            {
+                int c = idx % inp.D1;
+                int r = idx / inp.D1;
+                outp.Set2D(r, c, inp.Get2D(r, c) * 3f);
+            });
+        kernel(a.ElementCount, a, b);  // <-- OwnedTensor → TensorView implicit
+        await accelerator.SynchronizeAsync();
+
+        var result = await b.ToHostAsync();
+        for (int i = 0; i < hostA.Length; i++)
+            if (Math.Abs(result[i] - hostA[i] * 3f) > 1e-5f)
+                throw new Exception($"Idx {i}: expected {hostA[i] * 3f} got {result[i]}");
+
+        Console.WriteLine($"[OwnedTensor] Implicit conversion to TensorView at kernel call site verified");
+    });
+
+    [TestMethod]
+    public async Task OwnedTensor_Dispose_ReleasesBuffer() => await RunTest(async accelerator =>
+    {
+        // Allocate, dispose, allocate same shape again — must succeed without leaking.
+        // (Hard to assert "buffer released" directly without internal accelerator state,
+        // but if Dispose were a no-op this test would pass anyway; we run it inside a
+        // tight loop so any leak would surface as an OOM at scale on tighter backends.)
+        for (int i = 0; i < 50; i++)
+        {
+            var t = OwnedTensor<float>.Allocate(accelerator, new[] { 1024, 1024 });
+            t.Dispose();
+            t.Dispose(); // double-dispose is safe (idempotent guard inside).
+        }
+        Console.WriteLine($"[OwnedTensor] 50x allocate + dispose + double-dispose loop completed");
+        await Task.CompletedTask;
+    });
+
+    // ────────────────────────────────────────────────────────────────────────
+    //  Half element type. Verifies Tensor<Half> and TensorView<Half> work
+    //  through ILGPU's generic kernel pipeline for FP16 data.
+    // ────────────────────────────────────────────────────────────────────────
+
+    [TestMethod]
+    public async Task TensorView_Half_RoundTrip() => await RunTest(async accelerator =>
+    {
+        // Build an FP16 tensor on the host, copy to accelerator, run a kernel that
+        // touches every element through TensorView<Half> indexers, copy back, verify.
+        const int Rows = 4, Cols = 8;
+        const int Count = Rows * Cols;
+        var hostHalf = new global::ILGPU.Half[Count];
+        for (int i = 0; i < Count; i++) hostHalf[i] = (global::ILGPU.Half)(i * 0.25f);
+
+        using var inOwned = OwnedTensor<global::ILGPU.Half>.FromHost(accelerator, hostHalf, new[] { Rows, Cols });
+        using var outOwned = OwnedTensor<global::ILGPU.Half>.Allocate(accelerator, new[] { Rows, Cols });
+
+        // Kernel: out[i,j] = in[i,j] + (Half)1.5 — exercises both Get2D / Set2D on Half.
+        var kernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, TensorView<global::ILGPU.Half>, TensorView<global::ILGPU.Half>>(
+            (Index1D idx, TensorView<global::ILGPU.Half> inp, TensorView<global::ILGPU.Half> outp) =>
+            {
+                int c = idx % inp.D1;
+                int r = idx / inp.D1;
+                var v = inp.Get2D(r, c);
+                outp.Set2D(r, c, v + (global::ILGPU.Half)1.5f);
+            });
+        kernel(Count, inOwned, outOwned);
+        await accelerator.SynchronizeAsync();
+
+        var result = await outOwned.ToHostAsync();
+        for (int i = 0; i < Count; i++)
+        {
+            float expected = (float)hostHalf[i] + 1.5f;
+            float actual = (float)result[i];
+            // FP16 quantization: tolerance 1e-2 covers half-precision rounding.
+            if (Math.Abs(actual - expected) > 1e-2f)
+                throw new Exception($"Idx {i}: expected {expected} got {actual}");
+        }
+
+        Console.WriteLine($"[TensorView<Half>] {Rows}x{Cols} FP16 kernel round-trip verified");
+    });
+
+    // ────────────────────────────────────────────────────────────────────────
+    //  Phase 2: a kernel migrated to take TensorView<T> directly.
+    //  ImagePostprocessKernel.ResizeBilinear is the proof-of-concept; it now
+    //  reads source/dest H and W from the TensorView struct instead of taking
+    //  them as scalar kernel parameters.
+    // ────────────────────────────────────────────────────────────────────────
+
+    [TestMethod]
+    public async Task ResizeBilinear_TensorView_2xUpscale() => await RunTest(async accelerator =>
+    {
+        // 4x4 source → 8x8 dest. With BT.601 half-pixel sampling each dest pixel is the
+        // average of the four nearest source pixels in the limit, but for a constant-
+        // gradient source we expect a smooth gradient in the result too. We just check
+        // that corners match source corners (within tolerance) and that the destination
+        // has wider range than the source's first row (proving real interpolation).
+        const int SrcH = 4, SrcW = 4, DstH = 8, DstW = 8;
+        var srcData = new float[SrcH * SrcW];
+        for (int y = 0; y < SrcH; y++)
+            for (int x = 0; x < SrcW; x++)
+                srcData[y * SrcW + x] = y * 10f + x;
+
+        using var src = OwnedTensor<float>.FromHost(accelerator, srcData, new[] { SrcH, SrcW });
+        using var dst = OwnedTensor<float>.Allocate(accelerator, new[] { DstH, DstW });
+
+        var kernel = new SpawnDev.ILGPU.ML.Kernels.ImagePostprocessKernel(accelerator);
+        kernel.ResizeBilinear(src, dst); // <-- OwnedTensor → TensorView implicit, no W/H scalars!
+        await accelerator.SynchronizeAsync();
+
+        var dstHost = await dst.ToHostAsync();
+
+        // Corner sanity: top-left of dst should be near src[0,0] = 0. Bottom-right
+        // should be near src[3,3] = 33 (clamped, with half-pixel offset).
+        if (dstHost[0] > 5f)
+            throw new Exception($"Top-left dst should be small, got {dstHost[0]}");
+        if (dstHost[DstH * DstW - 1] < 28f)
+            throw new Exception($"Bottom-right dst should be large, got {dstHost[DstH * DstW - 1]}");
+
+        // Variance check: result must vary (we upsampled a gradient).
+        float dstMin = dstHost.Min(), dstMax = dstHost.Max();
+        if (dstMax - dstMin < 25f)
+            throw new Exception($"Upscaled gradient too flat: range [{dstMin}, {dstMax}]");
+
+        Console.WriteLine($"[ResizeBilinear(TensorView)] {SrcH}x{SrcW} → {DstH}x{DstW} range [{dstMin:F2}, {dstMax:F2}]");
+    });
 }
