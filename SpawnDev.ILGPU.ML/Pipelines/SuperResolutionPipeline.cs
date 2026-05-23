@@ -43,10 +43,17 @@ public class SuperResolutionPipeline : IDisposable
 
     /// <summary>
     /// Upscale an RGBA image using the super-resolution model.
+    ///
+    /// Output dimensions are <c>width * upscaleFactor × height * upscaleFactor</c> — the
+    /// source aspect ratio is preserved. Color is reconstructed by combining the
+    /// super-resolved Y channel from the model with Cb/Cr bilinearly upsampled from the
+    /// original RGBA source.
     /// </summary>
     public async Task<SuperResResult> UpscaleAsync(int[] rgbaPixels, int width, int height)
     {
         int modelH = _modelH, modelW = _modelW;
+        int dstW = width * _upscaleFactor;
+        int dstH = height * _upscaleFactor;
 
         // GPU preprocessing: RGBA → bilinear resize → Y luminance channel
         // BT.601: Y = 0.299*R + 0.587*G + 0.114*B — all on GPU, no CPU loops
@@ -56,37 +63,42 @@ public class SuperResolutionPipeline : IDisposable
         _preprocess.ForwardYChannel(rgbaBuf.View, inputBuf.View, width, height, modelW, modelH);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, modelH, modelW });
 
-        // Run inference
+        // Run inference — model produces a super-resolved Y plane at modelH*scale × modelW*scale
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
         });
         await _accelerator.SynchronizeAsync();
 
-        // GPU: Y float → grayscale RGBA — stays on GPU, only final result reads to CPU
         var output = outputs[_session.OutputNames[0]];
-        int outH = modelH * _upscaleFactor;
-        int outW = modelW * _upscaleFactor;
-        int outSize = Math.Min(outH * outW, output.ElementCount);
+        int yH = output.Shape.Length >= 3 ? output.Shape[^2] : modelH * _upscaleFactor;
+        int yW = output.Shape.Length >= 3 ? output.Shape[^1] : modelW * _upscaleFactor;
 
-        using var rgbaOutBuf = _accelerator.Allocate1D<int>(outSize);
+        // GPU: combine super-res Y + source Cb/Cr → color RGBA at source aspect ratio
+        using var rgbaOutBuf = _accelerator.Allocate1D<int>(dstW * dstH);
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
-        postprocess.GrayscaleToRGBA(output.Data.SubView(0, outSize), rgbaOutBuf.View, outSize);
+        postprocess.SuperResCompositeYCbCr(
+            rgbaBuf.View, output.Data.SubView(0, yH * yW), rgbaOutBuf.View,
+            width, height, yW, yH, dstW, dstH);
         await _accelerator.SynchronizeAsync();
-        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, outSize);
+        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, dstW * dstH);
 
-        return new SuperResResult(result, outW, outH, _upscaleFactor);
+        return new SuperResResult(result, dstW, dstH, _upscaleFactor);
     }
 
     /// <summary>
     /// Upscale an RGBA image and return result as GPU MemoryBuffer2D
     /// for zero-copy presentation via ICanvasRenderer.
+    /// Output dimensions preserve source aspect ratio (width * scale × height * scale)
+    /// and color is reconstructed via YCbCr composite.
     /// Caller owns the returned buffer and must dispose it.
     /// </summary>
     public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
         int[] rgbaPixels, int width, int height)
     {
         int modelH = _modelH, modelW = _modelW;
+        int dstW = width * _upscaleFactor;
+        int dstH = height * _upscaleFactor;
 
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var inputBuf = _accelerator.Allocate1D<float>(modelH * modelW);
@@ -100,17 +112,17 @@ public class SuperResolutionPipeline : IDisposable
         });
 
         var output = outputs[_session.OutputNames[0]];
-        int outH = modelH * _upscaleFactor;
-        int outW = modelW * _upscaleFactor;
-        int outSize = Math.Min(outH * outW, output.ElementCount);
+        int yH = output.Shape.Length >= 3 ? output.Shape[^2] : modelH * _upscaleFactor;
+        int yW = output.Shape.Length >= 3 ? output.Shape[^1] : modelW * _upscaleFactor;
 
-        // GPU: Y → grayscale RGBA, output to 2D buffer for zero-copy rendering
-        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
+        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(dstW, dstH));
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
-        postprocess.GrayscaleToRGBA(output.Data.SubView(0, outSize), resultBuf.View.BaseView, outSize);
+        postprocess.SuperResCompositeYCbCr(
+            rgbaBuf.View, output.Data.SubView(0, yH * yW), resultBuf.View.BaseView,
+            width, height, yW, yH, dstW, dstH);
         await _accelerator.SynchronizeAsync();
 
-        return (resultBuf, outW, outH);
+        return (resultBuf, dstW, dstH);
     }
 
     public void Dispose() { }

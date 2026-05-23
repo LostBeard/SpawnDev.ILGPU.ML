@@ -217,6 +217,121 @@ public class ImagePostprocessKernel
     }
 
     // ═══════════════════════════════════════════════════════════
+    //  Super-resolution composite (Y from model + Cb/Cr from source RGBA)
+    // ═══════════════════════════════════════════════════════════
+
+    private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int>? _superResCompositeKernel;
+
+    /// <summary>
+    /// Composite a super-resolved Y luminance plane with bilinearly-upsampled Cb/Cr
+    /// from the original RGBA source to produce a color upscaled image.
+    ///
+    /// ESPCN-style super-resolution models operate on the Y channel only. A naive
+    /// pipeline writes Y back as grayscale (R=G=B=Y), losing all color and shape-locking
+    /// the output to the model's square input/output dims. This kernel:
+    ///   - Bilinear-samples Y from the model output at the destination resolution
+    ///     (handles the case where srcW * scale != modelOutW)
+    ///   - Bilinear-samples Cb / Cr from the original RGBA source at the destination
+    ///     resolution
+    ///   - Combines BT.601 YCbCr → RGB and packs to RGBA
+    ///
+    /// One thread per destination pixel. dstSize = dstW * dstH.
+    /// </summary>
+    public void SuperResCompositeYCbCr(
+        ArrayView1D<int, Stride1D.Dense> rgbaSrc,
+        ArrayView1D<float, Stride1D.Dense> superResY,
+        ArrayView1D<int, Stride1D.Dense> rgbaOut,
+        int srcW, int srcH,
+        int yW, int yH,
+        int dstW, int dstH)
+    {
+        _superResCompositeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, int, int, int, int, int, int>(SuperResCompositeImpl);
+        _superResCompositeKernel(dstW * dstH, rgbaSrc, superResY, rgbaOut,
+            srcW, srcH, yW, yH, dstW, dstH);
+    }
+
+    private static void SuperResCompositeImpl(Index1D idx,
+        ArrayView1D<int, Stride1D.Dense> rgbaSrc,
+        ArrayView1D<float, Stride1D.Dense> superResY,
+        ArrayView1D<int, Stride1D.Dense> rgbaOut,
+        int srcW, int srcH, int yW, int yH, int dstW, int dstH)
+    {
+        int dy = idx / dstW;
+        int dx = idx % dstW;
+
+        // Sample Y from the super-resolved Y plane (typically yW×yH ≈ modelW*scale)
+        float fyY = ((dy + 0.5f) * yH / dstH) - 0.5f;
+        float fxY = ((dx + 0.5f) * yW / dstW) - 0.5f;
+        float floorYy = MathF.Floor(fyY); float floorYx = MathF.Floor(fxY);
+        int y0y = (int)floorYy; int y1y = y0y + 1;
+        int x0y = (int)floorYx; int x1y = x0y + 1;
+        float tYy = fyY - floorYy; float tYx = fxY - floorYx;
+        if (y0y < 0) y0y = 0; if (y0y >= yH) y0y = yH - 1;
+        if (y1y < 0) y1y = 0; if (y1y >= yH) y1y = yH - 1;
+        if (x0y < 0) x0y = 0; if (x0y >= yW) x0y = yW - 1;
+        if (x1y < 0) x1y = 0; if (x1y >= yW) x1y = yW - 1;
+        float y00 = superResY[y0y * yW + x0y];
+        float y01 = superResY[y0y * yW + x1y];
+        float y10 = superResY[y1y * yW + x0y];
+        float y11 = superResY[y1y * yW + x1y];
+        float yVal = y00 * (1f - tYy) * (1f - tYx) + y01 * (1f - tYy) * tYx
+                   + y10 * tYy * (1f - tYx) + y11 * tYy * tYx;
+        // Model Y is in [0,1]; convert to [0,255] to match Cb/Cr scale
+        float yScaled = yVal * 255f;
+
+        // Sample Cb and Cr from the source RGBA at the destination position.
+        // Two-statement floor: ILGPU optimizer can elide MathF.Floor before an int
+        // cast that would otherwise truncate toward zero for negative values.
+        float fyS = ((dy + 0.5f) * srcH / dstH) - 0.5f;
+        float fxS = ((dx + 0.5f) * srcW / dstW) - 0.5f;
+        float floorSy = MathF.Floor(fyS); float floorSx = MathF.Floor(fxS);
+        int y0s = (int)floorSy; int y1s = y0s + 1;
+        int x0s = (int)floorSx; int x1s = x0s + 1;
+        float tSy = fyS - floorSy; float tSx = fxS - floorSx;
+        if (y0s < 0) y0s = 0; if (y0s >= srcH) y0s = srcH - 1;
+        if (y1s < 0) y1s = 0; if (y1s >= srcH) y1s = srcH - 1;
+        if (x0s < 0) x0s = 0; if (x0s >= srcW) x0s = srcW - 1;
+        if (x1s < 0) x1s = 0; if (x1s >= srcW) x1s = srcW - 1;
+
+        int p00 = rgbaSrc[y0s * srcW + x0s];
+        int p01 = rgbaSrc[y0s * srcW + x1s];
+        int p10 = rgbaSrc[y1s * srcW + x0s];
+        int p11 = rgbaSrc[y1s * srcW + x1s];
+
+        // BT.601: Cb = -0.168736 R - 0.331264 G + 0.5 B + 128
+        //         Cr =  0.5 R       - 0.418688 G - 0.081312 B + 128
+        float cb00 = -0.168736f * (p00 & 0xFF) - 0.331264f * ((p00 >> 8) & 0xFF) + 0.5f * ((p00 >> 16) & 0xFF) + 128f;
+        float cb01 = -0.168736f * (p01 & 0xFF) - 0.331264f * ((p01 >> 8) & 0xFF) + 0.5f * ((p01 >> 16) & 0xFF) + 128f;
+        float cb10 = -0.168736f * (p10 & 0xFF) - 0.331264f * ((p10 >> 8) & 0xFF) + 0.5f * ((p10 >> 16) & 0xFF) + 128f;
+        float cb11 = -0.168736f * (p11 & 0xFF) - 0.331264f * ((p11 >> 8) & 0xFF) + 0.5f * ((p11 >> 16) & 0xFF) + 128f;
+        float cbVal = cb00 * (1f - tSy) * (1f - tSx) + cb01 * (1f - tSy) * tSx
+                    + cb10 * tSy * (1f - tSx) + cb11 * tSy * tSx;
+
+        float cr00 = 0.5f * (p00 & 0xFF) - 0.418688f * ((p00 >> 8) & 0xFF) - 0.081312f * ((p00 >> 16) & 0xFF) + 128f;
+        float cr01 = 0.5f * (p01 & 0xFF) - 0.418688f * ((p01 >> 8) & 0xFF) - 0.081312f * ((p01 >> 16) & 0xFF) + 128f;
+        float cr10 = 0.5f * (p10 & 0xFF) - 0.418688f * ((p10 >> 8) & 0xFF) - 0.081312f * ((p10 >> 16) & 0xFF) + 128f;
+        float cr11 = 0.5f * (p11 & 0xFF) - 0.418688f * ((p11 >> 8) & 0xFF) - 0.081312f * ((p11 >> 16) & 0xFF) + 128f;
+        float crVal = cr00 * (1f - tSy) * (1f - tSx) + cr01 * (1f - tSy) * tSx
+                    + cr10 * tSy * (1f - tSx) + cr11 * tSy * tSx;
+
+        // BT.601 YCbCr → RGB
+        float cbShift = cbVal - 128f;
+        float crShift = crVal - 128f;
+        float r = yScaled + 1.402f * crShift;
+        float g = yScaled - 0.344136f * cbShift - 0.714136f * crShift;
+        float b = yScaled + 1.772f * cbShift;
+
+        int ri = (int)(r + 0.5f); if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+        int gi = (int)(g + 0.5f); if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+        int bi = (int)(b + 0.5f); if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+
+        rgbaOut[idx] = ri | (gi << 8) | (bi << 16) | (0xFF << 24);
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  Normalize float array to [0,1] on GPU
     // ═══════════════════════════════════════════════════════════
 
