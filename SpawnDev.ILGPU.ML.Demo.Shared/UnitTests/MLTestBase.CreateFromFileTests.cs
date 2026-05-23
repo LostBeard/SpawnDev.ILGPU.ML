@@ -287,6 +287,69 @@ public abstract partial class MLTestBase
         pipeline.Dispose();
     });
 
+    /// <summary>
+    /// Depth Anything V2 Small: depth result must match source aspect ratio.
+    /// Regression: the model input is square (518×518) and the depth tensor comes back square,
+    /// so without GPU-side resize the result is squished against the original image in any
+    /// side-by-side display. The pipeline must default to source dimensions, and the
+    /// outputWidth/outputHeight params must drive both exact and aspect-preserving sizing.
+    /// </summary>
+    [TestMethod(Timeout = 300000)]
+    public async Task CreateFromFile_DepthAnything_OutputAspectRatio() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        using var session = InferenceSession.CreateFromOnnx(
+            accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]>
+            {
+                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+            });
+        var pipeline = new DepthEstimationPipeline(session, accelerator);
+
+        // 96×32 source (3:1 landscape) — same ratio as the city image that exposed the bug.
+        const int srcW = 96, srcH = 32;
+        var pixels = CreateGradientImage(srcW, srcH);
+
+        // Default: should match source dimensions exactly (preserves aspect 1:1 with input).
+        var def = await pipeline.EstimateAsync(pixels, srcW, srcH);
+        if (def.Width != srcW || def.Height != srcH)
+            throw new Exception($"Default output must match source: expected {srcW}x{srcH}, got {def.Width}x{def.Height}");
+        if (def.DepthMap.Length != srcW * srcH)
+            throw new Exception($"DepthMap length mismatch: expected {srcW * srcH}, got {def.DepthMap.Length}");
+
+        // Explicit width, derive height from source aspect: 200 × round(200*32/96) = 200 × 67.
+        var widthOnly = await pipeline.EstimateAsync(pixels, srcW, srcH, outputWidth: 200);
+        int expectedH = (int)MathF.Round(200f * srcH / srcW);
+        if (widthOnly.Width != 200 || widthOnly.Height != expectedH)
+            throw new Exception($"outputWidth=200 expected 200x{expectedH}, got {widthOnly.Width}x{widthOnly.Height}");
+
+        // Explicit height, derive width from source aspect: round(50*96/32) × 50 = 150 × 50.
+        var heightOnly = await pipeline.EstimateAsync(pixels, srcW, srcH, outputHeight: 50);
+        int expectedW = (int)MathF.Round(50f * srcW / srcH);
+        if (heightOnly.Width != expectedW || heightOnly.Height != 50)
+            throw new Exception($"outputHeight=50 expected {expectedW}x50, got {heightOnly.Width}x{heightOnly.Height}");
+
+        // Both explicit: exact size, no aspect preservation.
+        var exact = await pipeline.EstimateAsync(pixels, srcW, srcH, outputWidth: 128, outputHeight: 128);
+        if (exact.Width != 128 || exact.Height != 128)
+            throw new Exception($"Exact output expected 128x128, got {exact.Width}x{exact.Height}");
+        if (exact.DepthMap.Length != 128 * 128)
+            throw new Exception($"Exact DepthMap length mismatch: expected {128 * 128}, got {exact.DepthMap.Length}");
+
+        // Depth must still vary after resize (bilinear interpolation cannot create
+        // variation from nothing, but a flat result would indicate the resize is broken).
+        float range = def.DepthMap.Max() - def.DepthMap.Min();
+        if (range < 0.01f)
+            throw new Exception($"Resized depth map is flat: range={range:F6}");
+
+        Console.WriteLine($"[DepthAspect] PASS — default={def.Width}x{def.Height}, w-only={widthOnly.Width}x{widthOnly.Height}, h-only={heightOnly.Width}x{heightOnly.Height}, exact={exact.Width}x{exact.Height}");
+        pipeline.Dispose();
+    });
+
     // ──────────────────────────────────────────────────────────────
     // Helper: create a gradient test image
     // ──────────────────────────────────────────────────────────────

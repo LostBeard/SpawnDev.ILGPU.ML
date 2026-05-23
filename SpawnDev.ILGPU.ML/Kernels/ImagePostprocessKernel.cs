@@ -20,8 +20,63 @@ public class ImagePostprocessKernel
         float, float>? _depthToColormapKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         float, float>? _normalizeKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int>? _resizeFloatKernel;
 
     public ImagePostprocessKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    // ═══════════════════════════════════════════════════════════
+    //  Float bilinear resize (single-channel maps: depth, mask, heatmap)
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Bilinear-resize a single-channel float map [srcH * srcW] → [dstH * dstW] on GPU.
+    /// Used to upscale model outputs (518×518) back to source-image dimensions so
+    /// downstream rendering aligns 1:1 with the input image (depth maps, masks, etc).
+    /// One thread per destination pixel.
+    /// </summary>
+    public void ResizeBilinear(
+        ArrayView1D<float, Stride1D.Dense> src,
+        ArrayView1D<float, Stride1D.Dense> dst,
+        int srcW, int srcH, int dstW, int dstH)
+    {
+        _resizeFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>(ResizeBilinearImpl);
+        _resizeFloatKernel(dstW * dstH, src, dst, srcW, srcH, dstW, dstH);
+    }
+
+    private static void ResizeBilinearImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> src,
+        ArrayView1D<float, Stride1D.Dense> dst,
+        int srcW, int srcH, int dstW, int dstH)
+    {
+        int dy = idx / dstW;
+        int dx = idx % dstW;
+
+        float fy = ((dy + 0.5f) * srcH / dstH) - 0.5f;
+        float fx = ((dx + 0.5f) * srcW / dstW) - 0.5f;
+
+        // Two-statement floor: prevents ILGPU optimizer from eliding floor() before int cast.
+        // (int)x truncates toward zero — wrong for negative values.
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
+
+        if (y0 < 0) y0 = 0; if (y0 >= srcH) y0 = srcH - 1;
+        if (y1 < 0) y1 = 0; if (y1 >= srcH) y1 = srcH - 1;
+        if (x0 < 0) x0 = 0; if (x0 >= srcW) x0 = srcW - 1;
+        if (x1 < 0) x1 = 0; if (x1 >= srcW) x1 = srcW - 1;
+
+        float v00 = src[y0 * srcW + x0];
+        float v01 = src[y0 * srcW + x1];
+        float v10 = src[y1 * srcW + x0];
+        float v11 = src[y1 * srcW + x1];
+
+        dst[idx] = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
+                 + v10 * ty * (1f - tx) + v11 * ty * tx;
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  NCHW → RGBA (style transfer, classification overlay)

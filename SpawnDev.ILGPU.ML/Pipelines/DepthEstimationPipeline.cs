@@ -45,8 +45,17 @@ public class DepthEstimationPipeline : IDisposable
     /// <summary>
     /// Estimate depth from an RGBA image.
     /// Returns a depth map normalized to [0, 1] (higher = closer).
+    ///
+    /// Output dimensions:
+    ///   outputWidth = 0 && outputHeight = 0 → match source (width, height) — default,
+    ///       preserves aspect ratio so the depth map aligns 1:1 with the input.
+    ///   outputWidth > 0 && outputHeight = 0 → use outputWidth, derive height from source aspect.
+    ///   outputWidth = 0 && outputHeight > 0 → use outputHeight, derive width from source aspect.
+    ///   outputWidth > 0 && outputHeight > 0 → exact size (may not preserve aspect).
+    /// Resize is done on the accelerator via bilinear interpolation — no CPU readback of the raw map.
     /// </summary>
-    public async Task<DepthResult> EstimateAsync(int[] rgbaPixels, int width, int height)
+    public async Task<DepthResult> EstimateAsync(int[] rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
     {
         // Upload and preprocess
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
@@ -63,41 +72,79 @@ public class DepthEstimationPipeline : IDisposable
         });
         await _accelerator.SynchronizeAsync();
 
-        // Read depth output to CPU for the CPU-path result
         var output = outputs[_session.OutputNames[0]];
-        int depthSize = output.ElementCount;
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth CPU] Output: shape=[{string.Join(",", output.Shape)}], elements={depthSize}");
-        using var readBuf = _accelerator.Allocate1D<float>(depthSize);
-        var ew = new ElementWiseKernels(_accelerator);
-        ew.Scale(output.Data.SubView(0, depthSize), readBuf.View, depthSize, 1f);
-        await _accelerator.SynchronizeAsync();
-        var rawDepth = await readBuf.CopyToHostAsync<float>(0, depthSize);
+        int rawSize = output.ElementCount;
+        int rawH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
+        int rawW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth CPU] Output: shape=[{string.Join(",", output.Shape)}], elements={rawSize}");
 
-        // Find min/max on CPU (small cost — depth maps are typically 518×518)
+        // Resolve output dimensions (default = source size, preserves source aspect).
+        var (outW, outH) = ResolveOutputSize(width, height, rawW, rawH, outputWidth, outputHeight);
+        int outSize = outW * outH;
+
+        // GPU-side bilinear resize from raw model output (rawW × rawH) → (outW × outH).
+        var post = new Kernels.ImagePostprocessKernel(_accelerator);
+        using var resized = _accelerator.Allocate1D<float>(outSize);
+        post.ResizeBilinear(output.Data.SubView(0, rawSize), resized.View, rawW, rawH, outW, outH);
+        await _accelerator.SynchronizeAsync();
+
+        // Read resized depth to CPU for min/max + normalization.
+        var rawDepth = await resized.CopyToHostAsync<float>(0, outSize);
         float min = rawDepth.Min();
         float max = rawDepth.Max();
         float range = max - min;
-        var normalized = new float[depthSize];
+        var normalized = new float[outSize];
         if (range > 1e-6f)
         {
-            for (int i = 0; i < depthSize; i++)
+            for (int i = 0; i < outSize; i++)
                 normalized[i] = (rawDepth[i] - min) / range;
         }
-
-        int outH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
-        int outW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
 
         return new DepthResult(normalized, outW, outH, min, max);
     }
 
     /// <summary>
+    /// Resolve final output dimensions for a depth result from caller hints.
+    ///   (0, 0) → (srcW, srcH) — match source, preserves aspect.
+    ///   (w, 0) → (w, w * srcH / srcW) — preserve source aspect, fit width.
+    ///   (0, h) → (h * srcW / srcH, h) — preserve source aspect, fit height.
+    ///   (w, h) → (w, h) — exact, may distort.
+    /// rawW/rawH are used as a fallback when srcW/srcH are non-positive.
+    /// </summary>
+    private static (int w, int h) ResolveOutputSize(int srcW, int srcH, int rawW, int rawH,
+        int outW, int outH)
+    {
+        if (srcW <= 0 || srcH <= 0) { srcW = rawW; srcH = rawH; }
+        if (outW <= 0 && outH <= 0) return (srcW, srcH);
+        if (outW > 0 && outH <= 0)
+        {
+            int h = (int)MathF.Round(outW * (float)srcH / srcW);
+            return (outW, Math.Max(1, h));
+        }
+        if (outH > 0 && outW <= 0)
+        {
+            int w = (int)MathF.Round(outH * (float)srcW / srcH);
+            return (Math.Max(1, w), outH);
+        }
+        return (outW, outH);
+    }
+
+    /// <summary>
     /// Estimate depth and return a plasma colormap as a GPU MemoryBuffer2D
     /// for zero-copy presentation via ICanvasRenderer.
-    /// Entire pipeline stays on GPU — no CPU readback.
+    /// Entire pipeline stays on GPU — no CPU readback of the depth tensor itself
+    /// (only a small min/max readback for normalization).
+    ///
+    /// Output dimensions follow the same convention as <see cref="EstimateAsync"/>:
+    ///   (0, 0) → match source (width, height), preserving aspect ratio.
+    ///   (w, 0) / (0, h) → fit one axis, derive the other from source aspect.
+    ///   (w, h) → exact.
+    /// Resize is bilinear, executed on the accelerator before colormap.
     /// Caller owns the returned buffer and must dispose it.
     /// </summary>
     public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
-        int[] rgbaPixels, int width, int height)
+        int[] rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
     {
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
@@ -110,30 +157,35 @@ public class DepthEstimationPipeline : IDisposable
         });
 
         var output = outputs[_session.OutputNames[0]];
-        int depthSize = output.ElementCount;
-        int outH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
-        int outW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
+        int rawSize = output.ElementCount;
+        int rawH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
+        int rawW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
 
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Output: shape=[{string.Join(",", output.Shape)}], elements={depthSize}, dataLength={output.Data.Length}");
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Output: shape=[{string.Join(",", output.Shape)}], elements={rawSize}, dataLength={output.Data.Length}");
 
-        // Read output to CPU for min/max
-        // Use the actual data view, not SubView(0) which may miss the real offset
-        using var tempBuf = _accelerator.Allocate1D<float>(depthSize);
-        var ew = new ElementWiseKernels(_accelerator);
-        int readSize = Math.Min(depthSize, (int)output.Data.Length);
-        ew.Scale(output.Data.SubView(0, readSize), tempBuf.View.SubView(0, readSize), readSize, 1f);
-        await _accelerator.SynchronizeAsync();
-        var rawDepth = await tempBuf.CopyToHostAsync<float>(0, readSize);
-        float minD = rawDepth.Min();
-        float maxD = rawDepth.Max();
+        // Resolve final output dimensions (default = source, preserves aspect).
+        var (outW, outH) = ResolveOutputSize(width, height, rawW, rawH, outputWidth, outputHeight);
+        int outSize = outW * outH;
 
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={rawDepth.Max(v => MathF.Abs(v)):F4}, nonZero={rawDepth.Count(v => v != 0)}/{readSize}");
-
-        // GPU: depth → plasma colormap RGBA, output to 2D buffer for zero-copy rendering
-        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
-        postprocess.DepthToColormap(output.Data.SubView(0, depthSize), resultBuf.View.BaseView,
-            depthSize, minD, maxD);
+
+        // GPU bilinear resize from rawW×rawH → outW×outH.
+        // Allocate fresh — Data is not guaranteed to be a contiguous, exclusively-owned view.
+        int readRawSize = Math.Min(rawSize, (int)output.Data.Length);
+        using var resized = _accelerator.Allocate1D<float>(outSize);
+        postprocess.ResizeBilinear(output.Data.SubView(0, readRawSize), resized.View, rawW, rawH, outW, outH);
+        await _accelerator.SynchronizeAsync();
+
+        // Read resized depth to CPU for min/max (small — outW*outH at the requested display size).
+        var resizedHost = await resized.CopyToHostAsync<float>(0, outSize);
+        float minD = resizedHost.Min();
+        float maxD = resizedHost.Max();
+
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
+
+        // GPU: depth → plasma colormap RGBA, output to 2D buffer for zero-copy rendering.
+        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
+        postprocess.DepthToColormap(resized.View, resultBuf.View.BaseView, outSize, minD, maxD);
         await _accelerator.SynchronizeAsync();
 
         return (resultBuf, outW, outH);
