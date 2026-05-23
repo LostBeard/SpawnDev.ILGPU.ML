@@ -421,11 +421,11 @@ public class CumSumOperator(OperatorRegistry reg) : IOnnxOperator
         int axisSize = shape[axis];
         int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
 
-        // GPU path: one thread per (outer, inner) scan line, each scans axisSize sequentially
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { axisSize, inner, exclusive, reverse });
-        reg.ElementWise.CumSum(input.Data, output.Data, paramsBuf.View, outer * inner);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        // GPU path: one thread per output element (gather, not scatter — WebGL TF compatible)
+        var paramsData = new float[] { axisSize, inner, exclusive, reverse };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.CumSum(input.Data, output.Data, paramsBuf.Data, outer * axisSize * inner);
     }
 }
 
@@ -797,12 +797,13 @@ public class LRNOperator(OperatorRegistry reg) : IOnnxOperator
         int total = ctx.Inputs[0].ElementCount;
 
         // GPU path: params buffer [C, spatial, halfSize, size], fparams [alpha, beta, bias]
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, spatial, halfSize, size });
-        var fparamsBuf = reg.Accelerator.Allocate1D(new float[] { alpha, beta, bias });
-        reg.ElementWise.LRN(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, fparamsBuf.View, total);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
-        fparamsBuf.Dispose();
+        var paramsData = new float[] { C, spatial, halfSize, size };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        var fparamsData = new float[] { alpha, beta, bias };
+        var fparamsBuf = ctx.Pool.Rent(new[] { fparamsData.Length });
+        fparamsBuf.Data.SubView(0, fparamsData.Length).CopyFromCPU(fparamsData);
+        reg.ElementWise.LRN(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, fparamsBuf.Data, total);
     }
 }
 
@@ -992,11 +993,11 @@ public class ReverseSequenceOperator(OperatorRegistry reg) : IOnnxOperator
         int total = ctx.Inputs[0].ElementCount;
 
         // GPU path: one thread per element, reads seqLens from GPU
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { batchAxis, timeAxis, batchSize, timeSize, innerSize });
+        var paramsData = new float[] { batchAxis, timeAxis, batchSize, timeSize, innerSize };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
         reg.ElementWise.ReverseSequence(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
-            ctx.Inputs[1].Data, paramsBuf.View, total);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+            ctx.Inputs[1].Data, paramsBuf.Data, total);
     }
 }
 

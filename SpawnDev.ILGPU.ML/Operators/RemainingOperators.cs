@@ -24,11 +24,11 @@ public class LpNormalizationOperator(OperatorRegistry reg) : IOnnxOperator
         int axisSize = shape[axis];
         int inner = 1; for (int i = axis + 1; i < shape.Length; i++) inner *= shape[i];
 
-        // GPU path: one thread per (outer, inner) pair, iterates axisSize
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { axisSize, inner, p });
-        reg.ElementWise.LpNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, outer * inner);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        // GPU path: one thread per output element (gather, not scatter — WebGL TF compatible)
+        var paramsData = new float[] { axisSize, inner, p };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.LpNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, outer * axisSize * inner);
     }
 }
 public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -46,10 +46,10 @@ public class GlobalLpPoolOperator(OperatorRegistry reg) : IOnnxOperator
         int spatial = 1; for (int i = 2; i < shape.Length; i++) spatial *= shape[i];
 
         // GPU path: one thread per (N, C) pair, iterates spatial
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, spatial, p });
-        reg.ElementWise.GlobalLpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, N * C);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsData = new float[] { C, spatial, p };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.GlobalLpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * C);
     }
 }
 public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -85,10 +85,10 @@ public class LpPoolOperator(OperatorRegistry reg) : IOnnxOperator
         int totalOutput = N * C * outH * outW;
 
         // GPU path: one thread per output element, iterates kernel window
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, H, W, outH, outW, kH, kW, sH, sW, pH, pW, p });
-        reg.ElementWise.LpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, totalOutput);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsData = new float[] { C, H, W, outH, outW, kH, kW, sH, sW, pH, pW, p };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.LpPool(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, totalOutput);
     }
 }
 public class DetOperator(OperatorRegistry reg) : IOnnxOperator
@@ -187,10 +187,10 @@ public class CenterCropPadOperator(OperatorRegistry reg) : IOnnxOperator
             paramsData[1 + 2 * rank + d] = paramsData[1 + 2 * rank + d + 1] * inShape[d + 1];
 
         // GPU path: one thread per output element, reads centered input
-        var paramsBuf = reg.Accelerator.Allocate1D(paramsData);
-        reg.ElementWise.CenterCropPad(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, outCount);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsFloatData = paramsData.Select(v => (float)v).ToArray();
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsFloatData.Length });
+        paramsBuf.Data.SubView(0, paramsFloatData.Length).CopyFromCPU(paramsFloatData);
+        reg.ElementWise.CenterCropPad(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, outCount);
     }
 }
 public class MaxRoiPoolOperator(OperatorRegistry reg) : IOnnxOperator
@@ -331,10 +331,10 @@ public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
         int alignCorners = ctx.GetInt("align_corners", 0);
 
         // GPU path: theta is on GPU, one thread per pixel
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { H, W, alignCorners });
-        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, N * H * W);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsData = new float[] { H, W, alignCorners };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * H * W);
     }
 }
 public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
@@ -357,10 +357,10 @@ public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
         int totalOutput = N * C * Hout * Wout;
 
         // GPU path: bilinear interpolation, one thread per output element
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { N, C, Hin, Win, Hout, Wout, alignCorners });
-        reg.ElementWise.GridSample(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, paramsBuf.View, totalOutput);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsData = new float[] { N, C, Hin, Win, Hout, Wout, alignCorners };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.GridSample(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, paramsBuf.Data, totalOutput);
     }
 }
 public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
@@ -404,10 +404,10 @@ public class Col2ImOperator(OperatorRegistry reg) : IOnnxOperator
         int outCount = ctx.Outputs[0].ElementCount;
         reg.ElementWise.Fill(ctx.Outputs[0].Data, outCount, 0f);
         int totalOps = N * colDim * L;
-        var paramsBuf = reg.Accelerator.Allocate1D(new int[] { C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim });
-        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, totalOps);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsData = new float[] { C, L, kH, kW, outH, outW, sH, sW, pH, pW, blocksW, colDim };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.Col2Im(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, totalOps);
     }
 }
 public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
@@ -446,15 +446,14 @@ public class DeformConvOperator(OperatorRegistry reg) : IOnnxOperator
         // GPU path: offsets tensor on GPU, one thread per output element
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
         {
-            var paramsBuf = reg.Accelerator.Allocate1D(new int[] {
-                inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, group, offsetGroup });
+            var paramsData = new float[] { inC, H, W, outC, outH, outW, kH, kW, sH, sW, pH, pW, group, offsetGroup };
+            var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+            paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
             reg.ElementWise.DeformConv(x.Data, w.Data, ctx.Inputs[2].Data,
-                ctx.Outputs[0].Data, paramsBuf.View, totalOutput);
+                ctx.Outputs[0].Data, paramsBuf.Data, totalOutput);
             // Add bias if provided
             if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
                 reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[3].Data, totalOutput, outC);
-            reg.Accelerator.Synchronize();
-            paramsBuf.Dispose();
         }
         else
         {
@@ -780,11 +779,9 @@ public class QLinearConvOperator(OperatorRegistry reg) : IOnnxOperator
                 reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, outCount, 1f / ySc);
             if (yZp != 0f)
             {
-                var zpData = new[] { yZp };
-                var zpMem = reg.Accelerator.Allocate1D(zpData);
-                reg.ElementWise.AddBias(ctx.Outputs[0].Data, zpMem.View, outCount, 1);
-                reg.Accelerator.Synchronize();
-                zpMem.Dispose();
+                var zpBuf = ctx.Pool.Rent(new[] { 1 });
+                zpBuf.Data.SubView(0, 1).CopyFromCPU(new[] { yZp });
+                reg.ElementWise.AddBias(ctx.Outputs[0].Data, zpBuf.Data, outCount, 1);
             }
         }
     }

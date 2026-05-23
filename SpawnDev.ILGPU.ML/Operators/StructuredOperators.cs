@@ -1909,11 +1909,10 @@ public class TriluOperator(OperatorRegistry reg) : IOnnxOperator
         int batchStride = rows * cols;
 
         // GPU path: params buffer [rows, cols, k, upper, batchStride]
-        var paramsData = new int[] { rows, cols, k, upper, batchStride };
-        var paramsBuf = reg.Accelerator.Allocate1D(paramsData);
-        reg.ElementWise.Trilu(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.View, total);
-        reg.Accelerator.Synchronize();
-        paramsBuf.Dispose();
+        var paramsData = new float[] { rows, cols, k, upper, batchStride };
+        var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
+        paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        reg.ElementWise.Trilu(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, total);
     }
 }
 
