@@ -1,0 +1,4061 @@
+{
+  "name": "main",
+  "inputs": [
+    {
+      "name": "data",
+      "shape": [
+        1,
+        3,
+        224,
+        224
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "mobilenetv20_output_flatten0_reshape0",
+      "shape": [
+        1,
+        1000
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "opType": "Conv",
+      "inputs": [
+        "data",
+        "mobilenetv20_features_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_conv0_fwd",
+        "mobilenetv20_features_batchnorm0_gamma",
+        "mobilenetv20_features_batchnorm0_beta",
+        "mobilenetv20_features_batchnorm0_running_mean",
+        "mobilenetv20_features_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck0_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck0_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck0_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck0_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck0_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck0_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 32,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck0_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck0_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck0_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck0_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck0_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck0_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck0_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck0_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck0_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck0_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck0_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck1_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck1_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck1_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck1_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck1_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck1_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 96,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck1_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck1_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck1_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck1_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck1_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck2_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck2_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck2_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck2_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck2_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck2_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 144,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck2_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck2_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck2_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck2_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck2_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck2_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck2_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck2_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck2_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck1_batchnorm2_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck2_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck2_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck3_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck3_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck3_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck3_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck3_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck3_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 144,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck3_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck3_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck3_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck3_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck3_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck4_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck4_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck4_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck4_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck4_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck4_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 192,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck4_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck4_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck4_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck4_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck4_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck4_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck4_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck4_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck4_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck3_batchnorm2_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck4_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck4_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck5_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck5_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck5_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck5_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck5_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck5_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 192,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck5_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck5_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck5_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck5_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck5_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck5_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck5_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck5_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck5_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck4_elemwise_add0"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck5_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck5_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck6_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck6_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck6_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck6_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck6_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck6_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 192,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck6_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck6_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck6_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck6_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck6_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck7_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck7_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck7_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck7_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck7_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck7_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 384,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck7_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck7_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck7_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck7_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck7_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck7_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck7_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck7_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck7_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck6_batchnorm2_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck7_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck7_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck8_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck8_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck8_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck8_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck8_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck8_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 384,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck8_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck8_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck8_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck8_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck8_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck8_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck8_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck8_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck8_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck7_elemwise_add0"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck8_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck8_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck9_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck9_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck9_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck9_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck9_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck9_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 384,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck9_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck9_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck9_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck9_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck9_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck9_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck9_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck9_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck9_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck8_elemwise_add0"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck9_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck9_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck10_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck10_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck10_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck10_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck10_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck10_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 384,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck10_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck10_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck10_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck10_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck10_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck11_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck11_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck11_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck11_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck11_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck11_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 576,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck11_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck11_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck11_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck11_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck11_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck11_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck11_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck11_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck11_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck10_batchnorm2_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck11_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck11_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck12_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck12_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck12_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck12_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck12_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck12_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 576,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck12_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck12_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck12_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck12_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck12_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck12_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck12_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck12_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck12_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck11_elemwise_add0"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck12_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck12_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck13_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck13_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck13_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck13_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck13_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck13_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 576,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          2,
+          2
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck13_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck13_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck13_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck13_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck13_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck14_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck14_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck14_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck14_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck14_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck14_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 960,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck14_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck14_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck14_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck14_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck14_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck14_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck14_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck14_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck14_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck13_batchnorm2_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck14_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck14_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck15_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck15_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck15_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck15_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck15_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck15_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 960,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck15_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck15_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck15_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck15_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck15_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck15_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck15_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck15_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck15_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Add",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_batchnorm2_fwd",
+        "mobilenetv20_features_linearbottleneck14_elemwise_add0"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck15_elemwise_add0"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck15_elemwise_add0",
+        "mobilenetv20_features_linearbottleneck16_conv0_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_conv0_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_conv0_fwd",
+        "mobilenetv20_features_linearbottleneck16_batchnorm0_gamma",
+        "mobilenetv20_features_linearbottleneck16_batchnorm0_beta",
+        "mobilenetv20_features_linearbottleneck16_batchnorm0_running_mean",
+        "mobilenetv20_features_linearbottleneck16_batchnorm0_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_batchnorm0_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_batchnorm0_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_relu0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_relu0_fwd",
+        "mobilenetv20_features_linearbottleneck16_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 960,
+        "kernel_shape": [
+          3,
+          3
+        ],
+        "pads": [
+          1,
+          1,
+          1,
+          1
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_conv1_fwd",
+        "mobilenetv20_features_linearbottleneck16_batchnorm1_gamma",
+        "mobilenetv20_features_linearbottleneck16_batchnorm1_beta",
+        "mobilenetv20_features_linearbottleneck16_batchnorm1_running_mean",
+        "mobilenetv20_features_linearbottleneck16_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_relu1_fwd",
+        "mobilenetv20_features_linearbottleneck16_conv2_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_conv2_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_conv2_fwd",
+        "mobilenetv20_features_linearbottleneck16_batchnorm2_gamma",
+        "mobilenetv20_features_linearbottleneck16_batchnorm2_beta",
+        "mobilenetv20_features_linearbottleneck16_batchnorm2_running_mean",
+        "mobilenetv20_features_linearbottleneck16_batchnorm2_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_linearbottleneck16_batchnorm2_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_linearbottleneck16_batchnorm2_fwd",
+        "mobilenetv20_features_conv1_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_features_conv1_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "BatchNormalization",
+      "inputs": [
+        "mobilenetv20_features_conv1_fwd",
+        "mobilenetv20_features_batchnorm1_gamma",
+        "mobilenetv20_features_batchnorm1_beta",
+        "mobilenetv20_features_batchnorm1_running_mean",
+        "mobilenetv20_features_batchnorm1_running_var"
+      ],
+      "outputs": [
+        "mobilenetv20_features_batchnorm1_fwd"
+      ],
+      "attributes": {
+        "epsilon": 9.999999747378752e-06,
+        "momentum": 0.8999999761581421,
+        "spatial": 1
+      }
+    },
+    {
+      "opType": "Relu",
+      "inputs": [
+        "mobilenetv20_features_batchnorm1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_relu1_fwd"
+      ]
+    },
+    {
+      "opType": "GlobalAveragePool",
+      "inputs": [
+        "mobilenetv20_features_relu1_fwd"
+      ],
+      "outputs": [
+        "mobilenetv20_features_pool0_fwd"
+      ]
+    },
+    {
+      "opType": "Conv",
+      "inputs": [
+        "mobilenetv20_features_pool0_fwd",
+        "mobilenetv20_output_pred_weight"
+      ],
+      "outputs": [
+        "mobilenetv20_output_pred_fwd"
+      ],
+      "attributes": {
+        "dilations": [
+          1,
+          1
+        ],
+        "group": 1,
+        "kernel_shape": [
+          1,
+          1
+        ],
+        "pads": [
+          0,
+          0,
+          0,
+          0
+        ],
+        "strides": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "opType": "Reshape",
+      "inputs": [
+        "mobilenetv20_output_pred_fwd",
+        "reshape_attr_tensor421"
+      ],
+      "outputs": [
+        "mobilenetv20_output_flatten0_reshape0"
+      ]
+    }
+  ],
+  "initializers": {
+    "mobilenetv20_features_conv0_weight": [
+      32,
+      3,
+      3,
+      3
+    ],
+    "mobilenetv20_features_batchnorm0_gamma": [
+      32
+    ],
+    "mobilenetv20_features_batchnorm0_beta": [
+      32
+    ],
+    "mobilenetv20_features_batchnorm0_running_mean": [
+      32
+    ],
+    "mobilenetv20_features_batchnorm0_running_var": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_conv0_weight": [
+      32,
+      32,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm0_gamma": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm0_beta": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm0_running_mean": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm0_running_var": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_conv1_weight": [
+      32,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm1_gamma": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm1_beta": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm1_running_mean": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm1_running_var": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck0_conv2_weight": [
+      16,
+      32,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm2_gamma": [
+      16
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm2_beta": [
+      16
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm2_running_mean": [
+      16
+    ],
+    "mobilenetv20_features_linearbottleneck0_batchnorm2_running_var": [
+      16
+    ],
+    "mobilenetv20_features_linearbottleneck1_conv0_weight": [
+      96,
+      16,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm0_gamma": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm0_beta": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm0_running_mean": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm0_running_var": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_conv1_weight": [
+      96,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm1_gamma": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm1_beta": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm1_running_mean": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm1_running_var": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck1_conv2_weight": [
+      24,
+      96,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm2_gamma": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm2_beta": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm2_running_mean": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck1_batchnorm2_running_var": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck2_conv0_weight": [
+      144,
+      24,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm0_gamma": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm0_beta": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm0_running_mean": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm0_running_var": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_conv1_weight": [
+      144,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm1_gamma": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm1_beta": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm1_running_mean": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm1_running_var": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck2_conv2_weight": [
+      24,
+      144,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm2_gamma": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm2_beta": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm2_running_mean": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck2_batchnorm2_running_var": [
+      24
+    ],
+    "mobilenetv20_features_linearbottleneck3_conv0_weight": [
+      144,
+      24,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm0_gamma": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm0_beta": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm0_running_mean": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm0_running_var": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_conv1_weight": [
+      144,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm1_gamma": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm1_beta": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm1_running_mean": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm1_running_var": [
+      144
+    ],
+    "mobilenetv20_features_linearbottleneck3_conv2_weight": [
+      32,
+      144,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm2_gamma": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm2_beta": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm2_running_mean": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck3_batchnorm2_running_var": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck4_conv0_weight": [
+      192,
+      32,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm0_gamma": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm0_beta": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm0_running_mean": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm0_running_var": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_conv1_weight": [
+      192,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm1_gamma": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm1_beta": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm1_running_mean": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm1_running_var": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck4_conv2_weight": [
+      32,
+      192,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm2_gamma": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm2_beta": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm2_running_mean": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck4_batchnorm2_running_var": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck5_conv0_weight": [
+      192,
+      32,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm0_gamma": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm0_beta": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm0_running_mean": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm0_running_var": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_conv1_weight": [
+      192,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm1_gamma": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm1_beta": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm1_running_mean": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm1_running_var": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck5_conv2_weight": [
+      32,
+      192,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm2_gamma": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm2_beta": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm2_running_mean": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck5_batchnorm2_running_var": [
+      32
+    ],
+    "mobilenetv20_features_linearbottleneck6_conv0_weight": [
+      192,
+      32,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm0_gamma": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm0_beta": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm0_running_mean": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm0_running_var": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_conv1_weight": [
+      192,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm1_gamma": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm1_beta": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm1_running_mean": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm1_running_var": [
+      192
+    ],
+    "mobilenetv20_features_linearbottleneck6_conv2_weight": [
+      64,
+      192,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm2_gamma": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm2_beta": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm2_running_mean": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck6_batchnorm2_running_var": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck7_conv0_weight": [
+      384,
+      64,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm0_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm0_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm0_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm0_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_conv1_weight": [
+      384,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm1_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm1_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm1_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm1_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck7_conv2_weight": [
+      64,
+      384,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm2_gamma": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm2_beta": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm2_running_mean": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck7_batchnorm2_running_var": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck8_conv0_weight": [
+      384,
+      64,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm0_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm0_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm0_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm0_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_conv1_weight": [
+      384,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm1_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm1_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm1_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm1_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck8_conv2_weight": [
+      64,
+      384,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm2_gamma": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm2_beta": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm2_running_mean": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck8_batchnorm2_running_var": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck9_conv0_weight": [
+      384,
+      64,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm0_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm0_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm0_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm0_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_conv1_weight": [
+      384,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm1_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm1_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm1_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm1_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck9_conv2_weight": [
+      64,
+      384,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm2_gamma": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm2_beta": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm2_running_mean": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck9_batchnorm2_running_var": [
+      64
+    ],
+    "mobilenetv20_features_linearbottleneck10_conv0_weight": [
+      384,
+      64,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm0_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm0_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm0_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm0_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_conv1_weight": [
+      384,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm1_gamma": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm1_beta": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm1_running_mean": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm1_running_var": [
+      384
+    ],
+    "mobilenetv20_features_linearbottleneck10_conv2_weight": [
+      96,
+      384,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm2_gamma": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm2_beta": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm2_running_mean": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck10_batchnorm2_running_var": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck11_conv0_weight": [
+      576,
+      96,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm0_gamma": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm0_beta": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm0_running_mean": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm0_running_var": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_conv1_weight": [
+      576,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm1_gamma": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm1_beta": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm1_running_mean": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm1_running_var": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck11_conv2_weight": [
+      96,
+      576,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm2_gamma": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm2_beta": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm2_running_mean": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck11_batchnorm2_running_var": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck12_conv0_weight": [
+      576,
+      96,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm0_gamma": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm0_beta": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm0_running_mean": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm0_running_var": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_conv1_weight": [
+      576,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm1_gamma": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm1_beta": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm1_running_mean": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm1_running_var": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck12_conv2_weight": [
+      96,
+      576,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm2_gamma": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm2_beta": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm2_running_mean": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck12_batchnorm2_running_var": [
+      96
+    ],
+    "mobilenetv20_features_linearbottleneck13_conv0_weight": [
+      576,
+      96,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm0_gamma": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm0_beta": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm0_running_mean": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm0_running_var": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_conv1_weight": [
+      576,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm1_gamma": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm1_beta": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm1_running_mean": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm1_running_var": [
+      576
+    ],
+    "mobilenetv20_features_linearbottleneck13_conv2_weight": [
+      160,
+      576,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm2_gamma": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm2_beta": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm2_running_mean": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck13_batchnorm2_running_var": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck14_conv0_weight": [
+      960,
+      160,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm0_gamma": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm0_beta": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm0_running_mean": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm0_running_var": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_conv1_weight": [
+      960,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm1_gamma": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm1_beta": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm1_running_mean": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm1_running_var": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck14_conv2_weight": [
+      160,
+      960,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm2_gamma": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm2_beta": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm2_running_mean": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck14_batchnorm2_running_var": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck15_conv0_weight": [
+      960,
+      160,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm0_gamma": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm0_beta": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm0_running_mean": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm0_running_var": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_conv1_weight": [
+      960,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm1_gamma": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm1_beta": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm1_running_mean": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm1_running_var": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck15_conv2_weight": [
+      160,
+      960,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm2_gamma": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm2_beta": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm2_running_mean": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck15_batchnorm2_running_var": [
+      160
+    ],
+    "mobilenetv20_features_linearbottleneck16_conv0_weight": [
+      960,
+      160,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm0_gamma": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm0_beta": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm0_running_mean": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm0_running_var": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_conv1_weight": [
+      960,
+      1,
+      3,
+      3
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm1_gamma": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm1_beta": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm1_running_mean": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm1_running_var": [
+      960
+    ],
+    "mobilenetv20_features_linearbottleneck16_conv2_weight": [
+      320,
+      960,
+      1,
+      1
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm2_gamma": [
+      320
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm2_beta": [
+      320
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm2_running_mean": [
+      320
+    ],
+    "mobilenetv20_features_linearbottleneck16_batchnorm2_running_var": [
+      320
+    ],
+    "mobilenetv20_features_conv1_weight": [
+      1280,
+      320,
+      1,
+      1
+    ],
+    "mobilenetv20_features_batchnorm1_gamma": [
+      1280
+    ],
+    "mobilenetv20_features_batchnorm1_beta": [
+      1280
+    ],
+    "mobilenetv20_features_batchnorm1_running_mean": [
+      1280
+    ],
+    "mobilenetv20_features_batchnorm1_running_var": [
+      1280
+    ],
+    "mobilenetv20_output_pred_weight": [
+      1000,
+      1280,
+      1,
+      1
+    ],
+    "reshape_attr_tensor421": [
+      2
+    ]
+  }
+}
