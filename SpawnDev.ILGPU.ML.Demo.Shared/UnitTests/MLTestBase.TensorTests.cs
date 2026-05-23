@@ -388,6 +388,112 @@ public abstract partial class MLTestBase
     //  them as scalar kernel parameters.
     // ────────────────────────────────────────────────────────────────────────
 
+    // ────────────────────────────────────────────────────────────────────────
+    //  Phase 3: InferenceSession.RunOwnedAsync — Transformers.js-style API.
+    //  Caller provides Tensor<float> inputs (OwnedTensor converts implicitly);
+    //  session returns OwnedTensorMap<float> that disposes every output tensor
+    //  in one go when the map goes out of scope.
+    // ────────────────────────────────────────────────────────────────────────
+
+    [TestMethod(Timeout = 120000)]
+    public async Task InferenceSession_RunOwnedAsync_SqueezeNet() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        using var session = await InferenceSession.CreateFromFileAsync(
+            accelerator, http, "models/squeezenet/model.onnx");
+
+        // Build the input as an OwnedTensor — the user-facing way to allocate model
+        // inputs in the new API. Shape [1, 3, 224, 224] = standard SqueezeNet NCHW.
+        var inputName = session.InputNames[0];
+        const int H = 224, W = 224;
+        var pixels = new float[1 * 3 * H * W];
+        for (int c = 0; c < 3; c++)
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    pixels[((c * H) + y) * W + x] = (x / (float)W) - 0.5f;
+
+        using var input = OwnedTensor<float>.FromHost(accelerator, pixels,
+            new[] { 1, 3, H, W }, name: inputName);
+
+        // Transformers.js-style call: pass Tensor<float> inputs (OwnedTensor converts
+        // implicitly), get back an OwnedTensorMap<float> that owns every output buffer.
+        using var outputs = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>>
+        {
+            [inputName] = input,
+        });
+
+        if (outputs.Count < 1)
+            throw new Exception($"Expected ≥1 output tensor, got {outputs.Count}");
+
+        var first = outputs.Single();
+        Console.WriteLine($"[RunOwnedAsync] output '{first.Name}' shape [{string.Join(",", first.Shape)}] elements={first.ElementCount}");
+
+        if (first.ElementCount < 100)
+            throw new Exception($"SqueezeNet output suspiciously small: {first.ElementCount} elements");
+
+        // Verify the output is real classification logits, not zeros.
+        var hostOutput = await first.ToHostAsync();
+        float min = hostOutput.Min(), max = hostOutput.Max();
+        if (Math.Abs(max - min) < 1e-3f)
+            throw new Exception($"Output flat: range [{min}, {max}]");
+
+        Console.WriteLine($"[RunOwnedAsync] PASS — output range [{min:F4}, {max:F4}]");
+    });
+
+    [TestMethod(Timeout = 120000)]
+    public async Task InferenceSession_RunOwnedAsync_OutputsSurvivePastNextRun() => await RunTest(async accelerator =>
+    {
+        // OwnedTensor semantics: outputs from one run must not be mutated by a
+        // subsequent run. The legacy RunAsync returns views into pool-managed memory
+        // that the next run might recycle — RunOwnedAsync copies each output to a
+        // fresh caller-owned buffer so this guarantee holds.
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        using var session = await InferenceSession.CreateFromFileAsync(
+            accelerator, http, "models/squeezenet/model.onnx");
+
+        var inputName = session.InputNames[0];
+        const int H = 224, W = 224;
+        var pixelsA = new float[1 * 3 * H * W];
+        var pixelsB = new float[1 * 3 * H * W];
+        for (int i = 0; i < pixelsA.Length; i++)
+        {
+            pixelsA[i] = 0.1f;
+            pixelsB[i] = 0.8f;
+        }
+
+        using var inputA = OwnedTensor<float>.FromHost(accelerator, pixelsA, new[] { 1, 3, H, W }, inputName);
+        using var inputB = OwnedTensor<float>.FromHost(accelerator, pixelsB, new[] { 1, 3, H, W }, inputName);
+
+        using var outputsA = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>> { [inputName] = inputA });
+        var snapshotA = await outputsA.Single().ToHostAsync();
+
+        using var outputsB = await session.RunOwnedAsync(new Dictionary<string, Tensor<float>> { [inputName] = inputB });
+        var snapshotB = await outputsB.Single().ToHostAsync();
+
+        // After RunB completes, RunA's output buffer must still hold the original data.
+        var recheckA = await outputsA.Single().ToHostAsync();
+        for (int i = 0; i < snapshotA.Length; i++)
+            if (Math.Abs(recheckA[i] - snapshotA[i]) > 1e-5f)
+                throw new Exception(
+                    $"Outputs from Run A were mutated by Run B. Run-A buffer should be caller-owned and independent. "
+                    + $"Idx {i}: original {snapshotA[i]} now {recheckA[i]}.");
+
+        // Sanity: Run A and Run B should differ (different inputs).
+        bool differs = false;
+        for (int i = 0; i < snapshotA.Length; i++)
+            if (Math.Abs(snapshotA[i] - snapshotB[i]) > 1e-4f) { differs = true; break; }
+        if (!differs)
+            throw new Exception("Run A and Run B produced identical outputs despite different inputs — inference may not be running");
+
+        Console.WriteLine($"[RunOwnedAsync] PASS — output from Run A survived Run B's execution");
+    });
+
     [TestMethod]
     public async Task ResizeBilinear_TensorView_2xUpscale() => await RunTest(async accelerator =>
     {

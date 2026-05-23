@@ -237,8 +237,11 @@ public class DepthEstimationPipeline : IDisposable
     {
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(width, height));
-        postprocess.DepthToColormapPalette(rawDepth, resultBuf.View.BaseView,
-            width * height, minDepth, maxDepth, palette);
+        // Phase 2: TensorView<float> + TensorView<int> overload. Both tensors are
+        // row-major [H, W]; the kernel reads count from depth.ElementCount.
+        var depthView = new Tensors.TensorView<float>(rawDepth, new[] { height, width });
+        var rgbaView = new Tensors.TensorView<int>(resultBuf.View.BaseView, new[] { height, width });
+        postprocess.DepthToColormapPalette(depthView, rgbaView, minDepth, maxDepth, palette);
         await _accelerator.SynchronizeAsync();
         return resultBuf;
     }

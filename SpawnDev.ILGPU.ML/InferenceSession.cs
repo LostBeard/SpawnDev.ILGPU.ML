@@ -1428,6 +1428,48 @@ public class InferenceSession : IDisposable
     public Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
         => _executor.RunAsync(inputs);
 
+    /// <summary>
+    /// Transformers.js-style async inference. Inputs are <see cref="Tensors.Tensor{T}"/>
+    /// (non-owning views — caller manages the underlying buffers, an
+    /// <see cref="Tensors.OwnedTensor{T}"/> converts implicitly). Outputs are
+    /// <see cref="Tensors.OwnedTensor{T}"/> wrapped in an
+    /// <see cref="Tensors.OwnedTensorMap{T}"/>: the caller fully owns the returned
+    /// buffers and disposes them by wrapping the map in <c>using</c>. Internally each
+    /// output is copied off the executor's pool-managed buffer to a fresh
+    /// caller-owned buffer, so subsequent inference runs cannot mutate previously-
+    /// returned tensors.
+    /// </summary>
+    public async Task<Tensors.OwnedTensorMap<float>> RunOwnedAsync(
+        IDictionary<string, Tensors.Tensor<float>> inputs)
+    {
+        if (inputs == null) throw new ArgumentNullException(nameof(inputs));
+
+        // Convert generic Tensor<float> inputs back to the legacy non-generic Tensor
+        // the executor accepts. Both wrap the same ArrayView<float, Stride1D.Dense>,
+        // so this is metadata-only — no data movement.
+        var legacyInputs = new Dictionary<string, Tensor>(inputs.Count);
+        foreach (var kv in inputs)
+            legacyInputs[kv.Key] = new Tensor(kv.Value.Data, kv.Value.Shape, kv.Value.Name);
+
+        var executorOutputs = await _executor.RunAsync(legacyInputs);
+
+        // Copy each output to a fresh caller-owned buffer. Tensors returned by the
+        // executor view into pool-managed memory that may be reused by the next
+        // RunAsync invocation — copying gives the caller buffers with independent
+        // lifetimes. CopyFrom is a GPU-to-GPU copy on every backend, no host readback.
+        var owned = new Dictionary<string, Tensors.OwnedTensor<float>>(executorOutputs.Count);
+        foreach (var kv in executorOutputs)
+        {
+            var src = kv.Value;
+            var buf = _accelerator.Allocate1D<float>(src.ElementCount);
+            buf.View.CopyFrom(src.Data);
+            owned[kv.Key] = new Tensors.OwnedTensor<float>(buf, src.Shape, kv.Key);
+        }
+        await _accelerator.SynchronizeAsync();
+
+        return new Tensors.OwnedTensorMap<float>(owned);
+    }
+
     /// <summary>Run inference with a single input. Returns the first output tensor.</summary>
     public Tensor Run(string inputName, Tensor input)
     {

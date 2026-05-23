@@ -20,6 +20,8 @@ public class ImagePostprocessKernel
         float, float>? _depthToColormapKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         float, float, int>? _depthToColormapPaletteKernel;
+    private Action<Index1D, Tensors.TensorView<float>, Tensors.TensorView<int>,
+        float, float, int>? _depthToColormapPaletteTensorViewKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         float, float>? _normalizeKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -296,11 +298,37 @@ public class ImagePostprocessKernel
     };
 
     /// <summary>
-    /// GPU colormap with selectable palette. Normalizes depth by <c>(minVal, maxVal)</c>
-    /// then maps to RGBA via piecewise-linear interpolation of palette control points
-    /// inlined per branch (plasma / viridis / inferno / grayscale — same control points
-    /// as <see cref="Preprocessing.DepthColorMaps"/>). Use <see cref="PaletteFromName"/>
-    /// to convert the string ID a UI typically holds.
+    /// GPU colormap with selectable palette — TensorView overload. Both tensors are
+    /// row-major <c>[H, W]</c>; the kernel reads count from <c>depth.ElementCount</c>.
+    /// Same palette implementation as the legacy <see cref="DepthToColormapPalette(ArrayView1D{float, Stride1D.Dense}, ArrayView1D{int, Stride1D.Dense}, int, float, float, int)"/>
+    /// overload — both call into the same piecewise-linear branches.
+    /// </summary>
+    public void DepthToColormapPalette(
+        Tensors.TensorView<float> depth,
+        Tensors.TensorView<int> rgba,
+        float minDepth, float maxDepth, int palette)
+    {
+        _depthToColormapPaletteTensorViewKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            Tensors.TensorView<float>, Tensors.TensorView<int>,
+            float, float, int>(DepthToColormapPaletteTensorViewImpl);
+        _depthToColormapPaletteTensorViewKernel(depth.ElementCount, depth, rgba, minDepth, maxDepth, palette);
+    }
+
+    private static void DepthToColormapPaletteTensorViewImpl(Index1D idx,
+        Tensors.TensorView<float> depth,
+        Tensors.TensorView<int> rgba,
+        float minVal, float maxVal, int palette)
+    {
+        // Shared implementation: convert flat idx to ArrayView access on both tensors.
+        // Both are stored contiguous row-major so Data[idx] is correct regardless of
+        // whether the host code described them as [H,W] or [H*W,1].
+        DepthToColormapPaletteImpl(idx, depth.Data, rgba.Data, minVal, maxVal, palette);
+    }
+
+    /// <summary>
+    /// GPU colormap with selectable palette — legacy raw-ArrayView overload.
+    /// Prefer the <see cref="DepthToColormapPalette(Tensors.TensorView{float}, Tensors.TensorView{int}, float, float, int)"/>
+    /// TensorView overload for new code.
     /// </summary>
     public void DepthToColormapPalette(
         ArrayView1D<float, Stride1D.Dense> depth,
