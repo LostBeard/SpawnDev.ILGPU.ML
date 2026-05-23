@@ -54,13 +54,21 @@ public class SelectiveScanKernel
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int>(ScanImpl);
-        _scanKernel(batchSize, x, A, B, C, output, state, batchSize, seqLen, dState);
+        // One thread per (batch, t) output position — gather-only, no scatter writes.
+        // WebGL TF compatible across all 6 backends.
+        _scanKernel(batchSize * seqLen, x, A, B, C, output, state, batchSize, seqLen, dState);
     }
 
     /// <summary>
-    /// Per-batch selective scan. Sequential over time, parallel over state dimensions.
+    /// One thread per (batch, t) output position. Each thread recomputes the SSM prefix
+    /// scan analytically: h[t][s] = sum_{k=0..t} A[s]^(t-k) * B[b,k,s] * x[b,k], then
+    /// y[t] = sum_s C[b,t,s] * h[t][s]. Equivalent to the old sequential scan but with
+    /// only gather reads — no scatter writes, which lets it work under WebGL Transform
+    /// Feedback (single output per vertex). Trade-off: O(seqLen²·dState) per batch
+    /// instead of O(seqLen·dState). State buffer is no longer written (caller-owned
+    /// scratch); add a follow-up kernel if persistent autoregressive state is needed.
     /// </summary>
-    private static void ScanImpl(Index1D batchIdx,
+    private static void ScanImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> x,
         ArrayView1D<float, Stride1D.Dense> A,
         ArrayView1D<float, Stride1D.Dense> B,
@@ -69,34 +77,26 @@ public class SelectiveScanKernel
         ArrayView1D<float, Stride1D.Dense> state,
         int batchSize, int seqLen, int dState)
     {
-        // Initialize state for this batch
-        int stateOffset = batchIdx * dState;
+        int t = idx % seqLen;
+        int b = idx / seqLen;
+
+        float y = 0f;
         for (int s = 0; s < dState; s++)
-            state[stateOffset + s] = 0f;
-
-        // Sequential scan over time steps
-        for (int t = 0; t < seqLen; t++)
         {
-            int xIdx = batchIdx * seqLen + t;
-            float xVal = x[xIdx];
-
-            // Update state: h_t = A * h_{t-1} + B * x_t
-            for (int s = 0; s < dState; s++)
+            float a = A[s];
+            // Iterate prefix k=0..t building h[t][s] via Horner-style accumulation:
+            //   h = a*h + B[b,k,s] * x[b,k]
+            // After (t+1) iterations, h == sum_{k=0..t} a^(t-k) * B[b,k,s] * x[b,k].
+            float h = 0f;
+            int baseB = b * seqLen * dState;
+            int baseX = b * seqLen;
+            for (int k = 0; k <= t; k++)
             {
-                int bIdx = (batchIdx * seqLen + t) * dState + s;
-                state[stateOffset + s] = A[s] * state[stateOffset + s] + B[bIdx] * xVal;
+                h = a * h + B[baseB + k * dState + s] * x[baseX + k];
             }
-
-            // Compute output: y_t = C * h_t
-            float y = 0f;
-            for (int s = 0; s < dState; s++)
-            {
-                int cIdx = (batchIdx * seqLen + t) * dState + s;
-                y += C[cIdx] * state[stateOffset + s];
-            }
-
-            output[xIdx] = y;
+            y += C[(b * seqLen + t) * dState + s] * h;
         }
+        output[idx] = y;
     }
 
     // ═══════════════════════════════════════════════════════════

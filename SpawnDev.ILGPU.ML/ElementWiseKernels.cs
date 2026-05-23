@@ -856,11 +856,14 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> paramsArr)
     {
         // params: [H, W, alignCorners] (float-stored, cast to int)
+        // One thread per scalar output: idx = ((n * H * W + pixelIdx) * 2 + ri)
+        // where ri ∈ {0=ox, 1=oy}. Gather-only — WebGL TF compatible.
         int H = (int)paramsArr[0]; int W = (int)paramsArr[1]; int alignCorners = (int)paramsArr[2];
-        // idx = n * H * W + pixel_idx
+        int ri = idx % 2;
+        int tmp = idx / 2;
         int hw = H * W;
-        int n = idx / hw;
-        int pixelIdx = idx - n * hw;
+        int n = tmp / hw;
+        int pixelIdx = tmp - n * hw;
         int iy = pixelIdx / W;
         int ix = pixelIdx - iy * W;
         // Compute normalized coordinates
@@ -876,12 +879,8 @@ public class ElementWiseKernels : IDisposable
             ny = (2f * iy + 1f) / H - 1f;
         }
         // theta[n] is [2,3]: [[a,b,c],[d,e,f]]
-        int tOff = n * 6;
-        float ox = theta[tOff + 0] * nx + theta[tOff + 1] * ny + theta[tOff + 2];
-        float oy = theta[tOff + 3] * nx + theta[tOff + 4] * ny + theta[tOff + 5];
-        int outOff = (n * H * W + pixelIdx) * 2;
-        output[outOff] = ox;
-        output[outOff + 1] = oy;
+        int tOff = n * 6 + ri * 3;
+        output[idx] = theta[tOff + 0] * nx + theta[tOff + 1] * ny + theta[tOff + 2];
     }
 
     private static void LpPoolImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,

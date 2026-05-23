@@ -334,7 +334,8 @@ public class AffineGridOperator(OperatorRegistry reg) : IOnnxOperator
         var paramsData = new float[] { H, W, alignCorners };
         var paramsBuf = ctx.Pool.Rent(new[] { paramsData.Length });
         paramsBuf.Data.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * H * W);
+        // One thread per scalar output (x + y interleaved) — gather, WebGL TF compatible
+        reg.ElementWise.AffineGrid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, paramsBuf.Data, N * H * W * 2);
     }
 }
 public class GridSampleOperator(OperatorRegistry reg) : IOnnxOperator
