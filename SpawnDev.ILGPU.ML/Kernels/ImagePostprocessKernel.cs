@@ -18,6 +18,8 @@ public class ImagePostprocessKernel
         _grayscaleToRgbaKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         float, float>? _depthToColormapKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+        float, float, int>? _depthToColormapPaletteKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         float, float>? _normalizeKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -207,6 +209,134 @@ public class ImagePostprocessKernel
             r = 248f + s * (240f - 248f);
             g = 149f + s * (249f - 149f);
             b = 64f + s * (33f - 64f);
+        }
+
+        int ri = (int)(r + 0.5f); if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+        int gi = (int)(g + 0.5f); if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+        int bi = (int)(b + 0.5f); if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+
+        rgba[idx] = ri | (gi << 8) | (bi << 16) | (0xFF << 24);
+    }
+
+    // ─── palette indices (must match DepthColorMaps palette strings) ───
+    /// <summary>Plasma palette index for <see cref="DepthToColormapPalette"/>.</summary>
+    public const int PalettePlasma = 0;
+    /// <summary>Viridis palette index for <see cref="DepthToColormapPalette"/>.</summary>
+    public const int PaletteViridis = 1;
+    /// <summary>Inferno palette index for <see cref="DepthToColormapPalette"/>.</summary>
+    public const int PaletteInferno = 2;
+    /// <summary>Grayscale palette index for <see cref="DepthToColormapPalette"/>.</summary>
+    public const int PaletteGrayscale = 3;
+
+    /// <summary>Map a palette name to the int parameter accepted by <see cref="DepthToColormapPalette"/>.</summary>
+    public static int PaletteFromName(string name) => (name ?? "plasma").ToLowerInvariant() switch
+    {
+        "viridis" => PaletteViridis,
+        "inferno" => PaletteInferno,
+        "grayscale" => PaletteGrayscale,
+        _ => PalettePlasma,
+    };
+
+    /// <summary>
+    /// GPU colormap with selectable palette. Normalizes depth by <c>(minVal, maxVal)</c>
+    /// then maps to RGBA via piecewise-linear interpolation of palette control points
+    /// inlined per branch (plasma / viridis / inferno / grayscale — same control points
+    /// as <see cref="Preprocessing.DepthColorMaps"/>). Use <see cref="PaletteFromName"/>
+    /// to convert the string ID a UI typically holds.
+    /// </summary>
+    public void DepthToColormapPalette(
+        ArrayView1D<float, Stride1D.Dense> depth,
+        ArrayView1D<int, Stride1D.Dense> rgba,
+        int count, float minDepth, float maxDepth, int palette)
+    {
+        _depthToColormapPaletteKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+            float, float, int>(DepthToColormapPaletteImpl);
+        _depthToColormapPaletteKernel(count, depth, rgba, minDepth, maxDepth, palette);
+    }
+
+    /// <summary>
+    /// Piecewise-linear colormap kernel sharing the 9-point control sets defined in
+    /// <see cref="Preprocessing.DepthColorMaps"/>. Branches on palette; each branch
+    /// is a sequence of 8 ramps between adjacent control points (matplotlib-derived
+    /// plasma / viridis / inferno) or a single grayscale ramp.
+    /// </summary>
+    private static void DepthToColormapPaletteImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> depth,
+        ArrayView1D<int, Stride1D.Dense> rgba,
+        float minVal, float maxVal, int palette)
+    {
+        float range = maxVal - minVal;
+        float t = range > 1e-6f ? (depth[idx] - minVal) / range : 0f;
+        if (t < 0f) t = 0f;
+        if (t > 1f) t = 1f;
+
+        float r = 0f, g = 0f, b = 0f;
+
+        // Grayscale: linear ramp 0..255 across all channels.
+        if (palette == PaletteGrayscale)
+        {
+            r = t * 255f; g = r; b = r;
+        }
+        else if (palette == PaletteViridis)
+        {
+            // Control points from DepthColorMaps.GenerateViridis (t at 0.13/0.25/0.38/...).
+            if (t < 0.13f) { float s = t / 0.13f;
+                r = 68f + s * (72f - 68f); g = 1f + s * (36f - 1f); b = 84f + s * (117f - 84f); }
+            else if (t < 0.25f) { float s = (t - 0.13f) / 0.12f;
+                r = 72f + s * (65f - 72f); g = 36f + s * (68f - 36f); b = 117f + s * (135f - 117f); }
+            else if (t < 0.38f) { float s = (t - 0.25f) / 0.13f;
+                r = 65f + s * (53f - 65f); g = 68f + s * (95f - 68f); b = 135f + s * (141f - 135f); }
+            else if (t < 0.50f) { float s = (t - 0.38f) / 0.12f;
+                r = 53f + s * (33f - 53f); g = 95f + s * (145f - 95f); b = 141f + s * (140f - 141f); }
+            else if (t < 0.63f) { float s = (t - 0.50f) / 0.13f;
+                r = 33f + s * (53f - 33f); g = 145f + s * (183f - 145f); b = 140f + s * (121f - 140f); }
+            else if (t < 0.75f) { float s = (t - 0.63f) / 0.12f;
+                r = 53f + s * (109f - 53f); g = 183f + s * (205f - 183f); b = 121f + s * (89f - 121f); }
+            else if (t < 0.88f) { float s = (t - 0.75f) / 0.13f;
+                r = 109f + s * (180f - 109f); g = 205f + s * (222f - 205f); b = 89f + s * (44f - 89f); }
+            else { float s = (t - 0.88f) / 0.12f;
+                r = 180f + s * (253f - 180f); g = 222f + s * (231f - 222f); b = 44f + s * (37f - 44f); }
+        }
+        else if (palette == PaletteInferno)
+        {
+            // Control points from DepthColorMaps.GenerateInferno.
+            if (t < 0.13f) { float s = t / 0.13f;
+                r = 0f + s * (31f - 0f); g = 0f + s * (12f - 0f); b = 4f + s * (72f - 4f); }
+            else if (t < 0.25f) { float s = (t - 0.13f) / 0.12f;
+                r = 31f + s * (85f - 31f); g = 12f + s * (15f - 12f); b = 72f + s * (109f - 72f); }
+            else if (t < 0.38f) { float s = (t - 0.25f) / 0.13f;
+                r = 85f + s * (136f - 85f); g = 15f + s * (34f - 15f); b = 109f + s * (106f - 109f); }
+            else if (t < 0.50f) { float s = (t - 0.38f) / 0.12f;
+                r = 136f + s * (186f - 136f); g = 34f + s * (54f - 34f); b = 106f + s * (85f - 106f); }
+            else if (t < 0.63f) { float s = (t - 0.50f) / 0.13f;
+                r = 186f + s * (227f - 186f); g = 54f + s * (89f - 54f); b = 85f + s * (51f - 85f); }
+            else if (t < 0.75f) { float s = (t - 0.63f) / 0.12f;
+                r = 227f + s * (249f - 227f); g = 89f + s * (140f - 89f); b = 51f + s * (10f - 51f); }
+            else if (t < 0.88f) { float s = (t - 0.75f) / 0.13f;
+                r = 249f + s * (249f - 249f); g = 140f + s * (201f - 140f); b = 10f + s * (50f - 10f); }
+            else { float s = (t - 0.88f) / 0.12f;
+                r = 249f + s * (252f - 249f); g = 201f + s * (255f - 201f); b = 50f + s * (164f - 50f); }
+        }
+        else
+        {
+            // Plasma (default) — control points from DepthColorMaps.GeneratePlasma.
+            if (t < 0.13f) { float s = t / 0.13f;
+                r = 13f + s * (75f - 13f); g = 8f + s * (3f - 8f); b = 135f + s * (161f - 135f); }
+            else if (t < 0.25f) { float s = (t - 0.13f) / 0.12f;
+                r = 75f + s * (126f - 75f); g = 3f + s * (3f - 3f); b = 161f + s * (168f - 161f); }
+            else if (t < 0.38f) { float s = (t - 0.25f) / 0.13f;
+                r = 126f + s * (168f - 126f); g = 3f + s * (34f - 3f); b = 168f + s * (150f - 168f); }
+            else if (t < 0.50f) { float s = (t - 0.38f) / 0.12f;
+                r = 168f + s * (203f - 168f); g = 34f + s * (70f - 34f); b = 150f + s * (121f - 150f); }
+            else if (t < 0.63f) { float s = (t - 0.50f) / 0.13f;
+                r = 203f + s * (229f - 203f); g = 70f + s * (107f - 70f); b = 121f + s * (93f - 121f); }
+            else if (t < 0.75f) { float s = (t - 0.63f) / 0.12f;
+                r = 229f + s * (248f - 229f); g = 107f + s * (149f - 107f); b = 93f + s * (64f - 93f); }
+            else if (t < 0.88f) { float s = (t - 0.75f) / 0.13f;
+                r = 248f + s * (253f - 248f); g = 149f + s * (195f - 149f); b = 64f + s * (40f - 64f); }
+            else { float s = (t - 0.88f) / 0.12f;
+                r = 253f + s * (240f - 253f); g = 195f + s * (249f - 195f); b = 40f + s * (33f - 40f); }
         }
 
         int ri = (int)(r + 0.5f); if (ri < 0) ri = 0; if (ri > 255) ri = 255;

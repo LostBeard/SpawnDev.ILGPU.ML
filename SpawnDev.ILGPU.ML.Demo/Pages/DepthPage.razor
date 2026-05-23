@@ -19,7 +19,7 @@
 
     <div class="depth-controls">
         <label class="palette-label">Color palette:</label>
-        <select class="palette-select" @bind="_colorPalette" @bind:after="RecolorDepth">
+        <select class="palette-select" @bind="_colorPalette" @bind:after="OnPaletteChangedAsync">
             <option value="plasma">Plasma</option>
             <option value="viridis">Viridis</option>
             <option value="inferno">Inferno</option>
@@ -154,7 +154,6 @@
     private double _inferenceMs;
     private float _minDepth;
     private float _maxDepth;
-    private float[]? _depthMap;
     private int _depthWidth;
     private int _depthHeight;
     private string? _statusMessage;
@@ -173,12 +172,8 @@
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
 
-    private void RecolorDepth()
-    {
-        if (_depthMap == null) return;
-        var rgba = SpawnDev.ILGPU.ML.Preprocessing.DepthColorMaps.ApplyColorMap(_depthMap, _depthWidth, _depthHeight, _colorPalette);
-        var pngBytes = SpawnDev.ILGPU.ML.Preprocessing.PngEncoder.Encode(rgba, _depthWidth, _depthHeight);
-        _depthImageUrl = $"data:image/png;base64,{Convert.ToBase64String(pngBytes)}";
-        StateHasChanged();
-    }
+    // Palette switching is GPU-side: see DepthPage.razor.cs RecolorDepthGpuAsync /
+    // OnPaletteChangedAsync. The cached raw depth GPU buffer + cached min/max scalars
+    // feed ImagePostprocessKernel.DepthToColormapPalette directly — no host readback of
+    // depth values, no re-inference.
 }

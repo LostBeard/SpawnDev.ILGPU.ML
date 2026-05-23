@@ -26,8 +26,11 @@ public partial class DepthPage : IDisposable
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
 
-    // GPU-direct rendering
+    // GPU-direct rendering. Raw depth stays on GPU so palette switches re-dispatch only
+    // the colormap kernel — no re-inference, no CPU readback of depth values.
     private MemoryBuffer2D<int, Stride2D.DenseX>? _gpuDepthBuffer;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _gpuRawDepth;
+    private float _gpuRawMinDepth, _gpuRawMaxDepth;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -111,7 +114,6 @@ public partial class DepthPage : IDisposable
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
         _depthImageUrl = null;
-        _depthMap = null;
         _statusMessage = null;
 
         try
@@ -152,34 +154,23 @@ public partial class DepthPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
 
-            // GPU-direct: inference + plasma colormap on GPU → read final RGBA to CPU.
-            // The pipeline also returns the normalized depth values so the palette dropdown
-            // can re-color without re-running inference.
-            _gpuDepthBuffer?.Dispose();
-            var (buffer, w, h, normalized) = await _pipeline.EstimateGpuAsync(_rgbaPixels, _imageWidth, _imageHeight);
-            _gpuDepthBuffer = buffer;
+            // GPU-direct: inference returns the raw depth on the accelerator + min/max.
+            // The colormap is a separate accelerator-side step; on palette change we
+            // re-dispatch ApplyColormapGpuAsync against the cached raw depth — no
+            // re-inference and no host readback of depth values.
+            _gpuRawDepth?.Dispose();
+            var (rawDepth, minD, maxD, w, h) = await _pipeline.EstimateGpuRawAsync(
+                _rgbaPixels, _imageWidth, _imageHeight);
+            _gpuRawDepth = rawDepth;
+            _gpuRawMinDepth = minD;
+            _gpuRawMaxDepth = maxD;
             _depthWidth = w;
             _depthHeight = h;
-            _depthMap = normalized;
 
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
 
-            // First-time render uses the GPU-baked plasma colormap (zero extra work).
-            // Subsequent palette changes route through RecolorDepth() which uses the
-            // cached normalized depth + DepthColorMaps for any palette choice.
-            if (_colorPalette == "plasma")
-            {
-                using var readBuf = _accelerator.Allocate1D<int>(w * h);
-                readBuf.View.CopyFrom(buffer.View.BaseView);
-                await _accelerator.SynchronizeAsync();
-                var pixels = await readBuf.CopyToHostAsync<int>(0, w * h);
-                _depthImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, pixels, w, h);
-            }
-            else
-            {
-                RecolorDepth();
-            }
+            await RecolorDepthGpuAsync();
 
             _statusMessage = null;
         }
@@ -197,7 +188,12 @@ public partial class DepthPage : IDisposable
         if (backend == _selectedBackend && _isModelLoaded) return;
         _selectedBackend = backend;
         _depthImageUrl = null;
-        _depthMap = null;
+
+        // Free cached GPU buffers tied to the old accelerator before tearing it down.
+        _gpuDepthBuffer?.Dispose();
+        _gpuDepthBuffer = null;
+        _gpuRawDepth?.Dispose();
+        _gpuRawDepth = null;
 
         _pipeline?.Dispose();
         _session?.Dispose();
@@ -207,6 +203,42 @@ public partial class DepthPage : IDisposable
         _accelerator = null;
 
         await LoadBackendAndModelAsync();
+    }
+
+    /// <summary>
+    /// Re-apply the colormap on the accelerator using the cached raw depth GPU buffer
+    /// and current <see cref="_colorPalette"/>. No inference re-run, no host readback of
+    /// depth values — only the final colored RGBA is read to CPU for the PNG data-URL
+    /// display path. Called on every inference completion and every palette change.
+    /// </summary>
+    private async Task RecolorDepthGpuAsync()
+    {
+        if (_gpuRawDepth == null || _accelerator == null || _pipeline == null) return;
+
+        int paletteId = SpawnDev.ILGPU.ML.Kernels.ImagePostprocessKernel.PaletteFromName(_colorPalette);
+        _gpuDepthBuffer?.Dispose();
+        _gpuDepthBuffer = await _pipeline.ApplyColormapGpuAsync(
+            _gpuRawDepth.View, _depthWidth, _depthHeight,
+            _gpuRawMinDepth, _gpuRawMaxDepth, paletteId);
+
+        // Read the colored RGBA buffer to CPU for the BeforeAfterSlider <img> data URL.
+        // This is the display path's required readback — it's just RGBA pixels, not the
+        // depth values themselves, so the depth data stays GPU-side end-to-end.
+        using var readBuf = _accelerator.Allocate1D<int>(_depthWidth * _depthHeight);
+        readBuf.View.CopyFrom(_gpuDepthBuffer.View.BaseView);
+        await _accelerator.SynchronizeAsync();
+        var pixels = await readBuf.CopyToHostAsync<int>(0, _depthWidth * _depthHeight);
+        _depthImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, pixels, _depthWidth, _depthHeight);
+    }
+
+    /// <summary>
+    /// Razor dropdown handler — invoked via <c>@bind:after</c>. Fires the async GPU
+    /// colormap re-application and refreshes the UI when done.
+    /// </summary>
+    private async Task OnPaletteChangedAsync()
+    {
+        await RecolorDepthGpuAsync();
+        StateHasChanged();
     }
 
     private void DownloadResult()
@@ -230,8 +262,11 @@ public partial class DepthPage : IDisposable
     {
         _depthImageUrl = null;
         _imageDataUrl = null;
-        _depthMap = null;
         _rgbaPixels = null;
+        _gpuDepthBuffer?.Dispose();
+        _gpuDepthBuffer = null;
+        _gpuRawDepth?.Dispose();
+        _gpuRawDepth = null;
         _statusMessage = null;
         StateHasChanged();
     }
@@ -239,6 +274,7 @@ public partial class DepthPage : IDisposable
     public void Dispose()
     {
         _gpuDepthBuffer?.Dispose();
+        _gpuRawDepth?.Dispose();
         _pipeline?.Dispose();
         _session?.Dispose();
         _accelerator?.Dispose();

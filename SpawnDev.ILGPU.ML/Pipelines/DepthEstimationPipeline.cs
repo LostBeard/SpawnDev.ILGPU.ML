@@ -130,10 +130,9 @@ public class DepthEstimationPipeline : IDisposable
     }
 
     /// <summary>
-    /// Estimate depth and return a plasma colormap as a GPU MemoryBuffer2D
-    /// for zero-copy presentation via ICanvasRenderer, alongside the normalized [0, 1]
-    /// depth values at the same resolution so callers can re-apply a different colormap
-    /// later without re-running inference.
+    /// Estimate depth and return a plasma colormap as a GPU MemoryBuffer2D for zero-copy
+    /// presentation via ICanvasRenderer. The raw depth values stay on the accelerator;
+    /// nothing about them leaves the GPU through this contract.
     ///
     /// Output dimensions follow the same convention as <see cref="EstimateAsync"/>:
     ///   (0, 0) → match source (width, height), preserving aspect ratio.
@@ -141,10 +140,42 @@ public class DepthEstimationPipeline : IDisposable
     ///   (w, h) → exact.
     /// Resize is bilinear, executed on the accelerator before colormap.
     /// Caller owns the returned buffer and must dispose it.
+    ///
+    /// If you also need the raw depth buffer (to re-apply a different palette later or
+    /// run additional postprocessing without re-running inference) use
+    /// <see cref="EstimateGpuRawAsync"/> + <see cref="ApplyColormapGpuAsync"/> instead.
     /// </summary>
-    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height, float[] NormalizedDepth)> EstimateGpuAsync(
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
         int[] rgbaPixels, int width, int height,
         int outputWidth = 0, int outputHeight = 0)
+    {
+        var (rawDepth, minD, maxD, outW, outH) = await EstimateGpuRawAsync(
+            rgbaPixels, width, height, outputWidth, outputHeight);
+        try
+        {
+            var resultBuf = await ApplyColormapGpuAsync(rawDepth.View, outW, outH, minD, maxD,
+                Kernels.ImagePostprocessKernel.PalettePlasma);
+            return (resultBuf, outW, outH);
+        }
+        finally
+        {
+            rawDepth.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Run depth inference and return the raw normalized-range depth as a GPU buffer
+    /// alongside its min/max scalars and dimensions. The buffer stays on the accelerator —
+    /// callers can apply <see cref="ApplyColormapGpuAsync"/> as many times as they like
+    /// (e.g. when a UI palette toggle changes) without re-running inference.
+    ///
+    /// Output dimensions follow the same convention as <see cref="EstimateAsync"/>.
+    /// Caller owns the returned <see cref="MemoryBuffer1D{T, TStride}"/> and must dispose
+    /// it when finished.
+    /// </summary>
+    public async Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
+        EstimateGpuRawAsync(int[] rgbaPixels, int width, int height,
+            int outputWidth = 0, int outputHeight = 0)
     {
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
@@ -163,42 +194,47 @@ public class DepthEstimationPipeline : IDisposable
 
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Output: shape=[{string.Join(",", output.Shape)}], elements={rawSize}, dataLength={output.Data.Length}");
 
-        // Resolve final output dimensions (default = source, preserves aspect).
         var (outW, outH) = ResolveOutputSize(width, height, rawW, rawH, outputWidth, outputHeight);
         int outSize = outW * outH;
 
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
 
-        // GPU bilinear resize from rawW×rawH → outW×outH.
-        // Allocate fresh — Data is not guaranteed to be a contiguous, exclusively-owned view.
+        // GPU bilinear resize from rawW×rawH → outW×outH. The caller-owned buffer is
+        // returned untouched after this; the only readback is a small min/max for the
+        // colormap normalization scalar pair (TODO: replace with a GPU reduction so the
+        // raw path is entirely host-touch-free).
         int readRawSize = Math.Min(rawSize, (int)output.Data.Length);
-        using var resized = _accelerator.Allocate1D<float>(outSize);
-        postprocess.ResizeBilinear(output.Data.SubView(0, readRawSize), resized.View, rawW, rawH, outW, outH);
+        var rawDepth = _accelerator.Allocate1D<float>(outSize);
+        postprocess.ResizeBilinear(output.Data.SubView(0, readRawSize), rawDepth.View, rawW, rawH, outW, outH);
         await _accelerator.SynchronizeAsync();
 
-        // Read resized depth to CPU for min/max (small — outW*outH at the requested display size).
-        var resizedHost = await resized.CopyToHostAsync<float>(0, outSize);
+        var resizedHost = await rawDepth.CopyToHostAsync<float>(0, outSize);
         float minD = resizedHost.Min();
         float maxD = resizedHost.Max();
 
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
 
-        // GPU: depth → plasma colormap RGBA, output to 2D buffer for zero-copy rendering.
-        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(outW, outH));
-        postprocess.DepthToColormap(resized.View, resultBuf.View.BaseView, outSize, minD, maxD);
+        return (rawDepth, minD, maxD, outW, outH);
+    }
+
+    /// <summary>
+    /// Apply a colormap to a raw depth GPU buffer and return a fresh 2D RGBA buffer with
+    /// the colored result. Inference is NOT re-run — this is just the postprocess step.
+    /// Caller owns the returned buffer and must dispose it.
+    ///
+    /// Use <see cref="Kernels.ImagePostprocessKernel.PaletteFromName"/> to convert a UI
+    /// palette name (plasma / viridis / inferno / grayscale) into the int palette index.
+    /// </summary>
+    public async Task<MemoryBuffer2D<int, Stride2D.DenseX>> ApplyColormapGpuAsync(
+        ArrayView1D<float, Stride1D.Dense> rawDepth, int width, int height,
+        float minDepth, float maxDepth, int palette)
+    {
+        var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
+        var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(width, height));
+        postprocess.DepthToColormapPalette(rawDepth, resultBuf.View.BaseView,
+            width * height, minDepth, maxDepth, palette);
         await _accelerator.SynchronizeAsync();
-
-        // Normalize the host-side depth to [0, 1] so callers can swap colormaps
-        // (plasma / viridis / inferno / grayscale) without re-running inference.
-        var normalized = new float[outSize];
-        float range = maxD - minD;
-        if (range > 1e-6f)
-        {
-            for (int i = 0; i < outSize; i++)
-                normalized[i] = (resizedHost[i] - minD) / range;
-        }
-
-        return (resultBuf, outW, outH, normalized);
+        return resultBuf;
     }
 
     public void Dispose() { }
