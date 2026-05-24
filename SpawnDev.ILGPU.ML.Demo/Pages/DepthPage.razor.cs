@@ -260,8 +260,16 @@ public partial class DepthPage : IDisposable
 
         if (present && _canvasRenderer != null)
         {
-            await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
-            Console.WriteLine("[Depth] PresentAsync completed");
+            try
+            {
+                await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
+                Console.WriteLine("[Depth] PresentAsync completed");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Depth] PresentAsync THREW: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"[Depth] StackTrace: {ex.StackTrace}");
+            }
         }
     }
 
@@ -296,8 +304,21 @@ public partial class DepthPage : IDisposable
 
         if (_gpuDepthBuffer != null)
         {
-            await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
-            Console.WriteLine("[Depth] Initial PresentAsync completed");
+            try
+            {
+                Console.WriteLine($"[Depth] About to call PresentAsync on {_gpuDepthBuffer.GetType().Name} extent={_gpuDepthBuffer.Extent}");
+                await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
+                Console.WriteLine("[Depth] Initial PresentAsync completed");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Depth] PresentAsync THREW: {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine($"[Depth] StackTrace: {ex.StackTrace}");
+            }
+        }
+        else
+        {
+            Console.WriteLine("[Depth] _gpuDepthBuffer was NULL when canvas attached");
         }
     }
 
