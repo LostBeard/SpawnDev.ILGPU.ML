@@ -93,6 +93,76 @@ public abstract partial class MLTestBase
         Console.WriteLine("[Postprocess] Normalize: range [10,50]→[0,1] correct");
     });
 
+    /// <summary>
+    /// Phase 2 TensorView regression guard. The TensorView&lt;float&gt;+TensorView&lt;int&gt;
+    /// overload of <c>DepthToColormapPalette</c> writes to a
+    /// <c>MemoryBuffer2D&lt;int, Stride2D.DenseX&gt;.View.BaseView</c> — the path the
+    /// depth demo uses for zero-copy canvas presentation. On 2026-05-24 the demo went
+    /// flat-blue after migrating this kernel to TensorView while the kernel completed
+    /// without throwing. We reverted in <c>2c7dd0f</c> as a workaround. This test
+    /// drives BOTH overloads against MemoryBuffer2D-backed output and asserts the
+    /// readback matches byte-for-byte. If the TensorView path produces different
+    /// data on any backend, the kernel codegen has a real bug we need to root out
+    /// (NO workarounds — fix the library).
+    /// </summary>
+    [TestMethod]
+    public async Task Postprocess_DepthToColormapPalette_TensorView_Matches_Legacy() => await RunTest(async accelerator =>
+    {
+        var kernel = new Kernels.ImagePostprocessKernel(accelerator);
+
+        // 4x4 depth ramp [0, 15] - exercises every plasma colour band.
+        const int W = 4, H = 4;
+        var depth = new float[W * H];
+        for (int i = 0; i < depth.Length; i++) depth[i] = i;
+
+        using var depthBuf = accelerator.Allocate1D(depth);
+        using var legacyOut = accelerator.Allocate2DDenseX<int>(new Index2D(W, H));
+        using var tvOut = accelerator.Allocate2DDenseX<int>(new Index2D(W, H));
+
+        // Legacy overload: ArrayView1D + count.
+        kernel.DepthToColormapPalette(depthBuf.View, legacyOut.View.BaseView,
+            W * H, 0f, 15f, Kernels.ImagePostprocessKernel.PalettePlasma);
+
+        // TensorView overload: wraps the same MemoryBuffer2D BaseView in TensorView<int>.
+        var depthView = new Tensors.TensorView<float>(depthBuf.View, new[] { H, W });
+        var rgbaView = new Tensors.TensorView<int>(tvOut.View.BaseView, new[] { H, W });
+        kernel.DepthToColormapPalette(depthView, rgbaView, 0f, 15f,
+            Kernels.ImagePostprocessKernel.PalettePlasma);
+
+        // Stage both 2D outputs into 1D buffers (CopyToHostAsync is on MemoryBuffer1D).
+        using var legacyStage = accelerator.Allocate1D<int>(W * H);
+        using var tvStage = accelerator.Allocate1D<int>(W * H);
+        legacyStage.View.CopyFrom(legacyOut.View.BaseView);
+        tvStage.View.CopyFrom(tvOut.View.BaseView);
+        await accelerator.SynchronizeAsync();
+
+        var legacyPixels = await legacyStage.CopyToHostAsync<int>(0, W * H);
+        var tvPixels = await tvStage.CopyToHostAsync<int>(0, W * H);
+
+        int diffs = 0;
+        var msg = new System.Text.StringBuilder();
+        for (int i = 0; i < W * H; i++)
+        {
+            if (legacyPixels[i] != tvPixels[i])
+            {
+                diffs++;
+                if (diffs <= 4)
+                    msg.Append($"[{i}] legacy=0x{legacyPixels[i]:X8} tv=0x{tvPixels[i]:X8} ");
+            }
+        }
+        if (diffs > 0)
+            throw new Exception($"TensorView path diverges from legacy at {diffs}/{W * H} pixels. First mismatches: {msg}");
+
+        // Also assert the values are non-trivial (alpha=0xFF in plasma kernel) - guards
+        // against both kernels silently writing zeros.
+        bool sawNonZero = false;
+        foreach (var p in legacyPixels) if (p != 0) { sawNonZero = true; break; }
+        if (!sawNonZero) throw new Exception("Legacy kernel produced all-zero output - kernel didn't run?");
+
+        Console.WriteLine($"[Postprocess] TensorView matches legacy across {W * H} pixels. " +
+            $"Sample: legacy[0]=0x{legacyPixels[0]:X8}, legacy[{W * H - 1}]=0x{legacyPixels[W * H - 1]:X8}");
+    });
+
     [TestMethod]
     public async Task Postprocess_NCHWToRGBA_PacksCorrectly() => await RunTest(async accelerator =>
     {
