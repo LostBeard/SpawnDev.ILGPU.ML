@@ -256,8 +256,9 @@
 
     private List<ImageDropZone.SampleImage> _poseSamples = new()
     {
-        new() { Label = "Portrait", Url = "samples/portrait.jpg" },
-        new() { Label = "Street", Url = "samples/street.jpg" },
+        new() { Label = "Runner", Url = "samples/pose-runner.jpg" },
+        new() { Label = "Dancer", Url = "samples/pose-dancers.jpg" },
+        new() { Label = "Yoga", Url = "samples/pose-yoga.jpg" },
     };
 
     // MoveNet COCO skeleton connections
@@ -425,6 +426,24 @@
 
             var result = await _pipeline.EstimateAsync(rgbaPixels, w, h);
             _inferenceMs = result.InferenceTimeMs;
+
+            // Diagnostic: log raw confidence distribution so we can see whether
+            // the model is actually producing sensible output. If everything is
+            // < 0.3 the model rejected the image (no clear body); if everything
+            // is ~0 the inference is broken; if values are all over the place
+            // the pipeline is feeding garbage.
+            if (result.Keypoints.Length > 0)
+            {
+                var confs = result.Keypoints.Select(k => k.Confidence).ToArray();
+                Console.WriteLine($"[Pose] {w}x{h} infer={result.InferenceTimeMs:F0}ms" +
+                    $" conf min={confs.Min():F3} max={confs.Max():F3} avg={confs.Average():F3}");
+                for (int i = 0; i < result.Keypoints.Length; i++)
+                {
+                    var kp = result.Keypoints[i];
+                    Console.WriteLine($"  {i,2} {kp.Name,-15} x={kp.X,6:F1} y={kp.Y,6:F1} conf={kp.Confidence:F3}");
+                }
+            }
+
             _keypoints = result.Keypoints.Select(kp => new Keypoint
             {
                 X = kp.X,
