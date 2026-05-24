@@ -427,6 +427,21 @@
             var result = await _pipeline.EstimateAsync(rgbaPixels, w, h);
             _inferenceMs = result.InferenceTimeMs;
 
+            // Diagnostic logging for the active investigation. Prints per-keypoint
+            // coords + confidence so we can see whether inference is producing
+            // normalized output even when no keypoint clears the 0.3 display threshold.
+            if (result.Keypoints.Length > 0)
+            {
+                var confs = result.Keypoints.Select(k => k.Confidence).ToArray();
+                Console.WriteLine($"[Pose] {w}x{h} backend={_selectedBackend} infer={result.InferenceTimeMs:F0}ms" +
+                    $" conf min={confs.Min():F3} max={confs.Max():F3} avg={confs.Average():F3}");
+                for (int i = 0; i < result.Keypoints.Length; i++)
+                {
+                    var kp = result.Keypoints[i];
+                    Console.WriteLine($"  {i,2} {kp.Name,-15} x={kp.X,7:F1} y={kp.Y,7:F1} conf={kp.Confidence:F3}");
+                }
+            }
+
             _keypoints = result.Keypoints.Select(kp => new Keypoint
             {
                 X = kp.X,

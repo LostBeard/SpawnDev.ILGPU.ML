@@ -124,6 +124,77 @@ public abstract partial class MLTestBase
             throw new Exception($"[{name}] Mean error {meanErr:F4} > {maxMeanErr}");
     }
 
+    // ── MoveNet Reference Test ──
+
+    /// <summary>
+    /// MoveNet Lightning vs ONNX Runtime 1.24.3 ground truth on the cat reference image.
+    /// References at wwwroot/references/movenet-lightning/ : cat_input_nhwc_int32.bin
+    /// (192*192*3 = 110592 int32 [0,255] values) and cat_output.bin (51 float32 keypoint values
+    /// in [y,x,conf] x 17 layout).
+    ///
+    /// 2026-05-23: this test exists specifically to catch the broken-inference regression we
+    /// hit after shipping pose as "verified" - the unit test that gated the verification claim
+    /// (CreateFromFile_MoveNet_Inference) only required >=1 keypoint conf > 0.05, which was
+    /// trivially satisfied by a single saturated 1.0 spike from un-clipped Relu6 activations.
+    /// Comparing against ORT's actual keypoint coordinates+confidences is the real bar.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Reference_MoveNetLightning_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // Input is int32 NHWC [0,255] - the model takes int32 then internally Casts to float.
+        // We have an all-float pipeline so feed as floats with identical numeric values.
+        var inputInt32Bytes = await http.GetByteArrayAsync("references/movenet-lightning/cat_input_nhwc_int32.bin");
+        int elemCount = inputInt32Bytes.Length / 4;
+        var inputFloats = new float[elemCount];
+        for (int i = 0; i < elemCount; i++)
+        {
+            int v = BitConverter.ToInt32(inputInt32Bytes, i * 4);
+            inputFloats[i] = (float)v;
+        }
+
+        var expectedBytes = await http.GetByteArrayAsync("references/movenet-lightning/cat_output.bin");
+        var expected = new float[expectedBytes.Length / 4];
+        Buffer.BlockCopy(expectedBytes, 0, expected, 0, expectedBytes.Length);
+
+        using var session = await InferenceSession.CreateFromFileAsync(
+            accelerator, http, "models/movenet-lightning/model.onnx");
+        using var inputBuf = accelerator.Allocate1D(inputFloats);
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 192, 192, 3 });
+
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = inputTensor
+        });
+
+        var output = outputs[session.OutputNames[0]];
+        int elems = Math.Min(output.ElementCount, expected.Length);
+        using var readBuf = accelerator.Allocate1D<float>(elems);
+        new ElementWiseKernels(accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
+        await accelerator.SynchronizeAsync();
+        var actual = await readBuf.CopyToHostAsync<float>(0, elems);
+
+        // Per-keypoint diff diagnostic - prints the first 5 keypoints so failures surface
+        // which keypoints diverge and by how much. Useful when refining downstream pipeline.
+        Console.WriteLine($"[MoveNet-Ref] Per-keypoint comparison (ORT 1.24.3 vs SpawnDev.ILGPU.ML, cat image):");
+        for (int k = 0; k < 17; k++)
+        {
+            float yA = actual[k * 3 + 0], xA = actual[k * 3 + 1], cA = actual[k * 3 + 2];
+            float yE = expected[k * 3 + 0], xE = expected[k * 3 + 1], cE = expected[k * 3 + 2];
+            Console.WriteLine($"  kp {k,2}  ORT: y={yE:F4} x={xE:F4} c={cE:F4}   us: y={yA:F4} x={xA:F4} c={cA:F4}   d=({MathF.Abs(yA-yE):F4},{MathF.Abs(xA-xE):F4},{MathF.Abs(cA-cE):F4})");
+        }
+
+        // Strict-ish threshold: MoveNet outputs normalized coords in [0,1] and conf in [0,1],
+        // so abs differences should be small. ORT runs FP32, our pipeline runs FP32 with
+        // slightly different reduction orderings - tolerate up to 0.02 mean diff. If we're
+        // bit-exact that's even better, but small drift is acceptable for floating-point
+        // associativity differences across reduction orderings on GPU.
+        AssertReferenceMatch(actual, expected, 0.02f, "MoveNet-Lightning vs ORT 1.24.3");
+        Console.WriteLine("[MoveNet-Ref] PASS");
+    });
+
     // ── Style Transfer Reference Tests ──
 
     [TestMethod(Timeout = 120000)]

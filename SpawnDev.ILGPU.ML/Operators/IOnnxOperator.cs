@@ -53,6 +53,29 @@ public class OnnxOpContext
     /// Allows control flow operators to compile and execute embedded ONNX subgraphs.</summary>
     public OperatorRegistry? Registry { get; init; }
 
+    /// <summary>Names of tensors whose ONNX-declared dtype is integer (INT8/16/32/64, UINT8/16,
+    /// BOOL). Populated at session-init by walking initializers (with their TensorProto.DataType),
+    /// Cast nodes (with their `to` attribute), and known integer-producing ops (ArgMax, Shape,
+    /// Size, NonZero, TopK indices). Lets operators honour int-vs-float semantic differences
+    /// even though all storage in this pipeline is float32 -- the canonical case is ONNX Div,
+    /// which is FLOOR division on integer dtypes but float division on FP dtypes. TF's
+    /// `tf.floordiv` exports as Cast(int)+Div(int,int); without this set our Div produced
+    /// 18.479 instead of 18 for the (argmax mod 48) keypoint X-coord decode in MoveNet.</summary>
+    public HashSet<string>? IntegerTensorNames { get; init; }
+
+    /// <summary>True if all of this op's inputs are declared integer-typed in the ONNX graph.
+    /// Returns false when IntegerTensorNames is null or any input is missing / non-integer.</summary>
+    public bool AllInputsAreInteger()
+    {
+        if (IntegerTensorNames == null || InputNames.Length == 0) return false;
+        foreach (var name in InputNames)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (!IntegerTensorNames.Contains(name)) return false;
+        }
+        return true;
+    }
+
     /// <summary>Try to get pre-read float values for an input tensor (by index).
     /// Returns null if not available (tensor is dynamic, not pre-read).</summary>
     public float[]? TryGetInputValues(int inputIndex)

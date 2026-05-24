@@ -178,6 +178,10 @@ public partial class DepthPage : IDisposable
             _gpuRawMaxDepth = maxD;
             _depthWidth = w;
             _depthHeight = h;
+            // Diagnostic: visual flat-blue investigation. Tells us if the raw depth
+            // buffer is actually populated, what its value range is, and what the
+            // canvas dimensions are when the slider mounts.
+            Console.WriteLine($"[Depth] backend={_selectedBackend} src={_imageWidth}x{_imageHeight} -> depth={w}x{h} min={minD:F4} max={maxD:F4} range={(maxD-minD):F4}");
 
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
@@ -240,7 +244,11 @@ public partial class DepthPage : IDisposable
     /// </summary>
     private async Task RecolorDepthGpuAsync(bool present = true)
     {
-        if (_gpuRawDepth == null || _accelerator == null || _pipeline == null) return;
+        if (_gpuRawDepth == null || _accelerator == null || _pipeline == null)
+        {
+            Console.WriteLine($"[Depth] RecolorDepthGpuAsync SKIPPED: rawDepth={_gpuRawDepth != null} accel={_accelerator != null} pipeline={_pipeline != null}");
+            return;
+        }
 
         int paletteId = SpawnDev.ILGPU.ML.Kernels.ImagePostprocessKernel.PaletteFromName(_colorPalette);
         _gpuDepthBuffer?.Dispose();
@@ -248,9 +256,12 @@ public partial class DepthPage : IDisposable
             _gpuRawDepth.View, _depthWidth, _depthHeight,
             _gpuRawMinDepth, _gpuRawMaxDepth, paletteId);
 
+        Console.WriteLine($"[Depth] Recolor palette={_colorPalette}(id={paletteId}) dim={_depthWidth}x{_depthHeight} present={present} renderer={(_canvasRenderer != null ? "ATTACHED" : "NULL")}");
+
         if (present && _canvasRenderer != null)
         {
             await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
+            Console.WriteLine("[Depth] PresentAsync completed");
         }
     }
 
@@ -273,6 +284,7 @@ public partial class DepthPage : IDisposable
     /// </summary>
     private async Task OnAfterCanvasReady(ElementReference canvasRef)
     {
+        Console.WriteLine($"[Depth] OnAfterCanvasReady FIRED accel={(_accelerator != null ? _accelerator.AcceleratorType.ToString() : "NULL")} bufferReady={_gpuDepthBuffer != null}");
         if (_accelerator == null) return;
         _canvasRenderer?.Dispose();
         _canvasRenderer = CanvasRendererFactory.Create(_accelerator);
@@ -280,10 +292,12 @@ public partial class DepthPage : IDisposable
         _canvasRenderer.AttachCanvas(canvasEl);
         _afterCanvasRef = canvasRef;
         _canvasReady = true;
+        Console.WriteLine($"[Depth] Canvas attached, renderer={_canvasRenderer?.GetType().Name}");
 
         if (_gpuDepthBuffer != null)
         {
             await _canvasRenderer.PresentAsync(_gpuDepthBuffer);
+            Console.WriteLine("[Depth] Initial PresentAsync completed");
         }
     }
 
