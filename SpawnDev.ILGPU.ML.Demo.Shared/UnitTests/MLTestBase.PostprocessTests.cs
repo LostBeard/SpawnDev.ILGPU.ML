@@ -130,11 +130,13 @@ public abstract partial class MLTestBase
             Kernels.ImagePostprocessKernel.PalettePlasma);
 
         // Stage both 2D outputs into 1D buffers (CopyToHostAsync is on MemoryBuffer1D).
+        // CopyFromAsync is the backend-agnostic async mirror of CopyFrom; on Wasm it
+        // awaits pending kernel dispatches before the copy, closing the SharedArrayBuffer
+        // race the main thread would otherwise hit (Blazor WASM cannot block-wait).
         using var legacyStage = accelerator.Allocate1D<int>(W * H);
         using var tvStage = accelerator.Allocate1D<int>(W * H);
-        legacyStage.View.CopyFrom(legacyOut.View.BaseView);
-        tvStage.View.CopyFrom(tvOut.View.BaseView);
-        await accelerator.SynchronizeAsync();
+        await legacyStage.View.CopyFromAsync(legacyOut.View.BaseView);
+        await tvStage.View.CopyFromAsync(tvOut.View.BaseView);
 
         var legacyPixels = await legacyStage.CopyToHostAsync<int>(0, W * H);
         var tvPixels = await tvStage.CopyToHostAsync<int>(0, W * H);
