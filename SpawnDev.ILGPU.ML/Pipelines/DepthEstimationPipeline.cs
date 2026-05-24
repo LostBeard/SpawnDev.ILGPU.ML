@@ -237,15 +237,14 @@ public class DepthEstimationPipeline : IDisposable
     {
         var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(width, height));
-        // Use the LEGACY scalar-param overload pending Phase 2 TensorView regression
-        // investigation on WebGPU. 2026-05-24: TJ's depth demo showed flat blue / not
-        // honouring the grayscale palette even though the kernel dispatched and
-        // PresentAsync completed without throwing. The ORT reference test passes 6/6
-        // (inference is correct), so the failure mode is in the colormap step.
-        // The legacy overload was the proven path through preview.3.
-        int count = width * height;
-        postprocess.DepthToColormapPalette(rawDepth, resultBuf.View.BaseView,
-            count, minDepth, maxDepth, palette);
+        // Phase 2 TensorView<float> + TensorView<int> overload. Both tensors are
+        // row-major [H, W]; the kernel reads count from depth.ElementCount.
+        // Restored 2026-05-24 PM after SpawnDev.ILGPU 4.9.9-local.1 fixed the
+        // scalar-slot drift that caused the original migration to flat-blue the
+        // demo on WebGPU. See ILGPU commit d5154c6.
+        var depthView = new Tensors.TensorView<float>(rawDepth, new[] { height, width });
+        var rgbaView = new Tensors.TensorView<int>(resultBuf.View.BaseView, new[] { height, width });
+        postprocess.DepthToColormapPalette(depthView, rgbaView, minDepth, maxDepth, palette);
         await _accelerator.SynchronizeAsync();
         return resultBuf;
     }
