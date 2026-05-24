@@ -192,13 +192,32 @@ public class ClipOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // Opset 6: min/max as attributes. Opset 11+: min/max as optional inputs.
+        // Opset 6: min/max as attributes. Opset 11+ (the default tf2onnx, PyTorch,
+        // and onnxruntime-tools emit today): min/max as optional INPUT tensors
+        // (1-element initializers), NOT attributes.
+        //
+        // The previous impl only read attributes. Modern opset 11+ Clip(0,6) / Relu6
+        // silently became identity (minVal=float.MinValue, maxVal=float.MaxValue, the
+        // fallback branch never matched). MobileNetV2-FPN-based MoveNet exported by
+        // tf2onnx 1.16 has Relu6 between every conv block; without the [0, 6] clamp,
+        // activations doubled per block and saturated to 10^12 by the output decode,
+        // producing all-zero / all-saturated keypoint confidences.
         float minVal = ctx.GetFloat("min", float.MinValue);
         float maxVal = ctx.GetFloat("max", float.MaxValue);
 
-        // Opset 11+: inputs[1]=min, inputs[2]=max (scalar tensors)
-        // We can't easily read scalar GPU tensors to CPU here, so use attribute defaults
-        // which cover the common case (Clip(0,6) for ReLU6 has them as attributes).
+        // Opset 11+: pull scalar min from inputs[1], scalar max from inputs[2].
+        // TryGetInputValues returns the pre-extracted initializer / Constant-node float[]
+        // (already in CPU memory at session-init time for small constants).
+        if (ctx.Inputs.Length > 1 && ctx.InputNames.Length > 1 && !string.IsNullOrEmpty(ctx.InputNames[1]))
+        {
+            var minVals = ctx.TryGetInputValues(1);
+            if (minVals != null && minVals.Length > 0) minVal = minVals[0];
+        }
+        if (ctx.Inputs.Length > 2 && ctx.InputNames.Length > 2 && !string.IsNullOrEmpty(ctx.InputNames[2]))
+        {
+            var maxVals = ctx.TryGetInputValues(2);
+            if (maxVals != null && maxVals.Length > 0) maxVal = maxVals[0];
+        }
 
         if (minVal == 0f && maxVal == float.MaxValue)
         {

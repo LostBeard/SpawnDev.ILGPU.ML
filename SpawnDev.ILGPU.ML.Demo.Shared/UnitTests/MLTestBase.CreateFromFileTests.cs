@@ -471,8 +471,119 @@ public abstract partial class MLTestBase
         if (validKeypoints == 0)
             throw new Exception("All keypoints have confidence < 0.05 — model output may be uninitialized");
 
-        Console.WriteLine($"[MoveNet-Inference] PASS — {validKeypoints}/17 keypoints above 0.05 confidence");
+        // Stronger structural assertions that catch the saturation bug we hit on
+        // 2026-05-23: every Relu6 (Clip with opset 11+ tensor inputs) was silently
+        // an identity op, so MobileNet activations exploded to 10^12 and the final
+        // Sigmoid saturated everything to 0/1 with garbage coordinates. The old
+        // "≥1 keypoint > 0.05" floor was satisfied by a single saturated 1.0 spike.
+        int saturatedConf = result.Keypoints.Count(k => k.Confidence == 0f || k.Confidence == 1f);
+        if (saturatedConf >= 15)
+            throw new Exception($"Confidence saturated to 0/1 for {saturatedConf}/17 keypoints — " +
+                                "inference is producing extreme outputs (Clip / activation explosion?).");
+
+        // Coordinates must stay within image bounds. The OLD bug produced values
+        // in the billions; any keypoint with X or Y outside [0, max(W, H)] means the
+        // model is feeding non-normalized garbage into PoseSkeleton.DecodeMoveNetOutput.
+        // Allow a small overshoot (1.5x) for keypoints predicted just off-edge.
+        float coordLimit = Math.Max(W, H) * 1.5f;
+        foreach (var kp in result.Keypoints)
+        {
+            if (Math.Abs(kp.X) > coordLimit || Math.Abs(kp.Y) > coordLimit)
+                throw new Exception($"Keypoint '{kp.Name}' coordinates out of image range: " +
+                                    $"X={kp.X} Y={kp.Y} (image {W}x{H}) — inference output is not in [0,1] normalized range.");
+        }
+
+        Console.WriteLine($"[MoveNet-Inference] PASS — {validKeypoints}/17 keypoints above 0.05 confidence, " +
+                          $"{saturatedConf}/17 saturated (must stay < 15)");
         pipeline.Dispose();
+    });
+
+    /// <summary>
+    /// DIAGNOSTIC: traces MoveNet's per-op outputs to identify where the keypoint
+    /// decode produces values outside the [0, 1] normalized range. Captured per-op
+    /// outputs are printed sorted by node index with their min/max so we can spot
+    /// the first divergence into >1 magnitude. NOT a regression test - exists for
+    /// the active pose-estimation root-cause investigation. Remove once fixed.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task CreateFromFile_MoveNet_TraceIntermediates() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        // Browser backends already cover the same code path; only need one backend
+        // for the trace. CUDA is fastest and most numerically reliable.
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda)
+            throw new UnsupportedTestException("Trace only runs on CUDA - one backend is enough for op-by-op divergence hunting");
+
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeInfo = new Dictionary<string, string>();
+
+        try
+        {
+            using var session = await InferenceSession.CreateFromFileAsync(
+                accelerator, http, "models/movenet-lightning/model.onnx");
+
+            const int W = 192, H = 192;
+            var pixels = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    pixels[y * W + x] = (int)(x * 255f / W) | ((int)(y * 255f / H) << 8) | (128 << 16) | (0xFF << 24);
+
+            var pipeline = new PoseEstimationPipeline(session, accelerator);
+            var result = await pipeline.EstimateAsync(pixels, W, H);
+            pipeline.Dispose();
+
+            var sb = new System.Text.StringBuilder();
+            void Wl(string s) { Console.WriteLine(s); sb.AppendLine(s); }
+            Wl($"=== MoveNet Final keypoints (raw decode) ===");
+            foreach (var kp in result.Keypoints.Take(5))
+                Wl($"  {kp.Name}: ({kp.X:F2}, {kp.Y:F2}) conf={kp.Confidence:F4}");
+
+            Wl($"\n=== Per-op output ranges ({SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs.Count} captured) ===");
+            var sorted = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs
+                .OrderBy(kvp =>
+                {
+                    var k = kvp.Key;
+                    var us = k.IndexOf('_');
+                    return us > 0 && int.TryParse(k.AsSpan(0, us), out var n) ? n : 99999;
+                }).ToList();
+
+            int firstHuge = -1;
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                var kvp = sorted[i];
+                var vals = kvp.Value;
+                if (vals == null || vals.Length == 0) continue;
+                float mn = float.MaxValue, mx = float.MinValue;
+                int nanCt = 0, infCt = 0;
+                foreach (var v in vals)
+                {
+                    if (float.IsNaN(v)) nanCt++;
+                    else if (float.IsInfinity(v)) infCt++;
+                    else { if (v < mn) mn = v; if (v > mx) mx = v; }
+                }
+                bool huge = (Math.Abs(mn) > 1e5 || Math.Abs(mx) > 1e5);
+                if (huge && firstHuge < 0) firstHuge = i;
+                string flag = huge ? " <<HUGE>>" : "";
+                string nflag = nanCt > 0 || infCt > 0 ? $" NaN={nanCt} Inf={infCt}" : "";
+                // Print HUGE/NaN nodes always, plus nodes 100+ (output decode region).
+                int nodeIdx = 99999;
+                var us2 = kvp.Key.IndexOf('_');
+                if (us2 > 0) int.TryParse(kvp.Key.AsSpan(0, us2), out nodeIdx);
+                if (huge || nanCt > 0 || infCt > 0 || nodeIdx >= 100)
+                    Wl($"  {kvp.Key,-100} min={mn,12:G5} max={mx,12:G5}{flag}{nflag}");
+            }
+            if (firstHuge >= 0)
+                Wl($"\nFIRST_HUGE_NODE: {sorted[firstHuge].Key}");
+            else
+                Wl("\nNo huge values found - inference output range is normal");
+
+        }
+        finally
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs = null;
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeInfo = null;
+        }
     });
 
     /// <summary>EfficientNet-Lite0 (TFLite) — README claims it loads.</summary>

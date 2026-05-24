@@ -2234,6 +2234,44 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, outBuf.View, new float[] { 1, 2, 4, 3 }, 0f, "GatherElements: ");
     });
 
+    /// <summary>
+    /// Verifies Clip honors opset 11+ scalar tensor inputs for min/max (not just
+    /// attributes). The old impl only read attributes, so any Clip(0,6) / Relu6
+    /// from a modern opset-11+ export silently became an identity pass-through.
+    /// This broke MoveNet on 2026-05-23: every Relu6 in MobileNetV2 was a no-op,
+    /// activations exploded to 10^12, and pose keypoint decode produced garbage.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_Clip_Opset11_TensorInputs() => await RunTest(async accelerator =>
+    {
+        var data = new float[] { -2f, -0.5f, 0f, 3f, 6.5f, 100f };
+        var minScalar = new float[] { 0f };
+        var maxScalar = new float[] { 6f };
+        using var dataBuf = accelerator.Allocate1D(data);
+        using var minBuf = accelerator.Allocate1D(minScalar);
+        using var maxBuf = accelerator.Allocate1D(maxScalar);
+        using var outBuf = accelerator.Allocate1D<float>(data.Length);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = MakeOpCtx(accelerator,
+            new[] {
+                new Tensor(dataBuf.View, new[] { 6 }),
+                new Tensor(minBuf.View, new[] { 1 }),
+                new Tensor(maxBuf.View, new[] { 1 }),
+            },
+            new[] { new Tensor(outBuf.View, new[] { 6 }) },
+            inputNames: new[] { "data", "min", "max" },
+            constants: new Dictionary<string, float[]>
+            {
+                ["data"] = data, ["min"] = minScalar, ["max"] = maxScalar
+            });
+        reg.Resolve("Clip")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        // Expected Relu6 behaviour: [-2,-0.5,0,3,6.5,100] -> [0,0,0,3,6,6]
+        await AssertCloseGpu(accelerator, outBuf.View,
+            new float[] { 0f, 0f, 0f, 3f, 6f, 6f }, 0f,
+            "Clip(min=0,max=6) opset 11+: ");
+    });
+
     [TestMethod]
     public async Task Op_GatherND_MatchesCpu() => await RunTest(async accelerator =>
     {

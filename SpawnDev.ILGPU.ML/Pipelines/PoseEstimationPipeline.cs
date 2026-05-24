@@ -78,16 +78,6 @@ public class PoseEstimationPipeline : IDisposable
         await _accelerator.SynchronizeAsync();
         var outputData = await readBuf.CopyToHostAsync<float>(0, elems);
 
-        // Raw model output dump (BEFORE * imageWidth scaling). Gives us the
-        // ground truth of what the model is actually producing — separates
-        // "broken inference" from "broken decode". TEMP: unconditional for
-        // active pose-inference investigation.
-        Console.WriteLine($"[Pose] raw output (elems={elems}, output.ElementCount={output.ElementCount}, OutputName={_session.OutputNames[0]}):");
-        for (int i = 0; i < 17 && i * 3 + 2 < outputData.Length; i++)
-        {
-            Console.WriteLine($"  raw {i,2} y={outputData[i*3+0],14:G6} x={outputData[i*3+1],14:G6} c={outputData[i*3+2],14:G6}");
-        }
-
         // Decode keypoints
         var keypoints = PoseSkeleton.DecodeMoveNetOutput(outputData, width, height);
 
