@@ -397,7 +397,36 @@ public class GatherNDOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "GatherND";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[1] }; // Simplified — output shape depends on indices
+    {
+        // ONNX GatherND output shape per spec:
+        //   batch_dims  = attr (default 0)
+        //   data_shape  = [b_0..b_{bd-1}, d_0..d_{r-1}]      (b = batch dims, d = data dims)
+        //   index_shape = [b_0..b_{bd-1}, i_0..i_{q-1}, k]   (k = index last dim)
+        //   out_shape   = [b_0..b_{bd-1}, i_0..i_{q-1}, d_k..d_{r-1}]
+        // The previous impl returned inputs[1] (indices shape) which produced
+        // wrongly-sized output buffers — downstream code wrote only the leading
+        // portion and left the rest as zeros, breaking MoveNet keypoint decode.
+        int batchDims = attrs.TryGetValue("batch_dims", out var bdObj)
+            ? Convert.ToInt32(bdObj) : 0;
+        var data = inputs[0];
+        var idx  = inputs[1];
+        int lastIdxDim = idx[^1];
+
+        var outShape = new List<int>();
+        // 1) batch dims (shared between data + indices)
+        for (int i = 0; i < batchDims; i++) outShape.Add(idx[i]);
+        // 2) indices "middle" dims (everything between batch dims and the trailing dim)
+        for (int i = batchDims; i < idx.Length - 1; i++) outShape.Add(idx[i]);
+        // 3) remaining data dims after the indexed dimensions
+        for (int i = batchDims + lastIdxDim; i < data.Length; i++) outShape.Add(data[i]);
+
+        // Defensive: if for any reason the spec walk produces zero dims (e.g.
+        // unresolved dynamic shape upstream), fall back to a 1-element scalar
+        // rather than crashing the compiler — downstream Reshape can still
+        // recover real shape at runtime.
+        if (outShape.Count == 0) outShape.Add(1);
+        return new[] { outShape.ToArray() };
+    }
 
     // GPU GatherND kernel: each thread copies one element of the output.
     // params: [lastIdxDim, sliceSize, dataTotal, strides[0], strides[1], ...]

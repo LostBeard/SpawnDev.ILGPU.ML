@@ -2253,6 +2253,48 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, outBuf.View, new float[] { 3 }, 0f, "GatherND: ");
     });
 
+    /// <summary>
+    /// Verifies <c>GatherND.InferOutputShapes</c> matches the ONNX spec across the cases
+    /// MoveNet exercises. The old impl returned the indices shape unchanged — producing
+    /// wrongly-sized output buffers that left half the model output as zeros and broke
+    /// pose-keypoint decoding. This test exercises the inference path the GraphCompiler
+    /// uses for buffer allocation (independent of the kernel's runtime behaviour).
+    /// </summary>
+    [TestMethod]
+    public Task Op_GatherND_InferOutputShapes_Spec() => RunTest(accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("GatherND")!;
+
+        // Case 1 (classic): data [2,2], indices [1,2]. Per spec out = [1].
+        var case1 = op.InferOutputShapes(new[] { new[] { 2, 2 }, new[] { 1, 2 } }, new());
+        if (!case1[0].SequenceEqual(new[] { 1 }))
+            throw new Exception($"Case 1 expected [1], got [{string.Join(',', case1[0])}]");
+
+        // Case 2 (gather rows): data [3,4], indices [2,1]. Per spec out = [2, 4].
+        var case2 = op.InferOutputShapes(new[] { new[] { 3, 4 }, new[] { 2, 1 } }, new());
+        if (!case2[0].SequenceEqual(new[] { 2, 4 }))
+            throw new Exception($"Case 2 expected [2,4], got [{string.Join(',', case2[0])}]");
+
+        // Case 3 (MoveNet-style scalar gathers per keypoint):
+        // data [1, 48, 48, 17, 3], indices [1, 17, 1, 4]. Per spec out = [1, 17, 1, 3].
+        // Indices' last dim (4) indexes into the first 4 data dims, leaving data[4:] = [3].
+        var case3 = op.InferOutputShapes(
+            new[] { new[] { 1, 48, 48, 17, 3 }, new[] { 1, 17, 1, 4 } }, new());
+        if (!case3[0].SequenceEqual(new[] { 1, 17, 1, 3 }))
+            throw new Exception($"Case 3 expected [1,17,1,3], got [{string.Join(',', case3[0])}]");
+
+        // Case 4 (batch_dims=1): data [2, 4, 3], indices [2, 1, 1], batch_dims=1.
+        // Per spec out = [2, 1, 3] (1 leading batch, 1 middle, then data[1+1:] = [3]).
+        var case4 = op.InferOutputShapes(
+            new[] { new[] { 2, 4, 3 }, new[] { 2, 1, 1 } },
+            new Dictionary<string, object> { ["batch_dims"] = 1 });
+        if (!case4[0].SequenceEqual(new[] { 2, 1, 3 }))
+            throw new Exception($"Case 4 expected [2,1,3], got [{string.Join(',', case4[0])}]");
+
+        return Task.CompletedTask;
+    });
+
     [TestMethod]
     public async Task Op_Mod_MatchesCpu() => await RunTest(async accelerator =>
     {
