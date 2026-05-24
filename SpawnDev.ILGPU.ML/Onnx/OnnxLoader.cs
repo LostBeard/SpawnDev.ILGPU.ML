@@ -262,10 +262,12 @@ public static class OnnxLoader
             }
         }
 
-        // Initializer shapes
+        // Initializer shapes + declared ONNX data types (FLOAT, INT32, INT64, BOOL, ...)
+        var initDataTypes = new Dictionary<string, int>();
         foreach (var init in graph.Initializers)
         {
             shapes[init.Name] = init.Dims.Select(d => (int)d).ToArray();
+            initDataTypes[init.Name] = init.DataType;
         }
 
         // Register Constant node outputs as initializers (with shapes from their tensor data).
@@ -283,6 +285,8 @@ public static class OnnxLoader
                         shapes[outputName] = tensorShape;
                     if (!initNames.Contains(outputName))
                         initNames.Add(outputName);
+                    if (!initDataTypes.ContainsKey(outputName))
+                        initDataTypes[outputName] = valueAttr.T.DataType;
                 }
             }
         }
@@ -298,6 +302,7 @@ public static class OnnxLoader
             ValueShapes = shapes,
             OpsetVersion = (int)opset,
             InitializerNames = initNames.ToArray(),
+            InitializerDataTypes = initDataTypes,
         };
     }
 
@@ -386,6 +391,12 @@ public class OnnxModelInfo
     public Dictionary<string, int[]> ValueShapes { get; set; } = new();
     public int OpsetVersion { get; set; }
     public string[] InitializerNames { get; set; } = Array.Empty<string>();
+    /// <summary>Maps initializer (and Constant-node output) name to its ONNX
+    /// <see cref="OnnxDataType"/> code. Needed so the runtime can apply integer
+    /// semantics (ONNX Div as floor/trunc division) to ops whose ONNX-declared
+    /// inputs are integer-typed even though all storage in this pipeline is
+    /// float32. Populated by OnnxLoader at parse time.</summary>
+    public Dictionary<string, int> InitializerDataTypes { get; set; } = new();
 }
 
 /// <summary>A node in the model graph.</summary>

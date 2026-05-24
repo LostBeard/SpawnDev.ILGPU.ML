@@ -26,6 +26,7 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _transposeLastTwoKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _geluInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _reluInPlaceKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _truncateInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scaleInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _fillKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>>? _broadcastBinaryKernel;
@@ -447,6 +448,13 @@ public class ElementWiseKernels : IDisposable
         _reluInPlaceKernel!(count, data);
     }
 
+    /// <summary>In-place truncate toward zero (ONNX integer-Div post-step). Single buffer binding (WebGPU-safe).</summary>
+    public void TruncateInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
+    {
+        EnsureLoaded();
+        _truncateInPlaceKernel!(count, data);
+    }
+
     /// <summary>
     /// Concatenate two [T, C] tensors along last dim → [T, 2C].
     /// Inputs flat [T*C], output flat [T*2C]. output must be a separate buffer.
@@ -733,6 +741,10 @@ public class ElementWiseKernels : IDisposable
     /// <summary>Truncate: round toward zero (C-style cast from float to int).</summary>
     private static void TruncateImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = MathF.Truncate(input[idx]); }
+
+    /// <summary>In-place truncate toward zero. Single buffer binding (WebGPU-safe).</summary>
+    private static void TruncateInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
+    { data[idx] = MathF.Truncate(data[idx]); }
 
     private static void MinImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = a[idx] < b[idx] ? a[idx] : b[idx]; }
@@ -1673,6 +1685,8 @@ public class ElementWiseKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>>(GELUInPlaceImpl);
         _reluInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>>(ReLUInPlaceImpl);
+        _truncateInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>>(TruncateInPlaceImpl);
         _scaleInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
         _fillKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,

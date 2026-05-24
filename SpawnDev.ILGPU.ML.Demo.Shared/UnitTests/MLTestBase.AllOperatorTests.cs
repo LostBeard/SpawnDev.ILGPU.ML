@@ -18,13 +18,15 @@ public abstract partial class MLTestBase
     // Helper for operator-level tests
     private static OnnxOpContext MakeOpCtx(Accelerator acc, Tensor[] inputs, Tensor[] outputs,
         Dictionary<string, object>? attrs = null, string[]? inputNames = null,
-        Dictionary<string, float[]>? constants = null) => new OnnxOpContext
+        Dictionary<string, float[]>? constants = null,
+        HashSet<string>? integerTensorNames = null) => new OnnxOpContext
     {
         Inputs = inputs, Outputs = outputs,
         Attributes = attrs ?? new Dictionary<string, object>(),
         Pool = new BufferPool(acc),
         InputNames = inputNames ?? inputs.Select((_, i) => $"input_{i}").ToArray(),
-        ConstantValues = constants
+        ConstantValues = constants,
+        IntegerTensorNames = integerTensorNames,
     };
 
     [TestMethod] public async Task AllOps_Abs() => await RunTest(async a => { var e = GetOrCreateEW(a); using var i = a.Allocate1D(new float[]{-3,-1,0,1,3}); using var o = a.Allocate1D<float>(5); e.Abs(i.View,o.View,5); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{3,1,0,1,3},0f,"Abs:"); });

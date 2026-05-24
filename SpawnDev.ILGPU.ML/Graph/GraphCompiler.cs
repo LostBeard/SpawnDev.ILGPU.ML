@@ -726,6 +726,7 @@ public class GraphCompiler
             InputShapes = graph.Inputs.ToDictionary(i => i.Name, i => i.Shape),
             OutputShapes = graph.Outputs.ToDictionary(o => o.Name, o => knownShapes.TryGetValue(o.Name, out var s) ? s : Array.Empty<int>()),
             InitializerNames = graph.Initializers.Keys.ToHashSet(),
+            InitializerDataTypes = graph.InitializerDataTypes,
         };
       }
       catch (Exception compileEx)
@@ -808,6 +809,11 @@ public class CompiledGraph
     public required Dictionary<string, int[]> InputShapes { get; init; }
     public required Dictionary<string, int[]> OutputShapes { get; init; }
     public required HashSet<string> InitializerNames { get; init; }
+    /// <summary>Maps initializer (and Constant-node output) name to its ONNX-declared
+    /// data type code (see <see cref="Onnx.OnnxDataType"/>). Consumed by GraphExecutor
+    /// to seed integer-tensor dataflow propagation. Null when the source model didn't
+    /// supply dtype information (e.g., TFLite / CoreML paths).</summary>
+    public Dictionary<string, int>? InitializerDataTypes { get; init; }
 }
 
 /// <summary>A single compiled operation.</summary>

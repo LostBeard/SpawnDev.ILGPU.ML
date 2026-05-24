@@ -422,6 +422,19 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
         {
             BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x / y : 0f, BroadcastOp.Div);
         }
+
+        // ONNX spec: Div on integer dtypes truncates toward zero (C-style).
+        // TF's tf.floordiv exports as Cast(int)+Div(int,int); without this trunc step
+        // 887/48 reads as 18.479 instead of 18, breaking downstream (argmax mod 48)
+        // keypoint X-coord decode in MoveNet by a uniform ~0.4 per keypoint.
+        // In-place trunc keeps it to one extra single-binding dispatch (WebGPU-safe)
+        // and only when the dtype actually demands it.
+        if (ctx.AllInputsAreInteger())
+        {
+            int outCount = ctx.Outputs[0].ElementCount;
+            reg.ElementWise.TruncateInPlace(ctx.Outputs[0].Data, outCount);
+            System.Threading.Interlocked.Increment(ref Graph.GraphExecutor.LastRunIntegerDivCount);
+        }
     }
 }
 

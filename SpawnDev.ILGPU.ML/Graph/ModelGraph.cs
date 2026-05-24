@@ -47,6 +47,17 @@ public class ModelGraph
     [JsonIgnore]
     public Dictionary<string, float[]>? FloatConstantData { get; set; }
 
+    /// <summary>
+    /// ONNX-declared data type per initializer / Constant-node output
+    /// (see <see cref="Onnx.OnnxDataType"/> codes). Lets the runtime apply
+    /// integer-vs-float semantic differences (e.g. ONNX Div truncates toward
+    /// zero on integer dtypes but does float division on FP dtypes) even
+    /// though all storage in this pipeline is float32.
+    /// Not serialized — populated at runtime from OnnxModelInfo.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<string, int>? InitializerDataTypes { get; set; }
+
     public static ModelGraph FromJson(string json)
         => JsonSerializer.Deserialize<ModelGraph>(json) ?? throw new InvalidOperationException("Failed to parse model graph JSON");
 

@@ -808,6 +808,12 @@ public class InferenceSession : IDisposable
                 graph.Initializers[initName] = shape;
         }
 
+        // Carry ONNX-declared initializer dtypes forward. The runtime needs these
+        // to honour integer-vs-float Div semantics (TF tf.floordiv exports as
+        // Cast(int)→Div(int,int) and ONNX Div on integer dtypes truncates).
+        if (info.InitializerDataTypes != null && info.InitializerDataTypes.Count > 0)
+            graph.InitializerDataTypes = new Dictionary<string, int>(info.InitializerDataTypes);
+
         // Register Constant node outputs as initializers so their weight data gets uploaded to GPU.
         // OnnxLoader.ExtractWeights() already extracted the tensor data into cpuWeightsAll,
         // but without registering them here, the weight upload loop skips them.

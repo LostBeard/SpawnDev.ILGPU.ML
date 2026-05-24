@@ -161,6 +161,7 @@ public abstract partial class MLTestBase
 
         using var session = await InferenceSession.CreateFromFileAsync(
             accelerator, http, "models/movenet-lightning/model.onnx");
+        Console.WriteLine($"[MoveNet-Ref] session-init int-tensor count = {SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastIntegerTensorCount}");
         using var inputBuf = accelerator.Allocate1D(inputFloats);
         var inputTensor = new Tensor(inputBuf.View, new[] { 1, 192, 192, 3 });
 
@@ -168,6 +169,7 @@ public abstract partial class MLTestBase
         {
             [session.InputNames[0]] = inputTensor
         });
+        Console.WriteLine($"[MoveNet-Ref] run integer-Div count (TruncInPlace fires) = {SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunIntegerDivCount}");
 
         var output = outputs[session.OutputNames[0]];
         int elems = Math.Min(output.ElementCount, expected.Length);
@@ -191,7 +193,24 @@ public abstract partial class MLTestBase
         // slightly different reduction orderings - tolerate up to 0.02 mean diff. If we're
         // bit-exact that's even better, but small drift is acceptable for floating-point
         // associativity differences across reduction orderings on GPU.
-        AssertReferenceMatch(actual, expected, 0.02f, "MoveNet-Lightning vs ORT 1.24.3");
+        try { AssertReferenceMatch(actual, expected, 0.02f, "MoveNet-Lightning vs ORT 1.24.3"); }
+        catch (Exception ex)
+        {
+            // Compact per-keypoint diff so the failure message tells us WHERE the
+            // drift is, not just that it exists. 17 keypoints * 3 values = 51 floats.
+            var perKp = new System.Text.StringBuilder();
+            for (int k = 0; k < 17; k++)
+            {
+                float yA = actual[k * 3 + 0], xA = actual[k * 3 + 1], cA = actual[k * 3 + 2];
+                float yE = expected[k * 3 + 0], xE = expected[k * 3 + 1], cE = expected[k * 3 + 2];
+                perKp.Append($"kp{k}({yA:F3}/{yE:F3},{xA:F3}/{xE:F3},{cA:F3}/{cE:F3}) ");
+            }
+            throw new Exception(
+                $"{ex.Message} || diag: int-tensor-count={SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastIntegerTensorCount}, " +
+                $"int-Div-trunc-fired={SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunIntegerDivCount}, " +
+                $"init-dtypes={SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastInitializerDataTypesCount} || " +
+                $"per-kp (us/ort): {perKp}");
+        }
         Console.WriteLine("[MoveNet-Ref] PASS");
     });
 

@@ -678,6 +678,12 @@ public static class GraphOptimizer
             FloatConstantData = src.FloatConstantData != null
                 ? new Dictionary<string, float[]>(src.FloatConstantData)
                 : null,
+            // Without this copy the GraphExecutor's BuildIntegerTensorNames sees
+            // a null InitializerDataTypes after optimization, which silently breaks
+            // ONNX integer-Div trunc semantics (MoveNet keypoint X-coord regression).
+            InitializerDataTypes = src.InitializerDataTypes != null
+                ? new Dictionary<string, int>(src.InitializerDataTypes)
+                : null,
         };
     }
 }

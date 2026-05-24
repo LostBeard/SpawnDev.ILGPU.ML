@@ -116,6 +116,28 @@ public class GraphExecutor : IDisposable
     /// for fused dequantization during MatMul.</summary>
     private readonly Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? _quantizedWeights;
 
+    /// <summary>Names of tensors whose ONNX-declared dtype is integer
+    /// (INT8/16/32/64, UINT8/16/32/64, BOOL). Built once at session-init by
+    /// walking initializer dtypes + integer-producing op outputs + propagating
+    /// through dtype-preserving / binary ops. See <see cref="BuildIntegerTensorNames"/>.</summary>
+    private readonly HashSet<string> _integerTensorNames;
+
+    /// <summary>Number of integer-typed tensors identified by BuildIntegerTensorNames
+    /// in the most recently constructed GraphExecutor. Diagnostic for verifying that
+    /// dtype propagation is reaching Div / Mul / Mod chains it needs to.</summary>
+    public static int LastIntegerTensorCount;
+    /// <summary>Snapshot of the integer-tensor-name set built by the most recently
+    /// constructed GraphExecutor. Diagnostic; cleared and overwritten per construction.</summary>
+    public static List<string> LastIntegerTensorNames = new();
+    /// <summary>Size of CompiledGraph.InitializerDataTypes at GraphExecutor construction
+    /// time (or -1 if null). Diagnostic to verify dtype plumbing is reaching the executor.</summary>
+    public static int LastInitializerDataTypesCount;
+    /// <summary>Number of Div ops in the most recent RunAsync where all inputs were
+    /// flagged integer and TruncateInPlace was applied. Useful for verifying that the
+    /// MoveNet Cast(int)→Div(int,int) floordiv chain is actually being trunc'd.
+    /// Reset to 0 at the start of every RunAsync.</summary>
+    public static int LastRunIntegerDivCount;
+
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
         Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null,
@@ -129,6 +151,10 @@ public class GraphExecutor : IDisposable
         _quantizedWeights = quantizedWeights;
         _registry = registry;
         _ew = new ElementWiseKernels(accelerator);
+        LastInitializerDataTypesCount = graph.InitializerDataTypes?.Count ?? -1;
+        _integerTensorNames = BuildIntegerTensorNames(graph);
+        LastIntegerTensorCount = _integerTensorNames.Count;
+        LastIntegerTensorNames = _integerTensorNames.ToList();
 
         // Auto-detect KV cache pattern
         var inputShapes = new Dictionary<string, int[]>();
@@ -466,6 +492,7 @@ public class GraphExecutor : IDisposable
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
+                IntegerTensorNames = _integerTensorNames,
             };
             var nodeSw = VerboseLogging ? System.Diagnostics.Stopwatch.StartNew() : null;
             node.Operator.Execute(ctx);
@@ -552,6 +579,7 @@ public class GraphExecutor : IDisposable
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
         LastRunOpLog.Clear();
+        LastRunIntegerDivCount = 0;
         var tensors = new Dictionary<string, Tensor>();
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
@@ -820,6 +848,7 @@ public class GraphExecutor : IDisposable
                 ConstantValues = runtimeConstants,
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
+                IntegerTensorNames = _integerTensorNames,
             };
             // CapturedNodeTimingsMs (opt-in): wall-clock time per Execute + optional sync.
             // Captures via Stopwatch around node.Operator.Execute (and the PerOpSync sync
@@ -1109,6 +1138,209 @@ public class GraphExecutor : IDisposable
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _ew.Dispose();
+    }
+
+    /// <summary>
+    /// Walk the compiled graph to identify every tensor whose ONNX-declared dtype
+    /// is integer (INT8/16/32/64, UINT8/16/32/64, BOOL). Seeds from
+    /// <see cref="CompiledGraph.InitializerDataTypes"/>, then sweeps node outputs:
+    ///   * Cast: output dtype = `to` attribute
+    ///   * ArgMax / ArgMin / Shape / Size / NonZero: outputs are always integer
+    ///   * TopK: second output (indices) is integer
+    ///   * Dtype-preserving ops (Reshape, Squeeze, Unsqueeze, Transpose, Concat,
+    ///     Slice, Gather, GatherND, GatherElements, Identity, Tile, Expand, Pad,
+    ///     Flatten, Where, Compress, ScatterND, ScatterElements): output dtype =
+    ///     input[0] dtype
+    ///   * Binary arithmetic (Add, Sub, Mul, Div, Pow, Mod, Min, Max, BitwiseAnd/Or/Xor):
+    ///     output is integer iff all numeric inputs are integer
+    /// Iterates to fixed point so propagation closes through chains. The result
+    /// drives <see cref="OnnxOpContext.AllInputsAreInteger"/> at execute time,
+    /// which DivOperator uses to apply ONNX-spec truncation toward zero.
+    /// </summary>
+    private static HashSet<string> BuildIntegerTensorNames(CompiledGraph graph)
+    {
+        var intNames = new HashSet<string>();
+
+        static bool IsIntDataType(int dt) => dt switch
+        {
+            // OnnxDataType codes
+            2 or 3 or 4 or 5 or 6 or 7 or 9 or 12 or 13 => true, // UINT8/INT8/UINT16/INT16/INT32/INT64/BOOL/UINT32/UINT64
+            _ => false,
+        };
+
+        // Seed from initializer / Constant-node dtypes
+        if (graph.InitializerDataTypes != null)
+        {
+            foreach (var (name, dt) in graph.InitializerDataTypes)
+            {
+                if (IsIntDataType(dt))
+                    intNames.Add(name);
+            }
+        }
+
+        // Sweep nodes to fixed point. Most propagation closes in a single pass
+        // because topological order is preserved in CompiledGraph.Nodes; the
+        // outer loop guards against pathological graphs where Cast/ArgMax output
+        // feeds back into a propagator earlier in the array.
+        bool changed = true;
+        int guardIterations = 0;
+        while (changed && guardIterations < 8)
+        {
+            changed = false;
+            guardIterations++;
+
+            foreach (var node in graph.Nodes)
+            {
+                int beforeCount = intNames.Count;
+
+                switch (node.OpType)
+                {
+                    case "Cast":
+                    {
+                        // 'to' attribute is the target ONNX dtype code (long from JSON parse).
+                        long to = 0;
+                        if (node.Attributes.TryGetValue("to", out var toObj))
+                        {
+                            try { to = Convert.ToInt64(toObj); } catch { to = 0; }
+                        }
+                        bool toIsInt = IsIntDataType((int)to);
+                        foreach (var outName in node.OutputNames)
+                        {
+                            if (string.IsNullOrEmpty(outName)) continue;
+                            if (toIsInt) intNames.Add(outName);
+                            // else: explicitly NOT integer — do not add (Cast to float kills int chain)
+                        }
+                        break;
+                    }
+                    case "ArgMax":
+                    case "ArgMin":
+                    case "Shape":
+                    case "Size":
+                    case "NonZero":
+                        foreach (var outName in node.OutputNames)
+                            if (!string.IsNullOrEmpty(outName))
+                                intNames.Add(outName);
+                        break;
+                    case "TopK":
+                        // Output 0 is values (same dtype as input[0]); output 1 is indices (int).
+                        if (node.OutputNames.Length > 1 && !string.IsNullOrEmpty(node.OutputNames[1]))
+                            intNames.Add(node.OutputNames[1]);
+                        if (node.InputNames.Length > 0 && intNames.Contains(node.InputNames[0])
+                            && node.OutputNames.Length > 0 && !string.IsNullOrEmpty(node.OutputNames[0]))
+                            intNames.Add(node.OutputNames[0]);
+                        break;
+                    case "Equal":
+                    case "Greater":
+                    case "GreaterOrEqual":
+                    case "Less":
+                    case "LessOrEqual":
+                    case "Not":
+                    case "And":
+                    case "Or":
+                    case "Xor":
+                    case "IsInf":
+                    case "IsNaN":
+                        // Boolean-producing ops
+                        foreach (var outName in node.OutputNames)
+                            if (!string.IsNullOrEmpty(outName))
+                                intNames.Add(outName);
+                        break;
+                    case "Reshape":
+                    case "Squeeze":
+                    case "Unsqueeze":
+                    case "Transpose":
+                    case "Identity":
+                    case "Tile":
+                    case "Expand":
+                    case "Pad":
+                    case "Flatten":
+                    case "Slice":
+                    case "Gather":
+                    case "GatherND":
+                    case "GatherElements":
+                    case "Compress":
+                    case "ScatterND":
+                    case "ScatterElements":
+                    case "DepthToSpace":
+                    case "SpaceToDepth":
+                    case "ReverseSequence":
+                    case "Concat":
+                    case "Split":
+                    case "Where":
+                    {
+                        // Output dtype = data-input dtype. For Where the data inputs are 1,2.
+                        int dataInputIdx = node.OpType == "Where" ? 1 : 0;
+                        if (node.OpType == "Concat" || node.OpType == "Split")
+                            dataInputIdx = 0; // all inputs share dtype for Concat; output 0..N for Split
+                        if (node.InputNames.Length > dataInputIdx
+                            && !string.IsNullOrEmpty(node.InputNames[dataInputIdx])
+                            && intNames.Contains(node.InputNames[dataInputIdx]))
+                        {
+                            foreach (var outName in node.OutputNames)
+                                if (!string.IsNullOrEmpty(outName))
+                                    intNames.Add(outName);
+                        }
+                        break;
+                    }
+                    case "Add":
+                    case "Sub":
+                    case "Mul":
+                    case "Div":
+                    case "Mod":
+                    case "Pow":
+                    case "Min":
+                    case "Max":
+                    case "BitwiseAnd":
+                    case "BitwiseOr":
+                    case "BitwiseXor":
+                    case "BitShift":
+                    {
+                        // Output is integer iff all numeric inputs (skip optional empty names)
+                        // are integer-typed.
+                        bool allInt = true;
+                        bool sawAny = false;
+                        for (int i = 0; i < node.InputNames.Length; i++)
+                        {
+                            var nm = node.InputNames[i];
+                            if (string.IsNullOrEmpty(nm)) continue;
+                            sawAny = true;
+                            if (!intNames.Contains(nm)) { allInt = false; break; }
+                        }
+                        if (sawAny && allInt)
+                        {
+                            foreach (var outName in node.OutputNames)
+                                if (!string.IsNullOrEmpty(outName))
+                                    intNames.Add(outName);
+                        }
+                        break;
+                    }
+                    case "Neg":
+                    case "Abs":
+                    case "Sign":
+                    case "BitwiseNot":
+                    {
+                        // Unary dtype-preserving
+                        if (node.InputNames.Length > 0
+                            && !string.IsNullOrEmpty(node.InputNames[0])
+                            && intNames.Contains(node.InputNames[0]))
+                        {
+                            foreach (var outName in node.OutputNames)
+                                if (!string.IsNullOrEmpty(outName))
+                                    intNames.Add(outName);
+                        }
+                        break;
+                    }
+                    // All other ops (Conv, MatMul, Gemm, BatchNorm, LayerNorm, Softmax,
+                    // Sigmoid, Tanh, Relu, Gelu, Exp, Log, Sin, Cos, Sqrt, ...) produce
+                    // float output regardless of input dtype - no entry here means they
+                    // do not add to intNames, which is correct.
+                }
+
+                if (intNames.Count != beforeCount) changed = true;
+            }
+        }
+
+        return intNames;
     }
 
     /// <summary>

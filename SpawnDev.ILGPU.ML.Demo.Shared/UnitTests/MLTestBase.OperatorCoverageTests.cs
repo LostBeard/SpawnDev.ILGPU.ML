@@ -2272,6 +2272,74 @@ public abstract partial class MLTestBase
             "Clip(min=0,max=6) opset 11+: ");
     });
 
+    /// <summary>
+    /// ONNX Div on integer dtypes truncates toward zero (C-style). TF's
+    /// <c>tf.floordiv</c> exports as <c>Cast(to=INT32) → Div(int,int)</c>; if our
+    /// DivOperator ignores the integer-dtype flag we get <c>887/48 = 18.479</c>
+    /// instead of <c>18</c>, which breaks the downstream <c>argmax mod 48</c>
+    /// keypoint X-coord decode in MoveNet by a uniform ~0.4 per keypoint.
+    /// This test drives the Div op with all inputs flagged integer and asserts
+    /// trunc-toward-zero semantics (positive: 887/48=18, 100/48=2; negative
+    /// dividend: -7/48=0; negative divisor: 100/-48=-2 trunc, NOT -3 floor).
+    /// </summary>
+    [TestMethod]
+    public async Task Op_Div_IntegerInputs_FloorDivides() => await RunTest(async accelerator =>
+    {
+        // Pair of vectors (same shape) so DivOperator takes the elementwise path.
+        var a = new float[] { 887f, 100f, -7f, 100f };
+        var b = new float[] { 48f, 48f, 48f, -48f };
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = MakeOpCtx(accelerator,
+            new[] {
+                new Tensor(aBuf.View, new[] { 4 }),
+                new Tensor(bBuf.View, new[] { 4 }),
+            },
+            new[] { new Tensor(outBuf.View, new[] { 4 }) },
+            inputNames: new[] { "intA", "intB" },
+            integerTensorNames: new HashSet<string> { "intA", "intB" });
+        reg.Resolve("Div")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        // ONNX integer Div = trunc toward zero (NOT Python floordiv toward -inf):
+        //   887 /  48 =  18  (positive: trunc == floor)
+        //   100 /  48 =   2
+        //    -7 /  48 =   0  (trunc(-0.146) = 0, floor would give -1)
+        //   100 / -48 =  -2  (trunc(-2.083) = -2, floor would give -3)
+        await AssertCloseGpu(accelerator, outBuf.View,
+            new float[] { 18f, 2f, 0f, -2f }, 0f, "Div(int,int) trunc toward zero: ");
+    });
+
+    /// <summary>
+    /// Sanity guard: float-dtype Div must NOT silently truncate. Without the
+    /// integer-flag check we'd regress every float division (Softmax, LayerNorm,
+    /// pre-softmax scaling, etc.). Same dividends/divisors as the int test above
+    /// but no <c>integerTensorNames</c> set, so the trunc step must NOT run.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_Div_FloatInputs_NoTruncation() => await RunTest(async accelerator =>
+    {
+        var a = new float[] { 887f, 100f, -7f, 100f };
+        var b = new float[] { 48f, 48f, 48f, -48f };
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = MakeOpCtx(accelerator,
+            new[] {
+                new Tensor(aBuf.View, new[] { 4 }),
+                new Tensor(bBuf.View, new[] { 4 }),
+            },
+            new[] { new Tensor(outBuf.View, new[] { 4 }) },
+            inputNames: new[] { "floatA", "floatB" });
+        reg.Resolve("Div")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View,
+            new float[] { 887f / 48f, 100f / 48f, -7f / 48f, 100f / -48f },
+            1e-4f, "Div(float,float) no trunc: ");
+    });
+
     [TestMethod]
     public async Task Op_GatherND_MatchesCpu() => await RunTest(async accelerator =>
     {
