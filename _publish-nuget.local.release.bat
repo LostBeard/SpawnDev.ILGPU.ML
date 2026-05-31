@@ -1,9 +1,8 @@
 @echo off
 @REM Publish SpawnDev.ILGPU.ML to the LOCAL SpawnDevPackages feed.
 @REM Finds the most recent Release-build .nupkg under the library project's bin\Release,
-@REM registers it with `nuget add` (per-package subdirectory layout), AND drops a flat
-@REM top-level copy. Some consumers scan the flat layout directly; without the top-level
-@REM copy they will pin to a stale rc.
+@REM registers it with `nuget add` (per-package / per-version hierarchy only).
+@REM Do NOT copy .nupkg to the feed root and do NOT use `dotnet nuget push` against this feed.
 set projectPath=%~dp0SpawnDev.ILGPU.ML
 set releaseFolder=%projectPath%\bin\Release
 set feedRoot=D:\users\SpawnDevPackages
@@ -20,5 +19,4 @@ ECHO Latest *.nupkg file is:
 ECHO %NewestFile%
 
 nuget add "%releaseFolder%\%NewestFile%" -source "%feedRoot%"
-@REM Top-level flat copy for consumers that don't walk the per-package subdir layout.
-copy /Y "%releaseFolder%\%NewestFile%" "%feedRoot%\%NewestFile%"
+pause

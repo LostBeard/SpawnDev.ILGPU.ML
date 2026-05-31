@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using ILGPU;
 using ILGPU.Runtime;
 
@@ -100,26 +101,34 @@ public readonly struct TensorView<T> where T : unmanaged
     // host code if rank-safety matters; kernels prioritize zero-overhead access.
 
     /// <summary>1D access. Equivalent to <c>Data[i]</c>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T Get1D(int i) => Data[i];
 
     /// <summary>2D access in row-major <c>[D0, D1]</c> layout.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T Get2D(int i0, int i1) => Data[i0 * D1 + i1];
 
     /// <summary>3D access in row-major <c>[D0, D1, D2]</c> layout.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T Get3D(int i0, int i1, int i2) => Data[(i0 * D1 + i1) * D2 + i2];
 
     /// <summary>4D access in row-major <c>[D0, D1, D2, D3]</c> layout (e.g., NCHW).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T Get4D(int i0, int i1, int i2, int i3) => Data[((i0 * D1 + i1) * D2 + i2) * D3 + i3];
 
     /// <summary>1D write. Equivalent to <c>Data[i] = v</c>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Set1D(int i, T v) => Data[i] = v;
 
     /// <summary>2D write in row-major <c>[D0, D1]</c> layout.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Set2D(int i0, int i1, T v) => Data[i0 * D1 + i1] = v;
 
     /// <summary>3D write in row-major <c>[D0, D1, D2]</c> layout.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Set3D(int i0, int i1, int i2, T v) => Data[(i0 * D1 + i1) * D2 + i2] = v;
 
     /// <summary>4D write in row-major <c>[D0, D1, D2, D3]</c> layout.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Set4D(int i0, int i1, int i2, int i3, T v) => Data[((i0 * D1 + i1) * D2 + i2) * D3 + i3] = v;
 }

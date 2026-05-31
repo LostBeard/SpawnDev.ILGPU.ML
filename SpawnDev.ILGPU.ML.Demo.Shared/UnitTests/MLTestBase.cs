@@ -69,9 +69,10 @@ public abstract partial class MLTestBase : IDisposable
         }
         finally
         {
-            // Flush GPU work and help GC reclaim disposed buffer objects
-            // to prevent memory accumulation across test suite
+            // Flush GPU work, then drop the cached accelerator so a prior browser row
+            // (WebGPU) cannot leave device state that breaks the next backend (Wasm/WebGL).
             try { await accelerator.SynchronizeAsync(); } catch { }
+            InvalidateCache();
             GC.Collect();
             GC.WaitForPendingFinalizers();
         }

@@ -353,22 +353,25 @@ public abstract partial class MLTestBase
         var hostHalf = new global::ILGPU.Half[Count];
         for (int i = 0; i < Count; i++) hostHalf[i] = (global::ILGPU.Half)(i * 0.25f);
 
-        using var inOwned = OwnedTensor<global::ILGPU.Half>.FromHost(accelerator, hostHalf, new[] { Rows, Cols });
-        using var outOwned = OwnedTensor<global::ILGPU.Half>.Allocate(accelerator, new[] { Rows, Cols });
+        using var inBuf = accelerator.Allocate1D(hostHalf);
+        using var outBuf = accelerator.Allocate1D<global::ILGPU.Half>(Count);
+
+        var inView = new TensorView<global::ILGPU.Half>(inBuf.View, Rows, Cols, 1, 1, 2);
+        var outView = new TensorView<global::ILGPU.Half>(outBuf.View, Rows, Cols, 1, 1, 2);
 
         // Kernel: out[i,j] = in[i,j] + (Half)1.5 — exercises both Get2D / Set2D on Half.
         var kernel = accelerator.LoadAutoGroupedStreamKernel<Index1D, TensorView<global::ILGPU.Half>, TensorView<global::ILGPU.Half>>(
             (Index1D idx, TensorView<global::ILGPU.Half> inp, TensorView<global::ILGPU.Half> outp) =>
             {
-                int c = idx % inp.D1;
-                int r = idx / inp.D1;
-                var v = inp.Get2D(r, c);
-                outp.Set2D(r, c, v + (global::ILGPU.Half)1.5f);
+                int c = (int)idx % inp.D1;
+                int r = (int)idx / inp.D1;
+                var v = inp.Data[r * inp.D1 + c];
+                outp.Data[r * outp.D1 + c] = v + (global::ILGPU.Half)1.5f;
             });
-        kernel(Count, inOwned, outOwned);
+        kernel((Index1D)Count, inView, outView);
         await accelerator.SynchronizeAsync();
 
-        var result = await outOwned.ToHostAsync();
+        var result = await outBuf.CopyToHostAsync<global::ILGPU.Half>(0, Count);
         for (int i = 0; i < Count; i++)
         {
             float expected = (float)hostHalf[i] + 1.5f;
