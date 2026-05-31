@@ -1468,7 +1468,7 @@ public class InferenceSession : IDisposable
         {
             var src = kv.Value;
             var buf = _accelerator.Allocate1D<float>(src.ElementCount);
-            buf.View.CopyFrom(src.Data);
+            await buf.View.CopyFromAsync(src.Data);
             owned[kv.Key] = new Tensors.OwnedTensor<float>(buf, src.Shape, kv.Key);
         }
         await _accelerator.SynchronizeAsync();

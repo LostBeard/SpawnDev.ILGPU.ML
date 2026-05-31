@@ -24,6 +24,23 @@ public interface IOnnxOperator
     /// Inputs and outputs are pre-allocated by the graph executor.
     /// </summary>
     void Execute(OnnxOpContext ctx);
+
+    /// <summary>
+    /// Async execution path used by <c>GraphExecutor.RunAsync</c>. The default simply runs the
+    /// synchronous <see cref="Execute"/> — correct for the vast majority of operators, which
+    /// only dispatch GPU kernels (queuing work, never reading it back). Operators that need a
+    /// runtime GPU-&gt;CPU readback mid-execution (control flow such as Loop/If/Scan reading a
+    /// condition, or Einsum reading dynamic inputs) MUST override this to <c>await</c> the
+    /// browser-safe async readback (<c>CopyToHostAsync</c> / <c>SynchronizeAsync</c>) instead
+    /// of the synchronous <c>CopyToCPU</c>, which throws on WebGPU/WebGL/Wasm. This is what
+    /// gives those operators feature parity on the browser backends.
+    /// </summary>
+    /// <param name="ctx">The execution context.</param>
+    Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        Execute(ctx);
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>

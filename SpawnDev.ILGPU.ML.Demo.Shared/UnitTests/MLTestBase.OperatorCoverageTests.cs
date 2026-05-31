@@ -1491,6 +1491,133 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Op_Einsum_GeneralContraction_Async() => await RunTest(async accelerator =>
+    {
+        // Outer product "i,j->ij": NOT a fast path (not broadcast-mul, not single-contraction
+        // matmul) -> hits EinsumOperator's general CPU contraction, which must read the inputs
+        // back from the GPU. Inputs are DYNAMIC (deliberately NOT in ConstantValues) so the read
+        // goes through ExecuteAsync's CopyToHostAsync path. The sync Execute would throw on
+        // WebGPU/WebGL/Wasm and fall back to zeros; ExecuteAsync must produce the real result.
+        var a = new float[] { 1, 2, 3 };   // [3]
+        var b = new float[] { 10, 20 };    // [2]
+        var expected = new float[] { 10, 20, 20, 40, 30, 60 }; // [3,2] outer product
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var outBuf = accelerator.Allocate1D<float>(6);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(aBuf.View, new[] { 3 }), new Tensor(bBuf.View, new[] { 2 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 3, 2 }) },
+            Attributes = new Dictionary<string, object> { ["equation"] = "i,j->ij" },
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "A", "B" }
+            // NOTE: no ConstantValues -> inputs are dynamic -> async GPU readback is exercised.
+        };
+        await reg.Resolve("Einsum")!.ExecuteAsync(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-3f, "Einsum general (async dynamic readback): ");
+    });
+
+    [TestMethod]
+    public async Task Op_If_Async_RunsBranchSubgraph() => await RunTest(async accelerator =>
+    {
+        // If(cond=true) runs then_branch (Y = Relu(X)). Exercises IfOperator.ExecuteAsync ->
+        // SubgraphRunner.ExecuteAsync -> GraphExecutor.RunAsync — the browser-safe async subgraph
+        // path that Loop/Scan also use. else_branch (Neg) must NOT run.
+        var x = new float[] { -1f, 2f, -3f, 4f };
+        var expected = new float[] { 0f, 2f, 0f, 4f }; // Relu(X)
+        using var xBuf = accelerator.Allocate1D(x);
+        using var condBuf = accelerator.Allocate1D(new[] { 1f });
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+
+        static Onnx.OnnxGraphProto Branch(string op) => new()
+        {
+            Name = op + "_branch",
+            Inputs = { new Onnx.OnnxValueInfoProto { Name = "X", Shape = { new Onnx.OnnxDimension { DimValue = 4 } } } },
+            Outputs = { new Onnx.OnnxValueInfoProto { Name = "Y", Shape = { new Onnx.OnnxDimension { DimValue = 4 } } } },
+            Nodes = { new Onnx.OnnxNodeProto { OpType = op, Inputs = { "X" }, Outputs = { "Y" } } },
+        };
+
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(condBuf.View, new[] { 1 }), new Tensor(xBuf.View, new[] { 4 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 4 }) },
+            Attributes = new Dictionary<string, object>
+            {
+                ["then_branch"] = Branch("Relu"),
+                ["else_branch"] = Branch("Neg"),
+            },
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "cond", "X" },
+            ConstantValues = new Dictionary<string, float[]> { ["cond"] = new[] { 1f } },
+            Registry = reg,
+        };
+        await reg.Resolve("If")!.ExecuteAsync(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "If(then=Relu) async subgraph: ");
+    });
+
+    [TestMethod]
+    public async Task Op_Loop_Async_CountsWithGpuCondition() => await RunTest(async accelerator =>
+    {
+        // Loop with a body that increments a carried accumulator and re-emits a true condition.
+        // Exercises LoopOperator.ExecuteAsync: per-iteration GPU->CPU condition readback via the
+        // async CopyToHostAsync (the sync Execute uses CopyToCPU+Synchronize, which throws on
+        // browser backends), plus the async body subgraph. 3 trips over acc=[0,0,0,0] -> [3,3,3,3].
+        var accInit = new float[] { 0f, 0f, 0f, 0f };
+        var expected = new float[] { 3f, 3f, 3f, 3f };
+        using var tripBuf = accelerator.Allocate1D(new[] { 3f });
+        using var condBuf = accelerator.Allocate1D(new[] { 1f });
+        using var accBuf = accelerator.Allocate1D(accInit);
+        using var outBuf = accelerator.Allocate1D<float>(4);
+        var reg = new OperatorRegistry(accelerator);
+
+        // Body: inputs [iter, cond_in, acc] -> outputs [cond_out = Relu(cond_in), acc_out = acc + 1]
+        var body = new Onnx.OnnxGraphProto
+        {
+            Name = "loop_body",
+            Inputs =
+            {
+                new Onnx.OnnxValueInfoProto { Name = "iter", Shape = { new Onnx.OnnxDimension { DimValue = 1 } } },
+                new Onnx.OnnxValueInfoProto { Name = "cond_in", Shape = { new Onnx.OnnxDimension { DimValue = 1 } } },
+                new Onnx.OnnxValueInfoProto { Name = "acc", Shape = { new Onnx.OnnxDimension { DimValue = 4 } } },
+            },
+            Outputs =
+            {
+                new Onnx.OnnxValueInfoProto { Name = "cond_out", Shape = { new Onnx.OnnxDimension { DimValue = 1 } } },
+                new Onnx.OnnxValueInfoProto { Name = "acc_out", Shape = { new Onnx.OnnxDimension { DimValue = 4 } } },
+            },
+            Initializers = { new Onnx.OnnxTensorProto { Name = "one", Dims = new[] { 4L }, FloatData = new[] { 1f, 1f, 1f, 1f } } },
+            Nodes =
+            {
+                new Onnx.OnnxNodeProto { OpType = "Relu", Inputs = { "cond_in" }, Outputs = { "cond_out" } },
+                new Onnx.OnnxNodeProto { OpType = "Add", Inputs = { "acc", "one" }, Outputs = { "acc_out" } },
+            },
+        };
+
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(tripBuf.View, new[] { 1 }),
+                new Tensor(condBuf.View, new[] { 1 }),
+                new Tensor(accBuf.View, new[] { 4 }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 4 }) },
+            Attributes = new Dictionary<string, object> { ["body"] = body },
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "trip", "cond", "acc_init" },
+            ConstantValues = new Dictionary<string, float[]> { ["trip"] = new[] { 3f }, ["cond"] = new[] { 1f } },
+            Registry = reg,
+        };
+        await reg.Resolve("Loop")!.ExecuteAsync(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "Loop async (GPU condition readback): ");
+    });
+
+    [TestMethod]
     public async Task Op_GlobalLpPool_L2() => await RunTest(async accelerator =>
     {
         // [1, 1, 4] → GlobalLpPool p=2 → sqrt(sum(x^2)/N) per channel

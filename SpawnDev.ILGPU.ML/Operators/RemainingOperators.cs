@@ -899,6 +899,34 @@ internal static class SubgraphRunner
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs)
     {
+        var executor = BuildExecutor(ctx, subgraph, subgraphInputs);
+        return executor?.Run(subgraphInputs);
+    }
+
+    /// <summary>
+    /// Browser-safe async subgraph execution (used by the control-flow operators' ExecuteAsync).
+    /// Identical compile/weight setup as <see cref="Execute"/> but drives the subgraph through
+    /// <c>GraphExecutor.RunAsync</c>, so any GPU-&gt;CPU readback inside the subgraph (or in the
+    /// operators it contains) uses the async path that works on WebGPU/WebGL/Wasm.
+    /// </summary>
+    public static async Task<Dictionary<string, Tensor>?> ExecuteAsync(
+        OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
+        Dictionary<string, Tensor> subgraphInputs)
+    {
+        var executor = BuildExecutor(ctx, subgraph, subgraphInputs);
+        if (executor == null) return null;
+        return await executor.RunAsync(subgraphInputs);
+    }
+
+    /// <summary>
+    /// Shared subgraph setup: converts the OnnxGraphProto to ModelGraph IR, compiles it, builds
+    /// the weight map (subgraph initializers + outer-scope tensors), and returns a ready
+    /// GraphExecutor. Returns null when there is no registry. Pure setup — no execution.
+    /// </summary>
+    private static Graph.GraphExecutor? BuildExecutor(
+        OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
+        Dictionary<string, Tensor> subgraphInputs)
+    {
         if (ctx.Registry == null) return null;
 
         // Convert OnnxGraphProto to ModelGraph IR
@@ -928,12 +956,9 @@ internal static class SubgraphRunner
                 weights[name] = tensor;
         }
 
-        // Execute
-        var executor = new Graph.GraphExecutor(
+        return new Graph.GraphExecutor(
             ctx.Registry.Accelerator, compiled, weights,
             ctx.ConstantValues, registry: ctx.Registry);
-        var result = executor.Run(subgraphInputs);
-        return result;
     }
 
     private static Graph.ModelGraph ConvertToModelGraph(Onnx.OnnxGraphProto onnxGraph)
@@ -1052,6 +1077,49 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
             if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f);
         }
     }
+
+    /// <summary>Browser-safe async If: runs the selected branch subgraph through the async
+    /// subgraph runner (the condition is read from pre-read constants, no GPU readback here).</summary>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        bool condition = false;
+        var condVals = ctx.TryGetInputValues(0);
+        if (condVals != null && condVals.Length > 0)
+            condition = condVals[0] != 0f;
+
+        string branchKey = condition ? "then_branch" : "else_branch";
+        if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
+        {
+            var subInputs = new Dictionary<string, Tensor>();
+            for (int i = 0; i < ctx.InputNames.Length; i++)
+            {
+                if (!string.IsNullOrEmpty(ctx.InputNames[i]) && i < ctx.Inputs.Length)
+                    subInputs[ctx.InputNames[i]] = ctx.Inputs[i];
+            }
+
+            var result = await SubgraphRunner.ExecuteAsync(ctx, subgraph, subInputs);
+            if (result != null)
+            {
+                int outIdx = 0;
+                foreach (var (name, tensor) in result)
+                {
+                    if (outIdx < ctx.Outputs.Length)
+                    {
+                        int c = Math.Min(tensor.ElementCount, ctx.Outputs[outIdx].ElementCount);
+                        if (c > 0) reg.ElementWise.Scale(tensor.Data.SubView(0, c), ctx.Outputs[outIdx].Data.SubView(0, c), c, 1f);
+                        outIdx++;
+                    }
+                }
+                return;
+            }
+        }
+
+        if (ctx.Inputs.Length > 0 && ctx.Outputs.Length > 0)
+        {
+            int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+            if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f);
+        }
+    }
 }
 
 public class LoopOperator(OperatorRegistry reg) : IOnnxOperator
@@ -1155,6 +1223,92 @@ public class LoopOperator(OperatorRegistry reg) : IOnnxOperator
             if (c > 0) reg.ElementWise.Scale(ctx.Inputs[2].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f);
         }
     }
+
+    /// <summary>Browser-safe async Loop: runs the body via the async subgraph runner and reads the
+    /// per-iteration loop condition back with the async <c>CopyToHostAsync</c> (the sync Execute
+    /// uses <c>CopyToCPU</c>+<c>Synchronize</c>, which throws on WebGPU/WebGL/Wasm).</summary>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        int maxTrips = 100;
+        var tripVals = ctx.TryGetInputValues(0);
+        if (tripVals != null && tripVals.Length > 0 && tripVals[0] > 0)
+            maxTrips = Math.Min((int)tripVals[0], 10000);
+
+        bool keepGoing = true;
+        var condVals = ctx.TryGetInputValues(1);
+        if (condVals != null && condVals.Length > 0)
+            keepGoing = condVals[0] != 0f;
+
+        if (ctx.Attributes.TryGetValue("body", out var bodyObj) && bodyObj is Onnx.OnnxGraphProto bodyGraph)
+        {
+            int numCarried = ctx.Inputs.Length - 2;
+            var carriedState = new Tensor[numCarried];
+            for (int i = 0; i < numCarried && i + 2 < ctx.Inputs.Length; i++)
+                carriedState[i] = ctx.Inputs[i + 2];
+
+            for (int iter = 0; iter < maxTrips && keepGoing; iter++)
+            {
+                var subInputs = new Dictionary<string, Tensor>();
+                var bodyInputNames = bodyGraph.Inputs.Select(i => i.Name).ToList();
+
+                if (bodyInputNames.Count > 0)
+                {
+                    var iterTensor = ctx.Pool.Rent(new[] { 1 }, "_loop_iter");
+                    iterTensor.Data.SubView(0, 1).CopyFromCPU(new[] { (float)iter });
+                    subInputs[bodyInputNames[0]] = iterTensor;
+                }
+
+                if (bodyInputNames.Count > 1)
+                {
+                    var condTensor = ctx.Pool.Rent(new[] { 1 }, "_loop_cond");
+                    condTensor.Data.SubView(0, 1).CopyFromCPU(new[] { keepGoing ? 1f : 0f });
+                    subInputs[bodyInputNames[1]] = condTensor;
+                }
+
+                for (int i = 0; i < numCarried && i + 2 < bodyInputNames.Count; i++)
+                    subInputs[bodyInputNames[i + 2]] = carriedState[i];
+
+                for (int i = 0; i < ctx.InputNames.Length; i++)
+                {
+                    if (!string.IsNullOrEmpty(ctx.InputNames[i]) && i < ctx.Inputs.Length && !subInputs.ContainsKey(ctx.InputNames[i]))
+                        subInputs[ctx.InputNames[i]] = ctx.Inputs[i];
+                }
+
+                var result = await SubgraphRunner.ExecuteAsync(ctx, bodyGraph, subInputs);
+                if (result == null) break;
+
+                var bodyOutputNames = bodyGraph.Outputs.Select(o => o.Name).ToList();
+
+                // Output 0: updated condition — async GPU->CPU readback (browser-safe).
+                if (bodyOutputNames.Count > 0 && result.TryGetValue(bodyOutputNames[0], out var newCond))
+                {
+                    using var condBuf = reg.Accelerator.Allocate1D<float>(1);
+                    condBuf.View.SubView(0, 1).CopyFrom(newCond.Data.SubView(0, 1));
+                    var cv = await condBuf.CopyToHostAsync<float>(0, 1);
+                    keepGoing = cv[0] != 0f;
+                }
+
+                for (int i = 0; i < numCarried && i + 1 < bodyOutputNames.Count; i++)
+                {
+                    if (result.TryGetValue(bodyOutputNames[i + 1], out var newState))
+                        carriedState[i] = newState;
+                }
+            }
+
+            for (int i = 0; i < numCarried && i < ctx.Outputs.Length; i++)
+            {
+                int c = Math.Min(carriedState[i].ElementCount, ctx.Outputs[i].ElementCount);
+                if (c > 0) reg.ElementWise.Scale(carriedState[i].Data.SubView(0, c), ctx.Outputs[i].Data.SubView(0, c), c, 1f);
+            }
+            return;
+        }
+
+        if (ctx.Inputs.Length > 2 && ctx.Outputs.Length > 0)
+        {
+            int c = Math.Min(ctx.Inputs[2].ElementCount, ctx.Outputs[0].ElementCount);
+            if (c > 0) reg.ElementWise.Scale(ctx.Inputs[2].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f);
+        }
+    }
 }
 
 public class ScanOperator(OperatorRegistry reg) : IOnnxOperator
@@ -1242,6 +1396,83 @@ public class ScanOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         // Fallback: pass through input
+        if (ctx.Inputs.Length > 0 && ctx.Outputs.Length > 0)
+        {
+            int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
+            if (c > 0) reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, c), ctx.Outputs[0].Data.SubView(0, c), c, 1f);
+        }
+    }
+
+    /// <summary>Browser-safe async Scan: identical sequential scan but runs the body subgraph via
+    /// the async subgraph runner (so any GPU-&gt;CPU readback inside the body uses the async path).</summary>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        int numScanInputs = ctx.GetInt("num_scan_inputs", 1);
+
+        if (ctx.Attributes.TryGetValue("body", out var bodyObj) && bodyObj is Onnx.OnnxGraphProto bodyGraph)
+        {
+            int numStateInputs = ctx.Inputs.Length - numScanInputs;
+            if (numStateInputs < 0) numStateInputs = 0;
+
+            var state = new Tensor[numStateInputs];
+            for (int i = 0; i < numStateInputs; i++)
+                state[i] = ctx.Inputs[i];
+
+            int seqLen = 1;
+            if (numScanInputs > 0 && numStateInputs < ctx.Inputs.Length)
+            {
+                var scanInput = ctx.Inputs[numStateInputs];
+                seqLen = scanInput.Shape[0];
+            }
+
+            var bodyInputNames = bodyGraph.Inputs.Select(i => i.Name).ToList();
+            var bodyOutputNames = bodyGraph.Outputs.Select(o => o.Name).ToList();
+
+            for (int step = 0; step < seqLen; step++)
+            {
+                var subInputs = new Dictionary<string, Tensor>();
+
+                for (int i = 0; i < numStateInputs && i < bodyInputNames.Count; i++)
+                    subInputs[bodyInputNames[i]] = state[i];
+
+                for (int si = 0; si < numScanInputs; si++)
+                {
+                    int inputIdx = numStateInputs + si;
+                    int bodyIdx = numStateInputs + si;
+                    if (inputIdx < ctx.Inputs.Length && bodyIdx < bodyInputNames.Count)
+                    {
+                        var fullInput = ctx.Inputs[inputIdx];
+                        int sliceSize = fullInput.ElementCount / seqLen;
+                        var slice = ctx.Pool.Rent(fullInput.Shape[1..], "_scan_slice");
+                        reg.ElementWise.Scale(fullInput.Data.SubView(step * sliceSize, sliceSize), slice.Data.SubView(0, sliceSize), sliceSize, 1f);
+                        subInputs[bodyInputNames[bodyIdx]] = slice;
+                    }
+                }
+
+                for (int i = 0; i < ctx.InputNames.Length; i++)
+                {
+                    if (!string.IsNullOrEmpty(ctx.InputNames[i]) && i < ctx.Inputs.Length && !subInputs.ContainsKey(ctx.InputNames[i]))
+                        subInputs[ctx.InputNames[i]] = ctx.Inputs[i];
+                }
+
+                var result = await SubgraphRunner.ExecuteAsync(ctx, bodyGraph, subInputs);
+                if (result == null) break;
+
+                for (int i = 0; i < numStateInputs && i < bodyOutputNames.Count; i++)
+                {
+                    if (result.TryGetValue(bodyOutputNames[i], out var newState))
+                        state[i] = newState;
+                }
+            }
+
+            for (int i = 0; i < numStateInputs && i < ctx.Outputs.Length; i++)
+            {
+                int c = Math.Min(state[i].ElementCount, ctx.Outputs[i].ElementCount);
+                if (c > 0) reg.ElementWise.Scale(state[i].Data.SubView(0, c), ctx.Outputs[i].Data.SubView(0, c), c, 1f);
+            }
+            return;
+        }
+
         if (ctx.Inputs.Length > 0 && ctx.Outputs.Length > 0)
         {
             int c = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);

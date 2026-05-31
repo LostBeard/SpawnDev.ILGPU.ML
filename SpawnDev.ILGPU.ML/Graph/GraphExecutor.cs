@@ -856,7 +856,11 @@ public class GraphExecutor : IDisposable
             var sw = CapturedNodeTimingsMs != null ? System.Diagnostics.Stopwatch.StartNew() : null;
             try
             {
-                node.Operator.Execute(ctx);
+                // Async dispatch: operators that need a runtime GPU->CPU readback (Loop/If/Scan
+                // condition, Einsum dynamic inputs) override ExecuteAsync to await the
+                // browser-safe readback; all others fall through to the synchronous Execute via
+                // the default interface method. This is the browser-parity path.
+                await node.Operator.ExecuteAsync(ctx);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,
                 // WebGPU command-encoder errors) surface AT the failing node instead of

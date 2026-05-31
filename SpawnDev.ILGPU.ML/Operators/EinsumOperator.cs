@@ -39,10 +39,33 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
 
     public void Execute(OnnxOpContext ctx)
     {
-        var equation = ctx.GetString("equation");
-        var parsed = ParseEquation(equation, ctx.Inputs.Length);
+        var parsed = ParseEquation(ctx.GetString("equation"), ctx.Inputs.Length);
+        var dimSizes = BuildDimSizes(ctx, parsed);
+        if (TryGpuFastPath(ctx, parsed, dimSizes)) return;
+        // Sync CPU fallback (desktop). Dynamic inputs use sync GPU->CPU which throws on
+        // browser backends — there they fall back to zeros (see ExecuteAsync for parity).
+        var inputArrays = ReadInputsSync(ctx);
+        ComputeGeneralContraction(ctx, parsed, dimSizes, inputArrays);
+    }
 
-        // Build dimension size map from actual tensor shapes
+    /// <summary>
+    /// Browser-safe async path (GraphExecutor.RunAsync). Identical to <see cref="Execute"/>
+    /// except dynamic (non-constant) inputs are read back via the async <c>CopyToHostAsync</c>
+    /// instead of the synchronous readback that throws on WebGPU/WebGL/Wasm — giving the general
+    /// einsum contraction full feature parity on the browser backends instead of zeros.
+    /// </summary>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        var parsed = ParseEquation(ctx.GetString("equation"), ctx.Inputs.Length);
+        var dimSizes = BuildDimSizes(ctx, parsed);
+        if (TryGpuFastPath(ctx, parsed, dimSizes)) return;
+        var inputArrays = await ReadInputsAsync(ctx);
+        ComputeGeneralContraction(ctx, parsed, dimSizes, inputArrays);
+    }
+
+    /// <summary>Builds the einsum dimension-size map from the actual input tensor shapes.</summary>
+    private static Dictionary<char, int> BuildDimSizes(OnnxOpContext ctx, ParsedEquation parsed)
+    {
         var dimSizes = new Dictionary<char, int>();
         for (int inp = 0; inp < ctx.Inputs.Length; inp++)
         {
@@ -51,7 +74,15 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
             for (int d = 0; d < labels.Length && d < shape.Length; d++)
                 dimSizes[labels[d]] = shape[d];
         }
+        return dimSizes;
+    }
 
+    /// <summary>
+    /// Attempts the all-GPU fast paths (element-wise broadcast multiply, batched matmul).
+    /// Returns true if the equation was handled entirely on the GPU (no CPU readback needed).
+    /// </summary>
+    private bool TryGpuFastPath(OnnxOpContext ctx, ParsedEquation parsed, Dictionary<char, int> dimSizes)
+    {
         // GPU fast path: element-wise broadcast multiply (e.g., bnhd,hd->bnhd for RoPE).
         // Pattern: all output labels appear in input A, input B's labels are a suffix of A's.
         if (ctx.Inputs.Length == 2 && parsed.OutputLabels.SequenceEqual(parsed.InputLabels[0]))
@@ -67,7 +98,7 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                     ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
                     ctx.Inputs[0].Shape, ctx.Inputs[1].Shape, ctx.Outputs[0].Shape,
                     BroadcastOp.Mul);
-                return;
+                return true;
             }
         }
 
@@ -113,20 +144,22 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                             ctx.Outputs[0].Data.SubView(b * M * N, M * N),
                             M, K, N);
                     }
-                    return;
+                    return true;
                 }
             }
         }
 
-        // CPU fallback for general equations.
-        // Read inputs from pre-read constants (avoids GPU→CPU readback on browser backends).
-        int outputSize = ctx.Outputs[0].ElementCount;
-        var result = new float[outputSize];
-        var outLabels = parsed.OutputLabels;
-        var outShape = ctx.Outputs[0].Shape;
+        return false;
+    }
 
-        // Read all inputs to CPU — use constant values (pre-read during session creation)
-        // to avoid sync GPU→CPU which throws on WebGPU/WebGL/Wasm.
+    /// <summary>
+    /// Sync CPU-fallback input read. Pre-read constants are used directly; dynamic inputs use
+    /// a sync GPU-&gt;CPU readback that works on desktop but THROWS on WebGPU/WebGL/Wasm — there
+    /// the input falls back to zeros (the async <see cref="ReadInputsAsync"/> path reads it
+    /// properly). Returns one float[] per input.
+    /// </summary>
+    private float[][] ReadInputsSync(OnnxOpContext ctx)
+    {
         var inputArrays = new float[ctx.Inputs.Length][];
         bool allAvailable = true;
         for (int i = 0; i < ctx.Inputs.Length; i++)
@@ -150,7 +183,7 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                 catch (NotSupportedException)
                 {
                     // Browser backend — can't do sync GPU→CPU. Fall back to zero.
-                    // This Einsum equation needs a GPU kernel (not just broadcast multiply).
+                    // This Einsum equation needs the async path (ExecuteAsync) for real data.
                     inputArrays[i] = new float[ctx.Inputs[i].ElementCount];
                     allAvailable = false;
                 }
@@ -158,7 +191,47 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         if (!allAvailable && InferenceSession.VerboseLogging)
-            Console.WriteLine($"[Einsum] WARNING: equation '{equation}' has non-constant inputs on browser backend — GPU fast path needed");
+            Console.WriteLine($"[Einsum] WARNING: equation '{ctx.GetString("equation")}' has non-constant inputs on a browser backend via the SYNC path — use ExecuteAsync (GraphExecutor.RunAsync) for real readback");
+
+        return inputArrays;
+    }
+
+    /// <summary>
+    /// Browser-safe async input read. Pre-read constants are used directly; dynamic inputs are
+    /// staged GPU-&gt;GPU (<c>CopyFrom</c>, valid on all backends) then read back via the async
+    /// <c>CopyToHostAsync</c> (mapAsync / SAB / GL readback) — so the general contraction gets
+    /// real input data on WebGPU/WebGL/Wasm instead of zeros. Returns one float[] per input.
+    /// </summary>
+    private async Task<float[][]> ReadInputsAsync(OnnxOpContext ctx)
+    {
+        var inputArrays = new float[ctx.Inputs.Length][];
+        for (int i = 0; i < ctx.Inputs.Length; i++)
+        {
+            var constVals = ctx.TryGetInputValues(i);
+            if (constVals != null)
+            {
+                inputArrays[i] = constVals;
+                continue;
+            }
+            int count = ctx.Inputs[i].ElementCount;
+            using var readBuf = reg.Accelerator.Allocate1D<float>(count);
+            readBuf.View.SubView(0, count).CopyFrom(ctx.Inputs[i].Data.SubView(0, count));
+            inputArrays[i] = await readBuf.CopyToHostAsync<float>(0, count);
+        }
+        return inputArrays;
+    }
+
+    /// <summary>
+    /// General N-input einsum contraction on the CPU-read inputs, writing the result back to the
+    /// GPU output via <c>CopyFromCPU</c> (valid on all backends). Pure compute — no GPU readback.
+    /// </summary>
+    private void ComputeGeneralContraction(
+        OnnxOpContext ctx, ParsedEquation parsed, Dictionary<char, int> dimSizes, float[][] inputArrays)
+    {
+        int outputSize = ctx.Outputs[0].ElementCount;
+        var result = new float[outputSize];
+        var outLabels = parsed.OutputLabels;
+        var outShape = ctx.Outputs[0].Shape;
 
         // Identify contracted dimensions (in inputs but not in output)
         var allInputLabels = new HashSet<char>();
