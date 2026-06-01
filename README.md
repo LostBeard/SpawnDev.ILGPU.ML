@@ -31,7 +31,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 
 ## What's verified in `4.0.0-preview.4`
 
-Five demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + OpenCL — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries:
+Six demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + OpenCL — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries:
 
 | Demo | Model | Pipeline |
 |------|-------|----------|
@@ -40,10 +40,11 @@ Five demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + 
 | ![Style Transfer — Mosaic Cat](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_StyleTransfer-CatMosaic.jpg) | **Neural style transfer** — Mosaic ONNX Model Zoo | `StyleTransferPipeline` |
 | ![Background Removal — Person](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_BackgroundRemoval-Person.jpg) | **Background removal** — RMBG-1.4 | `BackgroundRemovalPipeline` |
 | ![Super Resolution — Tree](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_SuperResolution-Tree.jpg) | **3x super-resolution** — ESPCN, tile-based with color and source-aspect preservation | `SuperResolutionPipeline` |
+| ![Pose Estimation — Push-up](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-06-01-15-21_PoseEstimation-Runner.jpg) | **Pose estimation** — MoveNet Lightning (17 keypoints), skeleton overlaid on a GPU-rendered frame | `PoseEstimationPipeline` |
 
 Every result above is rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
 
-**Pose estimation (MoveNet Lightning)** also runs end-to-end on WebGPU, WebGL, Wasm, CUDA, and OpenCL as of `preview.4` — the `/pose` demo supports both live webcam and file-upload modes; a still-image screenshot for this gallery is pending the next deploy. 10 more pipelines exist in the codebase (object detection, face detection, NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
+The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes. 10 more pipelines exist in the codebase (object detection, face detection, NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
 
 ## Universal Model Loading
 
@@ -223,7 +224,7 @@ Auto-selection: WebGPU > WebGL > Wasm (browser) or CUDA > OpenCL > CPU (desktop)
 | **Style Transfer** (5 models) | Artistic style transfer | 6-7 MB each | **Working** — 112 nodes, reference-matched |
 | **YOLOv8 Nano** | Object detection (80 classes) | 12.2 MB | **Working** — matches ONNX Runtime reference |
 | **Depth Anything V2 Small** | Monocular depth estimation | 95 MB | Compiles (823 nodes, 25 op types) |
-| **MoveNet Lightning** | Pose estimation (17 keypoints) | 9 MB | Compiles (21 op types) |
+| **MoveNet Lightning** | Pose estimation (17 keypoints) | 9 MB | **Working** — matches ONNX Runtime reference |
 | **BlazeFace** | Face detection | 229 KB | TFLite — loads and runs |
 | **EfficientNet-Lite0** | Classification (1000 classes) | 17.7 MB | TFLite — loads and runs |
 
