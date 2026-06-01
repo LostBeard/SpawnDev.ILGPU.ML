@@ -55,6 +55,10 @@ self.onmessage = function (e) {
             handleFreeBuffer(msg);
             break;
 
+        case 'copyBuffer':
+            handleCopyBuffer(msg);
+            break;
+
         case 'dispatch':
             try {
                 const result = dispatchKernel(msg);
@@ -163,11 +167,50 @@ function handleFreeBuffer(msg) {
     }
 }
 
+// Worker-side GPU->GPU copy. The CPU-side _backingArray is never refreshed
+// after a kernel TF write (only the worker's entry.data is), so routing
+// CopyTo/CopyFrom GPU->GPU through the main thread reads stale zeros from
+// _backingArray and produces a destination of zeros. By doing the copy
+// here (worker's entry.data -> worker's entry.data) the canonical
+// post-kernel state is preserved, then we re-upload the destination
+// texture so subsequent dispatches see the new data.
+function handleCopyBuffer(msg) {
+    const { srcBufferId, srcByteOffset, dstBufferId, dstByteOffset, byteLength } = msg;
+    const srcEntry = bufferRegistry[srcBufferId];
+    const dstEntry = bufferRegistry[dstBufferId];
+    if (!srcEntry || !dstEntry) {
+        console.error('[GLWorker] copyBuffer: unknown bufferId(s)', srcBufferId, dstBufferId);
+        return;
+    }
+    const srcOff = srcByteOffset | 0;
+    const dstOff = dstByteOffset | 0;
+    const len = byteLength | 0;
+    // Bounds clamp - never overrun either typed array.
+    const srcEnd = Math.min(srcOff + len, srcEntry.data.length);
+    const copyLen = Math.max(0, srcEnd - srcOff);
+    if (copyLen <= 0) return;
+    if (dstOff + copyLen > dstEntry.data.length) {
+        console.error('[GLWorker] copyBuffer: destination overrun', dstOff, copyLen, dstEntry.data.length);
+        return;
+    }
+    dstEntry.data.set(srcEntry.data.subarray(srcOff, srcOff + copyLen), dstOff);
+    // Push the new bytes to the destination texture so subsequent kernel
+    // dispatches reading via texelFetch see the updated values.
+    uploadTextureData(dstEntry.texture, dstEntry);
+}
+
 // ---- Shader Compilation ----
 
 function getOrCompileProgram(programId, source, varyingNames) {
-    if (programCache[programId] && !programCache[programId].disposed) {
-        return programCache[programId];
+    const cached = programCache[programId];
+    if (cached && !cached.disposed && cached.source === source) {
+        return cached;
+    }
+    if (cached && !cached.disposed) {
+        gl.deleteProgram(cached.program);
+        gl.deleteShader(cached.vs);
+        gl.deleteShader(cached.fs);
+        cached.disposed = true;
     }
 
     const vs = gl.createShader(gl.VERTEX_SHADER);
@@ -207,9 +250,9 @@ function getOrCompileProgram(programId, source, varyingNames) {
         throw new Error('Program link error: ' + log);
     }
 
-    const cached = { program, vs, fs, uniformCache: {}, disposed: false };
-    programCache[programId] = cached;
-    return cached;
+    const entry = { program, vs, fs, uniformCache: {}, disposed: false, source };
+    programCache[programId] = entry;
+    return entry;
 }
 
 function getUniformLoc(cached, name) {
