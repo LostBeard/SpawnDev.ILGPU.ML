@@ -17,7 +17,7 @@ public abstract partial class MLTestBase
     //  Text Generation (Chatbot / AI Assistant)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task Pipeline_TextGeneration_ProducesTokens() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -50,7 +50,7 @@ public abstract partial class MLTestBase
     //  Background Removal (RMBG)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task Pipeline_BackgroundRemoval_ProducesMask() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -147,7 +147,7 @@ public abstract partial class MLTestBase
     /// Closes the gap that let Captain hit "result image identical to source" without any
     /// PMT failure.
     /// </summary>
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task Pipeline_BackgroundRemoval_RealImage_ProducesVaryingMask() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -227,7 +227,7 @@ public abstract partial class MLTestBase
     /// Always throws at the end with a summary of suspicious nodes so the captured info
     /// surfaces in test output regardless of pass/fail semantics.
     /// </summary>
-    [TestMethod(Timeout = 600000)]
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task Pipeline_BackgroundRemoval_PerOpDiagnostic() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -338,7 +338,7 @@ public abstract partial class MLTestBase
     //  Semantic Search (Feature Extraction + Cosine Similarity)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task Pipeline_SemanticSearch_SimilarSentencesCloser() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -412,7 +412,7 @@ public abstract partial class MLTestBase
     //  Image Generation (Diffusion)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task Pipeline_Diffusion_DDPM_ProducesImage() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

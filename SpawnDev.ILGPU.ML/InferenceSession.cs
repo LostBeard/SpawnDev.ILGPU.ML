@@ -346,8 +346,13 @@ public class InferenceSession : IDisposable
             return ModelFormat.TFLite;
 
         // ONNX: starts with protobuf varint field tag (typically 0x08 for field 1, varint type)
-        // More reliable: check for the "onnx" or "pytorch" producer string within first 64 bytes
-        for (int i = 0; i < Math.Min(64, data.Length - 4); i++)
+        // More reliable: check for the "onnx" or "pytorch" producer string within first 64 bytes.
+        // Bound is data.Length - 3 (not - 4): the last valid 4-byte window [i..i+3] starts at
+        // data.Length - 4, so the loop must allow i == data.Length - 4 (i.e. i < data.Length - 3).
+        // The old "- 4" bound skipped that final window, so an "onnx" string sitting exactly at
+        // offset 4 of a minimal 8-byte buffer was never scanned and the bytes fell through to the
+        // 0x08 protobuf fallback (mis-detected as CoreML version 7).
+        for (int i = 0; i < Math.Min(64, data.Length - 3); i++)
         {
             if (data[i] == 'o' && data[i + 1] == 'n' && data[i + 2] == 'n' && data[i + 3] == 'x')
                 return ModelFormat.ONNX;

@@ -21,6 +21,17 @@ public class FWHTKernel
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _fwhtKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _fwhtBatchInPlaceKernel;
 
+    // Pooled padding scratch for the non-power-of-2 batched path. MUST be a member buffer:
+    // a method-local `using var` is disposed when ForwardBatch returns — before the CALLER
+    // flushes the WebGPU command encoder — so the GPU buffer is destroyed while the FWHT
+    // dispatches that read/write it are still pending ("Buffer used in submit while destroyed").
+    // Reused across calls; on growth the previous buffer is retained (never disposed mid-flight,
+    // since it may still sit in a not-yet-submitted command encoder), mirroring TurboQuantKernels'
+    // _oldParamsBufs pattern. Avoids the per-call allocate/free churn too (Rule 4).
+    private MemoryBuffer1D<float, Stride1D.Dense>? _padBuf;
+    private int _padCapacity;
+    private readonly System.Collections.Generic.List<MemoryBuffer1D<float, Stride1D.Dense>> _oldPadBufs = new();
+
     public FWHTKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -89,12 +100,19 @@ public class FWHTKernel
 
         if (dPad != d)
         {
-            // Non-power-of-2: allocate padded temp buffer, zero-fill, copy input rows,
-            // run FWHT on padded buffer, copy results back to output.
-            using var padBuf = _accelerator.Allocate1D<float>(batchSize * dPad);
-            ew.Fill(padBuf.View, batchSize * dPad, 0f);
+            // Non-power-of-2: use the pooled padded scratch buffer (see _padBuf field comment),
+            // zero-fill, copy input rows, run FWHT on padded buffer, copy results back to output.
+            int padCount = batchSize * dPad;
+            if (_padBuf == null || _padCapacity < padCount)
+            {
+                if (_padBuf != null) _oldPadBufs.Add(_padBuf);
+                _padBuf = _accelerator.Allocate1D<float>(padCount);
+                _padCapacity = padCount;
+            }
+            var padView = _padBuf.View.SubView(0, padCount);
+            ew.Fill(padView, padCount, 0f);
             for (int b = 0; b < batchSize; b++)
-                ew.Scale(input.SubView(b * d, d), padBuf.View.SubView(b * dPad, d), d, 1f);
+                ew.Scale(input.SubView(b * d, d), padView.SubView(b * dPad, d), d, 1f);
 
             int numStagesPad = 0;
             for (int s = dPad; s > 1; s >>= 1) numStagesPad++;
@@ -103,13 +121,13 @@ public class FWHTKernel
                 int halfSize = 1 << stage;
                 _fwhtBatchInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                     ArrayView1D<float, Stride1D.Dense>, int>(FWHTBatchStageInPlaceImpl);
-                _fwhtBatchInPlaceKernel(batchSize * dPad / 2, padBuf.View, halfSize);
+                _fwhtBatchInPlaceKernel(padCount / 2, padView, halfSize);
             }
 
             // Copy first d elements of each padded row to output, with normalization
             float scalePad = 1f / MathF.Sqrt(d);
             for (int b = 0; b < batchSize; b++)
-                ew.Scale(padBuf.View.SubView(b * dPad, d), output.SubView(b * d, d), d, scalePad);
+                ew.Scale(padView.SubView(b * dPad, d), output.SubView(b * d, d), d, scalePad);
             return;
         }
 

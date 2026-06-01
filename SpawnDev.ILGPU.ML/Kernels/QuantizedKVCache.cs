@@ -78,6 +78,23 @@ public class QuantizedKVCache : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _tempTransformed;
     private MemoryBuffer1D<int, Stride1D.Dense>? _tempIndices;
 
+    // Pooled temp buffers for FlashAttention. These MUST be member buffers (not method-local
+    // `using var`): on WebGPU the kernels dispatched by FlashAttention are batched in the
+    // command encoder and not submitted until the CALLER calls SynchronizeAsync. A method-local
+    // `using var` is disposed when FlashAttention returns — before that submit — so the GPU
+    // buffer is destroyed while still referenced by a pending dispatch ("Buffer used in submit
+    // while destroyed"). Pooling them on the instance keeps them alive past the flush and avoids
+    // an internal Synchronize that would defeat WebGPU command batching. Reused across calls
+    // (single-token decode reuses the same scratch); grown if a larger numQueries arrives.
+    private MemoryBuffer1D<float, Stride1D.Dense>? _faQNormalized;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _faQNorms;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _faQFlipped;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _faQTransformed;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _faAttnOut;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _faInvFWHT;
+    private int _faElemCapacity;   // capacity of the numQueries*vecDim buffers
+    private int _faQueryCapacity;  // capacity of the per-query qNorms buffer
+
     /// <summary>Current sequence position (number of tokens cached).</summary>
     public int CurrentSeqLen { get; private set; }
 
@@ -271,25 +288,30 @@ public class QuantizedKVCache : IDisposable
                 ? TurboQuantKernels.Codebook4Bit
                 : TurboQuantKernels.Codebook3Bit);
 
-        // Allocate temp buffers for Q transform and output inverse transform
-        using var qNormalized = _accelerator.Allocate1D<float>(numQueries * vecDim);
-        using var qNorms = _accelerator.Allocate1D<float>(numQueries);
-        using var qFlipped = _accelerator.Allocate1D<float>(numQueries * vecDim);
-        using var qTransformed = _accelerator.Allocate1D<float>(numQueries * vecDim);
-        using var attnOut = _accelerator.Allocate1D<float>(numQueries * vecDim);
+        // Ensure the pooled temp buffers are large enough (allocated once, reused, grown only
+        // if a larger numQueries arrives). Kept alive on the instance so they survive until the
+        // CALLER flushes the command encoder — see the _faQNormalized field comment.
+        int elemCount = numQueries * vecDim;
+        EnsureFlashAttentionScratch(elemCount, numQueries);
+        var qNormalized = _faQNormalized!.View.SubView(0, elemCount);
+        var qNorms = _faQNorms!.View.SubView(0, numQueries);
+        var qFlipped = _faQFlipped!.View.SubView(0, elemCount);
+        var qTransformed = _faQTransformed!.View.SubView(0, elemCount);
+        var attnOut = _faAttnOut!.View.SubView(0, elemCount);
+        var invFWHT = _faInvFWHT!.View.SubView(0, elemCount);
 
         // Forward-transform Q into the Hadamard domain (same transform as KV encoding,
         // but WITHOUT the √d scaling — K has √d baked in for codebook matching,
         // so Q stays at 1/√d variance to keep the dot product correctly scaled)
-        _quant.Normalize(query, qNormalized.View, qNorms.View, numQueries, vecDim);
-        _quant.SignFlip(qNormalized.View, qFlipped.View, _signs!.View, numQueries * vecDim);
-        _quant.FWHT.ForwardBatch(qFlipped.View, qTransformed.View, numQueries, vecDim);
+        _quant.Normalize(query, qNormalized, qNorms, numQueries, vecDim);
+        _quant.SignFlip(qNormalized, qFlipped, _signs!.View, elemCount);
+        _quant.FWHT.ForwardBatch(qFlipped, qTransformed, numQueries, vecDim);
 
         // Run Flash Attention in the quantized Hadamard domain
         _quant.FlashQuantizedAttention(
-            qTransformed.View, kPacked.packed, _codebook!.View,
+            qTransformed, kPacked.packed, _codebook!.View,
             vPacked.packed, _vCodebookCopy.View,
-            kPacked.norms, vPacked.norms, attnOut.View,
+            kPacked.norms, vPacked.norms, attnOut,
             numQueries, CurrentSeqLen, vecDim, scale,
             bitsPerValue: _bitsPerValue, valuesPerInt: _valuesPerInt);
 
@@ -300,10 +322,38 @@ public class QuantizedKVCache : IDisposable
         // Do NOT apply Q_norm — the output is V-domain, not Q-domain.
         // The kernel already multiplied by V_norms inside the attention loop.
         float invSqrtD = 1f / MathF.Sqrt(vecDim);
-        new ElementWiseKernels(_accelerator).ScaleInPlace(attnOut.View, numQueries * vecDim, invSqrtD);
-        using var invFWHT = _accelerator.Allocate1D<float>(numQueries * vecDim);
-        _quant.FWHT.ForwardBatch(attnOut.View, invFWHT.View, numQueries, vecDim);
-        _quant.SignFlip(invFWHT.View, output, _signs!.View, numQueries * vecDim);
+        new ElementWiseKernels(_accelerator).ScaleInPlace(attnOut, elemCount, invSqrtD);
+        _quant.FWHT.ForwardBatch(attnOut, invFWHT, numQueries, vecDim);
+        _quant.SignFlip(invFWHT, output, _signs!.View, elemCount);
+    }
+
+    /// <summary>
+    /// Lazily (re)allocate the pooled FlashAttention scratch buffers so they cover
+    /// <paramref name="elemCount"/> (= numQueries * vecDim) floats and <paramref name="numQueries"/>
+    /// norms. Reused across calls; only reallocated when a larger request arrives.
+    /// </summary>
+    private void EnsureFlashAttentionScratch(int elemCount, int numQueries)
+    {
+        if (_faQNormalized == null || _faElemCapacity < elemCount)
+        {
+            _faQNormalized?.Dispose();
+            _faQFlipped?.Dispose();
+            _faQTransformed?.Dispose();
+            _faAttnOut?.Dispose();
+            _faInvFWHT?.Dispose();
+            _faQNormalized = _accelerator.Allocate1D<float>(elemCount);
+            _faQFlipped = _accelerator.Allocate1D<float>(elemCount);
+            _faQTransformed = _accelerator.Allocate1D<float>(elemCount);
+            _faAttnOut = _accelerator.Allocate1D<float>(elemCount);
+            _faInvFWHT = _accelerator.Allocate1D<float>(elemCount);
+            _faElemCapacity = elemCount;
+        }
+        if (_faQNorms == null || _faQueryCapacity < numQueries)
+        {
+            _faQNorms?.Dispose();
+            _faQNorms = _accelerator.Allocate1D<float>(numQueries);
+            _faQueryCapacity = numQueries;
+        }
     }
 
     // Separate codebook copy for V (WebGPU aliasing prevention)
@@ -445,5 +495,11 @@ public class QuantizedKVCache : IDisposable
         _tempFlipped?.Dispose();
         _tempTransformed?.Dispose();
         _tempIndices?.Dispose();
+        _faQNormalized?.Dispose();
+        _faQNorms?.Dispose();
+        _faQFlipped?.Dispose();
+        _faQTransformed?.Dispose();
+        _faAttnOut?.Dispose();
+        _faInvFWHT?.Dispose();
     }
 }

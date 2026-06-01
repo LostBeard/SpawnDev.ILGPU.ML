@@ -226,7 +226,7 @@ public abstract partial class MLTestBase
             new[] { 1, 3, 224, 224 }, 5.0f, "StyleMosaic");
     });
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task Reference_StyleMosaic_DiagnosticPerOpSync() => await RunTest(async accelerator =>
     {
         // 2026-05-04 Data: PerOpSync diagnostic for StyleMosaic Wasm hang. Forces
@@ -415,7 +415,7 @@ public abstract partial class MLTestBase
     // flag is true so the assertion message carries the diagnostic.
     public static bool DistilBERTDumpAllAbsMax { get; set; } = true;
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task Reference_DistilBERT_DiagnosticDump() => await RunTest(async accelerator =>
     {
         if (!DistilBERTDumpAllAbsMax) throw new UnsupportedTestException("DistilBERTDumpAllAbsMax not enabled");
@@ -500,7 +500,7 @@ public abstract partial class MLTestBase
 
     // ── Text Classification Reference Test (256MB model — may OOM in browser) ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task Reference_DistilBERT_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -590,7 +590,7 @@ public abstract partial class MLTestBase
 
     // ── Text Generation Reference Test ──
 
-    [TestMethod(Timeout = 900000)] // 15 min — GPT-2 is 652MB + 2620 nodes. Download + compile + inference needs headroom on WebGPU
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")] // 15 min — GPT-2 is 652MB + 2620 nodes. Download + compile + inference needs headroom on WebGPU
     public async Task Reference_GPT2_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -664,7 +664,7 @@ public abstract partial class MLTestBase
 
     // ── Whisper Encoder Reference Test ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task Reference_WhisperEncoder_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -704,7 +704,7 @@ public abstract partial class MLTestBase
 
     // ── CLIP Vision Reference Test ──
 
-    [TestMethod(Timeout = 180000)]
+    [TestMethod(Timeout = 180000, Category = "HeavyModel")]
     public async Task Reference_CLIPVision_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -754,7 +754,7 @@ public abstract partial class MLTestBase
 
     // ── Depth Estimation Reference Test ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task Reference_DepthAnything_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

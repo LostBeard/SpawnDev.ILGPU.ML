@@ -171,7 +171,7 @@ public abstract partial class MLTestBase
     /// This is the model that was failing in the demo.
     /// Verifies: model loads, compiles, and can run inference.
     /// </summary>
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task CreateFromFile_DepthAnything_Load() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -202,7 +202,7 @@ public abstract partial class MLTestBase
     /// Load Depth Anything V2 Small and run actual depth estimation on a gradient image.
     /// Verifies depth map output has spatial variation (not flat).
     /// </summary>
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task CreateFromFile_DepthAnything_Inference() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -253,7 +253,7 @@ public abstract partial class MLTestBase
     /// <summary>
     /// Depth estimation with real cat image — more meaningful than gradient.
     /// </summary>
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task CreateFromFile_DepthAnything_CatImage() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -291,7 +291,7 @@ public abstract partial class MLTestBase
     /// side-by-side display. The pipeline must default to source dimensions, and the
     /// outputWidth/outputHeight params must drive both exact and aspect-preserving sizing.
     /// </summary>
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task CreateFromFile_DepthAnything_OutputAspectRatio() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

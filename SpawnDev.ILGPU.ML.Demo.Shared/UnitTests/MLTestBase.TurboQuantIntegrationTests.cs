@@ -161,36 +161,36 @@ public abstract partial class MLTestBase
 
         using var qBuf = accelerator.Allocate1D(qData);
 
-        // Encode K and V: normalize → quantize → pack
+        // Encode K and V: normalize → quantize → pack.
+        // Upload K and V ONCE as whole buffers and SubView per vector. The previous code
+        // allocated a per-iteration `using var kVec`/`vVec` and disposed it each iteration —
+        // but on WebGPU the Normalize/Quantize dispatches are batched in the command encoder
+        // and not executed until SynchronizeAsync, so destroying the input buffer mid-loop
+        // produced "Buffer used in submit while destroyed" GPU errors (one per KV position).
+        // Whole-buffer SubViews stay alive until after the flush and avoid numKV uploads.
+        using var kAllBuf = accelerator.Allocate1D(kData);
+        using var vAllBuf = accelerator.Allocate1D(vData);
         using var kPackedBuf = accelerator.Allocate1D<int>(numKV * packedDim);
         using var vPackedBuf = accelerator.Allocate1D<int>(numKV * packedDim);
         using var kNormsBuf = accelerator.Allocate1D<float>(numKV);
         using var vNormsBuf = accelerator.Allocate1D<float>(numKV);
         using var codebookBuf = accelerator.Allocate1D(codebook);
 
-        // Per-vector encode
+        // Per-vector encode. Scratch (tempNorm/tempIndices/tempNormVal) is reused across
+        // iterations — safe on WebGPU because the batched compute passes execute in
+        // submission order; the only hazard was destroying input buffers before the flush.
         using var tempNorm = accelerator.Allocate1D<float>(headDim);
         using var tempNormVal = accelerator.Allocate1D<float>(1);
         using var tempIndices = accelerator.Allocate1D<int>(headDim);
 
         for (int kv = 0; kv < numKV; kv++)
         {
-            // Upload K vector
-            var kSlice = new float[headDim];
-            Array.Copy(kData, kv * headDim, kSlice, 0, headDim);
-            using var kVec = accelerator.Allocate1D(kSlice);
-
-            tq.Normalize(kVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
+            tq.Normalize(kAllBuf.View.SubView(kv * headDim, headDim), tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
             tq.BitPack4(tempIndices.View, kPackedBuf.View.SubView(kv * packedDim, packedDim), headDim);
             new ElementWiseKernels(accelerator).Scale(tempNormVal.View.SubView(0, 1), kNormsBuf.View.SubView(kv, 1), 1, 1f);
 
-            // Same for V
-            var vSlice = new float[headDim];
-            Array.Copy(vData, kv * headDim, vSlice, 0, headDim);
-            using var vVec = accelerator.Allocate1D(vSlice);
-
-            tq.Normalize(vVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
+            tq.Normalize(vAllBuf.View.SubView(kv * headDim, headDim), tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
             tq.BitPack4(tempIndices.View, vPackedBuf.View.SubView(kv * packedDim, packedDim), headDim);
             new ElementWiseKernels(accelerator).Scale(tempNormVal.View.SubView(0, 1), vNormsBuf.View.SubView(kv, 1), 1, 1f);
@@ -269,7 +269,14 @@ public abstract partial class MLTestBase
         // Quantize K and V (same setup as QuantizedAttention test)
         int packedDim = headDim / 8;
         var codebook = TurboQuantKernels.Codebook4Bit;
+        // Upload K and V ONCE as whole buffers and SubView per vector. Allocating and
+        // disposing a per-iteration kVec/vVec mid-loop destroyed the buffer before the
+        // batched WebGPU dispatches were flushed at SynchronizeAsync ("Buffer used in submit
+        // while destroyed", one error per KV position). Whole-buffer SubViews live until the
+        // flush and avoid numKV separate uploads.
         using var qBuf = accelerator.Allocate1D(qData);
+        using var kAllBuf = accelerator.Allocate1D(kData);
+        using var vAllBuf = accelerator.Allocate1D(vData);
         using var kPackedBuf = accelerator.Allocate1D<int>(numKV * packedDim);
         using var vPackedBuf = accelerator.Allocate1D<int>(numKV * packedDim);
         using var kNormsBuf = accelerator.Allocate1D<float>(numKV);
@@ -282,18 +289,12 @@ public abstract partial class MLTestBase
 
         for (int kv = 0; kv < numKV; kv++)
         {
-            var kSlice = new float[headDim];
-            Array.Copy(kData, kv * headDim, kSlice, 0, headDim);
-            using var kVec = accelerator.Allocate1D(kSlice);
-            tq.Normalize(kVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
+            tq.Normalize(kAllBuf.View.SubView(kv * headDim, headDim), tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
             tq.BitPack4(tempIndices.View, kPackedBuf.View.SubView(kv * packedDim, packedDim), headDim);
             new ElementWiseKernels(accelerator).Scale(tempNormVal.View.SubView(0, 1), kNormsBuf.View.SubView(kv, 1), 1, 1f);
 
-            var vSlice = new float[headDim];
-            Array.Copy(vData, kv * headDim, vSlice, 0, headDim);
-            using var vVec = accelerator.Allocate1D(vSlice);
-            tq.Normalize(vVec.View, tempNorm.View, tempNormVal.View, 1, headDim);
+            tq.Normalize(vAllBuf.View.SubView(kv * headDim, headDim), tempNorm.View, tempNormVal.View, 1, headDim);
             tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, 16);
             tq.BitPack4(tempIndices.View, vPackedBuf.View.SubView(kv * packedDim, packedDim), headDim);
             new ElementWiseKernels(accelerator).Scale(tempNormVal.View.SubView(0, 1), vNormsBuf.View.SubView(kv, 1), 1, 1f);
@@ -349,7 +350,7 @@ public abstract partial class MLTestBase
     /// Load Whisper Tiny decoder (merged), verify GraphExecutor auto-detects KV cache.
     /// Whisper Tiny has 4 decoder layers with both self-attention and cross-attention KV cache.
     /// </summary>
-    [TestMethod(Timeout = 600000)]
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_WhisperDecoder_KVCacheAutoDetected() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -396,7 +397,7 @@ public abstract partial class MLTestBase
     /// Run one decoder step of Whisper Tiny with fake encoder output,
     /// verify quantized KV cache captures the token's key/value data.
     /// </summary>
-    [TestMethod(Timeout = 600000)]
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_WhisperDecoder_KVCacheCaptures() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -549,9 +550,14 @@ public abstract partial class MLTestBase
 
             // Reverse: dequantize → scale(1/√d) → inverse FWHT → sign-flip → denormalize
             tq.Dequantize(indices.View, codebookBuf.View, transformed.View, numVecs * d, numCentroids);
-            // Scale by 1/√d to undo pre-quantization scaling
+            // Scale by 1/√d to undo pre-quantization scaling.
+            // In-place scale MUST use ScaleInPlace (single buffer binding): passing
+            // transformed.View as both input and output to Scale() binds the same GPU
+            // buffer to two read_write storage slots, which WebGPU forbids (the library
+            // correctly throws "Storage buffer aliasing detected"). Mirrors the ScaleInPlace
+            // call in the forward pass above.
             float invSqrtD = 1f / MathF.Sqrt(d);
-            new ElementWiseKernels(accelerator).Scale(transformed.View, transformed.View, numVecs * d, invSqrtD);
+            new ElementWiseKernels(accelerator).ScaleInPlace(transformed.View, numVecs * d, invSqrtD);
             tq.FWHT.ForwardBatch(transformed.View, flipped.View, numVecs, d); // FWHT is its own inverse
             tq.SignFlip(flipped.View, normalized.View, signsBuf.View, numVecs * d);
             tq.Denormalize(normalized.View, reconstructed.View, norms.View, numVecs, d);
@@ -598,7 +604,10 @@ public abstract partial class MLTestBase
             tq.Normalize(originalBuf.View, normalized.View, norms.View, numVecs, d);
             tq.SignFlip(normalized.View, flipped.View, signsBuf.View, numVecs * d);
             tq.FWHT.ForwardBatch(flipped.View, transformed.View, numVecs, d);
-            new ElementWiseKernels(accelerator).Scale(transformed.View, transformed.View, numVecs * d, MathF.Sqrt(d));
+            // In-place scale MUST use ScaleInPlace (single buffer binding) — passing transformed.View
+            // as both input and output to Scale() aliases one GPU buffer to two read_write storage
+            // slots, which WebGPU forbids. Mirrors the ScaleInPlace calls in the 3-bit/4-bit pass above.
+            new ElementWiseKernels(accelerator).ScaleInPlace(transformed.View, numVecs * d, MathF.Sqrt(d));
 
             // Quantize to 3-bit centroids
             tq.Quantize(transformed.View, codebook3Buf.View, indices.View, numVecs * d, 8);
@@ -706,7 +715,7 @@ public abstract partial class MLTestBase
     /// Establishes expected next token for "The cat sat on the" prompt.
     /// This must pass before TurboQuant integration is tested.
     /// </summary>
-    [TestMethod(Timeout = 600000)]
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_GPT2_Baseline_NoKVCache() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -789,7 +798,7 @@ public abstract partial class MLTestBase
     /// 3. KV cache captures token data after inference
     /// 4. Top token is logged for comparison with baseline
     /// </summary>
-    [TestMethod(Timeout = 600000)]
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_GPT2_WithKVCache() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -922,6 +931,8 @@ public abstract partial class MLTestBase
         // Generate random K and V vectors for each token, store originals for CPU reference
         var allK = new float[numTokens][];
         var allV = new float[numTokens][];
+        var kFlat = new float[numTokens * vecDim];
+        var vFlat = new float[numTokens * vecDim];
 
         for (int t = 0; t < numTokens; t++)
         {
@@ -934,11 +945,22 @@ public abstract partial class MLTestBase
             }
             allK[t] = kData;
             allV[t] = vData;
+            Array.Copy(kData, 0, kFlat, t * vecDim, vecDim);
+            Array.Copy(vData, 0, vFlat, t * vecDim, vecDim);
+        }
 
-            // Append to quantized cache
-            using var kBuf = accelerator.Allocate1D(kData);
-            using var vBuf = accelerator.Allocate1D(vData);
-            kvCache.Append(0, kBuf.View, vBuf.View);
+        // Upload ALL tokens once and Append each token's SubView. kvCache.Append runs
+        // QuantizeVector, which dispatches kernels that READ the input view — on WebGPU
+        // these are batched in the command encoder and not executed until SynchronizeAsync
+        // below. The previous code allocated a per-token `using var kBuf`/`vBuf` and disposed
+        // it each iteration, destroying the buffer before the flush, so the cache quantized
+        // garbage and the GPU attention output was all zeros (cosine 0). Whole-buffer
+        // SubViews stay alive until the flush.
+        using var kAllBuf = accelerator.Allocate1D(kFlat);
+        using var vAllBuf = accelerator.Allocate1D(vFlat);
+        for (int t = 0; t < numTokens; t++)
+        {
+            kvCache.Append(0, kAllBuf.View.SubView(t * vecDim, vecDim), vAllBuf.View.SubView(t * vecDim, vecDim));
             kvCache.AdvanceToken();
         }
 

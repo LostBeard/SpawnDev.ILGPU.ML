@@ -45,7 +45,10 @@ public abstract partial class MLTestBase
         }
     });
 
-    [TestMethod(Timeout = 120000)]
+    // HeavyModel: downloads a ~330MB GPT-2 decoder ONNX from the HuggingFace CDN AND compiles it
+    // on the GPU — minutes of download + compile, same big-model class as the DA3/GPT-2 reference
+    // tests. Gated out of the fast loop; run with PMT_EXCLUDE_CATEGORIES= when exercising it.
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task WebTorrent_DownloadOnnxModel() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

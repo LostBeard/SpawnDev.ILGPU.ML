@@ -118,7 +118,7 @@ public abstract partial class MLTestBase
 
     // ── DA3 Model Tests (require ONNX from HuggingFace) ──
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task DA3Small_ONNX_Loads() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -149,7 +149,7 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[DA3] DA3-Small ONNX load: PASS");
     });
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task DA3Small_Inference_ProducesDepth() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -229,7 +229,7 @@ public abstract partial class MLTestBase
         throw new Exception($"PASSED. timing: download={tDownload}ms create={tCreate}ms run={tRun}ms verify={tVerify}ms total={sw.ElapsedMilliseconds}ms; output absMax={absMax:F4} meanAbs={meanAbs:F4} NaN={nanCount}/{elems}");
     });
 
-    [TestMethod(Timeout = 300000)]
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task DA3Small_DepthMap_NotFlat() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -298,7 +298,7 @@ public abstract partial class MLTestBase
     /// increase kernel compile time"). Bounds work via GraphExecutor.BreakAtNode
     /// so the test fits in a reasonable budget even on a slow backend.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
     public async Task DA3Small_FirstNNodes_DiagnosticPerOpSync() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

@@ -13,6 +13,9 @@ public class ProjectTest
     public string? TestPageUrl { get; }
     public TestResult Result { get; set; }
     public string? ResultMessage { get; set; }
+    /// <summary>Category from [TestMethod(Category="...")], scraped from the row's
+    /// data-test-category attribute. Used to skip slow categories in routine runs.</summary>
+    public string Category { get; set; } = "";
     public Func<IPage, Task> TestFunc { get; set; }
     public ProjectTest(TestableProject testableProject, string name)
     {
@@ -115,10 +118,35 @@ public class ProjectTest
             // click the button to start the process for this row (button will be disabled)
             await runButton.ClickAsync();
 
-            // wait for test to finish (button will become enabled again)
+            // Wait for THIS row to reach the Done state, keyed on the row's 'test-state-done'
+            // class (set only when test.State == Done), and treat ANY page-query failure as
+            // "not done yet" so the lane only advances on a POSITIVE Done observation.
+            //
+            // Two bugs this guards against, both of which let the lane advance while the test
+            // was still running → tests ran CONCURRENTLY on the shared page → multiple heavy
+            // models at once → GPU OOM (VK_ERROR_OUT_OF_DEVICE_MEMORY) + shared cached
+            // accelerator disposed under sibling tests (ObjectDisposed cascade):
+            //   1. The old check polled the Run button's *enabled* state — right after
+            //      ClickAsync the button is briefly still enabled (Blazor has not re-rendered
+            //      yet), so it returned true on the first poll and reported "done" instantly.
+            //   2. Heavy tests saturate the single Blazor WASM main thread (per-node GPU→CPU
+            //      readbacks + CPU-side verification), so an EvaluateAsync poll can time out
+            //      and THROW. If that exception escapes the condition, WaitForConditionAsync
+            //      propagates it and the lane advances. Catching it and returning false keeps
+            //      us waiting until the page frees up and we actually observe Done.
+            // querySelector returns null safely if the row is momentarily detached.
             await page.WaitForConditionAsync(async () =>
             {
-                return await runButton.IsEnabledAsync();
+                try
+                {
+                    return await page.EvaluateAsync<bool>(
+                        "sel => { const el = document.querySelector(sel); return el != null && el.classList.contains('test-state-done'); }",
+                        rowSelector);
+                }
+                catch
+                {
+                    return false; // page busy / transient — keep waiting, never advance
+                }
             });
 
             // Stop capturing console

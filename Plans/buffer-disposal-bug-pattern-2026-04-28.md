@@ -216,3 +216,36 @@ Proposed fix paths (in order of preference):
 3. **`AcceleratorRequirements.RequiresAtomics = true` on the ML test class.** Skips AssertCloseGpu-dependent tests on WebGL with a clean reason. Doesn't fix the underlying problem but stops the noise.
 
 Logged here, not fixed today.
+
+---
+
+## 2026-06-01 update (Tuvok) — three more instances surfaced by the fast WebGPU loop
+
+The HeavyModel-gated fast WebGPU PMT loop surfaced `TurboQuant_KVCache_FlashAttention_EndToEnd`
+failing with the same `[Buffer used in submit while destroyed]` (3 errors). 4.9.11's stricter
+`SynchronizeAsync → ThrowIfGpuErrors` now surfaces this latent class. Two on-path sites fixed,
+one off-path latent site logged:
+
+1. **`FWHTKernel.ForwardBatch` non-power-of-2 padding path** (`Kernels/FWHTKernel.cs`) — the root
+   cause here. `using var padBuf = Allocate1D<float>(batchSize*dPad)` was disposed when the method
+   returned, before the caller's flush. FWHT runs once per token-append AND twice in FlashAttention
+   (vecDim=384 → not a power of 2 → padding path), so ~10 padBufs were destroyed before the single
+   end-of-test submit. **Fix:** pooled `_padBuf` member buffer, reused across calls, grown via the
+   deferred `_oldPadBufs` list (never disposed mid-flight) — mirrors `TurboQuantKernels._oldParamsBufs`
+   and `ElementWiseKernels._oldStridesBufs`. Also removes per-call alloc/free churn (Rule 4).
+
+2. **`QuantizedKVCache.FlashAttention` local temps** (`Kernels/QuantizedKVCache.cs`) — six
+   `using var` scratch buffers (qNormalized/qNorms/qFlipped/qTransformed/attnOut/invFWHT) disposed
+   on method return before the caller's flush. **Fix:** pooled member buffers `_faQNormalized…`,
+   lazily grown via `EnsureFlashAttentionScratch`, disposed only in `QuantizedKVCache.Dispose`.
+
+3. **`QuantizedKVCache.GetDequantized` temps** (`Kernels/QuantizedKVCache.cs:419-422`,
+   tempUnpacked/tempDequant/tempInvFWHT/tempInvFlip) — same `using var` class. **LATENT, not fixed:**
+   no current test exercises GetDequantized in a batched-before-flush context, so it isn't failing.
+   Logged so the next editor fixes it with the same pooling pattern when a test reaches it.
+
+Lesson reinforced: the safe pattern for any GPU temp that a kernel dispatch references is a pooled
+member buffer (or the deferred `_oldXxxBufs` keep-alive list), never a method-local `using var`,
+because on WebGPU the dispatch is not submitted until the CALLER flushes. See also
+[[feedback-dotnet-pack-stale-incremental-build]] for the parallel "verify by running, not by intent"
+discipline used to confirm these fixes.

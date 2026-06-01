@@ -286,26 +286,46 @@ namespace PlaywrightMultiTest
                             const rows = document.querySelectorAll('table.unit-test-view tbody tr');
                             return Array.from(rows).map(r => ({
                                 typeName: r.querySelector('.test-type-name')?.textContent ?? '',
-                                methodName: r.querySelector('.test-method-name')?.textContent ?? ''
+                                methodName: r.querySelector('.test-method-name')?.textContent ?? '',
+                                category: r.getAttribute('data-test-category') ?? ''
                             }));
                         }").ConfigureAwait(false);
 
+                        var excludedCats = ExcludedCategories();
                         int totalRows = rowsJson.GetArrayLength();
+                        int excludedByCategory = 0;
                         for (int i = 0; i < totalRows; i++)
                         {
                             var row = rowsJson[i];
                             var typeName = row.GetProperty("typeName").GetString() ?? "";
                             var methodName = row.GetProperty("methodName").GetString() ?? "";
-                            var rowTest = new ProjectTest(testableProject, typeName, methodName, testPageUrl);
+                            var category = row.TryGetProperty("category", out var catProp) ? (catProp.GetString() ?? "") : "";
+                            var rowTest = new ProjectTest(testableProject, typeName, methodName, testPageUrl) { Category = category };
 
                             if (filter != null && !MatchesFilter(filter, rowTest))
                             {
                                 continue;
                             }
 
+                            // Default fast loop skips slow integration tests by category (e.g.
+                            // "HeavyModel" — big-model end-to-end tests that run ~minutes via
+                            // per-node shape readbacks). Applied REGARDLESS of PMT_FILTER, because
+                            // the primary dev loop is a broad filter like PMT_FILTER=WebGPUTests —
+                            // keeping the heavy tests off the single shared Chromium page there is
+                            // exactly where the orphan-on-timeout overlap bug bites. To deliberately
+                            // run a heavy test, clear the set (PMT_EXCLUDE_CATEGORIES=) and scope by
+                            // name, or set PMT_EXCLUDE_CATEGORIES to a different category list.
+                            if (!string.IsNullOrEmpty(category)
+                                && excludedCats.Contains(category, StringComparer.OrdinalIgnoreCase))
+                            {
+                                excludedByCategory++;
+                                continue;
+                            }
+
                             testableProject.Tests.Add(rowTest);
                         }
-                        LogStatus($"Browser tests enumerated: {testableProject.Tests.Count} tests");
+                        LogStatus($"Browser tests enumerated: {testableProject.Tests.Count} tests"
+                            + (excludedByCategory > 0 ? $" ({excludedByCategory} skipped by category [{string.Join(",", excludedCats)}])" : ""));
 
                     }
                     catch (Exception ex)
@@ -339,28 +359,58 @@ namespace PlaywrightMultiTest
                         continue;
                     }
 
-                    // get list of tests by running the exe with a specific argument
+                    // get list of tests by running the exe with a specific argument.
+                    // PMT_EMIT_CATEGORY=1 opts the console enumeration into the
+                    // "Type.Method|Category" line format (SpawnDev.UnitTesting 2.5.5+) so the
+                    // desktop lanes can honor the same HeavyModel gate as the browser lane.
+                    // The child process inherits this env var (ProcessRunner uses
+                    // UseShellExecute=false without overriding EnvironmentVariables).
+                    Environment.SetEnvironmentVariable("PMT_EMIT_CATEGORY", "1");
+                    var excludedCats = ExcludedCategories();
+                    int excludedByCategory = 0;
                     LogStatus($"Enumerating tests from {Path.GetFileName(publishedBinary)}...");
                     var result = await ProcessRunner.Run(publishedBinary).ConfigureAwait(false);
                     LogStatus($"Enumeration done: exit={result.ExitCode}, lines={result.Text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length}");
                     var testList = result.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
                     foreach (var test in testList)
                     {
+                        // Lines are "Type.Method", or "Type.Method|Category" when the enumeration
+                        // honored PMT_EMIT_CATEGORY. Strip the trailing "|Category" before the dot
+                        // split (method/type names never contain '|').
+                        var line = test;
+                        var category = "";
+                        var pipeIdx = line.IndexOf('|');
+                        if (pipeIdx >= 0)
+                        {
+                            category = line.Substring(pipeIdx + 1);
+                            line = line.Substring(0, pipeIdx);
+                        }
+
                         // get test type name
-                        var typeName = test.Split(".")[0];
+                        var typeName = line.Split(".")[0];
 
                         // get test method name — skip lines where the method part is empty (e.g.
                         // console output from initialization code like "[LocalTracker] foo..." that
                         // ends with a dot but has no real method name after it)
-                        var parts = test.Split(".");
+                        var parts = line.Split(".");
                         var methodName = parts.Length >= 2 ? parts[1] : "";
                         if (string.IsNullOrWhiteSpace(methodName)) continue;
 
-                        var rowTest = new ProjectTest(testableProject, typeName!, methodName!);
+                        var rowTest = new ProjectTest(testableProject, typeName!, methodName!) { Category = category };
                         if (filter != null && !MatchesFilter(filter, rowTest))
                         {
                             continue;
                         }
+
+                        // Same HeavyModel-style category gate as the browser branch, applied
+                        // REGARDLESS of PMT_FILTER. Clear PMT_EXCLUDE_CATEGORIES to run them.
+                        if (!string.IsNullOrEmpty(category)
+                            && excludedCats.Contains(category, StringComparer.OrdinalIgnoreCase))
+                        {
+                            excludedByCategory++;
+                            continue;
+                        }
+
                         testableProject.Tests.Add(rowTest);
 
                         rowTest.TestFunc = async (page) =>
@@ -423,6 +473,9 @@ namespace PlaywrightMultiTest
                             var nmtt = true;
                         };
                     }
+
+                    LogStatus($"Console tests enumerated for {project.Name}: {testableProject.Tests.Count} tests"
+                        + (excludedByCategory > 0 ? $" ({excludedByCategory} skipped by category [{string.Join(",", excludedCats)}])" : ""));
 
                     var nmt11 = true;
                 }
@@ -1019,6 +1072,18 @@ namespace PlaywrightMultiTest
             (t.Name?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)
             || (t.TestTypeName?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)
             || (t.TestMethodName?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false);
+
+        // Test categories ([TestMethod(Category="...")]) skipped by default in routine runs.
+        // "HeavyModel" = slow big-model end-to-end tests (minutes each via per-node shape
+        // readbacks). Override via env PMT_EXCLUDE_CATEGORIES (comma-separated; empty string
+        // = exclude nothing / run everything).
+        private static readonly string[] DefaultExcludedCategories = { "HeavyModel" };
+        private static string[] ExcludedCategories()
+        {
+            var env = Environment.GetEnvironmentVariable("PMT_EXCLUDE_CATEGORIES");
+            if (env == null) return DefaultExcludedCategories;
+            return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
 
         private static string DesktopLaneOf(string? typeName) => (typeName ?? "") switch
         {
