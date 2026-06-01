@@ -19,7 +19,7 @@ public class Conv2DKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
-    // params: inC, inH, inW, outC, kH, kW, stride, padding, dilationH, dilationW
+    // params: inC, inH, inW, outC, kH, kW, stride, padTL(packed), outHW(packed), dilHW(packed)
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
@@ -28,7 +28,7 @@ public class Conv2DKernel : IDisposable
         int, int, int, int, int, int, int, int, int, int>?
         _conv2dKernel;
 
-    // params: C, inH, inW, kH, kW, stride, padding, dilationH, dilationW
+    // params: C, inH, inW, kH, kW, stride, padTL(packed), outHW(packed), dilHW(packed)
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
@@ -68,13 +68,16 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW, int outC, int kH, int kW,
-        int stride, int padding, int dilationH, int dilationW)
+        int stride, int padTL, int outHW, int dilHW)
     {
-        int effKH = dilationH * (kH - 1) + 1;
-        int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
-
+        // outH/outW, BEGIN pads, and dilations are passed PACKED to stay within ILGPU's
+        // 15-arg kernel limit: padTL=(padTop<<8)|padLeft, outHW=(outH<<16)|outW,
+        // dilHW=(dilationH<<8)|dilationW. Recomputing dims here from a single symmetric pad
+        // silently truncated stride-2 SAME convs (192->95 instead of 96), shearing every
+        // downstream feature map.
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
         int ox = idx % outW;
         int rem = idx / outW;
         int oy = rem % outH;
@@ -90,12 +93,12 @@ public class Conv2DKernel : IDisposable
             int wcBase = oc * inC * kH * kW + ic * kH * kW;
             for (int ky = 0; ky < kH; ky++)
             {
-                int iy = oy * stride + ky * dilationH - padding;
+                int iy = oy * stride + ky * dilationH - padTop;
                 if (iy < 0 || iy >= inH) continue;
 
                 for (int kx = 0; kx < kW; kx++)
                 {
-                    int ix = ox * stride + kx * dilationW - padding;
+                    int ix = ox * stride + kx * dilationW - padLeft;
                     if (ix < 0 || ix >= inW) continue;
 
                     sum += (double)input[icBase + iy * inW + ix] * (double)weight[wcBase + ky * kW + kx];
@@ -119,36 +122,54 @@ public class Conv2DKernel : IDisposable
         int outC, int kH, int kW,
         int stride = 1, int padding = 0,
         int dilationH = 1, int dilationW = 1)
+        => ForwardPadded(input, weight, bias, output, inC, inH, inW, outC, kH, kW,
+            stride, padding, padding, padding, padding, dilationH, dilationW);
+
+    /// <summary>
+    /// Conv2D NCHW with explicit asymmetric ONNX pads [padTop, padLeft, padBottom, padRight].
+    /// Output dims are computed from the FULL (begin+end) pads — never from a single symmetric
+    /// value — so stride-2 SAME convs (ONNX pads like [0,0,1,1]) produce the correct grid
+    /// instead of a 1-short, sheared one.
+    /// </summary>
+    public void ForwardPadded(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW,
+        int outC, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
     {
         EnsureLoaded();
 
         int effKH = dilationH * (kH - 1) + 1;
         int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
+        int outH = (inH + padTop + padBottom - effKH) / stride + 1;
+        int outW = (inW + padLeft + padRight - effKW) / stride + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"Conv2D output dimensions are invalid: outH={outH}, outW={outW} " +
-                $"(inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, padding={padding}, dilation={dilationH}x{dilationW}). " +
+                $"(inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}). " +
                 $"This usually means SAME padding was not applied correctly.");
         int totalOutputElements = outC * outH * outW;
         _convCallCount++;
         if (output.Length < totalOutputElements)
             throw new InvalidOperationException(
                 $"Conv2D NCHW output buffer too small: output.Length={output.Length} but kernel will write {totalOutputElements} elements " +
-                $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} padding={padding} dilation={dilationH}x{dilationW}). " +
+                $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
         try
         {
             _conv2dKernel!(totalOutputElements, input, weight, bias, output,
-                inC, inH, inW, outC, kH, kW, stride, padding, dilationH, dilationW);
+                inC, inH, inW, outC, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
         }
         catch (global::ILGPU.Runtime.OpenCL.CLException clEx)
         {
             throw new InvalidOperationException(
-                $"[Conv2DKernel.Forward call #{_convCallCount} {_accelerator.AcceleratorType}] "
+                $"[Conv2DKernel.ForwardPadded call #{_convCallCount} {_accelerator.AcceleratorType}] "
                 + $"OpenCL {clEx.Error} (CLError) at "
-                + $"input=[{inC},{inH},{inW}] outC={outC} k={kH}x{kW} stride={stride} pad={padding} "
+                + $"input=[{inC},{inH},{inW}] outC={outC} k={kH}x{kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] "
                 + $"totalOutput={totalOutputElements}", clEx);
         }
     }
@@ -164,13 +185,12 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int kH, int kW,
-        int stride, int padding, int dilationH, int dilationW)
+        int stride, int padTL, int outHW, int dilHW)
     {
-        int effKH = dilationH * (kH - 1) + 1;
-        int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
-
+        // outH/outW + begin pads + dilations passed packed. See Conv2DImpl.
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
         int ox = idx % outW;
         int rem = idx / outW;
         int oy = rem % outH;
@@ -182,12 +202,12 @@ public class Conv2DKernel : IDisposable
         int wBase = c * kH * kW;
         for (int ky = 0; ky < kH; ky++)
         {
-            int iy = oy * stride + ky * dilationH - padding;
+            int iy = oy * stride + ky * dilationH - padTop;
             if (iy < 0 || iy >= inH) continue;
 
             for (int kx = 0; kx < kW; kx++)
             {
-                int ix = ox * stride + kx * dilationW - padding;
+                int ix = ox * stride + kx * dilationW - padLeft;
                 if (ix < 0 || ix >= inW) continue;
 
                 sum += (double)input[inBase + iy * inW + ix] * (double)weight[wBase + ky * kW + kx];
@@ -206,26 +226,36 @@ public class Conv2DKernel : IDisposable
         int kH, int kW,
         int stride = 1, int padding = 0,
         int dilationH = 1, int dilationW = 1)
+        => ForwardDepthwisePadded(input, weight, bias, output, C, inH, inW, kH, kW,
+            stride, padding, padding, padding, padding, dilationH, dilationW);
+
+    /// <summary>Depthwise Conv2D NCHW with explicit asymmetric ONNX pads [top,left,bottom,right].</summary>
+    public void ForwardDepthwisePadded(
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
     {
         EnsureLoaded();
         int effKH = dilationH * (kH - 1) + 1;
         int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
+        int outH = (inH + padTop + padBottom - effKH) / stride + 1;
+        int outW = (inW + padLeft + padRight - effKW) / stride + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"DepthwiseConv2D output dimensions are invalid: outH={outH}, outW={outW} " +
-                $"(C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, padding={padding}, dilation={dilationH}x{dilationW}). " +
+                $"(C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}). " +
                 $"This usually means SAME padding was not applied correctly.");
         long needed = (long)C * outH * outW;
         if (output.Length < needed)
             throw new InvalidOperationException(
                 $"DepthwiseConv2D NCHW output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
-                $"(C={C} outH={outH} outW={outW}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} padding={padding} dilation={dilationH}x{dilationW}). " +
+                $"(C={C} outH={outH} outW={outW}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
 
         _depthwiseKernel!((int)needed, input, weight, bias, output,
-            C, inH, inW, kH, kW, stride, padding, dilationH, dilationW);
+            C, inH, inW, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
     }
 
     // ═══ NHWC Variants (TFLite native layout) ═══
@@ -240,14 +270,12 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW, int outC, int kH, int kW,
-        int stride, int padding, int dilationH, int dilationW)
+        int stride, int padTL, int outHW, int dilHW)
     {
-        int effKH = dilationH * (kH - 1) + 1;
-        int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
-
-        // NHWC output: [oy, ox, oc] indexing
+        // NHWC output: [oy, ox, oc] indexing. outH/outW + begin pads + dilations packed. See Conv2DImpl.
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
         int oc = idx % outC;
         int rem = idx / outC;
         int ox = rem % outW;
@@ -263,9 +291,9 @@ public class Conv2DKernel : IDisposable
             int ky = rem2 / kW;
             int kx = rem2 % kW;
 
-            int iy = oy * stride + ky * dilationH - padding;
+            int iy = oy * stride + ky * dilationH - padTop;
             if (iy < 0 || iy >= inH) continue;
-            int ix = ox * stride + kx * dilationW - padding;
+            int ix = ox * stride + kx * dilationW - padLeft;
             if (ix < 0 || ix >= inW) continue;
 
             int inIdx = (iy * inW + ix) * inC + ic;
@@ -281,25 +309,35 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW, int outC, int kH, int kW, int stride = 1, int padding = 0,
         int dilationH = 1, int dilationW = 1)
+        => ForwardNHWCPadded(input, weight, bias, output, inC, inH, inW, outC, kH, kW,
+            stride, padding, padding, padding, padding, dilationH, dilationW);
+
+    /// <summary>Conv2D NHWC with explicit asymmetric ONNX pads [top,left,bottom,right].</summary>
+    public void ForwardNHWCPadded(
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
     {
         EnsureLoaded();
         int effKH = dilationH * (kH - 1) + 1;
         int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
+        int outH = (inH + padTop + padBottom - effKH) / stride + 1;
+        int outW = (inW + padLeft + padRight - effKW) / stride + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"Conv2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
-                $"(inC={inC}, inH={inH}, inW={inW}, outC={outC}, kH={kH}, kW={kW}, stride={stride}, padding={padding}, dilation={dilationH}x{dilationW}). " +
+                $"(inC={inC}, inH={inH}, inW={inW}, outC={outC}, kH={kH}, kW={kW}, stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}). " +
                 $"This usually means SAME padding was not applied correctly.");
         long needed = (long)outH * outW * outC;
         if (output.Length < needed)
             throw new InvalidOperationException(
                 $"Conv2D NHWC output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
-                $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} padding={padding} dilation={dilationH}x{dilationW}). " +
+                $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
         _conv2dNHWCKernel!((int)needed, input, weight, bias, output,
-            inC, inH, inW, outC, kH, kW, stride, padding, dilationH, dilationW);
+            inC, inH, inW, outC, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
     }
 
     /// <summary>
@@ -312,13 +350,12 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int kH, int kW,
-        int stride, int padding, int dilationH, int dilationW)
+        int stride, int padTL, int outHW, int dilHW)
     {
-        int effKH = dilationH * (kH - 1) + 1;
-        int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
-
+        // outH/outW + begin pads + dilations passed packed. See Conv2DImpl.
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
         int c = idx % C;
         int rem = idx / C;
         int ox = rem % outW;
@@ -331,9 +368,9 @@ public class Conv2DKernel : IDisposable
         {
             int ky = k / kW;
             int kx = k % kW;
-            int iy = oy * stride + ky * dilationH - padding;
+            int iy = oy * stride + ky * dilationH - padTop;
             if (iy < 0 || iy >= inH) continue;
-            int ix = ox * stride + kx * dilationW - padding;
+            int ix = ox * stride + kx * dilationW - padLeft;
             if (ix < 0 || ix >= inW) continue;
 
             int inIdx = (iy * inW + ix) * C + c;
@@ -349,25 +386,35 @@ public class Conv2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
         int C, int inH, int inW, int kH, int kW, int stride = 1, int padding = 0,
         int dilationH = 1, int dilationW = 1)
+        => ForwardDepthwiseNHWCPadded(input, weight, bias, output, C, inH, inW, kH, kW,
+            stride, padding, padding, padding, padding, dilationH, dilationW);
+
+    /// <summary>Depthwise Conv2D NHWC with explicit asymmetric ONNX pads [top,left,bottom,right].</summary>
+    public void ForwardDepthwiseNHWCPadded(
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
     {
         EnsureLoaded();
         int effKH = dilationH * (kH - 1) + 1;
         int effKW = dilationW * (kW - 1) + 1;
-        int outH = (inH + 2 * padding - effKH) / stride + 1;
-        int outW = (inW + 2 * padding - effKW) / stride + 1;
+        int outH = (inH + padTop + padBottom - effKH) / stride + 1;
+        int outW = (inW + padLeft + padRight - effKW) / stride + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
                 $"DepthwiseConv2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
-                $"(C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, padding={padding}, dilation={dilationH}x{dilationW}). " +
+                $"(C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}). " +
                 $"This usually means SAME padding was not applied correctly.");
         long needed = (long)outH * outW * C;
         if (output.Length < needed)
             throw new InvalidOperationException(
                 $"DepthwiseConv2D NHWC output buffer too small: output.Length={output.Length} but kernel will write {needed} elements " +
-                $"(outH={outH} outW={outW} C={C}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} padding={padding} dilation={dilationH}x{dilationW}). " +
+                $"(outH={outH} outW={outW} C={C}, inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
         _depthwiseNHWCKernel!((int)needed, input, weight, bias, output,
-            C, inH, inW, kH, kW, stride, padding, dilationH, dilationW);
+            C, inH, inW, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
     }
 
     private void EnsureLoaded()

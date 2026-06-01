@@ -61,6 +61,11 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public static Dictionary<string, string>? CapturedNodeInfo { get; set; }
 
+    /// <summary>DIAGNOSTIC: max elements captured per node into <see cref="CapturedOutputs"/>.
+    /// Default 1024 (covers shape tensors + small features). Raise to capture full
+    /// feature channels (e.g. a 48x48x17 heatmap = 39168) when hunting a spatial bug.</summary>
+    public static int CaptureMaxElements = 1024;
+
     /// <summary>
     /// DIAGNOSTIC: when non-null, captures per-node Execute() wall-clock time in
     /// milliseconds keyed by the same node key as <see cref="CapturedOutputs"/>.
@@ -968,7 +973,7 @@ public class GraphExecutor : IDisposable
                 var captureOutput = nodeOutputs[0];
                 // Capture enough values to get a meaningful absMax (at least one full
                 // channel for Conv outputs). 1024 covers most shape tensors and small features.
-                int captureCount = Math.Min(1024, captureOutput.ElementCount);
+                int captureCount = Math.Min(CaptureMaxElements, captureOutput.ElementCount);
                 if (captureCount > 0)
                 {
                     try

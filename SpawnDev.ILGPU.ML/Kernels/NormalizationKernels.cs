@@ -15,7 +15,7 @@ public class NormalizationKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        int, int, int>? _batchNormKernel;
+        int, int, int, float>? _batchNormKernel;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
@@ -48,10 +48,8 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> mean,
         ArrayView1D<float, Stride1D.Dense> variance,
-        int N, int C, int spatial)
+        int N, int C, int spatial, float eps)
     {
-        float eps = 1e-5f;
-
         // Determine which channel this element belongs to
         int c = (idx / spatial) % C;
 
@@ -152,10 +150,10 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> mean,
         ArrayView1D<float, Stride1D.Dense> variance,
-        int N, int C, int spatial)
+        int N, int C, int spatial, float epsilon = 1e-5f)
     {
         EnsureLoaded();
-        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, N, C, spatial);
+        _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, N, C, spatial, epsilon);
     }
 
     /// <summary>
@@ -257,7 +255,7 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int>(BatchNormImpl);
+            int, int, int, float>(BatchNormImpl);
         _instanceNormMeanVarKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

@@ -156,9 +156,10 @@ public class BatchNormOperator(OperatorRegistry reg) : IOnnxOperator
         var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
             : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
         int spatial = ctx.Inputs[0].ElementCount / (N * C);
+        float epsilon = ctx.GetFloat("epsilon", 1e-5f); // TF/Keras BN exports 1e-3; ONNX default 1e-5
         reg.Normalization.BatchNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[1].Data, ctx.Inputs[2].Data,
-            ctx.Inputs[3].Data, ctx.Inputs[4].Data, N, C, spatial);
+            ctx.Inputs[3].Data, ctx.Inputs[4].Data, N, C, spatial, epsilon);
     }
 }
 
@@ -255,21 +256,34 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         var fmt = ctx.Format;
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
 
-        // Handle auto_pad (SAME_UPPER/SAME_LOWER from TFLite models)
+        // Resolve ONNX padding into the FOUR asymmetric components [top, left, bottom, right].
+        // ONNX `pads` = [x1_begin, x2_begin, x1_end, x2_end] = [top, left, bottom, right] for 2D.
+        // CRITICAL: stride-2 SAME convs (e.g. MobileNetV2) export asymmetric pads like [0,0,1,1].
+        // Collapsing these to a single symmetric value silently truncated the output grid
+        // (192->95 instead of 96) and sheared every downstream feature map. Keep all four.
         var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap) ? ap.ToString()! : "NOTSET";
-        int pad;
+        int padTop, padLeft, padBottom, padRight;
         if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
         {
             int inH = x.Shape.Length >= 4 ? x.Shape[LayoutHelper.HeightAxis(fmt)] : (x.Shape.Length >= 3 ? x.Shape[2] : 1);
-            int kH = w.Shape.Length >= 4 ? w.Shape[LayoutHelper.HeightAxis(fmt)] : (w.Shape.Length >= 3 ? w.Shape[2] : 1);
-            int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kH - inH);
-            pad = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
+            int inW = x.Shape.Length >= 4 ? x.Shape[LayoutHelper.WidthAxis(fmt)] : 1;
+            int kHa = w.Shape.Length >= 4 ? w.Shape[LayoutHelper.HeightAxis(fmt)] : (w.Shape.Length >= 3 ? w.Shape[2] : 1);
+            int kWa = w.Shape.Length >= 4 ? w.Shape[LayoutHelper.WidthAxis(fmt)] : (w.Shape.Length >= 3 ? (w.Shape.Length > 3 ? w.Shape[3] : 1) : 1);
+            int strideW = strides.Length > 1 ? strides[1] : stride;
+            int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kHa - inH);
+            int padW = Math.Max(0, ((int)Math.Ceiling((double)inW / strideW) - 1) * strideW + kWa - inW);
+            if (autoPad == "SAME_UPPER") { padTop = padH / 2; padBottom = padH - padH / 2; padLeft = padW / 2; padRight = padW - padW / 2; }
+            else { padTop = padH - padH / 2; padBottom = padH / 2; padLeft = padW - padW / 2; padRight = padW / 2; }
         }
         else
         {
             var pads = ctx.GetInts("pads");
-            pad = pads.Length > 0 ? pads[0] : 0;
+            padTop    = pads.Length > 0 ? pads[0] : 0;
+            padLeft   = pads.Length > 1 ? pads[1] : 0;
+            padBottom = pads.Length > 2 ? pads[2] : padTop;
+            padRight  = pads.Length > 3 ? pads[3] : padLeft;
         }
+        int pad = padTop; // Conv1D below uses the (symmetric) begin pad
         var dilationsAttr = ctx.GetInts("dilations");
         int dilationH = dilationsAttr.Length > 0 ? dilationsAttr[0] : 1;
         int dilationW = dilationsAttr.Length > 1 ? dilationsAttr[1] : dilationH;
@@ -313,20 +327,20 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             {
                 // Depthwise conv
                 if (fmt == DataFormat.NHWC)
-                    reg.Conv2D.ForwardDepthwiseNHWC(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, pad, dilationH, dilationW);
+                    reg.Conv2D.ForwardDepthwiseNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
                 else
-                    reg.Conv2D.ForwardDepthwise(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, kH, kW, stride, pad, dilationH, dilationW);
+                    reg.Conv2D.ForwardDepthwisePadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
             }
             else if (group == 1)
             {
                 if (fmt == DataFormat.NHWC)
-                    reg.Conv2D.ForwardNHWC(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, pad, dilationH, dilationW);
+                    reg.Conv2D.ForwardNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
                 else
-                    reg.Conv2D.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, pad, dilationH, dilationW);
+                    reg.Conv2D.ForwardPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
             }
             else if (group > 1 && inC % group == 0 && outC % group == 0)
             {
@@ -339,12 +353,12 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
                     int wOffset = g * outCPerGroup * inCPerGroup * kH * kW;
                     int outOffset = g * outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3];
                     // Use standard conv for each group slice
-                    reg.Conv2D.Forward(
+                    reg.Conv2D.ForwardPadded(
                         x.Data.SubView(inOffset, inCPerGroup * inH * inW),
                         w.Data.SubView(wOffset, outCPerGroup * inCPerGroup * kH * kW),
                         bias.SubView(g * outCPerGroup, outCPerGroup),
                         ctx.Outputs[0].Data.SubView(outOffset, outCPerGroup * ctx.Outputs[0].Shape[2] * ctx.Outputs[0].Shape[3]),
-                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, pad, dilationH, dilationW);
+                        inCPerGroup, inH, inW, outCPerGroup, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
                 }
             }
             else
