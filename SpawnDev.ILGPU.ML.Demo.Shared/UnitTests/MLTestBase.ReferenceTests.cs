@@ -216,7 +216,7 @@ public abstract partial class MLTestBase
 
     // ── Style Transfer Reference Tests ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task Reference_StyleMosaic_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,
@@ -266,7 +266,7 @@ public abstract partial class MLTestBase
         }
     });
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task Reference_StyleCandy_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,
@@ -276,7 +276,7 @@ public abstract partial class MLTestBase
             new[] { 1, 3, 224, 224 }, 5.0f, "StyleCandy");
     });
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task Reference_StyleRainPrincess_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,
@@ -286,7 +286,7 @@ public abstract partial class MLTestBase
             new[] { 1, 3, 224, 224 }, 5.0f, "StyleRainPrincess");
     });
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task Reference_StyleUdnie_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,
@@ -296,7 +296,7 @@ public abstract partial class MLTestBase
             new[] { 1, 3, 224, 224 }, 5.0f, "StyleUdnie");
     });
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task Reference_StylePointilism_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,

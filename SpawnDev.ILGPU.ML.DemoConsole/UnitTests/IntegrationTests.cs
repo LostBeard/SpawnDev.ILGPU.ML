@@ -760,7 +760,7 @@ public class IntegrationTests
     /// <summary>
     /// Direct .onnx style transfer: load mosaic model from .onnx, apply to gradient image.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task DirectOnnx_StyleTransfer_Mosaic()
     {
         // With two-pass InstanceNorm, style transfer should be much faster on CPU

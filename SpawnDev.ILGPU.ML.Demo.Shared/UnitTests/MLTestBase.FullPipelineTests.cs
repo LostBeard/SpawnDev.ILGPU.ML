@@ -12,7 +12,7 @@ public abstract partial class MLTestBase
     /// Style Transfer: load mosaic style model, apply to a gradient image,
     /// verify output pixels are non-zero and differ from input.
     /// </summary>
-    [TestMethod(Timeout = 60000)]
+    [TestMethod(Timeout = 60000, Category = "HeavyCpu")]
     public async Task WebModel_StyleTransfer_Mosaic() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

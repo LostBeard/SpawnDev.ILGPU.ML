@@ -1131,8 +1131,29 @@ namespace PlaywrightMultiTest
                 {
                     var tests = laneGroup.ToList();
                     var cap = CapFor(laneGroup.Key);
-                    LogStatus($"Phase A desktop lane '{laneGroup.Key}': {tests.Count} tests, cap={cap}");
-                    phaseA.Add(RunLaneConcurrentAsync(tests, cap, null));
+
+                    // CPU lane only: the ILGPU CPU accelerator already saturates ALL cores per
+                    // process, so running several compute-heavy CPU tests concurrently is pure
+                    // oversubscription (no throughput gain) and inflates each test's wall-clock
+                    // past its [TestMethod(Timeout=...)] — the failure mode that made every
+                    // real-model CPU test (style transfer etc.) "fail" with a timeout while the
+                    // exact same compute passed in isolation. So split: HeavyCpu-tagged tests run
+                    // serialized (cap=1, and alone — after the light burst drains) while light
+                    // tests keep the lane cap. The cuda/opencl lanes are already cap=1 and the
+                    // browser lane is single-page-sequential, so only the cpu lane needs this.
+                    if (laneGroup.Key == "cpu")
+                    {
+                        var heavy = tests.Where(IsCpuHeavy).ToList();
+                        var light = tests.Where(t => !IsCpuHeavy(t)).ToList();
+                        int heavyCap = EnvInt("PMT_CPU_HEAVY_PARALLELISM", 1);
+                        LogStatus($"Phase A desktop lane 'cpu': {light.Count} light (cap={cap}) + {heavy.Count} HeavyCpu (cap={heavyCap}, serialized after light)");
+                        phaseA.Add(RunCpuLaneAsync(light, cap, heavy, heavyCap));
+                    }
+                    else
+                    {
+                        LogStatus($"Phase A desktop lane '{laneGroup.Key}': {tests.Count} tests, cap={cap}");
+                        phaseA.Add(RunLaneConcurrentAsync(tests, cap, null));
+                    }
                 }
             }
 
@@ -1220,6 +1241,36 @@ namespace PlaywrightMultiTest
             await newPage.WaitForSelectorAsync("table.unit-test-ready", new() { Timeout = 30000 })
                 .ConfigureAwait(false);
             return newPage;
+        }
+
+        // Categories whose tests must run serialized on the CPU lane (one all-core CPU-accelerator
+        // process at a time). NOT an exclusion list — HeavyCpu tests run normally on every other
+        // lane (browser/WebGPU/WebGL/Wasm/CUDA/OpenCL), where they are fast; they are only slow on
+        // the CPU backend. Distinct from DefaultExcludedCategories ("HeavyModel" = skipped
+        // everywhere). Override the set via PMT_CPU_HEAVY_CATEGORIES (comma-separated).
+        private static readonly string[] DefaultCpuHeavyCategories = { "HeavyCpu" };
+        private static string[] CpuHeavyCategories()
+        {
+            var env = Environment.GetEnvironmentVariable("PMT_CPU_HEAVY_CATEGORIES");
+            if (env == null) return DefaultCpuHeavyCategories;
+            return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+        private static bool IsCpuHeavy(ProjectTest t) =>
+            !string.IsNullOrEmpty(t.Category)
+            && CpuHeavyCategories().Contains(t.Category, StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// CPU desktop lane: run the light tests at the lane cap (parallelism hides per-process
+        /// JIT/startup), then run the HeavyCpu tests serialized so each compute-bound, all-core
+        /// CPU test runs with ZERO competition from sibling CPU tests. A cap=1 PMT run proved a
+        /// heavy CPU style model passes well within its 120s budget when it does not contend with
+        /// other heavy CPU processes (the GPU/browser lanes running concurrently are fine). Light
+        /// runs first so the quick wins land before the serialized heavy pole.
+        /// </summary>
+        private async Task RunCpuLaneAsync(List<ProjectTest> light, int lightCap, List<ProjectTest> heavy, int heavyCap)
+        {
+            if (light.Count > 0) await RunLaneConcurrentAsync(light, lightCap, null).ConfigureAwait(false);
+            if (heavy.Count > 0) await RunLaneConcurrentAsync(heavy, heavyCap, null).ConfigureAwait(false);
         }
 
         private async Task RunLaneConcurrentAsync(List<ProjectTest> tests, int cap, IPage? page)

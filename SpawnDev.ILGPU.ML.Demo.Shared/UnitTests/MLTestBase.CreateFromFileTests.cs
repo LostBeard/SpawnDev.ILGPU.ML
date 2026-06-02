@@ -84,7 +84,10 @@ public abstract partial class MLTestBase
     /// Load style-mosaic via CreateFromFileAsync, apply to gradient image.
     /// Verifies output differs from input.
     /// </summary>
-    [TestMethod(Timeout = 60000)]
+    // 120s (not 60s): the same full 224x224 mosaic style inference as Reference_StyleMosaic,
+    // which is legitimately ~57s on the slow CPU backend (HeavyCpu, serialized). 60s was never a
+    // realistic budget for CPU; GPU backends finish in well under a second.
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task CreateFromFile_StyleTransfer_Mosaic() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
