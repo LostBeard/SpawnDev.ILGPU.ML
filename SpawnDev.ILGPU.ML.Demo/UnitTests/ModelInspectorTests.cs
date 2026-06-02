@@ -1,19 +1,29 @@
 using System.Text;
-using System.Text.Json;
 using SpawnDev.ILGPU.ML.Onnx;
 using SpawnDev.UnitTesting;
 
-namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
+namespace SpawnDev.ILGPU.ML.Demo.UnitTests;
 
 /// <summary>
-/// Tests for the Model Inspector demo (/inspector). These exercise the EXACT code path the
-/// demo page runs in HandleFileSelected: ModelInspectorHelper.Inspect(bytes) +
-/// ModelInspectorHelper.CheckCompatibility(bytes), against real model files. Pure in-browser
-/// parsing — no accelerator needed (parallels FormatDetectionTests). Proving these here means TJ
-/// only has to CONFIRM the demo, not discover whether it works.
+/// Tests for the Model Inspector demo (/inspector). These exercise the EXACT code path the demo page
+/// runs in HandleFileSelected: ModelInspectorHelper.InspectWithCompatibilityAsync over a stream, against
+/// real model files.
+///
+/// Model inspection is PURE CPU protobuf/header parsing — it NEVER touches a GPU accelerator. So these
+/// tests are NOT part of MLTestBase (which fans every method out across all 6 backend lanes); they live
+/// in their own class registered once in Program.cs, so they run a SINGLE time in the browser runtime
+/// (the meaningful environment: fetch-stream behavior, the sync-read ban, WASM memory limits) instead of
+/// 6× redundantly. Proving these here means TJ only has to CONFIRM the demo, not discover whether it works.
 /// </summary>
-public abstract partial class MLTestBase
+public class ModelInspectorTests
 {
+    private readonly HttpClient _http;
+
+    public ModelInspectorTests(HttpClient http)
+    {
+        _http = http;
+    }
+
     // Every model the Inspector demo accepts (the demo's accept= list is .onnx/.tflite/.gguf/.safetensors).
     private static readonly string[] AllInspectableModels =
     {
@@ -42,9 +52,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_Onnx_SqueezeNet_Inspects()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var bytes = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        var bytes = await _http.GetByteArrayAsync("models/squeezenet/model.onnx");
 
         var r = ModelInspectorHelper.Inspect(bytes);
         if (r.NodeCount <= 0) throw new Exception($"NodeCount={r.NodeCount}, expected > 0");
@@ -57,16 +65,20 @@ public abstract partial class MLTestBase
             throw new Exception("Expected graph/producer metadata");
     }
 
-    /// <summary>ONNX inspection: transformer models (GPT-2, DistilBERT) report millions of params + MatMul/Gemm.</summary>
-    [TestMethod]
+    /// <summary>
+    /// ONNX inspection: transformer models (GPT-2 ~623MB, DistilBERT ~256MB) report millions of params
+    /// + MatMul/Gemm. Inspected via STREAMING (InspectAsync over the HTTP response stream) — the weights
+    /// are skipped, never buffered, so this never materializes the multi-hundred-MB file in memory. This
+    /// is the exact path the demo runs when a user drops a large model. I/O-bound (large transfer), so a
+    /// generous timeout, not the 30s compute default.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
     public async Task ModelInspector_Onnx_Transformers_Inspect()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
         foreach (var path in new[] { "models/gpt2/model.onnx", "models/distilbert-sst2/model.onnx" })
         {
-            var bytes = await http.GetByteArrayAsync(path);
-            var r = ModelInspectorHelper.Inspect(bytes);
+            using var stream = await _http.GetStreamAsync(path);
+            var r = await ModelInspectorHelper.InspectAsync(stream);
             if (r.NodeCount <= 0) throw new Exception($"{path}: NodeCount={r.NodeCount}");
             if (r.TotalParameters < 1_000_000) throw new Exception($"{path}: params={r.TotalParameters}, expected millions");
             if (!r.Operators.Any(o => o.OpType is "MatMul" or "Gemm"))
@@ -78,11 +90,9 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_TFLite_Models_Inspect()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
         foreach (var path in new[] { "models/blaze-face/model.tflite", "models/efficientnet-lite0/model.tflite" })
         {
-            var bytes = await http.GetByteArrayAsync(path);
+            var bytes = await _http.GetByteArrayAsync(path);
             var r = ModelInspectorHelper.Inspect(bytes);
             if (r.NodeCount <= 0) throw new Exception($"{path}: NodeCount={r.NodeCount}");
             if (r.Operators.Length < 1) throw new Exception($"{path}: expected operators");
@@ -96,10 +106,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_GGUF_Inspects()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
         byte[] bytes;
-        try { bytes = await http.GetByteArrayAsync("test-models/test.gguf"); }
+        try { bytes = await _http.GetByteArrayAsync("test-models/test.gguf"); }
         catch (HttpRequestException) { throw new UnsupportedTestException("test.gguf not available"); }
 
         var r = ModelInspectorHelper.Inspect(bytes);
@@ -113,10 +121,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_SafeTensors_Inspects()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
         byte[] bytes;
-        try { bytes = await http.GetByteArrayAsync("test-models/test.safetensors"); }
+        try { bytes = await _http.GetByteArrayAsync("test-models/test.safetensors"); }
         catch (HttpRequestException) { throw new UnsupportedTestException("test.safetensors not available"); }
 
         var r = ModelInspectorHelper.Inspect(bytes);
@@ -130,26 +136,31 @@ public abstract partial class MLTestBase
     /// Compatibility check is meaningful for ONNX: ops are partitioned into supported/unsupported,
     /// the counts are self-consistent, and a fully-supported model reports IsFullySupported.
     /// </summary>
-    [TestMethod]
+    [TestMethod(Timeout = 120000)]
     public async Task ModelInspector_Compatibility_Onnx_Meaningful()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        // SqueezeNet uses only supported ops → fully compatible. Streamed (CheckCompatibilityAsync reads
+        // only the graph structure; weights are skipped).
+        using (var sqStream = await _http.GetStreamAsync("models/squeezenet/model.onnx"))
+        {
+            var sq = await ModelInspectorHelper.CheckCompatibilityAsync(sqStream);
+            if (!sq.Applicable) throw new Exception("ONNX compat must be Applicable");
+            if (sq.TotalOpsUsed <= 0) throw new Exception("Expected ops");
+            if (sq.SupportedOps.Length + sq.UnsupportedOps.Length != sq.TotalOpsUsed)
+                throw new Exception($"Op partition mismatch: {sq.SupportedOps.Length}+{sq.UnsupportedOps.Length} != {sq.TotalOpsUsed}");
+            if (!sq.IsFullySupported) throw new Exception($"SqueezeNet expected fully supported; missing: {string.Join(",", sq.UnsupportedOps)}");
+        }
 
-        // SqueezeNet uses only supported ops → fully compatible.
-        var sq = ModelInspectorHelper.CheckCompatibility(await http.GetByteArrayAsync("models/squeezenet/model.onnx"));
-        if (!sq.Applicable) throw new Exception("ONNX compat must be Applicable");
-        if (sq.TotalOpsUsed <= 0) throw new Exception("Expected ops");
-        if (sq.SupportedOps.Length + sq.UnsupportedOps.Length != sq.TotalOpsUsed)
-            throw new Exception($"Op partition mismatch: {sq.SupportedOps.Length}+{sq.UnsupportedOps.Length} != {sq.TotalOpsUsed}");
-        if (!sq.IsFullySupported) throw new Exception($"SqueezeNet expected fully supported; missing: {string.Join(",", sq.UnsupportedOps)}");
-
-        // GPT-2 has some unsupported ops → partial but self-consistent (guards the % math).
-        var gpt2 = ModelInspectorHelper.CheckCompatibility(await http.GetByteArrayAsync("models/gpt2/model.onnx"));
-        if (gpt2.SupportedOps.Length + gpt2.UnsupportedOps.Length != gpt2.TotalOpsUsed)
-            throw new Exception("GPT-2 op partition mismatch");
-        if (gpt2.CompatibilityPercent < 0 || gpt2.CompatibilityPercent > 100)
-            throw new Exception($"GPT-2 CompatibilityPercent={gpt2.CompatibilityPercent} out of range");
+        // GPT-2 (~623MB) has some unsupported ops → partial but self-consistent (guards the % math).
+        // Streamed — its compatibility is checked without ever loading its weights.
+        using (var gpt2Stream = await _http.GetStreamAsync("models/gpt2/model.onnx"))
+        {
+            var gpt2 = await ModelInspectorHelper.CheckCompatibilityAsync(gpt2Stream);
+            if (gpt2.SupportedOps.Length + gpt2.UnsupportedOps.Length != gpt2.TotalOpsUsed)
+                throw new Exception("GPT-2 op partition mismatch");
+            if (gpt2.CompatibilityPercent < 0 || gpt2.CompatibilityPercent > 100)
+                throw new Exception($"GPT-2 CompatibilityPercent={gpt2.CompatibilityPercent} out of range");
+        }
     }
 
     /// <summary>
@@ -160,9 +171,6 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_Compatibility_NonOnnx_DoesNotThrow()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-
         var nonOnnx = new[]
         {
             "models/blaze-face/model.tflite",
@@ -172,12 +180,13 @@ public abstract partial class MLTestBase
         };
         foreach (var path in nonOnnx)
         {
-            byte[] bytes;
-            try { bytes = await http.GetByteArrayAsync(path); }
+            Stream stream;
+            try { stream = await _http.GetStreamAsync(path); }
             catch (HttpRequestException) { continue; }
 
-            // Must not throw.
-            var c = ModelInspectorHelper.CheckCompatibility(bytes);
+            // Must not throw (streamed — non-ONNX is detected from the prefix, weights never read).
+            CompatibilityResult c;
+            using (stream) c = await ModelInspectorHelper.CheckCompatibilityAsync(stream);
             if (c.Applicable)
                 throw new Exception($"{path}: op-compat is ONNX-only; expected Applicable==false");
             if (string.IsNullOrEmpty(c.Summary))
@@ -186,34 +195,31 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>
-    /// Full-coverage smoke: every model the demo accepts must Inspect() without throwing and
-    /// produce a populated result. This is the demo's full use case (drop ANY supported model).
+    /// Full-coverage smoke: every model the demo accepts must inspect without throwing and produce a
+    /// populated result. This is the demo's full use case (drop ANY supported model), streamed one at a
+    /// time so memory stays bounded regardless of model size.
     /// </summary>
     [TestMethod(Timeout = 120000)]
     public async Task ModelInspector_Inspect_AllDemoModels_NoThrow()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-
         var failures = new List<string>();
         int reachable = 0;
         foreach (var path in AllInspectableModels)
         {
-            byte[] bytes;
-            try { bytes = await http.GetByteArrayAsync(path); }
-            catch (HttpRequestException) { continue; } // optional model not deployed — skip
             reachable++;
-
             try
             {
-                var r = ModelInspectorHelper.Inspect(bytes);
+                // ONE stream pass yields BOTH inspection and compatibility (the demo calls both) — the
+                // model is fetched once, not twice, and weights are skipped. This is exactly the demo's
+                // per-file path.
+                using var stream = await _http.GetStreamAsync(path);
+                var (r, _) = await ModelInspectorHelper.InspectWithCompatibilityAsync(stream);
                 if (string.IsNullOrEmpty(r.GraphName) && string.IsNullOrEmpty(r.ProducerName))
                     failures.Add($"{path}: empty metadata");
                 if (r.NodeCount <= 0 && r.InitializerCount <= 0)
                     failures.Add($"{path}: no nodes and no initializers");
-                // CheckCompatibility must also never throw for any accepted file (demo calls both).
-                _ = ModelInspectorHelper.CheckCompatibility(bytes);
             }
+            catch (HttpRequestException) { reachable--; continue; } // optional model not deployed — skip
             catch (Exception ex)
             {
                 failures.Add($"{path}: {ex.GetType().Name}: {ex.Message}");
@@ -231,10 +237,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_Stream_SafeTensors_MatchesByteArray()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
         byte[] bytes;
-        try { bytes = await http.GetByteArrayAsync("test-models/test.safetensors"); }
+        try { bytes = await _http.GetByteArrayAsync("test-models/test.safetensors"); }
         catch (HttpRequestException) { throw new UnsupportedTestException("test.safetensors not available"); }
 
         var fromBytes = ModelInspectorHelper.Inspect(bytes);
@@ -295,10 +299,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_Stream_GGUF_Seekable_Matches()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
         byte[] bytes;
-        try { bytes = await http.GetByteArrayAsync("test-models/test.gguf"); }
+        try { bytes = await _http.GetByteArrayAsync("test-models/test.gguf"); }
         catch (HttpRequestException) { throw new UnsupportedTestException("test.gguf not available"); }
 
         var fromBytes = ModelInspectorHelper.Inspect(bytes);
@@ -319,9 +321,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task ModelInspector_Stream_Onnx_NonSeekable_Matches()
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var bytes = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        var bytes = await _http.GetByteArrayAsync("models/squeezenet/model.onnx");
 
         var fromBytes = ModelInspectorHelper.Inspect(bytes);
         // Forward-only, non-seekable wrapper — simulates browser OpenReadStream / HttpClient stream.
@@ -334,6 +334,67 @@ public abstract partial class MLTestBase
             throw new Exception("Operators mismatch");
         if (fromStream.TotalParameters != fromBytes.TotalParameters)
             throw new Exception("TotalParameters mismatch");
+    }
+
+    /// <summary>
+    /// Streaming ONNX inspection over a SEEKABLE stream must match the in-memory Inspect(byte[])
+    /// field-for-field on every structural metric (the demo path for a seekable source).
+    /// </summary>
+    [TestMethod]
+    public async Task ModelInspector_Stream_Onnx_Seekable_Matches()
+    {
+        var bytes = await _http.GetByteArrayAsync("models/squeezenet/model.onnx");
+
+        var fromBytes = ModelInspectorHelper.Inspect(bytes);
+        using var ms = new MemoryStream(bytes); // seekable → exercises the Seek-past-weights path
+        var fromStream = await ModelInspectorHelper.InspectAsync(ms);
+
+        if (fromStream.NodeCount != fromBytes.NodeCount)
+            throw new Exception($"NodeCount stream={fromStream.NodeCount} bytes={fromBytes.NodeCount}");
+        if (fromStream.InitializerCount != fromBytes.InitializerCount)
+            throw new Exception($"InitializerCount stream={fromStream.InitializerCount} bytes={fromBytes.InitializerCount}");
+        if (fromStream.TotalParameters != fromBytes.TotalParameters)
+            throw new Exception($"TotalParameters stream={fromStream.TotalParameters} bytes={fromBytes.TotalParameters}");
+        if (fromStream.TotalWeightBytes != fromBytes.TotalWeightBytes)
+            throw new Exception($"TotalWeightBytes stream={fromStream.TotalWeightBytes} bytes={fromBytes.TotalWeightBytes}");
+        if (fromStream.Operators.Length != fromBytes.Operators.Length)
+            throw new Exception($"Operators stream={fromStream.Operators.Length} bytes={fromBytes.Operators.Length}");
+        if (fromStream.Inputs.Length != fromBytes.Inputs.Length)
+            throw new Exception($"Inputs stream={fromStream.Inputs.Length} bytes={fromBytes.Inputs.Length}");
+        if (fromStream.Outputs.Length != fromBytes.Outputs.Length)
+            throw new Exception($"Outputs stream={fromStream.Outputs.Length} bytes={fromBytes.Outputs.Length}");
+        if (fromStream.LargestWeights.Length != fromBytes.LargestWeights.Length)
+            throw new Exception($"LargestWeights stream={fromStream.LargestWeights.Length} bytes={fromBytes.LargestWeights.Length}");
+        // The two op-type sets must be identical (order among equal counts may differ).
+        var sSet = fromStream.Operators.Select(o => o.OpType).OrderBy(o => o).ToArray();
+        var bSet = fromBytes.Operators.Select(o => o.OpType).OrderBy(o => o).ToArray();
+        if (!sSet.SequenceEqual(bSet))
+            throw new Exception($"Op-type sets differ: stream=[{string.Join(",", sSet)}] bytes=[{string.Join(",", bSet)}]");
+    }
+
+    /// <summary>
+    /// PROOF that seekable ONNX inspection NEVER reads the weight blobs: a counting seekable stream
+    /// over a real ONNX model. The bytes actually Read() must be a small fraction of the file — the
+    /// raw_data weight sections are Seek()-ed past, not read. This is the whole point: inspect any-size
+    /// model from its structure alone.
+    /// </summary>
+    [TestMethod]
+    public async Task ModelInspector_Stream_Onnx_SeekSkipsWeights()
+    {
+        // SqueezeNet (~5MB) is mostly Conv weights; structure is a small fraction of the file.
+        var bytes = await _http.GetByteArrayAsync("models/squeezenet/model.onnx");
+
+        using var counting = new CountingSeekableStream(bytes);
+        var r = await ModelInspectorHelper.InspectAsync(counting);
+
+        if (r.NodeCount <= 0) throw new Exception("Expected a parsed graph");
+        if (r.InitializerCount <= 0) throw new Exception("Expected initializers (weights) listed by metadata");
+        // Weights were skipped via Seek, so bytes READ must be far below the file size. Generous bound:
+        // structure + dim/name fields are well under a quarter of a weight-heavy model.
+        if (counting.BytesRead >= bytes.Length / 4)
+            throw new Exception($"Read {counting.BytesRead} of {bytes.Length} bytes — weights were NOT skipped (expected << {bytes.Length / 4})");
+        if (counting.BytesSeeked <= 0)
+            throw new Exception("Expected Seek() calls skipping weight blobs; none occurred");
     }
 }
 
@@ -370,6 +431,51 @@ file sealed class HeaderThenThrowStream : Stream
     public override long Length => _claimedTotalLength;
     public override long Position { get => _pos; set => _pos = value; }
     public override long Seek(long offset, SeekOrigin origin) => _pos;
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
+/// <summary>Seekable stream over a byte[] that counts bytes actually READ vs bytes SEEKED past.
+/// Proves the streaming inspector skips weight blobs (Seek) instead of reading them.</summary>
+file sealed class CountingSeekableStream : Stream
+{
+    private readonly byte[] _data;
+    private long _pos;
+    public long BytesRead { get; private set; }
+    public long BytesSeeked { get; private set; }
+
+    public CountingSeekableStream(byte[] data) => _data = data;
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        int n = (int)Math.Min(count, _data.Length - _pos);
+        if (n <= 0) return 0;
+        Array.Copy(_data, _pos, buffer, offset, n);
+        _pos += n;
+        BytesRead += n;
+        return n;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        long target = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _pos + offset,
+            SeekOrigin.End => _data.Length + offset,
+            _ => _pos,
+        };
+        if (target > _pos) BytesSeeked += target - _pos;
+        _pos = target;
+        return _pos;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _data.Length;
+    public override long Position { get => _pos; set => _pos = value; }
     public override void Flush() { }
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();

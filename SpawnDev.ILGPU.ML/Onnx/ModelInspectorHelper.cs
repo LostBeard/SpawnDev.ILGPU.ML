@@ -9,7 +9,7 @@ namespace SpawnDev.ILGPU.ML.Onnx;
 /// Drop any .onnx file → see architecture, operators, shapes, weights.
 /// A developer tool that showcases our native ONNX parser.
 /// </summary>
-public static class ModelInspectorHelper
+public static partial class ModelInspectorHelper
 {
     // Bytes read up-front to detect the format. Covers every magic-byte check plus the ONNX
     // 64-byte producer-string scan and the SafeTensors 16-byte probe, while staying small enough
@@ -27,6 +27,38 @@ public static class ModelInspectorHelper
     /// </summary>
     public static async Task<InspectionResult> InspectAsync(Stream stream, CancellationToken ct = default)
     {
+        var (result, _) = await InspectCoreAsync(stream, ct).ConfigureAwait(false);
+        return result;
+    }
+
+    /// <summary>
+    /// Inspect AND check operator compatibility from a SINGLE stream pass — the structure is walked
+    /// once and reused for both results. This avoids re-opening / re-reading the source, which matters
+    /// for expensive streams (browser file, HTTP, WebTorrent piece stream) where a second pass would
+    /// re-download the whole model. The demo and the all-models smoke test use this.
+    /// </summary>
+    public static async Task<(InspectionResult Inspection, CompatibilityResult Compatibility)> InspectWithCompatibilityAsync(
+        Stream stream, Operators.OperatorRegistry? registry = null, CancellationToken ct = default)
+    {
+        var (result, format) = await InspectCoreAsync(stream, ct).ConfigureAwait(false);
+        CompatibilityResult compat;
+        if (format == ModelFormat.ONNX)
+        {
+            // Op types already collected by the structure walk — no second read.
+            var opsUsed = result.Operators.Select(o => o.OpType).Distinct().OrderBy(o => o).ToArray();
+            compat = PartitionCompatibility(opsUsed, registry);
+        }
+        else
+        {
+            compat = NonApplicableCompatibility(format);
+        }
+        return (result, compat);
+    }
+
+    /// <summary>Shared streaming-inspection core: detects format and returns the inspection result plus
+    /// the detected <see cref="ModelFormat"/> (so callers can derive compatibility without a second pass).</summary>
+    private static async Task<(InspectionResult Result, ModelFormat Format)> InspectCoreAsync(Stream stream, CancellationToken ct)
+    {
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
         // Read a small detection prefix without consuming the whole stream.
@@ -39,7 +71,7 @@ public static class ModelInspectorHelper
         // multi-GB SafeTensors down the full-read fallback, defeating streaming. Probe directly:
         // a plausible uint64 header length followed by '{'.
         if (IsSafeTensorsPrefix(prefix, prefixLen))
-            return await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false);
+            return (await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false), ModelFormat.SafeTensors);
 
         // DetectModelFormat is happy with a short buffer (it bounds all its probes by length).
         var detectBuf = prefixLen == prefix.Length ? prefix : prefix.AsSpan(0, prefixLen).ToArray();
@@ -48,7 +80,7 @@ public static class ModelInspectorHelper
         switch (format)
         {
             case ModelFormat.SafeTensors:
-                return await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false);
+                return (await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false), format);
 
             case ModelFormat.GGUF when stream.CanSeek:
                 // GGUF header is front-loaded (metadata + tensor infos, then the aligned data
@@ -57,14 +89,35 @@ public static class ModelInspectorHelper
                 // WebTorrent-seekable) support; non-seekable async-only streams (browser
                 // OpenReadStream) take the full-read fallback below.
                 var ggufModel = GGUF.GGUFParser.ParseHeader(new PrefixedReadStream(prefix, prefixLen, stream));
-                var ggufResult = BuildGGUFResult(ggufModel, stream.Length);
-                return ggufResult;
+                return (BuildGGUFResult(ggufModel, stream.Length), format);
+
+            case ModelFormat.ONNX:
+            {
+                // ONNX weights (initializer raw_data) are interleaved throughout the graph, so there
+                // is no contiguous header to range-fetch — but they are never needed for inspection.
+                // Walk the protobuf from the stream, keep graph structure, and seek past every
+                // raw_data blob. A seekable source rewinds to 0 (true Seek-over-weights); a forward
+                // stream replays the detection prefix and reads-and-discards weights. Either way the
+                // whole file is never resident — a 600 MB GPT-2 inspects from its structure alone.
+                Stream onnxStream;
+                if (stream.CanSeek)
+                {
+                    stream.Seek(0, SeekOrigin.Begin);
+                    onnxStream = stream;
+                }
+                else
+                {
+                    onnxStream = new PrefixedReadStream(prefix, prefixLen, stream);
+                }
+                var reader = new StreamProtoReader(onnxStream, ct);
+                return (await InspectOnnxStreamAsync(reader, stream.CanSeek ? stream.Length : 0, ct).ConfigureAwait(false), format);
+            }
 
             default:
-                // Not yet stream-optimized: assemble the full bytes (already-read prefix + the rest)
-                // and reuse the in-memory path. Still streams the source; no extra copy of the file.
+                // Remaining formats (TFLite FlatBuffers, etc.) are random-access; the demo's are small.
+                // Assemble the full bytes (already-read prefix + the rest) and reuse the in-memory path.
                 var all = await DrainWithPrefixAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false);
-                return Inspect(all);
+                return (Inspect(all), format);
         }
     }
 
@@ -95,6 +148,24 @@ public static class ModelInspectorHelper
             }
             return _inner.Read(buffer, offset, count);
         }
+
+        // Browser HTTP/file streams reject synchronous Read (net_http_synchronous_reads_not_supported).
+        // The base Stream.ReadAsync would fall back to sync Read on _inner, so override the async path
+        // explicitly: serve the buffered prefix first, then delegate to the inner stream's ReadAsync.
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_prefixPos < _prefixLen)
+            {
+                int n = Math.Min(buffer.Length, _prefixLen - _prefixPos);
+                _prefix.AsMemory(_prefixPos, n).CopyTo(buffer);
+                _prefixPos += n;
+                return n;
+            }
+            return await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
 
         public override bool CanRead => true;
         public override bool CanSeek => false;
@@ -549,54 +620,56 @@ public static class ModelInspectorHelper
     {
         var format = InferenceSession.DetectModelFormat(modelBytes);
         if (format != ModelFormat.ONNX)
-        {
-            return new CompatibilityResult
-            {
-                Format = format.ToString(),
-                Applicable = false,
-                TotalOpsUsed = 0,
-                SupportedOps = Array.Empty<string>(),
-                UnsupportedOps = Array.Empty<string>(),
-                IsFullySupported = true,
-                CompatibilityPercent = 100,
-            };
-        }
+            return NonApplicableCompatibility(format);
 
         var model = OnnxParser.Parse(modelBytes);
-        var graph = model.Graph;
+        var opsUsed = model.Graph.Nodes.Select(n => n.OpType).Distinct().OrderBy(o => o).ToArray();
+        return PartitionCompatibility(opsUsed, registry);
+    }
 
-        var opsUsed = graph.Nodes.Select(n => n.OpType).Distinct().OrderBy(o => o).ToArray();
+    /// <summary>Compatibility result for a non-ONNX (weights-only / different-vocabulary) format.</summary>
+    private static CompatibilityResult NonApplicableCompatibility(ModelFormat format) => new()
+    {
+        Format = format.ToString(),
+        Applicable = false,
+        TotalOpsUsed = 0,
+        SupportedOps = Array.Empty<string>(),
+        UnsupportedOps = Array.Empty<string>(),
+        IsFullySupported = true,
+        CompatibilityPercent = 100,
+    };
 
-        // Known supported operators (hardcoded fallback if no registry provided)
-        var knownSupported = new HashSet<string>
-        {
-            "Abs", "Add", "ArgMax", "AveragePool", "BatchNormalization", "Cast", "Ceil", "Clip",
-            "Concat", "Constant", "ConstantOfShape", "Conv", "ConvTranspose",
-            "DepthToSpace", "Div", "Dropout", "Equal", "Erf", "Exp", "Expand",
-            "Flatten", "Floor", "Gather", "GatherND", "Gelu", "Gemm", "GlobalAveragePool",
-            "Greater", "HardSigmoid", "HardSwish", "Identity", "InstanceNormalization",
-            "LayerNormalization", "LeakyRelu", "Less", "Log", "MatMul", "Max", "MaxPool",
-            "Min", "Mul", "Neg", "Not", "Pad", "Pow", "Range", "Reciprocal",
-            "ReduceMax", "ReduceMean", "ReduceMin", "ReduceSum",
-            "Relu", "Reshape", "Resize", "Shape", "Sigmoid", "Sign", "SiLU",
-            "Slice", "Softmax", "Split", "Sqrt", "Squeeze", "Sub",
-            "Tanh", "TopK", "Transpose", "Unsqueeze", "Upsample", "Where",
-        };
+    /// <summary>Operators the engine supports when no live registry is supplied. Single source of truth
+    /// for both the byte[] and streaming compatibility checks.</summary>
+    private static readonly HashSet<string> KnownSupportedOps = new()
+    {
+        "Abs", "Add", "ArgMax", "AveragePool", "BatchNormalization", "Cast", "Ceil", "Clip",
+        "Concat", "Constant", "ConstantOfShape", "Conv", "ConvTranspose",
+        "DepthToSpace", "Div", "Dropout", "Equal", "Erf", "Exp", "Expand",
+        "Flatten", "Floor", "Gather", "GatherND", "Gelu", "Gemm", "GlobalAveragePool",
+        "Greater", "HardSigmoid", "HardSwish", "Identity", "InstanceNormalization",
+        "LayerNormalization", "LeakyRelu", "Less", "Log", "MatMul", "Max", "MaxPool",
+        "Min", "Mul", "Neg", "Not", "Pad", "Pow", "Range", "Reciprocal",
+        "ReduceMax", "ReduceMean", "ReduceMin", "ReduceSum",
+        "Relu", "Reshape", "Resize", "Shape", "Sigmoid", "Sign", "SiLU",
+        "Slice", "Softmax", "Split", "Sqrt", "Squeeze", "Sub",
+        "Tanh", "TopK", "Transpose", "Unsqueeze", "Upsample", "Where",
+    };
 
-        // If registry provided, use its actual supported ops
+    /// <summary>Partition a distinct, sorted op-type list into supported/unsupported against the
+    /// registry (if provided) or the built-in known-supported set.</summary>
+    private static CompatibilityResult PartitionCompatibility(string[] opsUsed, Operators.OperatorRegistry? registry)
+    {
         HashSet<string> supportedOps;
         if (registry != null)
         {
             supportedOps = new HashSet<string>();
             foreach (var op in opsUsed)
-            {
-                if (registry.IsSupported(op))
-                    supportedOps.Add(op);
-            }
+                if (registry.IsSupported(op)) supportedOps.Add(op);
         }
         else
         {
-            supportedOps = knownSupported;
+            supportedOps = KnownSupportedOps;
         }
 
         var supported = opsUsed.Where(o => supportedOps.Contains(o)).ToArray();

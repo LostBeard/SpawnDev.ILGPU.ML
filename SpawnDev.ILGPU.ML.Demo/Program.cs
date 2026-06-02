@@ -26,6 +26,9 @@ builder.Services.AddSingleton<WebTorrentClient>();
 builder.Services.AddSingleton<DumpFolderTests>();
 // HuggingFace CDN tests run next — no GPU needed, validates API + downloads
 builder.Services.AddSingleton<HuggingFaceTests>();
+// Model Inspector tests — pure CPU parsing, no GPU. Registered standalone so they run ONCE in the
+// browser runtime, not once per backend lane (inspection never touches an accelerator).
+builder.Services.AddSingleton<ModelInspectorTests>();
 builder.Services.AddSingleton<WebGPUTests>();
 builder.Services.AddSingleton<WasmTests>();
 builder.Services.AddSingleton<WebGLTests>();

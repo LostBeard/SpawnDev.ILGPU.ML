@@ -200,13 +200,13 @@
 
         try
         {
-            using var stream = file.OpenReadStream(maxAllowedSize: 500 * 1024 * 1024); // 500MB max
-            using var ms = new MemoryStream();
-            await stream.CopyToAsync(ms);
-            var bytes = ms.ToArray();
-
-            _result = ModelInspectorHelper.Inspect(bytes);
-            _compatibility = ModelInspectorHelper.CheckCompatibility(bytes);
+            // Stream the model: the structure (graph, ops, tensor metadata) is read while every weight
+            // blob is skipped, so the whole file is never held in memory — a 600 MB GPT-2 or a multi-GB
+            // checkpoint inspects from its structure alone, with no size cap and no OOM. A SINGLE stream
+            // pass produces both the inspection and the compatibility check, so the file is read once.
+            const long maxSize = 64L * 1024 * 1024 * 1024; // 64 GB ceiling; bytes are read-through, never buffered
+            using var stream = file.OpenReadStream(maxAllowedSize: maxSize);
+            (_result, _compatibility) = await ModelInspectorHelper.InspectWithCompatibilityAsync(stream);
         }
         catch (Exception ex)
         {
