@@ -1,9 +1,18 @@
+using SpawnDev.ILGPU.ML.DemoConsole;
 using SpawnDev.UnitTesting;
 using System.Reflection;
 using System.Text.Json;
 
 // Auto-flush stdout so PlaywrightMultiTest sees output immediately
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+
+// Investigation diagnostic (NOT a PMT-substitute test runner): CPU-vs-CUDA per-node
+// bisection for the CPU-backend style-transfer correctness bug.
+if (args.Length > 0 && args[0] == "STYLEBISECT")
+{
+    await StyleBisect.Run(args);
+    return 0;
+}
 
 // Catch ILGPU assertion failures (CPU backend bounds checks) that would
 // otherwise show "unknown hard error" dialogs and kill the process.

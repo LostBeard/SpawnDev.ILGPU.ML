@@ -1,3 +1,7 @@
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
 namespace SpawnDev.ILGPU.ML.Onnx;
 
 /// <summary>
@@ -7,6 +11,173 @@ namespace SpawnDev.ILGPU.ML.Onnx;
 /// </summary>
 public static class ModelInspectorHelper
 {
+    // Bytes read up-front to detect the format. Covers every magic-byte check plus the ONNX
+    // 64-byte producer-string scan and the SafeTensors 16-byte probe, while staying small enough
+    // that header-front formats (SafeTensors/GGUF) with a non-trivial header never over-read into
+    // the weight section during detection.
+    private const int DetectPrefixBytes = 256;
+
+    /// <summary>
+    /// Inspect a model from a <see cref="Stream"/> WITHOUT requiring the whole model in memory.
+    /// For header-front formats (SafeTensors, GGUF) only the metadata header is read — a multi-GB
+    /// weights file inspects from a few KB and the weight blobs are never materialized. Works with
+    /// ANY stream source: browser IBrowserFile.OpenReadStream, HttpClient response streams, a
+    /// desktop FileStream, or a WebTorrent seekable stream. Other formats fall back to a full read
+    /// (functionally identical to <see cref="Inspect(byte[])"/>).
+    /// </summary>
+    public static async Task<InspectionResult> InspectAsync(Stream stream, CancellationToken ct = default)
+    {
+        if (stream == null) throw new ArgumentNullException(nameof(stream));
+
+        // Read a small detection prefix without consuming the whole stream.
+        var prefix = new byte[DetectPrefixBytes];
+        int prefixLen = await ReadUpToAsync(stream, prefix, 0, prefix.Length, ct).ConfigureAwait(false);
+
+        // SafeTensors must be probed prefix-tolerantly: its header (and thus the whole file) is
+        // typically far larger than the detection prefix, and DetectModelFormat's SafeTensors check
+        // requires `headerSize < data.Length - 8`, which a short prefix fails — that would send a
+        // multi-GB SafeTensors down the full-read fallback, defeating streaming. Probe directly:
+        // a plausible uint64 header length followed by '{'.
+        if (IsSafeTensorsPrefix(prefix, prefixLen))
+            return await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false);
+
+        // DetectModelFormat is happy with a short buffer (it bounds all its probes by length).
+        var detectBuf = prefixLen == prefix.Length ? prefix : prefix.AsSpan(0, prefixLen).ToArray();
+        var format = InferenceSession.DetectModelFormat(detectBuf);
+
+        switch (format)
+        {
+            case ModelFormat.SafeTensors:
+                return await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false);
+
+            case ModelFormat.GGUF when stream.CanSeek:
+                // GGUF header is front-loaded (metadata + tensor infos, then the aligned data
+                // section). ParseHeader reads only up to the data boundary — never the weight blob.
+                // It uses synchronous reads, which seekable streams (FileStream, MemoryStream,
+                // WebTorrent-seekable) support; non-seekable async-only streams (browser
+                // OpenReadStream) take the full-read fallback below.
+                var ggufModel = GGUF.GGUFParser.ParseHeader(new PrefixedReadStream(prefix, prefixLen, stream));
+                var ggufResult = BuildGGUFResult(ggufModel, stream.Length);
+                return ggufResult;
+
+            default:
+                // Not yet stream-optimized: assemble the full bytes (already-read prefix + the rest)
+                // and reuse the in-memory path. Still streams the source; no extra copy of the file.
+                var all = await DrainWithPrefixAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false);
+                return Inspect(all);
+        }
+    }
+
+    /// <summary>
+    /// Replays an already-read prefix, then delegates to the underlying stream — lets a parser read
+    /// from byte 0 even though the format-detection prefix was already consumed from the source.
+    /// </summary>
+    private sealed class PrefixedReadStream : Stream
+    {
+        private readonly byte[] _prefix;
+        private readonly int _prefixLen;
+        private readonly Stream _inner;
+        private int _prefixPos;
+
+        public PrefixedReadStream(byte[] prefix, int prefixLen, Stream inner)
+        {
+            _prefix = prefix; _prefixLen = prefixLen; _inner = inner;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_prefixPos < _prefixLen)
+            {
+                int n = Math.Min(count, _prefixLen - _prefixPos);
+                Array.Copy(_prefix, _prefixPos, buffer, offset, n);
+                _prefixPos += n;
+                return n;
+            }
+            return _inner.Read(buffer, offset, count);
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void Flush() { }
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// SafeTensors stream inspection: reads only [8-byte header length] + [JSON header], then stops.
+    /// The header carries every tensor's dtype/shape/data_offsets, so sizes are computed without
+    /// touching the tensor-data section (which may be hundreds of GB).
+    /// </summary>
+    private static async Task<InspectionResult> InspectSafeTensorsStreamAsync(
+        Stream stream, byte[] prefix, int prefixLen, CancellationToken ct)
+    {
+        if (prefixLen < 8) throw new InvalidOperationException("Stream too small for SafeTensors format");
+        long headerSize = BitConverter.ToInt64(prefix, 0);
+        if (headerSize <= 0 || headerSize > 1_000_000_000L)
+            throw new InvalidOperationException($"Invalid SafeTensors header size: {headerSize}");
+
+        long needed = 8 + headerSize;
+        // SafeTensorsParser.Parse validates headerSize <= data.Length - 8, so a header-only buffer
+        // (length == 8 + headerSize) is exactly sufficient; it never reads the tensor-data section.
+        var headerBuf = new byte[needed];
+        int have = (int)Math.Min(prefixLen, needed);
+        Array.Copy(prefix, headerBuf, have);
+        if (have < needed)
+            await ReadExactAsync(stream, headerBuf, have, (int)(needed - have), ct).ConfigureAwait(false);
+
+        var result = InspectSafeTensors(headerBuf);
+        // FileSizeBytes from the header-only buffer would be wrong; report the true length when known.
+        result.FileSizeBytes = stream.CanSeek ? stream.Length : 0;
+        return result;
+    }
+
+    /// <summary>
+    /// Prefix-tolerant SafeTensors probe: first 8 bytes are a plausible uint64 header length and the
+    /// 9th byte is '{' (start of the header JSON). Unlike InferenceSession.DetectModelFormat this
+    /// does NOT compare headerSize to the buffer length, so it correctly identifies a large
+    /// SafeTensors from a short stream prefix.
+    /// </summary>
+    private static bool IsSafeTensorsPrefix(byte[] prefix, int prefixLen)
+    {
+        if (prefixLen < 9) return false;
+        long headerSize = BitConverter.ToInt64(prefix, 0);
+        return headerSize > 0 && headerSize <= 1_000_000_000L && prefix[8] == (byte)'{';
+    }
+
+    /// <summary>Read up to <paramref name="count"/> bytes; returns the number actually read (may be &lt; count at EOF).</summary>
+    private static async Task<int> ReadUpToAsync(Stream s, byte[] buf, int offset, int count, CancellationToken ct)
+    {
+        int total = 0;
+        while (total < count)
+        {
+            int n = await s.ReadAsync(buf.AsMemory(offset + total, count - total), ct).ConfigureAwait(false);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
+
+    /// <summary>Read EXACTLY <paramref name="count"/> bytes or throw on premature EOF.</summary>
+    private static async Task ReadExactAsync(Stream s, byte[] buf, int offset, int count, CancellationToken ct)
+    {
+        int got = await ReadUpToAsync(s, buf, offset, count, ct).ConfigureAwait(false);
+        if (got < count)
+            throw new EndOfStreamException($"Expected {count} bytes, got {got} (truncated model stream).");
+    }
+
+    /// <summary>Concatenate the already-read prefix with the remainder of the stream into one byte[].</summary>
+    private static async Task<byte[]> DrainWithPrefixAsync(Stream s, byte[] prefix, int prefixLen, CancellationToken ct)
+    {
+        using var ms = new MemoryStream();
+        ms.Write(prefix, 0, prefixLen);
+        await s.CopyToAsync(ms, ct).ConfigureAwait(false);
+        return ms.ToArray();
+    }
+
     /// <summary>
     /// Inspect a model file and return a structured summary.
     /// Auto-detects format (ONNX or TFLite) from magic bytes.
@@ -181,9 +352,11 @@ public static class ModelInspectorHelper
 
     /// <summary>Inspect a GGUF model (LLM weights).</summary>
     public static InspectionResult InspectGGUF(byte[] ggufBytes)
-    {
-        var model = GGUF.GGUFParser.Parse(ggufBytes);
+        => BuildGGUFResult(GGUF.GGUFParser.Parse(ggufBytes), ggufBytes.Length);
 
+    /// <summary>Build a GGUF InspectionResult from a parsed model (shared by byte[] and stream paths).</summary>
+    private static InspectionResult BuildGGUFResult(GGUF.GGUFModel model, long fileSize)
+    {
         // Count tensor types as "operators"
         var typeCounts = model.Tensors
             .GroupBy(t => t.Type.ToString())
@@ -238,12 +411,10 @@ public static class ModelInspectorHelper
                 DataType = "text"
             }},
             LargestWeights = largestWeights.Take(20).ToArray(),
-            FileSizeBytes = ggufBytes.Length,
+            FileSizeBytes = fileSize,
         };
     }
 
-    /// <summary>
-    /// Check which operators the model needs that we support vs don't support.
     /// <summary>Inspect a SafeTensors file (weights only, no graph).</summary>
     public static InspectionResult InspectSafeTensors(byte[] stBytes)
     {
@@ -367,11 +538,31 @@ public static class ModelInspectorHelper
         };
     }
 
-    /// Answers "Can I run this model?" instantly.
+    /// <summary>
+    /// Check which operators the model needs that we support vs don't support.
+    /// Answers "Can I run this model?" instantly. Operator-level compatibility is an ONNX-graph
+    /// concept: GGUF/SafeTensors are weights only (no executable graph) and TFLite uses a different
+    /// operator vocabulary, so for non-ONNX formats this returns a non-applicable result instead of
+    /// throwing (the Model Inspector demo calls this for every dropped file).
     /// </summary>
-    public static CompatibilityResult CheckCompatibility(byte[] onnxBytes, Operators.OperatorRegistry? registry = null)
+    public static CompatibilityResult CheckCompatibility(byte[] modelBytes, Operators.OperatorRegistry? registry = null)
     {
-        var model = OnnxParser.Parse(onnxBytes);
+        var format = InferenceSession.DetectModelFormat(modelBytes);
+        if (format != ModelFormat.ONNX)
+        {
+            return new CompatibilityResult
+            {
+                Format = format.ToString(),
+                Applicable = false,
+                TotalOpsUsed = 0,
+                SupportedOps = Array.Empty<string>(),
+                UnsupportedOps = Array.Empty<string>(),
+                IsFullySupported = true,
+                CompatibilityPercent = 100,
+            };
+        }
+
+        var model = OnnxParser.Parse(modelBytes);
         var graph = model.Graph;
 
         var opsUsed = graph.Nodes.Select(n => n.OpType).Distinct().OrderBy(o => o).ToArray();
@@ -508,7 +699,15 @@ public class CompatibilityResult
     public bool IsFullySupported { get; set; }
     public float CompatibilityPercent { get; set; }
 
-    public string Summary => IsFullySupported
-        ? $"Fully compatible ({TotalOpsUsed} operators supported)"
-        : $"{CompatibilityPercent:F0}% compatible ({SupportedOps.Length}/{TotalOpsUsed} operators). Missing: {string.Join(", ", UnsupportedOps)}";
+    /// <summary>Detected model format ("ONNX", "TFLite", ...). Set for all results.</summary>
+    public string Format { get; set; } = "ONNX";
+    /// <summary>True when operator-level compatibility applies (ONNX graphs). False for
+    /// weights-only / non-ONNX formats, where the op check is not meaningful.</summary>
+    public bool Applicable { get; set; } = true;
+
+    public string Summary => !Applicable
+        ? $"{Format} model — operator compatibility check applies to ONNX graphs"
+        : IsFullySupported
+            ? $"Fully compatible ({TotalOpsUsed} operators supported)"
+            : $"{CompatibilityPercent:F0}% compatible ({SupportedOps.Length}/{TotalOpsUsed} operators). Missing: {string.Join(", ", UnsupportedOps)}";
 }
