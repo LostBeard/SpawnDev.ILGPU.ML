@@ -6,7 +6,7 @@
 <PageTitle>Text Generation — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Text Generation"
-            Description="Generate text with GPT-2 or other language models. Runs entirely in your browser — your text never leaves your device."
+            Description="Generate text with DistilGPT-2, streamed from the SpawnDev hub. The model loads over a seekable torrent stream straight to the GPU — never held whole in memory. Runs entirely on your device; your text never leaves it."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
@@ -14,11 +14,11 @@
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
             ShowModelProgress="true"
-            ModelName="GPT-2 Small"
+            ModelName="DistilGPT-2"
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="240">
+            ModelSizeMB="330">
 
     <div class="textgen-input">
         <label class="textgen-label">Prompt:</label>
@@ -76,10 +76,10 @@
         </div>
     }
 
-    @if (!_isModelLoaded && !_isModelLoading)
+    @if (_loadError != null)
     {
         <div class="model-needed">
-            Text generation requires a language model (GPT-2 Small ~240MB). This demo will be enabled once the KV cache and autoregressive generation pipeline are integrated. Tokenizer and sampling strategies (greedy, top-K, top-P) are already built.
+            Could not load the model from the SpawnDev hub: @_loadError
         </div>
     }
 
@@ -129,6 +129,12 @@
     private int _tokensGenerated;
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
+    private string? _loadError;
+
+    // DistilGPT-2 on HuggingFace, served through OUR hub (hub.spawndev.com) as a seekable torrent stream.
+    private const string HubRepoId = "Xenova/distilgpt2";
+    private const string ModelFile = "onnx/decoder_model.onnx";
+    private const string TokenizerFile = "tokenizer.json";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
@@ -136,6 +142,8 @@
     };
 
     [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient WebTorrent { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -151,6 +159,7 @@
     {
         try
         {
+            _loadError = null;
             _isModelLoading = true;
             _modelProgress = 5;
             StateHasChanged();
@@ -165,25 +174,33 @@
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
-            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(WebTorrent, Http);
 
-            // Use DistilGPT-2 (smaller, fits in browser better)
-            _modelProgress = 20;
+            // Open the model file as a SEEKABLE torrent stream from our hub (deselect:false — we need the
+            // weights), then stream it straight to the GPU. CreateFromOnnxStreamAsync seeks past + chunk-
+            // uploads each weight, so the ~330MB model is never materialized whole in CPU memory.
+            _modelProgress = 15;
             StateHasChanged();
-            var modelBytes = await hub.LoadAsync(
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
-                "onnx/decoder_model.onnx");
+            var model = await hub.OpenAsync(HubRepoId, ModelFile, deselect: false);
 
-            _modelProgress = 80;
-            StateHasChanged();
-            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            SpawnDev.ILGPU.ML.InferenceSession session;
+            await using (model.Stream)
+                session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxStreamAsync(
+                    _accelerator, model.Stream,
+                    onProgress: (stage, pct) =>
+                    {
+                        _modelProgress = 15 + pct * 0.70; // 15%..85% during streaming load
+                        InvokeAsync(StateHasChanged);
+                    });
 
-            // Load tokenizer
+            // Tokenizer from the same hub repo (small JSON — read the stream fully).
             _modelProgress = 90;
             StateHasChanged();
-            var tokenizerBytes = await hub.LoadAsync(
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
-            var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
+            var tok = await hub.OpenAsync(HubRepoId, TokenizerFile, deselect: false);
+            string tokenizerJson;
+            await using (tok.Stream)
+            using (var reader = new StreamReader(tok.Stream))
+                tokenizerJson = await reader.ReadToEndAsync();
 
             _pipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
             _pipeline.LoadTokenizer(tokenizerJson);
@@ -193,7 +210,8 @@
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[TextGen] Error: {ex.Message}");
+            _loadError = ex.Message;
+            Console.WriteLine($"[TextGen] Error: {ex}");
         }
         finally
         {

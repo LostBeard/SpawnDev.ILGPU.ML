@@ -44,7 +44,11 @@ Six demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + O
 
 Every result above is rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
 
-The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes. 10 more pipelines exist in the codebase (object detection, face detection, NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
+The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes.
+
+**Text generation** is verified end-to-end on WebGPU as the 7th demo pipeline: the `/text-gen` demo streams DistilGPT-2 from the SpawnDev hub (`hub.spawndev.com`) over a **seekable torrent stream straight to the GPU** — the model is never held whole in memory — then runs autoregressive generation entirely on-device. The **Model Inspector** (`/inspector`) is fully working: drop a local file or paste a hub/HuggingFace URL and any ONNX/TFLite/GGUF/SafeTensors model is parsed structure-only (weights skipped) into an architecture summary + operator-compatibility report — GPT-2 reports **100% supported**. No other browser ML library has either.
+
+9 more pipelines exist in the codebase (object detection, face detection, other NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
 
 ## Universal Model Loading
 

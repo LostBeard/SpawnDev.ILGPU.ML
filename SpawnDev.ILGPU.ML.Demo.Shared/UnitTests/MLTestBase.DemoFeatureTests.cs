@@ -46,6 +46,100 @@ public abstract partial class MLTestBase
             throw new Exception($"TextGeneration produced 0 tokens");
     });
 
+    // Proves the STREAMING load path (InferenceSession.CreateFromOnnxStreamAsync) works on a real
+    // transformer (DistilGPT-2), independent of the hub: download the model bytes, wrap them in a
+    // SEEKABLE MemoryStream, and load with a tiny streamThreshold so every weight takes the streaming
+    // (seek + chunk-upload-to-GPU) path — then run real generation. This is the workbench proof that
+    // the page's load+generate path is correct; the hub variant below adds the live network source.
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task Pipeline_TextGeneration_FromSeekableStream_ProducesTokens() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        var tokenizerJson = await http.GetStringAsync(
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+
+        // Seekable stream + tiny threshold forces the streaming weight path (not the inline byte path).
+        using var ms = new MemoryStream(modelBytes);
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(
+            accelerator, ms, streamThreshold: 4096);
+
+        var pipeline = new TextGenerationPipeline(session, accelerator);
+        pipeline.LoadTokenizer(tokenizerJson);
+        pipeline.MaxNewTokens = 5;
+
+        var result = await pipeline.GenerateAsync("The cat sat on the");
+        Console.WriteLine($"[TextGen/stream] Output: '{result.GeneratedText}' ({result.GeneratedTokenCount} tokens, {result.InferenceTimeMs:F0}ms)");
+
+        if (string.IsNullOrWhiteSpace(result.GeneratedText))
+            throw new Exception("Stream-loaded TextGeneration produced empty output");
+        if (result.GeneratedTokenCount < 1)
+            throw new Exception("Stream-loaded TextGeneration produced 0 tokens");
+    });
+
+    // EXACT /text-gen page path: load DistilGPT-2 from OUR live hub (hub.spawndev.com) over a SEEKABLE
+    // torrent stream and load it via InferenceSession.CreateFromOnnxStreamAsync — the model is never held
+    // whole in CPU memory (each weight is seeked + chunk-uploaded straight to GPU). Then run real
+    // autoregressive generation. This proves the demo's hub+stream wiring end to end, not just inspection.
+    // HeavyModel: full ~330MB model fetched via torrent + GPU compile + decode — gated out of the fast loop.
+    [TestMethod(Timeout = 360000, Category = "HeavyModel", RetryCount = 2)]
+    public async Task Pipeline_TextGeneration_ViaHubStream_ProducesTokens() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        const string repoId = "Xenova/distilgpt2";
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http);
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(5));
+
+            // Open the model file as a seekable stream (deselect:false → we need the weights).
+            var model = await hub.OpenAsync(repoId, "onnx/decoder_model.onnx", deselect: false, cts.Token);
+            if (model.File.Length < 1_000_000)
+                throw new Exception($"hub model file length={model.File.Length}, expected ~330MB");
+
+            InferenceSession session;
+            await using (model.Stream)
+                session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, model.Stream, ct: cts.Token);
+
+            using (session)
+            {
+                // Tokenizer from the same hub repo (small JSON — read the stream fully).
+                var tok = await hub.OpenAsync(repoId, "tokenizer.json", deselect: false, cts.Token);
+                string tokenizerJson;
+                await using (tok.Stream)
+                using (var reader = new StreamReader(tok.Stream))
+                    tokenizerJson = await reader.ReadToEndAsync(cts.Token);
+
+                var pipeline = new TextGenerationPipeline(session, accelerator);
+                pipeline.LoadTokenizer(tokenizerJson);
+                pipeline.MaxNewTokens = 5;
+
+                var result = await pipeline.GenerateAsync("The cat sat on the");
+                Console.WriteLine($"[TextGen/hub-stream] Output: '{result.GeneratedText}' ({result.GeneratedTokenCount} tokens, {result.InferenceTimeMs:F0}ms)");
+
+                if (string.IsNullOrWhiteSpace(result.GeneratedText))
+                    throw new Exception("Hub-stream TextGeneration produced empty output");
+                if (result.GeneratedTokenCount < 1)
+                    throw new Exception("Hub-stream TextGeneration produced 0 tokens");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally
+        {
+            await client.DisposeAsync();
+        }
+    });
+
     // ═══════════════════════════════════════════════════════════
     //  Background Removal (RMBG)
     // ═══════════════════════════════════════════════════════════
