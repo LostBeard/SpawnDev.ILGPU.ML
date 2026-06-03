@@ -1,0 +1,93 @@
+{
+  "model": "Xenova/distilgpt2 onnx/decoder_model.onnx (non-merged)",
+  "prompt": "The cat sat on the",
+  "input_ids": [
+    464,
+    3797,
+    3332,
+    319,
+    262
+  ],
+  "num_new_tokens": 12,
+  "generated_ids": [
+    464,
+    3797,
+    3332,
+    319,
+    262,
+    4314,
+    286,
+    262,
+    2156,
+    11,
+    290,
+    262,
+    3797,
+    3332,
+    319,
+    262,
+    4314
+  ],
+  "per_step": [
+    {
+      "seq": 5,
+      "argmax": 4314,
+      "top1_logit": -55.07926940917969
+    },
+    {
+      "seq": 6,
+      "argmax": 286,
+      "top1_logit": -58.79587173461914
+    },
+    {
+      "seq": 7,
+      "argmax": 262,
+      "top1_logit": -32.256107330322266
+    },
+    {
+      "seq": 8,
+      "argmax": 2156,
+      "top1_logit": -46.1850700378418
+    },
+    {
+      "seq": 9,
+      "argmax": 11,
+      "top1_logit": -63.94710159301758
+    },
+    {
+      "seq": 10,
+      "argmax": 290,
+      "top1_logit": -64.41624450683594
+    },
+    {
+      "seq": 11,
+      "argmax": 262,
+      "top1_logit": -70.18798828125
+    },
+    {
+      "seq": 12,
+      "argmax": 3797,
+      "top1_logit": -54.30854797363281
+    },
+    {
+      "seq": 13,
+      "argmax": 3332,
+      "top1_logit": -69.89991760253906
+    },
+    {
+      "seq": 14,
+      "argmax": 319,
+      "top1_logit": -54.68364334106445
+    },
+    {
+      "seq": 15,
+      "argmax": 262,
+      "top1_logit": -25.681547164916992
+    },
+    {
+      "seq": 16,
+      "argmax": 4314,
+      "top1_logit": -42.12535095214844
+    }
+  ]
+}
