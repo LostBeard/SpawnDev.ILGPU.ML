@@ -19,17 +19,26 @@
         {
             <button class="clear-btn" @onclick="Clear">Drop another model</button>
         }
-        else if (_isLoading)
-        {
-            <div class="loading-text">Parsing model...</div>
-        }
         else
         {
             <div class="drop-prompt">
                 <div class="drop-icon">&#x1F4E6;</div>
-                <p>Drop a model file here</p>
-                <p class="drop-hint">.onnx, .tflite, .gguf, .safetensors — or click to browse</p>
-                <InputFile OnChange="HandleFileSelected" accept=".onnx,.tflite,.gguf,.safetensors" class="file-input" />
+                @if (_isLoading)
+                {
+                    <p class="loading-text">Parsing model...</p>
+                }
+                else
+                {
+                    <p>Drop a model file here</p>
+                    <p class="drop-hint">.onnx, .tflite, .gguf, .safetensors — or click to browse</p>
+                }
+                @* The InputFile MUST stay mounted while loading: the streaming inspector reads the
+                   model over many async chunks, and if the <input> is unmounted mid-read Blazor clears
+                   its file registry, so the in-flight OpenReadStream fails with
+                   "Cannot read properties of null (reading '_blazorFilesById')". Keep it rendered
+                   (disabled during load) for the whole read. Long-term: read the File's Blob via a
+                   seekable BlobStream (no InputFile / _blazorFilesById dependency). *@
+                <InputFile OnChange="HandleFileSelected" accept=".onnx,.tflite,.gguf,.safetensors" class="file-input" disabled="@_isLoading" />
             </div>
         }
     </div>
