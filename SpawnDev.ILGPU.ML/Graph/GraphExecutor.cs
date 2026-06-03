@@ -472,6 +472,53 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime Unsqueeze: re-infer the output shape from the ACTUAL runtime input
+            // shape (insert size-1 dims at axes). At compile time, an upstream dynamic op
+            // (e.g. Range, whose placeholder shape is [1]) poisons Unsqueeze's compiled output
+            // shape, so the buffer is mis-sized and element count collapses. Unsqueeze only
+            // inserts size-1 dims, so re-inferring from the real input shape is always safe and
+            // preserves element count. (Needed so the position-id range survives Range→Unsqueeze
+            // →Reshape into the wpe Gather.)
+            if (node.OpType == "Unsqueeze" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                long[]? axesArr = null;
+                if (node.Attributes.TryGetValue("axes", out var axObj) && axObj is long[] al) axesArr = al;
+                else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var axC) && axC.Length > 0)
+                    axesArr = axC.Select(v => (long)v).ToArray();
+                if (axesArr != null)
+                {
+                    var inShape = nodeInputs[0]!.Shape;
+                    int outRank = inShape.Length + axesArr.Length;
+                    var norm = new HashSet<int>();
+                    foreach (var a in axesArr) { int x = (int)a; if (x < 0) x += outRank; norm.Add(x); }
+                    var resolved = new int[outRank];
+                    int ii = 0;
+                    for (int j = 0; j < outRank; j++)
+                        resolved[j] = norm.Contains(j) ? 1 : (ii < inShape.Length ? inShape[ii++] : 1);
+                    if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+                }
+            }
+
+            // Runtime Range: output length = ceil((limit - start) / delta), knowable only
+            // from the scalar input VALUES, not their shapes. RangeOperator.InferOutputShapes
+            // returns the [1] placeholder, so without this the output buffer is sized to ONE
+            // element and Range writes nothing (its ElementCount>=count guard fails) — collapsing
+            // a position-id range like [0,1,2,3,4] to [0]. That silently broke every wpe /
+            // position-embedding Gather (only position 0 correct, the rest stale garbage).
+            if (node.OpType == "Range" && node.InputNames.Length >= 3)
+            {
+                var startV = runtimeConstants.GetValueOrDefault(node.InputNames[0]);
+                var limitV = runtimeConstants.GetValueOrDefault(node.InputNames[1]);
+                var deltaV = runtimeConstants.GetValueOrDefault(node.InputNames[2]);
+                if (startV != null && startV.Length > 0 && limitV != null && limitV.Length > 0
+                    && deltaV != null && deltaV.Length > 0 && deltaV[0] != 0f)
+                {
+                    int count = Math.Max(0, (int)MathF.Ceiling((limitV[0] - startV[0]) / deltaV[0]));
+                    if (count > 0) runtimeOutputShapes = new[] { new[] { count } };
+                }
+            }
+
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
@@ -826,6 +873,53 @@ public class GraphExecutor : IDisposable
                         }
                         catch { /* fall through to compiled shapes */ }
                     }
+                }
+            }
+
+            // Runtime Unsqueeze: re-infer the output shape from the ACTUAL runtime input
+            // shape (insert size-1 dims at axes). At compile time, an upstream dynamic op
+            // (e.g. Range, whose placeholder shape is [1]) poisons Unsqueeze's compiled output
+            // shape, so the buffer is mis-sized and element count collapses. Unsqueeze only
+            // inserts size-1 dims, so re-inferring from the real input shape is always safe and
+            // preserves element count. (Needed so the position-id range survives Range→Unsqueeze
+            // →Reshape into the wpe Gather.)
+            if (node.OpType == "Unsqueeze" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                long[]? axesArr = null;
+                if (node.Attributes.TryGetValue("axes", out var axObj) && axObj is long[] al) axesArr = al;
+                else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var axC) && axC.Length > 0)
+                    axesArr = axC.Select(v => (long)v).ToArray();
+                if (axesArr != null)
+                {
+                    var inShape = nodeInputs[0]!.Shape;
+                    int outRank = inShape.Length + axesArr.Length;
+                    var norm = new HashSet<int>();
+                    foreach (var a in axesArr) { int x = (int)a; if (x < 0) x += outRank; norm.Add(x); }
+                    var resolved = new int[outRank];
+                    int ii = 0;
+                    for (int j = 0; j < outRank; j++)
+                        resolved[j] = norm.Contains(j) ? 1 : (ii < inShape.Length ? inShape[ii++] : 1);
+                    if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+                }
+            }
+
+            // Runtime Range: output length = ceil((limit - start) / delta), knowable only
+            // from the scalar input VALUES, not their shapes. RangeOperator.InferOutputShapes
+            // returns the [1] placeholder, so without this the output buffer is sized to ONE
+            // element and Range writes nothing (its ElementCount>=count guard fails) — collapsing
+            // a position-id range like [0,1,2,3,4] to [0]. That silently broke every wpe /
+            // position-embedding Gather (only position 0 correct, the rest stale garbage).
+            if (node.OpType == "Range" && node.InputNames.Length >= 3)
+            {
+                var startV = runtimeConstants.GetValueOrDefault(node.InputNames[0]);
+                var limitV = runtimeConstants.GetValueOrDefault(node.InputNames[1]);
+                var deltaV = runtimeConstants.GetValueOrDefault(node.InputNames[2]);
+                if (startV != null && startV.Length > 0 && limitV != null && limitV.Length > 0
+                    && deltaV != null && deltaV.Length > 0 && deltaV[0] != 0f)
+                {
+                    int count = Math.Max(0, (int)MathF.Ceiling((limitV[0] - startV[0]) / deltaV[0]));
+                    if (count > 0) runtimeOutputShapes = new[] { new[] { count } };
                 }
             }
 

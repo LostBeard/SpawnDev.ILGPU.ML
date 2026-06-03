@@ -46,6 +46,34 @@ public abstract partial class MLTestBase
             throw new Exception($"TextGeneration produced 0 tokens");
     });
 
+    // GATING: establish the merged DistilGPT-2 model's KV-cache IO contract on our engine before
+    // building incremental decode. Logs input/output names + whether HasKVCache fires (needs paired
+    // past_key_values.* inputs + present.* outputs). Asserts the past interface is detected.
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task TextGen_MergedModel_HasKVCacheInterface() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
+        using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
+
+        Console.WriteLine($"[merged] InputNames ({session.InputNames.Length}): {string.Join(", ", session.InputNames)}");
+        Console.WriteLine($"[merged] OutputNames ({session.OutputNames.Length}): {string.Join(", ", session.OutputNames)}");
+        Console.WriteLine($"[merged] HasKVCache = {session.Executor.HasKVCache}");
+        var kv = session.Executor.KVCache;
+        if (kv != null) Console.WriteLine($"[merged] KVCache layers = {kv.NumLayers}");
+
+        bool hasPast = session.InputNames.Any(n => n.Contains("past_key_values"));
+        bool hasPresent = session.OutputNames.Any(n => n.StartsWith("present"));
+        if (!hasPast)
+            throw new Exception($"merged model has NO past_key_values inputs — inputs: {string.Join(",", session.InputNames)}");
+        if (!hasPresent)
+            throw new Exception($"merged model has NO present outputs — outputs: {string.Join(",", session.OutputNames)}");
+        Console.WriteLine($"[merged] past inputs + present outputs both present — incremental decode is wireable.");
+    });
+
     // Proves the STREAMING load path (InferenceSession.CreateFromOnnxStreamAsync) works on a real
     // transformer (DistilGPT-2), independent of the hub: download the model bytes, wrap them in a
     // SEEKABLE MemoryStream, and load with a tiny streamThreshold so every weight takes the streaming
@@ -69,15 +97,17 @@ public abstract partial class MLTestBase
 
         var pipeline = new TextGenerationPipeline(session, accelerator);
         pipeline.LoadTokenizer(tokenizerJson);
-        pipeline.MaxNewTokens = 5;
+        pipeline.MaxNewTokens = 20;
 
         var result = await pipeline.GenerateAsync("The cat sat on the");
-        Console.WriteLine($"[TextGen/stream] Output: '{result.GeneratedText}' ({result.GeneratedTokenCount} tokens, {result.InferenceTimeMs:F0}ms)");
+        Console.WriteLine($"[TextGen/stream] prompt='The cat sat on the' generated='{result.GeneratedText}' ({result.GeneratedTokenCount} tokens, {result.InferenceTimeMs:F0}ms, {result.TokensPerSecond:F1} tok/s)");
 
         if (string.IsNullOrWhiteSpace(result.GeneratedText))
             throw new Exception("Stream-loaded TextGeneration produced empty output");
-        if (result.GeneratedTokenCount < 1)
-            throw new Exception("Stream-loaded TextGeneration produced 0 tokens");
+        // The demo use case is multi-token generation. A coherent narrative prompt under greedy decode
+        // must not stop after a single token (that's the bug TJ hit in the live demo).
+        if (result.GeneratedTokenCount <= 1)
+            throw new Exception($"TextGeneration stopped after {result.GeneratedTokenCount} token(s) — expected multi-token output. generated='{result.GeneratedText}'");
     });
 
     // EXACT /text-gen page path: load DistilGPT-2 from OUR live hub (hub.spawndev.com) over a SEEKABLE

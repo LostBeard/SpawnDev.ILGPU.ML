@@ -977,20 +977,66 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Op_Where_Broadcast() => await RunTest(async accelerator =>
     {
-        // condition [3]: [1, 0, 1], X [3]: [10, 20, 30], Y [3]: [100, 200, 300]
-        // → [10, 200, 30]
-        var cond = new float[] { 1f, 0f, 1f };
-        var x = new float[] { 10f, 20f, 30f };
-        var y = new float[] { 100f, 200f, 300f };
-        var expected = new float[] { 10f, 200f, 30f };
+        // The PRODUCTION case that was broken: the transformer causal mask.
+        //   Where(cond[1,1,seq,seq], scores[1,heads,seq,seq], scalar mask_value)
+        // cond broadcasts over the head dim; mask_value (scalar) broadcasts over everything.
+        // scores is a RUNTIME tensor (not a pre-read constant), so the operator must take the
+        // GPU stride-based broadcast path — exactly where the old min-element-count fallback
+        // wrote only output[0] and left 47/48 elements as stale garbage, silently destroying
+        // every decoder's causal mask (GPT-2 echoed input tokens with flat logits).
+        const int heads = 3, seq = 4;
+        // Lower-triangular causal mask [1,1,seq,seq]: keep j<=i, mask j>i.
+        var cond = new float[seq * seq];
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                cond[i * seq + j] = j <= i ? 1f : 0f;
+        // Distinct, all-nonzero scores [1,heads,seq,seq] so any stale/garbage element is caught.
+        var scores = new float[heads * seq * seq];
+        for (int h = 0; h < heads; h++)
+            for (int i = 0; i < seq; i++)
+                for (int j = 0; j < seq; j++)
+                    scores[h * seq * seq + i * seq + j] = h * 100f + i * 10f + j + 1f;
+        const float maskValue = -1e9f;
+        var yScalar = new float[] { maskValue };
+
+        // CPU reference: out[h,i,j] = cond[i,j] != 0 ? scores[h,i,j] : maskValue
+        var expected = new float[heads * seq * seq];
+        for (int h = 0; h < heads; h++)
+            for (int i = 0; i < seq; i++)
+                for (int j = 0; j < seq; j++)
+                    expected[h * seq * seq + i * seq + j] =
+                        cond[i * seq + j] != 0f ? scores[h * seq * seq + i * seq + j] : maskValue;
+
         using var condBuf = accelerator.Allocate1D(cond);
-        using var xBuf = accelerator.Allocate1D(x);
-        using var yBuf = accelerator.Allocate1D(y);
-        using var outBuf = accelerator.Allocate1D<float>(3);
-        var ew = GetOrCreateEW(accelerator);
-        ew.Where(condBuf.View, xBuf.View, yBuf.View, outBuf.View, 3);
+        using var scoresBuf = accelerator.Allocate1D(scores);
+        using var yBuf = accelerator.Allocate1D(yScalar);
+        using var outBuf = accelerator.Allocate1D<float>(heads * seq * seq);
+        var pool = new BufferPool(accelerator);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(condBuf.View, new[] { 1, 1, seq, seq }),
+                new Tensor(scoresBuf.View, new[] { 1, heads, seq, seq }),
+                new Tensor(yBuf.View, new[] { 1 }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 1, heads, seq, seq }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = pool,
+            InputNames = new[] { "cond", "scores", "mask_value" },
+            // Mirror production: cond + mask_value are graph constants, scores is runtime.
+            // scores is intentionally NOT in ConstantValues so TryGetInputValues(1) == null
+            // and the operator takes the GPU broadcast path (the one that was broken).
+            ConstantValues = new Dictionary<string, float[]>
+            {
+                ["cond"] = cond, ["mask_value"] = yScalar
+            }
+        };
+        reg.Resolve("Where")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
-        await AssertCloseGpu(accelerator, outBuf.View, expected, 0f, "Where: ");
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 0f,
+            "Where broadcast causal-mask [1,1,s,s]?[1,h,s,s]:scalar — ");
     });
 
     // ═══════════════════════════════════════════════════════════

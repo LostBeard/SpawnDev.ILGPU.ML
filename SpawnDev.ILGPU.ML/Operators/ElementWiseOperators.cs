@@ -729,10 +729,19 @@ public class WhereOperator(OperatorRegistry reg) : IOnnxOperator
             }
             else
             {
-                // Fallback: use minimum safe count to avoid OOB reads
-                int safeCount = Math.Min(Math.Min(cond.ElementCount, x.ElementCount),
-                    Math.Min(y.ElementCount, ctx.Outputs[0].ElementCount));
-                reg.ElementWise.Where(cond.Data, x.Data, y.Data, ctx.Outputs[0].Data, safeCount);
+                // Not all three inputs are small CPU constants — the common case is the
+                // causal-mask Where, where x = attention scores [1, heads, seq, seq] is a
+                // runtime GPU tensor (so xVals == null), cond = mask [1, 1, seq, seq], and
+                // y = a scalar mask_value. Do a real stride-based N-D broadcast on the GPU.
+                //
+                // The previous fallback called ElementWise.Where over
+                // min(elementCounts) elements — which is 1 when y is a scalar — writing only
+                // output[0] and leaving the rest as stale pooled-buffer garbage. That silently
+                // destroyed the causal mask in EVERY decoder layer (GPT-2/DistilGPT-2: flat,
+                // input-echoing logits), and corrupted any broadcasting Where on a runtime tensor.
+                reg.ElementWise.WhereBroadcastND(
+                    cond.Data, x.Data, y.Data, ctx.Outputs[0].Data,
+                    cond.Shape, x.Shape, y.Shape, ctx.Outputs[0].Shape);
             }
         }
     }

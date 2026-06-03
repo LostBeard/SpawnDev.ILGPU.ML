@@ -1384,6 +1384,33 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = cond[idx] != 0f ? x[idx] : y[idx]; }
 
+    /// <summary>
+    /// N-D broadcast Where: output[i] = cond[mapC(i)] != 0 ? x[mapX(i)] : y[mapY(i)].
+    /// strides layout: [rank, cStrides[0..rank], xStrides[0..rank], yStrides[0..rank], outStrides[0..rank]].
+    /// outStrides are dense (never 0) so the coordinate-decompose divide is safe on Wasm;
+    /// cond/x/y strides may be 0 for broadcast dims (only multiplied here, never divided).
+    /// </summary>
+    private static void WhereBroadcastKernel(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> cond,
+        ArrayView1D<float, Stride1D.Dense> x,
+        ArrayView1D<float, Stride1D.Dense> y,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> strides)
+    {
+        int rank = (int)strides[0];
+        int cIdx = 0, xIdx = 0, yIdx = 0, remaining = idx;
+        for (int d = 0; d < rank; d++)
+        {
+            int outStride = (int)strides[1 + 3 * rank + d];
+            int coord = remaining / outStride;
+            remaining = remaining % outStride;
+            cIdx += coord * (int)strides[1 + d];
+            xIdx += coord * (int)strides[1 + rank + d];
+            yIdx += coord * (int)strides[1 + 2 * rank + d];
+        }
+        output[idx] = cond[cIdx] != 0f ? x[xIdx] : y[yIdx];
+    }
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _sqrtKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _sinKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _cosKernel;
@@ -1398,6 +1425,9 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _erfKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _whereKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _whereBroadcastKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _floorKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _ceilKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _logKernel;
@@ -1483,6 +1513,51 @@ public class ElementWiseKernels : IDisposable
     public void Where(ArrayView1D<float, Stride1D.Dense> cond, ArrayView1D<float, Stride1D.Dense> x,
         ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _whereKernel!(count, cond, x, y, output); }
+
+    /// <summary>
+    /// N-D broadcast Where on GPU: output = cond != 0 ? x : y, with each input broadcast
+    /// (stride-0 on size-1/missing dims) up to outShape. Fixes the transformer causal-mask
+    /// case Where(mask[1,1,s,s], scores[1,heads,s,s], scalar mask_value) where the previous
+    /// min-element-count fallback computed only 1 element (y is scalar) and left the rest of
+    /// the output as stale pooled-buffer garbage — silently destroying every decoder's mask.
+    /// </summary>
+    public void WhereBroadcastND(
+        ArrayView1D<float, Stride1D.Dense> cond,
+        ArrayView1D<float, Stride1D.Dense> x,
+        ArrayView1D<float, Stride1D.Dense> y,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int[] condShape, int[] xShape, int[] yShape, int[] outShape)
+    {
+        EnsureLoaded2();
+        int rank = outShape.Length;
+        int outCount = 1;
+        for (int i = 0; i < rank; i++) outCount *= outShape[i];
+
+        var cStrides = Operators.BroadcastHelper.ComputeStrides(condShape, outShape);
+        var xStrides = Operators.BroadcastHelper.ComputeStrides(xShape, outShape);
+        var yStrides = Operators.BroadcastHelper.ComputeStrides(yShape, outShape);
+        // Dense output strides (never 0) — the kernel divides idx by these to decompose
+        // coordinates; a 0 stride would trap with divide-by-zero on Wasm (same rule as
+        // BroadcastBinaryOpND). Input strides may be 0 for broadcast dims (only multiplied).
+        var outStrides = new int[rank];
+        int denseStride = 1;
+        for (int i = rank - 1; i >= 0; i--) { outStrides[i] = denseStride; denseStride *= outShape[i]; }
+
+        // Pack: [rank, cStrides, xStrides, yStrides, outStrides]. Allocate a fresh buffer per
+        // call and defer disposal (browser dispatch is async; reuse races pending dispatches).
+        int paramsSize = 1 + 4 * rank;
+        if (_broadcastStridesBuf != null) _oldStridesBufs.Add(_broadcastStridesBuf);
+        _broadcastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
+        var paramsData = new float[paramsSize];
+        paramsData[0] = rank;
+        for (int i = 0; i < rank; i++) paramsData[1 + i] = cStrides[i];
+        for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = xStrides[i];
+        for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = yStrides[i];
+        for (int i = 0; i < rank; i++) paramsData[1 + 3 * rank + i] = outStrides[i];
+        _broadcastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+
+        _whereBroadcastKernel!(outCount, cond, x, y, output, _broadcastStridesBuf.View);
+    }
 
     public void Floor(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _floorKernel!(count, input, output); }
@@ -1597,6 +1672,8 @@ public class ElementWiseKernels : IDisposable
         _erfKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(ErfImpl);
         _whereKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(WhereImpl);
+        _whereBroadcastKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(WhereBroadcastKernel);
         _floorKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FloorImpl);
         _ceilKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CeilImpl);
         _logKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LogImpl);

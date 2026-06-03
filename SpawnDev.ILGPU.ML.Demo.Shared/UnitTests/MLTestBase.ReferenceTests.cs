@@ -590,6 +590,118 @@ public abstract partial class MLTestBase
 
     // ── Text Generation Reference Test ──
 
+    // Node-by-node bisection of the DistilGPT-2 forward pass against an ONNX Runtime
+    // ground-truth dump (tools/distilgpt2_dump_intermediates.py, ORT optimizations DISABLED
+    // to match our enableOptimization:false). Walks every captured node output in topological
+    // order and reports the FIRST node whose activation grossly diverges from ORT — i.e. the
+    // exact op where our forward pass goes wrong. Far stronger than argmax==4314: it localizes
+    // a bug to a single node instead of only flagging that the final token is wrong.
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Reference_GPT2_NodeBisect_VsOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        // ORT ground-truth intermediates: { tensorName: { shape, first[16], absmax, count } }.
+        var refJson = await http.GetStringAsync("references/gpt2/distilgpt2_intermediates.json");
+        using var refDoc = System.Text.Json.JsonDocument.Parse(refJson);
+        var ortRef = refDoc.RootElement;
+
+        Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+        Graph.GraphExecutor.CapturedNodeInfo = new Dictionary<string, string>();
+        // Capture enough per node to cover full block-0 activation tensors ([1,5,768]=3840,
+        // [1,12,5,64]=3840). With only the default 1024 we'd sample token 0 only — and the bug
+        // is per-token (token 0 right, tokens 1-4 wrong), so a small window hides the true source
+        // node and mis-attributes the divergence to a downstream transpose that reads token>0.
+        int savedCap = Graph.GraphExecutor.CaptureMaxElements;
+        Graph.GraphExecutor.CaptureMaxElements = 4096;
+        try
+        {
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["input_ids"] = new[] { 1, 5 },
+                    ["attention_mask"] = new[] { 1, 5 },
+                },
+                enableOptimization: false);
+
+            var tokenIds = new float[] { 464, 3797, 3332, 319, 262 };
+            var attentionMask = new float[] { 1, 1, 1, 1, 1 };
+            using var idsBuf = accelerator.Allocate1D(tokenIds);
+            using var maskBuf = accelerator.Allocate1D(attentionMask);
+            var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 }) };
+            if (session.InputNames.Length > 1) inputs[session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 });
+            await session.RunAsync(inputs);
+            await accelerator.SynchronizeAsync();
+
+            var captured = Graph.GraphExecutor.CapturedOutputs;
+            var nameRe = new System.Text.RegularExpressions.Regex(@"^\d+_[A-Za-z0-9]+_(.*)$");
+            var ordered = captured
+                .Select(kv => (idx: int.TryParse(kv.Key.Split('_')[0], out var i) ? i : int.MaxValue, kv.Key, kv.Value))
+                .OrderBy(t => t.idx).ToList();
+
+            // For each node, compute max abs diff of the first-K elements vs ORT. Report the
+            // FIRST node whose activation diverges beyond float noise (the bug), with 4 nodes of
+            // context before it. Tolerance is generous (0.5 abs) so float32 GPU-vs-CPU accumulation
+            // noise never trips it — only a genuinely wrong op does.
+            // A genuine op bug is wrong by a large FRACTION of the reference (≥10%) AND by a
+            // meaningful absolute amount (≥0.05, so near-zero values with noisy ratios don't trip).
+            const float REL_TOL = 0.10f, MIN_ABS = 0.05f;
+            bool found = false;
+            int afterBad = 0;
+            var recent = new System.Collections.Generic.Queue<string>();  // ring of last compared-node rows
+            var rows = new List<string>();
+            for (int n = 0; n < ordered.Count; n++)
+            {
+                var (idx, key, vals) = ordered[n];
+                var m = nameRe.Match(key);
+                if (!m.Success) continue;
+                var onnxName = m.Groups[1].Value;
+                if (!ortRef.TryGetProperty(onnxName, out var refEl)) continue;
+                var refFirst = refEl.GetProperty("first").EnumerateArray().Select(e => (float)e.GetDouble()).ToArray();
+                int k = Math.Min(refFirst.Length, vals.Length);
+                if (k == 0) continue;
+                // Use a RELATIVE tolerance: GPT-2 has known huge outlier activations (e.g. the
+                // LayerNorm Pow square reaches ~2.6e6, where float32 round-off alone is ±4). An
+                // absolute threshold there is pure noise. Flag only diffs that are large relative
+                // to the reference magnitude (a genuinely wrong op is wrong by a big fraction).
+                float maxRel = 0; int worst = 0; float worstAbs = 0;
+                for (int e = 0; e < k; e++)
+                {
+                    float d = MathF.Abs(vals[e] - refFirst[e]);
+                    float rel = d / (MathF.Abs(refFirst[e]) + 1e-3f);
+                    if (rel > maxRel) { maxRel = rel; worst = e; worstAbs = d; }
+                }
+                float maxDiff = worstAbs;  // reported absolute diff at the worst RELATIVE element
+                bool isBad = maxRel > REL_TOL && worstAbs > MIN_ABS && !found;
+                string shape = refEl.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32().ToString()).Aggregate("", (a, b) => a.Length == 0 ? b : a + "x" + b);
+                string row = $"{(isBad ? "►" : " ")}{idx,4} {onnxName} [{shape}] maxDiff={maxDiff:F3} ours=[{string.Join(",", vals.Take(6).Select(v => v.ToString("F3")))}] ort=[{string.Join(",", refFirst.Take(6).Select(v => v.ToString("F3")))}]{(isBad ? $" worst@{worst}: ours={vals[worst]:F4} ort={refFirst[worst]:F4}" : "")}";
+                if (!found)
+                {
+                    recent.Enqueue(row);
+                    while (recent.Count > 16) recent.Dequeue();
+                    if (isBad) { found = true; rows.AddRange(recent); }
+                }
+                else { rows.Add(row); if (++afterBad >= 2) break; }
+            }
+
+            if (!found)
+            {
+                Console.WriteLine($"[GPT2-bisect] No gross divergence across {ordered.Count} nodes — forward pass matches ORT.");
+                return;
+            }
+            throw new Exception($"[GPT2-bisect] FIRST divergence vs ORT (◄16-node context):\n{string.Join("\n", rows)}");
+        }
+        finally
+        {
+            Graph.GraphExecutor.CapturedOutputs = null;
+            Graph.GraphExecutor.CapturedNodeInfo = null;
+            Graph.GraphExecutor.CaptureMaxElements = savedCap;
+        }
+    });
+
     [TestMethod(Timeout = 900000, Category = "HeavyModel")] // 15 min — GPT-2 is 652MB + 2620 nodes. Download + compile + inference needs headroom on WebGPU
     public async Task Reference_GPT2_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
@@ -658,7 +770,16 @@ public abstract partial class MLTestBase
             throw new Exception($"[GPT-2] Logits are zero — model not producing output. token={nextToken}, logit={maxLogit:F4}");
         if (maxLogit < -100f)
             throw new Exception($"[GPT-2] Logits abnormally negative — inference may be corrupted. token={nextToken}, logit={maxLogit:F4}");
-        Console.WriteLine($"[GPT-2] PASS: inference produced valid logits");
+
+        // CORRECTNESS: greedy next token for "The cat sat on the" MUST be 4314 (" floor"), the
+        // ONNX Runtime / HF reference. "valid logits" is not enough — degenerate-but-finite logits
+        // (e.g. picking " The"/token 383 then EOS) is exactly the bug that made the /text-gen demo
+        // produce single-token garbage. Top-5 logged so a wrong result shows what the model preferred.
+        var top5 = logits.Select((v, i) => (i, v)).OrderByDescending(t => t.v).Take(5).ToArray();
+        Console.WriteLine($"[GPT-2] Top-5: {string.Join(", ", top5.Select(t => $"{t.i}={t.v:F3}"))}");
+        if (nextToken != 4314)
+            throw new Exception($"[GPT-2] WRONG next token {nextToken} (expected 4314 ' floor'). Logits are finite but incorrect — model execution bug. Top-5: {string.Join(", ", top5.Select(t => $"{t.i}={t.v:F3}"))}");
+        Console.WriteLine($"[GPT-2] PASS: next token 4314 matches reference");
 
     });
 
