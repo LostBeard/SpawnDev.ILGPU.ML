@@ -1,6 +1,10 @@
 @page "/inspector"
 @using SpawnDev.ILGPU.ML.Onnx
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.WebTorrent
 @using Microsoft.AspNetCore.Components.Forms
+@inject WebTorrentClient WtClient
+@inject HttpClient Http
 
 <PageTitle>Model Inspector — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -28,6 +32,15 @@
                 <InputFile OnChange="HandleFileSelected" accept=".onnx,.tflite,.gguf,.safetensors" class="file-input" />
             </div>
         }
+    </div>
+
+    <div class="hub-inspect">
+        <div class="hub-inspect-label">Or inspect a HuggingFace model by URL — streamed from the SpawnDev hub, structure only (weights are never downloaded):</div>
+        <div class="hub-inspect-row">
+            <input class="hub-input" @bind="_hubRepoId" @bind:event="oninput" placeholder="repo id, e.g. onnx-community/mobilenetv3_small_100.lamb_in1k" disabled="@_isLoading" />
+            <input class="hub-input hub-input-path" @bind="_hubFilePath" @bind:event="oninput" placeholder="file path, e.g. onnx/model.onnx" disabled="@_isLoading" />
+            <button class="hub-btn" @onclick="HandleHubInspect" disabled="@(_isLoading || string.IsNullOrWhiteSpace(_hubRepoId) || string.IsNullOrWhiteSpace(_hubFilePath))">Inspect from hub</button>
+        </div>
     </div>
 
     @if (_result != null)
@@ -176,6 +189,16 @@
 
     .error-box { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); border-radius: 8px; padding: 1rem; color: #fca5a5; margin-top: 1rem; }
 
+    .hub-inspect { margin-bottom: 1.5rem; }
+    .hub-inspect-label { color: #64748b; font-size: 0.85rem; margin-bottom: 0.5rem; }
+    .hub-inspect-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .hub-input { flex: 1 1 240px; min-width: 0; padding: 0.5rem 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: #e2e8f0; font-size: 0.85rem; font-family: 'JetBrains Mono','Consolas',monospace; }
+    .hub-input-path { flex: 0 1 200px; }
+    .hub-input:focus { outline: none; border-color: rgba(139,92,246,0.5); }
+    .hub-btn { padding: 0.5rem 1.1rem; border-radius: 8px; border: 1px solid rgba(139,92,246,0.4); background: rgba(139,92,246,0.15); color: #c4b5fd; cursor: pointer; white-space: nowrap; }
+    .hub-btn:hover:not(:disabled) { background: rgba(139,92,246,0.28); color: #e9d5ff; }
+    .hub-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
     @@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
     @@media (max-width: 640px) { .result-grid { grid-template-columns: 1fr; } .result-card-wide { grid-column: span 1; } }
 </style>
@@ -211,6 +234,36 @@
         catch (Exception ex)
         {
             _error = $"Failed to parse model: {ex.Message}";
+        }
+
+        _isLoading = false;
+        StateHasChanged();
+    }
+
+    private string _hubRepoId = "";
+    private string _hubFilePath = "";
+
+    private async Task HandleHubInspect()
+    {
+        if (string.IsNullOrWhiteSpace(_hubRepoId) || string.IsNullOrWhiteSpace(_hubFilePath)) return;
+
+        _isLoading = true;
+        _error = null;
+        _result = null;
+        _compatibility = null;
+        StateHasChanged();
+
+        try
+        {
+            // HubModelStream asks the hub for a magnet, resolves metadata peer-free via the magnet's HTTP
+            // exact-source, opens the torrent DESELECTED, and the inspector seeks past every weight blob —
+            // so only structure pieces are fetched. A multi-GB checkpoint inspects from a few hundred KB.
+            var hub = new HubModelStream(WtClient, Http);
+            (_result, _compatibility) = await hub.InspectWithCompatibilityAsync(_hubRepoId.Trim(), _hubFilePath.Trim());
+        }
+        catch (Exception ex)
+        {
+            _error = $"Failed to inspect from hub: {ex.Message}";
         }
 
         _isLoading = false;

@@ -80,13 +80,20 @@ public class HubModelStream
     /// downloads torrent pieces on demand; dispose it when done. The torrent stays in the client
     /// (so a subsequent open / load reuses already-downloaded pieces).
     /// </summary>
-    public async Task<HubModel> OpenAsync(string repoId, string filePath, CancellationToken ct = default)
+    /// <param name="deselect">
+    /// When <c>true</c>, the torrent is added DESELECTED: no piece is selected up front, so only the
+    /// pieces a read actually touches are fetched (SpawnDev.WebTorrent 3.2.5 Fix B). This is what makes
+    /// inspecting a multi-GB checkpoint pull only graph structure, never weights. When <c>false</c>
+    /// (default) the whole file is selected so a plain read / model load downloads it in the background.
+    /// </param>
+    public async Task<HubModel> OpenAsync(string repoId, string filePath, bool deselect = false, CancellationToken ct = default)
     {
         var magnet = await GetMagnetAsync(repoId, filePath, ct).ConfigureAwait(false);
 
         using var metaCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         metaCts.CancelAfter(MetadataTimeout);
-        var torrent = await _client.AddAsync(magnet, ct: metaCts.Token).ConfigureAwait(false);
+        var opts = deselect ? new AddTorrentOptions { Deselect = true } : null;
+        var torrent = await _client.AddAsync(magnet, opts, metaCts.Token).ConfigureAwait(false);
 
         if (torrent.Files == null || torrent.Files.Length == 0)
             throw new InvalidOperationException(
@@ -102,7 +109,8 @@ public class HubModelStream
     /// </summary>
     public async Task<InspectionResult> InspectAsync(string repoId, string filePath, CancellationToken ct = default)
     {
-        var model = await OpenAsync(repoId, filePath, ct).ConfigureAwait(false);
+        // deselect: true — inspection seeks past every weight blob, so only structure pieces are fetched.
+        var model = await OpenAsync(repoId, filePath, deselect: true, ct).ConfigureAwait(false);
         try
         {
             return await ModelInspectorHelper.InspectAsync(model.Stream, ct).ConfigureAwait(false);
@@ -120,7 +128,8 @@ public class HubModelStream
     public async Task<(InspectionResult Inspection, CompatibilityResult Compatibility)> InspectWithCompatibilityAsync(
         string repoId, string filePath, Operators.OperatorRegistry? registry = null, CancellationToken ct = default)
     {
-        var model = await OpenAsync(repoId, filePath, ct).ConfigureAwait(false);
+        // deselect: true — single seekable pass reads only structure pieces, never weights.
+        var model = await OpenAsync(repoId, filePath, deselect: true, ct).ConfigureAwait(false);
         try
         {
             return await ModelInspectorHelper.InspectWithCompatibilityAsync(model.Stream, registry, ct).ConfigureAwait(false);

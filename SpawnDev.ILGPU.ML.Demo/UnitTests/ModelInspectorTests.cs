@@ -1,6 +1,8 @@
 using System.Text;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Onnx;
 using SpawnDev.UnitTesting;
+using SpawnDev.WebTorrent;
 
 namespace SpawnDev.ILGPU.ML.Demo.UnitTests;
 
@@ -395,6 +397,56 @@ public class ModelInspectorTests
             throw new Exception($"Read {counting.BytesRead} of {bytes.Length} bytes — weights were NOT skipped (expected << {bytes.Length / 4})");
         if (counting.BytesSeeked <= 0)
             throw new Exception("Expected Seek() calls skipping weight blobs; none occurred");
+    }
+
+    // ── Inspect-by-URL via the live SpawnDev hub (the original #1 goal) ──
+
+    /// <summary>
+    /// Inspect a HuggingFace model BY URL via the live SpawnDev hub (hub.spawndev.com): HubModelStream
+    /// asks the hub for a magnet, resolves metadata PEER-FREE via the magnet's HTTP exact-source (xs=),
+    /// opens the torrent DESELECTED, and the inspector seeks past every weight blob. So inspecting the
+    /// model fetches only the structure pieces it touches — NOT the weights. Asserts (a) a meaningful
+    /// architecture parsed, and (b) the torrent did NOT download the whole file. This is the production
+    /// inspect-by-URL path the demo exposes; requires internet (cold hub cache → generous timeout).
+    /// </summary>
+    [TestMethod(Timeout = 240000, RetryCount = 2)]
+    public async Task ModelInspector_Hub_InspectByUrl_StructureOnly()
+    {
+        const string repoId = "onnx-community/mobilenetv3_small_100.lamb_in1k";
+        const string filePath = "onnx/model.onnx";
+
+        var client = new WebTorrentClient();
+        try
+        {
+            var hub = new HubModelStream(client, _http);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(180));
+
+            // Open DESELECTED so only touched (structure) pieces download.
+            var model = await hub.OpenAsync(repoId, filePath, deselect: true, cts.Token);
+            if (model.File.Length <= 0) throw new Exception($"hub model file length={model.File.Length}");
+
+            InspectionResult r;
+            await using (model.Stream)
+                r = await ModelInspectorHelper.InspectAsync(model.Stream, cts.Token);
+
+            // (a) Structure must be meaningful — proves on-demand deselected reads fetch the right pieces.
+            if (r.NodeCount <= 0) throw new Exception($"NodeCount={r.NodeCount}, expected > 0");
+            if (r.TotalParameters <= 0) throw new Exception($"TotalParameters={r.TotalParameters}, expected > 0");
+            if (!r.Operators.Any(o => o.OpType == "Conv")) throw new Exception("mobilenet must use Conv");
+
+            // (b) Inspecting structure must NOT pull the whole model. Without deselect + seek-past-weights
+            // the default select-all would download every byte. Degree of saving is layout/piece-size
+            // dependent, so the robust, non-flaky claim is simply: strictly less than the full file.
+            long downloaded = model.Torrent.Downloaded;
+            if (downloaded >= model.File.Length)
+                throw new Exception(
+                    $"inspect-by-URL downloaded {downloaded} of {model.File.Length} bytes (the whole file) — " +
+                    "deselect / seek-past-weights was not effective; weights were pulled");
+        }
+        finally
+        {
+            await client.DisposeAsync();
+        }
     }
 }
 
