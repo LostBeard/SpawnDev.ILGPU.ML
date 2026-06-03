@@ -724,6 +724,15 @@ public class GraphCompiler
             InputNames = graph.Inputs.Select(i => i.Name).ToArray(),
             OutputNames = graph.Outputs.Select(o => o.Name).ToArray(),
             InputShapes = graph.Inputs.ToDictionary(i => i.Name, i => i.Shape),
+            // Resolved input shapes actually used for compile-time shape inference
+            // (dynamic dims d<=0 replaced with 1, or pinned via inputShapes override).
+            // The executor compares runtime input tensor shapes against these to decide
+            // whether the model is being run at a DIFFERENT shape than it was compiled for
+            // (e.g. autoregressive generation growing the sequence dim) and, if so,
+            // re-infers per-node output buffer sizes from the actual runtime input shapes.
+            CompiledInputShapes = graph.Inputs.ToDictionary(
+                i => i.Name,
+                i => knownShapes.TryGetValue(i.Name, out var s) ? s : i.Shape.Select(d => d <= 0 ? 1 : d).ToArray()),
             OutputShapes = graph.Outputs.ToDictionary(o => o.Name, o => knownShapes.TryGetValue(o.Name, out var s) ? s : Array.Empty<int>()),
             InitializerNames = graph.Initializers.Keys.ToHashSet(),
             InitializerDataTypes = graph.InitializerDataTypes,
@@ -808,6 +817,13 @@ public class CompiledGraph
     public required string[] OutputNames { get; init; }
     public required Dictionary<string, int[]> InputShapes { get; init; }
     public required Dictionary<string, int[]> OutputShapes { get; init; }
+    /// <summary>Input shapes as resolved at compile time for shape inference: dynamic dims
+    /// (ONNX d&lt;=0) replaced with 1, or pinned to a caller-supplied override. The executor
+    /// compares actual runtime input tensor shapes against these to detect a shape change
+    /// (e.g. a growing sequence_length during autoregressive decode) and re-infer per-node
+    /// output buffer sizes from the real input shapes. Defaults to empty for graphs built
+    /// without the compiler (none currently — kept non-required for forward compatibility).</summary>
+    public Dictionary<string, int[]> CompiledInputShapes { get; init; } = new();
     public required HashSet<string> InitializerNames { get; init; }
     /// <summary>Maps initializer (and Constant-node output) name to its ONNX-declared
     /// data type code (see <see cref="Onnx.OnnxDataType"/>). Consumed by GraphExecutor

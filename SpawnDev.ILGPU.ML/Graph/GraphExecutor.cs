@@ -301,7 +301,9 @@ public class GraphExecutor : IDisposable
 
             // Use COMPILED shapes by default — they're correct for the compiled input dims.
             // Only override for operators with runtime-dependent shape tensors
-            // (Reshape, Slice, Expand, Resize) resolved below.
+            // (Reshape, Slice, Expand, Resize) resolved below. Dynamic input shapes (e.g. a
+            // growing decode sequence) are handled by InferenceSession recompiling the graph at
+            // the actual shape, so the executor always runs a graph compiled for THESE dims.
             int[][] runtimeOutputShapes = node.OutputShapes;
 
             // Runtime Slice: resolve output shape from starts/ends/axes constants
@@ -703,7 +705,9 @@ public class GraphExecutor : IDisposable
                 .ToArray();
 
             // Use COMPILED shapes by default (same as sync Run path).
-            // Full runtime re-inference caused cascading shape mismatches in attention blocks.
+            // Full runtime re-inference caused cascading shape mismatches in attention blocks;
+            // dynamic input shapes are instead handled by InferenceSession recompiling the graph
+            // for the actual shape, so this executor always runs a graph compiled for THESE dims.
             int[][] runtimeOutputShapes = node.OutputShapes;
 
             // Runtime Slice (same as sync Run)

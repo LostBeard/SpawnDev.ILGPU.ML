@@ -29,6 +29,25 @@ public class InferenceSession : IDisposable
     private readonly Dictionary<string, Tensor> _weights;
     private List<IDisposable>? _ownedBuffers; // Tracks buffers not managed by the pool (GGUF quantized bytes, etc.)
 
+    // ── Dynamic-shape recompilation (shape specialization) ──
+    // A model with dynamic input dims (e.g. a transformer decoder's sequence_length) is compiled
+    // ONCE at its declared shape (dynamic dims → 1). Running it at a DIFFERENT shape (the prompt
+    // length, then a growing decode sequence) needs every seq-dependent buffer re-sized. The
+    // executor's per-node compiled shapes can't be patched correctly at runtime (the compiler
+    // folds whole Shape→Gather→Concat→Reshape subgraphs with concrete dims; a runtime patch can't
+    // reproduce that), so instead we RECOMPILE the graph at the actual input shape and run that —
+    // identical to having pinned `inputShapes` to those dims. Compiled executors are cached per
+    // input-shape signature (kernels are cached at the accelerator level, so recompile is pure CPU
+    // shape inference; weights are shared, never re-uploaded). Null when recompilation isn't wired
+    // for this load path (TFLite/GGUF/etc.) — those keep the single-executor behavior.
+    private Graph.ModelGraph? _recompileGraph;             // graph structure (nodes/inputs/initializers)
+    private Dictionary<string, int[]>? _recompileConstSeed;    // CLEAN ConstantData seed (pre-fold)
+    private Dictionary<string, float[]>? _recompileFloatSeed;  // CLEAN FloatConstantData seed (pre-fold)
+    private bool _recompileEnableOptimization = true;
+    private readonly Dictionary<string, GraphExecutor> _shapeExecutors = new();
+    private readonly List<string> _shapeExecutorLru = new();
+    private const int MaxShapeExecutors = 3; // bound GPU memory: each holds its own intermediate pool
+
     /// <summary>Enable diagnostic logging to Console.</summary>
     public static bool VerboseLogging { get; set; }
 
@@ -83,6 +102,107 @@ public class InferenceSession : IDisposable
         _executor = executor;
         _pool = pool;
         _weights = weights;
+    }
+
+    /// <summary>
+    /// Wire up dynamic-shape recompilation for this session. Called by the ONNX load paths, passing
+    /// the <see cref="Graph.ModelGraph"/> plus SNAPSHOTS of its ConstantData/FloatConstantData taken
+    /// BEFORE the first compile. The seeds matter because with optimization OFF (the NLP path),
+    /// <see cref="GraphCompiler.Compile"/> folds constants directly onto the graph it is given — so
+    /// after the base compile the graph's ConstantData holds seq=1 folded values. Each recompile
+    /// resets the graph to these clean seeds first, then pins the actual input shapes. When a later
+    /// Run/RunAsync supplies an input shape that differs from the compile-time shape, the session
+    /// recompiles at the actual shape and runs that executor instead.
+    /// </summary>
+    private void EnableShapeRecompilation(Graph.ModelGraph graph,
+        Dictionary<string, int[]>? constSeed, Dictionary<string, float[]>? floatSeed,
+        bool enableOptimization)
+    {
+        _recompileGraph = graph;
+        _recompileConstSeed = constSeed;
+        _recompileFloatSeed = floatSeed;
+        _recompileEnableOptimization = enableOptimization;
+    }
+
+    private static bool ShapesEqual(int[] a, int[] b)
+    {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Pick (or build) the executor whose compiled graph matches these input shapes. Returns the
+    /// base executor when the inputs match the compile-time shapes (the common case: every shape-
+    /// pinned/static model), or recompilation isn't wired. Otherwise returns a per-shape executor,
+    /// recompiling + caching on first use of each distinct input-shape signature.
+    /// </summary>
+    private GraphExecutor ResolveExecutor(Dictionary<string, Tensor> inputs)
+    {
+        if (_recompileGraph == null) return _executor;
+
+        // Match against the shapes the base graph was compiled for. If every supplied input matches
+        // (or isn't a graph input), the base executor is already specialized for this call.
+        bool differs = false;
+        foreach (var (name, tensor) in inputs)
+        {
+            if (_compiled.CompiledInputShapes.TryGetValue(name, out var compiledShape)
+                && !ShapesEqual(tensor.Shape, compiledShape))
+            {
+                differs = true;
+                break;
+            }
+        }
+        if (!differs) return _executor;
+
+        var sig = string.Join("|", inputs.OrderBy(kv => kv.Key)
+            .Select(kv => $"{kv.Key}:{string.Join(",", kv.Value.Shape)}"));
+        if (_shapeExecutors.TryGetValue(sig, out var cached))
+        {
+            _shapeExecutorLru.Remove(sig);
+            _shapeExecutorLru.Add(sig);
+            return cached;
+        }
+
+        var exec = RecompileForShapes(inputs);
+        _shapeExecutors[sig] = exec;
+        _shapeExecutorLru.Add(sig);
+        // Bound GPU memory — each cached executor owns an intermediate buffer pool sized for its
+        // sequence length. Evict the least-recently-used (the base executor is never in this cache).
+        while (_shapeExecutorLru.Count > MaxShapeExecutors)
+        {
+            var evict = _shapeExecutorLru[0];
+            _shapeExecutorLru.RemoveAt(0);
+            if (_shapeExecutors.Remove(evict, out var old)) old.Dispose();
+        }
+        return exec;
+    }
+
+    /// <summary>
+    /// Recompile <see cref="_recompileGraph"/> with the supplied input shapes pinned, and build an
+    /// executor for it that SHARES this session's already-uploaded weights (no re-upload). The
+    /// compiler clones the graph internally, so mutating the stored graph's input shapes here is
+    /// safe and reused across recompiles.
+    /// </summary>
+    private GraphExecutor RecompileForShapes(Dictionary<string, Tensor> inputs)
+    {
+        var graph = _recompileGraph!;
+        // Reset to the clean pre-fold constant seeds (the prior compile may have folded seq-specific
+        // values onto the graph when optimization is off), then pin the actual input shapes.
+        graph.ConstantData = _recompileConstSeed != null ? new Dictionary<string, int[]>(_recompileConstSeed) : new();
+        graph.FloatConstantData = _recompileFloatSeed != null ? new Dictionary<string, float[]>(_recompileFloatSeed) : new();
+        foreach (var inp in graph.Inputs)
+            if (inputs.TryGetValue(inp.Name, out var t))
+                inp.Shape = t.Shape.ToArray();
+
+        var compiled = new GraphCompiler(_registry) { EnableOptimization = _recompileEnableOptimization }.Compile(graph);
+        var exec = new GraphExecutor(_accelerator, compiled, _weights, _recompileFloatSeed, registry: _registry)
+        {
+            Format = _executor.Format,
+        };
+        if (VerboseLogging)
+            Console.WriteLine($"[InferenceSession] Recompiled for shapes [{string.Join("; ", inputs.Select(kv => $"{kv.Key}:[{string.Join(",", kv.Value.Shape)}]"))}] — {compiled.Nodes.Length} nodes");
+        return exec;
     }
 
     /// <summary>
@@ -581,6 +701,10 @@ public class InferenceSession : IDisposable
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
+        // Snapshot the CLEAN constant seeds before Compile folds seq-specific values onto the graph
+        // (with optimization off, folding mutates `graph` directly). Used for dynamic-shape recompile.
+        var _constSeed = graph.ConstantData != null ? new Dictionary<string, int[]>(graph.ConstantData) : null;
+        var _floatSeed = graph.FloatConstantData != null ? new Dictionary<string, float[]>(graph.FloatConstantData) : null;
         var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
@@ -646,10 +770,14 @@ public class InferenceSession : IDisposable
         var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
         onProgress?.Invoke("ready", 100);
 
-        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
             ModelName = modelInfo.Name
         };
+        // Enable dynamic-shape recompilation: a later Run at a different input shape (e.g. a growing
+        // decode sequence) recompiles the graph at that shape rather than mis-sizing buffers.
+        session.EnableShapeRecompilation(graph, _constSeed, _floatSeed, enableOptimization);
+        return session;
     }
 
     /// <summary>
@@ -725,6 +853,10 @@ public class InferenceSession : IDisposable
 
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
+        // Snapshot the CLEAN constant seeds before Compile folds seq-specific values onto the graph
+        // (with optimization off, folding mutates `graph` directly). Used for dynamic-shape recompile.
+        var _constSeed = graph.ConstantData != null ? new Dictionary<string, int[]>(graph.ConstantData) : null;
+        var _floatSeed = graph.FloatConstantData != null ? new Dictionary<string, float[]>(graph.FloatConstantData) : null;
         var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
@@ -779,10 +911,14 @@ public class InferenceSession : IDisposable
         var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
         onProgress?.Invoke("ready", 100);
 
-        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
             ModelName = modelInfo.Name
         };
+        // Enable dynamic-shape recompilation: a later Run at a different input shape (e.g. a growing
+        // decode sequence) recompiles the graph at that shape rather than mis-sizing buffers.
+        session.EnableShapeRecompilation(graph, _constSeed, _floatSeed, enableOptimization);
+        return session;
     }
 
     /// <summary>
@@ -860,6 +996,10 @@ public class InferenceSession : IDisposable
 
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
+        // Snapshot the CLEAN constant seeds before Compile folds seq-specific values onto the graph
+        // (with optimization off, folding mutates `graph` directly). Used for dynamic-shape recompile.
+        var _constSeed = graph.ConstantData != null ? new Dictionary<string, int[]>(graph.ConstantData) : null;
+        var _floatSeed = graph.FloatConstantData != null ? new Dictionary<string, float[]>(graph.FloatConstantData) : null;
         var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
         onProgress?.Invoke("compile", 100);
 
@@ -917,10 +1057,14 @@ public class InferenceSession : IDisposable
         var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
         onProgress?.Invoke("ready", 100);
 
-        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
             ModelName = modelInfo.Name
         };
+        // Enable dynamic-shape recompilation: a later Run at a different input shape (e.g. a growing
+        // decode sequence) recompiles the graph at that shape rather than mis-sizing buffers.
+        session.EnableShapeRecompilation(graph, _constSeed, _floatSeed, enableOptimization);
+        return session;
     }
 
     /// <summary>
@@ -1568,14 +1712,17 @@ public class InferenceSession : IDisposable
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights) { ModelName = graph.Name };
     }
 
-    /// <summary>Run inference with named input tensors. Returns named output tensors.</summary>
+    /// <summary>Run inference with named input tensors. Returns named output tensors.
+    /// Recompiles for the actual input shape when it differs from the compile-time shape
+    /// (dynamic-shape models such as autoregressive decoders).</summary>
     public Dictionary<string, Tensor> Run(Dictionary<string, Tensor> inputs)
-        => _executor.Run(inputs);
+        => ResolveExecutor(inputs).Run(inputs);
 
     /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm)
-    /// which deadlock on synchronous Synchronize(). Periodically flushes GPU commands.</summary>
+    /// which deadlock on synchronous Synchronize(). Periodically flushes GPU commands.
+    /// Recompiles for the actual input shape when it differs from the compile-time shape.</summary>
     public Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
-        => _executor.RunAsync(inputs);
+        => ResolveExecutor(inputs).RunAsync(inputs);
 
     /// <summary>
     /// Transformers.js-style async inference. Inputs are <see cref="Tensors.Tensor{T}"/>
@@ -1717,6 +1864,11 @@ public class InferenceSession : IDisposable
     public void Dispose()
     {
         _executor.Dispose();
+        // Dispose per-shape recompiled executors (each owns its own intermediate buffer pool).
+        foreach (var exec in _shapeExecutors.Values)
+            try { exec.Dispose(); } catch { }
+        _shapeExecutors.Clear();
+        _shapeExecutorLru.Clear();
         _pool.Dispose();
         _registry.Dispose();
         // Dispose buffers not tracked by the pool (GGUF quantized bytes, etc.)

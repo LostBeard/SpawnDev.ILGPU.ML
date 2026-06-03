@@ -702,6 +702,95 @@ public abstract partial class MLTestBase
         }
     });
 
+    // Same node-bisect, but loaded WITHOUT pinning inputShapes (compiled at the dynamic seq=1,
+    // then RUN at seq=5 via the executor's runtime shape re-inference). The pinned bisect above is
+    // GREEN, so any divergence here localizes a bug that ONLY exists on the un-pinned dynamic path
+    // (the /text-gen demo path). DIAGNOSTIC — pins down the first wrong node so the fix is exact.
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Reference_GPT2_NodeBisect_Unpinned_VsOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        var refJson = await http.GetStringAsync("references/gpt2/distilgpt2_intermediates.json");
+        using var refDoc = System.Text.Json.JsonDocument.Parse(refJson);
+        var ortRef = refDoc.RootElement;
+
+        Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+        Graph.GraphExecutor.CapturedNodeInfo = new Dictionary<string, string>();
+        int savedCap = Graph.GraphExecutor.CaptureMaxElements;
+        Graph.GraphExecutor.CaptureMaxElements = 4096;
+        try
+        {
+            // NO inputShapes override — dynamic seq, re-inferred at runtime.
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes, enableOptimization: false);
+
+            var tokenIds = new float[] { 464, 3797, 3332, 319, 262 };
+            var attentionMask = new float[] { 1, 1, 1, 1, 1 };
+            using var idsBuf = accelerator.Allocate1D(tokenIds);
+            using var maskBuf = accelerator.Allocate1D(attentionMask);
+            var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 }) };
+            if (session.InputNames.Length > 1) inputs[session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 });
+            await session.RunAsync(inputs);
+            await accelerator.SynchronizeAsync();
+
+            var captured = Graph.GraphExecutor.CapturedOutputs;
+            var info = Graph.GraphExecutor.CapturedNodeInfo;
+            var nameRe = new System.Text.RegularExpressions.Regex(@"^\d+_[A-Za-z0-9]+_(.*)$");
+            var ordered = captured
+                .Select(kv => (idx: int.TryParse(kv.Key.Split('_')[0], out var i) ? i : int.MaxValue, kv.Key, kv.Value))
+                .OrderBy(t => t.idx).ToList();
+
+            const float REL_TOL = 0.10f, MIN_ABS = 0.05f;
+            bool found = false; int afterBad = 0;
+            var recent = new System.Collections.Generic.Queue<string>();
+            var rows = new List<string>();
+            for (int n = 0; n < ordered.Count; n++)
+            {
+                var (idx, key, vals) = ordered[n];
+                var m = nameRe.Match(key);
+                if (!m.Success) continue;
+                var onnxName = m.Groups[1].Value;
+                if (!ortRef.TryGetProperty(onnxName, out var refEl)) continue;
+                var refFirst = refEl.GetProperty("first").EnumerateArray().Select(e => (float)e.GetDouble()).ToArray();
+                int k = Math.Min(refFirst.Length, vals.Length);
+                if (k == 0) continue;
+                float maxRel = 0; int worst = 0; float worstAbs = 0;
+                for (int e = 0; e < k; e++)
+                {
+                    float d = MathF.Abs(vals[e] - refFirst[e]);
+                    float rel = d / (MathF.Abs(refFirst[e]) + 1e-3f);
+                    if (rel > maxRel) { maxRel = rel; worst = e; worstAbs = d; }
+                }
+                bool isBad = maxRel > REL_TOL && worstAbs > MIN_ABS && !found;
+                string shape = refEl.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32().ToString()).Aggregate("", (a, b) => a.Length == 0 ? b : a + "x" + b);
+                string oursShape = info != null && info.TryGetValue(key, out var ni) ? ni : "";
+                string row = $"{(isBad ? "►" : " ")}{idx,4} {onnxName} ort[{shape}] maxDiff={worstAbs:F3} ours=[{string.Join(",", vals.Take(6).Select(v => v.ToString("F3")))}] ort=[{string.Join(",", refFirst.Take(6).Select(v => v.ToString("F3")))}]{(isBad ? $" worst@{worst}: ours={vals[worst]:F4} ort={refFirst[worst]:F4} | {oursShape}" : "")}";
+                if (!found)
+                {
+                    recent.Enqueue(row);
+                    while (recent.Count > 16) recent.Dequeue();
+                    if (isBad) { found = true; rows.AddRange(recent); }
+                }
+                else { rows.Add(row); if (++afterBad >= 3) break; }
+            }
+            if (!found)
+            {
+                Console.WriteLine($"[GPT2-bisect-unpinned] No gross divergence across {ordered.Count} nodes — un-pinned forward matches ORT.");
+                return;
+            }
+            throw new Exception($"[GPT2-bisect-unpinned] FIRST divergence vs ORT (◄16-node context):\n{string.Join("\n", rows)}");
+        }
+        finally
+        {
+            Graph.GraphExecutor.CapturedOutputs = null;
+            Graph.GraphExecutor.CapturedNodeInfo = null;
+            Graph.GraphExecutor.CaptureMaxElements = savedCap;
+        }
+    });
+
     [TestMethod(Timeout = 900000, Category = "HeavyModel")] // 15 min — GPT-2 is 652MB + 2620 nodes. Download + compile + inference needs headroom on WebGPU
     public async Task Reference_GPT2_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
@@ -781,6 +870,121 @@ public abstract partial class MLTestBase
             throw new Exception($"[GPT-2] WRONG next token {nextToken} (expected 4314 ' floor'). Logits are finite but incorrect — model execution bug. Top-5: {string.Join(", ", top5.Select(t => $"{t.i}={t.v:F3}"))}");
         Console.WriteLine($"[GPT-2] PASS: next token 4314 matches reference");
 
+    });
+
+    // DYNAMIC-SHAPE guard: the same DistilGPT-2 forward pass, but loaded WITHOUT pinning
+    // inputShapes — so the graph compiles at the model's declared (fully-dynamic →
+    // sequence_length=1) shape and is then RUN at seq=5. This is exactly what the /text-gen demo
+    // does (it never pins shapes). Before the executor learned to re-infer buffer sizes from the
+    // ACTUAL runtime input shapes, every seq-dependent buffer was sized for seq=1, so each
+    // operator (which writes M*N from the real input shapes) overran its buffer → silent
+    // corruption and eventually a hard OOB in CastOperator. A pinned-shape forward (the test
+    // above) never exercised this. Asserting argmax==4314 here proves the dynamic-shape
+    // re-inference produces the IDENTICAL correct result as the pinned path.
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Reference_GPT2_DynamicShape_NoInputShapePin_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var gpt2Url = "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+        // NOTE: NO inputShapes override — the decoder compiles at its dynamic seq (→1).
+        using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
+            enableOptimization: false);
+
+        var tokenIds = new float[] { 464, 3797, 3332, 319, 262 }; // "The cat sat on the"
+        var attentionMask = new float[] { 1, 1, 1, 1, 1 };
+        using var idsBuf = accelerator.Allocate1D(tokenIds);
+        using var maskBuf = accelerator.Allocate1D(attentionMask);
+
+        var inputs = new Dictionary<string, Tensor>();
+        inputs[session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 });
+        if (session.InputNames.Length > 1)
+            inputs[session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 });
+
+        var outputs = await session.RunAsync(inputs);
+        var output = outputs.Values.First();
+        int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
+        Console.WriteLine($"[GPT-2 dyn] Output shape [{string.Join(",", output.Shape)}] elems={output.ElementCount} (expect last-dim {vocabSize}, seq 5)");
+        // The re-inference must have grown the logits buffer to the real seq=5 — element count
+        // must be 5*vocab, not the compiled 1*vocab. If it were still 1*vocab the model would
+        // have corrupted/crashed; assert it explicitly so a regression is unambiguous.
+        if (output.ElementCount < 5 * vocabSize)
+            throw new Exception($"[GPT-2 dyn] logits buffer not re-sized for seq=5: elems={output.ElementCount} < {5 * vocabSize}. Dynamic-shape re-inference regressed.");
+
+        int lastTokenOffset = (output.ElementCount / vocabSize - 1) * vocabSize;
+        using var readBuf = accelerator.Allocate1D<float>(vocabSize);
+        new ElementWiseKernels(accelerator).Scale(
+            output.Data.SubView(lastTokenOffset, vocabSize), readBuf.View, vocabSize, 1f);
+        await accelerator.SynchronizeAsync();
+        var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
+
+        int nextToken = 0; float maxLogit = float.MinValue;
+        for (int i = 0; i < logits.Length; i++)
+            if (!float.IsNaN(logits[i]) && logits[i] > maxLogit) { maxLogit = logits[i]; nextToken = i; }
+        var top5 = logits.Select((v, i) => (i, v)).OrderByDescending(t => t.v).Take(5).ToArray();
+        Console.WriteLine($"[GPT-2 dyn] Next token {nextToken} (logit={maxLogit:F4}). Top-5: {string.Join(", ", top5.Select(t => $"{t.i}={t.v:F3}"))}");
+        if (nextToken != 4314)
+            throw new Exception($"[GPT-2 dyn] WRONG next token {nextToken} (expected 4314 ' floor') on the UN-pinned dynamic-shape path. Top-5: {string.Join(", ", top5.Select(t => $"{t.i}={t.v:F3}"))}");
+        Console.WriteLine("[GPT-2 dyn] PASS: dynamic-shape (un-pinned) forward matches the pinned reference (4314).");
+    });
+
+    // MULTI-TOKEN correctness: greedy-decode DistilGPT-2 for N steps with a GROWING sequence
+    // (5→6→…), exactly as the TextGenerationPipeline does (re-feed the full running sequence each
+    // step, no KV cache), and assert the produced token IDs match the ONNX Runtime greedy
+    // reference (tools/distilgpt2_greedy_ref.py → references/gpt2/distilgpt2_greedy.json).
+    // This is the regression guard for Bug #4: the growing-seq loop used to corrupt/OOB once seq
+    // exceeded the compiled length. It exercises the un-pinned dynamic-shape path end to end and
+    // proves not just "produces tokens" but that EVERY generated token equals the reference.
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Reference_DistilGPT2_GreedyGeneration_MatchesOnnxRuntime() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var refJson = await http.GetStringAsync("references/gpt2/distilgpt2_greedy.json");
+        using var refDoc = System.Text.Json.JsonDocument.Parse(refJson);
+        var refIds = refDoc.RootElement.GetProperty("generated_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        var promptIds = refDoc.RootElement.GetProperty("input_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        int numNew = refIds.Length - promptIds.Length;
+
+        var gpt2Url = "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+        using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
+            enableOptimization: false); // NO inputShapes — dynamic, grows each step.
+
+        var ids = new List<int>(promptIds);
+        var generated = new List<int>(promptIds);
+        for (int step = 0; step < numNew; step++)
+        {
+            int seq = ids.Count;
+            var idsF = ids.Select(t => (float)t).ToArray();
+            var maskF = Enumerable.Repeat(1f, seq).ToArray();
+            using var idsBuf = accelerator.Allocate1D(idsF);
+            using var maskBuf = accelerator.Allocate1D(maskF);
+            var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, seq }) };
+            if (session.InputNames.Length > 1) inputs[session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, seq });
+
+            var outputs = await session.RunAsync(inputs);
+            var output = outputs.Values.First();
+            int vocab = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
+            int lastOffset = (output.ElementCount / vocab - 1) * vocab;
+            using var readBuf = accelerator.Allocate1D<float>(vocab);
+            new ElementWiseKernels(accelerator).Scale(output.Data.SubView(lastOffset, vocab), readBuf.View, vocab, 1f);
+            await accelerator.SynchronizeAsync();
+            var logits = await readBuf.CopyToHostAsync<float>(0, vocab);
+
+            int nxt = 0; float mx = float.MinValue;
+            for (int i = 0; i < logits.Length; i++)
+                if (!float.IsNaN(logits[i]) && logits[i] > mx) { mx = logits[i]; nxt = i; }
+
+            int expected = refIds[promptIds.Length + step];
+            Console.WriteLine($"[DistilGPT2-gen] step {step} seq={seq} -> {nxt} (logit={mx:F3}), ref={expected}");
+            if (nxt != expected)
+                throw new Exception($"[DistilGPT2-gen] step {step} (seq={seq}) produced {nxt}, expected {expected} (ORT greedy ref). Generated so far: [{string.Join(",", generated)}], ref: [{string.Join(",", refIds)}]");
+            generated.Add(nxt);
+            ids.Add(nxt);
+        }
+        Console.WriteLine($"[DistilGPT2-gen] PASS: all {numNew} greedy tokens match ORT reference. ids=[{string.Join(",", generated)}]");
     });
 
     // ── Whisper Encoder Reference Test ──
