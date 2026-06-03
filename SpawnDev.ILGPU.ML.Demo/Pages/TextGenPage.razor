@@ -190,7 +190,11 @@
                     {
                         _modelProgress = 15 + pct * 0.70; // 15%..85% during streaming load
                         InvokeAsync(StateHasChanged);
-                    });
+                    },
+                    // enableOptimization:false matches every green GPT-2/DistilGPT-2 reference test
+                    // (the graph optimizer is unreliable on NLP models) and skips the optimizer on
+                    // each per-step recompile, cutting decode time. Correctness is identical.
+                    enableOptimization: false);
 
             // Tokenizer from the same hub repo (small JSON — read the stream fully).
             _modelProgress = 90;
@@ -231,7 +235,16 @@
 
         try
         {
-            var result = await _pipeline.GenerateAsync(_prompt, maxNewTokens: _maxTokens);
+            // Stream tokens live: update the count + partial text after each generated token so the
+            // UI shows generation advancing (the decode loop is currently slow — recompiles per step
+            // pending the KV-cache speedup — so without this the page sits at "0 tokens" the whole run).
+            var result = await _pipeline.GenerateAsync(_prompt, maxNewTokens: _maxTokens,
+                onToken: async (count, textSoFar) =>
+                {
+                    _tokensGenerated = count;
+                    _generatedText = _prompt + textSoFar;
+                    await InvokeAsync(StateHasChanged);
+                });
             _generatedText = result.Text;
             _tokensGenerated = result.GeneratedTokenCount;
             _inferenceMs = result.InferenceTimeMs;

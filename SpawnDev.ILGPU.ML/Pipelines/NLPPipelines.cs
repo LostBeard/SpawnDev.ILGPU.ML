@@ -276,7 +276,12 @@ public class TextGenerationPipeline : IDisposable
     /// <summary>
     /// Generate text from a prompt using greedy decoding.
     /// </summary>
-    public async Task<TextGenerationResult> GenerateAsync(string prompt, int? maxNewTokens = null)
+    /// <param name="onToken">Optional progress callback invoked after EACH generated token with
+    /// (tokenCount, decodedTextSoFar). Lets a UI stream tokens live instead of showing nothing until
+    /// the whole (currently slow, per-step-recompiling) generation completes. Awaited so a Blazor UI
+    /// can <c>StateHasChanged</c> between steps.</param>
+    public async Task<TextGenerationResult> GenerateAsync(string prompt, int? maxNewTokens = null,
+        Func<int, string, Task>? onToken = null)
     {
         if (_tokenizer == null) throw new InvalidOperationException("Tokenizer not loaded.");
 
@@ -336,6 +341,14 @@ public class TextGenerationPipeline : IDisposable
             if (nextToken == 50256) break; // GPT-2 EOS token
 
             allTokens.Add(nextToken);
+
+            // Stream progress to the caller (live token count + partial text) so a UI can show
+            // generation advancing instead of a frozen "0 tokens" until the whole run finishes.
+            if (onToken != null)
+            {
+                var soFar = _tokenizer.Decode(allTokens.Skip(promptTokens.Count).ToArray());
+                await onToken(allTokens.Count - promptTokens.Count, soFar);
+            }
         }
 
         sw.Stop();
