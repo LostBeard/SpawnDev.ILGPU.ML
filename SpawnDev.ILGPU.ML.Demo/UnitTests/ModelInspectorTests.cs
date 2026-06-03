@@ -153,8 +153,12 @@ public class ModelInspectorTests
             if (!sq.IsFullySupported) throw new Exception($"SqueezeNet expected fully supported; missing: {string.Join(",", sq.UnsupportedOps)}");
         }
 
-        // GPT-2 (~623MB) has some unsupported ops → partial but self-consistent (guards the % math).
-        // Streamed — its compatibility is checked without ever loading its weights.
+        // GPT-2 (~623MB): every op it uses is now implemented + registered, so it must report FULLY
+        // supported. Earlier it showed 90% (27/30) only because And/IsNaN/LessOrEqual were registered and
+        // runnable but missing from the inspector's stale hand-maintained op list — fixed by sourcing the
+        // inspector from OperatorRegistry.BuiltinOpTypes (locked to the live registry by a drift test).
+        // Streamed — its compatibility is checked without ever loading its weights. This is the regression
+        // guard for the user-facing deliverable: GPT-2 == 100% compatible.
         using (var gpt2Stream = await _http.GetStreamAsync("models/gpt2/model.onnx"))
         {
             var gpt2 = await ModelInspectorHelper.CheckCompatibilityAsync(gpt2Stream);
@@ -162,6 +166,11 @@ public class ModelInspectorTests
                 throw new Exception("GPT-2 op partition mismatch");
             if (gpt2.CompatibilityPercent < 0 || gpt2.CompatibilityPercent > 100)
                 throw new Exception($"GPT-2 CompatibilityPercent={gpt2.CompatibilityPercent} out of range");
+            if (!gpt2.IsFullySupported)
+                throw new Exception(
+                    $"GPT-2 expected FULLY supported ({gpt2.CompatibilityPercent:F0}%, {gpt2.SupportedOps.Length}/{gpt2.TotalOpsUsed}); " +
+                    $"still unsupported: {string.Join(", ", gpt2.UnsupportedOps)}. " +
+                    "These ops are genuinely unimplemented (the manifest is drift-locked to the registry), not a stale-list bug.");
         }
     }
 

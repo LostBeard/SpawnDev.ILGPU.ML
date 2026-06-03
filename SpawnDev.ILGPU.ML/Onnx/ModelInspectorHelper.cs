@@ -640,32 +640,25 @@ public static partial class ModelInspectorHelper
     };
 
     /// <summary>Operators the engine supports when no live registry is supplied. Single source of truth
-    /// for both the byte[] and streaming compatibility checks.</summary>
-    private static readonly HashSet<string> KnownSupportedOps = new()
-    {
-        "Abs", "Add", "ArgMax", "AveragePool", "BatchNormalization", "Cast", "Ceil", "Clip",
-        "Concat", "Constant", "ConstantOfShape", "Conv", "ConvTranspose",
-        "DepthToSpace", "Div", "Dropout", "Equal", "Erf", "Exp", "Expand",
-        "Flatten", "Floor", "Gather", "GatherND", "Gelu", "Gemm", "GlobalAveragePool",
-        "Greater", "HardSigmoid", "HardSwish", "Identity", "InstanceNormalization",
-        "LayerNormalization", "LeakyRelu", "Less", "Log", "MatMul", "Max", "MaxPool",
-        "Min", "Mul", "Neg", "Not", "Pad", "Pow", "Range", "Reciprocal",
-        "ReduceMax", "ReduceMean", "ReduceMin", "ReduceSum",
-        "Relu", "Reshape", "Resize", "Shape", "Sigmoid", "Sign", "SiLU",
-        "Slice", "Softmax", "Split", "Sqrt", "Squeeze", "Sub",
-        "Tanh", "TopK", "Transpose", "Unsqueeze", "Upsample", "Where",
-    };
+    /// for both the byte[] and streaming compatibility checks.
+    ///
+    /// This is NOT a hand-maintained list — it points at <see cref="Operators.OperatorRegistry.BuiltinOpTypes"/>,
+    /// the single source of truth for every registered op. A drift test keeps that manifest locked to the
+    /// live registry, so the inspector can never again under-report support the way it did when this was a
+    /// stale local copy (GPT-2 falsely showed 90% because And/IsNaN/LessOrEqual were registered but absent here).</summary>
+    private static readonly IReadOnlySet<string> KnownSupportedOps = Operators.OperatorRegistry.BuiltinOpTypes;
 
     /// <summary>Partition a distinct, sorted op-type list into supported/unsupported against the
     /// registry (if provided) or the built-in known-supported set.</summary>
     private static CompatibilityResult PartitionCompatibility(string[] opsUsed, Operators.OperatorRegistry? registry)
     {
-        HashSet<string> supportedOps;
+        IReadOnlySet<string> supportedOps;
         if (registry != null)
         {
-            supportedOps = new HashSet<string>();
+            var live = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var op in opsUsed)
-                if (registry.IsSupported(op)) supportedOps.Add(op);
+                if (registry.IsSupported(op)) live.Add(op);
+            supportedOps = live;
         }
         else
         {

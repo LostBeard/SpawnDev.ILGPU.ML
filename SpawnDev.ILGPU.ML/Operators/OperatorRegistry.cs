@@ -15,6 +15,48 @@ public class OperatorRegistry : IDisposable
     private readonly Accelerator _accelerator;
     public Accelerator Accelerator => _accelerator;
 
+    /// <summary>
+    /// Canonical, accelerator-free manifest of every ONNX op-type registered by
+    /// <see cref="RegisterBuiltins"/>. Consumers that must answer "do we support this op?"
+    /// WITHOUT constructing a full registry (e.g. the streaming Model Inspector, which is
+    /// structure-only and never touches an accelerator) read this set instead.
+    ///
+    /// SINGLE SOURCE OF TRUTH: this list and the live registration calls are locked together
+    /// by <c>MLTestBase.Op_BuiltinOpTypes_MatchesLiveRegistry</c>, which constructs a real
+    /// registry and asserts <see cref="SupportedOps"/> set-equals this manifest. Add or remove
+    /// a <c>Register(...)</c> call and forget to mirror it here (or vice versa) and that test
+    /// fails. Do NOT maintain a second, divergent op list anywhere — point it at this one.
+    /// (Stale parallel lists are exactly what made GPT-2 falsely report 90% compatibility.)
+    /// </summary>
+    public static readonly IReadOnlySet<string> BuiltinOpTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Abs", "Acos", "Acosh", "Add", "AffineGrid", "And", "ArgMax", "ArgMin",
+        "Asin", "Asinh", "Atan", "Atanh", "AveragePool", "BatchNormalization", "Bernoulli", "BitShift",
+        "BitwiseAnd", "BitwiseNot", "BitwiseOr", "BitwiseXor", "BlackmanWindow", "Cast", "CastLike", "Ceil",
+        "Celu", "CenterCropPad", "Clip", "Col2Im", "Compress", "Concat", "ConcatFromSequence", "Constant",
+        "ConstantOfShape", "Conv", "ConvInteger", "ConvTranspose", "Cos", "Cosh", "CumSum", "DFT",
+        "DeformConv", "DepthToSpace", "DequantizeLinear", "Det", "Div", "Dropout", "DynamicQuantizeLinear", "Einsum",
+        "Elu", "Equal", "Erf", "Exp", "Expand", "EyeLike", "Flatten", "Floor",
+        "FusedLinear", "FusedScaledMatMul", "GRU", "Gather", "GatherElements", "GatherND", "Gelu", "Gemm",
+        "GlobalAveragePool", "GlobalLpPool", "GlobalMaxPool", "Greater", "GreaterOrEqual", "GridSample", "GroupNormalization", "HammingWindow",
+        "HannWindow", "HardSigmoid", "HardSwish", "Hardmax", "Identity", "If", "ImageDecoder", "InstanceNormalization",
+        "IsInf", "IsNaN", "LRN", "LSTM", "LayerNormalization", "LeakyRelu", "Less", "LessOrEqual",
+        "Log", "LogSoftmax", "Loop", "LpNormalization", "LpPool", "MatMul", "MatMulInteger", "Max",
+        "MaxPool", "MaxRoiPool", "MaxUnpool", "Mean", "MeanVarianceNormalization", "MelWeightMatrix", "Min", "Mish",
+        "Mod", "Mul", "Multinomial", "Neg", "NegativeLogLikelihoodLoss", "NonMaxSuppression", "NonZero", "Not",
+        "OneHot", "Optional", "OptionalGetElement", "OptionalHasElement", "Or", "PRelu", "Pad", "Pow",
+        "QLinearConv", "QLinearMatMul", "QuantizeLinear", "RNN", "RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike",
+        "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
+        "ReduceMin", "ReduceProd", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize", "ReverseSequence",
+        "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
+        "SequenceAt", "SequenceConstruct", "SequenceEmpty", "SequenceErase", "SequenceInsert", "SequenceLength", "SequenceMap", "Shape",
+        "Shrink", "SiLU", "Sigmoid", "Sign", "Sin", "Sinh", "Size", "Slice",
+        "Softmax", "SoftmaxCrossEntropyLoss", "Softplus", "Softsign", "SpaceToDepth", "Split", "SplitToSequence", "Sqrt",
+        "Squeeze", "StringConcat", "StringNormalizer", "StringSplit", "Sub", "Sum", "Tan", "Tanh",
+        "ThresholdedRelu", "Tile", "TopK", "Transpose", "Trilu", "Unique", "Unsqueeze", "Upsample",
+        "Where", "Xor",
+    };
+
     // Kernel instances (shared across operators)
     public MatMulKernel MatMul { get; }
     public LayerNormKernel LayerNorm { get; }

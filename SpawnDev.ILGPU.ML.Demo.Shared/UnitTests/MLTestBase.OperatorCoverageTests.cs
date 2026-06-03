@@ -2816,4 +2816,39 @@ public abstract partial class MLTestBase
         if (!allPositive) throw new Exception($"RoiAlign produced non-positive values: [{string.Join(",", result)}]");
         Console.WriteLine($"[RoiAlign] result: [{string.Join(",", result.Select(v => v.ToString("F2")))}] — PASS");
     });
+
+    // ═══════════════════════════════════════════════════════════
+    //  Op-type manifest drift guard (single source of truth)
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Locks <see cref="OperatorRegistry.BuiltinOpTypes"/> (the accelerator-free manifest the
+    /// Model Inspector reads to report compatibility) to the live registry's actually-registered
+    /// op set. If anyone adds or removes a <c>Register(...)</c> call without mirroring the manifest
+    /// (or vice versa), this fails with the exact diff. This is the guard that prevents a stale
+    /// parallel list — the bug that made GPT-2 falsely report 90% compatibility (And/IsNaN/LessOrEqual
+    /// were registered and runnable but missing from the inspector's hand-maintained list).
+    /// </summary>
+    [TestMethod]
+    public async Task Op_BuiltinOpTypes_MatchesLiveRegistry() => await RunTest(async accelerator =>
+    {
+        var reg = new OperatorRegistry(accelerator);
+        var live = new HashSet<string>(reg.SupportedOps, StringComparer.OrdinalIgnoreCase);
+        var manifest = new HashSet<string>(OperatorRegistry.BuiltinOpTypes, StringComparer.OrdinalIgnoreCase);
+
+        var registeredButNotInManifest = live.Except(manifest).OrderBy(s => s).ToArray();
+        var inManifestButNotRegistered = manifest.Except(live).OrderBy(s => s).ToArray();
+
+        if (registeredButNotInManifest.Length > 0 || inManifestButNotRegistered.Length > 0)
+        {
+            throw new Exception(
+                $"OperatorRegistry.BuiltinOpTypes has drifted from the live registry.\n" +
+                $"  Registered but MISSING from manifest ({registeredButNotInManifest.Length}): {string.Join(", ", registeredButNotInManifest)}\n" +
+                $"  In manifest but NOT registered ({inManifestButNotRegistered.Length}): {string.Join(", ", inManifestButNotRegistered)}\n" +
+                $"  Fix: mirror every Register(...) call in OperatorRegistry.BuiltinOpTypes (and remove stale entries).");
+        }
+
+        Console.WriteLine($"[BuiltinOpTypes] manifest == live registry: {live.Count} ops, zero drift — PASS");
+        await Task.CompletedTask;
+    });
 }
