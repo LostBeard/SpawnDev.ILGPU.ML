@@ -786,6 +786,144 @@ public class InferenceSession : IDisposable
     }
 
     /// <summary>
+    /// Create an InferenceSession from a SEEKABLE ONNX stream WITHOUT holding the whole model in memory.
+    /// The structure is parsed via <see cref="Onnx.OnnxParser.ParseFromStreamAsync"/> (weights recorded as
+    /// stream offsets, never materialized), the graph is compiled, then each large weight is seeked to and
+    /// uploaded to the GPU in 1 MB chunks — so a multi-GB model loads with a CPU peak of one chunk. The
+    /// stream stays open for the duration of this call (the loader seeks back to each weight); the caller
+    /// owns disposing it afterward. Foundation for loading a model directly from a <c>TorrentReadStream</c> /
+    /// HTTP-Range / Blob source, and for sharded loading (a peer fetches only its shard's tensors).
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromOnnxStreamAsync(
+        Accelerator accelerator, Stream stream,
+        Action<string, int>? onProgress = null,
+        Dictionary<string, int[]>? inputShapes = null,
+        bool enableOptimization = true,
+        int streamThreshold = 1024 * 1024,
+        CancellationToken ct = default)
+    {
+        if (stream == null) throw new ArgumentNullException(nameof(stream));
+
+        onProgress?.Invoke("parse", 0);
+        var parsedModel = await Onnx.OnnxParser.ParseFromStreamAsync(stream, streamThreshold, ct).ConfigureAwait(false);
+
+        var modelInfo = Onnx.OnnxLoader.ExtractModelInfoFromParsed(parsedModel);
+        var cpuSmallWeights = new Dictionary<string, float[]>();
+        foreach (var init in parsedModel.Graph.Initializers)
+        {
+            if (init.DataLocation == 1) continue;
+            if (init.ElementCount <= 64)
+                cpuSmallWeights[init.Name] = init.ToFloatArray();
+        }
+        foreach (var node in parsedModel.Graph.Nodes)
+        {
+            if (node.OpType == "Constant" && node.Outputs.Count > 0)
+            {
+                var valueAttr = node.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr != null)
+                {
+                    if (valueAttr.T != null && valueAttr.T.ElementCount <= 64)
+                        cpuSmallWeights[node.Outputs[0]] = valueAttr.T.ToFloatArray();
+                    else if (valueAttr.T == null)
+                    {
+                        if (valueAttr.F != 0 || valueAttr.I != 0)
+                            cpuSmallWeights[node.Outputs[0]] = new[] { valueAttr.F != 0 ? valueAttr.F : (float)valueAttr.I };
+                    }
+                }
+            }
+        }
+        onProgress?.Invoke("parse", 100);
+
+        if (inputShapes != null)
+            foreach (var (name, shape) in inputShapes)
+                modelInfo.ValueShapes[name] = shape;
+
+        ModelGraph graph;
+        try { graph = ConvertToModelGraph(modelInfo); }
+        catch (Exception ex) { throw new InvalidOperationException($"ConvertToModelGraph failed: {ex.GetType().Name}: {ex.Message}", ex); }
+
+        graph.ConstantData ??= new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        foreach (var (name, shape) in graph.Initializers)
+        {
+            int elems = shape.Aggregate(1, (a, b) => a * b);
+            if (elems > 0 && elems <= 64 && cpuSmallWeights.TryGetValue(name, out var data))
+            {
+                constantFloatValues[name] = data;
+                graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                graph.FloatConstantData[name] = data.ToArray();
+            }
+        }
+
+        PreExtractPads(parsedModel, cpuSmallWeights, constantFloatValues, graph);
+
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry) { EnableOptimization = enableOptimization }.Compile(graph);
+        onProgress?.Invoke("compile", 100);
+
+        cpuSmallWeights = null;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        onProgress?.Invoke("upload", 0);
+        var pool = new BufferPool(accelerator);
+        var gpuWeights = new Dictionary<string, Tensor>();
+        int loaded = 0;
+
+        // Stream weights to GPU: large tensors are seeked to + chunk-uploaded straight from the stream
+        // (never materialized); small/inline tensors use the in-memory chunked/standard path.
+        foreach (var (name, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
+        {
+            if (!graph.Initializers.TryGetValue(name, out var shape)) continue;
+            int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+            if (tensor.RawDataStreamOffset >= 0)
+                gpuWeights[name] = await pool.AllocatePermanentFromStreamAsync(
+                    stream, tensor.RawDataStreamOffset, tensor.RawDataLength, tensor.DataType, shape, name, ct).ConfigureAwait(false);
+            else if (tensor.ElementCount == 0 && expectedElems > 0)
+                gpuWeights[name] = pool.AllocatePermanent(new float[expectedElems], shape, name);
+            else
+                gpuWeights[name] = pool.AllocatePermanentChunked(tensor, shape, name);
+            loaded++;
+        }
+        foreach (var name in compiled.InitializerNames)
+        {
+            if (gpuWeights.ContainsKey(name)) continue;
+            if (constantFloatValues.TryGetValue(name, out var fData))
+            {
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fData.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fData, shape, name);
+                loaded++;
+            }
+            else if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var fcdData))
+            {
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fcdData.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fcdData, shape, name);
+                loaded++;
+            }
+            else if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var iData))
+            {
+                var fVals = iData.Select(v => (float)v).ToArray();
+                var shape = graph.Initializers.TryGetValue(name, out var s) ? s : new[] { fVals.Length };
+                gpuWeights[name] = pool.AllocatePermanent(fVals, shape, name);
+                loaded++;
+            }
+        }
+        onProgress?.Invoke("upload", 100);
+
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX (stream): {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
+
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        onProgress?.Invoke("ready", 100);
+
+        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        {
+            ModelName = modelInfo.Name
+        };
+    }
+
+    /// <summary>
     /// Convert OnnxModelInfo (from native parser) to ModelGraph (used by GraphCompiler).
     /// </summary>
     public static ModelGraph ConvertToModelGraph(Onnx.OnnxModelInfo info)

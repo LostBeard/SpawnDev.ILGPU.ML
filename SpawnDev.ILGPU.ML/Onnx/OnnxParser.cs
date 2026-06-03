@@ -6,7 +6,7 @@ namespace SpawnDev.ILGPU.ML.Onnx;
 /// Only reads fields needed for inference — skips doc_strings, training_info, metadata.
 /// ~350 lines. Compiles to ~10KB of IL (vs ~700KB for Google.Protobuf).
 /// </summary>
-public static class OnnxParser
+public static partial class OnnxParser
 {
     /// <summary>
     /// Parse an ONNX model from raw bytes.

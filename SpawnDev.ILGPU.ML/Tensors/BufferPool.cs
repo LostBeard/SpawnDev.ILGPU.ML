@@ -1,3 +1,6 @@
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
@@ -131,6 +134,65 @@ public class BufferPool : IDisposable
         }
 
         return new Tensor(buffer.View, shape, name);
+    }
+
+    /// <summary>
+    /// Allocate a permanent GPU tensor whose weight data lives at <paramref name="byteOffset"/> in a
+    /// SEEKABLE <paramref name="stream"/> (the streaming-load path). Seeks once, then reads the raw_data in
+    /// 1 MB chunks straight to the GPU via <c>CopyFromCPU</c> (queue.writeBuffer on WebGPU) — peak CPU is one
+    /// chunk, never the whole tensor, and the bytes are never held as a managed array. Supports FLOAT32
+    /// (dtype 1) and FLOAT16 (dtype 10) raw_data, converting FP16 → FP32 per chunk.
+    /// </summary>
+    public async Task<Tensor> AllocatePermanentFromStreamAsync(
+        Stream stream, long byteOffset, int byteLength, int dataType, int[] shape,
+        string? name = null, CancellationToken ct = default)
+    {
+        int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+        var buffer = _accelerator.Allocate1D<float>(count);
+        _allBuffers.Add(buffer);
+        if (count == 0) return new Tensor(buffer.View, shape, name);
+
+        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, _ => 0 };
+        if (srcElemBytes == 0)
+            throw new NotSupportedException(
+                $"Streaming load supports FLOAT32 (1) and FLOAT16 (10) raw_data; got dtype {dataType} for '{name}'. " +
+                "Load this model via CreateFromOnnx(byte[]).");
+
+        stream.Seek(byteOffset, SeekOrigin.Begin);
+
+        const int CHUNK = 262144; // 256K floats = 1 MB float buffer
+        var byteBuf = new byte[CHUNK * srcElemBytes];
+        var floatChunk = new float[CHUNK];
+        int uploaded = 0;
+        while (uploaded < count)
+        {
+            int n = Math.Min(CHUNK, count - uploaded);
+            int wantBytes = n * srcElemBytes;
+            await ReadExactAsync(stream, byteBuf, wantBytes, ct).ConfigureAwait(false);
+
+            if (dataType == 1) // FLOAT32 — direct little-endian copy
+                Buffer.BlockCopy(byteBuf, 0, floatChunk, 0, wantBytes);
+            else // FLOAT16 → FLOAT32 per element
+                for (int i = 0; i < n; i++)
+                    floatChunk[i] = (float)BitConverter.ToHalf(byteBuf, i * 2);
+
+            // Upload exactly n floats. CopyFromCPU is immediate (no temp buffer / command-encoder hazard).
+            buffer.View.SubView(uploaded, n).CopyFromCPU(n == floatChunk.Length ? floatChunk : floatChunk[..n]);
+            uploaded += n;
+        }
+        return new Tensor(buffer.View, shape, name);
+    }
+
+    /// <summary>Read exactly <paramref name="count"/> bytes into the start of <paramref name="buf"/>, or throw.</summary>
+    private static async Task ReadExactAsync(Stream stream, byte[] buf, int count, CancellationToken ct)
+    {
+        int got = 0;
+        while (got < count)
+        {
+            int n = await stream.ReadAsync(buf.AsMemory(got, count - got), ct).ConfigureAwait(false);
+            if (n == 0) throw new EndOfStreamException($"Stream ended {count - got} bytes short of a weight chunk.");
+            got += n;
+        }
     }
 
     /// <summary>Allocate a permanent zero-initialized tensor.</summary>

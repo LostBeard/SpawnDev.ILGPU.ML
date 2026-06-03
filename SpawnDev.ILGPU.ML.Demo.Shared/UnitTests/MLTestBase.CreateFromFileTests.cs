@@ -1,3 +1,4 @@
+using System.IO;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
@@ -348,6 +349,63 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DepthAspect] PASS — default={def.Width}x{def.Height}, w-only={widthOnly.Width}x{widthOnly.Height}, h-only={heightOnly.Width}x{heightOnly.Height}, exact={exact.Width}x{exact.Height}");
         pipeline.Dispose();
+    });
+
+    /// <summary>
+    /// Streaming ONNX LOAD: <see cref="InferenceSession.CreateFromOnnxStreamAsync"/> loads SqueezeNet from a
+    /// SEEKABLE stream WITHOUT holding the whole model in memory — each weight is seeked to and chunk-uploaded
+    /// straight to the GPU. Proves FUNCTIONAL EQUIVALENCE to the byte[] load: the SAME cat image classified
+    /// through BOTH sessions yields the same weight/node counts, the same top-5 class sequence, and a matching
+    /// top-1 confidence. A tiny streamThreshold forces the weights through the streaming-upload path (not the
+    /// small-tensor fallback), so this exercises AllocatePermanentFromStreamAsync. Foundation for loading a
+    /// model directly from a TorrentReadStream / HTTP-Range / Blob source, and for sharded loading.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task CreateFromOnnxStream_SqueezeNet_MatchesByteLoad() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        var bytes = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        var (pixels, width, height) = await LoadCatImage(http);
+
+        // Streamed load — tiny threshold forces real weights through the seek+chunk-upload path.
+        using var ms = new MemoryStream(bytes, writable: false);
+        using var streamSession = await InferenceSession.CreateFromOnnxStreamAsync(
+            accelerator, ms, streamThreshold: 4096);
+        // Reference: in-memory byte[] load.
+        using var byteSession = InferenceSession.CreateFromOnnx(accelerator, bytes);
+
+        Console.WriteLine($"[StreamLoad] stream: {streamSession}  byte: {byteSession}");
+
+        if (streamSession.WeightCount != byteSession.WeightCount)
+            throw new Exception($"weight count mismatch: stream={streamSession.WeightCount} byte={byteSession.WeightCount}");
+        if (streamSession.NodeCount != byteSession.NodeCount)
+            throw new Exception($"node count mismatch: stream={streamSession.NodeCount} byte={byteSession.NodeCount}");
+
+        var streamPipe = new ClassificationPipeline(streamSession, accelerator);
+        var bytePipe = new ClassificationPipeline(byteSession, accelerator);
+        var streamRes = await streamPipe.ClassifyAsync(pixels, width, height, 10);
+        var byteRes = await bytePipe.ClassifyAsync(pixels, width, height, 10);
+
+        int n = Math.Min(5, Math.Min(streamRes.Count(), byteRes.Count()));
+        if (n == 0) throw new Exception("classification returned no results");
+
+        // Same load → same weights → identical top-5 class sequence.
+        for (int i = 0; i < n; i++)
+            if (streamRes[i].ClassIndex != byteRes[i].ClassIndex)
+                throw new Exception(
+                    $"top-{i} class differs: stream={streamRes[i].ClassIndex} byte={byteRes[i].ClassIndex} — " +
+                    "streaming load produced different weights");
+
+        float confDiff = Math.Abs(streamRes[0].Confidence - byteRes[0].Confidence);
+        if (confDiff > 1e-3f)
+            throw new Exception($"top-1 confidence mismatch: stream={streamRes[0].Confidence:F6} byte={byteRes[0].Confidence:F6} diff={confDiff:F6}");
+
+        Console.WriteLine($"[StreamLoad] PASS — stream load == byte load (top-1 class {streamRes[0].ClassIndex} @ {streamRes[0].Confidence:P2}, {streamSession.WeightCount} weights, {streamSession.NodeCount} nodes)");
+        streamPipe.Dispose();
+        bytePipe.Dispose();
     });
 
     // ──────────────────────────────────────────────────────────────

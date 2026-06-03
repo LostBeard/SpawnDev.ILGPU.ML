@@ -56,6 +56,12 @@ public class OnnxTensorProto
     public int RawDataOffset { get; set; }
     public int RawDataLength { get; set; }
 
+    /// <summary>Streaming-load reference: when &gt;= 0, this tensor's raw_data lives at this absolute byte
+    /// offset in the LOAD STREAM (length = <see cref="RawDataLength"/>), and is NOT held in memory. The
+    /// streaming loader seeks here and uploads the bytes to the GPU in chunks. Set by the streaming ONNX
+    /// parser (<see cref="OnnxParser.ParseFromStreamAsync"/>); -1 means data is inline (RawData / *Data).</summary>
+    public long RawDataStreamOffset { get; set; } = -1;
+
     /// <summary>Float data (packed repeated float, proto field 4). Used when raw_data is absent.</summary>
     public float[]? FloatData { get; set; }
 
