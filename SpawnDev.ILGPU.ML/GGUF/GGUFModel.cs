@@ -18,11 +18,25 @@ public class GGUFModel
     public string? GetMetadataString(string key) =>
         Metadata.TryGetValue(key, out var v) && v is string s ? s : null;
 
-    public long GetMetadataInt(string key, long defaultValue = 0) =>
-        Metadata.TryGetValue(key, out var v) ? Convert.ToInt64(v) : defaultValue;
+    // Real-world GGUF metadata is heterogeneous: a key may hold a scalar, a string, a bool, or an
+    // ARRAY (e.g. tokenizer.ggml.tokens is a string[] of 100k+ tokens). Convert.ToInt64/ToSingle THROWS
+    // InvalidCastException on an array and FormatException on a non-numeric string. For inspection we
+    // want the default, never a crash — a single odd metadata value must not abort inspecting a 9 GB model.
+    public long GetMetadataInt(string key, long defaultValue = 0)
+    {
+        if (!Metadata.TryGetValue(key, out var v) || v is null) return defaultValue;
+        try { return Convert.ToInt64(v); }
+        catch (Exception ex) when (ex is InvalidCastException or FormatException or OverflowException)
+        { return defaultValue; }
+    }
 
-    public float GetMetadataFloat(string key, float defaultValue = 0) =>
-        Metadata.TryGetValue(key, out var v) ? Convert.ToSingle(v) : defaultValue;
+    public float GetMetadataFloat(string key, float defaultValue = 0)
+    {
+        if (!Metadata.TryGetValue(key, out var v) || v is null) return defaultValue;
+        try { return Convert.ToSingle(v); }
+        catch (Exception ex) when (ex is InvalidCastException or FormatException or OverflowException)
+        { return defaultValue; }
+    }
 
     public string[]? GetMetadataStringArray(string key) =>
         Metadata.TryGetValue(key, out var v) && v is string[] arr ? arr : null;
@@ -59,9 +73,19 @@ public class GGUFModel
     public long AttentionHeadCountKV => GetMetadataInt($"{Architecture}.attention.head_count_kv", 0);
 
     /// <summary>Vocabulary size.</summary>
-    public long VocabSize => GetMetadataInt($"tokenizer.ggml.tokens", 0) > 0
-        ? (GetMetadataStringArray("tokenizer.ggml.tokens")?.Length ?? 0)
-        : GetMetadataInt($"{Architecture}.vocab_size", 0);
+    public long VocabSize
+    {
+        get
+        {
+            // tokenizer.ggml.tokens is a STRING ARRAY (the token list); its length IS the vocab size.
+            // Must read it via GetMetadataStringArray — the old code called GetMetadataInt on this key,
+            // which did Convert.ToInt64(string[]) and threw InvalidCastException on every real LLM GGUF
+            // that carries an embedded tokenizer (the 9 GB model exposed it; test.gguf has no tokenizer).
+            var tokens = GetMetadataStringArray("tokenizer.ggml.tokens");
+            if (tokens is { Length: > 0 }) return tokens.Length;
+            return GetMetadataInt($"{Architecture}.vocab_size", 0);
+        }
+    }
 
     /// <summary>Get the absolute data offset for a tensor.</summary>
     public long GetTensorDataOffset(GGUFTensorInfo tensor)

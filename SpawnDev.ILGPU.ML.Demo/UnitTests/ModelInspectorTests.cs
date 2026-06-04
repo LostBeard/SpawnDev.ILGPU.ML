@@ -1,4 +1,6 @@
 using System.Text;
+using SpawnDev.BlazorJS.Toolbox;
+using Blob = SpawnDev.BlazorJS.JSObjects.Blob; // alias to avoid JSObjects.Array vs System.Array collision
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Onnx;
 using SpawnDev.UnitTesting;
@@ -205,10 +207,24 @@ public class ModelInspectorTests
         }
     }
 
+    // The giant transformers (GPT-2 ~623MB, DistilBERT ~256MB) are inspected by the dedicated streaming
+    // test ModelInspector_Onnx_Transformers_Inspect. The breadth smoke below intentionally skips them:
+    // HttpClient.GetStreamAsync yields a NON-seekable stream, so the inspector cannot Seek-past-weights and
+    // must read THROUGH every weight (no skip) — walking ~900MB of protobuf for those two alone, which
+    // blows any sane breadth-smoke budget. The production path (InspectorPage's seekable BlobStream) DOES
+    // seek past weights, so this read-through cost is a non-seekable-source artifact, not a demo cost.
+    private static readonly HashSet<string> BreadthSmokeSkip = new()
+    {
+        "models/gpt2/model.onnx",
+        "models/distilbert-sst2/model.onnx",
+    };
+
     /// <summary>
-    /// Full-coverage smoke: every model the demo accepts must inspect without throwing and produce a
-    /// populated result. This is the demo's full use case (drop ANY supported model), streamed one at a
-    /// time so memory stays bounded regardless of model size.
+    /// Full-coverage breadth smoke: every FORMAT the demo accepts (and every small/medium model) must
+    /// inspect without throwing and produce a populated result — the demo's full use case (drop ANY
+    /// supported model), streamed one at a time so memory stays bounded. The two giant transformers are
+    /// covered separately (see <see cref="ModelInspector_Onnx_Transformers_Inspect"/>) and skipped here so
+    /// this stays a fast, reliable format-breadth check rather than a ~1GB transfer stress test.
     /// </summary>
     [TestMethod(Timeout = 120000)]
     public async Task ModelInspector_Inspect_AllDemoModels_NoThrow()
@@ -217,12 +233,13 @@ public class ModelInspectorTests
         int reachable = 0;
         foreach (var path in AllInspectableModels)
         {
+            if (BreadthSmokeSkip.Contains(path)) continue; // covered by the dedicated streaming transformer test
             reachable++;
             try
             {
                 // ONE stream pass yields BOTH inspection and compatibility (the demo calls both) — the
-                // model is fetched once, not twice, and weights are skipped. This is exactly the demo's
-                // per-file path.
+                // model is fetched once, not twice. On a seekable source weights are skipped; over this
+                // non-seekable HTTP stream they are read-and-discarded. This is the demo's per-file path.
                 using var stream = await _http.GetStreamAsync(path);
                 var (r, _) = await ModelInspectorHelper.InspectWithCompatibilityAsync(stream);
                 if (string.IsNullOrEmpty(r.GraphName) && string.IsNullOrEmpty(r.ProducerName))
@@ -408,6 +425,192 @@ public class ModelInspectorTests
             throw new Exception("Expected Seek() calls skipping weight blobs; none occurred");
     }
 
+    /// <summary>
+    /// REGRESSION GUARD: a GGUF whose metadata carries a <c>tokenizer.ggml.tokens</c> STRING ARRAY (every
+    /// real LLM GGUF with an embedded tokenizer does) must inspect without throwing, and VocabSize must be
+    /// the token-array length. The old GGUFModel.VocabSize called GetMetadataInt on that array key, doing
+    /// Convert.ToInt64(string[]) → InvalidCastException — which crashed inspection of a real 9 GB gemma GGUF
+    /// (test.gguf has no tokenizer so it never triggered). Synthetic + tiny: no large file, no GitHub bloat.
+    /// </summary>
+    [TestMethod]
+    public async Task ModelInspector_GGUF_WithTokenizerArray_DoesNotThrow_VocabFromTokens()
+    {
+        // 5 fake tokens → VocabSize must be 5; arch string present.
+        var gguf = BuildMinimalGGUFWithTokenizer("llama", new[] { "<s>", "</s>", "a", "b", "c" });
+
+        // Inspect through the async-only (BlobStream-contract) stream — exercises ParseHeaderAsync's
+        // array-metadata reading AND the VocabSize fix end-to-end, exactly as the demo would.
+        using var stream = new AsyncOnlyStream(gguf);
+        var (r, compat) = await ModelInspectorHelper.InspectWithCompatibilityAsync(stream);
+
+        if (string.IsNullOrEmpty(r.ProducerName) || !r.ProducerName.Contains("GGUF", StringComparison.OrdinalIgnoreCase))
+            throw new Exception($"Expected a GGUF result; ProducerName='{r.ProducerName}'");
+        // BuildGGUFResult encodes VocabSize as the Outputs[0] shape "{N} tokens".
+        var vocab = r.Outputs.FirstOrDefault()?.Shape.FirstOrDefault() ?? "";
+        if (vocab != "5 tokens")
+            throw new Exception($"VocabSize should be the 5-token array length; Outputs vocab='{vocab}'");
+    }
+
+    /// <summary>Builds a minimal valid GGUF v3 byte blob: header + two metadata KVs (general.architecture
+    /// string, tokenizer.ggml.tokens string-array) + zero tensors. Enough to drive the streaming GGUF
+    /// header parser and BuildGGUFResult/VocabSize without any large file.</summary>
+    private static byte[] BuildMinimalGGUFWithTokenizer(string architecture, string[] tokens)
+    {
+        using var ms = new MemoryStream();
+        void U32(uint v) { Span<byte> b = stackalloc byte[4]; BitConverter.TryWriteBytes(b, v); ms.Write(b); }
+        void U64(ulong v) { Span<byte> b = stackalloc byte[8]; BitConverter.TryWriteBytes(b, v); ms.Write(b); }
+        void GStr(string s) { var u = Encoding.UTF8.GetBytes(s); U64((ulong)u.Length); ms.Write(u); }
+
+        U32(0x46554747);        // "GGUF" magic
+        U32(3);                 // version
+        U64(0);                 // tensor_count
+        U64(2);                 // metadata_kv_count
+
+        // general.architecture : String (type 8)
+        GStr("general.architecture");
+        U32(8);
+        GStr(architecture);
+
+        // tokenizer.ggml.tokens : Array (type 9) of String (type 8)
+        GStr("tokenizer.ggml.tokens");
+        U32(9);
+        U32(8);                 // element type = String
+        U64((ulong)tokens.Length);
+        foreach (var t in tokens) GStr(t);
+
+        return ms.ToArray();
+    }
+
+    // ── Async-only stream safety (BlobStream / WebTorrent contract) ──
+
+    /// <summary>
+    /// REGRESSION GUARD for the async-only stream contract. In Blazor WASM (and desktop WebTorrent)
+    /// every stream source is ASYNC ONLY — synchronous <see cref="Stream.Read(byte[],int,int)"/> is
+    /// unavailable (BlobStream throws NotSupportedException; browser HTTP streams throw
+    /// net_http_synchronous_reads_not_supported). The whole inspector must therefore read the source
+    /// purely via ReadAsync, never a sync Read.
+    ///
+    /// Every OTHER inspector stream test uses a fake that implements synchronous Read(), so they could
+    /// never catch a stray sync read on the source. <see cref="AsyncOnlyStream"/> mirrors BlobStream's
+    /// exact contract — CanSeek=true, Seek is pure pointer math, sync Read() THROWS, only ReadAsync
+    /// works, and (like BlobStream) it does NOT override the Memory&lt;byte&gt; overload, so it exercises
+    /// the same base-class routing to the array ReadAsync that BlobStream relies on. If any format's
+    /// inspection path does a synchronous Read on the source, this test throws exactly where it happens.
+    /// Runs on the CPU lane (inspection is pure CPU) so it needs no browser.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task ModelInspector_AsyncOnlyStream_AllFormats_NoSyncRead()
+    {
+        // One representative of each format the demo accepts. ONNX is the one TJ hits with large models
+        // via BlobStream; GGUF/SafeTensors/TFLite must be async-safe too (most sources will be streams).
+        var formats = new[]
+        {
+            "models/squeezenet/model.onnx",   // ONNX (seekable streaming, Seek-past-weights)
+            "test-models/test.gguf",          // GGUF (front-loaded header)
+            "test-models/test.safetensors",   // SafeTensors (header-only)
+            "models/blaze-face/model.tflite", // TFLite (full-buffer fallback, must drain via ReadAsync)
+        };
+
+        var failures = new List<string>();
+        int reachable = 0;
+        foreach (var path in formats)
+        {
+            byte[] bytes;
+            try { bytes = await _http.GetByteArrayAsync(path); }
+            catch (HttpRequestException) { continue; } // optional model not deployed — skip
+            reachable++;
+
+            try
+            {
+                // EXACT demo path: a single stream pass yields both inspection and compatibility, over a
+                // stream that bans synchronous reads — precisely what InspectorPage does with BlobStream.
+                using var stream = new AsyncOnlyStream(bytes);
+                var (r, compat) = await ModelInspectorHelper.InspectWithCompatibilityAsync(stream);
+                if (string.IsNullOrEmpty(r.GraphName) && string.IsNullOrEmpty(r.ProducerName))
+                    failures.Add($"{path}: empty metadata");
+                if (r.NodeCount <= 0 && r.InitializerCount <= 0)
+                    failures.Add($"{path}: no nodes and no initializers");
+                if (compat == null)
+                    failures.Add($"{path}: null compatibility");
+            }
+            catch (Exception ex)
+            {
+                // A NotSupportedException from a sync Read is the exact failure we are guarding against.
+                failures.Add($"{path}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        if (reachable == 0) throw new UnsupportedTestException("No inspectable models reachable");
+        if (failures.Count > 0)
+            throw new Exception($"Async-only stream inspection failed for {failures.Count}/{reachable}: {string.Join(" | ", failures)}");
+    }
+
+    /// <summary>
+    /// GOLD-STANDARD end-to-end proof of the InspectorPage path: wrap a REAL JS <see cref="Blob"/>
+    /// (what a dropped File is) in the REAL <c>SpawnDev.BlazorJS.Toolbox.BlobStream</c> and inspect it —
+    /// exactly what <c>InspectorPage.FileInput_OnChange</c> does. BlobStream is async-only (sync Read
+    /// throws) and seekable (Seek is pointer math), backed by HeapView for zero-copy throughput. If the
+    /// inspector did any synchronous source read, this throws NotSupportedException. The result must match
+    /// the in-memory Inspect(byte[]) field-for-field. Browser-only (a real Blob is a JS object), which is
+    /// where these tests run. SqueezeNet is small enough to marshal to a Blob cheaply while still being a
+    /// weight-heavy ONNX that exercises the Seek-past-weights path.
+    /// </summary>
+    [TestMethod]
+    public async Task ModelInspector_RealBlobStream_Onnx_MatchesByteArray()
+    {
+        var bytes = await _http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        var fromBytes = ModelInspectorHelper.Inspect(bytes);
+
+        // PHASE-INSTRUMENTED so a JS-interop failure reports exactly which BlobStream operation broke
+        // (Blob ctor vs small ReadAsync vs large ReadAsync vs Seek-then-read vs full inspect). Each phase
+        // rethrows with a label + the underlying message.
+        async Task<T> Phase<T>(string label, Func<Task<T>> op)
+        {
+            try { return await op(); }
+            catch (Exception ex) { throw new Exception($"[phase:{label}] {ex.GetType().Name}: {ex.Message}", ex); }
+        }
+        T PhaseSync<T>(string label, Func<T> op)
+        {
+            try { return op(); }
+            catch (Exception ex) { throw new Exception($"[phase:{label}] {ex.GetType().Name}: {ex.Message}", ex); }
+        }
+
+        using var blob = PhaseSync("blob-ctor", () => new Blob(new[] { bytes }));
+        var blobSize = PhaseSync("blob-size", () => blob.Size);
+        if (blobSize != bytes.Length)
+            throw new Exception($"[phase:blob-size] Blob.Size={blobSize} != bytes={bytes.Length} (Blob construction marshalled wrong)");
+
+        using var probe = PhaseSync("blobstream-ctor", () => new BlobStream(blob));
+        // Small read (matches BlobStreamTests' covered path).
+        var buf256 = new byte[256];
+        int n256 = await Phase("read-256", () => probe.ReadAsync(buf256, 0, 256));
+        if (n256 <= 0) throw new Exception("[phase:read-256] read 0 bytes from a non-empty blob");
+        // Large read (the inspector reads in 64KB chunks — NOT covered by BlobStreamTests).
+        probe.Position = 0;
+        var buf64k = new byte[64 * 1024];
+        int n64k = await Phase("read-64k", () => probe.ReadAsync(buf64k, 0, buf64k.Length));
+        if (n64k <= 0) throw new Exception("[phase:read-64k] read 0 bytes");
+        // Seek-then-read (the inspector Seeks past weight blobs).
+        PhaseSync("seek", () => probe.Seek(1024, SeekOrigin.Begin));
+        int nSeek = await Phase("seek-read", () => probe.ReadAsync(buf256, 0, 256));
+        if (nSeek <= 0) throw new Exception("[phase:seek-read] read 0 bytes after seek");
+
+        // Full demo single-pass inspect over a fresh BlobStream.
+        using var stream = PhaseSync("inspect-ctor", () => new BlobStream(blob));
+        var (r, compat) = await Phase("inspect", () => ModelInspectorHelper.InspectWithCompatibilityAsync(stream));
+
+        if (r.NodeCount != fromBytes.NodeCount)
+            throw new Exception($"NodeCount blobstream={r.NodeCount} bytes={fromBytes.NodeCount}");
+        if (r.InitializerCount != fromBytes.InitializerCount)
+            throw new Exception($"InitializerCount blobstream={r.InitializerCount} bytes={fromBytes.InitializerCount}");
+        if (r.TotalParameters != fromBytes.TotalParameters)
+            throw new Exception($"TotalParameters blobstream={r.TotalParameters} bytes={fromBytes.TotalParameters}");
+        if (r.Operators.Length != fromBytes.Operators.Length)
+            throw new Exception($"Operators blobstream={r.Operators.Length} bytes={fromBytes.Operators.Length}");
+        if (!compat.Applicable || compat.TotalOpsUsed <= 0)
+            throw new Exception("Expected an applicable ONNX compatibility result with ops");
+    }
+
     // ── Inspect-by-URL via the live SpawnDev hub (the original #1 goal) ──
 
     /// <summary>
@@ -529,6 +732,57 @@ file sealed class CountingSeekableStream : Stream
         };
         if (target > _pos) BytesSeeked += target - _pos;
         _pos = target;
+        return _pos;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _data.Length;
+    public override long Position { get => _pos; set => _pos = value; }
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
+/// <summary>
+/// Seekable stream over a byte[] that mirrors <c>SpawnDev.BlazorJS.Toolbox.BlobStream</c>'s contract:
+/// CanSeek is true and Seek is pure pointer math (no I/O), synchronous <see cref="Read(byte[],int,int)"/>
+/// THROWS, only <see cref="ReadAsync(byte[],int,int,CancellationToken)"/> works, and the
+/// <c>Memory&lt;byte&gt;</c> overload is intentionally NOT overridden — so the base class routes it to the
+/// array ReadAsync exactly as it does for BlobStream. Lets the inspector tests prove async-only safety
+/// (no stray synchronous source read) without needing a real browser Blob.
+/// </summary>
+file sealed class AsyncOnlyStream : Stream
+{
+    private readonly byte[] _data;
+    private long _pos;
+    public AsyncOnlyStream(byte[] data) => _data = data;
+
+    // Sync Read is banned — exactly like BlobStream. If any inspector path calls this, the test fails
+    // with this message, pinpointing the synchronous source read.
+    public override int Read(byte[] buffer, int offset, int count)
+        => throw new NotSupportedException($"{nameof(AsyncOnlyStream)}.Read not supported. Use ReadAsync (async-only stream, as in Blazor WASM).");
+
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        await Task.Yield(); // force a genuine async hop — no synchronous completion shortcut
+        int n = (int)Math.Min(count, _data.Length - _pos);
+        if (n <= 0) return 0;
+        Array.Copy(_data, _pos, buffer, offset, n);
+        _pos += n;
+        return n;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        _pos = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _pos + offset,
+            SeekOrigin.End => _data.Length + offset,
+            _ => _pos,
+        };
         return _pos;
     }
 

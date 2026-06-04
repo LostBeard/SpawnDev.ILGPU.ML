@@ -82,14 +82,15 @@ public static partial class ModelInspectorHelper
             case ModelFormat.SafeTensors:
                 return (await InspectSafeTensorsStreamAsync(stream, prefix, prefixLen, ct).ConfigureAwait(false), format);
 
-            case ModelFormat.GGUF when stream.CanSeek:
-                // GGUF header is front-loaded (metadata + tensor infos, then the aligned data
-                // section). ParseHeader reads only up to the data boundary — never the weight blob.
-                // It uses synchronous reads, which seekable streams (FileStream, MemoryStream,
-                // WebTorrent-seekable) support; non-seekable async-only streams (browser
-                // OpenReadStream) take the full-read fallback below.
-                var ggufModel = GGUF.GGUFParser.ParseHeader(new PrefixedReadStream(prefix, prefixLen, stream));
-                return (BuildGGUFResult(ggufModel, stream.Length), format);
+            case ModelFormat.GGUF:
+                // GGUF header is front-loaded (metadata + tensor infos, then the aligned data section).
+                // ParseHeaderAsync reads ONLY up to the data boundary — never the weight blob — using
+                // ReadAsync exclusively, so it works on every stream including async-only sources
+                // (BlobStream, browser OpenReadStream, WebTorrent). The header is forward-only, so no
+                // seeking is required; we replay the already-read detection prefix via PrefixedReadStream.
+                var ggufModel = await GGUF.GGUFParser.ParseHeaderAsync(
+                    new PrefixedReadStream(prefix, prefixLen, stream), ct).ConfigureAwait(false);
+                return (BuildGGUFResult(ggufModel, stream.CanSeek ? stream.Length : 0), format);
 
             case ModelFormat.ONNX:
             {

@@ -1,10 +1,15 @@
 @page "/inspector"
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@using SpawnDev.BlazorJS.Toolbox
 @using SpawnDev.ILGPU.ML.Onnx
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.WebTorrent
 @using Microsoft.AspNetCore.Components.Forms
+@implements IDisposable
 @inject WebTorrentClient WtClient
 @inject HttpClient Http
+@inject BlazorJSRuntime JS
 
 <PageTitle>Model Inspector — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -15,32 +20,26 @@
     </div>
 
     <div class="inspector-dropzone @(_isDragOver ? "drag-over" : "")">
-        @if (_result != null)
-        {
-            <button class="clear-btn" @onclick="Clear">Drop another model</button>
-        }
-        else
-        {
-            <div class="drop-prompt">
-                <div class="drop-icon">&#x1F4E6;</div>
-                @if (_isLoading)
-                {
-                    <p class="loading-text">Parsing model...</p>
-                }
-                else
-                {
-                    <p>Drop a model file here</p>
-                    <p class="drop-hint">.onnx, .tflite, .gguf, .safetensors — or click to browse</p>
-                }
-                @* The InputFile MUST stay mounted while loading: the streaming inspector reads the
+        <div class="drop-prompt">
+            <div class="drop-icon">&#x1F4E6;</div>
+            @if (_isLoading)
+            {
+                <p class="loading-text">Parsing model...</p>
+            }
+            else
+            {
+                <p>Drop a model file here</p>
+                <p class="drop-hint">.onnx, .tflite, .gguf, .safetensors — or click to browse</p>
+            }
+            @* The InputFile MUST stay mounted while loading: the streaming inspector reads the
                    model over many async chunks, and if the <input> is unmounted mid-read Blazor clears
                    its file registry, so the in-flight OpenReadStream fails with
                    "Cannot read properties of null (reading '_blazorFilesById')". Keep it rendered
                    (disabled during load) for the whole read. Long-term: read the File's Blob via a
                    seekable BlobStream (no InputFile / _blazorFilesById dependency). *@
-                <InputFile OnChange="HandleFileSelected" accept=".onnx,.tflite,.gguf,.safetensors" class="file-input" disabled="@_isLoading" />
-            </div>
-        }
+
+            <input @ref="_fileInputRef" type="file" accept=".onnx,.tflite,.gguf,.safetensors" class="file-input" disabled="@_isLoading" />
+        </div>
     </div>
 
     <div class="hub-inspect">
@@ -218,6 +217,60 @@
     private bool _isLoading;
     private bool _isDragOver;
     private string? _error;
+    ElementReference _fileInputRef;
+    HTMLInputElement? _fileInput;
+    bool _beenInit;
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        if (!_beenInit)
+        {
+            _beenInit = true;
+            _fileInput = new HTMLInputElement(_fileInputRef);
+            _fileInput.OnChange += FileInput_OnChange;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_beenInit)
+        {
+            _beenInit = false;
+            _fileInput!.OnChange -= FileInput_OnChange;
+            _fileInput.Dispose();
+        }
+    }
+
+    async void FileInput_OnChange(Event ev)
+    {
+        using var files = _fileInput!.Files;
+        var sourceFile = files!.Length > 0 ? files[0] : null;
+        var ext = Path.GetExtension(sourceFile?.Name ?? "").ToLowerInvariant();
+        if (sourceFile == null || ext is not (".onnx" or ".tflite" or ".gguf" or ".safetensors")) return;
+
+        _isLoading = true;
+        _error = null;
+        _result = null;
+        StateHasChanged();
+
+        try
+        {
+            // Stream the model: the structure (graph, ops, tensor metadata) is read while every weight
+            // blob is skipped, so the whole file is never held in memory — a 600 MB GPT-2 or a multi-GB
+            // checkpoint inspects from its structure alone, with no size cap and no OOM. A SINGLE stream
+            // pass produces both the inspection and the compatibility check, so the file is read once.
+            using var stream = new BlobStream(sourceFile);
+            (_result, _compatibility) = await ModelInspectorHelper.InspectWithCompatibilityAsync(stream);
+        }
+        catch (Exception ex)
+        {
+            _error = $"Failed to parse model: {ex.Message}";
+            JS.Log($"[FileInput_OnChange]", ex.GetType().Name,ex.StackTrace);
+        }
+
+        _isLoading = false;
+        StateHasChanged();
+    }
 
     private async Task HandleFileSelected(InputFileChangeEventArgs e)
     {

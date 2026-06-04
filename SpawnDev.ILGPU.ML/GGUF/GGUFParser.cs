@@ -1,5 +1,7 @@
 using System.IO;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace SpawnDev.ILGPU.ML.GGUF;
 
@@ -154,6 +156,158 @@ public static class GGUFParser
         long dataStart = (pos + alignment - 1) / alignment * alignment;
         model.DataStartOffset = dataStart;
         return model;
+    }
+
+    /// <summary>
+    /// Async, forward-only twin of <see cref="ParseHeader"/>. Reads ONLY the GGUF header (metadata +
+    /// tensor infos) using <see cref="Stream.ReadAsync(Memory{byte},CancellationToken)"/> exclusively —
+    /// never a synchronous <see cref="Stream.Read(byte[],int,int)"/>. This is mandatory for async-only
+    /// stream sources (Blazor WASM BlobStream, browser HTTP streams, desktop WebTorrent), where sync
+    /// Read throws. The header is forward-only so no seeking is required; the multi-GB weight blob is
+    /// never touched.
+    /// </summary>
+    public static async ValueTask<GGUFModel> ParseHeaderAsync(Stream s, CancellationToken ct = default)
+    {
+        var r = new AsyncByteSource(s);
+
+        uint magic = await r.ReadUInt32Async(ct).ConfigureAwait(false);
+        if (magic != GGUF_MAGIC)
+            throw new InvalidOperationException($"Not a GGUF file (magic: 0x{magic:X8}, expected 0x{GGUF_MAGIC:X8})");
+
+        var model = new GGUFModel { Version = await r.ReadUInt32Async(ct).ConfigureAwait(false) };
+        if (model.Version < 2 || model.Version > 3)
+            throw new InvalidOperationException($"Unsupported GGUF version: {model.Version} (expected 2 or 3)");
+
+        ulong tensorCount = await r.ReadUInt64Async(ct).ConfigureAwait(false);
+        ulong metadataCount = await r.ReadUInt64Async(ct).ConfigureAwait(false);
+
+        model.Metadata = new Dictionary<string, object>();
+        for (ulong i = 0; i < metadataCount; i++)
+        {
+            var key = await r.ReadStringAsync(ct).ConfigureAwait(false);
+            var valueType = (GGUFValueType)await r.ReadUInt32Async(ct).ConfigureAwait(false);
+            model.Metadata[key] = await r.ReadValueAsync(valueType, ct).ConfigureAwait(false);
+        }
+
+        model.Tensors = new GGUFTensorInfo[tensorCount];
+        for (ulong i = 0; i < tensorCount; i++)
+        {
+            var name = await r.ReadStringAsync(ct).ConfigureAwait(false);
+            uint nDims = await r.ReadUInt32Async(ct).ConfigureAwait(false);
+            var dims = new long[nDims];
+            for (int d = 0; d < (int)nDims; d++)
+                dims[d] = (long)await r.ReadUInt64Async(ct).ConfigureAwait(false);
+            var type = (GGMLType)await r.ReadUInt32Async(ct).ConfigureAwait(false);
+            ulong offset = await r.ReadUInt64Async(ct).ConfigureAwait(false);
+            model.Tensors[i] = new GGUFTensorInfo { Name = name, Dimensions = dims, Type = type, DataOffset = offset };
+        }
+
+        uint alignment = 32;
+        if (model.Metadata.TryGetValue("general.alignment", out var alignVal) && alignVal is long a)
+            alignment = (uint)a;
+        model.Alignment = alignment;
+        long dataStart = (r.Position + alignment - 1) / alignment * alignment;
+        model.DataStartOffset = dataStart;
+        return model;
+    }
+
+    /// <summary>
+    /// Buffered, forward-only ASYNC byte source over a stream. Mirrors the sequential SRead* helpers but
+    /// fills its buffer via <see cref="Stream.ReadAsync(Memory{byte},CancellationToken)"/> only, so it
+    /// works on async-only streams. Position tracks total bytes consumed (for the data-start alignment).
+    /// </summary>
+    private sealed class AsyncByteSource
+    {
+        private readonly Stream _s;
+        private readonly byte[] _buf = new byte[64 * 1024];
+        private int _bufPos, _bufLen;
+        public long Position { get; private set; }
+
+        public AsyncByteSource(Stream s) => _s = s;
+
+        public async ValueTask<byte[]> ReadBytesAsync(int n, CancellationToken ct)
+        {
+            var outBuf = new byte[n];
+            int got = 0;
+            while (got < n)
+            {
+                if (_bufPos >= _bufLen)
+                {
+                    _bufPos = 0;
+                    _bufLen = await _s.ReadAsync(_buf.AsMemory(0, _buf.Length), ct).ConfigureAwait(false);
+                    if (_bufLen == 0)
+                        throw new EndOfStreamException($"GGUF header truncated: wanted {n} bytes at pos {Position}, got {got}.");
+                }
+                int take = Math.Min(n - got, _bufLen - _bufPos);
+                Array.Copy(_buf, _bufPos, outBuf, got, take);
+                _bufPos += take;
+                got += take;
+            }
+            Position += n;
+            return outBuf;
+        }
+
+        public async ValueTask<uint> ReadUInt32Async(CancellationToken ct)
+        {
+            var b = await ReadBytesAsync(4, ct).ConfigureAwait(false);
+            return (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+        }
+
+        public async ValueTask<ulong> ReadUInt64Async(CancellationToken ct)
+        {
+            ulong lo = await ReadUInt32Async(ct).ConfigureAwait(false);
+            ulong hi = await ReadUInt32Async(ct).ConfigureAwait(false);
+            return lo | (hi << 32);
+        }
+
+        public async ValueTask<ushort> ReadUInt16Async(CancellationToken ct)
+        {
+            var b = await ReadBytesAsync(2, ct).ConfigureAwait(false);
+            return (ushort)(b[0] | (b[1] << 8));
+        }
+
+        public async ValueTask<string> ReadStringAsync(CancellationToken ct)
+        {
+            ulong len = await ReadUInt64Async(ct).ConfigureAwait(false);
+            var b = await ReadBytesAsync((int)len, ct).ConfigureAwait(false);
+            return Encoding.UTF8.GetString(b);
+        }
+
+        public async ValueTask<object> ReadValueAsync(GGUFValueType type, CancellationToken ct)
+        {
+            switch (type)
+            {
+                case GGUFValueType.UInt8: return (await ReadBytesAsync(1, ct).ConfigureAwait(false))[0];
+                case GGUFValueType.Int8: return (sbyte)(await ReadBytesAsync(1, ct).ConfigureAwait(false))[0];
+                case GGUFValueType.UInt16: return await ReadUInt16Async(ct).ConfigureAwait(false);
+                case GGUFValueType.Int16: return (short)await ReadUInt16Async(ct).ConfigureAwait(false);
+                case GGUFValueType.UInt32: return await ReadUInt32Async(ct).ConfigureAwait(false);
+                case GGUFValueType.Int32: return (int)await ReadUInt32Async(ct).ConfigureAwait(false);
+                case GGUFValueType.UInt64: return await ReadUInt64Async(ct).ConfigureAwait(false);
+                case GGUFValueType.Int64: return (long)await ReadUInt64Async(ct).ConfigureAwait(false);
+                case GGUFValueType.Float32: return BitConverter.ToSingle(await ReadBytesAsync(4, ct).ConfigureAwait(false), 0);
+                case GGUFValueType.Float64: return BitConverter.ToDouble(await ReadBytesAsync(8, ct).ConfigureAwait(false), 0);
+                case GGUFValueType.Bool: return (await ReadBytesAsync(1, ct).ConfigureAwait(false))[0] != 0;
+                case GGUFValueType.String: return await ReadStringAsync(ct).ConfigureAwait(false);
+                case GGUFValueType.Array: return await ReadArrayAsync(ct).ConfigureAwait(false);
+                default: throw new NotSupportedException($"Unknown GGUF value type: {type}");
+            }
+        }
+
+        public async ValueTask<object> ReadArrayAsync(CancellationToken ct)
+        {
+            var elemType = (GGUFValueType)await ReadUInt32Async(ct).ConfigureAwait(false);
+            ulong count = await ReadUInt64Async(ct).ConfigureAwait(false);
+            if (elemType == GGUFValueType.String)
+            {
+                var arr = new string[count];
+                for (ulong i = 0; i < count; i++) arr[i] = await ReadStringAsync(ct).ConfigureAwait(false);
+                return arr;
+            }
+            var result = new object[count];
+            for (ulong i = 0; i < count; i++) result[i] = await ReadValueAsync(elemType, ct).ConfigureAwait(false);
+            return result;
+        }
     }
 
     // ── Stream binary readers (sequential, header-only) ──
