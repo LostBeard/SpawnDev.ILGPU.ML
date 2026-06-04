@@ -368,7 +368,10 @@ public class TextGenerationPipeline : IDisposable
             readSw.Stop();
 
             // DIAGNOSTIC: attribute per-step decode cost to CPU recompile vs GPU forward vs readback.
-            if (InferenceSession.VerboseLogging)
+            // Always recorded into StepTimings (cheap strings, so a test can inspect them without
+            // turning on VerboseLogging); only echoed to console.error when VerboseLogging is set
+            // (PMT pipes console.error to stderr — console.log is dropped — but spamming it inflates
+            // the browser console-error count, so keep it opt-in).
             {
                 double recompileMs = _session.LastRecompileMs;
                 double runMs = runSw.Elapsed.TotalMilliseconds;
@@ -377,9 +380,7 @@ public class TextGenerationPipeline : IDisposable
                     $"readback={readSw.Elapsed.TotalMilliseconds:F0}ms (run={runMs:F0}ms) " +
                     $"poolBuffers={_session.LastExecutorBufferCount}";
                 StepTimings.Add(line);
-                // Emit at ERROR level: PMT pipes browser console.error to the dotnet-test stderr
-                // (Console.WriteLine / console.log is dropped). This is the only captured channel.
-                Console.Error.WriteLine(line);
+                if (InferenceSession.VerboseLogging) Console.Error.WriteLine(line);
             }
 
             // Greedy argmax

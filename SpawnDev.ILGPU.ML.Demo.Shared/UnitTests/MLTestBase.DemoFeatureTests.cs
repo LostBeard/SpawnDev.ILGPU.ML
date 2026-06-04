@@ -35,22 +35,34 @@ public abstract partial class MLTestBase
         var tokenizerJson = await http.GetStringAsync(
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
 
-        async Task<string> Gen(bool cache)
+        async Task<(string text, List<string> timings)> Gen(bool cache)
         {
             using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
             var pipeline = new TextGenerationPipeline(session, accelerator) { UseShapeReadbackCache = cache };
             pipeline.LoadTokenizer(tokenizerJson);
-            pipeline.MaxNewTokens = 6;
+            pipeline.MaxNewTokens = 8;
             var result = await pipeline.GenerateAsync("The cat sat on the");
-            return result.GeneratedText;
+            return (result.GeneratedText, new List<string>(pipeline.StepTimings));
         }
-        var cacheOff = await Gen(false);
-        var cacheOn = await Gen(true);
+        var (cacheOff, _) = await Gen(false);
+        var (cacheOn, onTimings) = await Gen(true);
         Console.WriteLine($"[TextGen-cache] off='{cacheOff}' on='{cacheOn}'");
         if (!cacheOff.TrimStart().StartsWith("floor"))
             throw new Exception($"Uncached generation WRONG: '{cacheOff}' — expected to start with ' floor' (ORT greedy reference).");
         if (cacheOn != cacheOff)
             throw new Exception($"Readback cache CHANGED the output — cached='{cacheOn}' vs uncached='{cacheOff}'. A data-dependent readback is being cached.");
+
+        // Memory: the reused fixed-shape executor must RECYCLE its output buffers, not grow the pool
+        // ~13/step (logits ≈11MB/step → OOM on long gens). Parse poolBuffers from the per-step timings;
+        // after the 2 cold probe steps it must PLATEAU (no linear per-step growth).
+        int PoolBuffers(string line) { var m = System.Text.RegularExpressions.Regex.Match(line, @"poolBuffers=(\d+)"); return m.Success ? int.Parse(m.Groups[1].Value) : -1; }
+        var pool = onTimings.Select(PoolBuffers).Where(v => v >= 0).ToList();
+        if (pool.Count >= 5)
+        {
+            int mid = pool[pool.Count - 3], last = pool[^1]; // two later steps, past the probe warmup
+            if (last - mid > 4) // allow tiny slack; a leak would be +13/step (+26 over two steps)
+                throw new Exception($"Decode pool GREW {mid}→{last} across late steps — output buffers are leaking (expected plateau). poolBuffers=[{string.Join(",", pool)}]");
+        }
     });
 
     [TestMethod(Timeout = 300000, Category = "HeavyModel")]

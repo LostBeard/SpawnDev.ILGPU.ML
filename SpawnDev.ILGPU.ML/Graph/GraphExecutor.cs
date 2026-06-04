@@ -42,6 +42,7 @@ public class GraphExecutor : IDisposable
     private Dictionary<string, float[]>? _readbackProbe;     // first probe run's values (for comparison)
     private Dictionary<string, float[]>? _readbackStable;    // proven-stable values, reused once finalized
     private bool _readbackStableFinalized;                   // true once _readbackStable is built
+    private List<Tensor>? _priorRunOutputs;                  // last run's graph-output tensors, recycled next run
 
     /// <summary>When true, logs each node execution to Console.</summary>
     public static bool VerboseLogging { get; set; }
@@ -703,6 +704,19 @@ public class GraphExecutor : IDisposable
                     runtimeConstants.Remove(outName);
         }
 
+        // Decode-loop output recycling: this executor is reused every step (fixed-shape decode), but
+        // the graph's OUTPUT buffers (logits + present.*) are never refcount-released — they're the
+        // results. Without this they'd accumulate ~13 fresh buffers/step (logits alone ≈11MB) and OOM
+        // long generations. Gated on CacheShapeReadbacks (the decode-loop signal, where the caller has
+        // consumed the prior outputs before this call): return last run's output buffers to the pool
+        // BEFORE renting, so this run's same-named, same-shape outputs reuse them. _namedBuffers still
+        // maps the output names to the prior buffers here, so Return→bucket→Rent recycles cleanly.
+        if (CacheShapeReadbacks && _priorRunOutputs != null)
+        {
+            foreach (var t in _priorRunOutputs) _pool.Return(t);
+            _priorRunOutputs = null;
+        }
+
         // Readback cache (auto-detecting). Once finalized, seed the proven-stable shape-derived values
         // so the per-node capture loop SKIPS their GPU round-trips. While probing (first two runs),
         // record this run's readbacks for cross-run comparison.
@@ -1224,6 +1238,14 @@ public class GraphExecutor : IDisposable
             if (tensors.TryGetValue(name, out var tensor))
                 results[name] = tensor;
         }
+
+        // Remember this run's output buffers so the next decode step can recycle them (see the
+        // CacheShapeReadbacks-gated Return at RunAsync start). Only the distinct output buffers —
+        // an output that aliases an input/weight is excluded (its buffer isn't pool-owned).
+        if (CacheShapeReadbacks)
+            _priorRunOutputs = results.Values
+                .Where(t => t.Name != null && !inputs.ContainsKey(t.Name) && !_weights.ContainsKey(t.Name))
+                .ToList();
 
         // TurboQuant KV cache: intercept present.N.key/value outputs and quantize
         if (_kvCache != null && _presentKeyOutputToLayer != null && _presentValueOutputToLayer != null)
