@@ -235,17 +235,32 @@
 
         try
         {
+            // Sampling config from the UI controls. Without this the pipeline runs pure greedy argmax,
+            // which makes DistilGPT-2 degenerate into "the first time I saw the first time I saw" loops.
+            // A modest repetition penalty further tames the small model's tendency to repeat phrases.
+            var config = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig
+            {
+                Strategy = _strategy,        // "greedy" | "top_k" | "top_p"
+                Temperature = _temperature,
+                TopK = _topK,
+                TopP = _topP,
+                RepetitionPenalty = 1.3f,
+            };
+
             // Stream tokens live: update the count + partial text after each generated token so the
             // UI shows generation advancing (the decode loop is currently slow — recompiles per step
             // pending the KV-cache speedup — so without this the page sits at "0 tokens" the whole run).
-            var result = await _pipeline.GenerateAsync(_prompt, maxNewTokens: _maxTokens,
+            // NOTE: the razor already renders the prompt in its own span, so _generatedText must hold
+            // ONLY the generated continuation — assigning result.Text (= prompt + generated) here is what
+            // made the page echo the prompt twice.
+            var result = await _pipeline.GenerateAsync(_prompt, maxNewTokens: _maxTokens, config: config,
                 onToken: async (count, textSoFar) =>
                 {
                     _tokensGenerated = count;
-                    _generatedText = _prompt + textSoFar;
+                    _generatedText = textSoFar;
                     await InvokeAsync(StateHasChanged);
                 });
-            _generatedText = result.Text;
+            _generatedText = result.GeneratedText;
             _tokensGenerated = result.GeneratedTokenCount;
             _inferenceMs = result.InferenceTimeMs;
             Console.WriteLine($"[TextGen] {result.TokensPerSecond:F1} tok/s, {result.GeneratedTokenCount} tokens");

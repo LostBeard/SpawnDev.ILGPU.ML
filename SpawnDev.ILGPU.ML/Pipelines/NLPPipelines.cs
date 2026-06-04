@@ -286,16 +286,28 @@ public class TextGenerationPipeline : IDisposable
     /// <summary>
     /// Generate text from a prompt using greedy decoding.
     /// </summary>
+    /// <param name="config">Optional sampling configuration (strategy, temperature, top-k/top-p,
+    /// repetition penalty, seed). When null the pipeline uses pure GREEDY argmax — this keeps the
+    /// deterministic GPT-2==ORT reference tests bit-exact. Sampling is OPT-IN and is what the demo
+    /// uses to escape greedy's degenerate repetition loops on a small model like DistilGPT-2.</param>
     /// <param name="onToken">Optional progress callback invoked after EACH generated token with
     /// (tokenCount, decodedTextSoFar). Lets a UI stream tokens live instead of showing nothing until
     /// the whole (currently slow, per-step-recompiling) generation completes. Awaited so a Blazor UI
     /// can <c>StateHasChanged</c> between steps.</param>
     public async Task<TextGenerationResult> GenerateAsync(string prompt, int? maxNewTokens = null,
-        Func<int, string, Task>? onToken = null)
+        GenerationConfig? config = null, Func<int, string, Task>? onToken = null)
     {
         if (_tokenizer == null) throw new InvalidOperationException("Tokenizer not loaded.");
 
-        int maxTokens = maxNewTokens ?? MaxNewTokens;
+        // Token-count precedence: explicit param > config.MaxNewTokens (only if the caller SET it -
+        // it's int? defaulting to null) > this pipeline's MaxNewTokens. The config default is null on
+        // purpose: passing a GenerationConfig for sampling must NOT silently override an explicitly-set
+        // pipeline.MaxNewTokens. (It used to default to 128, which made sampled generations quietly run
+        // 128 tokens regardless of pipeline.MaxNewTokens - which on a slow backend looked like a hang.)
+        int maxTokens = maxNewTokens ?? config?.MaxNewTokens ?? MaxNewTokens;
+        // Seeded RNG → reproducible sampling (a seeded test asserts identical output across two runs);
+        // unseeded → Random.Shared for normal generation. Created once so the whole decode shares a stream.
+        var rng = config?.Seed is int seed ? new Random(seed) : Random.Shared;
         StepTimings.Clear();
         var sw = Stopwatch.StartNew();
 
@@ -383,16 +395,31 @@ public class TextGenerationPipeline : IDisposable
                 if (InferenceSession.VerboseLogging) Console.Error.WriteLine(line);
             }
 
-            // Greedy argmax
-            int nextToken = 0;
-            float maxVal = float.MinValue;
-            for (int i = 0; i < logits.Length; i++)
+            // Pick the next token. Default (config == null) is pure greedy argmax — this keeps the
+            // GPT-2==ORT reference tests bit-exact. Sampling (top-k / top-p / temperature / repetition
+            // penalty) is opt-in via GenerationConfig; it's what the demo uses so DistilGPT-2 doesn't
+            // collapse into "the first time I saw the first time I saw" greedy loops.
+            int nextToken;
+            if (config == null || config.Strategy == "greedy")
             {
-                if (logits[i] > maxVal) { maxVal = logits[i]; nextToken = i; }
+                nextToken = TextGenerationSampler.Greedy(logits);
+            }
+            else
+            {
+                // Repetition penalty first (in-place on the CPU logits), THEN strategy sampling.
+                if (config.RepetitionPenalty != 1.0f)
+                    TextGenerationSampler.ApplyRepetitionPenalty(logits, allTokens.ToArray(), config.RepetitionPenalty);
+                nextToken = config.Strategy switch
+                {
+                    "top_k" => TextGenerationSampler.TopK(logits, config.TopK, config.Temperature, rng),
+                    "top_p" => TextGenerationSampler.TopP(logits, config.TopP, config.Temperature, rng),
+                    _ => TextGenerationSampler.Greedy(logits),
+                };
             }
 
-            // Check for EOS
-            if (nextToken == 50256) break; // GPT-2 EOS token
+            // Check for EOS — GPT-2's fixed EOS (50256) always stops; an explicit config EOS also stops.
+            if (nextToken == 50256 || (config != null && config.EosTokenId >= 0 && nextToken == config.EosTokenId))
+                break;
 
             allTokens.Add(nextToken);
 

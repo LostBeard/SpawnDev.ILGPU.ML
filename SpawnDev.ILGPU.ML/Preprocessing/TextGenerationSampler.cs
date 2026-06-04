@@ -38,8 +38,10 @@ public static class TextGenerationSampler
         rng ??= Random.Shared;
         k = Math.Min(k, logits.Length);
 
-        // Find top-K indices
-        var indices = TopKIndices(logits, k);
+        // Top-K indices: full descending argsort (Array.Sort, intrinsic float compares) then take the
+        // first k. The old O(n*k) selection was ~2.5M interpreted-WASM iterations/step for k=50 over a
+        // ~50k vocab; ArgsortDescending is O(n log n) with no per-element delegate, far cheaper there.
+        var indices = ArgsortDescending(logits);
 
         // Apply temperature and softmax over top-K only
         var probs = new float[k];
@@ -85,10 +87,11 @@ public static class TextGenerationSampler
         }
         for (int i = 0; i < probs.Length; i++) probs[i] /= sum;
 
-        // Sort by probability (descending)
-        var sortedIndices = Enumerable.Range(0, probs.Length)
-            .OrderByDescending(i => probs[i])
-            .ToArray();
+        // Sort indices by probability (descending). MUST be Array.Sort, not LINQ OrderByDescending:
+        // in interpreted Blazor WASM (RunAOTCompilation=false) the LINQ path over the full ~50k vocab
+        // (iterator + per-element keySelector delegate + boxed comparer) cost ~tens of seconds PER STEP
+        // and hung multi-token sampling. ArgsortDescending uses Array.Sort with intrinsic float compares.
+        var sortedIndices = ArgsortDescending(probs);
 
         // Find nucleus (smallest set where cumulative prob >= p)
         float cumulative = 0;
@@ -150,29 +153,24 @@ public static class TextGenerationSampler
 
     // ── Helpers ──
 
-    private static int[] TopKIndices(float[] values, int k)
+    /// <summary>
+    /// Indices of <paramref name="values"/> ordered by value DESCENDING. Uses Array.Sort on primitive
+    /// arrays (negated keys → ascending sort == descending by value) rather than LINQ OrderByDescending.
+    /// This is a hard requirement, not a micro-opt: token-generation runs in INTERPRETED Blazor WASM
+    /// (RunAOTCompilation=false), where LINQ's iterator + per-element keySelector delegate + boxed
+    /// comparer over the full ~50k-token vocabulary cost ~tens of seconds PER call and hung multi-token
+    /// top-p/top-k sampling. Array.Sort compares the float keys intrinsically (no interpreted delegate),
+    /// which is orders of magnitude faster under the interpreter. Ties order arbitrarily (introsort is
+    /// not stable), which is fine for sampling and still deterministic for identical input.
+    /// </summary>
+    private static int[] ArgsortDescending(float[] values)
     {
-        // Simple O(n*k) selection
-        var indices = new int[k];
-        var used = new bool[values.Length];
-
-        for (int ki = 0; ki < k; ki++)
-        {
-            float best = float.NegativeInfinity;
-            int bestIdx = 0;
-            for (int i = 0; i < values.Length; i++)
-            {
-                if (!used[i] && values[i] > best)
-                {
-                    best = values[i];
-                    bestIdx = i;
-                }
-            }
-            indices[ki] = bestIdx;
-            used[bestIdx] = true;
-        }
-
-        return indices;
+        int n = values.Length;
+        var keys = new float[n];
+        var idx = new int[n];
+        for (int i = 0; i < n; i++) { keys[i] = -values[i]; idx[i] = i; }
+        Array.Sort(keys, idx);
+        return idx;
     }
 
     private static int SampleFromDistribution(float[] probs, Random rng)
@@ -193,8 +191,11 @@ public static class TextGenerationSampler
 /// </summary>
 public class GenerationConfig
 {
-    /// <summary>Maximum number of new tokens to generate.</summary>
-    public int MaxNewTokens { get; set; } = 128;
+    /// <summary>Maximum number of new tokens to generate. NULL (the default) means "defer to the
+    /// pipeline's own MaxNewTokens" - so passing a GenerationConfig for sampling does NOT silently
+    /// override an explicitly-set TextGenerationPipeline.MaxNewTokens. Set a value here only to make
+    /// the config itself the source of truth for the token count.</summary>
+    public int? MaxNewTokens { get; set; } = null;
 
     /// <summary>Sampling strategy: "greedy", "top_k", "top_p".</summary>
     public string Strategy { get; set; } = "greedy";
@@ -210,6 +211,10 @@ public class GenerationConfig
 
     /// <summary>Repetition penalty (>1.0 reduces repetition).</summary>
     public float RepetitionPenalty { get; set; } = 1.0f;
+
+    /// <summary>Optional RNG seed for reproducible sampling. Null → non-deterministic (Random.Shared).
+    /// Set for unit tests that must assert identical output across runs.</summary>
+    public int? Seed { get; set; }
 
     /// <summary>End-of-sequence token ID. Generation stops when this is produced.</summary>
     public int EosTokenId { get; set; } = -1;

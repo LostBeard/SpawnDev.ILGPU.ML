@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Pipelines;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
 
@@ -63,6 +64,91 @@ public abstract partial class MLTestBase
             if (last - mid > 4) // allow tiny slack; a leak would be +13/step (+26 over two steps)
                 throw new Exception($"Decode pool GREW {mid}→{last} across late steps — output buffers are leaking (expected plateau). poolBuffers=[{string.Join(",", pool)}]");
         }
+    });
+
+    // REGRESSION GUARD for the GenerationConfig.MaxNewTokens precedence bug, plus a single-sampled-gen
+    // completion check (exactly what the /text-gen page does per "Generate" click). The bug:
+    // GenerationConfig.MaxNewTokens defaulted to 128 and silently overrode an explicitly-set
+    // pipeline.MaxNewTokens via the `maxNewTokens ?? config?.MaxNewTokens ?? MaxNewTokens` chain - so a
+    // sampled generation ran 128 tokens regardless of the pipeline value. That was fast on CUDA (~14s)
+    // but a timeout on slow cold WebGPU (~30s/token) - which masqueraded as a "WebGPU hang" and cost ~6
+    // blind WebGPU runs. Fix: GenerationConfig.MaxNewTokens is now int? = null (override only if set).
+    // This asserts the pipeline's MaxNewTokens(=2) is RESPECTED when a sampling config without its own
+    // MaxNewTokens is passed.
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task TextGen_Sampling_SingleGen_RespectsMaxTokens() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        var tokenizerJson = await http.GetStringAsync(
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+
+        using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
+        var pipeline = new TextGenerationPipeline(session, accelerator);
+        pipeline.LoadTokenizer(tokenizerJson);
+        pipeline.MaxNewTokens = 2;
+
+        // Sampling config with NO MaxNewTokens set - must NOT override pipeline.MaxNewTokens (=2).
+        var r = await pipeline.GenerateAsync("The cat sat on the", config: new GenerationConfig
+        {
+            Strategy = "top_p", TopP = 0.9f, Temperature = 0.7f, RepetitionPenalty = 1.3f, Seed = 1234,
+        });
+        Console.WriteLine($"[single-gen] tokens={r.GeneratedTokenCount} text='{r.GeneratedText}'");
+
+        if (string.IsNullOrWhiteSpace(r.GeneratedText))
+            throw new Exception("single sampled generation produced empty output");
+        if (r.GeneratedTokenCount < 1 || r.GeneratedTokenCount > 2)
+            throw new Exception($"sampled generation produced {r.GeneratedTokenCount} tokens, expected <=2 " +
+                "(pipeline.MaxNewTokens) - a config default must NOT override an explicit pipeline value.");
+    });
+
+    // Proves the GenerationConfig sampling path is WIRED end-to-end through the real DistilGPT-2 forward
+    // pass on the GPU - the fix for the live /text-gen page, whose Strategy/Temperature/Top-P controls
+    // were dead because the pipeline hardcoded greedy argmax (so DistilGPT-2 collapsed into "the first
+    // time I saw the first time I saw" loops). The sampler MATH (reproducibility, nucleus, penalty) is
+    // proven fast + deterministically by the Sampler_* tests in MLTestBase.SamplingTests; this test
+    // confirms config reaches the model and changes the GPU-decoded output. Fresh session per gen.
+    //   (1) default greedy still matches the ORT " floor" reference (no regression to deterministic decode),
+    //   (2) seeded top-p ENGAGES - it diverges from greedy (else the config never reached sampling),
+    //   (3) both respect pipeline.MaxNewTokens (guards the config-default-override regression that made
+    //       sampled gens silently run 128 tokens).
+    [TestMethod(Timeout = 480000, Category = "HeavyModel")]
+    public async Task TextGen_Sampling_EscapesGreedy() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        var tokenizerJson = await http.GetStringAsync(
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+
+        // Fresh session per generation (mirrors the proven TextGen_ReadbackCache pattern).
+        async Task<TextGenerationResult> Gen(GenerationConfig? cfg)
+        {
+            using var s = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
+            var p = new TextGenerationPipeline(s, accelerator);
+            p.LoadTokenizer(tokenizerJson);
+            p.MaxNewTokens = 3;
+            return await p.GenerateAsync("The cat sat on the", config: cfg);
+        }
+
+        var greedy = await Gen(null);
+        var sampled = await Gen(new GenerationConfig
+        {
+            Strategy = "top_p", TopP = 0.9f, Temperature = 0.7f, RepetitionPenalty = 1.3f, Seed = 1234,
+        });
+        Console.WriteLine($"[sample-e2e] greedy='{greedy.GeneratedText}' sampled='{sampled.GeneratedText}'");
+
+        if (!greedy.GeneratedText.TrimStart().StartsWith("floor"))
+            throw new Exception($"default greedy WRONG: '{greedy.GeneratedText}' - expected to start with ' floor' (ORT reference).");
+        if (sampled.GeneratedText == greedy.GeneratedText)
+            throw new Exception($"top-p produced the SAME text as greedy ('{sampled.GeneratedText}') - the config never reached sampling.");
+        if (greedy.GeneratedTokenCount > 3 || sampled.GeneratedTokenCount > 3)
+            throw new Exception($"MaxNewTokens not respected: greedy={greedy.GeneratedTokenCount}, sampled={sampled.GeneratedTokenCount}, expected <=3 (a config default must not override).");
     });
 
     [TestMethod(Timeout = 300000, Category = "HeavyModel")]
