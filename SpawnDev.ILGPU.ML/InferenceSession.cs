@@ -51,6 +51,35 @@ public class InferenceSession : IDisposable
     /// <summary>Enable diagnostic logging to Console.</summary>
     public static bool VerboseLogging { get; set; }
 
+    /// <summary>DIAGNOSTIC: wall-clock ms of the most recent per-shape recompile (Compile + executor
+    /// build). 0 when the last Run hit the base/cached executor (no recompile). Lets the decode loop
+    /// attribute per-step cost to CPU recompile vs GPU forward.</summary>
+    public double LastRecompileMs { get; private set; }
+
+    private bool _cacheShapeReadbacks;
+    /// <summary>Cache the mid-graph shape-derived runtime-constant readbacks (the ≤64-elem shape/scalar
+    /// tensors read back per node) so repeated same-shape inference skips ~643 GPU round-trips/forward
+    /// (~7.8s on DistilGPT-2 WebGPU). Safe ONLY for models whose small captured tensors are shape-
+    /// derived not data-derived — true for transformer decoders. Set by autoregressive pipelines
+    /// before the decode loop. Default off; general inference is unchanged. See
+    /// <see cref="GraphExecutor.CacheShapeReadbacks"/>.</summary>
+    public bool CacheShapeReadbacks
+    {
+        get => _cacheShapeReadbacks;
+        set
+        {
+            _cacheShapeReadbacks = value;
+            _executor.CacheShapeReadbacks = value;
+            foreach (var e in _shapeExecutors.Values) e.CacheShapeReadbacks = value;
+        }
+    }
+
+    /// <summary>DIAGNOSTIC: GPU intermediate-buffer count of the executor used by the most recent
+    /// Run/RunAsync. A per-shape executor rebuilt each step starts fresh (re-allocating every
+    /// intermediate buffer) — a high count that resets each step points the per-step cost at
+    /// fresh-pool churn rather than CPU recompile or forward compute.</summary>
+    public int LastExecutorBufferCount { get; private set; }
+
     /// <summary>Model input names and shapes.</summary>
     public string[] InputNames => _compiled.InputNames;
     public Dictionary<string, int[]> InputShapes => _compiled.InputShapes;
@@ -139,6 +168,7 @@ public class InferenceSession : IDisposable
     /// </summary>
     private GraphExecutor ResolveExecutor(Dictionary<string, Tensor> inputs)
     {
+        LastRecompileMs = 0; // set by RecompileForShapes on a cache miss; stays 0 for base/cached hits
         if (_recompileGraph == null) return _executor;
 
         // Match against the shapes the base graph was compiled for. If every supplied input matches
@@ -186,6 +216,7 @@ public class InferenceSession : IDisposable
     /// </summary>
     private GraphExecutor RecompileForShapes(Dictionary<string, Tensor> inputs)
     {
+        var recompileSw = System.Diagnostics.Stopwatch.StartNew();
         var graph = _recompileGraph!;
         // Reset to the clean pre-fold constant seeds (the prior compile may have folded seq-specific
         // values onto the graph when optimization is off), then pin the actual input shapes.
@@ -199,9 +230,12 @@ public class InferenceSession : IDisposable
         var exec = new GraphExecutor(_accelerator, compiled, _weights, _recompileFloatSeed, registry: _registry)
         {
             Format = _executor.Format,
+            CacheShapeReadbacks = _cacheShapeReadbacks,
         };
+        recompileSw.Stop();
+        LastRecompileMs = recompileSw.Elapsed.TotalMilliseconds;
         if (VerboseLogging)
-            Console.WriteLine($"[InferenceSession] Recompiled for shapes [{string.Join("; ", inputs.Select(kv => $"{kv.Key}:[{string.Join(",", kv.Value.Shape)}]"))}] — {compiled.Nodes.Length} nodes");
+            Console.WriteLine($"[InferenceSession] Recompiled for shapes [{string.Join("; ", inputs.Select(kv => $"{kv.Key}:[{string.Join(",", kv.Value.Shape)}]"))}] — {compiled.Nodes.Length} nodes in {LastRecompileMs:F0}ms");
         return exec;
     }
 
@@ -1716,13 +1750,23 @@ public class InferenceSession : IDisposable
     /// Recompiles for the actual input shape when it differs from the compile-time shape
     /// (dynamic-shape models such as autoregressive decoders).</summary>
     public Dictionary<string, Tensor> Run(Dictionary<string, Tensor> inputs)
-        => ResolveExecutor(inputs).Run(inputs);
+    {
+        var exec = ResolveExecutor(inputs);
+        var result = exec.Run(inputs);
+        LastExecutorBufferCount = exec.AllocatedBufferCount;
+        return result;
+    }
 
     /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm)
     /// which deadlock on synchronous Synchronize(). Periodically flushes GPU commands.
     /// Recompiles for the actual input shape when it differs from the compile-time shape.</summary>
-    public Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
-        => ResolveExecutor(inputs).RunAsync(inputs);
+    public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
+    {
+        var exec = ResolveExecutor(inputs);
+        var result = await exec.RunAsync(inputs);
+        LastExecutorBufferCount = exec.AllocatedBufferCount;
+        return result;
+    }
 
     /// <summary>
     /// Transformers.js-style async inference. Inputs are <see cref="Tensors.Tensor{T}"/>

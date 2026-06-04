@@ -17,6 +17,42 @@ public abstract partial class MLTestBase
     //  Text Generation (Chatbot / AI Assistant)
     // ═══════════════════════════════════════════════════════════
 
+    // REGRESSION GUARD for the fixed-shape decode + auto-detecting readback cache. The cache skips the
+    // ~643 mid-graph shape-readback GPU round-trips/step (~7.8s → fast decode) but MUST NOT change the
+    // output. A naive "cache every ≤64-elem readback" was WRONG: input_ids itself is ≤64 elems (seq≤64)
+    // and is DATA-dependent, so caching it froze the tokens (produced " floor, and the other" instead of
+    // " floor of the house"). The auto-detecting cache probes two different-data runs and caches only the
+    // values stable across both. This test asserts cache-ON output == cache-OFF output == the ORT greedy
+    // reference continuation, so any future cache regression (or a new data-dependent readback) fails here.
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task TextGen_ReadbackCache_MatchesUncached() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        var tokenizerJson = await http.GetStringAsync(
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+
+        async Task<string> Gen(bool cache)
+        {
+            using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
+            var pipeline = new TextGenerationPipeline(session, accelerator) { UseShapeReadbackCache = cache };
+            pipeline.LoadTokenizer(tokenizerJson);
+            pipeline.MaxNewTokens = 6;
+            var result = await pipeline.GenerateAsync("The cat sat on the");
+            return result.GeneratedText;
+        }
+        var cacheOff = await Gen(false);
+        var cacheOn = await Gen(true);
+        Console.WriteLine($"[TextGen-cache] off='{cacheOff}' on='{cacheOn}'");
+        if (!cacheOff.TrimStart().StartsWith("floor"))
+            throw new Exception($"Uncached generation WRONG: '{cacheOff}' — expected to start with ' floor' (ORT greedy reference).");
+        if (cacheOn != cacheOff)
+            throw new Exception($"Readback cache CHANGED the output — cached='{cacheOn}' vs uncached='{cacheOff}'. A data-dependent readback is being cached.");
+    });
+
     [TestMethod(Timeout = 300000, Category = "HeavyModel")]
     public async Task Pipeline_TextGeneration_ProducesTokens() => await RunTest(async accelerator =>
     {

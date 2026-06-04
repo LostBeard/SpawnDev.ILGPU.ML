@@ -262,6 +262,16 @@ public class TextGenerationPipeline : IDisposable
     public int MaxNewTokens { get; set; } = 50;
     public float Temperature { get; set; } = 1.0f;
 
+    /// <summary>Cache shape-derived runtime constants across the fixed-shape decode steps (skips the
+    /// ~643 readback GPU round-trips after step 0). Default on. Exposed so a correctness probe can
+    /// compare cached vs uncached output.</summary>
+    public bool UseShapeReadbackCache { get; set; } = true;
+
+    /// <summary>DIAGNOSTIC: per-step timing lines captured during the most recent <see cref="GenerateAsync"/>
+    /// when <see cref="InferenceSession.VerboseLogging"/> is set. A test can read this (the WASM browser
+    /// console is not piped into PMT stdout) to inspect the recompile/forward/readback/pool-churn split.</summary>
+    public List<string> StepTimings { get; } = new();
+
     public TextGenerationPipeline(InferenceSession session, Accelerator accelerator)
     {
         _session = session;
@@ -286,48 +296,91 @@ public class TextGenerationPipeline : IDisposable
         if (_tokenizer == null) throw new InvalidOperationException("Tokenizer not loaded.");
 
         int maxTokens = maxNewTokens ?? MaxNewTokens;
+        StepTimings.Clear();
         var sw = Stopwatch.StartNew();
 
         // Tokenize prompt
         var promptTokens = _tokenizer.Encode(prompt).ToList();
         var allTokens = new List<int>(promptTokens);
 
+        // FIXED-SHAPE decode: run the decoder at a CONSTANT sequence length (prompt + everything we
+        // will generate), right-padding the unused positions. Causal attention makes the logits at
+        // the current last-real-token position bit-identical to a variable-length forward — an earlier
+        // position never attends to right-padding — so greedy output is unchanged. The payoff: every
+        // step reuses ONE shape-specialized executor, so BOTH the per-step recompile AND the ~643
+        // shape-readback GPU round-trips/step disappear (the latter cached after step 0 via
+        // CacheShapeReadbacks). Measured WebGPU DistilGPT-2: ~13s → ~5.8s per step. The growing-shape
+        // loop recompiled + re-read every step (the "20-30 min" generations TJ hit).
+        const int GPT2_MAX_POSITIONS = 1024;
+        int ctx = Math.Min(promptTokens.Count + maxTokens, GPT2_MAX_POSITIONS);
+        const float PadToken = 50256f; // GPT-2 EOS as pad — never read (causal), value is irrelevant.
+        var inputNames = _session.InputNames;
+        // Shape-derived runtime constants are identical across the fixed-shape steps — cache them so
+        // steps 1+ skip the readback round-trips. Safe: this loop only ever feeds one shape.
+        _session.CacheShapeReadbacks = UseShapeReadbackCache;
+
+        var idsFloat = new float[ctx];
+        var maskFloat = new float[ctx];
+        var posFloat = new float[ctx];
+        for (int i = 0; i < ctx; i++) { maskFloat[i] = 1f; posFloat[i] = i; }
+
         for (int step = 0; step < maxTokens; step++)
         {
-            // Create input tensors
-            var idsFloat = allTokens.Select(t => (float)t).ToArray();
-            var maskFloat = Enumerable.Repeat(1f, allTokens.Count).ToArray();
-            var posFloat = Enumerable.Range(0, allTokens.Count).Select(i => (float)i).ToArray();
+            int valid = allTokens.Count;       // number of real tokens so far
+            if (valid >= ctx) break;           // fixed window full
+            int lastRealPos = valid - 1;       // position whose logits predict the next token
+
+            // Only input_ids changes per step; mask/pos are constant. Pad the tail.
+            for (int i = 0; i < ctx; i++) idsFloat[i] = i < valid ? allTokens[i] : PadToken;
 
             using var idsBuf = _accelerator.Allocate1D(idsFloat);
             using var maskBuf = _accelerator.Allocate1D(maskFloat);
             using var posBuf = _accelerator.Allocate1D(posFloat);
 
             var inputs = new Dictionary<string, Tensor>();
-            var inputNames = _session.InputNames;
-            inputs[inputNames[0]] = new Tensor(idsBuf.View, new[] { 1, allTokens.Count });
+            inputs[inputNames[0]] = new Tensor(idsBuf.View, new[] { 1, ctx });
             if (inputNames.Length > 1)
-                inputs[inputNames[1]] = new Tensor(maskBuf.View, new[] { 1, allTokens.Count });
+                inputs[inputNames[1]] = new Tensor(maskBuf.View, new[] { 1, ctx });
             if (inputNames.Length > 2)
-                inputs[inputNames[2]] = new Tensor(posBuf.View, new[] { 1, allTokens.Count });
+                inputs[inputNames[2]] = new Tensor(posBuf.View, new[] { 1, ctx });
 
+            var runSw = Stopwatch.StartNew();
             var outputs = await _session.RunAsync(inputs);
+            await _accelerator.SynchronizeAsync(); // flush forward GPU work so the timing attributes it to this step
+            runSw.Stop();
             var output = outputs[_session.OutputNames[0]];
 
-            // Get logits for last position: [1, seq, vocab] → last position
+            // Get logits at the last REAL token's position (not the padded tail): [1, ctx, vocab].
             int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
             int seqLen = output.Shape.Length >= 3 ? output.Shape[^2] : 1;
-            int lastPos = Math.Min(allTokens.Count - 1, seqLen - 1);
+            int lastPos = Math.Min(lastRealPos, seqLen - 1);
             int lastOffset = lastPos * vocabSize;
             // Bounds safety: ensure we don't read past the output buffer
             if (lastOffset + vocabSize > output.ElementCount)
                 lastOffset = Math.Max(0, output.ElementCount - vocabSize);
 
+            var readSw = Stopwatch.StartNew();
             using var readBuf = _accelerator.Allocate1D<float>(vocabSize);
             new ElementWiseKernels(_accelerator).Scale(
                 output.Data.SubView(lastOffset, vocabSize), readBuf.View, vocabSize, 1f);
             await _accelerator.SynchronizeAsync();
             var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
+            readSw.Stop();
+
+            // DIAGNOSTIC: attribute per-step decode cost to CPU recompile vs GPU forward vs readback.
+            if (InferenceSession.VerboseLogging)
+            {
+                double recompileMs = _session.LastRecompileMs;
+                double runMs = runSw.Elapsed.TotalMilliseconds;
+                var line = $"[textgen-timing] step {step} ctx={ctx} valid={valid}: " +
+                    $"recompile={recompileMs:F0}ms forward={Math.Max(0, runMs - recompileMs):F0}ms " +
+                    $"readback={readSw.Elapsed.TotalMilliseconds:F0}ms (run={runMs:F0}ms) " +
+                    $"poolBuffers={_session.LastExecutorBufferCount}";
+                StepTimings.Add(line);
+                // Emit at ERROR level: PMT pipes browser console.error to the dotnet-test stderr
+                // (Console.WriteLine / console.log is dropped). This is the only captured channel.
+                Console.Error.WriteLine(line);
+            }
 
             // Greedy argmax
             int nextToken = 0;

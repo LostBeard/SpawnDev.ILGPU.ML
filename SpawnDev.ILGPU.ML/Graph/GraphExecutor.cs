@@ -29,8 +29,30 @@ public class GraphExecutor : IDisposable
     private readonly Dictionary<string, int>? _presentKeyOutputToLayer;
     private readonly Dictionary<string, int>? _presentValueOutputToLayer;
 
+    /// <summary>When set, the mid-graph runtime-constant readbacks (the ≤64-elem shape/scalar tensors
+    /// captured via SynchronizeAsync+CopyToHostAsync — measured at ~7.8s of a 1554-node DistilGPT-2
+    /// forward) are cached and reused across calls. This executor is shape-specialized (one input
+    /// shape for its whole life), so SHAPE-derived readbacks are constant across calls — but some
+    /// captured ≤64-elem tensors are DATA-derived (e.g. input_ids itself, when seq≤64), which change
+    /// per call. The cache AUTO-DETECTS which: it probes the first two runs (full readback both),
+    /// caches ONLY the readbacks whose values were IDENTICAL across those two different-data runs,
+    /// and re-reads the rest every call. Correct by construction. Opt-in via
+    /// InferenceSession.CacheShapeReadbacks; default off so general inference is unchanged.</summary>
+    public bool CacheShapeReadbacks { get; set; }
+    private Dictionary<string, float[]>? _readbackProbe;     // first probe run's values (for comparison)
+    private Dictionary<string, float[]>? _readbackStable;    // proven-stable values, reused once finalized
+    private bool _readbackStableFinalized;                   // true once _readbackStable is built
+
     /// <summary>When true, logs each node execution to Console.</summary>
     public static bool VerboseLogging { get; set; }
+
+    /// <summary>Number of nodes RunAsync executes between GPU command-buffer flushes
+    /// (<c>SynchronizeAsync</c>). Each flush is an async round-trip; on WebGPU/Blazor that latency
+    /// dominates large-graph forward time (a 1554-node decoder at interval 64 = ~24 round-trips).
+    /// Higher = fewer round-trips (faster) but more unsubmitted commands + deferred buffer releases
+    /// held longer (higher peak GPU memory). Tunable so the autoregressive decode loop can trade
+    /// memory for latency.</summary>
+    public static int SyncIntervalNodes = 64;
 
     /// <summary>
     /// DIAGNOSTIC: when set, RunAsync's main loop breaks after executing
@@ -117,6 +139,11 @@ public class GraphExecutor : IDisposable
     /// <summary>Access to the quantized KV cache (null if model doesn't use KV cache).</summary>
     public QuantizedKVCache? KVCache => _kvCache;
 
+    /// <summary>DIAGNOSTIC: number of GPU intermediate buffers this executor's pool has allocated.
+    /// A freshly-recompiled executor starts at 0 and allocates one per distinct intermediate-buffer
+    /// size on its first Run — lets the decode loop see whether per-step cost is fresh-pool churn.</summary>
+    public int AllocatedBufferCount => _pool.AllocatedBufferCount;
+
     /// <summary>Quantized weight byte buffers on GPU (Q4_0, Q8_0, etc.)
     /// for fused dequantization during MatMul.</summary>
     private readonly Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? _quantizedWeights;
@@ -142,6 +169,14 @@ public class GraphExecutor : IDisposable
     /// MoveNet Cast(int)→Div(int,int) floordiv chain is actually being trunc'd.
     /// Reset to 0 at the start of every RunAsync.</summary>
     public static int LastRunIntegerDivCount;
+
+    /// <summary>DIAGNOSTIC: number of mid-graph small-tensor (≤64-elem) runtime-constant readbacks
+    /// (each a SynchronizeAsync + CopyToHostAsync GPU round-trip) in the most recent RunAsync. With
+    /// const-folding (enableOptimization) these shape/scalar values are computed at compile time and
+    /// this drops toward 0. Reset at the start of every RunAsync.</summary>
+    public static int LastRunReadbackCount;
+    /// <summary>DIAGNOSTIC: total wall-clock ms spent in those mid-graph readbacks. Reset per RunAsync.</summary>
+    public static double LastRunReadbackMs;
 
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
@@ -634,6 +669,8 @@ public class GraphExecutor : IDisposable
     {
         LastRunOpLog.Clear();
         LastRunIntegerDivCount = 0;
+        LastRunReadbackCount = 0;
+        LastRunReadbackMs = 0;
         var tensors = new Dictionary<string, Tensor>();
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
@@ -665,6 +702,15 @@ public class GraphExecutor : IDisposable
                 if (!constantNodeOutputsAsync.Contains(outName))
                     runtimeConstants.Remove(outName);
         }
+
+        // Readback cache (auto-detecting). Once finalized, seed the proven-stable shape-derived values
+        // so the per-node capture loop SKIPS their GPU round-trips. While probing (first two runs),
+        // record this run's readbacks for cross-run comparison.
+        bool warmReadback = CacheShapeReadbacks && _readbackStableFinalized && _readbackStable != null;
+        if (warmReadback)
+            foreach (var (k, v) in _readbackStable!) runtimeConstants[k] = v;
+        Dictionary<string, float[]>? readbackThisRun =
+            (CacheShapeReadbacks && !_readbackStableFinalized) ? new Dictionary<string, float[]>() : null;
 
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
@@ -1002,6 +1048,10 @@ public class GraphExecutor : IDisposable
                 if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
                 {
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
+                    // Warm readback cache: value already seeded into runtimeConstants from the proven-
+                    // stable set — skip the GPU round-trip entirely.
+                    if (outName != null && warmReadback && _readbackStable!.ContainsKey(outName))
+                        continue;
                     if (outName != null)
                     {
                         // Defensive null-check: outTensor.Data can be null on backends where
@@ -1025,9 +1075,15 @@ public class GraphExecutor : IDisposable
                             // then async readback via CopyToHostAsync(offset, count).
                             _ew.Scale(srcView, tmpBuf.View, elCount, 1f);
                             captureStage = $"sync[{elCount}]";
+                            var _rbSw = System.Diagnostics.Stopwatch.StartNew();
                             await _accelerator.SynchronizeAsync();
                             captureStage = $"copy-back[{elCount}]";
                             runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
+                            _rbSw.Stop();
+                            LastRunReadbackCount++;
+                            LastRunReadbackMs += _rbSw.Elapsed.TotalMilliseconds;
+                            // Probing: record this run's value for cross-run stability comparison.
+                            if (readbackThisRun != null) readbackThisRun[outName] = runtimeConstants[outName];
                         }
                         catch (NotSupportedException) { /* Backend doesn't support async readback */ }
                         catch (NullReferenceException) {
@@ -1120,8 +1176,9 @@ public class GraphExecutor : IDisposable
             LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}");
 
             // Flush GPU command buffer periodically to prevent massive single submissions.
-            // 64 nodes between syncs balances latency vs throughput (was 16, too many syncs for GPT-2's 2620 nodes).
-            if (nodeIdx % 64 == 0)
+            // Interval tunable via SyncIntervalNodes — each flush is an async round-trip whose
+            // latency dominates large-graph forward time on WebGPU/Blazor.
+            if (nodeIdx % SyncIntervalNodes == 0)
             {
                 try { await _accelerator.SynchronizeAsync(); }
                 catch (Exception syncEx)
@@ -1192,6 +1249,29 @@ public class GraphExecutor : IDisposable
                 }
             }
             _kvCache.AdvanceToken();
+        }
+
+        // Auto-detecting readback cache: finalize the proven-stable set from two probe runs.
+        if (CacheShapeReadbacks && !_readbackStableFinalized && readbackThisRun != null)
+        {
+            if (_readbackProbe == null)
+            {
+                _readbackProbe = readbackThisRun; // first probe run — keep for comparison
+            }
+            else
+            {
+                // Second probe run (different input data): a readback is shape-derived (cache-safe)
+                // iff its value is IDENTICAL across the two runs. Data-derived ones (input_ids when
+                // seq≤64, etc.) differ and are excluded — they keep getting read back every call.
+                var stable = new Dictionary<string, float[]>();
+                foreach (var (k, v) in readbackThisRun)
+                    if (_readbackProbe.TryGetValue(k, out var prev) && prev.Length == v.Length
+                        && prev.AsSpan().SequenceEqual(v))
+                        stable[k] = v;
+                _readbackStable = stable;
+                _readbackStableFinalized = true;
+                _readbackProbe = null;
+            }
         }
 
         return results;
