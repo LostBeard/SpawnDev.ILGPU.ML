@@ -16,8 +16,8 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// SD Turbo is recommended for browser (single-step, no guidance, ~2.5 GB).
 ///
 /// Usage:
-///   var hub = new ModelHub(js);
-///   var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
+///   var hubStream = new HubModelStream(webTorrentClient, httpClient);
+///   var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hubStream,
 ///       ModelHub.KnownModels.SDTurbo, onProgress: (stage, pct) => UpdateUI(stage, pct));
 ///   pipe.NumInferenceSteps = 1; // SD Turbo: single step
 ///   pipe.GuidanceScale = 0f;    // SD Turbo: no guidance
@@ -71,42 +71,58 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
     ///   vae_decoder/model.onnx (99 MB) — Latent → pixel decoder
     /// </summary>
     public static async Task<ImageGenerationPipeline> CreateAsync(
-        Accelerator accelerator, ModelHub hub, string? repoId = null,
+        Accelerator accelerator, HubModelStream hubStream, string? repoId = null,
         Action<string, int>? onProgress = null)
     {
         var pipe = new ImageGenerationPipeline(accelerator);
         repoId ??= ModelHub.KnownModels.SDTurbo;
         pipe.ModelName = repoId;
 
-        // Load tokenizer
+        // Tokenizer (small JSON) - read the seekable hub stream fully.
         onProgress?.Invoke("tokenizer", 0);
-        var tokenizerBytes = await hub.LoadAsync(repoId, "tokenizer/tokenizer.json");
-        var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
+        var tokModel = await hubStream.OpenAsync(repoId, "tokenizer/tokenizer.json");
+        string tokenizerJson;
+        await using (tokModel.Stream)
+        {
+            using var ms = new System.IO.MemoryStream();
+            await tokModel.Stream.CopyToAsync(ms);
+            tokenizerJson = System.Text.Encoding.UTF8.GetString(ms.ToArray());
+        }
         pipe._tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
         onProgress?.Invoke("tokenizer", 100);
 
-        // Load 3 ONNX sub-models (sequential — browser memory limited)
+        // 3 ONNX sub-models streamed weight-by-weight straight to the GPU - never materialized whole in
+        // memory (the U-Net alone is 1.7GB; a byte[] of that OOMs Blazor WASM, which is why /generate
+        // never ran on the old hub.LoadAsync path). Sequential: browser memory is limited even while
+        // streaming. The "upload" sub-progress drives each per-model bar so the long U-Net stream doesn't
+        // look frozen (same lesson as the text-gen model-load progress fix).
         onProgress?.Invoke("text_encoder", 0);
-        var textEncoderBytes = await hub.LoadAsync(repoId, "text_encoder/model.onnx");
-        pipe._textEncoder = InferenceSession.CreateFromOnnx(accelerator, textEncoderBytes,
-            inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 77 } });
+        var teModel = await hubStream.OpenAsync(repoId, "text_encoder/model.onnx");
+        await using (teModel.Stream)
+            pipe._textEncoder = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, teModel.Stream,
+                onProgress: (s, p) => { if (s == "upload") onProgress?.Invoke("text_encoder", p); },
+                inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 77 } });
         onProgress?.Invoke("text_encoder", 100);
 
         onProgress?.Invoke("unet", 0);
-        var unetBytes = await hub.LoadAsync(repoId, "unet/model.onnx");
-        pipe._unet = InferenceSession.CreateFromOnnx(accelerator, unetBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["sample"] = new[] { 1, 4, 64, 64 },
-                ["timestep"] = new[] { 1 },
-                ["encoder_hidden_states"] = new[] { 1, 77, 1024 },
-            });
+        var unetModel = await hubStream.OpenAsync(repoId, "unet/model.onnx");
+        await using (unetModel.Stream)
+            pipe._unet = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, unetModel.Stream,
+                onProgress: (s, p) => { if (s == "upload") onProgress?.Invoke("unet", p); },
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["sample"] = new[] { 1, 4, 64, 64 },
+                    ["timestep"] = new[] { 1 },
+                    ["encoder_hidden_states"] = new[] { 1, 77, 1024 },
+                });
         onProgress?.Invoke("unet", 100);
 
         onProgress?.Invoke("vae_decoder", 0);
-        var vaeBytes = await hub.LoadAsync(repoId, "vae_decoder/model.onnx");
-        pipe._vaeDecoder = InferenceSession.CreateFromOnnx(accelerator, vaeBytes,
-            inputShapes: new Dictionary<string, int[]> { ["latent_sample"] = new[] { 1, 4, 64, 64 } });
+        var vaeModel = await hubStream.OpenAsync(repoId, "vae_decoder/model.onnx");
+        await using (vaeModel.Stream)
+            pipe._vaeDecoder = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, vaeModel.Stream,
+                onProgress: (s, p) => { if (s == "upload") onProgress?.Invoke("vae_decoder", p); },
+                inputShapes: new Dictionary<string, int[]> { ["latent_sample"] = new[] { 1, 4, 64, 64 } });
         onProgress?.Invoke("vae_decoder", 100);
 
         pipe._alphasCumprod = DiffusionScheduler.ComputeAlphasCumprod();

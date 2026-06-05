@@ -209,6 +209,8 @@
     };
 
     [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient WebTorrent { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline? _pipeline;
@@ -235,9 +237,12 @@
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
-            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+            // Stream the SD-Turbo sub-models from the hub over WebTorrent (seekable, OPFS-persisted,
+            // weight-by-weight to GPU) - the old ModelHub.LoadAsync path materialized the 1.7GB U-Net as
+            // a byte[] and OOM'd before /generate could run.
+            var hubStream = new SpawnDev.ILGPU.ML.Hub.HubModelStream(WebTorrent, Http);
             _pipeline = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(
-                _accelerator, hub, onProgress: (stage, pct) =>
+                _accelerator, hubStream, onProgress: (stage, pct) =>
                 {
                     _modelStatusText = $"SD Turbo — {stage}";
                     _modelProgress = pct;
