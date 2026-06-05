@@ -56,6 +56,16 @@ public class ModelCache : IDisposable
     }
 
     /// <summary>
+    /// True if the browser OPFS cache is available (secure context + a modern browser). When false,
+    /// nothing is cached and every model load re-downloads — a cache-management UI should say so.
+    /// </summary>
+    public async Task<bool> IsAvailableAsync()
+    {
+        await EnsureInitializedAsync();
+        return _cacheDir != null;
+    }
+
+    /// <summary>
     /// Check if a model is already cached.
     /// </summary>
     public async Task<bool> IsCachedAsync(string url, string? cacheKey = null)

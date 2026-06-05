@@ -21,6 +21,11 @@ builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
 // WebTorrent client for P2P model delivery (direct stream access, no service worker needed)
 builder.Services.AddSingleton<WebTorrentClient>();
 
+// Shared OPFS model cache (browser). One instance so every demo + the cache-management page see the same
+// cached models. ModelCache reads/writes the persistent OPFS "ilgpu-ml-models" dir, so even multiple
+// instances would share storage — but a singleton gives the management UI a single source to query/purge.
+builder.Services.AddSingleton<SpawnDev.ILGPU.ML.Hub.ModelCache>();
+
 // Register test types as singletons for UnitTestsView discovery
 // DumpFolder test runs FIRST — verifies results can be written
 builder.Services.AddSingleton<DumpFolderTests>();

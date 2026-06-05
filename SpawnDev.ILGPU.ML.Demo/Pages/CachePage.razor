@@ -1,0 +1,136 @@
+@page "/cache"
+@using SpawnDev.ILGPU.ML.Hub
+@inject ModelCache Cache
+
+<PageTitle>Model Cache — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="cache-page">
+    <h1>Cached Models</h1>
+    <p class="cache-desc">
+        Models you download are cached in your browser's private storage (OPFS) so they don't re-download every
+        time — important for the large models. Removing a model frees device space; it re-downloads automatically
+        the next time you open a demo that needs it (so "Remove" also doubles as "force a fresh download").
+    </p>
+
+    <div class="cache-summary">
+        <div class="cache-summary-stat"><span class="cache-num">@_models.Count</span> models</div>
+        <div class="cache-summary-stat"><span class="cache-num">@FormatBytes(_totalBytes)</span> on device</div>
+        <button class="cache-btn" @onclick="Refresh" disabled="@_busy">Refresh</button>
+        <button class="cache-btn danger" @onclick="ClearAll" disabled="@(_busy || _models.Count == 0)">Clear All</button>
+    </div>
+
+    @if (_loading)
+    {
+        <p class="cache-muted">Reading cache…</p>
+    }
+    else if (!_opfsAvailable)
+    {
+        <p class="cache-warn">Browser private storage (OPFS) isn't available here — models can't be cached in this context (needs a secure context / modern browser). Demos will re-download each visit.</p>
+    }
+    else if (_models.Count == 0)
+    {
+        <p class="cache-muted">No models cached yet. Open a demo to download and cache a model, then come back here.</p>
+    }
+    else
+    {
+        <table class="cache-table">
+            <thead><tr><th>Model</th><th class="cache-right">Size</th><th></th></tr></thead>
+            <tbody>
+                @foreach (var m in _models)
+                {
+                    <tr>
+                        <td class="cache-key">@m.Key</td>
+                        <td class="cache-right cache-size">@FormatBytes(m.SizeBytes)</td>
+                        <td class="cache-right"><button class="cache-btn danger small" @onclick="() => Remove(m.Key)" disabled="@_busy">Remove</button></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    @if (_status != null) { <p class="cache-status">@_status</p> }
+</div>
+
+<style>
+    .cache-page { max-width: 860px; margin: 0 auto; padding: 1.5rem; color: #e2e8f0; }
+    .cache-page h1 { font-size: 1.6rem; margin-bottom: 0.5rem; }
+    .cache-desc { color: #94a3b8; font-size: 0.9rem; line-height: 1.6; margin-bottom: 1.25rem; }
+    .cache-summary { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+    .cache-summary-stat { color: #94a3b8; font-size: 0.9rem; }
+    .cache-num { color: #38bdf8; font-weight: 700; font-size: 1.1rem; }
+    .cache-btn { padding: 0.4rem 0.9rem; border-radius: 7px; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05); color: #e2e8f0; font-size: 0.85rem; cursor: pointer; transition: all 0.15s; }
+    .cache-btn:hover:not(:disabled) { background: rgba(255,255,255,0.1); }
+    .cache-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .cache-btn.danger { border-color: rgba(239,68,68,0.4); color: #fca5a5; }
+    .cache-btn.danger:hover:not(:disabled) { background: rgba(239,68,68,0.12); }
+    .cache-btn.small { padding: 0.25rem 0.6rem; font-size: 0.78rem; }
+    .cache-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    .cache-table th { text-align: left; color: #64748b; font-weight: 600; padding: 0.5rem 0.6rem; border-bottom: 1px solid rgba(255,255,255,0.1); }
+    .cache-table td { padding: 0.55rem 0.6rem; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .cache-right { text-align: right; }
+    .cache-key { font-family: monospace; color: #cbd5e1; word-break: break-all; }
+    .cache-size { color: #38bdf8; font-variant-numeric: tabular-nums; }
+    .cache-muted { color: #64748b; font-size: 0.9rem; }
+    .cache-warn { color: #fbbf24; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.85rem; }
+    .cache-status { margin-top: 1rem; color: #86efac; font-size: 0.85rem; }
+</style>
+
+@code {
+    private List<(string Key, long SizeBytes)> _models = new();
+    private long _totalBytes;
+    private bool _loading = true;
+    private bool _busy;
+    private bool _opfsAvailable = true;
+    private string? _status;
+
+    protected override async Task OnInitializedAsync() => await Refresh();
+
+    private async Task Refresh()
+    {
+        _busy = true; _loading = true; StateHasChanged();
+        try
+        {
+            // ListCachedAsync returns empty both when OPFS is unavailable and when nothing is cached;
+            // IsAvailableAsync distinguishes them so the user gets the right message.
+            _opfsAvailable = await Cache.IsAvailableAsync();
+            _models = await Cache.ListCachedAsync();
+            _models.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
+            _totalBytes = _models.Sum(m => m.SizeBytes);
+        }
+        catch { _opfsAvailable = false; }
+        finally { _loading = false; _busy = false; StateHasChanged(); }
+    }
+
+    private async Task Remove(string key)
+    {
+        _busy = true; StateHasChanged();
+        try
+        {
+            await Cache.RemoveAsync(key);
+            _status = $"Removed \"{key}\" — it will re-download next time a demo needs it.";
+        }
+        finally { _busy = false; }
+        await Refresh();
+    }
+
+    private async Task ClearAll()
+    {
+        _busy = true; StateHasChanged();
+        try
+        {
+            await Cache.ClearAllAsync();
+            _status = "Cleared all cached models. They'll re-download as needed.";
+        }
+        finally { _busy = false; }
+        await Refresh();
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes <= 0) return "0 B";
+        string[] units = { "B", "KB", "MB", "GB", "TB" };
+        double size = bytes; int unit = 0;
+        while (size >= 1024 && unit < units.Length - 1) { size /= 1024; unit++; }
+        return $"{size:0.#} {units[unit]}";
+    }
+}
