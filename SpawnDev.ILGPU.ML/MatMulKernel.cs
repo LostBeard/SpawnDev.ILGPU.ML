@@ -236,10 +236,34 @@ public class MatMulKernel
         C[idx] = sum;
     }
 
+    /// <summary>
+    /// Simple MatMul with fp16 (ILGPU.Half) weights in B: C[fp32] = A[fp32] × B[fp16]. Upconverts each
+    /// weight to float and accumulates in fp32 — ORT-style mixed precision: HALF the weight memory, no
+    /// accuracy loss vs the all-fp32 kernel. One thread per output element, no shared memory (works on
+    /// every backend incl. WGSL; the f16 spike proved ILGPU.Half storage + fp32 compute everywhere).
+    /// </summary>
+    private static void SimpleMatMulHalfWeightImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+    {
+        int col = idx % N;
+        int row = idx / N;
+        if (row >= M) return;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[row * K + k] * (float)B[k * N + col];
+        C[idx] = sum;
+    }
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulHalfWeightKernel;
 
     // ─────────────────────────────────────────────────────────────
     //  Public API
@@ -280,6 +304,21 @@ public class MatMulKernel
     }
 
     /// <summary>
+    /// Matrix multiply with fp16 weights: C[M,N] = A[M,K] (fp32) × B[K,N] (fp16 ILGPU.Half). Simple
+    /// (non-tiled) path — proves the f16-weight pipeline; tiled/register-blocked fp16 variants follow.
+    /// Half the weight memory, fp32 accumulate (no accuracy loss vs the all-fp32 MatMul).
+    /// </summary>
+    public void MatMulHalfWeight(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+    {
+        EnsureKernelsLoaded(_accelerator);
+        _simpleMatMulHalfWeightKernel!(M * N, A, B, C, M, K, N);
+    }
+
+    /// <summary>
     /// Batched matrix multiply: C[b] = A[b] × B[b] for b in [0, batchSize).
     /// </summary>
     public void BatchedMatMul(
@@ -314,6 +353,9 @@ public class MatMulKernel
         _simpleBatchedMatMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulImpl);
+        _simpleMatMulHalfWeightKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulHalfWeightImpl);
 
         _matMulKernel ??= accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>,
