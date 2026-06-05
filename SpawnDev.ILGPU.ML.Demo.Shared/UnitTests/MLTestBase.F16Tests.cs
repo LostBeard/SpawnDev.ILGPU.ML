@@ -276,4 +276,99 @@ public abstract partial class MLTestBase
         }
         finally { pool.Dispose(); }
     });
+
+    /// <summary>
+    /// Slice 5: the Conv OPERATOR routes a half-backed weight (NCHW group-1) to the half kernel. Builds a
+    /// half Conv weight via Tensor.FromHalf and runs ConvOperator.Execute end to end, matching a fp32 conv
+    /// reference using the same fp16-rounded weights (isolates the operator routing + the half kernel).
+    /// </summary>
+    [TestMethod]
+    public Task F16_ConvOperator_RoutesHalfWeight() => RunTest(async accelerator =>
+    {
+        int inC = 2, inH = 5, inW = 5, outC = 3, kH = 3, kW = 3, stride = 1, pad = 1;
+        int outH = (inH + 2 * pad - kH) / stride + 1;
+        int outW = (inW + 2 * pad - kW) / stride + 1;
+        var rng = new Random(17);
+        var input = new float[inC * inH * inW];
+        var wf = new float[outC * inC * kH * kW];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < wf.Length; i++) wf[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var wBytes = new byte[wf.Length * 2];
+        var wRounded = new float[wf.Length];
+        for (int i = 0; i < wf.Length; i++)
+        {
+            var hb = (System.Half)wf[i];
+            var bb = BitConverter.GetBytes(hb);
+            wBytes[i * 2] = bb[0]; wBytes[i * 2 + 1] = bb[1];
+            wRounded[i] = (float)hb;
+        }
+
+        // CPU reference conv (NCHW, zero bias since no bias input).
+        var cpuOut = new float[outC * outH * outW];
+        for (int oc = 0; oc < outC; oc++)
+            for (int oy = 0; oy < outH; oy++)
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    double sum = 0;
+                    for (int ic = 0; ic < inC; ic++)
+                        for (int ky = 0; ky < kH; ky++)
+                            for (int kx = 0; kx < kW; kx++)
+                            {
+                                int iy = oy * stride + ky - pad, ix = ox * stride + kx - pad;
+                                if (iy < 0 || iy >= inH || ix < 0 || ix >= inW) continue;
+                                sum += (double)input[ic * inH * inW + iy * inW + ix]
+                                     * (double)wRounded[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx];
+                            }
+                    cpuOut[oc * outH * outW + oy * outW + ox] = (float)sum;
+                }
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            using var ms = new System.IO.MemoryStream(wBytes);
+            var halfW = await pool.AllocateHalfWeightFromStreamAsync(ms, 0, wBytes.Length, 10, new[] { outC, inC, kH, kW });
+            var wT = Tensor.FromHalf(halfW);
+            using var inBuf = accelerator.Allocate1D(input);
+            using var outBuf = accelerator.Allocate1D<float>(outC * outH * outW);
+            var xT = new Tensor(inBuf.View, new[] { 1, inC, inH, inW }, "x");
+            var outT = new Tensor(outBuf.View, new[] { 1, outC, outH, outW }, "out");
+
+            var registry = new OperatorRegistry(accelerator);
+            var op = new ConvOperator(registry);
+            var ctx = new OnnxOpContext
+            {
+                Inputs = new[] { xT, wT },
+                Outputs = new[] { outT },
+                Attributes = new Dictionary<string, object>
+                {
+                    ["strides"] = new long[] { stride, stride },
+                    ["pads"] = new long[] { pad, pad, pad, pad },
+                    ["group"] = (long)1,
+                    ["dilations"] = new long[] { 1, 1 },
+                },
+                Pool = pool,
+                InputNames = new[] { "x", "w" },
+                Registry = registry,
+            };
+            op.Execute(ctx);
+            await accelerator.SynchronizeAsync();
+            var gpuOut = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
+
+            float maxErr = 0f;
+            for (int i = 0; i < cpuOut.Length; i++)
+                maxErr = MathF.Max(maxErr, MathF.Abs(gpuOut[i] - cpuOut[i]));
+            if (maxErr > 1e-3f)
+                throw new Exception($"Conv operator half-weight routing maxErr={maxErr:E3} (expected < 1e-3)");
+        }
+        finally { pool.Dispose(); }
+    });
+
+    // NOTE (2026-06-05): a GENERIC-WEIGHT kernel (generic over TW:INumber<TW>, read TW->float via
+    // float.CreateTruncating, fp32 accumulate) was spiked here and FAILED on all 6 backends —
+    // NotSupportedException "Class type 'System.Type' is not supported" (float.CreateTruncating inspects
+    // typeof(TOther) internally; ILGPU can't transpile it). Geordi's ILGPU.Half:INumber enables generic
+    // PURE-T arithmetic (all operands T), but NOT the mixed-precision fp16-weight->fp32-accumulate convert.
+    // So the DEDICATED half kernels (ILGPU.Half's (float) operator [transpilable] + fp32 accumulate) are the
+    // ORT-parity approach. Spike removed; do NOT reintroduce float.CreateTruncating in a kernel.
 }

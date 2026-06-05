@@ -299,6 +299,15 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
         if (group == -1) group = inC_from_x;
         int outC = w.Shape[0];
 
+        // f16 weights are wired only for the standard NCHW group-1 2D Conv path so far. The loader gates
+        // which fp16 weights load as half (only those whose consumer is half-capable), so this should never
+        // fire — it's a hard guard so a half weight can't silently reach a path with no half kernel (its
+        // float Data is empty). Add depthwise/NHWC/grouped/Conv1D half kernels to widen this.
+        if (w.IsHalf && (group != 1 || fmt != DataFormat.NCHW || x.Shape.Length != 4))
+            throw new NotSupportedException(
+                $"f16 Conv weight reached an unsupported path (group={group}, fmt={fmt}, rank={x.Shape.Length}); " +
+                "only standard NCHW group-1 2D Conv has a half-weight kernel so far.");
+
         // Always provide a valid bias buffer (zero-filled if no bias input)
         ArrayView1D<float, Stride1D.Dense> bias;
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
@@ -343,6 +352,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
             {
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                else if (w.IsHalf) // fp16 weight (NCHW group-1, per the guard above) -> half kernel, fp32 accumulate
+                    reg.Conv2D.ForwardPaddedHalfWeight(x.Data, w.HalfData, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
                 else
                     reg.Conv2D.ForwardPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
