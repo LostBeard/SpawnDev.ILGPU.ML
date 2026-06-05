@@ -1,6 +1,8 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Operators;
+using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
@@ -138,6 +140,70 @@ public abstract partial class MLTestBase
                 maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
             if (maxErr > 1e-3f)
                 throw new Exception($"BufferPool half-weight load+matmul maxErr={maxErr:E3} (expected < 1e-3)");
+        }
+        finally { pool.Dispose(); }
+    });
+
+    /// <summary>
+    /// Slice 4: the MatMul OPERATOR routes a half-backed weight (Tensor.FromHalf — fp16, no float buffer)
+    /// to the half-weight kernel. Verifies the executor-carries-half-tensors path end to end: fp16 weight
+    /// -> HalfTensor -> Tensor.FromHalf -> MatMulOperator.Execute -> MatMulHalfWeight, matching a fp32
+    /// reference with the same fp16-rounded weights.
+    /// </summary>
+    [TestMethod]
+    public Task F16_MatMulOperator_RoutesHalfWeight() => RunTest(async accelerator =>
+    {
+        int M = 4, K = 8, N = 4;
+        var rng = new Random(11);
+        var a = new float[M * K];
+        var w = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            var wBytes = new byte[w.Length * 2];
+            for (int i = 0; i < w.Length; i++) { var bb = BitConverter.GetBytes((System.Half)w[i]); wBytes[i * 2] = bb[0]; wBytes[i * 2 + 1] = bb[1]; }
+            using var ms = new System.IO.MemoryStream(wBytes);
+            var halfTensor = await pool.AllocateHalfWeightFromStreamAsync(ms, 0, wBytes.Length, 10, new[] { K, N });
+            var bHalf = Tensor.FromHalf(halfTensor);
+            if (!bHalf.IsHalf) throw new Exception("Tensor.FromHalf should set IsHalf=true");
+
+            using var aBuf = accelerator.Allocate1D(a);
+            using var outBuf = accelerator.Allocate1D<float>(M * N);
+            var aT = new Tensor(aBuf.View, new[] { M, K }, "a");
+            var outT = new Tensor(outBuf.View, new[] { M, N }, "out");
+
+            var registry = new OperatorRegistry(accelerator);
+            var op = new MatMulOperator(registry);
+            var ctx = new OnnxOpContext
+            {
+                Inputs = new[] { aT, bHalf },
+                Outputs = new[] { outT },
+                Attributes = new Dictionary<string, object>(),
+                Pool = pool,
+                InputNames = new[] { "a", "b" },
+                Registry = registry,
+            };
+            op.Execute(ctx);
+            await accelerator.SynchronizeAsync();
+            var gpuC = await outBuf.CopyToHostAsync<float>(0, M * N);
+
+            var cpuC = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++)
+                        s += a[r * K + k] * (float)(System.Half)w[k * N + c];
+                    cpuC[r * N + c] = s;
+                }
+            float maxErr = 0f;
+            for (int i = 0; i < cpuC.Length; i++)
+                maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+            if (maxErr > 1e-3f)
+                throw new Exception($"MatMul operator half-weight routing maxErr={maxErr:E3} (expected < 1e-3)");
         }
         finally { pool.Dispose(); }
     });

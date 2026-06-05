@@ -38,6 +38,38 @@ public class Tensor
         Name = name;
     }
 
+    // ── f16-native weights ──
+    // A WEIGHT loaded as fp16 is carried as a half-backed Tensor: IsHalf == true, the data lives in
+    // HalfData (ILGPU.Half — half the GPU bytes), and NO float buffer is allocated (Data is empty). The
+    // graph's tensor map + node inputs stay Tensor-typed (no churn to the executor or op handlers' shape
+    // logic); weight-consuming op handlers branch on IsHalf and route to their half-weight kernel variant
+    // (e.g. MatMulKernel.MatMulHalfWeight), reading HalfData + accumulating fp32. Activations are always
+    // fp32 (IsHalf == false). The f16 spike (2026-06-05) proved ILGPU.Half storage + fp32 compute on all
+    // 6 backends; a generic-math (System.Half) kernel does not compile (BitCast intrinsic).
+
+    /// <summary>True if the data is fp16 in <see cref="HalfData"/> (a weight), not fp32 in <see cref="Data"/>.</summary>
+    public bool IsHalf { get; }
+
+    /// <summary>fp16 GPU data view — valid IFF <see cref="IsHalf"/>. Length == ElementCount.</summary>
+    public ArrayView1D<global::ILGPU.Half, Stride1D.Dense> HalfData { get; }
+
+    /// <summary>Wrap a fp16 <see cref="HalfTensor"/> as a half-backed Tensor for the graph (carries shape
+    /// + the ILGPU.Half view; NO float buffer). The executor map stays Tensor-typed; handlers check IsHalf.</summary>
+    public static Tensor FromHalf(HalfTensor half) => new Tensor(half.Data, half.Shape, half.Name);
+
+    private Tensor(ArrayView1D<global::ILGPU.Half, Stride1D.Dense> halfData, int[] shape, string? name)
+    {
+        int count = TensorHelpers.ElementCount(shape);
+        if (halfData.Length < count)
+            throw new ArgumentException($"Half data length {halfData.Length} < shape element count {count}");
+        HalfData = halfData.SubView(0, count);
+        IsHalf = true;
+        Shape = shape;
+        Strides = TensorHelpers.ComputeStrides(shape);
+        Name = name;
+        // Data (float) intentionally left empty — a half-backed tensor has NO float buffer.
+    }
+
     /// <summary>Number of dimensions.</summary>
     public int Rank => Shape.Length;
 

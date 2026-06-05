@@ -45,12 +45,18 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
             return;
         }
 
+        // f16-native weights: if B is a half-backed weight (fp16, no float buffer), route to the
+        // half-weight kernel (reads ILGPU.Half, fp32 accumulate). Activations (A) stay fp32.
         if (a.Rank == 2 && b.Rank == 2)
         {
-            reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
+            if (b.IsHalf) reg.MatMul.MatMulHalfWeight(a.Data, b.HalfData, ctx.Outputs[0].Data, M, K, N);
+            else reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
         }
         else
         {
+            if (b.IsHalf)
+                throw new NotSupportedException(
+                    "f16 weight for batched MatMul is not yet supported (needs a batched half-weight kernel — slice 5).");
             int batch = a.ElementCount / (M * K);
             reg.MatMul.BatchedMatMul(a.Data, b.Data, ctx.Outputs[0].Data, batch, M, K, N);
         }
