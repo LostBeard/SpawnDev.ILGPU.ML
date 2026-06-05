@@ -188,7 +188,17 @@
                     _accelerator, model.Stream,
                     onProgress: (stage, pct) =>
                     {
-                        _modelProgress = 15 + pct * 0.70; // 15%..85% during streaming load
+                        // Map each load stage to its OWN monotonic slice so the bar never jumps backwards.
+                        // "upload" is the heavy phase (streaming the ~330MB model over the torrent), so it
+                        // gets the bulk of the range and now advances per-weight (InferenceSession reports
+                        // incremental upload progress) instead of freezing at 15% until done.
+                        _modelProgress = stage switch
+                        {
+                            "parse" => 15 + pct * 0.05,    // 15-20%
+                            "compile" => 20 + pct * 0.05,  // 20-25%
+                            "upload" => 25 + pct * 0.60,   // 25-85% (the big stream)
+                            _ => _modelProgress,           // "ready" etc. — don't regress the bar
+                        };
                         InvokeAsync(StateHasChanged);
                     },
                     // enableOptimization:false matches every green GPT-2/DistilGPT-2 reference test

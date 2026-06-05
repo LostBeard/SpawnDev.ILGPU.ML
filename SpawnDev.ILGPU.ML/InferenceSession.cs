@@ -1045,6 +1045,12 @@ public class InferenceSession : IDisposable
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         int loaded = 0;
+        // Denominator for INCREMENTAL upload progress. This loop seeks+reads each weight from the stream,
+        // so on a torrent/HTTP stream it IS the heavy multi-hundred-MB transfer. Without per-weight
+        // progress the caller's bar sat frozen at the start of "upload" for the entire download, then
+        // jumped to done — the "/text-gen stuck at 15%" report.
+        int totalWeights = Math.Max(1, parsedModel.Graph.Initializers.Count);
+        int lastUploadPct = -1;
 
         // Stream weights to GPU: large tensors are seeked to + chunk-uploaded straight from the stream
         // (never materialized); small/inline tensors use the in-memory chunked/standard path.
@@ -1060,6 +1066,8 @@ public class InferenceSession : IDisposable
             else
                 gpuWeights[name] = pool.AllocatePermanentChunked(tensor, shape, name);
             loaded++;
+            int uploadPct = (int)Math.Min(99, loaded * 100L / totalWeights);
+            if (uploadPct != lastUploadPct) { lastUploadPct = uploadPct; onProgress?.Invoke("upload", uploadPct); }
         }
         foreach (var name in compiled.InitializerNames)
         {
