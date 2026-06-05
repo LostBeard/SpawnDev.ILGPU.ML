@@ -364,6 +364,49 @@ public abstract partial class MLTestBase
         finally { pool.Dispose(); }
     });
 
+    /// <summary>
+    /// Slice 6: batched MatMul with fp16 weights (SD-Turbo attention projections — 2D weight, rank-3
+    /// activation). Matches a fp32 per-batch reference using the same fp16-rounded weights.
+    /// </summary>
+    [TestMethod]
+    public Task F16_BatchedMatMulHalfWeight_MatchesFp32Reference() => RunTest(async accelerator =>
+    {
+        int batch = 2, M = 3, K = 8, N = 4;
+        var rng = new Random(23);
+        var a = new float[batch * M * K];
+        var bf = new float[batch * K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < bf.Length; i++) bf[i] = (float)(rng.NextDouble() * 2 - 1);
+        var bHalf = new global::ILGPU.Half[bf.Length];
+        var bRounded = new float[bf.Length];
+        for (int i = 0; i < bf.Length; i++) { bHalf[i] = (global::ILGPU.Half)bf[i]; bRounded[i] = (float)bHalf[i]; }
+
+        var cpuC = new float[batch * M * N];
+        for (int bt = 0; bt < batch; bt++)
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++)
+                        s += a[bt * M * K + r * K + k] * bRounded[bt * K * N + k * N + c];
+                    cpuC[bt * M * N + r * N + c] = s;
+                }
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(bHalf);
+        using var cBuf = accelerator.Allocate1D<float>(batch * M * N);
+        var mm = new MatMulKernel(accelerator);
+        mm.BatchedMatMulHalfWeight(aBuf.View, bBuf.View, cBuf.View, batch, M, K, N);
+        await accelerator.SynchronizeAsync();
+        var gpuC = await cBuf.CopyToHostAsync<float>(0, batch * M * N);
+
+        float maxErr = 0f;
+        for (int i = 0; i < cpuC.Length; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+        if (maxErr > 1e-3f)
+            throw new Exception($"BatchedMatMulHalfWeight maxErr={maxErr:E3} (expected < 1e-3)");
+    });
+
     // NOTE (2026-06-05): a GENERIC-WEIGHT kernel (generic over TW:INumber<TW>, read TW->float via
     // float.CreateTruncating, fp32 accumulate) was spiked here and FAILED on all 6 backends —
     // NotSupportedException "Class type 'System.Type' is not supported" (float.CreateTruncating inspects

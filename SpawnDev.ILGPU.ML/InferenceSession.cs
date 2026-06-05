@@ -1052,13 +1052,48 @@ public class InferenceSession : IDisposable
         int totalWeights = Math.Max(1, parsedModel.Graph.Initializers.Count);
         int lastUploadPct = -1;
 
+        // ── f16 weight gating ──
+        // An fp16 initializer is loaded as HALF (ILGPU.Half — half the GPU bytes) only if EVERY node that
+        // consumes it does so as the WEIGHT operand (input index 1) of a HALF-CAPABLE op: MatMul, or a
+        // standard NCHW group-1 Conv. Anything else (shared weight, non-weight use, depthwise/grouped Conv,
+        // ConvTranspose, Gemm — none wired for half yet) keeps it fp32. The MatMul/Conv operator guards are
+        // the runtime safety net: a mis-gated half weight throws clearly instead of corrupting. (Generic
+        // kernels later will let the loader half ALL fp16 weights with no gating; until then, conservative.)
+        var halfEligible = new HashSet<string>();
+        var halfBlocked = new HashSet<string>();
+        foreach (var node in compiled.Nodes)
+        {
+            var ins = node.InputNames;
+            for (int oi = 0; oi < ins.Length; oi++)
+            {
+                var inName = ins[oi];
+                if (string.IsNullOrEmpty(inName)) continue;
+                int convGroup = node.OpType == "Conv" && node.Attributes.TryGetValue("group", out var gv) && gv is long gl ? (int)gl : 1;
+                bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || (node.OpType == "Conv" && convGroup == 1));
+                if (okAsWeight) halfEligible.Add(inName);
+                else halfBlocked.Add(inName);
+            }
+        }
+        halfEligible.ExceptWith(halfBlocked); // used EXCLUSIVELY as a half-capable weight operand
+        int halfLoaded = 0;
+
         // Stream weights to GPU: large tensors are seeked to + chunk-uploaded straight from the stream
         // (never materialized); small/inline tensors use the in-memory chunked/standard path.
         foreach (var (name, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
         {
             if (!graph.Initializers.TryGetValue(name, out var shape)) continue;
             int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
-            if (tensor.RawDataStreamOffset >= 0)
+            // fp16-source (dtype 10) weight, consumed exclusively by a half-capable op as its weight: keep
+            // it fp16 on the GPU (half the bytes). Only fp16 SOURCE — never downcast a fp32 weight to fp16
+            // (that would lose precision the model expects). Streaming path only (large weights = the win).
+            if (halfEligible.Contains(name) && tensor.DataType == 10 && tensor.RawDataStreamOffset >= 0)
+            {
+                var halfW = await pool.AllocateHalfWeightFromStreamAsync(
+                    stream, tensor.RawDataStreamOffset, tensor.RawDataLength, tensor.DataType, shape, name, ct).ConfigureAwait(false);
+                gpuWeights[name] = Tensor.FromHalf(halfW);
+                halfLoaded++;
+            }
+            else if (tensor.RawDataStreamOffset >= 0)
                 gpuWeights[name] = await pool.AllocatePermanentFromStreamAsync(
                     stream, tensor.RawDataStreamOffset, tensor.RawDataLength, tensor.DataType, shape, name, ct).ConfigureAwait(false);
             else if (tensor.ElementCount == 0 && expectedElems > 0)
@@ -1069,6 +1104,8 @@ public class InferenceSession : IDisposable
             int uploadPct = (int)Math.Min(99, loaded * 100L / totalWeights);
             if (uploadPct != lastUploadPct) { lastUploadPct = uploadPct; onProgress?.Invoke("upload", uploadPct); }
         }
+        if (VerboseLogging)
+            Console.WriteLine($"[InferenceSession] f16 weights: {halfLoaded} loaded as fp16 (half GPU bytes) of {halfEligible.Count} half-eligible; the rest fp32.");
         foreach (var name in compiled.InitializerNames)
         {
             if (gpuWeights.ContainsKey(name)) continue;

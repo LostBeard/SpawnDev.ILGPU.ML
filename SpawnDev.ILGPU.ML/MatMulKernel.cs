@@ -258,12 +258,38 @@ public class MatMulKernel
         C[idx] = sum;
     }
 
+    /// <summary>Batched MatMul with fp16 (ILGPU.Half) weights in B — e.g. SD-Turbo attention projections
+    /// (2D weight, rank-3 activation -> batched path; batch=1 so bOff=0 reads the shared weight). Upconverts
+    /// each weight to float, fp32 accumulate. Mirrors SimpleBatchedMatMulImpl.</summary>
+    private static void SimpleBatchedMatMulHalfWeightImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int batchSize, int M, int K, int N)
+    {
+        int elementsPerBatch = M * N;
+        int batch = idx / elementsPerBatch;
+        int local = idx % elementsPerBatch;
+        int col = local % N;
+        int row = local / N;
+        if (batch >= batchSize || row >= M) return;
+        int aOff = batch * M * K;
+        int bOff = batch * K * N;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[aOff + row * K + k] * (float)B[bOff + k * N + col];
+        C[idx] = sum;
+    }
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulHalfWeightKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulHalfWeightKernel;
 
     // ─────────────────────────────────────────────────────────────
     //  Public API
@@ -319,6 +345,20 @@ public class MatMulKernel
     }
 
     /// <summary>
+    /// Batched matrix multiply with fp16 (ILGPU.Half) weights: C[b] = A[b] × B (fp16), fp32 accumulate.
+    /// For SD-Turbo attention (2D weight shared across batch=1). Simple (non-tiled) path.
+    /// </summary>
+    public void BatchedMatMulHalfWeight(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int batchSize, int M, int K, int N)
+    {
+        EnsureKernelsLoaded(_accelerator);
+        _simpleBatchedMatMulHalfWeightKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
+    }
+
+    /// <summary>
     /// Batched matrix multiply: C[b] = A[b] × B[b] for b in [0, batchSize).
     /// </summary>
     public void BatchedMatMul(
@@ -356,6 +396,9 @@ public class MatMulKernel
         _simpleMatMulHalfWeightKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulHalfWeightImpl);
+        _simpleBatchedMatMulHalfWeightKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulHalfWeightImpl);
 
         _matMulKernel ??= accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>,

@@ -54,11 +54,11 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            if (b.IsHalf)
-                throw new NotSupportedException(
-                    "f16 weight for batched MatMul is not yet supported (needs a batched half-weight kernel — slice 5).");
             int batch = a.ElementCount / (M * K);
-            reg.MatMul.BatchedMatMul(a.Data, b.Data, ctx.Outputs[0].Data, batch, M, K, N);
+            if (b.IsHalf)
+                reg.MatMul.BatchedMatMulHalfWeight(a.Data, b.HalfData, ctx.Outputs[0].Data, batch, M, K, N);
+            else
+                reg.MatMul.BatchedMatMul(a.Data, b.Data, ctx.Outputs[0].Data, batch, M, K, N);
         }
     }
 }
