@@ -48,11 +48,61 @@ public class BufferPool : IDisposable
             return tensor;
         }
 
-        var newBuffer = _accelerator.Allocate1D<float>(bucketSize);
+        MemoryBuffer1D<float, Stride1D.Dense> newBuffer;
+        try
+        {
+            newBuffer = _accelerator.Allocate1D<float>(bucketSize);
+        }
+        catch
+        {
+            // Memory-bounded execution: the pool retains every Returned buffer in size-buckets for reuse, so a
+            // 1-pass large model (e.g. a 512x512 VAE decode = ~227 distinct-size feature maps, each used once)
+            // grows the pool to the SUM of its intermediates (multi-GB), not the live working set. Under GPU
+            // memory pressure, flush pending GPU work, dispose the AVAILABLE (Returned, not-live) bucketed
+            // buffers to reclaim VRAM, and retry. Models that fit never hit this; models that don't are bounded
+            // to their live set. (Flush is required so WebGPU/WebGL don't free a buffer a pending dispatch reads.)
+            try { _accelerator.Synchronize(); } catch { }
+            long reclaimed = DisposeBucketedBuffers();
+            try
+            {
+                newBuffer = _accelerator.Allocate1D<float>(bucketSize);
+            }
+            catch (Exception ex2)
+            {
+                long live = 0; foreach (var b in _allBuffers) live += b.LengthInBytes;
+                long half = 0; foreach (var b in _allHalfBuffers) half += b.LengthInBytes;
+                throw new InvalidOperationException(
+                    $"GPU out of memory renting '{name}' (+{bucketSize * 4L / 1048576}MB) after reclaiming " +
+                    $"{reclaimed / 1048576}MB of pooled buffers; live working set = {_allBuffers.Count} fp32 " +
+                    $"({live / 1048576}MB) + {_allHalfBuffers.Count} fp16 ({half / 1048576}MB). Exceeds VRAM — " +
+                    "needs tiled execution or fp16 activations.", ex2);
+            }
+        }
         _allBuffers.Add(newBuffer);
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) _namedBuffers[name] = newBuffer;
         return newTensor;
+    }
+
+    /// <summary>
+    /// Dispose all AVAILABLE (Returned, not-live) bucketed buffers, reclaiming their GPU memory. Live (rented)
+    /// buffers — held in <c>_namedBuffers</c> until Returned — and permanent weights are untouched. Called under
+    /// GPU memory pressure (see Rent's catch). The pool re-allocates these sizes on demand afterward, so the
+    /// only cost is lost reuse, never correctness. Returns bytes freed.
+    /// </summary>
+    private long DisposeBucketedBuffers()
+    {
+        long freed = 0;
+        foreach (var stack in _buckets.Values)
+            while (stack.Count > 0)
+            {
+                var buf = stack.Pop();
+                freed += buf.LengthInBytes;
+                _allBuffers.Remove(buf);
+                buf.Dispose();
+            }
+        _buckets.Clear();
+        return freed;
     }
 
     /// <summary>Return a tensor's buffer to the pool for reuse by name.</summary>
