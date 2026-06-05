@@ -28,6 +28,15 @@ public class Conv2DKernel : IDisposable
         int, int, int, int, int, int, int, int, int, int>?
         _conv2dKernel;
 
+    // f16 weights: identical to _conv2dKernel but the WEIGHT (2nd view) is ILGPU.Half (half the bytes).
+    private Action<Index1D,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int>?
+        _conv2dHalfWeightKernel;
+
     // params: C, inH, inW, kH, kW, stride, padTL(packed), outHW(packed), dilHW(packed)
     private Action<Index1D,
         ArrayView1D<float, Stride1D.Dense>,
@@ -110,6 +119,53 @@ public class Conv2DKernel : IDisposable
     }
 
     /// <summary>
+    /// Conv2D NCHW with fp16 (ILGPU.Half) WEIGHTS — identical math to Conv2DImpl, but each filter weight is
+    /// read as ILGPU.Half and upconverted to float for the double-precision accumulation. Half the weight
+    /// memory, no accuracy loss (input/bias/output stay fp32). The UNet is mostly Conv, so this is the bulk
+    /// of the f16 memory win for SD-Turbo. The f16 spike proved ILGPU.Half storage + fp32 compute on all 6.
+    /// </summary>
+    private static void Conv2DHalfWeightImpl(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kH, int kW,
+        int stride, int padTL, int outHW, int dilHW)
+    {
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
+        int ox = idx % outW;
+        int rem = idx / outW;
+        int oy = rem % outH;
+        int oc = rem / outH;
+
+        double sum = (double)bias[oc];
+
+        for (int ic = 0; ic < inC; ic++)
+        {
+            int icBase = ic * inH * inW;
+            int wcBase = oc * inC * kH * kW + ic * kH * kW;
+            for (int ky = 0; ky < kH; ky++)
+            {
+                int iy = oy * stride + ky * dilationH - padTop;
+                if (iy < 0 || iy >= inH) continue;
+
+                for (int kx = 0; kx < kW; kx++)
+                {
+                    int ix = ox * stride + kx * dilationW - padLeft;
+                    if (ix < 0 || ix >= inW) continue;
+
+                    sum += (double)input[icBase + iy * inW + ix] * (double)(float)weight[wcBase + ky * kW + kx];
+                }
+            }
+        }
+
+        output[idx] = (float)sum;
+    }
+
+    /// <summary>
     /// Run Conv2D NCHW. Input: [inC, inH, inW]. Output: [outC, outH, outW].
     /// Weight: [outC, inC, kH, kW]. Bias: [outC] or empty.
     /// </summary>
@@ -173,6 +229,49 @@ public class Conv2DKernel : IDisposable
                 + $"totalOutput={totalOutputElements}", clEx);
         }
     }
+
+    /// <summary>fp16-weight Conv2D NCHW (asymmetric ONNX pads). Identical to <see cref="ForwardPadded"/>
+    /// but the weight is ILGPU.Half (half the bytes); routes to the half-weight kernel (fp32 accumulate).</summary>
+    public void ForwardPaddedHalfWeight(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW,
+        int outC, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
+    {
+        EnsureLoaded();
+        int effKH = dilationH * (kH - 1) + 1;
+        int effKW = dilationW * (kW - 1) + 1;
+        int outH = (inH + padTop + padBottom - effKH) / stride + 1;
+        int outW = (inW + padLeft + padRight - effKW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"Conv2D(f16) output dims invalid: outH={outH}, outW={outW} (inH={inH}, inW={inW}, kH={kH}, kW={kW}, " +
+                $"stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}).");
+        int totalOutputElements = outC * outH * outW;
+        _convCallCount++;
+        if (output.Length < totalOutputElements)
+            throw new InvalidOperationException(
+                $"Conv2D(f16) NCHW output buffer too small: output.Length={output.Length} < {totalOutputElements} elements.");
+        _conv2dHalfWeightKernel!(totalOutputElements, input, weight, bias, output,
+            inC, inH, inW, outC, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
+    }
+
+    /// <summary>fp16-weight Conv2D NCHW (symmetric padding). See <see cref="Forward"/>.</summary>
+    public void ForwardHalfWeight(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW,
+        int outC, int kH, int kW,
+        int stride = 1, int padding = 0,
+        int dilationH = 1, int dilationW = 1)
+        => ForwardPaddedHalfWeight(input, weight, bias, output, inC, inH, inW, outC, kH, kW,
+            stride, padding, padding, padding, padding, dilationH, dilationW);
 
     /// <summary>
     /// Depthwise Conv2D NCHW: each input channel convolved independently.
@@ -425,6 +524,12 @@ public class Conv2DKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int, int, int, int, int, int, int>(Conv2DImpl);
+        _conv2dHalfWeightKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int, int, int, int, int, int>(Conv2DHalfWeightImpl);
         _depthwiseKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

@@ -207,4 +207,73 @@ public abstract partial class MLTestBase
         }
         finally { pool.Dispose(); }
     });
+
+    /// <summary>
+    /// Slice 5: Conv2DKernel.ForwardHalfWeight (fp16 filter, fp32 accumulate) — Conv is the UNet's bulk, so
+    /// this is the big SD-Turbo memory win. Matches a fp32 reference conv computed with the same fp16-rounded
+    /// weights (isolates kernel correctness). NCHW, asymmetric-pad-capable, double accumulate like the float kernel.
+    /// </summary>
+    [TestMethod]
+    public Task F16_Conv2DHalfWeight_MatchesFp32Reference() => RunTest(async accelerator =>
+    {
+        int inC = 2, inH = 5, inW = 5, outC = 3, kH = 3, kW = 3, stride = 1, pad = 1;
+        int outH = (inH + 2 * pad - kH) / stride + 1;
+        int outW = (inW + 2 * pad - kW) / stride + 1;
+        var rng = new Random(13);
+        var input = new float[inC * inH * inW];
+        var wf = new float[outC * inC * kH * kW];
+        var bias = new float[outC];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < wf.Length; i++) wf[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < bias.Length; i++) bias[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var wHalfBytes = new byte[wf.Length * 2];
+        var wRounded = new float[wf.Length];
+        for (int i = 0; i < wf.Length; i++)
+        {
+            var hb = (System.Half)wf[i];
+            var bb = BitConverter.GetBytes(hb);
+            wHalfBytes[i * 2] = bb[0]; wHalfBytes[i * 2 + 1] = bb[1];
+            wRounded[i] = (float)hb;
+        }
+
+        var cpuOut = new float[outC * outH * outW];
+        for (int oc = 0; oc < outC; oc++)
+            for (int oy = 0; oy < outH; oy++)
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    double sum = bias[oc];
+                    for (int ic = 0; ic < inC; ic++)
+                        for (int ky = 0; ky < kH; ky++)
+                            for (int kx = 0; kx < kW; kx++)
+                            {
+                                int iy = oy * stride + ky - pad, ix = ox * stride + kx - pad;
+                                if (iy < 0 || iy >= inH || ix < 0 || ix >= inW) continue;
+                                sum += (double)input[ic * inH * inW + iy * inW + ix]
+                                     * (double)wRounded[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx];
+                            }
+                    cpuOut[oc * outH * outW + oy * outW + ox] = (float)sum;
+                }
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            using var ms = new System.IO.MemoryStream(wHalfBytes);
+            var halfW = await pool.AllocateHalfWeightFromStreamAsync(ms, 0, wHalfBytes.Length, 10, new[] { outC, inC, kH, kW });
+            using var inBuf = accelerator.Allocate1D(input);
+            using var biasBuf = accelerator.Allocate1D(bias);
+            using var outBuf = accelerator.Allocate1D<float>(outC * outH * outW);
+            var conv = new Conv2DKernel(accelerator);
+            conv.ForwardHalfWeight(inBuf.View, halfW.Data, biasBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride, pad);
+            await accelerator.SynchronizeAsync();
+            var gpuOut = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
+
+            float maxErr = 0f;
+            for (int i = 0; i < cpuOut.Length; i++)
+                maxErr = MathF.Max(maxErr, MathF.Abs(gpuOut[i] - cpuOut[i]));
+            if (maxErr > 1e-3f)
+                throw new Exception($"Conv2D half-weight maxErr={maxErr:E3} vs fp16-weight fp32 reference (expected < 1e-3)");
+        }
+        finally { pool.Dispose(); }
+    });
 }
