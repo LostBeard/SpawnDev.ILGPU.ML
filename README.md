@@ -2,24 +2,28 @@
 
 [![NuGet](https://img.shields.io/nuget/v/SpawnDev.ILGPU.ML.svg?)](https://www.nuget.org/packages/SpawnDev.ILGPU.ML)
 
-[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — 21 interactive demos: classification, style transfer, depth estimation, object detection, pose estimation, speech-to-text, text generation, background removal, zero-shot CLIP, image generation, and more — all running on your GPU in your browser.
+[**Live Demo**](https://lostbeard.github.io/SpawnDev.ILGPU.ML/) — interactive GPU demos: classification, style transfer, depth estimation, object detection, pose estimation, text generation, background removal, zero-shot CLIP, and more — running on your GPU in your browser, no server. ([Which are verified vs WIP →](Docs/DEMO_AND_MODEL_STATUS.md))
 
 **Hardware-agnostic neural network inference + training for .NET — C# compute kernels that run on WebGPU, CUDA, OpenCL, WebGL, Wasm, and CPU via [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU).**
 
-SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a model file — ONNX, TFLite, GGUF, or any of 11 supported formats — and run it on any of six backends. Train custom models directly on your GPU in the browser — no server, no Python, no CUDA install.
+SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU compute kernels written entirely in C#. Models run as compute shaders transpiled from C# — no ONNX Runtime, no JavaScript, no native binaries. The same code runs in the browser (Blazor WebAssembly) and on desktop. Drop in a model file — ONNX, TFLite, GGUF, or any of **7 inference formats** — and run it on any of six backends. Train custom models directly on your GPU in the browser — no server, no Python, no CUDA install.
+
+> **Honest status:** not every demo or model below is finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) lists exactly which demos are **VERIFIED** (passing end-to-end test, most ONNX-Runtime-matched) vs **WIP**. We mark stubs honestly — you should never click something here and get nothing.
 
 > **Active development.** API is stabilizing but may change. Contributions and feedback welcome.
 
 ## Highlights
 
-- **21 demo pages** — every demo fully functional, loading models from HuggingFace CDN, zero placeholders
+> **What actually works:** [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth — a per-demo **VERIFIED / PARTIAL / WIP** table with the test that proves each one. We mark stubs as WIP honestly, so a demo never lies to you.
+
+- **Demos** — **12 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, CLIP, background-removal, super-res, text-gen, embeddings, inspector, benchmark), plus several PARTIAL/WIP (image-to-3D, voice, SD-Turbo image-gen are not done yet). See the status doc for exactly which.
 - **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
 - **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
-- **200+ ONNX operators** — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
-- **11 format parsers + 4 exporters** — ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML, SPZ, PLY, glTF, OBJ. Zero-dependency. Auto-detected from magic bytes. Full round-trip export for SPZ, PLY, glTF, OBJ. First pure C# SPZ parser.
+- **~194 ONNX operators registered** (exact count is `OperatorRegistry.BuiltinOpTypes.Count`, rendered live on the Home page — not all are full-spec-complete; some are registered pass-throughs) — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
+- **7 inference model formats + 4 mesh/splat IO formats** — *inference loaders:* ONNX, TFLite, GGUF, SafeTensors, TF GraphDef, PyTorch, CoreML. *Mesh/splat import-export (not inference):* SPZ, PLY, glTF, OBJ. Zero-dependency, auto-detected from magic bytes. First pure C# SPZ parser. (Loading a format ≠ running every model in it end-to-end — see the status doc.)
 - **6 backends from one codebase** — WebGPU, WebGL, Wasm, CUDA, OpenCL, CPU
 - **HuggingFace CDN** — All models load from HuggingFace with OPFS caching. No bundling. Search, browse, and load any public model.
 - **Zero-copy GPU pipeline** — Data enters the GPU at preprocessing and stays until the pixel hits the canvas. CanvasRendererFactory for GPU→canvas rendering without CPU readback.
@@ -331,7 +335,7 @@ Every model is automatically optimized during compilation:
 | **MarchingCubes** | 3D isosurface extraction (TripoSR) | — |
 | **Training** | SoftmaxCE, ReLU/Conv2D/MaxPool backward, SGD, Adam | GPU training |
 
-### 200+ ONNX Operators (Full Coverage)
+### ~194 ONNX Operators Registered
 
 **Core Math:** Abs, Add, Sub, Mul, Div, Pow, Sqrt, Exp, Log, Neg, Reciprocal, Floor, Ceil, Mod, Clip, Min, Max, Sign, Erf, CumSum
 **Trig:** Sin, Cos, Tan, Acos, Acosh, Asin, Asinh, Atan, Atanh, Cosh, Sinh
@@ -355,7 +359,7 @@ Every model is automatically optimized during compilation:
 **Misc:** Dropout, Where, Resize, Upsample, DepthToSpace, SpaceToDepth, Einsum, Softmax, LogSoftmax, Hardmax, Sum, Mean, Det, ImageDecoder
 **Sequence/Optional/String:** Full pass-through support for non-tensor ONNX types
 
-### Pipeline Classes (16 implemented)
+### Pipeline Classes (18 implemented; not all verified end-to-end — see status doc)
 
 | Pipeline | Input | Output |
 |----------|-------|--------|
@@ -437,17 +441,18 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 All demos include backend selection, inference timing, "100% client-side" privacy badges, keyboard shortcuts (`?` for help, `Space` = run, `D` = download), and the voice command system ("Computer, classify this image").
 
-27 demo pages. Everything runs on YOUR GPU, in YOUR browser.
+Most demo pages run real models on your GPU in your browser — but not all are finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) says exactly which.
 
 ### The Wow Factor
 
-These are the things that make people stop scrolling:
+**Real today:**
+- **Backend Race Mode** — Run the same model on WebGPU, WebGL, and Wasm simultaneously, with live timing bars + medals (on the `/classify` demo). No other library does this.
+- **"How Fast Is Your Device?"** — A dedicated `/benchmark` page: MatMul throughput, model load time, inference speed. Like Cinebench for browser ML.
 
-- **Backend Race Mode** — Run the same model on WebGPU, WebGL, and Wasm simultaneously. Live timing bars with medals. "Copy Results" formatted for social media. No other library can do this — this IS the differentiator.
-- **"How Fast Is Your Device?"** — A dedicated benchmark page. MatMul throughput, model load time, inference speed. Like Cinebench for browser ML. Developers love posting benchmark scores.
-- **Pipeline Composer** — Visual node editor for building ML pipelines. Auto-propagation of tensor shapes through the graph — connect Conv2D to Linear and dimensions calculate automatically. Dimension mismatch highlighting. Three-stage workflow (Data → Architecture → Train). Live training curves. Save/load pipelines as JSON. Build, train, and run models without writing code.
-- **Progressive Enhancement** — Start with Wasm (slow), switch to WebGL (faster), switch to WebGPU (fastest). Animated bars showing the speedup. Tells the story of "why WebGPU matters" in 10 seconds.
-- **Offline Mode** — Toggle airplane mode. Inference still runs. "Your AI doesn't need the cloud."
+**Planned (not built yet — no demo page exists, listed so the roadmap is honest):**
+- **Pipeline Composer** — a visual node editor for building/training pipelines without code. *Design only — there is no Pipeline Composer page yet.*
+- **Progressive Enhancement story page** — an animated Wasm→WebGL→WebGPU speedup walkthrough. *No dedicated page yet.*
+- **Offline Mode toggle** — "toggle airplane mode, inference still runs." *Not wired as a global toggle yet.*
 - **Collaborative Canvas** — Multiple users on different devices, all running the same model, real-time via WebRTC (using SpawnDev.BlazorJS). Multi-device ML collaboration, all in-browser.
 - **Model-to-Model Pipeline** — Photo → depth estimation → 3D point cloud → style transfer on the texture → render. Three ML models + 3D rendering, all on GPU, no server, one C# codebase. The ultimate SpawnDev ecosystem demo.
 - **Real-Time Audio + Video Fusion** — Webcam (pose + face landmarks) + microphone (speech + emotion) simultaneously: "Person speaking with happy expression, arms raised." Multi-modal real-time inference from two input streams.

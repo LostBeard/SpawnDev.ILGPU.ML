@@ -140,7 +140,7 @@
             <p>GELU, ReLU, Sigmoid, Tanh, SiLU, LeakyReLU, HardSigmoid, HardSwish, ELU — with in-place variants to minimize allocations.</p>
         </div>
         <div class="feature-card">
-            <h3>71 ONNX Operators</h3>
+            <h3>@OperatorCount ONNX Operators</h3>
             <p>Full operator registry supporting classification, depth estimation, style transfer, super resolution, and more. Direct .onnx file loading with zero-dependency protobuf parser.</p>
         </div>
         <div class="feature-card">
@@ -162,7 +162,7 @@
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
-            <div class="roadmap-label">PlaywrightMultiTest (227+ tests, all passing on WebGPU)</div>
+            <div class="roadmap-label">PlaywrightMultiTest harness — browser + desktop across all 6 backends</div>
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
@@ -170,7 +170,7 @@
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
-            <div class="roadmap-label">71 ONNX operators + InferenceSession API</div>
+            <div class="roadmap-label">@OperatorCount ONNX operators + InferenceSession API</div>
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
@@ -178,7 +178,7 @@
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
-            <div class="roadmap-label">12 inference pipelines (classification, style, depth, detection, pose, face, CLIP, STT, NLP, segmentation)</div>
+            <div class="roadmap-label">18 inference pipelines (classification, style, depth, detection, pose, face, CLIP, embeddings, STT, TTS, NLP, super-res, diffusion, image-to-3D, background removal)</div>
         </div>
         <div class="roadmap-item done">
             <div class="roadmap-status">Done</div>
@@ -614,3 +614,11 @@
         }
     }
 </style>
+
+@code {
+    // Operator count is rendered LIVE from OperatorRegistry.BuiltinOpTypes - the registry's documented
+    // SINGLE SOURCE OF TRUTH - so this marketing copy can never drift from the code again. A hardcoded
+    // "71" here (vs the real ~194) is exactly the "stale parallel list" the registry header warns against.
+    // BuiltinOpTypes is designed to be read standalone (no accelerator), so this is cheap + safe.
+    int OperatorCount => SpawnDev.ILGPU.ML.Operators.OperatorRegistry.BuiltinOpTypes.Count;
+}
