@@ -56,11 +56,17 @@ public static class DiffusionScheduler
     /// <param name="numTrainTimesteps">Total training timesteps (usually 1000)</param>
     public static int[] GetTimesteps(int numInferenceSteps, int numTrainTimesteps = 1000)
     {
-        float stepRatio = (float)numTrainTimesteps / numInferenceSteps;
+        // "trailing" timestep spacing — the SD-Turbo scheduler_config.json setting (EulerDiscreteScheduler,
+        // timestep_spacing="trailing"). Matches diffusers: round(arange(numTrain, 0, -stepRatio)) - 1, i.e.
+        // timesteps run from the NOISIEST end toward the cleanest, ending NEAR (not at) 0. For
+        // numInferenceSteps=1 this is [999] — the single SD-Turbo step denoises from FULL noise. The old
+        // "(numInferenceSteps-1-i)*stepRatio" (leading-style) formula gave [0] for 1 step, which fed the
+        // UNet the clean-end timestep + a near-zero init sigma → /generate produced garbage.
+        double stepRatio = (double)numTrainTimesteps / numInferenceSteps;
         var timesteps = new int[numInferenceSteps];
         for (int i = 0; i < numInferenceSteps; i++)
         {
-            timesteps[i] = (int)Math.Round((numInferenceSteps - 1 - i) * stepRatio);
+            timesteps[i] = (int)Math.Round(numTrainTimesteps - i * stepRatio) - 1;
         }
         return timesteps;
     }

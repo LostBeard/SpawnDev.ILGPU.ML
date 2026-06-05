@@ -69,10 +69,37 @@ public class HubModelStream
         var url = $"{HubBaseUrl.TrimEnd('/')}/magnet/{repoId.Trim('/')}/{filePath.TrimStart('/')}";
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(PrepareTimeout);
-        var result = await _http.GetFromJsonAsync<HubMagnetResult>(url, cts.Token).ConfigureAwait(false);
-        if (result == null || string.IsNullOrEmpty(result.MagnetUri))
-            throw new InvalidOperationException($"Hub returned no magnet for '{repoId}/{filePath}' ({url}).");
-        return result.MagnetUri;
+
+        // The hub builds a .torrent on first request for a file (download from HF + SHA-256 hash). For a
+        // large file (e.g. SD-Turbo's 1.7GB UNet) that server-side prep exceeds the hub's reverse-proxy
+        // gateway timeout (~25s observed), so the first requests return 504 while prep continues in the
+        // background. Retry transient gateway errors (502/503/504) with backoff until prep completes (200)
+        // or PrepareTimeout elapses. A 404 (or any other 4xx) is a real "not found" and is NOT retried.
+        var delay = TimeSpan.FromSeconds(2);
+        try
+        {
+            while (true)
+            {
+                using var resp = await _http.GetAsync(url, cts.Token).ConfigureAwait(false);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var result = await resp.Content.ReadFromJsonAsync<HubMagnetResult>(cts.Token).ConfigureAwait(false);
+                    if (result == null || string.IsNullOrEmpty(result.MagnetUri))
+                        throw new InvalidOperationException($"Hub returned no magnet for '{repoId}/{filePath}' ({url}).");
+                    return result.MagnetUri;
+                }
+                int status = (int)resp.StatusCode;
+                if (status != 502 && status != 503 && status != 504)
+                    throw new HttpRequestException($"Hub /magnet for '{repoId}/{filePath}' failed: HTTP {status} ({url}).");
+                // Still preparing server-side — wait and retry (bounded by PrepareTimeout via cts).
+                await Task.Delay(delay, cts.Token).ConfigureAwait(false);
+                if (delay < TimeSpan.FromSeconds(15)) delay += TimeSpan.FromSeconds(2);
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Hub /magnet did not finish preparing '{repoId}/{filePath}' within {PrepareTimeout.TotalSeconds:F0}s ({url}).");
+        }
     }
 
     /// <summary>

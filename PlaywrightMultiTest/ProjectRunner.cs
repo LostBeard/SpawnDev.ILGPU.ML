@@ -427,7 +427,7 @@ namespace PlaywrightMultiTest
                             // pre-empted every WebRTC test that did real peer discovery, even when
                             // the test's own attribute granted 180s+. Bumping to 10 minutes
                             // restores the contract: "PMT respects test-method timeouts."
-                            var result = await ProcessRunner.Run(publishedBinary, rowTest.Name, timeout: 600_000).ConfigureAwait(false);
+                            var result = await ProcessRunner.Run(publishedBinary, rowTest.Name, timeout: ConsoleTestTimeoutMs()).ConfigureAwait(false);
                             var resultLines = result.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
                             var testResltTest = resultLines.LastOrDefault(o => o.StartsWith("TEST: "))?.Substring(6);
                             var unitTest = testResltTest != null ? JsonSerializer.Deserialize<UnitTest>(testResltTest) : null;
@@ -1083,6 +1083,16 @@ namespace PlaywrightMultiTest
             var env = Environment.GetEnvironmentVariable("PMT_EXCLUDE_CATEGORIES");
             if (env == null) return DefaultExcludedCategories;
             return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        // Per-console-test hard cap (subprocess kill, ms). Default 10 min. A genuinely heavy test whose
+        // own [TestMethod(Timeout)] exceeds this (e.g. a multi-GB model E2E whose 2.5GB download alone
+        // needs >10 min) would otherwise be killed by this outer cap before its own timeout — raise it
+        // via PMT_CONSOLE_TIMEOUT_MS for that run. Default unchanged so routine runs behave identically.
+        private static int ConsoleTestTimeoutMs()
+        {
+            var env = Environment.GetEnvironmentVariable("PMT_CONSOLE_TIMEOUT_MS");
+            return int.TryParse(env, out var ms) && ms > 0 ? ms : 600_000;
         }
 
         private static string DesktopLaneOf(string? typeName) => (typeName ?? "") switch

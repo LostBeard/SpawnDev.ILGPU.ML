@@ -78,17 +78,22 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         repoId ??= ModelHub.KnownModels.SDTurbo;
         pipe.ModelName = repoId;
 
-        // Tokenizer (small JSON) - read the seekable hub stream fully.
+        // CLIP tokenizer: SD-Turbo (and CLIP generally) ships the classic vocab.json + merges.txt pair,
+        // NOT a consolidated tokenizer.json — that file does not exist in schmuell/sd-turbo-ort-web, so
+        // the old "tokenizer/tokenizer.json" open 404'd at the hub before /generate could ever load.
+        // Read both small text files from the hub and build the BPE tokenizer (EncodeCLIP uses the
+        // hardcoded CLIP 49406/49407 special-token ids, so vocab+merges is sufficient).
         onProgress?.Invoke("tokenizer", 0);
-        var tokModel = await hubStream.OpenAsync(repoId, "tokenizer/tokenizer.json");
-        string tokenizerJson;
-        await using (tokModel.Stream)
-        {
-            using var ms = new System.IO.MemoryStream();
-            await tokModel.Stream.CopyToAsync(ms);
-            tokenizerJson = System.Text.Encoding.UTF8.GetString(ms.ToArray());
-        }
-        pipe._tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
+        string vocabJson, mergesText;
+        var vocabFile = await hubStream.OpenAsync(repoId, "tokenizer/vocab.json");
+        await using (vocabFile.Stream)
+        using (var r = new System.IO.StreamReader(vocabFile.Stream))
+            vocabJson = await r.ReadToEndAsync();
+        var mergesFile = await hubStream.OpenAsync(repoId, "tokenizer/merges.txt");
+        await using (mergesFile.Stream)
+        using (var r = new System.IO.StreamReader(mergesFile.Stream))
+            mergesText = await r.ReadToEndAsync();
+        pipe._tokenizer = BPETokenizer.Load(vocabJson, mergesText);
         onProgress?.Invoke("tokenizer", 100);
 
         // 3 ONNX sub-models streamed weight-by-weight straight to the GPU - never materialized whole in
@@ -184,71 +189,70 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         int latentW = Width / 8;
         var noiseData = DiffusionScheduler.GenerateNoise(4, latentH, latentW, seed);
 
-        // Scale initial noise by first sigma (for Euler scheduler)
-        if (Scheduler == "euler" && _alphasCumprod != null)
-        {
-            var timesteps = DiffusionScheduler.GetTimesteps(steps);
-            var sigmas = DiffusionScheduler.TimestepsToSigmas(timesteps, _alphasCumprod);
-            noiseData = DiffusionScheduler.ScaleNoise(noiseData, sigmas[0]);
-        }
+        // Euler sigmas for the selected (trailing) timesteps. sigmas[0] = sigma_max (the Euler init
+        // scale), sigmas[^1] = 0. SD-Turbo's single step starts from FULL noise, so the init latent is
+        // noise * sigma_max — without this the UNet denoises near-zero input and emits a flat image.
+        var timestepValues = DiffusionScheduler.GetTimesteps(steps);
+        float[]? sigmas = _alphasCumprod != null
+            ? DiffusionScheduler.TimestepsToSigmas(timestepValues, _alphasCumprod)
+            : null;
+        bool euler = Scheduler == "euler" && sigmas != null;
+        if (euler)
+            noiseData = DiffusionScheduler.ScaleNoise(noiseData, sigmas![0]);
 
         using var latentBuf = _accelerator.Allocate1D(noiseData);
         var latentTensor = new Tensor(latentBuf.View, new[] { 1, 4, latentH, latentW });
 
         // ═══════════════════════════════════════════════════════════
-        //  Step 4: UNet denoising (1 step for SD Turbo)
+        //  Step 4: Denoising. SD-Turbo = ONE Euler step from full noise. The UNet predicts epsilon
+        //  (scheduler_config prediction_type="epsilon"), so each step:
+        //    (a) scale_model_input — feed the UNet sample/sqrt(sigma^2+1) (it's trained on ~unit
+        //        variance; the raw latent is sigma-times too large → out-of-distribution → garbage),
+        //    (b) UNet → epsilon,
+        //    (c) Euler step on the ORIGINAL sample: x_{t-1} = sample + epsilon*(sigma_next - sigma);
+        //        final step sigma_next=0 ⇒ x0 = sample - sigma*epsilon (the denoised latent).
+        //  The old code SHORT-CIRCUITED steps==1 by copying the UNet output into the latent — i.e. it
+        //  treated the predicted NOISE as the image. That, plus a clean-end timestep (GetTimesteps,
+        //  now trailing) and no scale_model_input, is why /generate produced garbage.
         // ═══════════════════════════════════════════════════════════
-        var timestepValues = DiffusionScheduler.GetTimesteps(steps);
-
         for (int step = 0; step < steps; step++)
         {
             OnProgress?.Invoke(step + 1, steps + 2);
 
-            // Timestep as float tensor [1]
+            // (a) scale_model_input (Euler): unet_input = sample / sqrt(sigma^2 + 1).
+            using var scaledBuf = euler ? _accelerator.Allocate1D<float>(noiseData.Length) : null;
+            Tensor unetSample = latentTensor;
+            if (euler)
+            {
+                float c = 1f / MathF.Sqrt(sigmas![step] * sigmas[step] + 1f);
+                new ElementWiseKernels(_accelerator).Scale(
+                    latentTensor.Data.SubView(0, noiseData.Length), scaledBuf!.View, noiseData.Length, c);
+                await _accelerator.SynchronizeAsync();
+                unetSample = new Tensor(scaledBuf.View, new[] { 1, 4, latentH, latentW });
+            }
+
             using var tBuf = _accelerator.Allocate1D(new float[] { timestepValues[step] });
             var tTensor = new Tensor(tBuf.View, new[] { 1 });
 
             var unetInputs = new Dictionary<string, Tensor>
             {
-                [_unet!.InputNames[0]] = latentTensor,   // sample [1,4,64,64]
+                [_unet!.InputNames[0]] = unetSample,      // sample [1,4,64,64] (scale_model_input applied)
                 [_unet.InputNames[1]] = tTensor,          // timestep [1]
                 [_unet.InputNames[2]] = textEmbeddings,   // encoder_hidden_states [1,77,1024]
             };
 
             var unetOutputs = await _unet.RunAsync(unetInputs);
-            var noisePred = unetOutputs[_unet.OutputNames[0]]; // out_sample [1,4,64,64]
+            var noisePred = unetOutputs[_unet.OutputNames[0]]; // epsilon [1,4,64,64]
 
-            if (steps == 1)
-            {
-                // SD Turbo single-step: output IS the denoised latent, no scheduler step needed
-                // Copy denoised output to latent tensor for VAE
-                new ElementWiseKernels(_accelerator).Scale(
-                    noisePred.Data.SubView(0, noiseData.Length),
-                    latentTensor.Data.SubView(0, noiseData.Length),
-                    noiseData.Length, 1f);
-                await _accelerator.SynchronizeAsync();
-            }
-            else
-            {
-                // Multi-step: apply scheduler (DDIM or Euler)
-                var noisePredCpu = await ReadTensorToCpu(noisePred, noiseData.Length);
-                var latentCpu = await ReadTensorToCpu(latentTensor, noiseData.Length);
-
-                float[] updated;
-                if (Scheduler == "euler" && _alphasCumprod != null)
-                {
-                    var sigmas = DiffusionScheduler.TimestepsToSigmas(timestepValues, _alphasCumprod);
-                    updated = DiffusionScheduler.EulerStep(noisePredCpu, latentCpu, sigmas[step], sigmas[step + 1]);
-                }
-                else
-                {
-                    int prevT = step + 1 < timestepValues.Length ? timestepValues[step + 1] : -1;
-                    updated = DiffusionScheduler.DDIMStep(noisePredCpu, latentCpu, timestepValues[step], prevT, _alphasCumprod!);
-                }
-
-                latentTensor.Data.SubView(0, updated.Length).CopyFromCPU(updated);
-                await _accelerator.SynchronizeAsync();
-            }
+            // (b,c) scheduler step on the ORIGINAL (unscaled) latent.
+            var noisePredCpu = await ReadTensorToCpu(noisePred, noiseData.Length);
+            var latentCpu = await ReadTensorToCpu(latentTensor, noiseData.Length);
+            float[] updated = euler
+                ? DiffusionScheduler.EulerStep(noisePredCpu, latentCpu, sigmas![step], sigmas[step + 1])
+                : DiffusionScheduler.DDIMStep(noisePredCpu, latentCpu, timestepValues[step],
+                    step + 1 < timestepValues.Length ? timestepValues[step + 1] : -1, _alphasCumprod!);
+            latentTensor.Data.SubView(0, updated.Length).CopyFromCPU(updated);
+            await _accelerator.SynchronizeAsync();
         }
 
         // ═══════════════════════════════════════════════════════════

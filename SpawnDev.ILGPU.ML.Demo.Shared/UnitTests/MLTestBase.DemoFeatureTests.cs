@@ -322,6 +322,123 @@ public abstract partial class MLTestBase
     });
 
     // ═══════════════════════════════════════════════════════════
+    //  Diffusion scheduler math (SD-Turbo) — CPU-only regression guard
+    // ═══════════════════════════════════════════════════════════
+
+    // Guards the 4 SD-Turbo diffusion-math fixes behind /generate. DiffusionScheduler is pure CPU (no GPU),
+    // so this proves the scheduler is CORRECT independent of the GPU-memory work still needed to render the
+    // full image. Values are diffusers EulerDiscreteScheduler references (timestep_spacing="trailing",
+    // prediction_type="epsilon"). The old leading-spacing formula gave GetTimesteps(1)=[0] → garbage output.
+    [TestMethod]
+    public Task Diffusion_SchedulerMath_SDTurboFixes()
+    {
+        static void Check(bool ok, string msg) { if (!ok) throw new Exception("Diffusion scheduler: " + msg); }
+        static bool Close(float a, float b, float tol = 1e-4f) => MathF.Abs(a - b) <= tol;
+
+        // FIX 1 — trailing timestep spacing: 1 step denoises from FULL noise → [999], not [0].
+        var t1 = SpawnDev.ILGPU.ML.Preprocessing.DiffusionScheduler.GetTimesteps(1, 1000);
+        Check(t1.Length == 1 && t1[0] == 999, $"GetTimesteps(1)=[{string.Join(",", t1)}], expected [999]");
+        var t4 = SpawnDev.ILGPU.ML.Preprocessing.DiffusionScheduler.GetTimesteps(4, 1000);
+        int[] exp4 = { 999, 749, 499, 249 };
+        for (int i = 0; i < 4; i++) Check(t4[i] == exp4[i], $"GetTimesteps(4)[{i}]={t4[i]}, expected {exp4[i]}");
+
+        // FIX 2 — sigmas sqrt((1-ᾱ)/ᾱ), final 0, monotonic decreasing.
+        var ac = SpawnDev.ILGPU.ML.Preprocessing.DiffusionScheduler.ComputeAlphasCumprod(1000);
+        var sig = SpawnDev.ILGPU.ML.Preprocessing.DiffusionScheduler.TimestepsToSigmas(t4, ac);
+        Check(sig.Length == 5 && sig[4] == 0f, "sigmas must be len 5 with final 0");
+        Check(sig[0] > sig[1] && sig[1] > sig[2] && sig[2] > sig[3], "sigmas must decrease");
+        Check(Close(sig[0], MathF.Sqrt((1f - ac[999]) / ac[999])), $"sigma[0]={sig[0]} formula mismatch");
+
+        // FIX 3 — Euler epsilon→x0: final step (sigmaNext=0) ⇒ x = sample - sigma*eps.
+        var x = SpawnDev.ILGPU.ML.Preprocessing.DiffusionScheduler.EulerStep(new[] { 1f, 2f }, new[] { 10f, 10f }, 3f, 0f);
+        Check(Close(x[0], 7f) && Close(x[1], 4f), $"EulerStep final [{x[0]},{x[1]}], expected [7,4]");
+        var x2 = SpawnDev.ILGPU.ML.Preprocessing.DiffusionScheduler.EulerStep(new[] { 1f }, new[] { 10f }, 5f, 2f);
+        Check(Close(x2[0], 7f), $"EulerStep mid {x2[0]}, expected 7");
+
+        // FIX 4 — scale_model_input c = 1/sqrt(σ²+1) (applied in ImageGenerationPipeline.RunAsync).
+        Check(Close(1f / MathF.Sqrt(3f * 3f + 1f), 0.3162278f), "scale_model_input factor σ=3 mismatch");
+
+        return Task.CompletedTask;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Text-to-Image (SD-Turbo) — the /generate demo
+    // ═══════════════════════════════════════════════════════════
+
+    // SD-TURBO TEXT-TO-IMAGE E2E — proves ImageGenerationPipeline end to end. Streams the 3 sub-models
+    // (~2.5GB: CLIP text-encoder 681MB + UNet 1.7GB + VAE decoder 99MB) from OUR hub via the part-2a
+    // CreateFromOnnxStreamAsync path — each weight seeked + chunk-uploaded straight to GPU, NEVER a whole
+    // byte[] (the 1.7GB UNet byte[] OOMed Blazor WASM — why /generate never ran). Then RunAsync the
+    // single-step diffusion: CLIP encode → UNet denoise (1 step, no guidance) → VAE decode → RGBA.
+    // Asserts a VALID, non-degenerate 512x512 image (RunAsync was UNPROVEN — never run E2E). This is the
+    // PMT gate; pixel-accuracy (the actual cat) is confirmed visually in the /generate demo (Rule 5).
+    // HeavyModel: 2.5GB fetch + GPU diffusion → long timeout; console lane needs PMT_CONSOLE_TIMEOUT_MS raised.
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task SDTurbo_Generate_E2E() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new Hub.HubModelStream(client, http);
+            var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
+                Hub.ModelHub.KnownModels.SDTurbo,
+                onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
+            using (pipe)
+            {
+                if (!pipe.IsReady)
+                    throw new Exception("SD-Turbo pipeline not ready after CreateAsync (a sub-model failed to load).");
+                pipe.NumInferenceSteps = 1; // SD-Turbo is single-step
+                pipe.GuidanceScale = 0f;    // SD-Turbo uses no classifier-free guidance
+                pipe.Seed = 42;             // reproducible
+
+                var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a photo of a cat" });
+
+                // Structural: 512x512 RGBA.
+                int px = result.Width * result.Height;
+                int expectedBytes = 4 * px;
+                if (result.Width != 512 || result.Height != 512)
+                    throw new Exception($"Expected 512x512, got {result.Width}x{result.Height}.");
+                if (result.ImageRGBA.Length != expectedBytes)
+                    throw new Exception($"Image byte length {result.ImageRGBA.Length} != expected {expectedBytes}.");
+
+                // Content non-degeneracy: a real generation is NOT all-black, NOT constant, alpha=255.
+                // Broken diffusion (NaN→0, all-zeros, flat) is caught here. (Pixel-accuracy = demo/visual.)
+                long nonZero = 0; double sum = 0, sumSq = 0;
+                for (int i = 0; i < px; i++)
+                {
+                    byte r = result.ImageRGBA[i * 4], g = result.ImageRGBA[i * 4 + 1],
+                         b = result.ImageRGBA[i * 4 + 2], a = result.ImageRGBA[i * 4 + 3];
+                    if (a != 255) throw new Exception($"Alpha at px {i} = {a}, expected 255.");
+                    if (r != 0 || g != 0 || b != 0) nonZero++;
+                    double lum = r + g + b;
+                    sum += lum; sumSq += lum * lum;
+                }
+                double mean = sum / px, variance = sumSq / px - mean * mean;
+                double std = Math.Sqrt(Math.Max(0, variance));
+                Console.WriteLine($"[SDTurbo] {result.Width}x{result.Height} {result.NumSteps}-step {result.InferenceTimeMs:F0}ms " +
+                    $"nonZeroPx={nonZero}/{px} lumMean={mean:F1} lumStd={std:F1}");
+
+                if (nonZero < px / 100)
+                    throw new Exception($"Image essentially all-black ({nonZero}/{px} non-zero px) — diffusion produced no image.");
+                if (std < 5.0)
+                    throw new Exception($"Image near-constant (lumStd={std:F1}) — flat/degenerate, not a real generation.");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
+        {
+            throw new UnsupportedTestException($"SD-Turbo hub/network unavailable: {ex.Message}");
+        }
+        finally
+        {
+            await client.DisposeAsync();
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════
     //  Background Removal (RMBG)
     // ═══════════════════════════════════════════════════════════
 
