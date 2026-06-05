@@ -21,6 +21,9 @@ public class BufferPool : IDisposable
     private readonly Accelerator _accelerator;
     private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allBuffers = new();
+    // fp16 weight buffers (ILGPU.Half) — half the bytes of the fp32 _allBuffers. Tracked separately for
+    // disposal (different element type). See AllocateHalfWeightFromStreamAsync.
+    private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _allHalfBuffers = new();
 
     /// <summary>Total number of GPU buffers allocated by this pool.</summary>
     public int AllocatedBufferCount => _allBuffers.Count;
@@ -183,6 +186,53 @@ public class BufferPool : IDisposable
         return new Tensor(buffer.View, shape, name);
     }
 
+    /// <summary>
+    /// Like <see cref="AllocatePermanentFromStreamAsync"/> but stores the weight as fp16
+    /// (<see cref="ILGPU.Half"/>) — HALF the GPU bytes of the fp32 path. FLOAT16 (dtype 10) source is the
+    /// common case (e.g. SD-Turbo); FLOAT32 (dtype 1) is downcast to fp16. Weight-consuming kernels read
+    /// the result via their half-weight overload (e.g. <c>MatMulKernel.MatMulHalfWeight</c>), upconverting
+    /// to float and accumulating fp32 (ORT-style mixed precision; no accuracy loss). Peak CPU is one chunk,
+    /// never the whole tensor. The f16 spike (2026-06-05) confirmed ILGPU.Half storage works on all 6 backends.
+    /// </summary>
+    public async Task<HalfTensor> AllocateHalfWeightFromStreamAsync(
+        Stream stream, long byteOffset, int byteLength, int dataType, int[] shape,
+        string? name = null, CancellationToken ct = default)
+    {
+        int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+        var buffer = _accelerator.Allocate1D<global::ILGPU.Half>(count);
+        _allHalfBuffers.Add(buffer);
+        if (count == 0) return new HalfTensor(buffer.View, shape, name);
+
+        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, _ => 0 };
+        if (srcElemBytes == 0)
+            throw new NotSupportedException(
+                $"f16 weight load supports FLOAT32 (1) and FLOAT16 (10) raw_data; got dtype {dataType} for '{name}'.");
+
+        stream.Seek(byteOffset, SeekOrigin.Begin);
+
+        const int CHUNK = 262144; // 256K elements
+        var byteBuf = new byte[CHUNK * srcElemBytes];
+        var halfChunk = new global::ILGPU.Half[CHUNK];
+        int uploaded = 0;
+        while (uploaded < count)
+        {
+            int n = Math.Min(CHUNK, count - uploaded);
+            int wantBytes = n * srcElemBytes;
+            await ReadExactAsync(stream, byteBuf, wantBytes, ct).ConfigureAwait(false);
+
+            if (dataType == 10) // FLOAT16 source — round-trip through float (lossless: both are IEEE fp16)
+                for (int i = 0; i < n; i++)
+                    halfChunk[i] = (global::ILGPU.Half)(float)BitConverter.ToHalf(byteBuf, i * 2);
+            else // FLOAT32 source — downcast to fp16
+                for (int i = 0; i < n; i++)
+                    halfChunk[i] = (global::ILGPU.Half)BitConverter.ToSingle(byteBuf, i * 4);
+
+            buffer.View.SubView(uploaded, n).CopyFromCPU(n == halfChunk.Length ? halfChunk : halfChunk[..n]);
+            uploaded += n;
+        }
+        return new HalfTensor(buffer.View, shape, name);
+    }
+
     /// <summary>Read exactly <paramref name="count"/> bytes into the start of <paramref name="buf"/>, or throw.</summary>
     private static async Task ReadExactAsync(Stream stream, byte[] buf, int count, CancellationToken ct)
     {
@@ -211,7 +261,13 @@ public class BufferPool : IDisposable
             try { buffer.Dispose(); }
             catch { /* Buffer may already be disposed by executor ref-counting or external code */ }
         }
+        foreach (var buffer in _allHalfBuffers)
+        {
+            try { buffer.Dispose(); }
+            catch { /* may already be disposed */ }
+        }
         _allBuffers.Clear();
+        _allHalfBuffers.Clear();
         _buckets.Clear();
     }
 

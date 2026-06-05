@@ -84,4 +84,61 @@ public abstract partial class MLTestBase
         if (maxErr > 1e-3f)
             throw new Exception($"MatMulHalfWeight maxErr={maxErr:E3} vs fp16-weight fp32 reference (expected < 1e-3)");
     });
+
+    /// <summary>
+    /// Slice 2+3: BufferPool.AllocateHalfWeightFromStreamAsync loads an fp16 weight from a stream (like an
+    /// ONNX fp16 initializer) into a HalfTensor (half the GPU bytes), then MatMulHalfWeight consumes it.
+    /// Verifies the LOAD+COMPUTE path matches a fp32 reference using the same fp16-rounded weights.
+    /// </summary>
+    [TestMethod]
+    public Task F16_BufferPoolHalfWeight_LoadAndMatMul() => RunTest(async accelerator =>
+    {
+        int M = 4, K = 8, N = 4;
+        var rng = new Random(7);
+        var a = new float[M * K];
+        var w = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Serialize the weight as fp16 bytes (dtype 10), exactly like an ONNX FLOAT16 initializer.
+        var wBytes = new byte[w.Length * 2];
+        for (int i = 0; i < w.Length; i++)
+        {
+            var bits = BitConverter.GetBytes((System.Half)w[i]);
+            wBytes[i * 2] = bits[0];
+            wBytes[i * 2 + 1] = bits[1];
+        }
+        using var ms = new System.IO.MemoryStream(wBytes);
+
+        var pool = new SpawnDev.ILGPU.ML.Tensors.BufferPool(accelerator);
+        try
+        {
+            var halfW = await pool.AllocateHalfWeightFromStreamAsync(ms, 0, wBytes.Length, 10, new[] { K, N });
+
+            // CPU reference: A × (fp16-rounded W), fp32 accumulate.
+            var cpuC = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++)
+                        s += a[r * K + k] * (float)(System.Half)w[k * N + c];
+                    cpuC[r * N + c] = s;
+                }
+
+            using var aBuf = accelerator.Allocate1D(a);
+            using var cBuf = accelerator.Allocate1D<float>(M * N);
+            var mm = new MatMulKernel(accelerator);
+            mm.MatMulHalfWeight(aBuf.View, halfW.Data, cBuf.View, M, K, N);
+            await accelerator.SynchronizeAsync();
+            var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
+
+            float maxErr = 0f;
+            for (int i = 0; i < cpuC.Length; i++)
+                maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+            if (maxErr > 1e-3f)
+                throw new Exception($"BufferPool half-weight load+matmul maxErr={maxErr:E3} (expected < 1e-3)");
+        }
+        finally { pool.Dispose(); }
+    });
 }
