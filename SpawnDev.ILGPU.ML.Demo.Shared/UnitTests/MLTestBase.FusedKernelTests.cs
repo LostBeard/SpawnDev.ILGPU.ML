@@ -108,4 +108,75 @@ public abstract partial class MLTestBase
 
         await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-3f, "FusedLinear+None: ");
     });
+
+    // ── Register-blocked path (M,N >= 64) — the GPT-2 FFN regime (768→3072 / 3072→768) ──
+    // The tests above use sub-64 dims and hit the per-element kernels; these force the
+    // register-blocked fused GEMM on capable backends (CPU/WebGL fall back to per-element,
+    // both compared to the same CPU reference). Dims are non-multiples of 64/16 to exercise
+    // the partial-tile bounds guards.
+
+    /// <summary>
+    /// Fused linear, no activation, at register-blocked sizes (M,N >= 64) — matches MatMul + Bias.
+    /// </summary>
+    [TestMethod]
+    public async Task FusedLinear_None_RegBlocked_LargeMatchesReference() => await RunTest(async accelerator =>
+    {
+        int M = 70, K = 130, N = 100; // >= 64, non-tile-multiple → register-blocked path + partial tiles
+        var input = RandomFloats(M * K, seed: 330);
+        var weights = RandomFloats(K * N, seed: 331, scale: 0.1f);
+        var bias = RandomFloats(N, seed: 332, scale: 0.5f);
+
+        var expected = CpuMatMul(input, weights, M, K, N);
+        for (int r = 0; r < M; r++)
+        for (int c = 0; c < N; c++)
+            expected[r * N + c] += bias[c];
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weights);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(M * N);
+
+        var fused = new FusedLinearKernel(accelerator);
+        fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.None);
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-3f, "FusedLinear+None (reg-blocked): ");
+    });
+
+    /// <summary>
+    /// Fused linear with erf-GELU at register-blocked sizes (M,N >= 64) — the GPT-2 decoder FFN path.
+    /// Guards that the register-blocked erf-GELU is bit-faithful to the per-element / ORT-matched form.
+    /// </summary>
+    [TestMethod]
+    public async Task FusedLinear_Gelu_RegBlocked_LargeMatchesReference() => await RunTest(async accelerator =>
+    {
+        int M = 70, K = 130, N = 100; // >= 64, non-tile-multiple → register-blocked erf-GELU path
+        var input = RandomFloats(M * K, seed: 340, scale: 2f);   // wider spread → some pre-activations in the GELU tails
+        var weights = RandomFloats(K * N, seed: 341, scale: 0.2f);
+        var bias = RandomFloats(N, seed: 342, scale: 0.5f);
+
+        var expected = new float[M * N];
+        for (int r = 0; r < M; r++)
+        for (int c = 0; c < N; c++)
+        {
+            float sum = 0;
+            for (int k = 0; k < K; k++)
+                sum += input[r * K + k] * weights[k * N + c];
+            float x = sum + bias[c];
+            if (x > 10f) expected[r * N + c] = x;
+            else if (x < -10f) expected[r * N + c] = 0f;
+            else expected[r * N + c] = 0.5f * x * (1f + ErfApprox(x * 0.7071067811865475f));
+        }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weights);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(M * N);
+
+        var fused = new FusedLinearKernel(accelerator);
+        fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.GELU);
+        await accelerator.SynchronizeAsync();
+
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-2f, "FusedLinear+GELU (reg-blocked): ");
+    });
 }
