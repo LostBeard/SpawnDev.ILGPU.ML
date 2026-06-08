@@ -105,6 +105,15 @@ public abstract partial class MLTestBase
         var fs = GetAsyncFS();
         if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
 
+        // PROFILE: one COLD read-driven load via CreateFromOnnxStreamAsync (the real demo path), deselect:true so
+        // only the pieces the weight-reads touch are fetched on-demand (no background re-request), single polite
+        // web-seed connection. Break the per-piece zero-copy download pipeline into phases to see where the time
+        // goes. (deselect:false + wait-for-Done background download re-requests / never completes - separate path
+        // the demo doesn't use.)
+        SpawnDev.WebTorrent.Torrent.MaxConcurrentLeafDigests = 32;
+        SpawnDev.WebTorrent.Torrent.EnableZcProfiling = true;   // measurement: turn on per-phase timing (off in production)
+        SpawnDev.WebTorrent.Torrent.ResetZcProfile();
+
         var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http);
         const string repo = "Xenova/distilgpt2";
         const string file = "onnx/decoder_model.onnx";
@@ -112,60 +121,33 @@ public abstract partial class MLTestBase
 
         try
         {
-            // ── Warm OPFS: fully download the model once so the A/B loads below read from cache (download
-            //    removed -> the only difference between A and B is the weight-upload path). ──
-            long total;
-            var swDl = System.Diagnostics.Stopwatch.StartNew();
-            {
-                var warm = await hub.OpenAsync(repo, file, deselect: false);
-                total = warm.File.Length;
-                var buf = new byte[1 << 20];
-                await using (warm.Stream)
-                    while (await warm.Stream.ReadAsync(buf, 0, buf.Length) > 0) { }
-            }
-            swDl.Stop();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var m = await hub.OpenAsync(repo, file, deselect: true);   // on-demand: only read-touched pieces fetch
+            long total = m.File.Length;
+            int pieceLen = m.Torrent.PieceLength;
+            m.Torrent.MaxWebConns = 1;                                 // polite single web-seed connection
+            SpawnDev.ILGPU.ML.InferenceSession s;
+            await using (m.Stream)
+                s = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxStreamAsync(
+                    accelerator, m.Stream, inputShapes: inputShapes, enableOptimization: false);
+            sw.Stop();
+            long zc; using (s) zc = s.ZeroCopyWeightBytes;
 
-            // ── Load A: zero-copy JS->GPU weight upload (default). ──
-            var swA = System.Diagnostics.Stopwatch.StartNew();
-            long zcA;
-            {
-                var m = await hub.OpenAsync(repo, file, deselect: false);
-                SpawnDev.ILGPU.ML.InferenceSession s;
-                await using (m.Stream)
-                    s = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxStreamAsync(
-                        accelerator, m.Stream, inputShapes: inputShapes, enableOptimization: false);
-                using (s) zcA = s.ZeroCopyWeightBytes;
-            }
-            swA.Stop();
-
-            // ── Load B: forced .NET byte[] upload path (same cached pieces). ──
-            var swB = System.Diagnostics.Stopwatch.StartNew();
-            long zcB;
-            SpawnDev.ILGPU.ML.Tensors.BufferPool.DisableJsZeroCopyWeights = true;
-            try
-            {
-                var m = await hub.OpenAsync(repo, file, deselect: false);
-                SpawnDev.ILGPU.ML.InferenceSession s;
-                await using (m.Stream)
-                    s = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxStreamAsync(
-                        accelerator, m.Stream, inputShapes: inputShapes, enableOptimization: false);
-                using (s) zcB = s.ZeroCopyWeightBytes;
-            }
-            finally { SpawnDev.ILGPU.ML.Tensors.BufferPool.DisableJsZeroCopyWeights = false; }
-            swB.Stop();
-
-            double tDl = swDl.Elapsed.TotalSeconds, tA = swA.Elapsed.TotalSeconds, tB = swB.Elapsed.TotalSeconds;
+            double t = sw.Elapsed.TotalSeconds;
             int mb = (int)(total / 1024 / 1024);
+            int pieces = SpawnDev.WebTorrent.Torrent.ZcPieces;
+            double fetchedMB = pieces * (pieceLen / 1024.0 / 1024.0);
 
-            if (zcA == 0)
-                throw new Exception($"[DLMEASURE] ZERO-COPY DID NOT FIRE: load A ZeroCopyWeightBytes=0 (fell back to .NET byte[]). " +
-                    $"model={mb}MB warmDownload={tDl:F1}s loadA={tA:F1}s loadB(byte[])={tB:F1}s. Expected weights to upload JS->GPU.");
+            if (zc == 0)
+                throw new Exception($"[DLMEASURE] ZERO-COPY DID NOT FIRE (zc=0). coldReadDrivenLoad={t:F1}s model={mb}MB pieces={pieces}");
 
-            // Success: report the measurement (thrown so PMT surfaces it).
+            // Success: report (thrown so PMT surfaces it; the browser lane drops Console.WriteLine).
             throw new Exception(
-                $"[DLMEASURE] OK distilgpt2 decoder {mb}MB on {accelerator.AcceleratorType} | " +
-                $"warmDownload={tDl:F1}s | loadA(zero-copy JS->GPU)={tA:F1}s zc={zcA / 1024 / 1024}MB | " +
-                $"loadB(.NET byte[])={tB:F1}s zc={zcB} | upload-path delta(B-A)={tB - tA:F1}s | " +
+                $"[DLMEASURE] OK distilgpt2 decoder {mb}MB on {accelerator.AcceleratorType} | coldReadDrivenLoad={t:F1}s | " +
+                $"zc={zc / 1024 / 1024}MB | zeroCopyPieces={pieces} (~{fetchedMB:F0}MB fetched, conns=1, leafCap={SpawnDev.WebTorrent.Torrent.MaxConcurrentLeafDigests}) | " +
+                $"PHASE total-ms: fetch={SpawnDev.WebTorrent.Torrent.ZcFetchMs:F0} digestFire={SpawnDev.WebTorrent.Torrent.ZcDigestFireMs:F0} " +
+                $"digestWait={SpawnDev.WebTorrent.Torrent.ZcDigestWaitMs:F0} read={SpawnDev.WebTorrent.Torrent.ZcReadMs:F0} " +
+                $"tree={SpawnDev.WebTorrent.Torrent.ZcTreeMs:F0} store={SpawnDev.WebTorrent.Torrent.ZcStoreMs:F0} | " +
                 $"(raw-HTTP source ceiling ~37MB/s single-stream on the 1GB LAN)");
         }
         catch (UnsupportedTestException) { throw; }

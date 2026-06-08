@@ -135,6 +135,11 @@ public class ProjectTest
             //      propagates it and the lane advances. Catching it and returning false keeps
             //      us waiting until the page frees up and we actually observe Done.
             // querySelector returns null safely if the row is momentarily detached.
+            // Done-wait cap. Default 600s, but a genuinely heavy browser test (e.g. a multi-GB model E2E whose
+            // cold download alone exceeds 10 min) declares a larger [TestMethod(Timeout)] that this hard 600s
+            // silently overrode. Allow raising it for a run via PMT_BROWSER_DONE_TIMEOUT_MS (parallel to the
+            // console lane's PMT_CONSOLE_TIMEOUT_MS). Default unchanged so routine runs behave identically.
+            int doneTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("PMT_BROWSER_DONE_TIMEOUT_MS"), out var dt) && dt > 0 ? dt : 600_000;
             await page.WaitForConditionAsync(async () =>
             {
                 try
@@ -147,7 +152,7 @@ public class ProjectTest
                 {
                     return false; // page busy / transient — keep waiting, never advance
                 }
-            });
+            }, doneTimeoutMs);
 
             // Stop capturing console
             page.Console -= OnConsole;

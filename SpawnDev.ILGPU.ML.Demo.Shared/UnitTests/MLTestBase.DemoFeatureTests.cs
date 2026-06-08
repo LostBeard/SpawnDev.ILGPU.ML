@@ -460,7 +460,16 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        // Prefer the demo's OPFS-backed client (browser): exercises the real zero-copy weight path AND keeps
+        // the 2.5GB of pieces in OPFS instead of the .NET heap (the in-memory store OOM'd). Fall back to a
+        // private in-memory client on desktop. Clear stale cross-run OPFS state for a faithful cold run.
+        var sharedClient = GetWebTorrentClient();
+        if (sharedClient != null)
+        {
+            var fs = GetAsyncFS();
+            if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
+        }
+        var client = sharedClient ?? new SpawnDev.WebTorrent.WebTorrentClient();
         try
         {
             var hub = new Hub.HubModelStream(client, http);
@@ -515,7 +524,7 @@ public abstract partial class MLTestBase
         }
         finally
         {
-            await client.DisposeAsync();
+            if (sharedClient == null) await client.DisposeAsync(); // never dispose the shared DI singleton
         }
     });
 
