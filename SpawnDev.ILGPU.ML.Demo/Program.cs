@@ -18,8 +18,13 @@ builder.Services.AddBlazorJSRuntime();
 // Cross-platform persistent file system (OPFS in browser, native on desktop)
 builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
 
-// WebTorrent client for P2P model delivery (direct stream access, no service worker needed)
-builder.Services.AddSingleton<WebTorrentClient>();
+// WebTorrent client for P2P model delivery (direct stream access, no service worker needed).
+// Wire the OPFS filesystem into the client so torrent pieces persist to OPFS AND the zero-copy browser
+// download path fires (each piece's bytes stay in JS: fetch -> SubtleCrypto -> OPFS, no .NET byte[] hop).
+// Without AsyncFileSystem the client falls back to an in-memory store + the byte[] download path, so the
+// model download never uses zero-copy.
+builder.Services.AddSingleton<WebTorrentClient>(sp =>
+    new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = sp.GetRequiredService<IAsyncFS>() }));
 
 // Shared OPFS model cache (browser). One instance so every demo + the cache-management page see the same
 // cached models. ModelCache reads/writes the persistent OPFS "ilgpu-ml-models" dir, so even multiple
