@@ -44,6 +44,17 @@ public class GraphExecutor : IDisposable
     private bool _readbackStableFinalized;                   // true once _readbackStable is built
     private List<Tensor>? _priorRunOutputs;                  // last run's graph-output tensors, recycled next run
 
+    /// <summary>Fixed-shape decode (CacheShapeReadbacks) buffer cache for Shape op outputs: output name →
+    /// (retained GPU buffer, the input dims it holds). ShapeOperator re-uploads the constant input dims via
+    /// CopyFromCPU on EVERY step (measured ~1537ms across 141 Shape nodes per GPT-2 decode step on WebGPU —
+    /// per-op writeBuffer latency, not data size). In a shape-specialized executor those dims never change,
+    /// so the buffer is uploaded once (first step) and reused thereafter. Reusing the BUFFER (not just the
+    /// value) is required because at least one downstream consumer reads the Shape output as a GPU TENSOR,
+    /// so skipping the upload outright corrupts output — see
+    /// feedback-shape-outputs-consumed-as-gpu-tensor-not-just-value. Retained buffers are never returned to
+    /// the pool (so no other node's Rent can clobber them) and are freed when the pool is disposed.</summary>
+    private Dictionary<string, (Tensor Buf, int[] Dims)>? _shapeBufferCache;
+
     /// <summary>When true, logs each node execution to Console.</summary>
     public static bool VerboseLogging { get; set; }
 
@@ -987,6 +998,37 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Fixed-shape decode: reuse the Shape op's output BUFFER across steps instead of
+            // re-uploading the (constant) input dims via CopyFromCPU every step. See
+            // _shapeBufferCache and feedback-shape-outputs-consumed-as-gpu-tensor-not-just-value.
+            // We reuse the BUFFER (not just publish the value) because a downstream consumer reads
+            // the Shape output as a GPU tensor — skipping the upload outright corrupts output.
+            bool shapeCacheHit = false;
+            Tensor? cachedShapeBuf = null;
+            if (CacheShapeReadbacks && node.OpType == "Shape" && node.OutputNames.Length == 1
+                && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                _shapeBufferCache ??= new Dictionary<string, (Tensor Buf, int[] Dims)>();
+                var sName = node.OutputNames[0];
+                var curDims = nodeInputs[0]!.Shape;
+                if (_shapeBufferCache.TryGetValue(sName, out var entry)
+                    && entry.Dims.Length == curDims.Length
+                    && entry.Dims.AsSpan().SequenceEqual(curDims))
+                {
+                    // Cache hit: reuse the retained buffer; skip this step's CopyFromCPU upload.
+                    shapeCacheHit = true;
+                    cachedShapeBuf = entry.Buf;
+                    tensors[sName] = entry.Buf;
+                    refCounts[sName] = int.MaxValue; // retained across runs; never returned to the pool
+                    // Publish the dims to downstream VALUE consumers (Reshape/Slice/Concat targets),
+                    // exactly as the post-execute readback-capture would, but with no GPU round-trip.
+                    var dimVals = new float[curDims.Length];
+                    for (int d = 0; d < curDims.Length; d++) dimVals[d] = curDims[d];
+                    runtimeConstants[sName] = dimVals;
+                    if (readbackThisRun != null) readbackThisRun[sName] = dimVals;
+                }
+            }
+
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
@@ -997,7 +1039,8 @@ public class GraphExecutor : IDisposable
                 for (int d = 0; d < shape.Length; d++)
                     if (shape[d] <= 0) shape[d] = 1;
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
-                nodeOutputs[i] = _pool.Rent(shape, name);
+                // Shape-cache hit: bind the retained buffer instead of renting a fresh one.
+                nodeOutputs[i] = shapeCacheHit && i == 0 ? cachedShapeBuf! : _pool.Rent(shape, name);
             }
 
             var ctx = new OnnxOpContext
@@ -1023,7 +1066,8 @@ public class GraphExecutor : IDisposable
                 // condition, Einsum dynamic inputs) override ExecuteAsync to await the
                 // browser-safe readback; all others fall through to the synchronous Execute via
                 // the default interface method. This is the browser-parity path.
-                await node.Operator.ExecuteAsync(ctx);
+                // shapeCacheHit: buffer already holds the correct dims from a prior step — skip.
+                if (!shapeCacheHit) await node.Operator.ExecuteAsync(ctx);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,
                 // WebGPU command-encoder errors) surface AT the failing node instead of
@@ -1052,10 +1096,24 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
 
+            // First step (or shape changed): retain this Shape output buffer so later steps reuse it.
+            // refCounts=MaxValue keeps it out of the pool's return path for the rest of this run AND
+            // marks it retained; it's freed when the pool is disposed (BufferPool tracks _allBuffers).
+            if (!shapeCacheHit && CacheShapeReadbacks && node.OpType == "Shape" && node.OutputNames.Length == 1
+                && nodeInputs.Length > 0 && nodeInputs[0] != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
+            {
+                var sName = node.OutputNames[0];
+                (_shapeBufferCache ??= new Dictionary<string, (Tensor Buf, int[] Dims)>())[sName] =
+                    (nodeOutputs[0], (int[])nodeInputs[0]!.Shape.Clone());
+                refCounts[sName] = int.MaxValue;
+            }
+
             // Capture small intermediate outputs as runtime constants.
             // Only sync+readback for truly small shape tensors (≤64 elements) that downstream
             // operators need for parameter resolution (Slice starts/ends, Reshape dims, Expand shapes).
             // Was ≤2048 with double-sync per node — killed GPT-2 perf with hundreds of unnecessary syncs.
+            // Shape-cache hit already published its value above (no GPU output to read) — skip.
+            if (!shapeCacheHit)
             for (int oi = 0; oi < nodeOutputs.Length; oi++)
             {
                 var outTensor = nodeOutputs[oi];
@@ -1136,7 +1194,7 @@ public class GraphExecutor : IDisposable
             }
 
             // Capture intermediate values for debugging (when enabled)
-            if (CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
+            if (!shapeCacheHit && CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
             {
                 var captureOutput = nodeOutputs[0];
                 // Capture enough values to get a meaningful absMax (at least one full

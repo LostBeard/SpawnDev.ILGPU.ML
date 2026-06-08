@@ -380,10 +380,11 @@ public class TextGenerationPipeline : IDisposable
             readSw.Stop();
 
             // DIAGNOSTIC: attribute per-step decode cost to CPU recompile vs GPU forward vs readback.
-            // Always recorded into StepTimings (cheap strings, so a test can inspect them without
-            // turning on VerboseLogging); only echoed to console.error when VerboseLogging is set
-            // (PMT pipes console.error to stderr — console.log is dropped — but spamming it inflates
-            // the browser console-error count, so keep it opt-in).
+            // Always recorded into StepTimings (cheap strings, so a test can inspect them in-process —
+            // the primary consumption path — without turning on VerboseLogging); only echoed to the
+            // console when VerboseLogging is set. Echo via Console.WriteLine (stdout/console.log), NEVER
+            // Console.Error — in Blazor WASM stderr makes the #blazor-error-ui bar appear, which PMT
+            // flags as a FAILED test even when the body succeeded. (Tests read StepTimings, not this echo.)
             {
                 double recompileMs = _session.LastRecompileMs;
                 double runMs = runSw.Elapsed.TotalMilliseconds;
@@ -392,7 +393,7 @@ public class TextGenerationPipeline : IDisposable
                     $"readback={readSw.Elapsed.TotalMilliseconds:F0}ms (run={runMs:F0}ms) " +
                     $"poolBuffers={_session.LastExecutorBufferCount}";
                 StepTimings.Add(line);
-                if (InferenceSession.VerboseLogging) Console.Error.WriteLine(line);
+                if (InferenceSession.VerboseLogging) Console.WriteLine(line);
             }
 
             // Pick the next token. Default (config == null) is pure greedy argmax — this keeps the
@@ -442,6 +443,7 @@ public class TextGenerationPipeline : IDisposable
         {
             Text = prompt + generatedText,
             GeneratedText = generatedText,
+            GeneratedTokenIds = generatedTokens,
             PromptTokenCount = promptTokens.Count,
             GeneratedTokenCount = generatedTokens.Length,
             TotalTokenCount = allTokens.Count,
@@ -458,6 +460,9 @@ public class TextGenerationResult
 {
     public string Text { get; init; } = "";
     public string GeneratedText { get; init; } = "";
+    /// <summary>The newly generated token IDs (excludes the prompt), in order. Lets callers compare
+    /// against a reference greedy decode (e.g. an ORT-produced fixture) without re-tokenizing text.</summary>
+    public int[] GeneratedTokenIds { get; init; } = Array.Empty<int>();
     public int PromptTokenCount { get; init; }
     public int GeneratedTokenCount { get; init; }
     public int TotalTokenCount { get; init; }

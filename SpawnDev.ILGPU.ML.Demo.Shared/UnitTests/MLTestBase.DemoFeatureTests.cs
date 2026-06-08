@@ -18,46 +18,59 @@ public abstract partial class MLTestBase
     //  Text Generation (Chatbot / AI Assistant)
     // ═══════════════════════════════════════════════════════════
 
-    // REGRESSION GUARD for the fixed-shape decode + auto-detecting readback cache. The cache skips the
-    // ~643 mid-graph shape-readback GPU round-trips/step (~7.8s → fast decode) but MUST NOT change the
-    // output. A naive "cache every ≤64-elem readback" was WRONG: input_ids itself is ≤64 elems (seq≤64)
-    // and is DATA-dependent, so caching it froze the tokens (produced " floor, and the other" instead of
-    // " floor of the house"). The auto-detecting cache probes two different-data runs and caches only the
-    // values stable across both. This test asserts cache-ON output == cache-OFF output == the ORT greedy
-    // reference continuation, so any future cache regression (or a new data-dependent readback) fails here.
-    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
-    public async Task TextGen_ReadbackCache_MatchesUncached() => await RunTest(async accelerator =>
+    // REGRESSION GUARD for the fixed-shape decode + auto-detecting readback cache + Shape-output BUFFER
+    // cache. Together these eliminate the ~643 mid-graph shape-readback GPU round-trips/step AND the
+    // per-step CopyFromCPU re-upload of the (constant) Shape op outputs — but they MUST NOT change the
+    // output. A naive "cache every ≤64-elem readback" was WRONG: input_ids itself is ≤64 elems and
+    // DATA-dependent, so caching it froze the tokens (" floor, and the other" instead of " floor of the
+    // house"); likewise skipping a Shape op's GPU upload corrupts a downstream tensor-reading consumer.
+    // This test runs ONLY the cached path and asserts the generated token IDs match the ORT greedy
+    // reference (references/gpt2/distilgpt2_greedy.json) — a STRONGER, absolute check than the old
+    // cache-vs-uncached comparison. It deliberately does NOT re-run the uncached baseline: on interpreted
+    // Wasm the forward is ~50-95s/step, so running it twice doubled the work and blew the harness page-wait
+    // (the uncached path's correctness is covered separately by
+    // Reference_DistilGPT2_GreedyGeneration_MatchesOnnxRuntime). See the buffer-cache memory
+    // feedback-shape-outputs-consumed-as-gpu-tensor-not-just-value.
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task TextGen_ReadbackCache_MatchesReference() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // ORT greedy reference for prompt "The cat sat on the" (prompt input_ids + full generated_ids).
+        var refJson = await http.GetStringAsync("references/gpt2/distilgpt2_greedy.json");
+        using var refDoc = System.Text.Json.JsonDocument.Parse(refJson);
+        var promptIds = refDoc.RootElement.GetProperty("input_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        var refGenIds = refDoc.RootElement.GetProperty("generated_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+
+        const int NumNew = 6; // ≥5 so the pool-plateau check runs; ~6 cached steps fit interpreted Wasm in the page-wait
+        var expected = refGenIds.Skip(promptIds.Length).Take(NumNew).ToArray();
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
         var tokenizerJson = await http.GetStringAsync(
             "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
 
-        async Task<(string text, List<string> timings)> Gen(bool cache)
-        {
-            using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
-            var pipeline = new TextGenerationPipeline(session, accelerator) { UseShapeReadbackCache = cache };
-            pipeline.LoadTokenizer(tokenizerJson);
-            pipeline.MaxNewTokens = 8;
-            var result = await pipeline.GenerateAsync("The cat sat on the");
-            return (result.GeneratedText, new List<string>(pipeline.StepTimings));
-        }
-        var (cacheOff, _) = await Gen(false);
-        var (cacheOn, onTimings) = await Gen(true);
-        Console.WriteLine($"[TextGen-cache] off='{cacheOff}' on='{cacheOn}'");
-        if (!cacheOff.TrimStart().StartsWith("floor"))
-            throw new Exception($"Uncached generation WRONG: '{cacheOff}' — expected to start with ' floor' (ORT greedy reference).");
-        if (cacheOn != cacheOff)
-            throw new Exception($"Readback cache CHANGED the output — cached='{cacheOn}' vs uncached='{cacheOff}'. A data-dependent readback is being cached.");
+        using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
+        var pipeline = new TextGenerationPipeline(session, accelerator) { UseShapeReadbackCache = true };
+        pipeline.LoadTokenizer(tokenizerJson);
+        pipeline.MaxNewTokens = NumNew;
+        var result = await pipeline.GenerateAsync("The cat sat on the");
+
+        var got = result.GeneratedTokenIds;
+        Console.WriteLine($"[TextGen-cache] gen=[{string.Join(",", got)}] expected=[{string.Join(",", expected)}] text='{result.GeneratedText}'");
+        if (got.Length < NumNew)
+            throw new Exception($"Cached generation produced only {got.Length} tokens, expected {NumNew}. text='{result.GeneratedText}'");
+        for (int i = 0; i < NumNew; i++)
+            if (got[i] != expected[i])
+                throw new Exception($"Readback/Shape cache produced WRONG token at step {i}: got {got[i]}, expected {expected[i]} (ORT greedy ref). " +
+                    $"gen=[{string.Join(",", got.Take(NumNew))}] vs ref=[{string.Join(",", expected)}]. A data-dependent readback or Shape buffer is being mis-cached.");
 
         // Memory: the reused fixed-shape executor must RECYCLE its output buffers, not grow the pool
         // ~13/step (logits ≈11MB/step → OOM on long gens). Parse poolBuffers from the per-step timings;
         // after the 2 cold probe steps it must PLATEAU (no linear per-step growth).
         int PoolBuffers(string line) { var m = System.Text.RegularExpressions.Regex.Match(line, @"poolBuffers=(\d+)"); return m.Success ? int.Parse(m.Groups[1].Value) : -1; }
-        var pool = onTimings.Select(PoolBuffers).Where(v => v >= 0).ToList();
+        var pool = pipeline.StepTimings.Select(PoolBuffers).Where(v => v >= 0).ToList();
         if (pool.Count >= 5)
         {
             int mid = pool[pool.Count - 3], last = pool[^1]; // two later steps, past the probe warmup
@@ -185,6 +198,74 @@ public abstract partial class MLTestBase
         // growing sequence is guarded by Reference_DistilGPT2_GreedyGeneration_MatchesOnnxRuntime.)
         if (!result.GeneratedText.TrimStart().StartsWith("floor"))
             throw new Exception($"TextGeneration produced WRONG continuation '{result.GeneratedText}' — expected to start with ' floor' (ORT greedy reference for 'The cat sat on the').");
+    });
+
+    // DIAGNOSTIC (not a pass/fail gate): where does a distilgpt2 decode STEP actually spend time now that
+    // readbacks are cached + matmuls are register-blocked? Uses GraphExecutor's static per-node timing
+    // capture (CapturedNodeTimingsMs) — no GPU sync per node, so it's CPU-side DISPATCH time per op — and
+    // a second pass with PerOpSync to fold in GPU execution. Aggregates by op-type so we can see whether
+    // the residual ~5.8s/step is dispatch overhead (-> fusion/dispatch-reduction helps) or GPU compute
+    // (-> better kernels / incremental KV decode). Logs the breakdown; the only assertion is that it ran.
+    [TestMethod(Timeout = 360000, Category = "HeavyModel")]
+    public async Task Profile_DistilGPT2_Decode_OpTypeBreakdown() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        var tokenizerJson = await http.GetStringAsync(
+            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+
+        using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+        var pipeline = new TextGenerationPipeline(session, accelerator);
+        pipeline.LoadTokenizer(tokenizerJson);
+        pipeline.MaxNewTokens = 4; // a few steady-state steps; the capture dict holds the LAST step
+
+        async Task<(double totalMs, int readbacks, double readbackMs, int nodes, string top)> Measure(bool perOpSync)
+        {
+            Graph.GraphExecutor.PerOpSync = perOpSync;
+            Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var r = await pipeline.GenerateAsync("The cat sat on the");
+            await accelerator.SynchronizeAsync();
+            sw.Stop();
+
+            var cap = Graph.GraphExecutor.CapturedNodeTimingsMs!;
+            // Keys are "{idx:D3}_{OpType}_{output}" — aggregate ms + node-count by OpType.
+            var byOp = new Dictionary<string, (double ms, int n)>();
+            foreach (var (key, ms) in cap)
+            {
+                var parts = key.Split('_');
+                var op = parts.Length >= 2 ? parts[1] : key;
+                var cur = byOp.GetValueOrDefault(op);
+                byOp[op] = (cur.ms + ms, cur.n + 1);
+            }
+            double sumMs = byOp.Values.Sum(v => v.ms);
+            var top = string.Join("  ", byOp.OrderByDescending(kv => kv.Value.ms).Take(12)
+                .Select(kv => $"{kv.Key}={kv.Value.ms:F0}ms/{kv.Value.n}"));
+            Console.WriteLine($"[DecodeProfile perOpSync={perOpSync}] stepWall(last gen total)={sw.ElapsedMilliseconds}ms tok={r.GeneratedTokenCount} " +
+                $"| capturedNodes={cap.Count} sum(per-op)={sumMs:F0}ms " +
+                $"| midGraphReadbacks={Graph.GraphExecutor.LastRunReadbackCount} readbackMs={Graph.GraphExecutor.LastRunReadbackMs:F0}");
+            Console.WriteLine($"[DecodeProfile perOpSync={perOpSync}] TOP: {top}");
+            return (sumMs, Graph.GraphExecutor.LastRunReadbackCount, Graph.GraphExecutor.LastRunReadbackMs, cap.Count, top);
+        }
+
+        // Pass 1: CPU dispatch time per op (no per-node sync). Pass 2: + GPU execution (PerOpSync).
+        var cpu = await Measure(perOpSync: false);
+        var gpu = await Measure(perOpSync: true);
+        Graph.GraphExecutor.PerOpSync = false;
+        Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+
+        // DIAGNOSTIC-THROW: browser-test Console.WriteLine doesn't echo to the PMT .log; PMT DOES capture
+        // the (innermost) exception message. So surface the whole breakdown here. This test always "fails"
+        // by design — it's a measurement probe, not a gate. Remove once the decode lever is chosen.
+        throw new Exception(
+            $"[DecodeProfile RESULT] CPU-dispatch sum={cpu.totalMs:F0}ms | GPU-inclusive sum={gpu.totalMs:F0}ms " +
+            $"over {cpu.nodes} captured nodes | midGraphReadbacks={cpu.readbacks} readbackMs={cpu.readbackMs:F0}. " +
+            $"VERDICT: GPU-inclusive>>CPU-dispatch => compute/GPU-bound (better kernels / incremental KV decode); " +
+            $"~equal => dispatch-overhead-bound (fold 3-input Gemm + GELU subgraph to cut dispatch count). " +
+            $"\nCPU-dispatch TOP: {cpu.top}\nGPU-inclusive TOP: {gpu.top}");
     });
 
     // GATING: establish the merged DistilGPT-2 model's KV-cache IO contract on our engine before
