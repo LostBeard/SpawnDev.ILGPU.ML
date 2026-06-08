@@ -58,36 +58,24 @@ public class BufferPool : IDisposable
             return tensor;
         }
 
-        MemoryBuffer1D<float, Stride1D.Dense> newBuffer;
-        try
-        {
-            newBuffer = _accelerator.Allocate1D<float>(bucketSize);
-        }
-        catch
-        {
-            // Memory-bounded execution: the pool retains every Returned buffer in size-buckets for reuse, so a
-            // 1-pass large model (e.g. a 512x512 VAE decode = ~227 distinct-size feature maps, each used once)
-            // grows the pool to the SUM of its intermediates (multi-GB), not the live working set. Under GPU
-            // memory pressure, flush pending GPU work, dispose the AVAILABLE (Returned, not-live) bucketed
-            // buffers to reclaim VRAM, and retry. Models that fit never hit this; models that don't are bounded
-            // to their live set. (Flush is required so WebGPU/WebGL don't free a buffer a pending dispatch reads.)
-            try { _accelerator.Synchronize(); } catch { }
-            long reclaimed = DisposeBucketedBuffers();
-            try
-            {
-                newBuffer = _accelerator.Allocate1D<float>(bucketSize);
-            }
-            catch (Exception ex2)
+        // Memory-bounded execution: the pool retains every Returned buffer in size-buckets for reuse, so a
+        // 1-pass large model (e.g. a 512x512 VAE decode = ~227 distinct-size feature maps, each used once)
+        // grows the pool to the SUM of its intermediates (multi-GB), not the live working set. Under GPU memory
+        // pressure, ILGPU's AllocateWithReclaim flushes pending GPU work, runs our reclaim (dispose the
+        // AVAILABLE Returned-not-live bucketed buffers), retries once, and throws our working-set message if
+        // still OOM. Models that fit never hit this; models that don't are bounded to their live set.
+        MemoryBuffer1D<float, Stride1D.Dense> newBuffer = _accelerator.AllocateWithReclaim(
+            () => _accelerator.Allocate1D<float>(bucketSize),   // allocate
+            DisposeBucketedBuffers,                             // reclaim (dispose Returned-not-live), returns bytes freed
+            reclaimed =>
             {
                 long live = 0; foreach (var b in _allBuffers) live += b.LengthInBytes;
                 long half = 0; foreach (var b in _allHalfBuffers) half += b.LengthInBytes;
-                throw new InvalidOperationException(
-                    $"GPU out of memory renting '{name}' (+{bucketSize * 4L / 1048576}MB) after reclaiming " +
-                    $"{reclaimed / 1048576}MB of pooled buffers; live working set = {_allBuffers.Count} fp32 " +
-                    $"({live / 1048576}MB) + {_allHalfBuffers.Count} fp16 ({half / 1048576}MB). Exceeds VRAM — " +
-                    "needs tiled execution or fp16 activations.", ex2);
-            }
-        }
+                return $"GPU out of memory renting '{name}' (+{bucketSize * 4L / 1048576}MB) after reclaiming " +
+                       $"{reclaimed / 1048576}MB of pooled buffers; live working set = {_allBuffers.Count} fp32 " +
+                       $"({live / 1048576}MB) + {_allHalfBuffers.Count} fp16 ({half / 1048576}MB). Exceeds VRAM — " +
+                       "needs tiled execution or fp16 activations.";
+            });
         _allBuffers.Add(newBuffer);
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) _namedBuffers[name] = newBuffer;
@@ -223,21 +211,17 @@ public class BufferPool : IDisposable
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
 
-        // ZERO-COPY browser path: a FLOAT32 weight's raw little-endian bytes ARE the GPU float buffer's bytes
-        // (no conversion). If the stream can hand the bytes back as a JS Uint8Array (IJSReadStream - e.g. a
-        // WebTorrent piece stream or an ArrayBuffer/Blob stream) and the GPU buffer is a browser buffer
-        // (IBrowserMemoryBuffer), upload them straight to the GPU via CopyFromJS. The weight bytes never enter
-        // the .NET/WASM managed heap - the whole point in the browser, where a model is mostly weights bound
-        // for the accelerator and never touched by .NET. byteLength == count*4 is always a multiple of 4
-        // (WebGPU WriteBuffer requirement). FP16 (dtype 10) still needs a per-element upcast, so it stays on
-        // the byte[] path below; the half-weight path is handled separately.
-        if (dataType == 1 && byteLength == count * 4 && !DisableJsZeroCopyWeights
-            && stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream jsStream
-            && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer browserBuf)
+        // RAW FLOAT32: a fp32 weight's raw little-endian bytes ARE the GPU float buffer's bytes (no conversion),
+        // so delegate to ILGPU's CopyFromStreamAsync. It streams the bytes in 16 MiB chunks and, on a browser
+        // IJSReadStream source + browser buffer, goes JS->GPU via CopyFromJS without the bytes ever entering the
+        // .NET/WASM managed heap (the whole point in the browser); on desktop it awaits ReadExactlyAsync ->
+        // CopyFromCPU (genuinely async, never blocking). FP16 source (dtype 10) needs a per-element upcast, so
+        // it stays on the byte[] path below. DisableJsZeroCopyWeights forces the managed loop (A/B diagnostic).
+        if (dataType == 1 && byteLength == count * 4 && !DisableJsZeroCopyWeights)
         {
-            using var u8 = await jsStream.ReadUint8ArrayAsync(byteLength, ct).ConfigureAwait(false);
-            browserBuf.CopyFromJS(u8, 0);
-            ZeroCopyWeightBytes += byteLength;
+            await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+            if (stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+                ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
             return new Tensor(buffer.View, shape, name);
         }
 
@@ -288,20 +272,17 @@ public class BufferPool : IDisposable
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
 
-        // ZERO-COPY browser path: a FLOAT16 weight's raw little-endian bytes ARE the GPU Half buffer's bytes
-        // (ILGPU.Half is IEEE binary16, same 2-byte layout as the source - no conversion). Upload straight from
-        // a JS Uint8Array to the GPU via CopyFromJS; the weight bytes never enter the .NET heap. Requires the
-        // byte length be a multiple of 4 (WebGPU WriteBuffer requirement; CopyFromJS does not pad) - true when
-        // the element count is even, which large weight tensors effectively always are; an odd-count fp16 weight
-        // falls through to the byte[] path. FLOAT32 source (dtype 1) needs an fp32->fp16 downcast, so it also
-        // stays on the byte[] path below.
-        if (dataType == 10 && byteLength == count * 2 && byteLength % 4 == 0 && !DisableJsZeroCopyWeights
-            && stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream jsStream
-            && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer browserBuf)
+        // RAW FLOAT16: ILGPU.Half is IEEE binary16, same 2-byte layout as the source (no conversion), so
+        // delegate to CopyFromStreamAsync. It streams in 16 MiB chunks and, on a browser IJSReadStream + browser
+        // buffer, goes JS->GPU via CopyFromJS with no managed-heap copy; the WebGPU 4-byte WriteBuffer rule (an
+        // odd-count Half tensor = byteLength not a multiple of 4) is handled by its managed padded fallback, so
+        // no element-count guard is needed here. FLOAT32 source (dtype 1) needs an fp32->fp16 downcast, so it
+        // stays on the byte[] path below. DisableJsZeroCopyWeights forces the managed loop (A/B diagnostic).
+        if (dataType == 10 && byteLength == count * 2 && !DisableJsZeroCopyWeights)
         {
-            using var u8 = await jsStream.ReadUint8ArrayAsync(byteLength, ct).ConfigureAwait(false);
-            browserBuf.CopyFromJS(u8, 0);
-            ZeroCopyWeightBytes += byteLength;
+            await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+            if (stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+                ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
             return new HalfTensor(buffer.View, shape, name);
         }
 
