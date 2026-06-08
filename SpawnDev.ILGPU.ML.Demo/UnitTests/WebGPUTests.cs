@@ -19,15 +19,23 @@ namespace SpawnDev.ILGPU.ML.Demo.UnitTests;
 public class WebGPUTests : MLTestBase
 {
     private readonly System.Net.Http.HttpClient _http;
+    private readonly SpawnDev.WebTorrent.WebTorrentClient _webTorrent;
+    private readonly SpawnDev.AsyncFileSystem.IAsyncFS _asyncFs;
 
-    public WebGPUTests(System.Net.Http.HttpClient http)
+    public WebGPUTests(System.Net.Http.HttpClient http, SpawnDev.WebTorrent.WebTorrentClient webTorrent, SpawnDev.AsyncFileSystem.IAsyncFS asyncFs)
     {
         _http = http;
+        _webTorrent = webTorrent;
+        _asyncFs = asyncFs;
     }
 
     protected override string BackendName => "WebGPU";
 
     protected override System.Net.Http.HttpClient? GetHttpClient() => _http;
+
+    // The DEMO's OPFS-backed client + filesystem (Program.cs) — so a download measurement exercises the real demo path.
+    protected override SpawnDev.WebTorrent.WebTorrentClient? GetWebTorrentClient() => _webTorrent;
+    protected override SpawnDev.AsyncFileSystem.IAsyncFS? GetAsyncFS() => _asyncFs;
 
     protected override async Task<(Context context, Accelerator accelerator)> CreateAcceleratorAsync()
     {

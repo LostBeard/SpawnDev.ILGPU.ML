@@ -26,6 +26,9 @@ public class InferenceSession : IDisposable
     private readonly GraphExecutor _executor;
     private readonly CompiledGraph _compiled;
     private readonly BufferPool _pool;
+    /// <summary>Weight bytes uploaded straight from JS to the GPU (zero-copy, never entered the .NET heap) during
+    /// this session's streaming load. 0 unless the model was loaded via a JS-backed stream on a browser backend.</summary>
+    public long ZeroCopyWeightBytes => _pool?.ZeroCopyWeightBytes ?? 0;
     private readonly Dictionary<string, Tensor> _weights;
     private List<IDisposable>? _ownedBuffers; // Tracks buffers not managed by the pool (GGUF quantized bytes, etc.)
 

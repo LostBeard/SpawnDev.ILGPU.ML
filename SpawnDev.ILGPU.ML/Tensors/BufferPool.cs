@@ -30,6 +30,16 @@ public class BufferPool : IDisposable
     /// <summary>Number of buffers available for reuse.</summary>
     public int AvailableBufferCount => _buckets.Values.Sum(s => s.Count);
 
+    /// <summary>Test/diagnostic switch: when true, the browser JS zero-copy weight-upload path is skipped and
+    /// the .NET byte[] chunked path is used instead. Lets a measurement A/B the two upload paths from the same
+    /// cached source to isolate the JS&lt;-&gt;.NET copy cost. Default false (zero-copy on where applicable).</summary>
+    public static bool DisableJsZeroCopyWeights = false;
+
+    /// <summary>Total weight bytes uploaded straight from JS to the GPU (zero-copy: never entered the .NET heap)
+    /// by the browser streaming-load path. Stays 0 on desktop / non-JS streams. Lets a load measurement confirm
+    /// the zero-copy path actually fired instead of the .NET byte[] fallback.</summary>
+    public long ZeroCopyWeightBytes { get; private set; }
+
     public BufferPool(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
@@ -213,6 +223,24 @@ public class BufferPool : IDisposable
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
 
+        // ZERO-COPY browser path: a FLOAT32 weight's raw little-endian bytes ARE the GPU float buffer's bytes
+        // (no conversion). If the stream can hand the bytes back as a JS Uint8Array (IJSReadStream - e.g. a
+        // WebTorrent piece stream or an ArrayBuffer/Blob stream) and the GPU buffer is a browser buffer
+        // (IBrowserMemoryBuffer), upload them straight to the GPU via CopyFromJS. The weight bytes never enter
+        // the .NET/WASM managed heap - the whole point in the browser, where a model is mostly weights bound
+        // for the accelerator and never touched by .NET. byteLength == count*4 is always a multiple of 4
+        // (WebGPU WriteBuffer requirement). FP16 (dtype 10) still needs a per-element upcast, so it stays on
+        // the byte[] path below; the half-weight path is handled separately.
+        if (dataType == 1 && byteLength == count * 4 && !DisableJsZeroCopyWeights
+            && stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream jsStream
+            && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer browserBuf)
+        {
+            using var u8 = await jsStream.ReadUint8ArrayAsync(byteLength, ct).ConfigureAwait(false);
+            browserBuf.CopyFromJS(u8, 0);
+            ZeroCopyWeightBytes += byteLength;
+            return new Tensor(buffer.View, shape, name);
+        }
+
         const int CHUNK = 262144; // 256K floats = 1 MB float buffer
         var byteBuf = new byte[CHUNK * srcElemBytes];
         var floatChunk = new float[CHUNK];
@@ -259,6 +287,23 @@ public class BufferPool : IDisposable
                 $"f16 weight load supports FLOAT32 (1) and FLOAT16 (10) raw_data; got dtype {dataType} for '{name}'.");
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
+
+        // ZERO-COPY browser path: a FLOAT16 weight's raw little-endian bytes ARE the GPU Half buffer's bytes
+        // (ILGPU.Half is IEEE binary16, same 2-byte layout as the source - no conversion). Upload straight from
+        // a JS Uint8Array to the GPU via CopyFromJS; the weight bytes never enter the .NET heap. Requires the
+        // byte length be a multiple of 4 (WebGPU WriteBuffer requirement; CopyFromJS does not pad) - true when
+        // the element count is even, which large weight tensors effectively always are; an odd-count fp16 weight
+        // falls through to the byte[] path. FLOAT32 source (dtype 1) needs an fp32->fp16 downcast, so it also
+        // stays on the byte[] path below.
+        if (dataType == 10 && byteLength == count * 2 && byteLength % 4 == 0 && !DisableJsZeroCopyWeights
+            && stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream jsStream
+            && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer browserBuf)
+        {
+            using var u8 = await jsStream.ReadUint8ArrayAsync(byteLength, ct).ConfigureAwait(false);
+            browserBuf.CopyFromJS(u8, 0);
+            ZeroCopyWeightBytes += byteLength;
+            return new HalfTensor(buffer.View, shape, name);
+        }
 
         const int CHUNK = 262144; // 256K elements
         var byteBuf = new byte[CHUNK * srcElemBytes];

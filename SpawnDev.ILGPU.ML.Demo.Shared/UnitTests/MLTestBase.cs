@@ -41,6 +41,19 @@ public abstract partial class MLTestBase : IDisposable
         return _envHttpClient;
     }
 
+    /// <summary>
+    /// The DI-registered <see cref="SpawnDev.WebTorrent.WebTorrentClient"/> the DEMO uses (OPFS-backed in the
+    /// browser, so the zero-copy web-seed download path fires). Browser subclasses override to return the
+    /// injected singleton; returns null elsewhere (desktop / lanes without it) so download-measurement tests
+    /// skip rather than measure a different, non-demo client.
+    /// </summary>
+    protected virtual SpawnDev.WebTorrent.WebTorrentClient? GetWebTorrentClient() => null;
+
+    /// <summary>The DI-registered OPFS file system the demo's WebTorrentClient persists to. Browser subclasses
+    /// override to return the injected singleton; null elsewhere. Lets a download measurement clear stale
+    /// cross-run OPFS state before a clean cold run.</summary>
+    protected virtual SpawnDev.AsyncFileSystem.IAsyncFS? GetAsyncFS() => null;
+
     private Context? _cachedContext;
     private Accelerator? _cachedAccelerator;
 
