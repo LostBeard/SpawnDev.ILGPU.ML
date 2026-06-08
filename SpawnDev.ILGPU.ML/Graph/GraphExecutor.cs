@@ -166,6 +166,18 @@ public class GraphExecutor : IDisposable
     /// through dtype-preserving / binary ops. See <see cref="BuildIntegerTensorNames"/>.</summary>
     private readonly HashSet<string> _integerTensorNames;
 
+    /// <summary>Output tensor names whose ≤64-elem mid-graph readback is provably unnecessary and is
+    /// SKIPPED (built once at construction by <see cref="BuildReadbackSkipSet"/>). These are
+    /// feature/data tensors — e.g. LayerNorm ReduceMean/Add/Sqrt intermediates — that no downstream op
+    /// consumes as a runtime-constant value, only as a GPU tensor. The eager ≤64 readback grabbed them
+    /// anyway (they're small + token-dependent so the warm cache can't elide them), costing ~2.7s/step
+    /// on WebGPU GPT-2 (53 readbacks) for values nothing reads. See <see cref="BuildReadbackSkipSet"/>
+    /// for the safety rules (never skips anything a value-needing op consumes).</summary>
+    private readonly HashSet<string> _readbackSkipNames;
+    /// <summary>DIAGNOSTIC: count of names in <see cref="_readbackSkipNames"/> for the most recently
+    /// constructed executor.</summary>
+    public static int LastReadbackSkipCount;
+
     /// <summary>Number of integer-typed tensors identified by BuildIntegerTensorNames
     /// in the most recently constructed GraphExecutor. Diagnostic for verifying that
     /// dtype propagation is reaching Div / Mul / Mod chains it needs to.</summary>
@@ -189,6 +201,11 @@ public class GraphExecutor : IDisposable
     public static int LastRunReadbackCount;
     /// <summary>DIAGNOSTIC: total wall-clock ms spent in those mid-graph readbacks. Reset per RunAsync.</summary>
     public static double LastRunReadbackMs;
+    /// <summary>DIAGNOSTIC: "OpType:outName" of every mid-graph readback that actually fired in the most
+    /// recent RunAsync (i.e. NOT skipped by the warm shape-readback cache). In warm fixed-shape decode this
+    /// is the RESIDUAL set — the per-step token-dependent readbacks the cache can't elide. Reset per RunAsync.
+    /// Used to decide whether those readbacks are even needed downstream (vs pure-data waste).</summary>
+    public static List<string> LastRunReadbackNames = new();
 
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
@@ -207,6 +224,8 @@ public class GraphExecutor : IDisposable
         _integerTensorNames = BuildIntegerTensorNames(graph);
         LastIntegerTensorCount = _integerTensorNames.Count;
         LastIntegerTensorNames = _integerTensorNames.ToList();
+        _readbackSkipNames = BuildReadbackSkipSet(graph);
+        LastReadbackSkipCount = _readbackSkipNames.Count;
 
         // Auto-detect KV cache pattern
         var inputShapes = new Dictionary<string, int[]>();
@@ -683,6 +702,7 @@ public class GraphExecutor : IDisposable
         LastRunIntegerDivCount = 0;
         LastRunReadbackCount = 0;
         LastRunReadbackMs = 0;
+        LastRunReadbackNames.Clear();
         var tensors = new Dictionary<string, Tensor>();
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
@@ -1120,6 +1140,11 @@ public class GraphExecutor : IDisposable
                 if (outTensor != null && outTensor.ElementCount > 0 && outTensor.ElementCount <= 64)
                 {
                     var outName = oi < node.OutputNames.Length ? node.OutputNames[oi] : null;
+                    // Static skip set: this output is feature/data that no value-needing op consumes
+                    // (e.g. LayerNorm ReduceMean/Add/Sqrt intermediates) — the eager ≤64 readback was
+                    // pure waste (token-dependent, so the warm cache can't help). See BuildReadbackSkipSet.
+                    if (outName != null && _readbackSkipNames.Contains(outName))
+                        continue;
                     // Warm readback cache: value already seeded into runtimeConstants from the proven-
                     // stable set — skip the GPU round-trip entirely.
                     if (outName != null && warmReadback && _readbackStable!.ContainsKey(outName))
@@ -1154,6 +1179,7 @@ public class GraphExecutor : IDisposable
                             _rbSw.Stop();
                             LastRunReadbackCount++;
                             LastRunReadbackMs += _rbSw.Elapsed.TotalMilliseconds;
+                            LastRunReadbackNames.Add($"{node.OpType}:{outName}");
                             // Probing: record this run's value for cross-run stability comparison.
                             if (readbackThisRun != null) readbackThisRun[outName] = runtimeConstants[outName];
                         }
@@ -1405,6 +1431,85 @@ public class GraphExecutor : IDisposable
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _ew.Dispose();
+    }
+
+    // ── Mid-graph readback skip set ──────────────────────────────────────────────
+    // The async executor eagerly reads back EVERY ≤64-elem node output into runtimeConstants so that
+    // downstream value-consuming ops (Slice starts/ends, Reshape dims, Range bounds, Gather indices, …)
+    // can resolve their parameters on the CPU. But many small outputs are pure feature DATA that NO op
+    // ever reads as a value — most notably LayerNorm's per-row ReduceMean / Add(eps) / Sqrt intermediates
+    // ([1, seq, 1], so ≤64 whenever seq≤64). Those are token-dependent (the warm shape-readback cache
+    // can't elide them) so they were read back EVERY decode step — measured 53 readbacks ≈ 2.7s/step on
+    // WebGPU GPT-2, a ~32% decode cost for values nothing consumes. We pre-compute, from the static graph,
+    // the outputs whose readback is provably unnecessary and skip them.
+
+    /// <summary>Ops whose output is ALWAYS feature/data and is never consumed as a runtime-constant
+    /// param value (reductions to a mean/var, activations, big matmuls). Conservative on purpose — only
+    /// ops that cannot appear in a shape/index computation. Dual-use ops (Add/Sub/Mul/Div/Pow, ReduceSum/
+    /// ReduceProd, Shape/Gather/Concat/Cast) are deliberately EXCLUDED.</summary>
+    private static readonly HashSet<string> ReadbackFeatureOnlyProducers = new(StringComparer.Ordinal)
+    {
+        "ReduceMean", "ReduceMax", "ReduceMin", "ReduceL1", "ReduceL2", "ReduceSumSquare",
+        "Sqrt", "Softmax", "LogSoftmax", "Gelu", "Erf", "Relu", "LeakyRelu", "PRelu",
+        "Sigmoid", "Tanh", "HardSigmoid", "HardSwish", "SiLU", "Mish", "Softplus", "Elu", "Selu", "Celu",
+        "MatMul", "Gemm", "Conv", "ConvTranspose", "LayerNormalization", "BatchNormalization",
+        "InstanceNormalization", "GroupNormalization", "RMSNormalization",
+    };
+
+    /// <summary>Ops that read at least one input's runtime-constant VALUE and have NO correct GPU-only
+    /// fallback for it — i.e. they GENUINELY need the readback (shape/index/param resolution). If an
+    /// output feeds any of these, it is NEVER skipped. Over-inclusion here is safe (it only keeps a
+    /// readback that may be unnecessary); omission is the dangerous direction, so the list is broad.</summary>
+    private static readonly HashSet<string> ReadbackRequiresValueConsumers = new(StringComparer.Ordinal)
+    {
+        "Reshape", "Slice", "Expand", "Resize", "Upsample", "Pad", "Unsqueeze", "Squeeze", "Range",
+        "Tile", "ConstantOfShape", "TopK", "NonZero", "Compress", "Unique", "OneHot", "Gather",
+        "GatherElements", "GatherND", "ScatterElements", "ScatterND", "Scatter", "EyeLike", "Multinomial",
+        "CumSum", "HannWindow", "HammingWindow", "BlackmanWindow", "Cast", "Mod", "Trilu", "Split",
+        "ReduceSum", "ReduceProd", "Concat", "Shape", "Equal", "Where",
+    };
+
+    /// <summary>Build the set of node-output names whose ≤64-elem mid-graph readback can be safely skipped.
+    /// An output is skipped iff (a) NO consumer is in <see cref="ReadbackRequiresValueConsumers"/>, AND
+    /// (b) either its producer is in <see cref="ReadbackFeatureOnlyProducers"/> OR every consumer is itself
+    /// a feature-only (value-never-reading) op. Both directions are conservative: the only outputs removed
+    /// are ones provably read only as GPU tensors, so correctness is unchanged while the wasted per-step
+    /// GPU round-trips disappear.</summary>
+    private static HashSet<string> BuildReadbackSkipSet(CompiledGraph graph)
+    {
+        var skip = new HashSet<string>(StringComparer.Ordinal);
+        // producer op-type per output, consumer op-types per tensor name
+        var producerOp = new Dictionary<string, string>(StringComparer.Ordinal);
+        var consumerOps = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var node in graph.Nodes)
+        {
+            foreach (var o in node.OutputNames)
+                if (!string.IsNullOrEmpty(o)) producerOp[o] = node.OpType;
+            foreach (var inp in node.InputNames)
+            {
+                if (string.IsNullOrEmpty(inp)) continue;
+                if (!consumerOps.TryGetValue(inp, out var list)) { list = new List<string>(); consumerOps[inp] = list; }
+                list.Add(node.OpType);
+            }
+        }
+
+        foreach (var node in graph.Nodes)
+        {
+            foreach (var o in node.OutputNames)
+            {
+                if (string.IsNullOrEmpty(o)) continue;
+                var cons = consumerOps.GetValueOrDefault(o);
+                // Any consumer that genuinely needs the value → must keep the readback.
+                if (cons != null && cons.Any(c => ReadbackRequiresValueConsumers.Contains(c))) continue;
+                bool featureProducer = ReadbackFeatureOnlyProducers.Contains(node.OpType);
+                // Rule B: every consumer is itself a feature-only op (which never reads a value). Vacuously
+                // true for a dead/graph-output tensor (nothing reads its value either).
+                bool allConsumersFeatureOnly = cons == null || cons.All(c => ReadbackFeatureOnlyProducers.Contains(c));
+                if (featureProducer || allConsumersFeatureOnly)
+                    skip.Add(o);
+            }
+        }
+        return skip;
     }
 
     /// <summary>
