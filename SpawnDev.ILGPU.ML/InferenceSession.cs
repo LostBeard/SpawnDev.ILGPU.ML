@@ -1802,9 +1802,11 @@ public class InferenceSession : IDisposable
         return result;
     }
 
-    /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm)
-    /// which deadlock on synchronous Synchronize(). Periodically flushes GPU commands.
-    /// Recompiles for the actual input shape when it differs from the compile-time shape.</summary>
+    /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm): a synchronous
+    /// Synchronize() only flushes (dispatches) the GPU queue and returns without awaiting (it does NOT
+    /// deadlock), so you must SynchronizeAsync() to await GPU completion before a readback. Periodically
+    /// awaits to drain GPU commands. Recompiles for the actual input shape when it differs from the
+    /// compile-time shape.</summary>
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
         var exec = ResolveExecutor(inputs);

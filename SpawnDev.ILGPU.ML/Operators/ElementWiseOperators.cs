@@ -476,7 +476,9 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
         {
             // Scalar/small exponent broadcast (LayerNorm x^2, InstanceNorm x^2).
             // Expand exponent to full size on CPU, then element-wise Pow.
-            // Avoids BroadcastBinaryOpND which has synchronous Synchronize() — deadlocks on WebGPU.
+            // Avoids BroadcastBinaryOpND's synchronous Synchronize()+readback path, which is unsafe on
+            // browser: a sync Synchronize() only flushes (dispatches) without awaiting (NOT a deadlock),
+            // so a following synchronous readback reads stale/not-yet-computed data.
             var bVals = ctx.TryGetInputValues(1);
             if (bVals != null)
             {

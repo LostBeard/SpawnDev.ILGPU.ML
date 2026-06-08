@@ -692,9 +692,11 @@ public class GraphExecutor : IDisposable
     }
 
     /// <summary>
-    /// Async version of Run. Required for browser backends (WebGPU/WebGL/Wasm)
-    /// which deadlock on synchronous Synchronize(). Periodically awaits
-    /// SynchronizeAsync() to flush GPU command buffers.
+    /// Async version of Run. Required for browser backends (WebGPU/WebGL/Wasm): a synchronous
+    /// Synchronize() only FLUSHES (dispatches/submits) the GPU queue and returns WITHOUT waiting —
+    /// it does NOT deadlock — so results aren't ready for a synchronous readback. You must
+    /// SynchronizeAsync() to AWAIT GPU completion. Periodically awaits SynchronizeAsync() to
+    /// flush + drain GPU command buffers.
     /// </summary>
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
