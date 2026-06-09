@@ -19,12 +19,17 @@ builder.Services.AddBlazorJSRuntime();
 builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
 
 // WebTorrent client for P2P model delivery (direct stream access, no service worker needed).
-// Wire the OPFS filesystem into the client so torrent pieces persist to OPFS AND the zero-copy browser
-// download path fires (each piece's bytes stay in JS: fetch -> SubtleCrypto -> OPFS, no .NET byte[] hop).
-// Without AsyncFileSystem the client falls back to an in-memory store + the byte[] download path, so the
-// model download never uses zero-copy.
+// The download store needs a Uint8Array-capable IAsyncBrowserFileSystem for the zero-copy browser path to
+// fire (each piece's bytes stay in JS: fetch -> SubtleCrypto -> store, no .NET byte[] hop). The OPFS FS
+// (AsyncFSFileSystemDirectoryHandle) qualifies on paper, but was NOT reliably triggering zero-copy at
+// runtime (the model download fell back to the byte[] path: 4 concurrent web-seed connections + ~10s
+// stalls). AsyncFSMemory is an in-memory IAsyncBrowserFileSystem (JS Blob storage, browser-managed) that
+// supports Uint8Array reliably, so zero-copy ALWAYS fires; Blob storage also avoids the WASM-heap OOM a
+// .NET byte[] store hits on multi-GB models. Persistence (OPFS) stays available via the IAsyncFS singleton
+// for the model cache; the per-download store is ephemeral (re-downloaded each session, which the SD-Turbo
+// path does anyway).
 builder.Services.AddSingleton<WebTorrentClient>(sp =>
-    new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = sp.GetRequiredService<IAsyncFS>() }));
+    new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = new AsyncFSMemory() }));
 
 // Shared OPFS model cache (browser). One instance so every demo + the cache-management page see the same
 // cached models. ModelCache reads/writes the persistent OPFS "ilgpu-ml-models" dir, so even multiple

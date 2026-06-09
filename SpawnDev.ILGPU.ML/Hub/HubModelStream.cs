@@ -131,6 +131,21 @@ public class HubModelStream
     }
 
     /// <summary>
+    /// Remove a previously-<see cref="OpenAsync"/>'d model's torrent from the client. Call this once the
+    /// model is fully loaded (after disposing its <see cref="HubModel.Stream"/>) so the per-file torrents
+    /// do NOT accumulate: an open torrent keeps its own web-seed connection running, and in the browser
+    /// every torrent's piece-receive + SHA verify + OPFS write share the single WASM thread — so N open
+    /// torrents = N concurrent downloads that starve the model currently being uploaded to the GPU (a
+    /// multi-file model like SD-Turbo otherwise crawls even though the hub serves fast). Removing each
+    /// torrent after its model loads keeps exactly one active at a time.
+    /// </summary>
+    public Task RemoveAsync(HubModel model)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return _client.RemoveAsync(model.Torrent);
+    }
+
+    /// <summary>
     /// Inspect a hub-served model's structure WITHOUT downloading its weights — the inspector seeks
     /// past every weight blob, so only graph-structure pieces are fetched over the wire.
     /// </summary>
