@@ -89,12 +89,14 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         await using (vocabFile.Stream)
         using (var r = new System.IO.StreamReader(vocabFile.Stream))
             vocabJson = await r.ReadToEndAsync();
-        await hubStream.RemoveAsync(vocabFile);   // drop the torrent so it stops competing for the WASM thread
+        // NOTE: do NOT remove the per-file torrents after load. RemoveAsync disposes the model's AsyncFSMemory
+        //   Blobs, but the WebTorrent store's cached File references them (new File([blob]) is a reference, not a
+        //   copy), so disposing mid-load raced an in-flight read -> intermittent NotReadableError. The download
+        //   works fine on AsyncFSMemory alone (the browser spills the accumulated Blobs to disk).
         var mergesFile = await hubStream.OpenAsync(repoId, "tokenizer/merges.txt");
         await using (mergesFile.Stream)
         using (var r = new System.IO.StreamReader(mergesFile.Stream))
             mergesText = await r.ReadToEndAsync();
-        await hubStream.RemoveAsync(mergesFile);
         pipe._tokenizer = BPETokenizer.Load(vocabJson, mergesText);
         onProgress?.Invoke("tokenizer", 100);
 
@@ -109,7 +111,6 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             pipe._textEncoder = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, teModel.Stream,
                 onProgress: (s, p) => { Console.WriteLine($"[GenLoad {Environment.TickCount64}ms] text_encoder/{s} {p}%"); onProgress?.Invoke($"text_encoder:{s}", p); },
                 inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 77 } });
-        await hubStream.RemoveAsync(teModel);     // loaded onto the GPU; remove so unet downloads alone
         onProgress?.Invoke("text_encoder", 100);
 
         onProgress?.Invoke("unet", 0);
@@ -123,7 +124,6 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
                     ["timestep"] = new[] { 1 },
                     ["encoder_hidden_states"] = new[] { 1, 77, 1024 },
                 });
-        await hubStream.RemoveAsync(unetModel);   // 1.7GB loaded; remove before the vae download
         onProgress?.Invoke("unet", 100);
 
         onProgress?.Invoke("vae_decoder", 0);
@@ -132,7 +132,6 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             pipe._vaeDecoder = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, vaeModel.Stream,
                 onProgress: (s, p) => { Console.WriteLine($"[GenLoad {Environment.TickCount64}ms] vae_decoder/{s} {p}%"); onProgress?.Invoke($"vae_decoder:{s}", p); },
                 inputShapes: new Dictionary<string, int[]> { ["latent_sample"] = new[] { 1, 4, 64, 64 } });
-        await hubStream.RemoveAsync(vaeModel);
         onProgress?.Invoke("vae_decoder", 100);
 
         pipe._alphasCumprod = DiffusionScheduler.ComputeAlphasCumprod();
