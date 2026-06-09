@@ -75,6 +75,24 @@ internal static class BroadcastHelper
         }
     }
 
+    /// <summary>
+    /// WebGPU and WebGL forbid binding the same GPU buffer to two storage slots in one dispatch. When an
+    /// ONNX graph feeds the SAME tensor to BOTH operands of a binary op (e.g. <c>x - x</c>, <c>x / x</c> —
+    /// the executor hands back the same <see cref="Tensor"/> instance for a repeated input name), the op
+    /// would bind one buffer to two slots and the backend throws an aliasing violation. This de-aliases by
+    /// copying the second operand into a pooled temp. Returns <paramref name="b"/> unchanged when there is
+    /// no aliasing; otherwise the pooled copy (the caller must <c>ctx.Pool.Return(rented)</c> after the
+    /// dispatch). <c>CopyFrom</c> is a native GPU→GPU command (no kernel dispatch) valid on every backend.
+    /// </summary>
+    internal static Tensor DeAliasSecondOperand(OnnxOpContext ctx, Tensor a, Tensor b, out Tensor? rented)
+    {
+        rented = null;
+        if (!object.ReferenceEquals(a, b)) return b;
+        rented = ctx.Pool.Rent(b.Shape, "_dealias");
+        rented.Data.SubView(0, b.ElementCount).CopyFrom(b.Data.SubView(0, b.ElementCount));
+        return rented;
+    }
+
     internal static int[] ComputeStrides(int[] shape, int[] outShape)
     {
         // Broadcast strides: if dim size is 1 or shape is shorter, stride is 0 (broadcast)
@@ -302,20 +320,11 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         if (a.ElementCount == b.ElementCount)
         {
-            // WebGPU forbids binding the same buffer to multiple storage slots.
-            // Detect aliasing (e.g., x * x where both inputs are the same tensor)
-            // and copy to a temp buffer to avoid the aliasing violation.
-            if (object.ReferenceEquals(a, b))
-            {
-                var temp = ctx.Pool.Rent(b.Shape, "_mul_alias");
-                reg.ElementWise.Scale(b.Data, temp.Data, b.ElementCount, 1f);
-                reg.ElementWise.Mul(a.Data, temp.Data, ctx.Outputs[0].Data, a.ElementCount);
-                ctx.Pool.Return(temp);
-            }
-            else
-            {
-                reg.ElementWise.Mul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
-            }
+            // De-alias if both operands are the same tensor (x * x): WebGPU/WebGL forbid binding one
+            // buffer to two storage slots. (Shared helper — same guard Sub/Div use.)
+            var bb = DeAliasSecondOperand(ctx, a, b, out var rented);
+            reg.ElementWise.Mul(a.Data, bb.Data, ctx.Outputs[0].Data, a.ElementCount);
+            if (rented != null) ctx.Pool.Return(rented);
         }
         else if (b.ElementCount == a.Shape[^1])
         {
@@ -360,8 +369,12 @@ public class SubOperator(OperatorRegistry reg) : IOnnxOperator
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
-            // Single-dispatch subtract — safe, no aliasing risk
-            reg.ElementWise.Sub(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            // Single-dispatch subtract. De-alias if both operands are the same tensor (e.g. an ONNX
+            // graph Sub fed x to both inputs → x - x): WebGPU/WebGL reject binding one buffer to two
+            // storage slots. (This is the SD-Turbo UNet aliasing crash — node 'Sub' with identical inputs.)
+            var bb = DeAliasSecondOperand(ctx, a, b, out var rented);
+            reg.ElementWise.Sub(a.Data, bb.Data, ctx.Outputs[0].Data, a.ElementCount);
+            if (rented != null) ctx.Pool.Return(rented);
         }
         else if (a.ElementCount == b.ElementCount)
         {
@@ -394,7 +407,11 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         if (a.ElementCount == b.ElementCount)
         {
-            reg.ElementWise.Div(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
+            // De-alias if both operands are the same tensor (x / x): WebGPU/WebGL reject binding one
+            // buffer to two storage slots (same class of crash as the SD-Turbo Sub aliasing).
+            var bb = DeAliasSecondOperand(ctx, a, b, out var rented);
+            reg.ElementWise.Div(a.Data, bb.Data, ctx.Outputs[0].Data, a.ElementCount);
+            if (rented != null) ctx.Pool.Return(rented);
         }
         else if (b.ElementCount == 1)
         {
