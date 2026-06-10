@@ -148,16 +148,77 @@ public class BPETokenizer : ITokenizer
     /// </summary>
     public int[] EncodeCLIP(string text, int maxLength = 77)
     {
-        var tokens = Encode(text.ToLowerInvariant());
+        // CLIP BPE (NOT the GPT-2 Encode): whitespace-collapse + regex pretokenize (no standalone space
+        // tokens) + byte-encode + BPE with </w> word-ending. The GPT-2 Encode produced 'Ġ'(space) tokens
+        // and no </w>, so "a photo of a cat" tokenized to gibberish → broken conditioning.
+        var tokens = EncodeClipBpe(text);
         var result = new List<int> { 49406 }; // <|startoftext|>
         result.AddRange(tokens.Take(maxLength - 2));
         result.Add(49407); // <|endoftext|>
 
-        // Pad to maxLength
+        // Pad to maxLength with the EOS token (49407) — CLIP's pad_token IS <|endoftext|>
+        // (HF CLIPTokenizer.pad_token_id == 49407). SD's text encoder runs over ALL 77 positions with no
+        // attention mask and the UNet cross-attends to all of them, so padding with token 0 ("!") instead
+        // of EOS swamps the real prompt with ~70 junk tokens → conditioning collapses → the UNet predicts
+        // ε≈input-noise → x0 goes near-flat → VAE decodes green mush. Must be 49407, not 0.
         while (result.Count < maxLength)
-            result.Add(0);
+            result.Add(49407);
 
         return result.Take(maxLength).ToArray();
+    }
+
+    // ── CLIP BPE (OpenAI CLIP simple_tokenizer) ──
+    // Distinct from the GPT-2 Encode(): CLIP whitespace-cleans + regex-pretokenizes so spaces are NOT
+    // emitted as tokens, byte-encodes the UTF-8 bytes of each match, and appends </w> to the LAST symbol
+    // of each word before BPE-merging (the merges/vocab contain the </w> forms).
+    private static readonly System.Text.RegularExpressions.Regex ClipPat = new(
+        @"<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|\p{L}+|\p{N}|[^\s\p{L}\p{N}]+",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+    private readonly Dictionary<string, string> _clipBpeCache = new();
+
+    private static string WhitespaceClean(string text) =>
+        System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ").Trim();
+
+    private int[] EncodeClipBpe(string text)
+    {
+        text = WhitespaceClean(text).ToLowerInvariant();
+        var ids = new List<int>();
+        foreach (System.Text.RegularExpressions.Match m in ClipPat.Matches(text))
+        {
+            var byteWord = string.Concat(System.Text.Encoding.UTF8.GetBytes(m.Value).Select(b => ByteToUnicode(b)));
+            foreach (var tok in BpeClip(byteWord).Split(' '))
+                if (_encoder.TryGetValue(tok, out int id)) ids.Add(id);
+        }
+        return ids.ToArray();
+    }
+
+    private string BpeClip(string token)
+    {
+        if (token.Length == 0) return token;
+        if (_clipBpeCache.TryGetValue(token, out var cached)) return cached;
+
+        var word = new List<string>(token.Length);
+        for (int i = 0; i < token.Length; i++) word.Add(token[i].ToString());
+        word[^1] += "</w>"; // CLIP word-end marker on the last symbol
+
+        while (word.Count >= 2)
+        {
+            (string, string)? best = null; int bestRank = int.MaxValue;
+            for (int i = 0; i < word.Count - 1; i++)
+                if (_bpeRanks.TryGetValue((word[i], word[i + 1]), out int rank) && rank < bestRank) { bestRank = rank; best = (word[i], word[i + 1]); }
+            if (best == null) break;
+            var merged = best.Value.Item1 + best.Value.Item2;
+            var nw = new List<string>(); int j = 0;
+            while (j < word.Count)
+            {
+                if (j < word.Count - 1 && word[j] == best.Value.Item1 && word[j + 1] == best.Value.Item2) { nw.Add(merged); j += 2; }
+                else { nw.Add(word[j]); j++; }
+            }
+            word = nw;
+        }
+        var result = string.Join(" ", word);
+        _clipBpeCache[token] = result;
+        return result;
     }
 
     private string ApplyBPE(string token)
