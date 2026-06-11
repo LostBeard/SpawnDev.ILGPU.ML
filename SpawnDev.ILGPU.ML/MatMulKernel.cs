@@ -310,8 +310,14 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        if (_useSimpleKernels)
+        if (_useSimpleKernels || M == 1)
         {
+            // GEMV (M == 1, the LLM decode shape): the simple thread-per-output kernel
+            // IS the right GEMV for row-major B[K,N] - consecutive threads n read
+            // consecutive B addresses (coalesced) and broadcast-read A[k]. The 16x16
+            // tiled kernel pads the single row to a 16-row tile (15/16 of every
+            // 256-thread group idle), and its shared-memory staging buys nothing at
+            // M = 1: there is no A-row reuse and GEMV touches each B element once.
             _simpleMatMulKernel!(M * N, A, B, C, M, K, N);
         }
         else if (M >= REG_TILE && N >= REG_TILE)
@@ -370,8 +376,11 @@ public class MatMulKernel
         var accelerator = _accelerator;
         EnsureKernelsLoaded(accelerator);
 
-        if (_useSimpleKernels)
+        if (_useSimpleKernels || M == 1)
         {
+            // Batched GEMV (M == 1 per batch entry = decode-time attention, one row of
+            // Q against K^T/V per head): same routing rationale as MatMul - the tiled
+            // kernel pads each batch entry's single row to a 16-row tile (15/16 idle).
             _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
         }
         else
