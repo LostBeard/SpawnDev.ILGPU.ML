@@ -458,6 +458,29 @@ public static partial class ModelInspectorHelper
         }
         largestWeights.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
 
+        // Full metadata KV map. LargestWeights caps at 20 (all big quantized matmuls), so the
+        // architecturally-decisive small tensors and the metadata that describes them (sliding-window
+        // pattern, per-layer head_count_kv, dual RoPE base, logit soft-cap) would otherwise be invisible.
+        // Array values (e.g. 262K-token tokenizer lists) are summarized so they never bloat the result.
+        var metadata = model.Metadata
+            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => new MetadataEntry { Key = kv.Key, Value = FormatMetadataValue(kv.Value) })
+            .ToArray();
+
+        // Tensor-name templates with blk.N collapsed to blk.* — surfaces EVERY distinct tensor shape
+        // (incl. the small norms/scales hidden by LargestWeights.Take(20)) without listing all N hundred.
+        var templates = model.Tensors
+            .GroupBy(t => CollapseBlock(t.Name))
+            .Select(g => { var ex = g.First(); return new TensorTemplate
+            {
+                Name = CollapseBlock(ex.Name),
+                DataType = ex.Type.ToString(),
+                ExampleShape = ex.Shape,
+                Count = g.Count(),
+            }; })
+            .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ToArray();
+
         return new InspectionResult
         {
             GraphName = $"{model.Name} ({model.Architecture})",
@@ -483,8 +506,52 @@ public static partial class ModelInspectorHelper
                 DataType = "text"
             }},
             LargestWeights = largestWeights.Take(20).ToArray(),
+            Metadata = metadata,
+            TensorTemplates = templates,
             FileSizeBytes = fileSize,
         };
+    }
+
+    /// <summary>Collapse a per-layer tensor name's block index so all layers share one template
+    /// (e.g. "blk.7.attn_q_norm.weight" → "blk.*.attn_q_norm.weight").</summary>
+    private static string CollapseBlock(string name)
+        => System.Text.RegularExpressions.Regex.Replace(name, @"\bblk\.\d+\.", "blk.*.");
+
+    /// <summary>Render a GGUF metadata value for display. Scalars/strings pass through (long strings
+    /// truncated); arrays are summarized as "[N × elemType] {first few…}" so a 262K-entry tokenizer
+    /// list never materializes into the inspection output.</summary>
+    private static string FormatMetadataValue(object? v)
+    {
+        if (v is null) return "null";
+        if (v is string s) return s.Length > 120 ? s[..120] + "…" : s;
+        if (v is Array arr)
+        {
+            // Boxed arrays (bool[]/int[] come through as object[]) report element type "Object" — infer the
+            // real element type from the first non-null entry so the reader sees "[48 × bool]" not "[48 × Object]".
+            var declared = arr.GetType().GetElementType();
+            var elemType = declared != null && declared != typeof(object)
+                ? declared
+                : arr.Cast<object?>().FirstOrDefault(x => x != null)?.GetType();
+            var shown = arr.Cast<object?>().Take(8).Select(FormatMetadataElement);
+            return $"[{arr.Length} × {FriendlyTypeName(elemType)}] {{{string.Join(", ", shown)}{(arr.Length > 8 ? ", …" : "")}}}";
+        }
+        return v.ToString() ?? "";
+    }
+
+    private static string FriendlyTypeName(Type? t) => t?.Name switch
+    {
+        null => "?",
+        "Boolean" => "bool", "String" => "str", "Single" => "f32", "Double" => "f64",
+        "Byte" => "u8", "SByte" => "i8", "Int16" => "i16", "UInt16" => "u16",
+        "Int32" => "i32", "UInt32" => "u32", "Int64" => "i64", "UInt64" => "u64",
+        var n => n,
+    };
+
+    private static string FormatMetadataElement(object? e)
+    {
+        if (e is null) return "null";
+        if (e is string s) return "\"" + (s.Length > 24 ? s[..24] + "…" : s) + "\"";
+        return e.ToString() ?? "";
     }
 
     /// <summary>Inspect a SafeTensors file (weights only, no graph).</summary>
@@ -715,6 +782,17 @@ public class InspectionResult
     public TensorInfo[] Outputs { get; set; } = Array.Empty<TensorInfo>();
     public WeightInfo[] LargestWeights { get; set; } = Array.Empty<WeightInfo>();
 
+    /// <summary>Full key/value metadata map. Populated for header formats that carry one (GGUF today);
+    /// empty otherwise. Array values are summarized so large embedded arrays (tokenizer lists) never
+    /// bloat the result. This is where frontier-arch detail lives (sliding-window pattern, per-layer
+    /// head_count_kv, dual RoPE base, logit soft-cap) that LargestWeights cannot show.</summary>
+    public MetadataEntry[] Metadata { get; set; } = Array.Empty<MetadataEntry>();
+
+    /// <summary>Distinct tensor-name templates (per-layer block index collapsed to blk.*). Populated for
+    /// GGUF; empty otherwise. Surfaces every tensor SHAPE including the small norms/scales hidden by the
+    /// LargestWeights top-20 cap, without enumerating all N hundred tensors.</summary>
+    public TensorTemplate[] TensorTemplates { get; set; } = Array.Empty<TensorTemplate>();
+
     public string TotalParametersFormatted => TotalParameters switch
     {
         >= 1_000_000_000 => $"{TotalParameters / 1_000_000_000.0:F1}B",
@@ -755,6 +833,24 @@ public class WeightInfo
         >= 1024 => $"{SizeBytes / 1024.0:F1} KB",
         _ => $"{SizeBytes} B",
     };
+}
+
+/// <summary>One GGUF metadata key/value pair (array values pre-summarized for display).</summary>
+public class MetadataEntry
+{
+    public string Key { get; set; } = "";
+    public string Value { get; set; } = "";
+}
+
+/// <summary>A distinct tensor-name template (per-layer block index collapsed to blk.*) with an example
+/// shape/dtype and how many tensors share it.</summary>
+public class TensorTemplate
+{
+    public string Name { get; set; } = "";
+    public string DataType { get; set; } = "";
+    public int[] ExampleShape { get; set; } = Array.Empty<int>();
+    public int Count { get; set; }
+    public string ShapeStr => $"[{string.Join(", ", ExampleShape)}]";
 }
 
 /// <summary>Result of checking model compatibility with our engine.</summary>

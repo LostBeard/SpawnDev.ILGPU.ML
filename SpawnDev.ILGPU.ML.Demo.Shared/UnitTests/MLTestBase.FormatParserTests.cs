@@ -124,6 +124,76 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task ModelInspector_GGUF_SurfacesMetadataKVsAndTensorTemplates() => await RunTest(async accelerator =>
+    {
+        // Regression guard for the inspector enhancement: BuildGGUFResult must surface (a) the FULL
+        // metadata KV map (incl. arrays, with the real element type) and (b) tensor-name templates with
+        // blk.N collapsed — so the small-but-decisive tensors the LargestWeights top-20 cap hides
+        // (norms/scales) and the frontier-arch metadata (per-layer head_count_kv, sliding-window pattern)
+        // are visible. Without these, gemma4's QK-norm / interleave / soft-cap would be invisible.
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        bw.Write((byte)'G'); bw.Write((byte)'G'); bw.Write((byte)'U'); bw.Write((byte)'F');
+        bw.Write((uint)3);    // version
+        bw.Write((ulong)3);   // tensor count
+        bw.Write((ulong)3);   // metadata KV count
+
+        WriteGGUFString(bw, "general.architecture");
+        bw.Write((uint)8); WriteGGUFString(bw, "testarch");
+
+        // i32 array (mirrors gemma4's per-layer head_count_kv = [8,8,1])
+        WriteGGUFString(bw, "testarch.attention.head_count_kv");
+        bw.Write((uint)9); bw.Write((uint)5); bw.Write((ulong)3); // Array of Int32, count 3
+        bw.Write(8); bw.Write(8); bw.Write(1);
+
+        // bool array (mirrors gemma4's sliding_window_pattern = [true,true,false])
+        WriteGGUFString(bw, "testarch.attention.sliding_window_pattern");
+        bw.Write((uint)9); bw.Write((uint)7); bw.Write((ulong)3); // Array of Bool, count 3
+        bw.Write((byte)1); bw.Write((byte)1); bw.Write((byte)0);
+
+        void WriteTensorInfo(string name, ulong dim, uint ggmlType, ulong offset)
+        {
+            WriteGGUFString(bw, name);
+            bw.Write((uint)1); bw.Write(dim); bw.Write(ggmlType); bw.Write(offset);
+        }
+        // Two per-layer norms (collapse to one template) + one model-level tensor. All F32.
+        WriteTensorInfo("blk.0.attn_q_norm.weight", 4, 0, 0);
+        WriteTensorInfo("blk.1.attn_q_norm.weight", 4, 0, 16);
+        WriteTensorInfo("token_embd.weight", 8, 0, 32);
+
+        while (ms.Position % 32 != 0) bw.Write((byte)0);
+        for (int i = 0; i < 16; i++) bw.Write(0.0f); // 64-byte data section
+        bw.Flush();
+
+        var data = ms.ToArray();
+        var result = await SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper.InspectAsync(new MemoryStream(data));
+
+        // (a) Metadata KV map surfaced with correct element typing.
+        if (result.Metadata.Length != 3) throw new Exception($"Metadata: expected 3, got {result.Metadata.Length}");
+        var hck = result.Metadata.FirstOrDefault(m => m.Key == "testarch.attention.head_count_kv")
+            ?? throw new Exception("head_count_kv metadata missing");
+        if (!hck.Value.Contains("i32") || !hck.Value.Contains("8, 8, 1"))
+            throw new Exception($"head_count_kv value wrong: '{hck.Value}'");
+        var swp = result.Metadata.FirstOrDefault(m => m.Key == "testarch.attention.sliding_window_pattern")
+            ?? throw new Exception("sliding_window_pattern metadata missing");
+        if (!swp.Value.Contains("bool") || !swp.Value.Contains("True"))
+            throw new Exception($"sliding_window_pattern value wrong: '{swp.Value}'");
+
+        // (b) Tensor templates: blk.N collapsed, small norm visible despite the top-20 weight cap.
+        if (result.TensorTemplates.Length != 2) throw new Exception($"Templates: expected 2, got {result.TensorTemplates.Length}");
+        var norm = result.TensorTemplates.FirstOrDefault(t => t.Name == "blk.*.attn_q_norm.weight")
+            ?? throw new Exception("collapsed norm template missing");
+        if (norm.Count != 2) throw new Exception($"norm template count: expected 2, got {norm.Count}");
+        if (norm.ExampleShape.Length != 1 || norm.ExampleShape[0] != 4)
+            throw new Exception($"norm example shape wrong: {norm.ShapeStr}");
+        var embed = result.TensorTemplates.FirstOrDefault(t => t.Name == "token_embd.weight")
+            ?? throw new Exception("token_embd template missing");
+        if (embed.Count != 1) throw new Exception($"token_embd count: expected 1, got {embed.Count}");
+
+        Console.WriteLine("[GGUF] Inspector metadata KV map + tensor templates — PASS");
+    });
+
     private static void WriteGGUFString(BinaryWriter bw, string s)
     {
         var bytes = Encoding.UTF8.GetBytes(s);
