@@ -4,7 +4,7 @@ using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML;
 
 /// <summary>Binary operations for GPU broadcast kernels.</summary>
-public enum BroadcastOp { Add, Sub, Mul, Div, Pow }
+public enum BroadcastOp { Add, Sub, Mul, Div, Pow, Less, Greater, Equal, LessOrEqual, GreaterOrEqual }
 
 /// <summary>
 /// Element-wise neural network operations: GELU, ReLU, Add, Mul, AddBias.
@@ -190,6 +190,13 @@ public class ElementWiseKernels : IDisposable
     static float BroadcastMulOp(float a, float b) => a * b;
     static float BroadcastDivOp(float a, float b) => b != 0f ? a / b : 0f;
     static float BroadcastPowOp(float a, float b) => MathF.Pow(a, b);
+    // Comparison broadcast ops (return 1.0/0.0). Needed so Less/Greater/Equal actually compare on the GPU
+    // N-D broadcast path — without these they silently fell through to Add, collapsing the CLIP causal mask.
+    static float BroadcastLessOp(float a, float b) => a < b ? 1f : 0f;
+    static float BroadcastGreaterOp(float a, float b) => a > b ? 1f : 0f;
+    static float BroadcastEqualOp(float a, float b) => a == b ? 1f : 0f;
+    static float BroadcastLessOrEqualOp(float a, float b) => a <= b ? 1f : 0f;
+    static float BroadcastGreaterOrEqualOp(float a, float b) => a >= b ? 1f : 0f;
 
     /// <summary>
     /// Unified broadcast binary kernel: output[i] = op(a[mapA(i)], b[mapB(i)]).
@@ -527,6 +534,11 @@ public class ElementWiseKernels : IDisposable
             BroadcastOp.Mul => new DelegateSpecialization<Func<float, float, float>>(BroadcastMulOp),
             BroadcastOp.Div => new DelegateSpecialization<Func<float, float, float>>(BroadcastDivOp),
             BroadcastOp.Pow => new DelegateSpecialization<Func<float, float, float>>(BroadcastPowOp),
+            BroadcastOp.Less => new DelegateSpecialization<Func<float, float, float>>(BroadcastLessOp),
+            BroadcastOp.Greater => new DelegateSpecialization<Func<float, float, float>>(BroadcastGreaterOp),
+            BroadcastOp.Equal => new DelegateSpecialization<Func<float, float, float>>(BroadcastEqualOp),
+            BroadcastOp.LessOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastLessOrEqualOp),
+            BroadcastOp.GreaterOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastGreaterOrEqualOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
         _broadcastBinaryKernel!(outCount, a, b, output, _lastStridesBuf.View, opSpec);

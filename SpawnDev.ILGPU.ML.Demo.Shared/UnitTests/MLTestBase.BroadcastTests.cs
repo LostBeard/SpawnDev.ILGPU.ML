@@ -172,6 +172,61 @@ public abstract partial class MLTestBase
     });
 
     // ═══════════════════════════════════════════════════════════
+    //  GPU-PATH COMPARISON BROADCAST  (CLIP causal-mask regression)
+    //
+    //  The tests above pass the inputs as ConstantValues, so they run the CPU constant-fold path inside
+    //  BroadcastBinaryOp — NOT the GPU broadcast kernel. The CLIP forward bug lived in the GPU kernel path:
+    //  comparison ops (Less/Greater/Equal) had no BroadcastOp enum, so BroadcastBinaryOpND silently used the
+    //  DEFAULT enum (Add) and computed a+b instead of a comparison, collapsing the causal mask in every
+    //  decoder. These tests force the GPU kernel path (no ConstantValues) so they actually exercise the fix.
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task BroadcastGpu_Less_Scalar() => await RunTest(async accelerator =>
+    {
+        // [4] < [1] on the GPU kernel path. Pre-fix this returned a+b (Add), not the 0/1 comparison.
+        await VerifyBinaryOpGpuPath(accelerator, "Less",
+            new float[] { 1, 5, 3, 2 }, new[] { 4 }, new float[] { 3 }, new[] { 1 },
+            new float[] { 1, 0, 0, 1 }, new[] { 4 });
+    });
+
+    [TestMethod]
+    public async Task BroadcastGpu_Greater_Scalar() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "Greater",
+            new float[] { 1, 5, 3, 2 }, new[] { 4 }, new float[] { 3 }, new[] { 1 },
+            new float[] { 0, 1, 0, 0 }, new[] { 4 });
+    });
+
+    [TestMethod]
+    public async Task BroadcastGpu_Equal_Scalar() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "Equal",
+            new float[] { 1, 3, 3, 2 }, new[] { 4 }, new float[] { 3 }, new[] { 1 },
+            new float[] { 0, 1, 1, 0 }, new[] { 4 });
+    });
+
+    [TestMethod]
+    public async Task BroadcastGpu_CausalMask_2D() => await RunTest(async accelerator =>
+    {
+        // THE regression: a [4,1] vs [1,4] GreaterOrEqual broadcasts on BOTH axes → a 4x4 lower-triangular
+        // causal mask out[i,j] = (i >= j). This is the exact shape the CLIP bug destroyed, and it also guards
+        // the tightened fast-path guard: a.ElementCount(4) == b.ElementCount(4) but != output(16), so it must
+        // take the broadcast path, not the element-wise fast path (which pre-fix wrote 4 elems of garbage).
+        var rows = new float[] { 0, 1, 2, 3 };       // [4,1]
+        var cols = new float[] { 0, 1, 2, 3 };       // [1,4]
+        var expected = new float[]
+        {
+            1, 0, 0, 0,
+            1, 1, 0, 0,
+            1, 1, 1, 0,
+            1, 1, 1, 1,
+        };
+        await VerifyBinaryOpGpuPath(accelerator, "GreaterOrEqual",
+            rows, new[] { 4, 1 }, cols, new[] { 1, 4 }, expected, new[] { 4, 4 });
+    });
+
+    // ═══════════════════════════════════════════════════════════
     //  HELPER — runs any binary operator and verifies output
     // ═══════════════════════════════════════════════════════════
 
@@ -215,5 +270,46 @@ public abstract partial class MLTestBase
                 $"Got: [{string.Join(",", result.Select(v => v.ToString("F1")))}]");
 
         Console.WriteLine($"[Broadcast_{opType}] PASS — {string.Join("x", aShape)} op {string.Join("x", bShape)} → maxErr={maxErr:E1}");
+    }
+
+    /// <summary>
+    /// Like <see cref="VerifyBinaryOp"/> but provides NO ConstantValues, so <c>BroadcastBinaryOp</c> cannot
+    /// take its CPU constant-fold shortcut and must dispatch the real GPU broadcast kernel
+    /// (<c>BroadcastBinaryOpND</c> with the <c>BroadcastOp</c> enum). This is the production path that the CLIP
+    /// causal-mask bug lived in; the constant-fold helper never reached it.
+    /// </summary>
+    private async Task VerifyBinaryOpGpuPath(Accelerator accelerator, string opType,
+        float[] aData, int[] aShape, float[] bData, int[] bShape,
+        float[] expected, int[] outShape)
+    {
+        using var aBuf = accelerator.Allocate1D(aData);
+        using var bBuf = accelerator.Allocate1D(bData);
+        using var outBuf = accelerator.Allocate1D<float>(expected.Length);
+
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve(opType);
+
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(aBuf.View, aShape), new Tensor(bBuf.View, bShape) },
+            Outputs = new[] { new Tensor(outBuf.View, outShape) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "a", "b" },
+            ConstantValues = new Dictionary<string, float[]>(), // empty → no CPU fold → GPU kernel path
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, expected.Length);
+
+        float maxErr = 0;
+        for (int i = 0; i < expected.Length; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(result[i] - expected[i]));
+
+        if (maxErr > 0.01f)
+            throw new Exception($"{opType} GPU-path maxErr={maxErr:E3} (likely the comparison fell back to Add). " +
+                $"Expected: [{string.Join(",", expected.Select(v => v.ToString("F0")))}] " +
+                $"Got: [{string.Join(",", result.Select(v => v.ToString("F0")))}]");
+
+        Console.WriteLine($"[{opType}_GPUPath] PASS — {string.Join("x", aShape)} op {string.Join("x", bShape)} → maxErr={maxErr:E1}");
     }
 }

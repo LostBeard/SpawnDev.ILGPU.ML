@@ -587,6 +587,58 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime ConstantOfShape: output shape = input shape-tensor VALUES (e.g. [77,77]). Placeholder
+            // at compile time → fill buffer collapses → CLIP causal mask broke. Same class as Range.
+            if (node.OpType == "ConstantOfShape" && node.InputNames.Length >= 1 && !string.IsNullOrEmpty(node.InputNames[0])
+                && runtimeConstants.TryGetValue(node.InputNames[0], out var cosDims) && cosDims.Length > 0)
+            {
+                var resolved = cosDims.Select(v => (int)MathF.Round(v)).ToArray();
+                if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+            }
+
+            // Runtime Expand: output = broadcast(input shape, target-shape VALUES) (input[1] is runtime).
+            if (node.OpType == "Expand" && node.InputNames.Length >= 2 && nodeInputs.Length > 0 && nodeInputs[0] != null
+                && !string.IsNullOrEmpty(node.InputNames[1])
+                && runtimeConstants.TryGetValue(node.InputNames[1], out var expDims) && expDims.Length > 0)
+            {
+                var tgt = expDims.Select(v => (int)MathF.Round(v)).ToArray();
+                var inS = nodeInputs[0]!.Shape; int rank = Math.Max(tgt.Length, inS.Length);
+                var resolved = new int[rank];
+                for (int dd = 0; dd < rank; dd++)
+                {
+                    int tv = dd - (rank - tgt.Length) >= 0 ? tgt[dd - (rank - tgt.Length)] : 1;
+                    int iv = dd - (rank - inS.Length) >= 0 ? inS[dd - (rank - inS.Length)] : 1;
+                    resolved[dd] = Math.Max(tv, iv);
+                }
+                if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+            }
+
+            // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
+            if (node.OpType == "Shape" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+                runtimeOutputShapes = new[] { new[] { nodeInputs[0]!.Shape.Length } };
+
+            // Runtime broadcast re-inference for elementwise/select ops poisoned by an upstream
+            // value-dependent placeholder — re-infer the output from the ACTUAL runtime input shapes.
+            if ((node.OpType == "Where" || node.OpType == "Cast" || node.OpType == "Add" || node.OpType == "Sub"
+                 || node.OpType == "Mul" || node.OpType == "Div" || node.OpType == "Equal" || node.OpType == "Less"
+                 || node.OpType == "Greater" || node.OpType == "And" || node.OpType == "Or" || node.OpType == "Not"
+                 || node.OpType == "Min" || node.OpType == "Max") && nodeInputs.Length > 0)
+            {
+                int wr = 0;
+                foreach (var t in nodeInputs) if (t != null) wr = Math.Max(wr, t.Shape.Length);
+                if (wr > 0)
+                {
+                    var resolved = new int[wr];
+                    for (int dd = 0; dd < wr; dd++)
+                    {
+                        int mx = 1;
+                        foreach (var t in nodeInputs) if (t != null) { int id = dd - (wr - t.Shape.Length); if (id >= 0) mx = Math.Max(mx, t.Shape[id]); }
+                        resolved[dd] = mx;
+                    }
+                    if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+                }
+            }
+
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
@@ -1017,6 +1069,58 @@ public class GraphExecutor : IDisposable
                 {
                     int count = Math.Max(0, (int)MathF.Ceiling((limitV[0] - startV[0]) / deltaV[0]));
                     if (count > 0) runtimeOutputShapes = new[] { new[] { count } };
+                }
+            }
+
+            // Runtime ConstantOfShape: output shape = input shape-tensor VALUES (e.g. [77,77]). Placeholder
+            // at compile time → fill buffer collapses → CLIP causal mask broke. Same class as Range.
+            if (node.OpType == "ConstantOfShape" && node.InputNames.Length >= 1 && !string.IsNullOrEmpty(node.InputNames[0])
+                && runtimeConstants.TryGetValue(node.InputNames[0], out var cosDims) && cosDims.Length > 0)
+            {
+                var resolved = cosDims.Select(v => (int)MathF.Round(v)).ToArray();
+                if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+            }
+
+            // Runtime Expand: output = broadcast(input shape, target-shape VALUES) (input[1] is runtime).
+            if (node.OpType == "Expand" && node.InputNames.Length >= 2 && nodeInputs.Length > 0 && nodeInputs[0] != null
+                && !string.IsNullOrEmpty(node.InputNames[1])
+                && runtimeConstants.TryGetValue(node.InputNames[1], out var expDims) && expDims.Length > 0)
+            {
+                var tgt = expDims.Select(v => (int)MathF.Round(v)).ToArray();
+                var inS = nodeInputs[0]!.Shape; int rank = Math.Max(tgt.Length, inS.Length);
+                var resolved = new int[rank];
+                for (int dd = 0; dd < rank; dd++)
+                {
+                    int tv = dd - (rank - tgt.Length) >= 0 ? tgt[dd - (rank - tgt.Length)] : 1;
+                    int iv = dd - (rank - inS.Length) >= 0 ? inS[dd - (rank - inS.Length)] : 1;
+                    resolved[dd] = Math.Max(tv, iv);
+                }
+                if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+            }
+
+            // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
+            if (node.OpType == "Shape" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+                runtimeOutputShapes = new[] { new[] { nodeInputs[0]!.Shape.Length } };
+
+            // Runtime broadcast re-inference for elementwise/select ops poisoned by an upstream
+            // value-dependent placeholder — re-infer the output from the ACTUAL runtime input shapes.
+            if ((node.OpType == "Where" || node.OpType == "Cast" || node.OpType == "Add" || node.OpType == "Sub"
+                 || node.OpType == "Mul" || node.OpType == "Div" || node.OpType == "Equal" || node.OpType == "Less"
+                 || node.OpType == "Greater" || node.OpType == "And" || node.OpType == "Or" || node.OpType == "Not"
+                 || node.OpType == "Min" || node.OpType == "Max") && nodeInputs.Length > 0)
+            {
+                int wr = 0;
+                foreach (var t in nodeInputs) if (t != null) wr = Math.Max(wr, t.Shape.Length);
+                if (wr > 0)
+                {
+                    var resolved = new int[wr];
+                    for (int dd = 0; dd < wr; dd++)
+                    {
+                        int mx = 1;
+                        foreach (var t in nodeInputs) if (t != null) { int id = dd - (wr - t.Shape.Length); if (id >= 0) mx = Math.Max(mx, t.Shape[id]); }
+                        resolved[dd] = mx;
+                    }
+                    if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
                 }
             }
 

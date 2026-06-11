@@ -262,7 +262,7 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         var output = ctx.Outputs[0];
 
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             // Safe two-step: copy a → output, then add b in-place.
             // Avoids 3-way aliasing (a, b, output may share same GPU buffer on WebGPU).
@@ -318,7 +318,7 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             // De-alias if both operands are the same tensor (x * x): WebGPU/WebGL forbid binding one
             // buffer to two storage slots. (Shared helper — same guard Sub/Div use.)
@@ -405,7 +405,7 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             // De-alias if both operands are the same tensor (x / x): WebGPU/WebGL reject binding one
             // buffer to two storage slots (same class of crash as the SD-Turbo Sub aliasing).
@@ -485,7 +485,7 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             reg.ElementWise.Pow(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         }
@@ -835,10 +835,10 @@ public class EqualOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
             reg.ElementWise.Equal(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
-            BroadcastBinaryOp(ctx, reg, (x, y) => x == y ? 1f : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x == y ? 1f : 0f, BroadcastOp.Equal);
     }
 }
 
@@ -850,10 +850,10 @@ public class GreaterOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
             reg.ElementWise.Greater(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
-            BroadcastBinaryOp(ctx, reg, (x, y) => x > y ? 1f : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x > y ? 1f : 0f, BroadcastOp.Greater);
     }
 }
 
@@ -865,10 +865,10 @@ public class LessOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
             reg.ElementWise.Less(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
-            BroadcastBinaryOp(ctx, reg, (x, y) => x < y ? 1f : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x < y ? 1f : 0f, BroadcastOp.Less);
     }
 }
 
@@ -880,7 +880,7 @@ public class LessOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             // a <= b is !(a > b). Greater returns 1.0 for true, 0.0 for false.
             // Negate: output = 1.0 - Greater(a, b)
@@ -893,7 +893,7 @@ public class LessOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            BroadcastBinaryOp(ctx, reg, (x, y) => x <= y ? 1f : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x <= y ? 1f : 0f, BroadcastOp.LessOrEqual);
         }
     }
 }
@@ -906,7 +906,7 @@ public class GreaterOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             // a >= b is !(a < b)
             reg.ElementWise.Less(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
@@ -918,7 +918,7 @@ public class GreaterOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            BroadcastBinaryOp(ctx, reg, (x, y) => x >= y ? 1f : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => x >= y ? 1f : 0f, BroadcastOp.GreaterOrEqual);
         }
     }
 }
@@ -956,7 +956,7 @@ public class AndOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
-        if (a.ElementCount == b.ElementCount)
+        if (a.ElementCount == b.ElementCount && a.ElementCount == ctx.Outputs[0].ElementCount)
         {
             // And = Mul(a, b) then threshold: any non-zero × non-zero = non-zero
             reg.ElementWise.Mul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
