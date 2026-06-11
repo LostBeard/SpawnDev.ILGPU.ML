@@ -48,9 +48,14 @@ public static class GGUFGraphBuilder
         int ffnDim = (int)model.GetMetadataInt($"{model.Architecture}.feed_forward_length",
             embedDim * 4);
 
-        // Architecture-specific settings
-        bool useRMSNorm = arch is "llama" or "mistral" or "gemma" or "gemma2" or "qwen" or "qwen2";
-        bool useSiLU = arch is not "phi" and not "phi3" and not "gpt2" and not "falcon" and not "bloom" and not "mpt";
+        // Architecture-specific settings. The whole gemma family (gemma, gemma2, gemma3, gemma4) uses
+        // RMSNorm + a GELU-gated (GeGLU) MLP — NOT SiLU/SwiGLU like llama. Match by prefix so each new
+        // gemma generation is recognized without a hardcoded version list (gemma4 fell to LayerNorm+SiLU,
+        // both wrong, before this).
+        bool isGemma = arch.StartsWith("gemma", StringComparison.Ordinal);
+        bool useRMSNorm = isGemma || arch is "llama" or "mistral" or "qwen" or "qwen2";
+        bool useSiLU = !isGemma
+            && arch is not "phi" and not "phi3" and not "gpt2" and not "falcon" and not "bloom" and not "mpt";
 
         // Graph input: token IDs [1, seq_len]
         graph.Inputs.Add(new GraphValueInfo { Name = "input_ids", Shape = new[] { 1, -1 } });

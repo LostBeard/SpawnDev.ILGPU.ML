@@ -119,6 +119,18 @@ Lane: hub/WebTorrent.Server (Riker's), covered by the 2026-06-01 lead-editor-all
 
 Each maps to the code site that must change. Items 3–7 are one coherent "per-layer attention config" change.
 
+> **PROGRESS (2026-06-11):**
+> - ✅ **#0** K-quant type-routed fused dequant — Seven P1 (`2bf6934`), verified by Tuvok (68/68 all backends).
+> - ✅ **#11** tied-embedding LM head + compressed `Gather`-table (Q6_K embed stays in VRAM) — Seven P1.
+> - ✅ **#1** arch-tag (`gemma4`→RMSNorm) + ✅ **#8** GeGLU-not-SiLU — Tuvok: `GGUFGraphBuilder` matches the
+>   gemma family by prefix; test `Gemma4_GraphBuilder_UsesRMSNormAndGeGLU` (`MLTestBase.Gemma4Tests.cs`).
+> - ⏳ **Remaining** (Tuvok graph-wiring; #6/#7 gated on Seven's kernels): #2 `(1+weight)` RMSNorm,
+>   #3 4-norm sandwich (`post_attention_norm`/`post_ffw_norm`), #4 QK-norm, #5 per-layer geometry
+>   (incl. the 8 global layers that lack a standalone `attn_v`), #6 SWA/global mask (Seven's flash-attn
+>   mask kernel), #7 dual-base RoPE (Seven's RoPE kernel), #9 `layer_output_scale`, #10 logit soft-cap.
+> - ⚠ Also note: the current generic attention path has **no causal mask at all** — fine for the ONNX
+>   decoders (mask baked into the export) but the GGUF builder needs causal (+ SWA) added for gemma4 (#6).
+
 0. **⚠ BLOCKER — K-quant GPU MatMul decodes everything as Q4_0** (the §3 landmine). Carry `GGMLType`
    with the quantized bytes (the loader dict drops it) → route only implemented types to the fused kernel,
    CPU-dequant-to-F32 fallback otherwise (correct immediately); then add **Q4_K / Q6_K / Q8_0 fused
