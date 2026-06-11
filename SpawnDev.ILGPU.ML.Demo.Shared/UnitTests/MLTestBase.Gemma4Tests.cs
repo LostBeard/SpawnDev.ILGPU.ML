@@ -71,6 +71,28 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Gemma4_GraphBuilder_RMSNormPlusOne() => await RunTest(async accelerator =>
+    {
+        var (_, weights, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
+
+        // gemma RMSNorm convention output = x_normed * (1 + weight); the builder folds the +1 into the
+        // weight at load. Every norm (attn/ffn + the post-norm sandwich + the final norm) gets it.
+        foreach (var name in new[]
+        {
+            "blk.0.attn_norm.weight", "blk.0.post_attention_norm.weight",
+            "blk.0.ffn_norm.weight", "blk.0.post_ffw_norm.weight", "output_norm.weight",
+        })
+        {
+            var w = weights[name];
+            if (Math.Abs(w[0] - 1.05f) > 1e-5f)  // raw 0.05 + 1
+                throw new Exception($"{name}: gemma RMSNorm weight should be raw+1 (0.05+1=1.05), got {w[0]}.");
+        }
+
+        Console.WriteLine("[Gemma4] RMSNorm (1+weight) offset folded at load for all norms");
+        await Task.CompletedTask;
+    });
+
     /// <summary>Minimal F32 gemma4 model. BuildGraph only constructs nodes + extracts weights (no
     /// execution), so tiny consistent dims suffice. <paramref name="withPostNorms"/> adds the
     /// post_attention_norm / post_ffw_norm tensors that trigger the norm-sandwich.</summary>

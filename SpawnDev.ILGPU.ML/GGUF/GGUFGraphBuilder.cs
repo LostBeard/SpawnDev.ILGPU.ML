@@ -90,7 +90,7 @@ public static class GGUFGraphBuilder
 
             // ── Attention norm ──
             string normOut = $"{pfx}_attn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm);
+            AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm, isGemma);
 
             // ── Q, K, V projections ──
             string qOut = $"{pfx}_q", kOut = $"{pfx}_k", vOut = $"{pfx}_v";
@@ -163,7 +163,7 @@ public static class GGUFGraphBuilder
             if (FindTensor(model, $"{pfx}.post_attention_norm.weight") != null)
             {
                 string postAttnOut = $"{pfx}_post_attn_norm";
-                AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm);
+                AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm, isGemma);
                 attnResInput = postAttnOut;
             }
 
@@ -173,7 +173,7 @@ public static class GGUFGraphBuilder
 
             // ── FFN norm ──
             string ffnNormOut = $"{pfx}_ffn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
+            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm, isGemma);
 
             // ── FFN: gate + up → activation → down ──
             string gateOut = $"{pfx}_gate", upOut = $"{pfx}_up";
@@ -208,7 +208,7 @@ public static class GGUFGraphBuilder
             if (FindTensor(model, $"{pfx}.post_ffw_norm.weight") != null)
             {
                 string postFfwOut = $"{pfx}_post_ffw_norm";
-                AddNorm(graph, model, weights, $"{pfx}.post_ffw_norm", ffnOut, postFfwOut, embedDim, useRMSNorm);
+                AddNorm(graph, model, weights, $"{pfx}.post_ffw_norm", ffnOut, postFfwOut, embedDim, useRMSNorm, isGemma);
                 ffnResInput = postFfwOut;
             }
 
@@ -222,7 +222,7 @@ public static class GGUFGraphBuilder
         //  3. Final norm
         // ═══════════════════════════════════════════════════════════
         string finalNormOut = "final_norm_out";
-        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm);
+        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm, isGemma);
 
         // ═══════════════════════════════════════════════════════════
         //  4. LM head (output projection)
@@ -345,7 +345,7 @@ public static class GGUFGraphBuilder
         => new() { [key] = JsonSerializer.SerializeToElement(value) };
 
     private static void AddNorm(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
-        string tensorPrefix, string input, string output, int dim, bool useRMSNorm)
+        string tensorPrefix, string input, string output, int dim, bool useRMSNorm, bool addOneToNormWeight = false)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
@@ -353,6 +353,11 @@ public static class GGUFGraphBuilder
             // Norm weights are 1-D vectors with no fused dequant consumer: F32/F16 only
             // (a quantized norm weight throws in ExtractWeight - honest failure).
             ExtractWeight(model, weightTensor, weights);
+            // gemma RMSNorm convention: output = x_normed * (1 + weight). gemma stores the weights centered
+            // at 0, so fold the +1 in at load — mathematically identical and the generic norm op needs no
+            // change. (Applies to every gemma norm: attn/ffn, the post-norm sandwich, and the final norm.)
+            if (addOneToNormWeight && weights.TryGetValue(weightTensor.Name, out var nw))
+                for (int i = 0; i < nw.Length; i++) nw[i] += 1f;
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
         }
 
