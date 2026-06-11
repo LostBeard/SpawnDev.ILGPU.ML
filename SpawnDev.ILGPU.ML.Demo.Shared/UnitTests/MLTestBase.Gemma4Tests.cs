@@ -46,10 +46,35 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Gemma4_GraphBuilder_LogitSoftCap() => await RunTest(async accelerator =>
+    {
+        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false, logitSoftCap: 30f));
+
+        // gemma4 final logit soft-cap: logits = cap * tanh(logits / cap). The LM-head MatMul writes a
+        // pre-cap tensor; a Tanh + Mul produce the final "logits".
+        if (!graph.Nodes.Any(n => n.OpType == "MatMul" && n.Outputs.Contains("logits_presoftcap")))
+            throw new Exception("LM head must write a pre-cap tensor when final_logit_softcapping is set.");
+        if (!graph.Nodes.Any(n => n.OpType == "Tanh"))
+            throw new Exception("logit soft-cap missing its Tanh node.");
+        if (!graph.Nodes.Any(n => n.OpType == "Mul" && n.Outputs.Contains("logits")))
+            throw new Exception("final 'logits' must be produced by the soft-cap Mul (cap * tanh).");
+
+        // Without a cap, "logits" comes straight from the MatMul (no Tanh).
+        var (plain, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false));
+        if (plain.Nodes.Any(n => n.OpType == "Tanh"))
+            throw new Exception("no soft-cap metadata -> no Tanh expected.");
+        if (!plain.Nodes.Any(n => n.OpType == "MatMul" && n.Outputs.Contains("logits")))
+            throw new Exception("without a cap, the LM-head MatMul should output 'logits' directly.");
+
+        Console.WriteLine("[Gemma4] final logit soft-cap wired (cap * tanh(logits / cap))");
+        await Task.CompletedTask;
+    });
+
     /// <summary>Minimal F32 gemma4 model. BuildGraph only constructs nodes + extracts weights (no
     /// execution), so tiny consistent dims suffice. <paramref name="withPostNorms"/> adds the
     /// post_attention_norm / post_ffw_norm tensors that trigger the norm-sandwich.</summary>
-    private static GGUFModel MakeGemma4Model(bool withPostNorms)
+    private static GGUFModel MakeGemma4Model(bool withPostNorms, float logitSoftCap = 0f)
     {
         const int embd = 8, ffn = 16, vocab = 4;
         var raw = new List<byte>();
@@ -74,22 +99,25 @@ public abstract partial class MLTestBase
         if (withPostNorms) Add("blk.0.post_ffw_norm.weight", new long[] { embd });
         Add("output_norm.weight", new long[] { embd });           // NO output.weight -> tied head
 
+        var meta = new Dictionary<string, object>
+        {
+            ["general.architecture"] = "gemma4",
+            ["gemma4.embedding_length"] = (long)embd,
+            ["gemma4.block_count"] = 1L,
+            ["gemma4.attention.head_count"] = 2L,
+            ["gemma4.attention.head_count_kv"] = 2L,
+            ["gemma4.vocab_size"] = (long)vocab,
+            ["gemma4.feed_forward_length"] = (long)ffn,
+            ["gemma4.context_length"] = 64L,
+        };
+        if (logitSoftCap > 0f) meta["gemma4.final_logit_softcapping"] = logitSoftCap;
+
         return new GGUFModel
         {
             RawData = raw.ToArray(),
             DataStartOffset = 0,
             Tensors = tensors.ToArray(),
-            Metadata = new Dictionary<string, object>
-            {
-                ["general.architecture"] = "gemma4",
-                ["gemma4.embedding_length"] = (long)embd,
-                ["gemma4.block_count"] = 1L,
-                ["gemma4.attention.head_count"] = 2L,
-                ["gemma4.attention.head_count_kv"] = 2L,
-                ["gemma4.vocab_size"] = (long)vocab,
-                ["gemma4.feed_forward_length"] = (long)ffn,
-                ["gemma4.context_length"] = 64L,
-            },
+            Metadata = meta,
         };
     }
 }

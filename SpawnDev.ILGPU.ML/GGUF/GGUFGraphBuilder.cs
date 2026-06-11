@@ -227,12 +227,16 @@ public static class GGUFGraphBuilder
         // ═══════════════════════════════════════════════════════════
         //  4. LM head (output projection)
         // ═══════════════════════════════════════════════════════════
+        // gemma2/gemma4 soft-cap the final logits: logits = cap * tanh(logits / cap). When present
+        // (cap > 0) the LM head writes a pre-cap tensor and the cap is applied below to produce "logits".
+        float logitCap = model.GetMetadataFloat($"{model.Architecture}.final_logit_softcapping", 0f);
+        string lmHead = logitCap > 0f ? "logits_presoftcap" : "logits";
         var outputWeight = FindTensor(model, "output.weight");
         if (outputWeight != null)
         {
             ExtractWeight(model, outputWeight, weights, quantizedBytes, transposeOnUpload, isLinearB: true);
             graph.Initializers[outputWeight.Name] = outputWeight.Shape;
-            AddNode(graph, "MatMul", new[] { finalNormOut, outputWeight.Name }, new[] { "logits" });
+            AddNode(graph, "MatMul", new[] { finalNormOut, outputWeight.Name }, new[] { lmHead });
         }
         else if (embedWeight != null)
         {
@@ -255,7 +259,18 @@ public static class GGUFGraphBuilder
                 weights[headName] = fw; // same float[] reference
                 transposeOnUpload.Add(headName); // storage [vocab][n_embd] -> declared [n_embd][vocab]
             }
-            AddNode(graph, "MatMul", new[] { finalNormOut, headName }, new[] { "logits" });
+            AddNode(graph, "MatMul", new[] { finalNormOut, headName }, new[] { lmHead });
+        }
+
+        // ── Final logit soft-cap (gemma2/gemma4): logits = cap * tanh(logits / cap) ──
+        if (logitCap > 0f)
+        {
+            const string capName = "logit_softcap";
+            weights[capName] = new[] { logitCap };
+            graph.Initializers[capName] = new[] { 1 };
+            AddNode(graph, "Div", new[] { lmHead, capName }, new[] { "logits_div_cap" });
+            AddNode(graph, "Tanh", new[] { "logits_div_cap" }, new[] { "logits_tanh" });
+            AddNode(graph, "Mul", new[] { "logits_tanh", capName }, new[] { "logits" });
         }
 
         return (graph, weights, quantizedBytes, transposeOnUpload);
