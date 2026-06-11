@@ -57,6 +57,24 @@ public class Tensor
     /// + the ILGPU.Half view; NO float buffer). The executor map stays Tensor-typed; handlers check IsHalf.</summary>
     public static Tensor FromHalf(HalfTensor half) => new Tensor(half.Data, half.Shape, half.Name);
 
+    /// <summary>
+    /// A shape-only tensor with NO backing buffer - for graph entries whose real data
+    /// lives elsewhere (GGUF-quantized weights: raw bytes in QuantizedWeights, consumed
+    /// by fused dequant kernels that need this entry only for its SHAPE). Any accidental
+    /// use of <see cref="Data"/> hits an empty view and fails loudly instead of computing
+    /// on garbage. Never allocate a full F32 buffer just to carry a shape - for a
+    /// 262k×3840 embedding table that is ~4GB of dead VRAM.
+    /// </summary>
+    public static Tensor ShapeOnly(int[] shape, string? name = null) => new Tensor(shape, name);
+
+    private Tensor(int[] shape, string? name)
+    {
+        Data = default;
+        Shape = shape;
+        Strides = TensorHelpers.ComputeStrides(shape);
+        Name = name;
+    }
+
     private Tensor(ArrayView1D<global::ILGPU.Half, Stride1D.Dense> halfData, int[] shape, string? name)
     {
         int count = TensorHelpers.ElementCount(shape);

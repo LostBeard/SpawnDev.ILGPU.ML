@@ -331,9 +331,12 @@ public class GGUFModel
 
     /// <summary>
     /// Dequantize Q8_1: 32 elements per block.
-    /// Block layout: [scale:float16] [min:float16] [quants:int8 × 32]
+    /// Block layout: [d:float16] [s:float16] [quants:int8 × 32]
     /// Block size: 2 + 2 + 32 = 36 bytes
-    /// value = quant * scale + min
+    /// value = quant * d. The second fp16 is s = d * sum(quants), a dot-product
+    /// optimization term in ggml - NOT a minimum; ggml has no dequantize_row_q8_1
+    /// and Q8_1 never appears as a GGUF weight type (it is an activation format).
+    /// Kept for completeness; previously this wrongly added s as a per-element min.
     /// </summary>
     private float[] DequantizeQ8_1(long offset, long elements)
     {
@@ -343,14 +346,12 @@ public class GGUFModel
         {
             int blockOffset = (int)offset + block * 36;
             ushort scaleHalf = (ushort)(RawData[blockOffset] | (RawData[blockOffset + 1] << 8));
-            ushort minHalf = (ushort)(RawData[blockOffset + 2] | (RawData[blockOffset + 3] << 8));
             float scale = HalfToFloat(scaleHalf);
-            float min = HalfToFloat(minHalf);
             int resultBase = block * 32;
             for (int i = 0; i < 32; i++)
             {
                 sbyte q = (sbyte)RawData[blockOffset + 4 + i];
-                result[resultBase + i] = q * scale + min;
+                result[resultBase + i] = q * scale;
             }
         }
         return result;
@@ -364,7 +365,11 @@ public class GGUFModel
     /// <summary>
     /// Q4_K: 256 elements per super-block, 144 bytes per block.
     /// Layout: [d:fp16(2)] [dmin:fp16(2)] [scales:uint8×12] [quants:uint8×128]
-    /// Each byte holds two 4-bit values. Scales encode per-sub-block scale and min.
+    /// Direct port of ggml dequantize_row_q4_K: the 128 quant bytes are consumed in
+    /// FOUR 32-byte chunks; each chunk's LOW nibbles are elements 64t..64t+31 and its
+    /// HIGH nibbles are elements 64t+32..64t+63 (two consecutive 6-bit scale/min pairs
+    /// per chunk via get_scale_min_k4). NOT a per-16-byte lo/hi split - getting this
+    /// order wrong permutes the weights inside every super-block.
     /// </summary>
     private float[] DequantizeQ4_K(long offset, long elements)
     {
@@ -376,41 +381,55 @@ public class GGUFModel
             float d = HalfToFloat((ushort)(RawData[bOff] | (RawData[bOff + 1] << 8)));
             float dmin = HalfToFloat((ushort)(RawData[bOff + 2] | (RawData[bOff + 3] << 8)));
             int scaleOff = bOff + 4;
-            int quantOff = bOff + 16; // 4 + 12 scales = 16
+            int q = bOff + 16; // 4 + 12 scales = 16
+            int y = block * 256;
+            int isIdx = 0;
 
-            for (int j = 0; j < 8; j++) // 8 sub-blocks of 32
+            for (int j = 0; j < 256; j += 64) // four 64-element chunks per super-block
             {
-                // Decode 6-bit scales from packed 12 bytes
-                int sc, m;
-                if (j < 4)
-                {
-                    sc = RawData[scaleOff + j] & 0x3F;
-                    m = RawData[scaleOff + j + 4] & 0x3F;
-                }
-                else
-                {
-                    sc = ((RawData[scaleOff + j + 4] & 0xF) | ((RawData[scaleOff + j - 4] >> 6) << 4));
-                    m = ((RawData[scaleOff + j + 4] >> 4) | ((RawData[scaleOff + j] >> 6) << 4));
-                }
-                float scale = d * sc;
-                float min = dmin * m;
-                int rBase = block * 256 + j * 32;
+                GetScaleMinK4(isIdx + 0, scaleOff, out int sc1, out int m1);
+                float d1 = d * sc1; float min1 = dmin * m1;
+                GetScaleMinK4(isIdx + 1, scaleOff, out int sc2, out int m2);
+                float d2 = d * sc2; float min2 = dmin * m2;
 
-                for (int i = 0; i < 16; i++)
+                for (int l = 0; l < 32; l++)
                 {
-                    byte packed = RawData[quantOff + j * 16 + i];
-                    result[rBase + i] = (packed & 0x0F) * scale - min;
-                    result[rBase + i + 16] = (packed >> 4) * scale - min;
+                    byte packed = RawData[q + l];
+                    result[y + l] = d1 * (packed & 0x0F) - min1;
+                    result[y + 32 + l] = d2 * (packed >> 4) - min2;
                 }
+                y += 64; q += 32; isIdx += 2;
             }
         }
         return result;
     }
 
     /// <summary>
+    /// ggml get_scale_min_k4: decode the j-th 6-bit (scale, min) pair from the
+    /// 12-byte packed scales array of a Q4_K/Q5_K super-block.
+    /// </summary>
+    private void GetScaleMinK4(int j, int scaleOff, out int sc, out int m)
+    {
+        if (j < 4)
+        {
+            sc = RawData[scaleOff + j] & 63;
+            m = RawData[scaleOff + j + 4] & 63;
+        }
+        else
+        {
+            sc = (RawData[scaleOff + j + 4] & 0xF) | ((RawData[scaleOff + j - 4] >> 6) << 4);
+            m = (RawData[scaleOff + j + 4] >> 4) | ((RawData[scaleOff + j] >> 6) << 4);
+        }
+    }
+
+    /// <summary>
     /// Q6_K: 256 elements per super-block, 210 bytes per block.
     /// Layout: [ql:uint8×128] [qh:uint8×64] [scales:int8×16] [d:fp16(2)]
-    /// 6-bit quantization: 4 bits from ql + 2 bits from qh = 6 bits, signed offset by -32.
+    /// Direct port of ggml dequantize_row_q6_K: the super-block is TWO 128-element
+    /// halves (ql advances 64, qh 32, scales 8 per half). Within a half, for l in
+    /// 0..31: element l = ql[l].lo + qh[l] bits 0-1; element l+32 = ql[l+32].lo +
+    /// qh[l] bits 2-3; element l+64 = ql[l].hi + qh[l] bits 4-5; element l+96 =
+    /// ql[l+32].hi + qh[l] bits 6-7; all minus 32, scale = sc[l/16 + {0,2,4,6}].
     /// </summary>
     private float[] DequantizeQ6_K(long offset, long elements)
     {
@@ -419,31 +438,41 @@ public class GGUFModel
         for (int block = 0; block < numBlocks; block++)
         {
             int bOff = (int)offset + block * 210;
-            int qlOff = bOff;
-            int qhOff = bOff + 128;
-            int scOff = bOff + 192;
             float d = HalfToFloat((ushort)(RawData[bOff + 208] | (RawData[bOff + 209] << 8)));
-            int rBase = block * 256;
+            int ql = bOff;
+            int qh = bOff + 128;
+            int sc = bOff + 192;
+            int y = block * 256;
 
-            for (int j = 0; j < 16; j++) // 16 sub-blocks of 16
+            for (int n = 0; n < 256; n += 128) // two 128-element halves
             {
-                float scale = d * (sbyte)RawData[scOff + j];
-                int subOff = j * 16;
-                for (int i = 0; i < 16; i++)
+                for (int l = 0; l < 32; l++)
                 {
-                    int ql4 = (i < 8)
-                        ? (RawData[qlOff + subOff / 2 + i] & 0x0F)
-                        : (RawData[qlOff + subOff / 2 + i - 8] >> 4);
-                    int qh2 = (RawData[qhOff + subOff / 4 + i % 8] >> ((i / 8) * 2 + (subOff / 16 % 2) * 4)) & 0x03;
-                    int q = (ql4 | (qh2 << 4)) - 32;
-                    result[rBase + subOff + i] = q * scale;
+                    int isIdx = l / 16;
+                    int hbits = RawData[qh + l];
+                    int q1 = ((RawData[ql + l] & 0x0F) | (((hbits >> 0) & 3) << 4)) - 32;
+                    int q2 = ((RawData[ql + l + 32] & 0x0F) | (((hbits >> 2) & 3) << 4)) - 32;
+                    int q3 = ((RawData[ql + l] >> 4) | (((hbits >> 4) & 3) << 4)) - 32;
+                    int q4 = ((RawData[ql + l + 32] >> 4) | (((hbits >> 6) & 3) << 4)) - 32;
+                    result[y + l] = d * (sbyte)RawData[sc + isIdx] * q1;
+                    result[y + l + 32] = d * (sbyte)RawData[sc + isIdx + 2] * q2;
+                    result[y + l + 64] = d * (sbyte)RawData[sc + isIdx + 4] * q3;
+                    result[y + l + 96] = d * (sbyte)RawData[sc + isIdx + 6] * q4;
                 }
+                y += 128; ql += 64; qh += 32; sc += 8;
             }
         }
         return result;
     }
 
-    /// <summary>Q2_K: 256 elements, 84 bytes per block.</summary>
+    /// <summary>
+    /// Q2_K: 256 elements, 84 bytes per block.
+    /// Layout: [scales:uint8×16] [quants:uint8×64] [d:fp16(2)] [dmin:fp16(2)]
+    /// Direct port of ggml dequantize_row_q2_K: two 128-element halves; within a half
+    /// the 2-bit quants come from the SAME 32 bytes at increasing shifts (0,2,4,6),
+    /// 16-element runs alternating bytes q[0..15] / q[16..31]. Scale byte per run:
+    /// low nibble × d, high nibble × dmin.
+    /// </summary>
     private float[] DequantizeQ2_K(long offset, long elements)
     {
         var result = new float[elements];
@@ -453,62 +482,102 @@ public class GGUFModel
             int bOff = (int)offset + block * 84;
             float d = HalfToFloat((ushort)(RawData[bOff + 80] | (RawData[bOff + 81] << 8)));
             float dmin = HalfToFloat((ushort)(RawData[bOff + 82] | (RawData[bOff + 83] << 8)));
-            int rBase = block * 256;
+            int q = bOff + 16;
+            int y = block * 256;
+            int isIdx = 0;
 
-            for (int j = 0; j < 16; j++)
+            for (int n = 0; n < 256; n += 128)
             {
-                int sc = RawData[bOff + j] & 0x0F;
-                int m = RawData[bOff + j] >> 4;
-                float scale = d * sc;
-                float min = dmin * m;
-                for (int i = 0; i < 16; i++)
+                int shift = 0;
+                for (int j = 0; j < 4; j++)
                 {
-                    int byteIdx = bOff + 16 + j * 4 + i / 4;
-                    int bitShift = (i % 4) * 2;
-                    int q = (RawData[byteIdx] >> bitShift) & 0x03;
-                    result[rBase + j * 16 + i] = q * scale - min;
+                    byte sc = RawData[bOff + isIdx++];
+                    float dl = d * (sc & 0x0F); float ml = dmin * (sc >> 4);
+                    for (int l = 0; l < 16; l++)
+                        result[y++] = dl * ((RawData[q + l] >> shift) & 3) - ml;
+
+                    sc = RawData[bOff + isIdx++];
+                    dl = d * (sc & 0x0F); ml = dmin * (sc >> 4);
+                    for (int l = 0; l < 16; l++)
+                        result[y++] = dl * ((RawData[q + l + 16] >> shift) & 3) - ml;
+
+                    shift += 2;
                 }
+                q += 32;
             }
         }
         return result;
     }
 
-    /// <summary>Q3_K: 256 elements, 110 bytes per block.</summary>
+    /// <summary>
+    /// Q3_K: 256 elements, 110 bytes per block.
+    /// Layout: [hmask:uint8×32] [quants:uint8×64] [scales:uint8×12] [d:fp16(2)]
+    /// Direct port of ggml dequantize_row_q3_K: quant runs mirror Q2_K (same-32-bytes
+    /// at shifts 0/2/4/6 per half); the high bit comes from hmask with a bit-plane mask
+    /// m that doubles every run ACROSS the whole super-block (1..128, never resets);
+    /// value = 2-bit quant MINUS 4 when the hmask bit is NOT set. The 16 6-bit signed
+    /// scales unpack via the ggml kmask aux-word scheme (low 4 bits from bytes 0..7,
+    /// high 2 bits from bytes 8..11), then -32.
+    /// </summary>
     private float[] DequantizeQ3_K(long offset, long elements)
     {
         var result = new float[elements];
         int numBlocks = (int)(elements / 256);
+        Span<int> scales = stackalloc int[16];
+        Span<uint> aux = stackalloc uint[4];
         for (int block = 0; block < numBlocks; block++)
         {
             int bOff = (int)offset + block * 110;
-            int hmOff = bOff;          // high bit mask: 32 bytes
-            int qOff = bOff + 32;       // quants: 64 bytes (2 bits each, 4 per byte)
-            int scOff = bOff + 96;      // scales: 12 bytes
+            int hm = bOff;          // high-bit mask: 32 bytes
+            int q = bOff + 32;      // quants: 64 bytes (2 bits each)
+            int scOff = bOff + 96;  // scales: 12 bytes
             float d = HalfToFloat((ushort)(RawData[bOff + 108] | (RawData[bOff + 109] << 8)));
-            int rBase = block * 256;
 
-            for (int j = 0; j < 16; j++)
+            // ggml kmask scale unpack: aux[0..1] = low nibbles source, aux[2] = high-2-bit source
+            uint a0 = (uint)(RawData[scOff] | (RawData[scOff + 1] << 8) | (RawData[scOff + 2] << 16) | (RawData[scOff + 3] << 24));
+            uint a1 = (uint)(RawData[scOff + 4] | (RawData[scOff + 5] << 8) | (RawData[scOff + 6] << 16) | (RawData[scOff + 7] << 24));
+            uint tmp = (uint)(RawData[scOff + 8] | (RawData[scOff + 9] << 8) | (RawData[scOff + 10] << 16) | (RawData[scOff + 11] << 24));
+            const uint kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f;
+            aux[2] = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+            aux[1] = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            for (int i = 0; i < 16; i++)
+                scales[i] = (sbyte)(byte)(aux[i / 4] >> ((i % 4) * 8));
+
+            int y = block * 256;
+            int isIdx = 0;
+            int mBit = 1;
+            for (int n = 0; n < 256; n += 128)
             {
-                // Decode scale from packed 12 bytes
-                int scByte = j < 8 ? RawData[scOff + j] : RawData[scOff + j - 4];
-                int sc = j < 8 ? (scByte & 0x0F) : (scByte >> 4);
-                sc = sc >= 8 ? sc - 16 : sc; // sign extend 4-bit
-                float scale = d * sc;
-
-                for (int i = 0; i < 16; i++)
+                int shift = 0;
+                for (int j = 0; j < 4; j++)
                 {
-                    int idx = j * 16 + i;
-                    int q2 = (RawData[qOff + idx / 4] >> ((idx % 4) * 2)) & 0x03;
-                    int hm = (RawData[hmOff + idx / 8] >> (idx % 8)) & 0x01;
-                    int q = (q2 | (hm << 2)) - 4; // 3 bits, offset by -4
-                    result[rBase + idx] = q * scale;
+                    float dl = d * (scales[isIdx++] - 32);
+                    for (int l = 0; l < 16; l++)
+                        result[y++] = dl * (((RawData[q + l] >> shift) & 3) - ((RawData[hm + l] & mBit) != 0 ? 0 : 4));
+
+                    dl = d * (scales[isIdx++] - 32);
+                    for (int l = 0; l < 16; l++)
+                        result[y++] = dl * (((RawData[q + l + 16] >> shift) & 3) - ((RawData[hm + l + 16] & mBit) != 0 ? 0 : 4));
+
+                    shift += 2;
+                    mBit <<= 1;
                 }
+                q += 32;
             }
         }
         return result;
     }
 
-    /// <summary>Q5_K: 256 elements, 176 bytes per block.</summary>
+    /// <summary>
+    /// Q5_K: 256 elements, 176 bytes per block.
+    /// Layout: [d:fp16(2)] [dmin:fp16(2)] [scales:uint8×12] [qh:uint8×32] [ql:uint8×128]
+    /// Direct port of ggml dequantize_row_q5_K: four 64-element chunks like Q4_K
+    /// (lo nibbles of 32 bytes, then hi nibbles, ql advances 32/chunk); the fifth bit
+    /// for element l of a chunk comes from qh[l] (qh does NOT advance) under bit-plane
+    /// masks u1/u2 that shift left 2 each chunk (lo: 1,4,16,64; hi: 2,8,32,128).
+    /// </summary>
     private float[] DequantizeQ5_K(long offset, long elements)
     {
         var result = new float[elements];
@@ -519,36 +588,27 @@ public class GGUFModel
             float d = HalfToFloat((ushort)(RawData[bOff] | (RawData[bOff + 1] << 8)));
             float dmin = HalfToFloat((ushort)(RawData[bOff + 2] | (RawData[bOff + 3] << 8)));
             int scOff = bOff + 4;
-            int qhOff = bOff + 16;  // 12 scale bytes + 4 header = 16
-            int qlOff = bOff + 48;  // 16 + 32 high bits = 48
-            int rBase = block * 256;
+            int qh = bOff + 16;  // 4 header + 12 scales = 16
+            int ql = bOff + 48;  // 16 + 32 high bits = 48
+            int y = block * 256;
+            int isIdx = 0;
+            int u1 = 1, u2 = 2;
 
-            for (int j = 0; j < 8; j++)
+            for (int j = 0; j < 256; j += 64)
             {
-                int sc, m;
-                if (j < 4)
-                {
-                    sc = RawData[scOff + j] & 0x3F;
-                    m = RawData[scOff + j + 4] & 0x3F;
-                }
-                else
-                {
-                    sc = ((RawData[scOff + j + 4] & 0xF) | ((RawData[scOff + j - 4] >> 6) << 4));
-                    m = ((RawData[scOff + j + 4] >> 4) | ((RawData[scOff + j] >> 6) << 4));
-                }
-                float scale = d * sc;
-                float min = dmin * m;
+                GetScaleMinK4(isIdx + 0, scOff, out int sc1, out int m1);
+                float d1 = d * sc1; float min1 = dmin * m1;
+                GetScaleMinK4(isIdx + 1, scOff, out int sc2, out int m2);
+                float d2 = d * sc2; float min2 = dmin * m2;
 
-                for (int i = 0; i < 32; i++)
+                for (int l = 0; l < 32; l++)
                 {
-                    int idx = j * 32 + i;
-                    int q4 = i < 16
-                        ? (RawData[qlOff + j * 16 + i] & 0x0F)
-                        : (RawData[qlOff + j * 16 + i - 16] >> 4);
-                    int qh = (RawData[qhOff + idx / 8] >> (idx % 8)) & 0x01;
-                    int q = (q4 | (qh << 4));
-                    result[rBase + idx] = q * scale - min;
+                    int hbits = RawData[qh + l];
+                    result[y + l] = d1 * ((RawData[ql + l] & 0x0F) + ((hbits & u1) != 0 ? 16 : 0)) - min1;
+                    result[y + 32 + l] = d2 * ((RawData[ql + l] >> 4) + ((hbits & u2) != 0 ? 16 : 0)) - min2;
                 }
+                y += 64; ql += 32; isIdx += 2;
+                u1 <<= 2; u2 <<= 2;
             }
         }
         return result;

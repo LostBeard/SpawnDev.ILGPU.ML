@@ -1345,7 +1345,7 @@ public class InferenceSession : IDisposable
 
         // Build transformer graph from architecture metadata
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeightsAll, quantizedWeightBytes) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values
@@ -1374,25 +1374,59 @@ public class InferenceSession : IDisposable
         var pool = new BufferPool(accelerator);
         var gpuWeights = new Dictionary<string, Tensor>();
         var gpuQuantizedWeights = new Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>();
+        var quantizedTypes = new Dictionary<string, GGUF.GGMLType>();
         var quantizedBuffers = new List<MemoryBuffer1D<byte, Stride1D.Dense>>(); // keep alive
+        // Tied-embed aliases share one byte[]; dedupe by reference so the compressed
+        // table is uploaded ONCE and serves both Gather and the LM-head MatMul.
+        var uploadedQuant = new Dictionary<byte[], ArrayView1D<byte, Stride1D.Dense>>(
+            ReferenceEqualityComparer.Instance);
         int loaded = 0;
         foreach (var (name, data) in cpuWeightsAll)
         {
             if (graph.Initializers.TryGetValue(name, out var shape))
             {
-                // Check if this weight has quantized bytes — upload raw if so
-                if (quantizedWeightBytes.TryGetValue(name, out var qBytes))
+                if (quantizedWeightsTyped.TryGetValue(name, out var qw))
                 {
-                    var qBuf = accelerator.Allocate1D<byte>(qBytes.Length);
-                    qBuf.View.CopyFromCPU(qBytes);
-                    gpuQuantizedWeights[name] = qBuf.View;
-                    quantizedBuffers.Add(qBuf);
-                    // Still need a Tensor entry for shape tracking (empty data)
-                    gpuWeights[name] = pool.Rent(shape, name);
+                    if (!uploadedQuant.TryGetValue(qw.Bytes, out var qView))
+                    {
+                        // Pad to a 4-byte multiple: the fused kernels read the bytes as
+                        // packed int32 words (Cast<byte,int> truncates a ragged tail) and
+                        // WebGPU requires 4-byte buffer sizes anyway.
+                        int padded = (qw.Bytes.Length + 3) & ~3;
+                        var qBuf = accelerator.Allocate1D<byte>(padded);
+                        qBuf.View.SubView(0, qw.Bytes.Length).CopyFromCPU(qw.Bytes);
+                        qView = qBuf.View;
+                        quantizedBuffers.Add(qBuf);
+                        uploadedQuant[qw.Bytes] = qView;
+                    }
+                    gpuQuantizedWeights[name] = qView;
+                    quantizedTypes[name] = qw.Type;
+                    // Shape-tracking entry only - the floats never exist. ShapeOnly
+                    // carries no buffer (a full F32 rent here would be ~4GB for a
+                    // gemma-class embedding) and fails loudly if any op reads .Data.
+                    gpuWeights[name] = Tensor.ShapeOnly(shape, name);
                 }
                 else if (data.Length > 0)
                 {
-                    gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                    if (transposeOnUpload.Contains(name))
+                    {
+                        // GGUF storage is [N rows][K contig] but the declared MatMul B is
+                        // [K, N] row-major: one-time GPU transpose at load (never a CPU
+                        // pass - unacceptable in interpreted Blazor WASM). shape = [K, N]
+                        // declared; the raw floats are its reverse.
+                        var final = pool.AllocatePermanent(shape, name);
+                        using var temp = accelerator.Allocate1D(data);
+                        registry.Transpose.Transpose(temp.View, final.Data,
+                            new[] { shape[1], shape[0] }, new[] { 1, 0 });
+                        // Flush before the temp buffer is disposed: the transpose
+                        // dispatch may still be pending in the command encoder.
+                        accelerator.Synchronize();
+                        gpuWeights[name] = final;
+                    }
+                    else
+                    {
+                        gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                    }
                 }
                 loaded++;
             }
@@ -1400,8 +1434,9 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("upload", 100);
 
         int qCount = gpuQuantizedWeights.Count;
-        if (VerboseLogging) Console.WriteLine($"[InferenceSession] GGUF: {ggufModel.Name} ({ggufModel.Architecture}), {compiled.Nodes.Length} nodes, {loaded} weights ({qCount} quantized), {ggufModel.BlockCount} layers");
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] GGUF: {ggufModel.Name} ({ggufModel.Architecture}), {compiled.Nodes.Length} nodes, {loaded} weights ({qCount} quantized, {uploadedQuant.Count} buffers), {ggufModel.BlockCount} layers");
 
+        registry.QuantizedWeightTypes = quantizedTypes.Count > 0 ? quantizedTypes : null;
         var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues,
             quantizedWeights: gpuQuantizedWeights.Count > 0 ? gpuQuantizedWeights : null);
         onProgress?.Invoke("ready", 100);

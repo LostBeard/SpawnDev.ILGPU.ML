@@ -73,9 +73,22 @@ public class OperatorRegistry : IDisposable
     public PadKernel Pad { get; }
     public ConvTranspose2DKernel ConvTranspose { get; }
     public Kernels.FusedDequantMatMul FusedDequant { get; }
+    public Kernels.FusedDequantGather FusedDequantGather { get; }
     public Kernels.SliceKernel Slice { get; }
     public Kernels.ConcatKernel Concat { get; }
     public Kernels.MissingElementWiseKernels MissingElementWise { get; }
+
+    /// <summary>
+    /// GGML quantization type per quantized-weight tensor name, set by the GGUF loader
+    /// alongside <c>OnnxOpContext.QuantizedWeights</c> (which carries only the raw byte
+    /// views). Operators that route a tensor to a fused dequant kernel MUST resolve its
+    /// type here - a quantized view without a type is an error, never "assume Q4_0"
+    /// (decoding one GGML layout as another produces silent garbage; see the K-quant
+    /// landmine, DevComms seven P1 thread 2026-06-11). Session-scoped: lives on the
+    /// registry because the registry already flows to every operator, keeping
+    /// GraphExecutor's plumbing untouched.
+    /// </summary>
+    public IReadOnlyDictionary<string, GGUF.GGMLType>? QuantizedWeightTypes { get; set; }
 
     public OperatorRegistry(Accelerator accelerator)
     {
@@ -97,6 +110,7 @@ public class OperatorRegistry : IDisposable
         Pad = new PadKernel(accelerator);
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
+        FusedDequantGather = new Kernels.FusedDequantGather(accelerator);
         Slice = new Kernels.SliceKernel(accelerator);
         Concat = new Kernels.ConcatKernel(accelerator);
         MissingElementWise = new Kernels.MissingElementWiseKernels(accelerator);
@@ -370,6 +384,7 @@ public class OperatorRegistry : IDisposable
         try { (Pad as IDisposable)?.Dispose(); } catch { }
         try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
         try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
+        try { (FusedDequantGather as IDisposable)?.Dispose(); } catch { }
         try { (Slice as IDisposable)?.Dispose(); } catch { }
         try { (Concat as IDisposable)?.Dispose(); } catch { }
         try { (MissingElementWise as IDisposable)?.Dispose(); } catch { }

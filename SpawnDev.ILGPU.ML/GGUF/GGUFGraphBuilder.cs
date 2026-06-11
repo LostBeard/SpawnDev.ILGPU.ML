@@ -20,14 +20,22 @@ namespace SpawnDev.ILGPU.ML.GGUF;
 /// time by the GraphExecutor's attention path, not baked into the static graph.
 /// The graph represents the data flow; positional encoding is a runtime concern.
 /// </summary>
+/// <summary>Raw GGUF block bytes + the GGML quantization type that decodes them.
+/// The type MUST travel with the bytes: every GGML layout decodes differently, and
+/// decoding one as another produces silent garbage (the K-quant landmine, 2026-06-11).</summary>
+public sealed record GGUFQuantizedWeight(byte[] Bytes, GGMLType Type);
+
 public static class GGUFGraphBuilder
 {
-    public static (ModelGraph Graph, Dictionary<string, float[]> Weights, Dictionary<string, byte[]> QuantizedWeightBytes) BuildGraph(GGUFModel model)
+    public static (ModelGraph Graph, Dictionary<string, float[]> Weights,
+        Dictionary<string, GGUFQuantizedWeight> QuantizedWeights,
+        HashSet<string> TransposeOnUpload) BuildGraph(GGUFModel model)
     {
         var arch = model.Architecture.ToLowerInvariant();
         var graph = new ModelGraph { Name = $"{model.Name} ({arch})" };
         var weights = new Dictionary<string, float[]>();
-        var quantizedBytes = new Dictionary<string, byte[]>();
+        var quantizedBytes = new Dictionary<string, GGUFQuantizedWeight>();
+        var transposeOnUpload = new HashSet<string>();
 
         // Extract architecture hyperparameters
         int vocabSize = (int)model.VocabSize;
@@ -56,8 +64,13 @@ public static class GGUFGraphBuilder
         var embedWeight = FindTensor(model, "token_embd.weight");
         if (embedWeight != null)
         {
+            // GATHER-TABLE role: quantized tables stay compressed (FusedDequantGather
+            // decodes looked-up rows in-register). Declared shape is the PHYSICAL
+            // row-major order [vocab, n_embd] - GGUF ne is fastest-dim-first
+            // [n_embd, vocab], so reverse. Gather(axis 0) then reads token rows as
+            // stored; no transpose, no F32 expansion.
             ExtractWeight(model, embedWeight, weights, quantizedBytes);
-            graph.Initializers[embedWeight.Name] = embedWeight.Shape;
+            graph.Initializers[embedWeight.Name] = embedWeight.Shape.Reverse().ToArray();
             AddNode(graph, "Gather", new[] { embedWeight.Name, prevOutput }, new[] { "embed_out" });
             prevOutput = "embed_out";
         }
@@ -72,13 +85,13 @@ public static class GGUFGraphBuilder
 
             // ── Attention norm ──
             string normOut = $"{pfx}_attn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm, quantizedBytes);
+            AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm);
 
             // ── Q, K, V projections ──
             string qOut = $"{pfx}_q", kOut = $"{pfx}_k", vOut = $"{pfx}_v";
-            AddLinear(graph, model, weights, $"{pfx}.attn_q", normOut, qOut, quantizedBytes);
-            AddLinear(graph, model, weights, $"{pfx}.attn_k", normOut, kOut, quantizedBytes);
-            AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{pfx}.attn_q", normOut, qOut, quantizedBytes, transposeOnUpload);
+            AddLinear(graph, model, weights, $"{pfx}.attn_k", normOut, kOut, quantizedBytes, transposeOnUpload);
+            AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes, transposeOnUpload);
 
             // ── Multi-head reshape: [batch, seq, embed] → [batch, nHeads, seq, headDim] ──
             string qReshaped = $"{pfx}_q_mh", kReshaped = $"{pfx}_k_mh", vReshaped = $"{pfx}_v_mh";
@@ -137,7 +150,7 @@ public static class GGUFGraphBuilder
 
             // ── Output projection ──
             string attnOut = $"{pfx}_attn_out";
-            AddLinear(graph, model, weights, $"{pfx}.attn_output", attnMerged, attnOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{pfx}.attn_output", attnMerged, attnOut, quantizedBytes, transposeOnUpload);
 
             // ── Residual 1 ──
             string residual1 = $"{pfx}_res1";
@@ -145,12 +158,12 @@ public static class GGUFGraphBuilder
 
             // ── FFN norm ──
             string ffnNormOut = $"{pfx}_ffn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm, quantizedBytes);
+            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
 
             // ── FFN: gate + up → activation → down ──
             string gateOut = $"{pfx}_gate", upOut = $"{pfx}_up";
-            AddLinear(graph, model, weights, $"{pfx}.ffn_gate", ffnNormOut, gateOut, quantizedBytes);
-            AddLinear(graph, model, weights, $"{pfx}.ffn_up", ffnNormOut, upOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{pfx}.ffn_gate", ffnNormOut, gateOut, quantizedBytes, transposeOnUpload);
+            AddLinear(graph, model, weights, $"{pfx}.ffn_up", ffnNormOut, upOut, quantizedBytes, transposeOnUpload);
 
             string activated;
             if (useSiLU)
@@ -173,7 +186,7 @@ public static class GGUFGraphBuilder
             }
 
             string ffnOut = $"{pfx}_ffn_out";
-            AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes);
+            AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes, transposeOnUpload);
 
             // ── Residual 2 ──
             string layerOut = $"block_{layer}_out";
@@ -185,7 +198,7 @@ public static class GGUFGraphBuilder
         //  3. Final norm
         // ═══════════════════════════════════════════════════════════
         string finalNormOut = "final_norm_out";
-        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm, quantizedBytes);
+        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm);
 
         // ═══════════════════════════════════════════════════════════
         //  4. LM head (output projection)
@@ -193,24 +206,35 @@ public static class GGUFGraphBuilder
         var outputWeight = FindTensor(model, "output.weight");
         if (outputWeight != null)
         {
-            ExtractWeight(model, outputWeight, weights, quantizedBytes);
+            ExtractWeight(model, outputWeight, weights, quantizedBytes, transposeOnUpload, isLinearB: true);
             graph.Initializers[outputWeight.Name] = outputWeight.Shape;
             AddNode(graph, "MatMul", new[] { finalNormOut, outputWeight.Name }, new[] { "logits" });
         }
-        else
+        else if (embedWeight != null)
         {
-            // Tied embeddings: output.weight = token_embd.weight
-            // Need transpose: embedding is [vocab, embed], LM head needs [embed, vocab]
-            if (embedWeight != null)
+            // Tied embeddings: the LM head is embed^T. The fused-MatMul orientation
+            // contract (B declared [K, N], storage [N rows][K contig]) makes the RAW
+            // embedding storage [vocab][n_embd] directly usable as B = [n_embd, vocab]:
+            // register the SAME bytes under an alias declared in GGUF ne order. For a
+            // quantized table that is zero-copy (the loader dedupes the upload, one
+            // compressed buffer serves Gather AND the head). For an F32 table the alias
+            // gets a one-time GPU transpose at upload. Either way: no runtime Transpose
+            // node, no per-forward work.
+            string headName = embedWeight.Name + "#lm_head";
+            graph.Initializers[headName] = embedWeight.Shape; // ne order = [n_embd, vocab] = [K, N]
+            if (quantizedBytes.TryGetValue(embedWeight.Name, out var qw))
             {
-                string transposed = "output_weight_transposed";
-                AddNode(graph, "Transpose", new[] { embedWeight.Name }, new[] { transposed },
-                    Attrs("perm", new long[] { 1, 0 }));
-                AddNode(graph, "MatMul", new[] { finalNormOut, transposed }, new[] { "logits" });
+                quantizedBytes[headName] = qw; // same byte[] reference -> single GPU upload
             }
+            else if (weights.TryGetValue(embedWeight.Name, out var fw))
+            {
+                weights[headName] = fw; // same float[] reference
+                transposeOnUpload.Add(headName); // storage [vocab][n_embd] -> declared [n_embd][vocab]
+            }
+            AddNode(graph, "MatMul", new[] { finalNormOut, headName }, new[] { "logits" });
         }
 
-        return (graph, weights, quantizedBytes);
+        return (graph, weights, quantizedBytes, transposeOnUpload);
     }
 
     // ── Helpers ──
@@ -218,21 +242,52 @@ public static class GGUFGraphBuilder
     private static GGUFTensorInfo? FindTensor(GGUFModel model, string name)
         => model.Tensors.FirstOrDefault(t => t.Name == name);
 
+    /// <summary>
+    /// Extract one tensor for GPU loading. ROLE-AWARE routing - the consumer determines
+    /// what a correct representation is:
+    /// - Quantized + fused-supported (Q4_0/Q8_0/Q4_K/Q6_K) + a consumer with a fused
+    ///   kernel (MatMul B, Gather table): RAW BYTES + GGMLType. The tensor stays
+    ///   compressed in GPU memory; the fused kernels decode blocks in-register.
+    /// - Quantized otherwise: THROW. There is deliberately NO CPU-dequant fallback -
+    ///   a multi-hundred-MB CPU pass is unacceptable in interpreted Blazor WASM, and a
+    ///   silent F32 expansion blows VRAM. Honest failure until a kernel exists.
+    /// - F32/F16: dequantized floats. Linear-B tensors are marked for a one-time GPU
+    ///   transpose at upload: GGUF storage is [N rows][K contig] (ne = [K, N]) but the
+    ///   declared ONNX MatMul B is [K, N] row-major. (The fused quantized path needs no
+    ///   transpose - its kernels read the [N][K] storage directly; that IS the contract.)
+    /// </summary>
     private static void ExtractWeight(GGUFModel model, GGUFTensorInfo tensor,
-        Dictionary<string, float[]> weights, Dictionary<string, byte[]>? quantizedBytes = null)
+        Dictionary<string, float[]> weights,
+        Dictionary<string, GGUFQuantizedWeight>? quantizedBytes = null,
+        HashSet<string>? transposeOnUpload = null,
+        bool isLinearB = false)
     {
-        if (quantizedBytes != null && GGUFModel.IsQuantized(tensor.Type))
+        if (GGUFModel.IsQuantized(tensor.Type))
         {
-            var rawBytes = model.GetTensorRawBytes(tensor);
-            if (rawBytes != null)
+            if (quantizedBytes != null && Kernels.FusedDequantMatMul.Supports(tensor.Type))
             {
-                quantizedBytes[tensor.Name] = rawBytes;
-                weights[tensor.Name] = Array.Empty<float>();
+                var rawBytes = model.GetTensorRawBytes(tensor)
+                    ?? throw new InvalidDataException(
+                        $"GGUF tensor '{tensor.Name}' ({tensor.Type}): raw data out of bounds.");
+                quantizedBytes[tensor.Name] = new GGUFQuantizedWeight(rawBytes, tensor.Type);
+                weights[tensor.Name] = Array.Empty<float>(); // presence marker; loader creates a ShapeOnly tensor
                 return;
             }
+            throw new NotSupportedException(
+                $"GGUF tensor '{tensor.Name}' uses {tensor.Type}" +
+                (quantizedBytes == null
+                    ? " in a role with no fused dequant kernel (norm/bias)."
+                    : ", which has no fused GPU dequant kernel yet (supported: Q4_0, Q8_0, Q4_K, Q6_K).") +
+                " CPU dequantization is deliberately not performed (heavy CPU passes are " +
+                "unacceptable in the browser). Re-quantize the model or request a kernel for this type.");
         }
-        var data = model.GetTensorFloat32(tensor);
-        if (data != null) weights[tensor.Name] = data;
+
+        var data = model.GetTensorFloat32(tensor)
+            ?? throw new NotSupportedException(
+                $"GGUF tensor '{tensor.Name}' has unsupported type {tensor.Type}.");
+        if (isLinearB && tensor.Dimensions.Length == 2)
+            transposeOnUpload?.Add(tensor.Name);
+        weights[tensor.Name] = data;
     }
 
     private static void AddNode(ModelGraph graph, string opType, string[] inputs, string[] outputs,
@@ -251,13 +306,14 @@ public static class GGUFGraphBuilder
         => new() { [key] = JsonSerializer.SerializeToElement(value) };
 
     private static void AddNorm(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
-        string tensorPrefix, string input, string output, int dim, bool useRMSNorm,
-        Dictionary<string, byte[]>? quantizedBytes = null)
+        string tensorPrefix, string input, string output, int dim, bool useRMSNorm)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
         {
-            ExtractWeight(model, weightTensor, weights, quantizedBytes);
+            // Norm weights are 1-D vectors with no fused dequant consumer: F32/F16 only
+            // (a quantized norm weight throws in ExtractWeight - honest failure).
+            ExtractWeight(model, weightTensor, weights);
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
         }
 
@@ -283,12 +339,16 @@ public static class GGUFGraphBuilder
 
     private static void AddLinear(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
         string tensorPrefix, string input, string output,
-        Dictionary<string, byte[]>? quantizedBytes = null)
+        Dictionary<string, GGUFQuantizedWeight>? quantizedBytes = null,
+        HashSet<string>? transposeOnUpload = null)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
         {
-            ExtractWeight(model, weightTensor, weights, quantizedBytes);
+            // MatMul-B role: declared [K, N] (= GGUF ne order). Quantized stays raw
+            // (fused kernel reads the [N][K] storage = the transpose, by contract);
+            // F32/F16 gets a one-time GPU transpose at upload.
+            ExtractWeight(model, weightTensor, weights, quantizedBytes, transposeOnUpload, isLinearB: true);
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
         }
 

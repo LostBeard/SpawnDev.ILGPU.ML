@@ -2,6 +2,61 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — GGUF quantization correctness overhaul (the K-quant landmine)
+
+### The bug class (gemma4 gap #0)
+
+The GGUF GPU path dropped the GGML quantization type: every quantized tensor was decoded
+by the fused MatMul kernel as **Q4_0**, so any K-quant model (Q4_K_M = the modern default,
+including gemma4) computed with silently garbage weights. Root-caused by Seven 2026-06-11;
+fixing it surfaced two more layers of the same disease:
+
+- **All five K-quant CPU dequant routines (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) were wrong** vs the
+  ggml reference (element permutations inside super-blocks); Q8_1 treated ggml's `s`
+  (a dot-product term) as a per-element min. All rewritten as direct ports of
+  ggml-quants.c `dequantize_row_*` (fetched verbatim). Legacy Q4_0/Q4_1/Q5_0/Q5_1/Q8_0
+  were verified correct.
+- **The GPU Q4_0 kernel read nibbles in interleaved order**; the GGUF format is split
+  order (low nibbles of a 16-byte run = elements 0-15, high = 16-31). Even pure-Q4_0
+  files decoded permuted. Its unit test encoded synthetic data in the kernel's OWN wrong
+  order - self-consistent, never spec-checked.
+
+### What shipped
+
+- **Typed fused dequant MatMul** (`FusedDequantMatMul`): Q4_0 + Q8_0 + Q4_K + Q6_K
+  (gemma4's Q4_K_M mix), `Forward(..., GGMLType)`, single packed-int kernel per type on
+  all 6 backends, host-side block-size validation, per-shape params-buffer cache
+  (replaces a dispose-while-dispatch-pending hazard). Weights stay COMPRESSED in GPU
+  memory; blocks decode in registers.
+- **NEW `FusedDequantGather`**: quantized embedding lookup - the table stays compressed
+  in VRAM and only gathered rows decode in-register (a gemma-class Q6_K table is ~770MB
+  compressed vs ~4GB as F32). No CPU dequant pass, ever (interpreted Blazor WASM cannot
+  afford one and the heavy work belongs on the GPU).
+- **Type travels with the bytes**: `GGUFGraphBuilder` returns `GGUFQuantizedWeight(bytes,
+  type)`; `OperatorRegistry.QuantizedWeightTypes` carries types to operators (executor
+  plumbing untouched); MatMul/Gather operators route by type and THROW on an untyped
+  quantized tensor instead of guessing a layout. Unsupported quantized types
+  (Q2_K/Q3_K/Q5_K/IQ*) throw a clear error at load - no silent fallback.
+- **Orientation contracts**: GGUF linear storage is [N rows][K contig]; fused kernels
+  read it transposed (that IS the contract, B declared [K,N]); F32/F16 linears get a
+  one-time GPU transpose at upload; embeddings declare physical [vocab, n_embd] order.
+  **Tied-embed LM head is zero-copy**: the head MatMul reads the SAME compressed buffer
+  as the embedding Gather via an alias initializer - the old per-forward Transpose node
+  is gone (it also read a wrongly-declared shape).
+- **`Tensor.ShapeOnly`**: quantized graph entries carry shape without a dead F32 buffer
+  (previously a full-size buffer was rented per quantized weight purely for shape
+  tracking - ~4GB for a gemma-class embedding).
+- **9-test oracle suite** (`MLTestBase.FusedDequantMatMulTests`): CPU dequant locked to
+  ggml-reference ports for ALL TEN types; GPU fused MatMul + Gather vs reference oracle
+  per type; operator routing incl. the untyped-throw; graph-builder contract assertions.
+  Synthetic blocks are encoded in the REAL GGUF layout.
+
+### Breaking (preview API)
+
+`FusedDequantMatMul.Forward` requires a `GGMLType`; `GGUFGraphBuilder.BuildGraph` returns
+4 items (typed quantized dict + transpose set). No silent-default overloads were kept -
+an untyped quantized decode is exactly the bug this release removes.
+
 ## 4.0.0-preview.4 (2026-05-23) — Transformers.js-style Tensor API + /depth GPU-direct rendering + palette swap on accelerator
 
 ### Headline: native C# Tensor types

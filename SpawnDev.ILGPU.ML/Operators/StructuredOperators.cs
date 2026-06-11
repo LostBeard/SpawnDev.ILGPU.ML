@@ -36,12 +36,22 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
         int N = b.Rank >= 2 ? b.Shape[^1] : 1;
         if (M == 0 || K == 0 || N == 0) return; // degenerate dimensions
 
-        // Check if weight B is quantized (Q4_0) — use fused dequant kernel
+        // Quantized weight B — use the fused dequant kernel for its GGML type. The type
+        // is MANDATORY: every GGML layout decodes differently, and decoding one as
+        // another (the old hardcoded-Q4_0 behavior) produces silent garbage for every
+        // K-quant model. The GGUF loader sets reg.QuantizedWeightTypes alongside the
+        // byte views and only admits FusedDequantMatMul.Supports types.
         string? bName = ctx.InputNames.Length > 1 ? ctx.InputNames[1] : null;
         if (bName != null && ctx.QuantizedWeights != null
-            && ctx.QuantizedWeights.TryGetValue(bName, out var q4Data))
+            && ctx.QuantizedWeights.TryGetValue(bName, out var qData))
         {
-            reg.FusedDequant.Forward(a.Data, q4Data, ctx.Outputs[0].Data, M, K, N);
+            if (reg.QuantizedWeightTypes == null
+                || !reg.QuantizedWeightTypes.TryGetValue(bName, out var qType))
+                throw new InvalidOperationException(
+                    $"MatMul: quantized weight '{bName}' has no GGML type registered " +
+                    "(OperatorRegistry.QuantizedWeightTypes). Refusing to guess a block " +
+                    "layout - the loader must record the type with the bytes.");
+            reg.FusedDequant.Forward(a.Data, qData, ctx.Outputs[0].Data, M, K, N, qType);
             return;
         }
 
@@ -784,6 +794,44 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
         // The constant-folded result is flat, so axis must be 0.
         if (axis >= data.Shape.Length)
             axis = 0;
+
+        // Quantized table (GGUF embedding lookup) — fused dequant-Gather keeps the
+        // table COMPRESSED in GPU memory and decodes only the gathered rows in-register.
+        // Never expand a quantized embedding table to F32 (VRAM blow-up) and never
+        // CPU-dequantize it (interpreted Blazor WASM cannot afford the pass).
+        string? dataName = ctx.InputNames.Length > 0 ? ctx.InputNames[0] : null;
+        if (dataName != null && ctx.QuantizedWeights != null
+            && ctx.QuantizedWeights.TryGetValue(dataName, out var qTable))
+        {
+            if (reg.QuantizedWeightTypes == null
+                || !reg.QuantizedWeightTypes.TryGetValue(dataName, out var qType))
+                throw new InvalidOperationException(
+                    $"Gather: quantized table '{dataName}' has no GGML type registered " +
+                    "(OperatorRegistry.QuantizedWeightTypes).");
+            if (axis != 0 || data.Shape.Length != 2)
+                throw new NotSupportedException(
+                    $"Gather on a quantized table supports axis=0 over a 2-D [rows, rowLength] " +
+                    $"table only (embedding lookup); got axis={axis}, rank={data.Shape.Length}.");
+
+            int rows = data.Shape[0];
+            int rowLength = data.Shape[1];
+            int numIdx = indices.ElementCount;
+
+            // Indices may be a runtime GPU tensor (token IDs) or pre-read constants;
+            // constants go through a small GPU upload (CopyFromCPU = immediate
+            // writeBuffer, safe) so ONE kernel serves both.
+            var idxConst = ctx.TryGetInputValues(1);
+            var idxView = indices.Data;
+            if (idxConst != null)
+            {
+                var idxTensor = ctx.Pool.Rent(new[] { numIdx }, "gather_idx_const");
+                idxTensor.Data.CopyFromCPU(idxConst);
+                idxView = idxTensor.Data;
+            }
+            reg.FusedDequantGather.GatherAxis0(qTable, idxView, ctx.Outputs[0].Data,
+                numIdx, rowLength, rows, qType);
+            return;
+        }
 
         // Get index values from pre-read constants (avoids GPU→CPU readback)
         var idxFloats = ctx.TryGetInputValues(1);
