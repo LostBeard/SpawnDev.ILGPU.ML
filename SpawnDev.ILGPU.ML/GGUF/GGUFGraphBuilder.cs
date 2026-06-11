@@ -157,9 +157,19 @@ public static class GGUFGraphBuilder
             string attnOut = $"{pfx}_attn_out";
             AddLinear(graph, model, weights, $"{pfx}.attn_output", attnMerged, attnOut, quantizedBytes, transposeOnUpload);
 
+            // ── Post-attention norm (gemma 2/3/4 norm-sandwich: normalize the sublayer OUTPUT before the
+            //    residual add). Presence-based — llama/mistral/etc. have no such tensor and are unaffected. ──
+            string attnResInput = attnOut;
+            if (FindTensor(model, $"{pfx}.post_attention_norm.weight") != null)
+            {
+                string postAttnOut = $"{pfx}_post_attn_norm";
+                AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm);
+                attnResInput = postAttnOut;
+            }
+
             // ── Residual 1 ──
             string residual1 = $"{pfx}_res1";
-            AddNode(graph, "Add", new[] { layerIn, attnOut }, new[] { residual1 });
+            AddNode(graph, "Add", new[] { layerIn, attnResInput }, new[] { residual1 });
 
             // ── FFN norm ──
             string ffnNormOut = $"{pfx}_ffn_norm";
@@ -193,9 +203,18 @@ public static class GGUFGraphBuilder
             string ffnOut = $"{pfx}_ffn_out";
             AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes, transposeOnUpload);
 
+            // ── Post-FFN norm (gemma norm-sandwich), presence-based. ──
+            string ffnResInput = ffnOut;
+            if (FindTensor(model, $"{pfx}.post_ffw_norm.weight") != null)
+            {
+                string postFfwOut = $"{pfx}_post_ffw_norm";
+                AddNorm(graph, model, weights, $"{pfx}.post_ffw_norm", ffnOut, postFfwOut, embedDim, useRMSNorm);
+                ffnResInput = postFfwOut;
+            }
+
             // ── Residual 2 ──
             string layerOut = $"block_{layer}_out";
-            AddNode(graph, "Add", new[] { residual1, ffnOut }, new[] { layerOut });
+            AddNode(graph, "Add", new[] { residual1, ffnResInput }, new[] { layerOut });
             prevOutput = layerOut;
         }
 
