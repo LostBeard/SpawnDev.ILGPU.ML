@@ -93,6 +93,41 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Gemma4_PerLayerAttnConfig_SwaGlobalInterleave() => await RunTest(async accelerator =>
+    {
+        // Only metadata is needed — GetLayerAttnConfig reads config, not tensors.
+        var model = new GGUFModel
+        {
+            Metadata = new Dictionary<string, object>
+            {
+                ["general.architecture"] = "gemma4",
+                ["gemma4.attention.sliding_window_pattern"] = new[] { true, true, true, true, true, false }, // 5:1
+                ["gemma4.attention.head_count_kv"] = new[] { 8, 8, 8, 8, 8, 1 },
+                ["gemma4.attention.sliding_window"] = 1024L,
+                ["gemma4.rope.freq_base"] = 1000000f,
+                ["gemma4.rope.freq_base_swa"] = 10000f,
+                ["gemma4.attention.key_length"] = 512L,
+                ["gemma4.attention.key_length_swa"] = 256L,
+                ["gemma4.rope.dimension_count"] = 512L,
+                ["gemma4.rope.dimension_count_swa"] = 256L,
+            },
+        };
+
+        var swa = GGUFGraphBuilder.GetLayerAttnConfig(model, layer: 0, nHeads: 16, defaultNKV: 8, defaultHeadDim: 256);
+        if (swa.IsGlobal || swa.Window != 1024 || Math.Abs(swa.RopeBase - 10000f) > 1f
+            || swa.NKVHeads != 8 || swa.HeadDim != 256 || swa.RotaryDim != 256)
+            throw new Exception($"sliding layer 0 config wrong: {swa}");
+
+        var glb = GGUFGraphBuilder.GetLayerAttnConfig(model, layer: 5, nHeads: 16, defaultNKV: 8, defaultHeadDim: 256);
+        if (!glb.IsGlobal || glb.Window != 0 || Math.Abs(glb.RopeBase - 1000000f) > 1f
+            || glb.NKVHeads != 1 || glb.HeadDim != 512 || glb.RotaryDim != 512)
+            throw new Exception($"global layer 5 config wrong: {glb}");
+
+        Console.WriteLine("[Gemma4] per-layer SWA/global attn config (window/base/KV-heads/head-dim) correct");
+        await Task.CompletedTask;
+    });
+
     /// <summary>Minimal F32 gemma4 model. BuildGraph only constructs nodes + extracts weights (no
     /// execution), so tiny consistent dims suffice. <paramref name="withPostNorms"/> adds the
     /// post_attention_norm / post_ffw_norm tensors that trigger the norm-sandwich.</summary>

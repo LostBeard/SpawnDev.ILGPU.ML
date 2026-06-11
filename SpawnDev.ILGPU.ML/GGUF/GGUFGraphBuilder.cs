@@ -281,6 +281,49 @@ public static class GGUFGraphBuilder
     private static GGUFTensorInfo? FindTensor(GGUFModel model, string name)
         => model.Tensors.FirstOrDefault(t => t.Name == name);
 
+    /// <summary>Per-layer attention configuration for archs with interleaved sliding-window/global
+    /// attention (gemma3/gemma4). Each field is the value the RoPE + FusedAttention node attributes use.</summary>
+    public readonly record struct LayerAttnConfig(
+        bool IsGlobal, int Window, float RopeBase, int RotaryDim, int NKVHeads, int HeadDim);
+
+    /// <summary>
+    /// Resolve a layer's attention config from the GGUF metadata. `sliding_window_pattern[L]`==true means a
+    /// windowed (SWA) layer; ==false (or no pattern) means full/global attention. SWA layers use the *_swa
+    /// metadata (window, freq_base_swa, key_length_swa, dimension_count_swa); global layers use the full
+    /// values. `head_count_kv` is per-layer (an array) for gemma4 (8 sliding / 1 global) with a scalar fallback.
+    /// </summary>
+    public static LayerAttnConfig GetLayerAttnConfig(GGUFModel model, int layer, int nHeads, int defaultNKV, int defaultHeadDim)
+    {
+        string a = model.Architecture;
+        bool[]? BoolArr(string k) => model.Metadata.TryGetValue(k, out var v)
+            ? (v as bool[]) ?? (v is Array arr ? arr.Cast<object>().Select(Convert.ToBoolean).ToArray() : null) : null;
+        int[]? IntArr(string k) => model.Metadata.TryGetValue(k, out var v)
+            ? (v as int[]) ?? (v is Array arr ? arr.Cast<object>().Select(Convert.ToInt32).ToArray() : null) : null;
+
+        var pattern = BoolArr($"{a}.attention.sliding_window_pattern");
+        bool isGlobal = pattern == null || layer >= pattern.Length || !pattern[layer];
+
+        var kv = IntArr($"{a}.attention.head_count_kv");
+        int nkv = kv != null && layer < kv.Length ? kv[layer]
+                : (int)model.GetMetadataInt($"{a}.attention.head_count_kv", defaultNKV);
+        if (nkv <= 0) nkv = defaultNKV;
+
+        int window = isGlobal ? 0 : (int)model.GetMetadataInt($"{a}.attention.sliding_window", 0);
+
+        float baseFull = model.GetMetadataFloat($"{a}.rope.freq_base", 10000f);
+        float ropeBase = isGlobal ? baseFull : model.GetMetadataFloat($"{a}.rope.freq_base_swa", baseFull);
+
+        int dimFull = (int)model.GetMetadataInt($"{a}.rope.dimension_count", defaultHeadDim);
+        int rotaryDim = isGlobal ? dimFull : (int)model.GetMetadataInt($"{a}.rope.dimension_count_swa", dimFull);
+
+        int klFull = (int)model.GetMetadataInt($"{a}.attention.key_length", defaultHeadDim);
+        int headDim = isGlobal ? klFull : (int)model.GetMetadataInt($"{a}.attention.key_length_swa", klFull);
+        if (headDim <= 0) headDim = defaultHeadDim;
+        if (rotaryDim <= 0) rotaryDim = headDim;
+
+        return new LayerAttnConfig(isGlobal, window, ropeBase, rotaryDim, nkv, headDim);
+    }
+
     /// <summary>
     /// Extract one tensor for GPU loading. ROLE-AWARE routing - the consumer determines
     /// what a correct representation is:
