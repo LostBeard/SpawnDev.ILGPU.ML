@@ -6,14 +6,28 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// <summary>
 /// Rotary Position Embedding (RoPE) GPU kernel.
 /// Applies rotation-based position encoding to query and key tensors.
-/// Used by Depth Anything V3, LLaMA, Mistral, and modern transformers.
+/// Used by LLaMA, Mistral, gemma, GPT-J/NeoX-family and modern transformers.
 ///
-/// RoPE encodes position by rotating pairs of dimensions:
-///   x'[2i]   = x[2i]   * cos(θ) - x[2i+1] * sin(θ)
-///   x'[2i+1] = x[2i]   * sin(θ) + x[2i+1] * cos(θ)
-/// where θ = position / base^(2i/d), base=10000 by default.
+/// Two pairing STYLES exist in the wild and produce different layouts:
+/// - NeoX / split-half (LLaMA, Mistral, gemma; the default here):
+///     pair = (x[i], x[i + rotaryDim/2]) for i in [0, rotaryDim/2)
+/// - GPT-J / interleaved:
+///     pair = (x[2i], x[2i+1]) for i in [0, rotaryDim/2)
+/// Both rotate each pair by θ_i = position / base^(2i / rotaryDim):
+///     x0' = x0·cos θ − x1·sin θ ; x1' = x0·sin θ + x1·cos θ
 ///
-/// Key property: dot(RoPE(q,pos_q), RoPE(k,pos_k)) depends only on (pos_q - pos_k),
+/// PER-CALL parameters (gemma4 needs them per LAYER - 5:1 SWA/global interleave uses
+/// base 10000 on local layers and 1000000 on global layers; the graph wiring selects
+/// and passes them, this kernel just honors the arguments):
+/// - ropeBase: the θ base for this call (ctor value is only the default).
+/// - rotaryDim: rotate only the first rotaryDim dims of each head; pass-through the
+///   rest (partial rotary, e.g. GPT-NeoX 25%). Must be even; rotaryDim == headDim
+///   is the usual full rotation.
+/// - interleaved: pairing style (false = NeoX split-half, matching the previous
+///   behavior of this kernel; its earlier doc described the interleaved form while
+///   implementing split-half - the flag makes both real and the docs honest).
+///
+/// Key property: dot(RoPE(q,pos_q), RoPE(k,pos_k)) depends only on (pos_q − pos_k),
 /// giving relative position awareness without explicit position embeddings.
 /// </summary>
 public class RoPEKernel
@@ -22,7 +36,7 @@ public class RoPEKernel
     private readonly float _base;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int, float>? _ropeKernel;
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, float, int, int>? _ropeKernel;
 
     public RoPEKernel(Accelerator accelerator, float ropeBase = 10000f)
     {
@@ -31,60 +45,94 @@ public class RoPEKernel
     }
 
     /// <summary>
-    /// Apply RoPE to a batch of vectors.
-    /// input [numPositions, headDim] → output [numPositions, headDim]
-    /// Positions are assumed sequential: 0, 1, 2, ..., numPositions-1.
+    /// Apply RoPE with the constructor base, full head dim, NeoX style - the original
+    /// API, behavior unchanged.
+    /// input [numPositions, headDim] → output [numPositions, headDim];
+    /// positions are startPosition, startPosition+1, ...
     /// </summary>
     public void Apply(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        int numPositions, int headDim, int startPosition = 0)
-    {
-        // One thread per scalar output (gather, not scatter — WebGL TF compatible).
-        // idx = pos * headDim + k. Doubles the thread count vs the prior pair-per-thread
-        // launch, but each thread now writes exactly one position (its own idx).
-        _ropeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, float>(RoPEImpl);
-        _ropeKernel(numPositions * headDim, input, output,
-            numPositions, headDim, startPosition, _base);
-    }
+        int numPositions, int headDim, int startPosition = 0) =>
+        Apply(input, output, numPositions, headDim, startPosition,
+            _base, headDim, interleaved: false);
 
     /// <summary>
-    /// Apply RoPE in-place.
+    /// Apply RoPE with per-call base / partial rotary / pairing style (see class doc).
     /// </summary>
+    public void Apply(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numPositions, int headDim, int startPosition,
+        float ropeBase, int rotaryDim, bool interleaved)
+    {
+        if (rotaryDim <= 0 || rotaryDim > headDim || (rotaryDim & 1) != 0)
+            throw new ArgumentOutOfRangeException(nameof(rotaryDim),
+                $"rotaryDim must be even and in (0, headDim]; got {rotaryDim} for headDim {headDim}");
+
+        // One thread per scalar output (gather, not scatter — WebGL TF compatible).
+        _ropeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, float, int, int>(RoPEImpl);
+        _ropeKernel(numPositions * headDim, input, output,
+            numPositions, headDim, startPosition, ropeBase, rotaryDim, interleaved ? 1 : 0);
+    }
+
+    /// <summary>Apply RoPE in-place (original API).</summary>
     public void ApplyInPlace(
         ArrayView1D<float, Stride1D.Dense> data,
-        int numPositions, int headDim, int startPosition = 0)
-    {
+        int numPositions, int headDim, int startPosition = 0) =>
         Apply(data, data, numPositions, headDim, startPosition);
-    }
+
+    /// <summary>Apply RoPE in-place with per-call parameters.</summary>
+    public void ApplyInPlace(
+        ArrayView1D<float, Stride1D.Dense> data,
+        int numPositions, int headDim, int startPosition,
+        float ropeBase, int rotaryDim, bool interleaved) =>
+        Apply(data, data, numPositions, headDim, startPosition, ropeBase, rotaryDim, interleaved);
 
     private static void RoPEImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        int numPos, int D, int startPos, float ropeBase)
+        int numPos, int D, int startPos, float ropeBase, int rotDim, int interleaved)
     {
-        // idx = (pos * D + k)
-        int halfD = D / 2;
+        // idx = (pos * D + k). Branch shape: the pass-through/rotate split and the
+        // style selects below are TOP-LEVEL (not inside any loop) - safe for the
+        // WebGL emitter (cf. the loop-body branch explosion documented on
+        // FusedDequantMatMul; this kernel has no loops at all).
         int k = idx % D;
         int pos = idx / D + startPos;
-        // Both halves share the same dimIdx in [0, halfD); first-half outputs cos-sin,
-        // second-half outputs sin+cos. The two inputs needed are always at k_low and k_low+halfD.
-        bool secondHalf = k >= halfD;
-        int dimIdx = secondHalf ? k - halfD : k;
+        int rowStart = (idx / D) * D;
 
-        // Frequency: θ = pos / base^(2*dimIdx/D)
-        float freqExp = 2f * dimIdx / (float)D;
+        if (k >= rotDim)
+        {
+            // Partial rotary: dims beyond rotaryDim pass through unchanged.
+            output[idx] = input[idx];
+            return;
+        }
+
+        int half = rotDim / 2;
+
+        // Pair geometry per style:
+        // NeoX (interleaved=0): lane i = k % half; x0 at i, x1 at i + half; k >= half is the second element.
+        // GPT-J (interleaved=1): lane i = k / 2;   x0 at 2i, x1 at 2i+1;   odd k is the second element.
+        int laneNeoX = k >= half ? k - half : k;
+        int laneJ = k >> 1;
+        int i = interleaved == 1 ? laneJ : laneNeoX;
+        int x0Idx = interleaved == 1 ? 2 * laneJ : laneNeoX;
+        int x1Idx = interleaved == 1 ? 2 * laneJ + 1 : laneNeoX + half;
+        bool second = interleaved == 1 ? (k & 1) == 1 : k >= half;
+
+        // θ = pos / base^(2i / rotaryDim)
+        float freqExp = 2f * i / (float)rotDim;
         float invFreq = 1f / MathF.Pow(ropeBase, freqExp);
         float theta = pos * invFreq;
         float cosTheta = MathF.Cos(theta);
         float sinTheta = MathF.Sin(theta);
 
-        int rowStart = (idx / D) * D;
-        float x0 = input[rowStart + dimIdx];          // first half
-        float x1 = input[rowStart + dimIdx + halfD];  // second half
-        output[idx] = secondHalf ? (x0 * sinTheta + x1 * cosTheta)
-                                 : (x0 * cosTheta - x1 * sinTheta);
+        float x0 = input[rowStart + x0Idx];
+        float x1 = input[rowStart + x1Idx];
+        output[idx] = second ? (x0 * sinTheta + x1 * cosTheta)
+                             : (x0 * cosTheta - x1 * sinTheta);
     }
 }

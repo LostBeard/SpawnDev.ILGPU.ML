@@ -2,6 +2,29 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — gemma4 decode-path kernels (GEMV routing, masked flash attention, RoPE generalization)
+
+The three kernel prerequisites for the gemma4 bring-up (the graph wiring selects and
+passes the per-layer values; the kernels honor call parameters):
+
+- **GEMV routing**: M==1 matmuls (every LLM decode matmul) no longer pad through the
+  16x16 tiled kernel (15/16 of each group idled); the simple thread-per-output kernel is
+  the coalesced GEMV for row-major B. Applies to `MatMul` and `BatchedMatMul` (per-head
+  decode attention).
+- **`FusedAttentionKernel` masking**: new `Forward(..., causal, window, kvOffset)` -
+  index-computed causal + sliding-window masking (gemma4's 5:1 SWA/global interleave
+  passes per-layer windows; global layers pass window >= seqKV), KV-cache decode at any
+  position via kvOffset. Branch-free body (WebGL emitter rule), exact-bits softmax scale
+  (the old param quantized it to 1e-4), params-buffer ring (fixes a dispose-while-
+  pending-dispatch hazard). Original API unchanged via delegation.
+- **`RoPEKernel` generalization**: per-call `ropeBase` (gemma4 dual 10000 local /
+  1000000 global), pairing-style flag (NeoX split-half | GPT-J interleaved - the old doc
+  described interleaved while implementing split-half; both are now real), partial
+  `rotaryDim` with exact tail pass-through. Original API unchanged via delegation.
+
+All three: CPU-oracle test suites, scoped PMT green on all 6 backends, offline GLSL
+size probes (the WebGL emitter constraint) before gating.
+
 ## Unreleased — GGUF quantization correctness overhaul (the K-quant landmine)
 
 ### The bug class (gemma4 gap #0)
