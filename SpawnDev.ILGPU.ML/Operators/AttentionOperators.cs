@@ -10,6 +10,9 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// <summary>
 /// RoPE node - rotary position embedding via <see cref="Kernels.RoPEKernel"/>.
 /// in: [x] (last dim = head_dim; rows = everything before it)
+///     [freq_factors] OPTIONAL second input, [rotary_dim/2] floats (gemma4 global
+///     layers pass rope_freqs.weight; absent = scalar-base behavior). ggml semantics:
+///     the per-pair theta is DIVIDED by its factor.
 /// attrs: rope_base:f (default 10000), rotary_dim:i (default = head_dim),
 ///        interleaved:i 0/1 (default 0 = NeoX split-half),
 ///        kv_offset:i (default 0; sequence position of row 0),
@@ -37,8 +40,18 @@ public class RoPEOperator(OperatorRegistry reg) : IOnnxOperator
         int kvOffset = ctx.GetInt("kv_offset", 0);
         int rowsPerPosition = ctx.GetInt("rows_per_position", 1);
 
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>? freqFactors = null;
+        if (ctx.Inputs.Length > 1 && ctx.Inputs[1].ElementCount > 0)
+        {
+            var ff = ctx.Inputs[1];
+            if (ff.ElementCount < rotaryDim / 2)
+                throw new InvalidOperationException(
+                    $"RoPE freq_factors input must have rotary_dim/2 = {rotaryDim / 2} entries; got {ff.ElementCount}.");
+            freqFactors = ff.Data;
+        }
+
         reg.RoPE.Apply(x.Data, ctx.Outputs[0].Data, rows, headDim, kvOffset,
-            ropeBase, rotaryDim, interleaved, rowsPerPosition);
+            ropeBase, rotaryDim, interleaved, rowsPerPosition, freqFactors);
     }
 }
 

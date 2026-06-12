@@ -30,13 +30,19 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// Key property: dot(RoPE(q,pos_q), RoPE(k,pos_k)) depends only on (pos_q − pos_k),
 /// giving relative position awareness without explicit position embeddings.
 /// </summary>
-public class RoPEKernel
+public class RoPEKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
     private readonly float _base;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int, float, int, int, int>? _ropeKernel;
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, float, int, int, int,
+        ArrayView1D<float, Stride1D.Dense>, int>? _ropeKernel;
+
+    // Shared 1-element {1f} buffer bound as freq_factors when none are provided; the
+    // kernel reads index i * hasFactors, so the absent case always reads this 1.0
+    // (branch-free - no kernel variant, no in-kernel branching).
+    private MemoryBuffer1D<float, Stride1D.Dense>? _onesBuf;
 
     public RoPEKernel(Accelerator accelerator, float ropeBase = 10000f)
     {
@@ -79,21 +85,55 @@ public class RoPEKernel
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int numPositions, int headDim, int startPosition,
-        float ropeBase, int rotaryDim, bool interleaved, int rowsPerPosition)
+        float ropeBase, int rotaryDim, bool interleaved, int rowsPerPosition) =>
+        Apply(input, output, numPositions, headDim, startPosition,
+            ropeBase, rotaryDim, interleaved, rowsPerPosition, freqFactors: null);
+
+    /// <summary>
+    /// Apply RoPE with optional per-pair FREQUENCY FACTORS (NTK / proportional rope):
+    /// <paramref name="freqFactors"/> has rotaryDim/2 entries and the pair angle becomes
+    /// θ_i = position · base^(−2i/rotaryDim) / freqFactors[i] - ggml semantics
+    /// (theta_base is DIVIDED by the factor; verified verbatim against llama.cpp's rope
+    /// kernels, `freq_factors[i0/2]`, 2026-06-11). gemma4 global layers carry
+    /// rope_freqs.weight; sliding layers pass null (= all-ones behavior).
+    /// </summary>
+    public void Apply(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numPositions, int headDim, int startPosition,
+        float ropeBase, int rotaryDim, bool interleaved, int rowsPerPosition,
+        ArrayView1D<float, Stride1D.Dense>? freqFactors)
     {
         if (rotaryDim <= 0 || rotaryDim > headDim || (rotaryDim & 1) != 0)
             throw new ArgumentOutOfRangeException(nameof(rotaryDim),
                 $"rotaryDim must be even and in (0, headDim]; got {rotaryDim} for headDim {headDim}");
         if (rowsPerPosition <= 0)
             throw new ArgumentOutOfRangeException(nameof(rowsPerPosition));
+        if (freqFactors.HasValue && freqFactors.Value.Length < rotaryDim / 2)
+            throw new ArgumentOutOfRangeException(nameof(freqFactors),
+                $"freqFactors must have rotaryDim/2 = {rotaryDim / 2} entries; got {freqFactors.Value.Length}");
+
+        if (_onesBuf == null)
+        {
+            _onesBuf = _accelerator.Allocate1D(new[] { 1f });
+        }
+        var ffView = freqFactors ?? _onesBuf.View;
+        int hasFactors = freqFactors.HasValue ? 1 : 0;
 
         // One thread per scalar output (gather, not scatter — WebGL TF compatible).
         _ropeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, float, int, int, int>(RoPEImpl);
+            int, int, int, float, int, int, int,
+            ArrayView1D<float, Stride1D.Dense>, int>(RoPEImpl);
         _ropeKernel(numPositions * headDim, input, output,
             numPositions, headDim, startPosition, ropeBase, rotaryDim,
-            interleaved ? 1 : 0, rowsPerPosition);
+            interleaved ? 1 : 0, rowsPerPosition, ffView, hasFactors);
+    }
+
+    public void Dispose()
+    {
+        _onesBuf?.Dispose();
+        _onesBuf = null;
     }
 
     /// <summary>Apply RoPE in-place (original API).</summary>
@@ -113,7 +153,7 @@ public class RoPEKernel
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int numPos, int D, int startPos, float ropeBase, int rotDim, int interleaved,
-        int rowsPerPos)
+        int rowsPerPos, ArrayView1D<float, Stride1D.Dense> freqFactors, int hasFactors)
     {
         // idx = (row * D + k). Branch shape: the pass-through/rotate split and the
         // style selects below are TOP-LEVEL (not inside any loop) - safe for the
@@ -142,10 +182,14 @@ public class RoPEKernel
         int x1Idx = interleaved == 1 ? 2 * laneJ + 1 : laneNeoX + half;
         bool second = interleaved == 1 ? (k & 1) == 1 : k >= half;
 
-        // θ = pos / base^(2i / rotaryDim)
+        // θ = pos / (base^(2i / rotaryDim) · freqFactor_i) - ggml DIVIDES theta by the
+        // per-pair factor (NTK / proportional rope). Absent factors: hasFactors = 0
+        // makes every lane read freqFactors[0] = 1.0 from the shared ones-buffer
+        // (index arithmetic, no branch).
         float freqExp = 2f * i / (float)rotDim;
         float invFreq = 1f / MathF.Pow(ropeBase, freqExp);
-        float theta = pos * invFreq;
+        float ff = freqFactors[i * hasFactors];
+        float theta = pos * invFreq / ff;
         float cosTheta = MathF.Cos(theta);
         float sinTheta = MathF.Sin(theta);
 

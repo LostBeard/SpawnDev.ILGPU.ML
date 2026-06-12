@@ -67,6 +67,66 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task AttnOp_RoPE_FreqFactors_NTK_MatchesCPU() => await RunTest(async accelerator =>
+    {
+        // gemma4 global layer: base 1e6 + rope_freqs.weight as the OPTIONAL 2nd input.
+        // ggml semantics: per-pair theta is DIVIDED by its factor (verified verbatim
+        // against llama.cpp rope kernels - freq_factors[i0/2]).
+        const int seq = 5, heads = 2, headDim = 16;
+        const float ropeBase = 1000000f;
+        const int kvOffset = 3;
+        int half = headDim / 2;
+        var rng = new Random(83);
+        var x = new float[seq * heads * headDim];
+        for (int i = 0; i < x.Length; i++) x[i] = (float)(rng.NextDouble() * 2 - 1);
+        var factors = new float[half];
+        for (int i = 0; i < half; i++) factors[i] = 1f + i * 0.5f; // 1.0 .. 4.5
+
+        var expected = (float[])x.Clone();
+        for (int s = 0; s < seq; s++)
+            for (int h = 0; h < heads; h++)
+                for (int i = 0; i < half; i++)
+                {
+                    long pos = kvOffset + s;
+                    double theta = pos / (Math.Pow(ropeBase, 2.0 * i / headDim) * factors[i]);
+                    double c = Math.Cos(theta), sn = Math.Sin(theta);
+                    int row = (s * heads + h) * headDim;
+                    double x0 = x[row + i], x1 = x[row + i + half];
+                    expected[row + i] = (float)(x0 * c - x1 * sn);
+                    expected[row + i + half] = (float)(x0 * sn + x1 * c);
+                }
+
+        using var inBuf = accelerator.Allocate1D(x);
+        using var ffBuf = accelerator.Allocate1D(factors);
+        using var outBuf = accelerator.Allocate1D<float>(x.Length);
+        using var registry = new OperatorRegistry(accelerator);
+        var op = registry.Resolve("RoPE");
+        var pool = new BufferPool(accelerator);
+        op.Execute(new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(inBuf.View, new[] { seq, heads, headDim }),
+                new Tensor(ffBuf.View, new[] { half }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { seq, heads, headDim }) },
+            Attributes = new Dictionary<string, object>
+            {
+                ["rope_base"] = ropeBase,
+                ["kv_offset"] = kvOffset,
+                ["rows_per_position"] = heads,
+            },
+            Pool = pool,
+            InputNames = new[] { "x", "freq_factors" },
+        });
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, x.Length);
+
+        AssertCloseQuant(got, expected, 2e-3f, "RoPE op freq_factors");
+        Console.WriteLine("[AttnOp] RoPE freq_factors (NTK, theta/ff) matches CPU oracle");
+    });
+
+    [TestMethod]
     public async Task AttnOp_FusedAttention_GQA_SWA_MatchesCPU() => await RunTest(async accelerator =>
         // gemma4-shaped: 4 query heads on 2 kv heads, causal + window 4.
         await FusedAttnOpOracle(accelerator, nHeads: 4, kvHeads: 2, seqQ: 10, seqKV: 10,
