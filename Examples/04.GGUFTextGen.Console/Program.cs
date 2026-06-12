@@ -124,6 +124,19 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
     using var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, path);
     Console.WriteLine($"Loaded: {session}\n");
 
+    // GGUF_GEN_PIPE=1 → use the first-class GgufTextGenerationPipeline (chat template + KV-cache decode +
+    // sampler in one call). Dogfoods the library API end-to-end.
+    if (Environment.GetEnvironmentVariable("GGUF_GEN_PIPE") == "1")
+    {
+        using var pipe = new SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline(session, accelerator, gm, maxSeqLen: ids.Count + maxNew + 8);
+        var pSw = Stopwatch.StartNew();
+        var text = await pipe.GenerateAsync(prompt, maxNewTokens: maxNew,
+            onToken: (n, _) => { Console.Write($"\r  [pipeline] {n} tokens..."); return Task.CompletedTask; });
+        pSw.Stop();
+        Console.WriteLine($"\n=== PIPELINE OUTPUT ({pSw.Elapsed.TotalSeconds:F1}s) ===\n{text}");
+        return 0;
+    }
+
     // GGUF_GEN_KV=1 → incremental KV-cache decode (O(n)); else full-recompute (O(n^2)). The two MUST
     // produce identical greedy tokens — that's the decode-equivalence validation gate for the cache.
     bool useKV = Environment.GetEnvironmentVariable("GGUF_GEN_KV") == "1";
