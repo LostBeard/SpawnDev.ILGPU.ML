@@ -2023,6 +2023,50 @@ public class InferenceSession : IDisposable
         return result;
     }
 
+    // ── GGUF incremental decode (full-precision KV-cache) ──
+    private Kernels.GGUFDecodeKVCache? _decodeCache;
+
+    /// <summary>Tokens already cached (advances per <see cref="RunDecodeStepAsync"/>; 0 before prefill).</summary>
+    public int DecodePastLen { get; private set; }
+
+    /// <summary>Enable incremental KV-cache decode with a caller-built full-precision cache (per-layer
+    /// kvHeads/headDim matching the model's attention geometry). Turns the O(n^2) full-recompute decode
+    /// into O(n): each step only computes the new token's K/V and attends it against the cached history.
+    /// Resets the decode cursor. Gemma4 etc. via <see cref="GGUF.GGUFGraphBuilder"/> (FusedAttention nodes
+    /// carry the "layer" tag the executor intercept needs).</summary>
+    public void EnableGGUFDecode(Kernels.GGUFDecodeKVCache cache)
+    {
+        _decodeCache = cache ?? throw new ArgumentNullException(nameof(cache));
+        DecodePastLen = 0;
+    }
+
+    /// <summary>Reset the decode cursor to begin a fresh sequence (reuses the cache allocation).</summary>
+    public void ResetGGUFDecode() => DecodePastLen = 0;
+
+    /// <summary>Run ONE decode/prefill step with the KV-cache active. The step's tokens are written at
+    /// the current <see cref="DecodePastLen"/> and attended against all cached history; the cursor then
+    /// advances by the input sequence length. Prefill = the first call with the full prompt (seq=N);
+    /// subsequent calls feed exactly one new token (seq=1). The decode-mode flag is set on the resolved
+    /// per-shape executor only for the duration of this run (cleared in finally) so normal runs are
+    /// unaffected; the cache STATE persists on the session.</summary>
+    public async Task<Dictionary<string, Tensor>> RunDecodeStepAsync(Dictionary<string, Tensor> inputs)
+    {
+        if (_decodeCache == null)
+            throw new InvalidOperationException("Call EnableGGUFDecode(cache) before RunDecodeStepAsync.");
+        var exec = ResolveExecutor(inputs);
+        exec.DecodeKVCache = _decodeCache;
+        exec.DecodePastLen = DecodePastLen;
+        try
+        {
+            var result = await exec.RunAsync(inputs);
+            LastExecutorBufferCount = exec.AllocatedBufferCount;
+            int seq = inputs.TryGetValue("input_ids", out var t) ? t.Shape[^1] : 1;
+            DecodePastLen += seq;
+            return result;
+        }
+        finally { exec.DecodeKVCache = null; }
+    }
+
     /// <summary>
     /// Transformers.js-style async inference. Inputs are <see cref="Tensors.Tensor{T}"/>
     /// (non-owning views — caller manages the underlying buffers, an

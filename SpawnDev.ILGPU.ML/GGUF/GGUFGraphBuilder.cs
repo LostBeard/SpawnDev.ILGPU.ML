@@ -176,6 +176,10 @@ public static class GGUFGraphBuilder
                 ["causal"] = JsonSerializer.SerializeToElement(1L),
                 ["window"] = JsonSerializer.SerializeToElement((long)cfg.Window),
                 ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
+                // layer index: lets the incremental-decode KV-cache (GGUFDecodeKVCache) associate this
+                // FusedAttention node with its per-layer K/V buffer. Unused in the default full-recompute
+                // forward; read only in decode mode. See Plans/gemma4-kvcache-decode-plan-2026-06-12.md.
+                ["layer"] = JsonSerializer.SerializeToElement((long)layer),
             };
             if (gemmaAttn)
                 faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);

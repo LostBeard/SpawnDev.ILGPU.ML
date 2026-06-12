@@ -16,6 +16,8 @@ using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
 using ILGPU.Runtime.OpenCL;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.GGUF;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
 
 string modelPath = args.FirstOrDefault(a => !a.Contains(',') && (a.EndsWith(".gguf") || File.Exists(a)))
@@ -130,27 +132,50 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
     using var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, path);
     Console.WriteLine($"Loaded: {session}\n");
 
+    // GGUF_GEN_KV=1 → incremental KV-cache decode (O(n)); else full-recompute (O(n^2)). The two MUST
+    // produce identical greedy tokens — that's the decode-equivalence validation gate for the cache.
+    bool useKV = Environment.GetEnvironmentVariable("GGUF_GEN_KV") == "1";
+    GGUFDecodeKVCache? kvCache = null;
+    if (useKV)
+    {
+        int nLayers = (int)gm.BlockCount, nH = (int)gm.AttentionHeadCount;
+        int defNKV = (int)gm.AttentionHeadCountKV; if (defNKV == 0) defNKV = nH;
+        int embd = (int)gm.EmbeddingLength, defHd = embd / nH;
+        var kvHeadsArr = new int[nLayers]; var hdArr = new int[nLayers];
+        for (int L = 0; L < nLayers; L++)
+        { var cfg = GGUFGraphBuilder.GetLayerAttnConfig(gm, L, nH, defNKV, defHd); kvHeadsArr[L] = cfg.NKVHeads; hdArr[L] = cfg.HeadDim; }
+        kvCache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen: ids.Count + maxNew + 8);
+        session.EnableGGUFDecode(kvCache);
+        Console.WriteLine($"[KV-cache decode] {nLayers} layers, maxSeq={ids.Count + maxNew + 8}");
+    }
+
     var gen = new List<int>();
     var sw = Stopwatch.StartNew();
+    int[] stepIds = ids.ToArray();  // KV path: prefill = whole prompt, then 1 token/step
     for (int step = 0; step < maxNew; step++)
     {
-        var cur = ids.Concat(gen).ToArray();
+        var cur = useKV ? stepIds : ids.Concat(gen).ToArray();
         var idf = cur.Select(i => (float)i).ToArray();
         using var inBuf = accelerator.Allocate1D(idf);
         var input = new Tensor(inBuf.View, new[] { 1, cur.Length }, "input_ids");
-        var outputs = await session.RunAsync(new Dictionary<string, Tensor> { ["input_ids"] = input });
+        var outputs = useKV
+            ? await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = input })
+            : await session.RunAsync(new Dictionary<string, Tensor> { ["input_ids"] = input });
         await accelerator.SynchronizeAsync();
         var logits = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
         int vocab = logits.Shape[^1];
+        int seqOut = logits.ElementCount / vocab;  // KV decode step => 1; prefill/full => cur.Length
         var host = new float[logits.ElementCount];
         logits.Data.CopyToCPU(host);
-        int last = (cur.Length - 1) * vocab, arg = 0; float best = host[last];
+        int last = (seqOut - 1) * vocab, arg = 0; float best = host[last];
         for (int v = 1; v < vocab; v++) if (host[last + v] > best) { best = host[last + v]; arg = v; }
         gen.Add(arg);
         Console.WriteLine($"  step {step,2}: token {arg,7} '{tok.Decode(new[] { arg })}' (logit {best:F3})");
         if (arg == turnC || arg == eos) { Console.WriteLine("  [stop token]"); break; }
+        stepIds = new[] { arg };  // decode: feed only the new token (KV path)
     }
     sw.Stop();
+    kvCache?.Dispose();
     Console.WriteLine($"\n=== GENERATED ({gen.Count} tokens, {sw.Elapsed.TotalSeconds:F1}s) ===");
     Console.WriteLine(tok.Decode(gen.ToArray()));
     return 0;

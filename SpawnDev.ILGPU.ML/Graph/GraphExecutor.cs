@@ -29,6 +29,18 @@ public class GraphExecutor : IDisposable
     private readonly Dictionary<string, int>? _presentKeyOutputToLayer;
     private readonly Dictionary<string, int>? _presentValueOutputToLayer;
 
+    /// <summary>GGUF incremental-decode KV cache (full-precision, GGUF-native — distinct from the
+    /// TurboQuant <see cref="_kvCache"/>). Session-owned and shared across the prefill executor (seq=N)
+    /// and the decode executor (seq=1); set by the session before a decode-mode run. When non-null, the
+    /// async node loop intercepts each FusedAttention node (tagged with a "layer" attr): it writes the
+    /// step's K/V into the cache at <see cref="DecodePastLen"/> and feeds the kernel the full history.
+    /// Null = the normal full-recompute forward (untouched).</summary>
+    public GGUFDecodeKVCache? DecodeKVCache { get; set; }
+
+    /// <summary>Number of tokens already cached BEFORE this run's tokens (the session advances it between
+    /// runs: 0 for prefill, then prompt-length, then +1 per decoded token). All layers in a run share it.</summary>
+    public int DecodePastLen { get; set; }
+
     /// <summary>When set, the mid-graph runtime-constant readbacks (the ≤64-elem shape/scalar tensors
     /// captured via SynchronizeAsync+CopyToHostAsync — measured at ~7.8s of a 1554-node DistilGPT-2
     /// forward) are cached and reused across calls. This executor is shape-specialized (one input
@@ -1177,11 +1189,44 @@ public class GraphExecutor : IDisposable
                 nodeOutputs[i] = shapeCacheHit && i == 0 ? cachedShapeBuf! : _pool.Rent(shape, name);
             }
 
+            // ── GGUF incremental-decode KV-cache intercept (gated on DecodeKVCache; normal forward
+            //    untouched when it's null) ──
+            // The static graph rope's/attends at kv_offset=0 (full-recompute). In decode mode the step's
+            // tokens live at absolute positions [DecodePastLen, DecodePastLen+seqQ). So:
+            //  - RoPE nodes: override kv_offset = DecodePastLen, so Q/K rotate at their true position
+            //    (position = kv_offset + row/rows_per_position). Uniform across all RoPE nodes in a step.
+            //  - FusedAttention nodes (tagged "layer"): write this step's K/V (the post-transpose
+            //    head-major [kvHeads,seqQ,hd] inputs) into the per-layer cache at DecodePastLen, then
+            //    feed the kernel the FULL history [kvHeads, DecodePastLen+seqQ, hd] with kv_offset =
+            //    DecodePastLen. Prefill (seq=N, pastLen=0) is numerically identical to the normal forward
+            //    AND populates the cache; decode (seq=1) attends the new query against all cached tokens.
+            Dictionary<string, object>? decodeAttrs = null;
+            if (DecodeKVCache != null && node.Attributes != null)
+            {
+                if (node.OpType == "RoPE")
+                {
+                    decodeAttrs = new Dictionary<string, object>(node.Attributes) { ["kv_offset"] = (long)DecodePastLen };
+                }
+                else if (node.OpType == "FusedAttention"
+                    && node.Attributes.TryGetValue("layer", out var _dLayerEl)
+                    && nodeInputs.Length >= 3 && nodeInputs[1] != null && nodeInputs[2] != null)
+                {
+                    int dLayer = Convert.ToInt32(_dLayerEl);
+                    int dHd = DecodeKVCache.HeadDim(dLayer), dKvH = DecodeKVCache.KvHeads(dLayer);
+                    int dSeqQ = nodeInputs[1]!.ElementCount / (dKvH * dHd);
+                    int dTotal = DecodePastLen + dSeqQ;
+                    DecodeKVCache.Write(dLayer, nodeInputs[1]!.Data, nodeInputs[2]!.Data, DecodePastLen, dSeqQ);
+                    nodeInputs[1] = new Tensor(DecodeKVCache.PackedK(dLayer, dTotal), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[1]);
+                    nodeInputs[2] = new Tensor(DecodeKVCache.PackedV(dLayer, dTotal), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[2]);
+                    decodeAttrs = new Dictionary<string, object>(node.Attributes) { ["kv_offset"] = (long)DecodePastLen };
+                }
+            }
+
             var ctx = new OnnxOpContext
             {
                 Inputs = nodeInputs,
                 Outputs = nodeOutputs,
-                Attributes = node.Attributes,
+                Attributes = decodeAttrs ?? node.Attributes,
                 Pool = _pool,
                 Format = Format,
                 InputNames = node.InputNames,
