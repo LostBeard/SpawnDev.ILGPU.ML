@@ -207,6 +207,32 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Gemma4_Attn_AttentionScaleIsOne() => await RunTest(async accelerator =>
+    {
+        // gemma4 attention scale = 1.0, NOT 1/sqrt(head_dim) - verbatim from llama.cpp
+        // src/models/gemma4.cpp: `hparams.f_attention_scale = 1.0f; // Gemma4 uses self.scaling = 1.0`.
+        // The QK-norm already normalizes Q/K so the usual 1/sqrt(d) is folded away. Letting the op
+        // default to 1/sqrt(head_dim) made scores ~sqrt(head_dim)x too small -> softmax went near-uniform
+        // -> attention averaged all positions -> residual collapsed (cross-position cosine -> 1) and
+        // generation degenerated to whitespace. Every gemma4 FusedAttention node must carry scale = 1.0.
+        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
+
+        var faNodes = graph.Nodes.Where(n => n.OpType == "FusedAttention").ToList();
+        if (faNodes.Count == 0) throw new Exception("expected FusedAttention nodes.");
+        foreach (var fa in faNodes)
+        {
+            if (fa.Attributes == null || !fa.Attributes.TryGetValue("scale", out var sc))
+                throw new Exception("gemma4 FusedAttention must set an explicit scale attr (=1.0), not rely on the 1/sqrt(d) default.");
+            float scale = sc.GetSingle();
+            if (Math.Abs(scale - 1.0f) > 1e-6f)
+                throw new Exception($"gemma4 FusedAttention scale must be 1.0 (llama.cpp f_attention_scale), got {scale}.");
+        }
+
+        Console.WriteLine($"[Gemma4] all {faNodes.Count} FusedAttention nodes use scale = 1.0 (not 1/sqrt(head_dim))");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Gemma4_Attn_GlobalLayer_VReuseAndFreqFactors() => await RunTest(async accelerator =>
     {
         var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());

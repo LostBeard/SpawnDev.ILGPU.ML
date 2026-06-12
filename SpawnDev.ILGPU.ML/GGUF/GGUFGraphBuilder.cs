@@ -158,10 +158,15 @@ public static class GGUFGraphBuilder
                 qkNormTensor: null, freqFactors: null, doRope: false, weightlessNorm: gemmaAttn);
 
             // ── Fused masked attention: softmax(QKᵀ·scale [+ causal/SWA mask]) · V in one dispatch ──
-            // (GQA: n_kv_heads < n_heads; window 0 = global, else sliding.) The scale attr is OMITTED →
-            // the op defaults to 1/sqrt(head_dim). gemma4's exact f_attention_scale (no query_pre_attn_scalar
-            // in its metadata; likely 1.0, controlled by QK-norm) is confirmed at E2E vs a llama.cpp reference —
-            // flip this one attr if the node-bisect disagrees.
+            // (GQA: n_kv_heads < n_heads; window 0 = global, else sliding.)
+            // SCALE: gemma4 uses f_attention_scale = 1.0 (NOT 1/sqrt(head_dim)) - verbatim from llama.cpp
+            // src/models/gemma4.cpp `load_arch_hparams`: `hparams.f_attention_scale = 1.0f; // Gemma4 uses
+            // self.scaling = 1.0 (no pre-attn scaling)`. The QK-norm (attn_q_norm/attn_k_norm RMS) already
+            // normalizes Q/K, so the usual 1/sqrt(d) is folded away. Omitting it (letting the op default to
+            // 1/sqrt(head_dim) ≈ 0.044 for the 512-d global heads) made scores ~22x too small → softmax went
+            // near-uniform → attention averaged all positions → the residual stream collapsed (cross-position
+            // cosine → 1.0 by layer ~23) and content prediction degenerated to whitespace. Pass 1.0 explicitly
+            // on the gemma4 QK-norm path; other archs keep the 1/sqrt(head_dim) default.
             string attnValues = $"{pfx}_attn_val";
             var faAttrs = new Dictionary<string, JsonElement>
             {
@@ -172,6 +177,8 @@ public static class GGUFGraphBuilder
                 ["window"] = JsonSerializer.SerializeToElement((long)cfg.Window),
                 ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
             };
+            if (gemmaAttn)
+                faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);
             AddNode(graph, "FusedAttention", new[] { qReshaped, kReshaped, vReshaped }, new[] { attnValues }, faAttrs);
 
             // ── Merge heads: [1, nHeads, seq, hd] → [1, seq, nHeads*hd] ──

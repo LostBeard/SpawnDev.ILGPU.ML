@@ -237,7 +237,18 @@ async Task<int> RunAsync(string path, int[] ids)
             var posRms = new List<string>();
             for (int p = 0; p < sq && (p + 1) * hdim <= v.Length; p++)
             { var (r, _) = Stat(v, p * hdim, hdim); posRms.Add($"{r:F3}"); }
-            Console.WriteLine($"  {key,-44} rms={rms,9:F4} absMax={amax,11:F4}  posRMS=[{string.Join(" ", posRms)}]");
+            // Cross-position COSINE similarity pos0-vs-posLast: if it climbs to ~1 at deep layers the
+            // positions have COLLAPSED (attention is averaging everything / not differentiating context).
+            int nPos = 0; for (int p = 0; p < sq && (p + 1) * hdim <= v.Length; p++) nPos++;
+            string cos = "";
+            if (nPos >= 2)
+            {
+                int last = nPos - 1; double dot = 0, n0 = 0, nl = 0;
+                for (int i = 0; i < hdim; i++) { float a = v[i], b = v[last * hdim + i]; dot += (double)a * b; n0 += (double)a * a; nl += (double)b * b; }
+                double c = (n0 > 0 && nl > 0) ? dot / (Math.Sqrt(n0) * Math.Sqrt(nl)) : 0;
+                cos = $" cos(p0,p{last})={c:F3}";
+            }
+            Console.WriteLine($"  {key,-44} rms={rms,8:F3} absMax={amax,10:F3}{cos}");
         }
     }
 
