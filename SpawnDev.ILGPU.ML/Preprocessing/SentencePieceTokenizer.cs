@@ -33,6 +33,12 @@ public class SentencePieceTokenizer : ITokenizer
     /// <summary>EOS token ID.</summary>
     public int EosId => _eosId;
 
+    /// <summary>Look up the exact vocab id of a token string (e.g. a control token like
+    /// "&lt;|turn&gt;"). Returns false if the string is not a single vocab entry. Used by chat
+    /// templates that must emit control tokens as SINGLE ids rather than rely on greedy
+    /// sub-word matching of their literal text.</summary>
+    public bool TryGetId(string token, out int id) => _tokenToId.TryGetValue(token, out id);
+
     /// <summary>
     /// Create a SentencePiece tokenizer from GGUF metadata arrays.
     /// </summary>

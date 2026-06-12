@@ -110,16 +110,8 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
 
     var ids = new List<int>();
     if (raw) { if (bos >= 0) ids.Add(bos); ids.AddRange(tok.Encode(prompt)); }
-    else
-    {
-        // gemma4 chat template (from tokenizer.chat_template):
-        //   <bos> <|turn>system\n <|think|>\n <turn|>\n  <|turn>user\n {prompt} <turn|>\n  <|turn>model\n
-        // The <|think|> at the top of the first system turn arms the thinking model.
-        if (bos >= 0) ids.Add(bos);
-        ids.Add(turnO); ids.AddRange(tok.Encode("system\n")); ids.Add(think); ids.AddRange(tok.Encode("\n")); ids.Add(turnC); ids.AddRange(tok.Encode("\n"));
-        ids.Add(turnO); ids.AddRange(tok.Encode("user\n" + prompt)); ids.Add(turnC); ids.AddRange(tok.Encode("\n"));
-        ids.Add(turnO); ids.AddRange(tok.Encode("model\n"));
-    }
+    // gemma4 chat template, now via the library helper (dogfooding ChatTemplates.BuildGemma4PromptTokens).
+    else ids.AddRange(SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.BuildGemma4PromptTokens(tok, systemPrompt: null, userMessage: prompt, thinking: true));
     Console.WriteLine($"Prompt: \"{prompt}\"  (raw={raw})\nPrompt token ids ({ids.Count}): [{string.Join(",", ids)}]");
     Console.WriteLine($"control: bos={bos} turn_open={turnO} turn_close={turnC} think={think} eos={eos}\n");
 
