@@ -54,57 +54,77 @@ public abstract partial class MLTestBase : IDisposable
     /// cross-run OPFS state before a clean cold run.</summary>
     protected virtual SpawnDev.AsyncFileSystem.IAsyncFS? GetAsyncFS() => null;
 
-    private Context? _cachedContext;
-    private Accelerator? _cachedAccelerator;
-
-    private async Task<Accelerator> GetOrCreateAcceleratorAsync()
-    {
-        if (_cachedAccelerator == null)
-        {
-            var (context, accelerator) = await CreateAcceleratorAsync();
-            _cachedContext = context;
-            _cachedAccelerator = accelerator;
-        }
-        return _cachedAccelerator;
-    }
+    // The most recent invocation's pair, for ZOMBIE EVICTION only (see RunTest).
+    private Accelerator? _prevAccelerator;
+    private Context? _prevContext;
 
     protected async Task RunTest(Func<Accelerator, Task> testBody)
     {
-        var accelerator = await GetOrCreateAcceleratorAsync();
+        // Each invocation OWNS its context + accelerator as LOCALS - never a shared
+        // cache. The runner abandons a timed-out test and moves on, but the abandoned
+        // (zombie) continuation still reaches this finally LATER; the previous
+        // shared-field cache's cleanup disposed whatever the field held by then -
+        // the NEXT test's LIVE accelerator/context. That was the 4.10.0 Wasm cascade:
+        // ObjectDisposedException(WasmAccelerator) mid-RunKernelAsync and
+        // ObjectDisposedException(ReaderWriterLockSlim) inside ILGPU
+        // TypeInformationManager mid-compile, always right after a timeout, plus the
+        // follow-on timeouts it knocked over. A zombie may now only dispose its own
+        // pair. (Disposal per test also keeps a prior browser row's device state from
+        // leaking into the next backend lane - that behavior is unchanged.)
+        //
+        // ZOMBIE EVICTION: dispose the PREVIOUS invocation's pair up front. A
+        // timed-out-but-still-running zombie otherwise keeps a full accelerator (on
+        // Wasm: a hardwareConcurrency worker pool) alive next to the new test's one -
+        // pool pile-up oversubscribes the CPU and cascades the heavy tests into
+        // timeouts. Eviction is deterministic (next test's START, before it creates
+        // its own pair - never from the zombie's finally), so it cannot dispose a
+        // live successor; the zombie's next dispatch hits the disposal guard and its
+        // abandoned task faults harmlessly (its outcome was already recorded as the
+        // timeout). Invocations on one instance are sequential by runner design.
+        try { _prevAccelerator?.Dispose(); } catch { }
+        try { _prevContext?.Dispose(); } catch { }
+        _prevAccelerator = null;
+        _prevContext = null;
+
+        var (context, accelerator) = await CreateAcceleratorAsync();
+        _prevAccelerator = accelerator;
+        _prevContext = context;
         try
         {
             await testBody(accelerator);
         }
-        catch
-        {
-            InvalidateCache();
-            throw;
-        }
         finally
         {
-            // Flush GPU work, then drop the cached accelerator so a prior browser row
-            // (WebGPU) cannot leave device state that breaks the next backend (Wasm/WebGL).
+            // Flush GPU work before disposal so pending dispatches complete.
             try { await accelerator.SynchronizeAsync(); } catch { }
-            InvalidateCache();
+            // Drop this accelerator's AssertCloseGpu kernel cache entry - the static
+            // dictionary would otherwise grow one (kernels + dead accelerator key) per
+            // test for the whole run.
+            lock (_ewCache)
+            {
+                if (_ewCache.Remove(accelerator, out var ew))
+                    try { (ew as IDisposable)?.Dispose(); } catch { }
+            }
+            try { accelerator.Dispose(); } catch { }
+            try { context.Dispose(); } catch { }
+            // Deregister from zombie eviction IF still ours - a zombie reaching this
+            // line later must not clear the SUCCESSOR's registration.
+            if (ReferenceEquals(_prevAccelerator, accelerator))
+            {
+                _prevAccelerator = null;
+                _prevContext = null;
+            }
             GC.Collect();
             GC.WaitForPendingFinalizers();
         }
     }
 
-    private void InvalidateCache()
-    {
-        try { _cachedAccelerator?.Dispose(); } catch { }
-        _cachedAccelerator = null;
-        try { _cachedContext?.Dispose(); } catch { }
-        _cachedContext = null;
-    }
-
     public virtual void Dispose()
     {
-        _cachedAccelerator?.Dispose();
-        _cachedAccelerator = null;
-        _cachedContext?.Dispose();
-        _cachedContext = null;
+        try { _prevAccelerator?.Dispose(); } catch { }
+        _prevAccelerator = null;
+        try { _prevContext?.Dispose(); } catch { }
+        _prevContext = null;
     }
 
     #region Helpers
@@ -184,12 +204,15 @@ public abstract partial class MLTestBase : IDisposable
     private static readonly Dictionary<Accelerator, ElementWiseKernels> _ewCache = new();
     private static ElementWiseKernels GetOrCreateEW(Accelerator accelerator)
     {
-        if (!_ewCache.TryGetValue(accelerator, out var ew))
+        lock (_ewCache)
         {
-            ew = new ElementWiseKernels(accelerator);
-            _ewCache[accelerator] = ew;
+            if (!_ewCache.TryGetValue(accelerator, out var ew))
+            {
+                ew = new ElementWiseKernels(accelerator);
+                _ewCache[accelerator] = ew;
+            }
+            return ew;
         }
-        return ew;
     }
 
     protected static async Task AssertCloseGpu(Accelerator accelerator,
