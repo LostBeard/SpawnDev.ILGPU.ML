@@ -122,14 +122,18 @@ Each maps to the code site that must change. Items 3–7 are one coherent "per-l
 > **PROGRESS (2026-06-11):**
 > - ✅ **#0** K-quant type-routed fused dequant — Seven P1 (`2bf6934`), verified by Tuvok (68/68 all backends).
 > - ✅ **#11** tied-embedding LM head + compressed `Gather`-table (Q6_K embed stays in VRAM) — Seven P1.
-> - ✅ **#1** arch-tag (`gemma4`→RMSNorm) + ✅ **#8** GeGLU-not-SiLU — Tuvok: `GGUFGraphBuilder` matches the
->   gemma family by prefix; test `Gemma4_GraphBuilder_UsesRMSNormAndGeGLU` (`MLTestBase.Gemma4Tests.cs`).
-> - ⏳ **Remaining** (Tuvok graph-wiring; #6/#7 gated on Seven's kernels): #2 `(1+weight)` RMSNorm,
->   #3 4-norm sandwich (`post_attention_norm`/`post_ffw_norm`), #4 QK-norm, #5 per-layer geometry
->   (incl. the 8 global layers that lack a standalone `attn_v`), #6 SWA/global mask (Seven's flash-attn
->   mask kernel), #7 dual-base RoPE (Seven's RoPE kernel), #9 `layer_output_scale`, #10 logit soft-cap.
-> - ⚠ Also note: the current generic attention path has **no causal mask at all** — fine for the ONNX
->   decoders (mask baked into the export) but the GGUF builder needs causal (+ SWA) added for gemma4 (#6).
+> - ✅ **#1** arch-tag + ✅ **#8** GeGLU + ✅ **#2** `(1+weight)` RMSNorm + ✅ **#3** 4-norm sandwich +
+>   ✅ **#10** logit soft-cap — Tuvok graph-wiring (`6651b73`/`c7112a5`/`c05567d`/`f814c19`/`fb2a97a`).
+> - ✅ **FLOOR (2026-06-11 late, Tuvok):** true **RMSNormalization operator** + weightless variant + registration;
+>   builder now emits `RMSNormalization` (not the mean-centered `LayerNormalization` it used to — a never-correct
+>   path hidden by structural-only tests). CPU-oracle EXECUTION tests + a mean-centering discriminator
+>   (`MLTestBase.RMSNormTests.cs`).
+> - ✅ **#4 QK-norm + #5 per-layer geometry + #6 SWA/global + #7 dual-base RoPE + #9 layer_output_scale**
+>   — Tuvok attention emission (RoPE+QK-norm+FusedAttention via Seven's ops `0be3092`; freq_factors via S1
+>   `26b8444`; V=Kcur for global layers; weightless V-norm). Verbatim-matched to llama.cpp gemma4.cpp.
+>   Structural tests in `Gemma4Tests.cs` (`Gemma4_Attn_*`).
+> - ⏳ **Remaining:** gemma4 **E2E** vs a llama.cpp reference (needs the local gguf + the exact `f_attention_scale`
+>   confirmed at node-bisect). Everything upstream of E2E is in + PMT-validated.
 
 0. **⚠ BLOCKER — K-quant GPU MatMul decodes everything as Q4_0** (the §3 landmine). Carry `GGMLType`
    with the quantized bytes (the loader dict drops it) → route only implemented types to the fused kernel,
@@ -189,10 +193,19 @@ That is exactly why it is a *good* target: it stress-tests the GGUF + executor p
 
 ## 8. Open items / risks
 
-- **8 global-attention layers lack a standalone `attn_v.weight`** (template view: `attn_v ×40`, while
-  Q/K/output are ×48; tensor count checks out: `14×48 + 3 − 8 = 667`). The global layers (1 KV head) are
-  structurally different — V is fused/shared/elsewhere. Resolve during the per-layer attention-config work
-  (gap #5): read each layer's actual tensor set, do not assume a uniform 14-tensor block.
+- **RESOLVED (2026-06-11 late, Tuvok) — global-layer structure + a template-view trap.** The collapsed
+  `TensorTemplates` inspector view HID per-layer shape variance (merged differently-shaped `blk.*.attn_q`
+  into one row), which made the earlier §8 read backwards. Raw per-layer dump (new inspector `--tensors`
+  flag, streamed from the real Ollama blob) + verbatim `llama.cpp src/models/gemma4.cpp` give the truth:
+  - **Sliding layers (40):** head_dim **256**, 8 KV heads, own `attn_v` (`[3840,2048]`). RoPE base 1e4, no freq_factors.
+  - **Global layers (8: 5,11,17,23,29,35,41,47):** head_dim **512**, **1** KV head, **NO `attn_v`** →
+    `Vcur = wv ? wv·x : Kcur` (V reuses the RAW K projection). RoPE base 1e6 + `rope_freqs.weight` (NTK).
+  - **All layers:** Q/K get QK-norm (weighted RMS over head_dim) then RoPE; **V gets a WEIGHTLESS RMS-norm**
+    (`ggml_rms_norm`, no scale) and NO RoPE. `f_attention_scale` is a stored scalar (no `query_pre_attn_scalar`
+    in metadata) — exact value deferred to E2E node-bisect.
+  - `GetLayerAttnConfig` (`fb2a97a`) was already correct. The top-level `headDim = embedDim/nHeads = 240` was
+    NOT used for the reshape — emission uses `cfg.HeadDim` per layer. Inspector gear-fix (template-variance
+    split) is queued.
 - `mmproj` vision path (image input) — deferred, separate milestone.
 - Whether `RoPEKernel` already supports per-call `freq_base` / the `rope_freqs.weight` precompute — code-read pending.
 - `layer_output_scale` exact semantics (residual scale vs logit/attn scale) — confirm against reference numerics.

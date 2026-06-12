@@ -21,9 +21,24 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using SpawnDev.ILGPU.ML.Onnx;
+using SpawnDev.ILGPU.ML.GGUF;
 
 if (args.Contains("--ci"))
     return await RunSelfCheck();
+
+// --tensors=<prefix,prefix,...> : dump RAW per-tensor dims (no template collapse) for tensors whose
+// name starts with any prefix. Surfaces per-layer shape VARIANCE the collapsed template view can hide
+// (e.g. a frontier arch where global vs sliding layers carry different head_dim / KV-head counts).
+var tensorsArg = args.FirstOrDefault(a => a.StartsWith("--tensors", StringComparison.Ordinal));
+if (tensorsArg is not null)
+{
+    var eq = tensorsArg.IndexOf('=');
+    var prefixes = (eq >= 0 ? tensorsArg[(eq + 1)..] : "")
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    var tgt = args.FirstOrDefault(a => !a.StartsWith("--"));
+    if (string.IsNullOrWhiteSpace(tgt)) { Usage(); return 2; }
+    return await DumpRawTensors(tgt.Trim(), prefixes);
+}
 
 var target = args.FirstOrDefault(a => !a.StartsWith("--"));
 if (string.IsNullOrWhiteSpace(target))
@@ -77,6 +92,21 @@ async Task<Stream> OpenAsync(string source, HttpClient http)
     if (!resp.IsSuccessStatusCode && resp.StatusCode != HttpStatusCode.PartialContent)
         throw new HttpRequestException($"HTTP {(int)resp.StatusCode} {resp.ReasonPhrase} for {url}");
     return await resp.Content.ReadAsStreamAsync();
+}
+
+// ── raw per-tensor dump (no template collapse) for the given name-prefixes ────────────────────────
+async Task<int> DumpRawTensors(string source, string[] prefixes)
+{
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("SpawnDev.ILGPU.ML-inspector/1.0");
+    await using var stream = await OpenAsync(source, http);
+    var model = await GGUFParser.ParseHeaderAsync(stream);
+
+    Console.WriteLine($"\n=== raw tensors ({source}) — prefixes: {string.Join(", ", prefixes)} ===");
+    bool Match(string n) => prefixes.Length == 0 || prefixes.Any(p => n.StartsWith(p, StringComparison.Ordinal));
+    foreach (var t in model.Tensors.Where(t => Match(t.Name)).OrderBy(t => t.Name, StringComparer.Ordinal))
+        Console.WriteLine($"  {t.Name,-36} [{string.Join(", ", t.Dimensions)}]  {t.Type}");
+    return 0;
 }
 
 // ── Ollama "name:tag" / "ns/name:tag" -> the GGUF blob URL (the manifest -> blob acquisition flow) ─

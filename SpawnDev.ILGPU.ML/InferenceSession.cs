@@ -230,7 +230,14 @@ public class InferenceSession : IDisposable
                 inp.Shape = t.Shape.ToArray();
 
         var compiled = new GraphCompiler(_registry) { EnableOptimization = _recompileEnableOptimization }.Compile(graph);
-        var exec = new GraphExecutor(_accelerator, compiled, _weights, _recompileFloatSeed, registry: _registry)
+        // The recompiled executor must carry the SAME quantized byte-view map as the base executor:
+        // quantized weights are session-lifetime GPU buffers (uploaded once at load), and without the
+        // map every quantized MatMul/Gather silently falls back to the F32 path against a ShapeOnly
+        // tensor's EMPTY view — a CUDA illegal memory access at the first quantized node. This was
+        // the gemma4 multi-token (seq>1) fault: seq=1 matched the base compile shape and never
+        // recompiled, so only recompiled (seq>1) executors faulted. 2026-06-12.
+        var exec = new GraphExecutor(_accelerator, compiled, _weights, _recompileFloatSeed,
+            quantizedWeights: _executor.QuantizedWeights, registry: _registry)
         {
             Format = _executor.Format,
             CacheShapeReadbacks = _cacheShapeReadbacks,
@@ -1363,6 +1370,10 @@ public class InferenceSession : IDisposable
             }
         }
 
+        // Snapshot CLEAN (pre-fold) constants for dynamic-shape recompiles (see the streaming path).
+        var constSeed = graph.ConstantData != null ? new Dictionary<string, int[]>(graph.ConstantData) : null;
+        var floatSeed = graph.FloatConstantData != null ? new Dictionary<string, float[]>(graph.FloatConstantData) : null;
+
         // Compile graph
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
@@ -1376,6 +1387,9 @@ public class InferenceSession : IDisposable
         var gpuQuantizedWeights = new Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>();
         var quantizedTypes = new Dictionary<string, GGUF.GGMLType>();
         var quantizedBuffers = new List<MemoryBuffer1D<byte, Stride1D.Dense>>(); // keep alive
+        // Transpose-on-upload temps that must outlive this sync entry point on browser
+        // backends (Synchronize() only flushes there) — owned by the session.
+        var transposeTemps = new List<IDisposable>();
         // Tied-embed aliases share one byte[]; dedupe by reference so the compressed
         // table is uploaded ONCE and serves both Gather and the LM-head MatMul.
         var uploadedQuant = new Dictionary<byte[], ArrayView1D<byte, Stride1D.Dense>>(
@@ -1415,12 +1429,23 @@ public class InferenceSession : IDisposable
                         // pass - unacceptable in interpreted Blazor WASM). shape = [K, N]
                         // declared; the raw floats are its reverse.
                         var final = pool.AllocatePermanent(shape, name);
-                        using var temp = accelerator.Allocate1D(data);
+                        var temp = accelerator.Allocate1D(data);
                         registry.Transpose.Transpose(temp.View, final.Data,
                             new[] { shape[1], shape[0] }, new[] { 1, 0 });
-                        // Flush before the temp buffer is disposed: the transpose
-                        // dispatch may still be pending in the command encoder.
+                        // Flush so the transpose is no longer pending in a command encoder.
                         accelerator.Synchronize();
+                        // On the BROWSER backends Synchronize() only FLUSHES — it cannot drain
+                        // in-flight work on the single Blazor thread, so the transpose may still
+                        // be queued and the temp buffer must OUTLIVE this sync entry point.
+                        // Disposing it here made the deferred Wasm dispatch read a freed
+                        // SharedArrayBuffer region → "RangeError: offset is out of bounds" at
+                        // the first real SynchronizeAsync (2026-06-12). Desktop Synchronize()
+                        // drains, so there the temp can be freed immediately.
+                        if (accelerator.AcceleratorType is AcceleratorType.Wasm
+                            or AcceleratorType.WebGL or AcceleratorType.WebGPU)
+                            transposeTemps.Add(temp);
+                        else
+                            temp.Dispose();
                         gpuWeights[name] = final;
                     }
                     else
@@ -1441,12 +1466,157 @@ public class InferenceSession : IDisposable
             quantizedWeights: gpuQuantizedWeights.Count > 0 ? gpuQuantizedWeights : null);
         onProgress?.Invoke("ready", 100);
 
-        return new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        var ownedDisposables = quantizedBuffers.Cast<IDisposable>().Concat(transposeTemps).ToList();
+        var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
             ModelName = graph.Name,
-            _ownedBuffers = quantizedBuffers.Count > 0
-                ? quantizedBuffers.Cast<IDisposable>().ToList() : null
+            _ownedBuffers = ownedDisposables.Count > 0 ? ownedDisposables : null
         };
+        session.EnableShapeRecompilation(graph, constSeed, floatSeed, enableOptimization: true);
+        return session;
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from a .gguf FILE PATH by STREAMING — the only way to load a model larger
+    /// than ~2 GB (a single byte[] caps there; gemma4:12b is 7 GB). Opens an async, seekable FileStream and
+    /// delegates to <see cref="CreateFromGGUFStreamAsync"/>.
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromGGUFFileAsync(
+        Accelerator accelerator, string ggufPath,
+        Action<string, int>? onProgress = null, CancellationToken ct = default)
+    {
+        await using var fs = new FileStream(ggufPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            bufferSize: 1 << 20, useAsync: true);
+        return await CreateFromGGUFStreamAsync(accelerator, fs, onProgress, ct);
+    }
+
+    /// <summary>
+    /// Create an InferenceSession from a SEEKABLE .gguf stream by STREAMING the weights to the GPU — never
+    /// materializing the whole model as a byte[] (impossible past ~2 GB). The header is parsed async; small
+    /// F32/F16 tensors (norms/scales) are read on demand; the bulk quantized weights (Q4_K/Q6_K, the 7 GB)
+    /// stream tensor-by-tensor straight to GPU byte buffers via <see cref="BufferPool.AllocateQuantizedBytesFromStreamAsync"/>.
+    /// The stream must outlive this call (it is read here) and be seekable. Mirrors <see cref="CreateFromGGUF"/>
+    /// (byte[]); the only difference is the quantized upload path.
+    /// </summary>
+    public static async Task<InferenceSession> CreateFromGGUFStreamAsync(
+        Accelerator accelerator, Stream stream,
+        Action<string, int>? onProgress = null, CancellationToken ct = default)
+    {
+        if (!stream.CanSeek)
+            throw new ArgumentException("CreateFromGGUFStreamAsync requires a seekable stream.", nameof(stream));
+
+        onProgress?.Invoke("parse", 0);
+        var ggufModel = await GGUF.GGUFParser.ParseHeaderAsync(stream, ct).ConfigureAwait(false);
+        ggufModel.SourceStream = stream; // small F32/F16 tensors are read on demand during BuildGraph
+        onProgress?.Invoke("parse", 100);
+
+        onProgress?.Invoke("build_graph", 0);
+        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        onProgress?.Invoke("build_graph", 100);
+
+        // Small constants (identical to CreateFromGGUF).
+        graph.ConstantData ??= new Dictionary<string, int[]>();
+        var constantFloatValues = new Dictionary<string, float[]>();
+        foreach (var (name, shape) in graph.Initializers)
+        {
+            int elems = shape.Aggregate(1, (a, b) => a * b);
+            if (elems > 0 && elems <= 64 && cpuWeightsAll.TryGetValue(name, out var data))
+            {
+                constantFloatValues[name] = data;
+                graph.ConstantData[name] = data.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                graph.FloatConstantData[name] = data.ToArray();
+            }
+        }
+
+        // Snapshot the CLEAN (pre-fold) constants so dynamic-shape recompiles reseed correctly (decoders
+        // run at a growing seq length — without recompilation the graph stays pinned to the seq=1 compile
+        // shape and silently ignores all but the first token).
+        var constSeed = graph.ConstantData != null ? new Dictionary<string, int[]>(graph.ConstantData) : null;
+        var floatSeed = graph.FloatConstantData != null ? new Dictionary<string, float[]>(graph.FloatConstantData) : null;
+
+        onProgress?.Invoke("compile", 0);
+        var registry = new OperatorRegistry(accelerator);
+        var compiled = new GraphCompiler(registry) { EnableOptimization = true }.Compile(graph);
+        onProgress?.Invoke("compile", 100);
+
+        onProgress?.Invoke("upload", 0);
+        var pool = new BufferPool(accelerator);
+        var gpuWeights = new Dictionary<string, Tensor>();
+        var gpuQuantizedWeights = new Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>();
+        var quantizedTypes = new Dictionary<string, GGUF.GGMLType>();
+        var quantizedBuffers = new List<MemoryBuffer1D<byte, Stride1D.Dense>>();
+        // Dedup tied-embed aliases: stream-offset key (boxed long compares by value) for streamed tensors,
+        // byte[] reference for any in-memory ones — one Dictionary<object,...> handles both.
+        var uploadedQuant = new Dictionary<object, ArrayView1D<byte, Stride1D.Dense>>();
+        int loaded = 0;
+        foreach (var (name, data) in cpuWeightsAll)
+        {
+            if (!graph.Initializers.TryGetValue(name, out var shape)) continue;
+
+            if (quantizedWeightsTyped.TryGetValue(name, out var qw))
+            {
+                object dedupKey = qw.StreamOffset >= 0 ? qw.StreamOffset : qw.Bytes;
+                if (!uploadedQuant.TryGetValue(dedupKey, out var qView))
+                {
+                    MemoryBuffer1D<byte, Stride1D.Dense> qBuf;
+                    if (qw.StreamOffset >= 0)
+                        qBuf = await pool.AllocateQuantizedBytesFromStreamAsync(stream, qw.StreamOffset, qw.StreamByteSize, ct).ConfigureAwait(false);
+                    else
+                    {
+                        int padded = (qw.Bytes.Length + 3) & ~3;
+                        qBuf = accelerator.Allocate1D<byte>(padded);
+                        qBuf.View.SubView(0, qw.Bytes.Length).CopyFromCPU(qw.Bytes);
+                    }
+                    qView = qBuf.View;
+                    quantizedBuffers.Add(qBuf);
+                    uploadedQuant[dedupKey] = qView;
+                }
+                gpuQuantizedWeights[name] = qView;
+                quantizedTypes[name] = qw.Type;
+                gpuWeights[name] = Tensor.ShapeOnly(shape, name); // floats never exist (a Q6_K embed would be ~4 GB F32)
+            }
+            else if (data.Length > 0)
+            {
+                if (transposeOnUpload.Contains(name))
+                {
+                    var final = pool.AllocatePermanent(shape, name);
+                    var temp = accelerator.Allocate1D(data);
+                    registry.Transpose.Transpose(temp.View, final.Data, new[] { shape[1], shape[0] }, new[] { 1, 0 });
+                    // DRAIN (not just flush) before disposing the temp: on browser backends a
+                    // sync Synchronize() only flushes, so the transpose could still be in flight
+                    // and a disposed temp becomes a freed-SharedArrayBuffer read (Wasm
+                    // "RangeError: offset is out of bounds", 2026-06-12). This path is async —
+                    // do it properly.
+                    await accelerator.SynchronizeAsync().ConfigureAwait(false);
+                    temp.Dispose();
+                    gpuWeights[name] = final;
+                }
+                else
+                {
+                    gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                }
+            }
+            loaded++;
+        }
+        onProgress?.Invoke("upload", 100);
+
+        if (VerboseLogging) Console.WriteLine($"[InferenceSession] GGUF(stream): {ggufModel.Name} ({ggufModel.Architecture}), {compiled.Nodes.Length} nodes, {loaded} weights ({gpuQuantizedWeights.Count} quantized, {uploadedQuant.Count} buffers), {ggufModel.BlockCount} layers");
+
+        registry.QuantizedWeightTypes = quantizedTypes.Count > 0 ? quantizedTypes : null;
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues,
+            quantizedWeights: gpuQuantizedWeights.Count > 0 ? gpuQuantizedWeights : null);
+        onProgress?.Invoke("ready", 100);
+
+        var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
+        {
+            ModelName = graph.Name,
+            _ownedBuffers = quantizedBuffers.Count > 0 ? quantizedBuffers.Cast<IDisposable>().ToList() : null
+        };
+        // Dynamic-shape recompilation: a Run at a growing decode length recompiles (CPU-only; GPU weights
+        // are reused) rather than running the seq=1 compile shape and dropping all but the first token.
+        session.EnableShapeRecompilation(graph, constSeed, floatSeed, enableOptimization: true);
+        return session;
     }
 
     // ═══════════════════════════════════════════════════════════

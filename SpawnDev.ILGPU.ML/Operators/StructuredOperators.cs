@@ -36,6 +36,20 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
         int N = b.Rank >= 2 ? b.Shape[^1] : 1;
         if (M == 0 || K == 0 || N == 0) return; // degenerate dimensions
 
+        // FAIL LOUDLY on an undersized output view: every path below writes one float per
+        // (input row x N) - (a.ElementCount/K) rows in total (= M*N rank-2, batch*M*N batched).
+        // M/N come from the RUNTIME input shapes, but the output buffer was allocated from the
+        // COMPILE-TIME shape; if a compiler bug pins the output smaller (e.g. the declared-
+        // output -1 -> 1 override, 2026-06-12) the kernel silently corrupts pool memory past
+        // the buffer - or traps, backend-dependent. Name the cause instead.
+        long requiredOut = (long)(a.ElementCount / K) * N;
+        if (ctx.Outputs[0].Data.Length < requiredOut)
+            throw new InvalidOperationException(
+                $"MatMul: output '{ctx.Outputs[0].Name ?? "?"}' view holds {ctx.Outputs[0].Data.Length} " +
+                $"elements but the kernel writes {requiredOut} (a=[{string.Join(",", a.Shape)}], " +
+                $"b=[{string.Join(",", b.Shape)}], M={M},K={K},N={N}). The output buffer was sized " +
+                "from a stale/wrong compile-time shape - shape inference and runtime disagree.");
+
         // Quantized weight B — use the fused dequant kernel for its GGML type. The type
         // is MANDATORY: every GGML layout decodes differently, and decoding one as
         // another (the old hardcoded-Q4_0 behavior) produces silent garbage for every
@@ -51,9 +65,34 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
                     $"MatMul: quantized weight '{bName}' has no GGML type registered " +
                     "(OperatorRegistry.QuantizedWeightTypes). Refusing to guess a block " +
                     "layout - the loader must record the type with the bytes.");
+            // DIAGNOSTIC (env GGUF_MM_CHECK=1): catch an undersized activation/output buffer (a recompile
+            // that didn't resize) vs an in-kernel index bug — the M*K input / M*N output must fit.
+            // Checks the PHYSICAL view lengths (Data.Length), not just shape-derived ElementCount:
+            // Tensor.Shape is settable post-construction, so ElementCount can claim more elements
+            // than the view actually backs — the exact blind spot that hid the 2026-06-12 recompile
+            // fault (ElementCount said 20480, and the real problem was elsewhere entirely).
+            if (System.Environment.GetEnvironmentVariable("GGUF_MM_CHECK") == "1"
+                && (a.Data.Length < (long)M * K || ctx.Outputs[0].Data.Length < (long)M * N))
+                Console.WriteLine($"[MatMul-Q] BUFFER MISMATCH '{bName}': a.Data={a.Data.Length} (need M*K={(long)M * K}), " +
+                    $"out.Data={ctx.Outputs[0].Data.Length} (need M*N={(long)M * N}), M={M},K={K},N={N}, " +
+                    $"aShape=[{string.Join(",", a.Shape)}], outShape=[{string.Join(",", ctx.Outputs[0].Shape)}]");
             reg.FusedDequant.Forward(a.Data, qData, ctx.Outputs[0].Data, M, K, N, qType);
             return;
         }
+
+        // FAIL LOUDLY before the F32 kernels: a ShapeOnly B (quantized weight whose floats never
+        // exist) reaching this point means the quantized byte-view map was not wired into this
+        // executor (e.g. a shape-recompiled executor constructed without quantizedWeights — the
+        // gemma4 seq>1 CUDA illegal-access, 2026-06-12). Dispatching the empty view is a GPU
+        // null-pointer read; this exception names the actual cause instead.
+        if (!b.IsHalf && b.Data.Length < (long)K * N)
+            throw new InvalidOperationException(
+                $"MatMul: B '{bName ?? b.Name ?? "?"}' has no usable F32 data (view length {b.Data.Length}, " +
+                $"needs K*N={(long)K * N}). " +
+                (ctx.QuantizedWeights == null
+                    ? "ctx.QuantizedWeights is NULL — this executor was constructed without the session's " +
+                      "quantized byte-view map (shape-recompiled executor missing quantizedWeights?)."
+                    : $"ctx.QuantizedWeights has {ctx.QuantizedWeights.Count} entries but not '{bName}'."));
 
         // f16-native weights: if B is a half-backed weight (fp16, no float buffer), route to the
         // half-weight kernel (reads ILGPU.Half, fp32 accumulate). Activations (A) stay fp32.
@@ -155,6 +194,42 @@ public class LayerNormOperator(OperatorRegistry reg) : IOnnxOperator
         int C = 1; for (int i = axis; i < shape.Length; i++) C *= shape[i];
         reg.LayerNorm.Forward(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[1].Data, ctx.Inputs[2].Data, rows, C, eps);
+    }
+}
+
+// ── RMSNormalization ──
+//
+// True RMSNorm (NO mean-centering): output = x / sqrt(mean(x^2) + eps) * weight.
+// This is what every RMS decoder (llama/mistral/qwen/gemma via GGUF) needs. The 2-input
+// "LayerNormalization" the GGUF builder used to emit routed to the MEAN-CENTERED LayerNorm
+// kernel (wrong math) AND crashed reading the absent bias Inputs[2]; structural-only tests
+// never executed it so it went unnoticed. The kernel (NormalizationKernels.RMSNorm) already
+// existed unwrapped — this operator wires it.
+//
+//   inputs: x [..., C]    (required)
+//           weight [C]    (optional — absent = WEIGHTLESS unit-gain, e.g. gemma4's V-norm)
+//   attrs:  axis:i (default -1), epsilon:f (default 1e-6 — the RMS-decoder convention; gemma = 1e-6)
+//   out:    same shape as x
+public class RMSNormOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "RMSNormalization";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        int axis = ctx.GetInt("axis", -1);
+        float eps = ctx.GetFloat("epsilon", 1e-6f);
+        var shape = ctx.Inputs[0].Shape;
+        if (axis < 0) axis += shape.Length;
+        int rows = 1; for (int i = 0; i < axis; i++) rows *= shape[i];
+        int C = 1; for (int i = axis; i < shape.Length; i++) C *= shape[i];
+
+        bool hasWeight = ctx.Inputs.Length > 1 && ctx.Inputs[1] != null;
+        if (hasWeight)
+            reg.Normalization.RMSNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+                ctx.Inputs[1].Data, rows, C, eps);
+        else
+            reg.Normalization.RMSNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data, rows, C, eps);
     }
 }
 
@@ -832,6 +907,18 @@ public class GatherOperator(OperatorRegistry reg) : IOnnxOperator
                 numIdx, rowLength, rows, qType);
             return;
         }
+
+        // FAIL LOUDLY before the F32 paths: a ShapeOnly data tensor (quantized table whose floats
+        // never exist) here means the quantized byte-view map was not wired into this executor —
+        // same failure class as the MatMul guard above. Every path below reads data.Data.
+        if (data.Data.Length < data.ElementCount)
+            throw new InvalidOperationException(
+                $"Gather: data '{dataName ?? data.Name ?? "?"}' has no usable F32 data (view length " +
+                $"{data.Data.Length}, shape [{string.Join(",", data.Shape)}] = {data.ElementCount} elements). " +
+                (ctx.QuantizedWeights == null
+                    ? "ctx.QuantizedWeights is NULL — this executor was constructed without the session's " +
+                      "quantized byte-view map (shape-recompiled executor missing quantizedWeights?)."
+                    : $"ctx.QuantizedWeights has {ctx.QuantizedWeights.Count} entries but not '{dataName}'."));
 
         // Get index values from pre-read constants (avoids GPU→CPU readback)
         var idxFloats = ctx.TryGetInputValues(1);

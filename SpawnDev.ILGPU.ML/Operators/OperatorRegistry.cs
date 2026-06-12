@@ -49,6 +49,7 @@ public class OperatorRegistry : IDisposable
         "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
         "RoPE",
         "ReduceMin", "ReduceProd", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize", "ReverseSequence",
+        "RMSNormalization",
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
         "SequenceAt", "SequenceConstruct", "SequenceEmpty", "SequenceErase", "SequenceInsert", "SequenceLength", "SequenceMap", "Shape",
         "Shrink", "SiLU", "Sigmoid", "Sign", "Sin", "Sinh", "Size", "Slice",
@@ -366,6 +367,9 @@ public class OperatorRegistry : IDisposable
         // gemma4 fused-attention layer (graph builder emits per-layer nodes)
         Register(new RoPEOperator(this));
         Register(new FusedAttentionOperator(this));
+        // True RMSNorm (every RMS decoder: llama/mistral/qwen/gemma). Distinct from the
+        // mean-centered LayerNormalization — see RMSNormOperator.
+        Register(new RMSNormOperator(this));
     }
 
     public void Dispose()

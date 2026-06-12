@@ -78,6 +78,20 @@ public class QuantizedKVCache : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _tempTransformed;
     private MemoryBuffer1D<int, Stride1D.Dense>? _tempIndices;
 
+    // Temp buffers for the DEQUANT pipeline (GetDequantized). Member buffers for the same
+    // reason as the FlashAttention temps below: GetDequantized is synchronous, so a
+    // method-local `using var` is disposed while its dispatches are still queued on the
+    // browser backends (WebGPU encoder not yet submitted; Wasm worker queue not yet
+    // drained -> freed-SharedArrayBuffer read). Allocated lazily; vecDim is fixed.
+    private MemoryBuffer1D<int, Stride1D.Dense>? _dqUnpacked;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dqDequant;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dqInvFWHT;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dqInvFlip;
+    // Outgrown dequant output buffers awaiting safe disposal: a smaller buffer may still
+    // be referenced by queued dispatches on the browser backends, so it retires at
+    // cache Dispose() instead of at grow time (geometric growth keeps this list tiny).
+    private readonly List<IDisposable> _retiredBuffers = new();
+
     // Pooled temp buffers for FlashAttention. These MUST be member buffers (not method-local
     // `using var`): on WebGPU the kernels dispatched by FlashAttention are batched in the
     // command encoder and not submitted until the CALLER calls SynchronizeAsync. A method-local
@@ -412,14 +426,28 @@ public class QuantizedKVCache : IDisposable
         int packedDim = (vecDim + _valuesPerInt - 1) / _valuesPerInt;
         int totalElems = CurrentSeqLen * vecDim;
 
-        // Allocate output buffer
-        var outBuf = _accelerator.Allocate1D<float>(totalElems);
+        // Output buffer: per-(layer, K/V) instance-owned, grow-only. A fresh Allocate1D
+        // here LEAKED one buffer per layer per decode step (the returned Tensor doesn't
+        // own its view; nothing disposed it), and disposing it eagerly would hit the same
+        // queued-dispatch hazard as the temps. Grown geometrically as the sequence grows;
+        // the previous step's reads are complete before the next step's overwrite (steps
+        // are sequential with a drain between). Old buffers retire at cache Dispose().
+        ref var outSlot = ref isKey ? ref lc.K_dequantOut : ref lc.V_dequantOut;
+        if (outSlot == null || outSlot.Length < totalElems)
+        {
+            long grown = Math.Max(totalElems, (outSlot?.Length ?? 0) * 2);
+            if (outSlot != null) _retiredBuffers.Add(outSlot);
+            outSlot = _accelerator.Allocate1D<float>(grown);
+        }
+        var outBuf = outSlot;
 
-        // Temp buffers for dequant pipeline (per-token)
-        using var tempUnpacked = _accelerator.Allocate1D<int>(vecDim);
-        using var tempDequant = _accelerator.Allocate1D<float>(vecDim);
-        using var tempInvFWHT = _accelerator.Allocate1D<float>(vecDim);
-        using var tempInvFlip = _accelerator.Allocate1D<float>(vecDim);
+        // Temp buffers for dequant pipeline (per-token). Instance-owned, NOT `using var`:
+        // this method is synchronous, so locals would be disposed while the dispatches
+        // below are still queued on the browser backends (see the field comment).
+        var tempUnpacked = _dqUnpacked ??= _accelerator.Allocate1D<int>(vecDim);
+        var tempDequant = _dqDequant ??= _accelerator.Allocate1D<float>(vecDim);
+        var tempInvFWHT = _dqInvFWHT ??= _accelerator.Allocate1D<float>(vecDim);
+        var tempInvFlip = _dqInvFlip ??= _accelerator.Allocate1D<float>(vecDim);
 
         var packed = isKey ? lc.K_packed! : lc.V_packed!;
         var norms = isKey ? lc.K_norms! : lc.V_norms!;
@@ -475,6 +503,9 @@ public class QuantizedKVCache : IDisposable
         public MemoryBuffer1D<int, Stride1D.Dense>? V_packed;
         public MemoryBuffer1D<float, Stride1D.Dense>? K_norms;
         public MemoryBuffer1D<float, Stride1D.Dense>? V_norms;
+        // Grow-only dequant output buffers (GetDequantized) — reused across decode steps.
+        public MemoryBuffer1D<float, Stride1D.Dense>? K_dequantOut;
+        public MemoryBuffer1D<float, Stride1D.Dense>? V_dequantOut;
 
         public void Dispose()
         {
@@ -482,6 +513,8 @@ public class QuantizedKVCache : IDisposable
             V_packed?.Dispose();
             K_norms?.Dispose();
             V_norms?.Dispose();
+            K_dequantOut?.Dispose();
+            V_dequantOut?.Dispose();
         }
     }
 
@@ -495,6 +528,12 @@ public class QuantizedKVCache : IDisposable
         _tempFlipped?.Dispose();
         _tempTransformed?.Dispose();
         _tempIndices?.Dispose();
+        _dqUnpacked?.Dispose();
+        _dqDequant?.Dispose();
+        _dqInvFWHT?.Dispose();
+        _dqInvFlip?.Dispose();
+        foreach (var b in _retiredBuffers) b.Dispose();
+        _retiredBuffers.Clear();
         _faQNormalized?.Dispose();
         _faQNorms?.Dispose();
         _faQFlipped?.Dispose();

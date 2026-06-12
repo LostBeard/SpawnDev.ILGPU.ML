@@ -13,6 +13,33 @@ public class GGUFModel
     public long DataStartOffset { get; set; }
     public byte[] RawData { get; set; } = Array.Empty<byte>();
 
+    /// <summary>
+    /// Streaming-load source. When set (and <see cref="RawData"/> is empty), small F32/F16 tensors are read
+    /// on demand by seeking this stream instead of indexing a multi-GB in-memory <see cref="RawData"/> byte[]
+    /// (which caps at ~2 GB and can't hold a 7 GB model). Quantized weights are NOT read through here — they
+    /// stream straight to GPU byte buffers via their offset/size descriptors. Must be seekable. NOTE: the
+    /// F32/F16 reads below are SYNCHRONOUS — fine for a desktop FileStream; a browser async-only stream needs
+    /// the small tensors pre-loaded async first (paired with the hub streaming-source work).
+    /// </summary>
+    public Stream? SourceStream { get; set; }
+
+    /// <summary>Get a byte window for a tensor region: a zero-copy view into RawData (byte[] path) or a freshly
+    /// read slice from <see cref="SourceStream"/> (streaming path). Returns the backing array + the base index.</summary>
+    private (byte[] bytes, int baseIdx) SourceBytes(long absOffset, int byteCount)
+    {
+        if (SourceStream == null) return (RawData, (int)absOffset);
+        var buf = new byte[byteCount];
+        SourceStream.Seek(absOffset, SeekOrigin.Begin);
+        int got = 0;
+        while (got < byteCount)
+        {
+            int n = SourceStream.Read(buf, got, byteCount - got);
+            if (n == 0) throw new EndOfStreamException($"GGUF stream ended {byteCount - got} bytes short at offset {absOffset}.");
+            got += n;
+        }
+        return (buf, 0);
+    }
+
     // ── Metadata helpers ──
 
     public string? GetMetadataString(string key) =>
@@ -127,7 +154,8 @@ public class GGUFModel
         if (elements <= 0) return null;
 
         long offset = GetTensorDataOffset(tensor);
-        if (offset + GGMLTypes.TypeSize(tensor.Type, elements) > RawData.Length) return null;
+        // RawData bound only applies to the in-memory path; streaming reads on demand from SourceStream.
+        if (SourceStream == null && offset + GGMLTypes.TypeSize(tensor.Type, elements) > RawData.Length) return null;
 
         return tensor.Type switch
         {
@@ -151,7 +179,8 @@ public class GGUFModel
     private float[] ReadF32(long offset, long count)
     {
         var result = new float[count];
-        Buffer.BlockCopy(RawData, (int)offset, result, 0, (int)count * 4);
+        var (bytes, b) = SourceBytes(offset, (int)count * 4);
+        Buffer.BlockCopy(bytes, b, result, 0, (int)count * 4);
         return result;
     }
 
@@ -320,10 +349,11 @@ public class GGUFModel
     private float[] ReadF16(long offset, long count)
     {
         var result = new float[count];
+        var (bytes, b) = SourceBytes(offset, (int)count * 2);
         for (long i = 0; i < count; i++)
         {
-            int pos = (int)(offset + i * 2);
-            ushort fp16 = (ushort)(RawData[pos] | (RawData[pos + 1] << 8));
+            int pos = b + (int)(i * 2);
+            ushort fp16 = (ushort)(bytes[pos] | (bytes[pos + 1] << 8));
             result[i] = HalfToFloat(fp16);
         }
         return result;

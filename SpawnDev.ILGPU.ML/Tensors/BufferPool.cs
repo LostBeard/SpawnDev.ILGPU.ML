@@ -309,6 +309,38 @@ public class BufferPool : IDisposable
         return new HalfTensor(buffer.View, shape, name);
     }
 
+    /// <summary>
+    /// Stream a QUANTIZED tensor's RAW BYTES (Q4_K/Q6_K/Q8_0/...) from <paramref name="byteOffset"/> in a
+    /// seekable <paramref name="stream"/> straight to a GPU byte buffer — the quantized sibling of
+    /// <see cref="AllocatePermanentFromStreamAsync"/> (which is float-only and throws on quantized dtypes).
+    /// The bytes stay COMPRESSED on the GPU; FusedDequantMatMul/Gather decode blocks in-register. Peak CPU is
+    /// one 4 MB chunk, never the whole tensor — this is what makes a 7 GB GGUF loadable (a single byte[] caps
+    /// at ~2 GB). The buffer is padded to a 4-byte multiple (fused kernels read packed int32 words; WebGPU
+    /// requires 4-byte buffer sizes). Returns the buffer so the caller owns its lifetime (mirrors the existing
+    /// quantized-upload path, whose buffers the session disposes).
+    /// </summary>
+    public async Task<MemoryBuffer1D<byte, Stride1D.Dense>> AllocateQuantizedBytesFromStreamAsync(
+        Stream stream, long byteOffset, int byteLength, CancellationToken ct = default)
+    {
+        int padded = (byteLength + 3) & ~3;
+        var buffer = _accelerator.Allocate1D<byte>(padded);
+        if (byteLength == 0) return buffer;
+
+        stream.Seek(byteOffset, SeekOrigin.Begin);
+        const int CHUNK = 4 * 1024 * 1024; // 4 MB
+        var byteBuf = new byte[Math.Min(CHUNK, byteLength)];
+        int uploaded = 0;
+        while (uploaded < byteLength)
+        {
+            int n = Math.Min(byteBuf.Length, byteLength - uploaded);
+            await ReadExactAsync(stream, byteBuf, n, ct).ConfigureAwait(false);
+            // CopyFromCPU is immediate (queue.writeBuffer on WebGPU) — no temp-buffer/command-encoder hazard.
+            buffer.View.SubView(uploaded, n).CopyFromCPU(n == byteBuf.Length ? byteBuf : byteBuf[..n]);
+            uploaded += n;
+        }
+        return buffer;
+    }
+
     /// <summary>Read exactly <paramref name="count"/> bytes into the start of <paramref name="buf"/>, or throw.</summary>
     private static async Task ReadExactAsync(Stream stream, byte[] buf, int count, CancellationToken ct)
     {

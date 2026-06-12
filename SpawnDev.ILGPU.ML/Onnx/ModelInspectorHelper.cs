@@ -469,16 +469,21 @@ public static partial class ModelInspectorHelper
 
         // Tensor-name templates with blk.N collapsed to blk.* — surfaces EVERY distinct tensor shape
         // (incl. the small norms/scales hidden by LargestWeights.Take(20)) without listing all N hundred.
+        // Group by (collapsed-name, SHAPE, dtype) — NOT name alone: a `blk.*` name whose layers carry
+        // DIFFERENT shapes (e.g. gemma4 attn_q is [3840,4096] on sliding layers but [3840,8192] on the 8
+        // global layers) must split into one row PER distinct shape. Collapsing on name and keeping only
+        // First()'s shape silently hid that variance and made the gemma4 global-layer geometry invisible.
         var templates = model.Tensors
-            .GroupBy(t => CollapseBlock(t.Name))
-            .Select(g => { var ex = g.First(); return new TensorTemplate
+            .GroupBy(t => (Name: CollapseBlock(t.Name), Shape: string.Join(",", t.Shape), Type: t.Type.ToString()))
+            .Select(g => new TensorTemplate
             {
-                Name = CollapseBlock(ex.Name),
-                DataType = ex.Type.ToString(),
-                ExampleShape = ex.Shape,
+                Name = g.Key.Name,
+                DataType = g.Key.Type,
+                ExampleShape = g.First().Shape,
                 Count = g.Count(),
-            }; })
+            })
             .OrderBy(t => t.Name, StringComparer.Ordinal)
+            .ThenByDescending(t => t.Count) // same name, distinct shapes: most-common variant first
             .ToArray();
 
         return new InspectionResult

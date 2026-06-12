@@ -227,6 +227,54 @@ public abstract partial class MLTestBase
     });
 
     // ═══════════════════════════════════════════════════════════
+    //  REPRO — SD-Turbo VAE per-channel-bias Add throws on OpenCL (CUDA passes).
+    //  a is a large NCHW GPU tensor, b a [C,1,1] CONSTANT bias → BroadcastBinaryOp's "expand b on
+    //  CPU then ND kernel" branch (ElementWiseOperators.cs:47). The full model uses [1,128,512,512];
+    //  this hits the same branch at a lighter size. Surfaces the TargetInvocationException inner cause.
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task BroadcastAdd_NCHW_PerChannelBias_ConstB() => await RunTest(async accelerator =>
+    {
+        const int C = 128, H = 256, W = 256;       // 8.4M elems; escalate to 512x512 if it only repros there
+        int n = C * H * W;
+        var aData = new float[n];
+        var bData = new float[C];
+        for (int i = 0; i < n; i++) aData[i] = (i % 13) * 0.05f;
+        for (int c = 0; c < C; c++) bData[c] = c * 0.01f;
+
+        using var aBuf = accelerator.Allocate1D(aData);
+        using var bBuf = accelerator.Allocate1D(bData);
+        using var outBuf = accelerator.Allocate1D<float>(n);
+        using var pool = new BufferPool(accelerator);
+
+        var reg = new OperatorRegistry(accelerator);
+        reg.Resolve("Add").Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(aBuf.View, new[] { 1, C, H, W }), new Tensor(bBuf.View, new[] { C, 1, 1 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 1, C, H, W }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = pool,
+            InputNames = new[] { "a", "b" },
+            ConstantValues = new Dictionary<string, float[]> { ["b"] = bData },  // b constant -> expand-b branch
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, n);
+
+        float maxErr = 0;
+        for (int c = 0; c < C; c++)
+            for (int hw = 0; hw < H * W; hw++)
+            {
+                int idx = c * H * W + hw;
+                maxErr = MathF.Max(maxErr, MathF.Abs(result[idx] - (aData[idx] + bData[c])));
+            }
+        if (maxErr > 1e-4f)
+            throw new Exception($"per-channel bias Add wrong: maxErr={maxErr:E3}");
+
+        Console.WriteLine($"[BroadcastAdd] [1,{C},{H},{W}]+[{C},1,1] per-channel bias — maxErr={maxErr:E1}");
+    });
+
+    // ═══════════════════════════════════════════════════════════
     //  HELPER — runs any binary operator and verifies output
     // ═══════════════════════════════════════════════════════════
 

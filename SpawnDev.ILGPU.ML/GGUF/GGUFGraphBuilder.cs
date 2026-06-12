@@ -23,7 +23,11 @@ namespace SpawnDev.ILGPU.ML.GGUF;
 /// <summary>Raw GGUF block bytes + the GGML quantization type that decodes them.
 /// The type MUST travel with the bytes: every GGML layout decodes differently, and
 /// decoding one as another produces silent garbage (the K-quant landmine, 2026-06-11).</summary>
-public sealed record GGUFQuantizedWeight(byte[] Bytes, GGMLType Type);
+/// <param name="Bytes">The raw quantized bytes (in-memory load). Empty when streaming — the bytes are
+/// uploaded directly from the file via <paramref name="StreamOffset"/>/<paramref name="StreamByteSize"/>.</param>
+/// <param name="StreamOffset">Absolute byte offset of this tensor in the streaming source, or -1 for the
+/// in-memory path.</param>
+public sealed record GGUFQuantizedWeight(byte[] Bytes, GGMLType Type, long StreamOffset = -1, int StreamByteSize = 0);
 
 public static class GGUFGraphBuilder
 {
@@ -92,66 +96,76 @@ public static class GGUFGraphBuilder
             string normOut = $"{pfx}_attn_norm";
             AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm, isGemma);
 
-            // ── Q, K, V projections ──
+            // ── Per-layer attention geometry ──
+            // head_dim VARIES per layer (gemma4: 256 sliding / 512 global) — NEVER embedDim/nHeads.
+            // GetLayerAttnConfig resolves window / rope-base / rotary-dim / KV-heads / head-dim from the
+            // GGUF metadata; for llama/mistral/etc it collapses to one global config (head_dim=embedDim/nHeads,
+            // base from rope.freq_base, no window). nHeads (query heads) is constant across layers.
+            var cfg = GetLayerAttnConfig(model, layer, nHeads, nKVHeads, headDim);
+            int hd = cfg.HeadDim;
+
+            // ── Q, K, V projections (raw) ──
             string qOut = $"{pfx}_q", kOut = $"{pfx}_k", vOut = $"{pfx}_v";
             AddLinear(graph, model, weights, $"{pfx}.attn_q", normOut, qOut, quantizedBytes, transposeOnUpload);
             AddLinear(graph, model, weights, $"{pfx}.attn_k", normOut, kOut, quantizedBytes, transposeOnUpload);
-            AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes, transposeOnUpload);
+            // gemma4 global layers carry no attn_v: V reuses the RAW K projection
+            // (llama.cpp `Vcur = wv ? wv·x : Kcur`). All other archs always have attn_v.
+            bool hasV = FindTensor(model, $"{pfx}.attn_v.weight") != null;
+            if (hasV)
+                AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes, transposeOnUpload);
+            string vSrc = hasV ? vOut : kOut;
 
-            // ── Multi-head reshape: [batch, seq, embed] → [batch, nHeads, seq, headDim] ──
-            string qReshaped = $"{pfx}_q_mh", kReshaped = $"{pfx}_k_mh", vReshaped = $"{pfx}_v_mh";
-            // Reshape Q: [1, seq, nHeads*headDim] → [1, seq, nHeads, headDim] → transpose to [1, nHeads, seq, headDim]
-            AddNode(graph, "Reshape", new[] { qOut }, new[] { $"{pfx}_q_4d" },
-                Attrs("shape", new long[] { 1, -1, nHeads, headDim }));
-            AddNode(graph, "Transpose", new[] { $"{pfx}_q_4d" }, new[] { qReshaped },
-                Attrs("perm", new long[] { 0, 2, 1, 3 }));
+            // gemma4-style attention is signalled by the QK-norm tensors. When present we ALSO apply the
+            // weightless V RMS-norm and (global layers) the rope_freqs NTK factors — all gemma4 behaviors.
+            // Absent (llama/mistral/gemma2/...) = standard attention: no QK-norm, no V-norm.
+            bool gemmaAttn = FindTensor(model, $"{pfx}.attn_q_norm.weight") != null;
 
-            // Reshape K: [1, seq, nKVHeads*headDim] → [1, nKVHeads, seq, headDim]
-            AddNode(graph, "Reshape", new[] { kOut }, new[] { $"{pfx}_k_4d" },
-                Attrs("shape", new long[] { 1, -1, nKVHeads, headDim }));
-            AddNode(graph, "Transpose", new[] { $"{pfx}_k_4d" }, new[] { kReshaped },
-                Attrs("perm", new long[] { 0, 2, 1, 3 }));
+            // rope_freqs (NTK / proportional rope) — global (full-attention) gemma4 layers only. Shared
+            // model-level tensor; extract once, reference per global layer.
+            string? freqFactors = null;
+            if (gemmaAttn && cfg.IsGlobal)
+            {
+                var rf = FindTensor(model, "rope_freqs.weight");
+                if (rf != null)
+                {
+                    if (!weights.ContainsKey(rf.Name)) { ExtractWeight(model, rf, weights); graph.Initializers[rf.Name] = rf.Shape; }
+                    freqFactors = rf.Name;
+                }
+            }
 
-            // Reshape V: same as K
-            AddNode(graph, "Reshape", new[] { vOut }, new[] { $"{pfx}_v_4d" },
-                Attrs("shape", new long[] { 1, -1, nKVHeads, headDim }));
-            AddNode(graph, "Transpose", new[] { $"{pfx}_v_4d" }, new[] { vReshaped },
-                Attrs("perm", new long[] { 0, 2, 1, 3 }));
+            // Q/K: reshape → QK-norm → RoPE → transpose. V: reshape → weightless-norm → transpose (no RoPE).
+            string qReshaped = EmitAttnHead(graph, model, weights, pfx, "q", qOut, nHeads, hd, cfg,
+                gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, isGemma, doRope: true, weightlessNorm: false);
+            string kReshaped = EmitAttnHead(graph, model, weights, pfx, "k", kOut, cfg.NKVHeads, hd, cfg,
+                gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, isGemma, doRope: true, weightlessNorm: false);
+            string vReshaped = EmitAttnHead(graph, model, weights, pfx, "v", vSrc, cfg.NKVHeads, hd, cfg,
+                qkNormTensor: null, freqFactors: null, isGemma, doRope: false, weightlessNorm: gemmaAttn);
 
-            // ── Attention: Q @ K^T / sqrt(headDim) → softmax → @ V ──
-            // Transpose K for matmul: [1, nKVHeads, seq, headDim] → [1, nKVHeads, headDim, seq]
-            string kTransposed = $"{pfx}_k_t";
-            AddNode(graph, "Transpose", new[] { kReshaped }, new[] { kTransposed },
-                Attrs("perm", new long[] { 0, 1, 3, 2 }));
-
-            // Q @ K^T → [1, nHeads, seq, seq]
-            string qkOut = $"{pfx}_qk";
-            AddNode(graph, "MatMul", new[] { qReshaped, kTransposed }, new[] { qkOut });
-
-            // Scale by 1/sqrt(headDim)
-            string qkScaled = $"{pfx}_qk_scaled";
-            float scale = 1f / MathF.Sqrt(headDim);
-            string scaleName = $"{pfx}_scale";
-            weights[scaleName] = new[] { scale };
-            graph.Initializers[scaleName] = new[] { 1 };
-            AddNode(graph, "Mul", new[] { qkOut, scaleName }, new[] { qkScaled });
-
-            // Softmax over last axis (seq dimension)
-            string attnWeights = $"{pfx}_attn_weights";
-            AddNode(graph, "Softmax", new[] { qkScaled }, new[] { attnWeights },
-                Attrs("axis", -1L));
-
-            // Attention @ V → [1, nHeads, seq, headDim]
+            // ── Fused masked attention: softmax(QKᵀ·scale [+ causal/SWA mask]) · V in one dispatch ──
+            // (GQA: n_kv_heads < n_heads; window 0 = global, else sliding.) The scale attr is OMITTED →
+            // the op defaults to 1/sqrt(head_dim). gemma4's exact f_attention_scale (no query_pre_attn_scalar
+            // in its metadata; likely 1.0, controlled by QK-norm) is confirmed at E2E vs a llama.cpp reference —
+            // flip this one attr if the node-bisect disagrees.
             string attnValues = $"{pfx}_attn_val";
-            AddNode(graph, "MatMul", new[] { attnWeights, vReshaped }, new[] { attnValues });
+            var faAttrs = new Dictionary<string, JsonElement>
+            {
+                ["n_heads"] = JsonSerializer.SerializeToElement((long)nHeads),
+                ["n_kv_heads"] = JsonSerializer.SerializeToElement((long)cfg.NKVHeads),
+                ["head_dim"] = JsonSerializer.SerializeToElement((long)hd),
+                ["causal"] = JsonSerializer.SerializeToElement(1L),
+                ["window"] = JsonSerializer.SerializeToElement((long)cfg.Window),
+                ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
+            };
+            AddNode(graph, "FusedAttention", new[] { qReshaped, kReshaped, vReshaped }, new[] { attnValues }, faAttrs);
 
-            // ── Merge heads: [1, nHeads, seq, headDim] → [1, seq, embed] ──
+            // ── Merge heads: [1, nHeads, seq, hd] → [1, seq, nHeads*hd] ──
+            // (nHeads*hd, NOT embedDim: gemma4 attn_output input is 16*256=4096 sliding / 16*512=8192 global.)
             string attnTransposed = $"{pfx}_attn_t";
             AddNode(graph, "Transpose", new[] { attnValues }, new[] { attnTransposed },
                 Attrs("perm", new long[] { 0, 2, 1, 3 }));
             string attnMerged = $"{pfx}_attn_merged";
             AddNode(graph, "Reshape", new[] { attnTransposed }, new[] { attnMerged },
-                Attrs("shape", new long[] { 1, -1, embedDim }));
+                Attrs("shape", new long[] { 1, -1, (long)(nHeads * hd) }));
 
             // ── Output projection ──
             string attnOut = $"{pfx}_attn_out";
@@ -215,7 +229,23 @@ public static class GGUFGraphBuilder
             // ── Residual 2 ──
             string layerOut = $"block_{layer}_out";
             AddNode(graph, "Add", new[] { residual1, ffnResInput }, new[] { layerOut });
-            prevOutput = layerOut;
+
+            // ── Per-layer output scalar (gemma4 layer_output_scale) ──
+            // llama.cpp: `if (out_scale) cur *= out_scale` — a per-layer [1] scalar multiply on the WHOLE
+            // block output, AFTER residual-2 (not an attention/logit scale). Presence-based; absent elsewhere.
+            var outScale = FindTensor(model, $"{pfx}.layer_output_scale.weight");
+            if (outScale != null)
+            {
+                ExtractWeight(model, outScale, weights);
+                graph.Initializers[outScale.Name] = outScale.Shape; // [1]
+                string scaledOut = $"{pfx}_out_scaled";
+                AddNode(graph, "Mul", new[] { layerOut, outScale.Name }, new[] { scaledOut });
+                prevOutput = scaledOut;
+            }
+            else
+            {
+                prevOutput = layerOut;
+            }
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -252,7 +282,8 @@ public static class GGUFGraphBuilder
             graph.Initializers[headName] = embedWeight.Shape; // ne order = [n_embd, vocab] = [K, N]
             if (quantizedBytes.TryGetValue(embedWeight.Name, out var qw))
             {
-                quantizedBytes[headName] = qw; // same byte[] reference -> single GPU upload
+                quantizedBytes[headName] = qw; // same byte[]/stream-offset -> single GPU upload (deduped)
+                weights[headName] = Array.Empty<float>(); // presence marker so the upload loop (iterates `weights`) processes the alias
             }
             else if (weights.TryGetValue(embedWeight.Name, out var fw))
             {
@@ -348,10 +379,26 @@ public static class GGUFGraphBuilder
         {
             if (quantizedBytes != null && Kernels.FusedDequantMatMul.Supports(tensor.Type))
             {
-                var rawBytes = model.GetTensorRawBytes(tensor)
-                    ?? throw new InvalidDataException(
-                        $"GGUF tensor '{tensor.Name}' ({tensor.Type}): raw data out of bounds.");
-                quantizedBytes[tensor.Name] = new GGUFQuantizedWeight(rawBytes, tensor.Type);
+                if (model.SourceStream != null)
+                {
+                    // Streaming load: record the file offset/size — the bytes stay on disk until the upload
+                    // loop streams them straight to a GPU byte buffer (never materialized; a 7 GB model has no
+                    // single byte[]). The embedding (Q6_K, ~787 MB) fits int; assert so a future giant tensor
+                    // fails loudly rather than silently truncating.
+                    long absOffset = model.GetTensorDataOffset(tensor);
+                    long byteSize = GGMLTypes.TypeSize(tensor.Type, model.GetTensorElementCount(tensor));
+                    if (byteSize > int.MaxValue)
+                        throw new NotSupportedException(
+                            $"GGUF tensor '{tensor.Name}' is {byteSize} bytes (> 2 GB) — single-tensor streaming upload not supported.");
+                    quantizedBytes[tensor.Name] = new GGUFQuantizedWeight(Array.Empty<byte>(), tensor.Type, absOffset, (int)byteSize);
+                }
+                else
+                {
+                    var rawBytes = model.GetTensorRawBytes(tensor)
+                        ?? throw new InvalidDataException(
+                            $"GGUF tensor '{tensor.Name}' ({tensor.Type}): raw data out of bounds.");
+                    quantizedBytes[tensor.Name] = new GGUFQuantizedWeight(rawBytes, tensor.Type);
+                }
                 weights[tensor.Name] = Array.Empty<float>(); // presence marker; loader creates a ShapeOnly tensor
                 return;
             }
@@ -370,6 +417,62 @@ public static class GGUFGraphBuilder
         if (isLinearB && tensor.Dimensions.Length == 2)
             transposeOnUpload?.Add(tensor.Name);
         weights[tensor.Name] = data;
+    }
+
+    /// <summary>
+    /// Emit one attention head-stream as gemma4/llama.cpp wires it (verbatim-matched to
+    /// src/models/gemma4.cpp): projection output → Reshape [1, seq, heads, hd] →
+    /// (optional QK-norm = weighted RMS over hd) → (optional weightless V RMS-norm over hd) →
+    /// (optional RoPE on the PRE-transpose layout, rows_per_position = heads) →
+    /// Transpose [0,2,1,3] → [1, heads, seq, hd] (the flat layout FusedAttention expects).
+    /// Q/K take a QK-norm + RoPE; V takes the weightless norm and NO RoPE.
+    /// </summary>
+    private static string EmitAttnHead(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
+        string pfx, string tag, string projOut, int heads, int hd, LayerAttnConfig cfg,
+        string? qkNormTensor, string? freqFactors, bool isGemma, bool doRope, bool weightlessNorm)
+    {
+        string r4d = $"{pfx}_{tag}_4d";
+        AddNode(graph, "Reshape", new[] { projOut }, new[] { r4d },
+            Attrs("shape", new long[] { 1, -1, heads, hd }));
+        string cur = r4d;
+
+        // QK-norm: weighted RMS over head_dim, BEFORE RoPE (gemma: (1+weight) fold). Presence-gated.
+        if (qkNormTensor != null && FindTensor(model, $"{qkNormTensor}.weight") != null)
+        {
+            string normed = $"{pfx}_{tag}_qknorm";
+            AddNorm(graph, model, weights, qkNormTensor, cur, normed, hd, useRMSNorm: true, addOneToNormWeight: isGemma);
+            cur = normed;
+        }
+
+        // Weightless V RMS-norm (gemma4: `Vcur = ggml_rms_norm(Vcur, eps)`, no learned scale).
+        if (weightlessNorm)
+        {
+            float rmsEps = model.GetMetadataFloat($"{model.Architecture}.attention.layer_norm_rms_epsilon", 1e-6f);
+            string vn = $"{pfx}_{tag}_vnorm";
+            AddNode(graph, "RMSNormalization", new[] { cur }, new[] { vn }, Attrs("epsilon", rmsEps));
+            cur = vn;
+        }
+
+        // RoPE on the pre-transpose [1, seq, heads, hd] layout (rows_per_position = heads). Global gemma4
+        // layers also pass freq_factors (rope_freqs, NTK); sliding/other archs pass none.
+        if (doRope)
+        {
+            string roped = $"{pfx}_{tag}_roped";
+            var ropeAttrs = new Dictionary<string, JsonElement>
+            {
+                ["rope_base"] = JsonSerializer.SerializeToElement(cfg.RopeBase),
+                ["rotary_dim"] = JsonSerializer.SerializeToElement((long)cfg.RotaryDim),
+                ["rows_per_position"] = JsonSerializer.SerializeToElement((long)heads),
+                ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
+            };
+            var ins = freqFactors != null ? new[] { cur, freqFactors } : new[] { cur };
+            AddNode(graph, "RoPE", ins, new[] { roped }, ropeAttrs);
+            cur = roped;
+        }
+
+        string t = $"{pfx}_{tag}_t";
+        AddNode(graph, "Transpose", new[] { cur }, new[] { t }, Attrs("perm", new long[] { 0, 2, 1, 3 }));
+        return t;
     }
 
     private static void AddNode(ModelGraph graph, string opType, string[] inputs, string[] outputs,
@@ -406,9 +509,14 @@ public static class GGUFGraphBuilder
 
         if (useRMSNorm)
         {
-            AddNode(graph, "LayerNormalization",
+            // TRUE RMSNorm (no mean-centering). Emitting "LayerNormalization" here was a latent bug:
+            // it routed to the mean-centered LayerNorm kernel (wrong) and read an absent bias. Use the
+            // model's RMS epsilon (gemma = 1e-6); the RMSNormalization op defaults to 1e-6 too.
+            float rmsEps = model.GetMetadataFloat($"{model.Architecture}.attention.layer_norm_rms_epsilon", 1e-6f);
+            AddNode(graph, "RMSNormalization",
                 weightTensor != null ? new[] { input, weightTensor.Name } : new[] { input },
-                new[] { output });
+                new[] { output },
+                Attrs("epsilon", rmsEps));
         }
         else
         {

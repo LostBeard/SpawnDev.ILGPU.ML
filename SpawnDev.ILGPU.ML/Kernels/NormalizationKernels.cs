@@ -27,6 +27,10 @@ public class NormalizationKernels
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
+        int>? _rmsNormApplyNoWeightKernel;
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
         int, float>? _instanceNormMeanVarKernel;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -91,6 +95,20 @@ public class NormalizationKernels
         int row = idx / C;
         int col = idx % C;
         output[idx] = input[idx] * invRms[row] * weight[col];
+    }
+
+    /// <summary>
+    /// RMSNorm Pass 2, WEIGHTLESS: apply normalization per element with unit gain (no learned scale).
+    /// gemma4's V-norm is a plain <c>ggml_rms_norm</c> with no weight (output = input * invRms).
+    /// </summary>
+    private static void RMSNormApplyNoWeightImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> invRms,
+        int C)
+    {
+        int row = idx / C;
+        output[idx] = input[idx] * invRms[row];
     }
 
     /// <summary>
@@ -179,6 +197,23 @@ public class NormalizationKernels
 
         // Pass 2: apply normalization per element
         _rmsNormApplyKernel!(rows * C, input, output, weight, rmsInvRms.View, C);
+    }
+
+    /// <summary>
+    /// Weightless RMSNorm: input [rows, C] → output [rows, C], unit gain (no learned scale).
+    /// gemma4 applies this to V (a plain <c>ggml_rms_norm</c> with no weight) before attention.
+    /// </summary>
+    public void RMSNorm(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int rows, int C, float epsilon = 1e-6f)
+    {
+        EnsureLoaded();
+
+        var rmsInvRms = _accelerator.Allocate1D<float>(rows);
+        _allTempBufs.Add(rmsInvRms);
+
+        _rmsNormStatsKernel!(rows, input, rmsInvRms.View, C, epsilon);
+        _rmsNormApplyNoWeightKernel!(rows * C, input, output, rmsInvRms.View, C);
     }
 
     /// <summary>
@@ -273,5 +308,9 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int>(RMSNormApplyImpl);
+        _rmsNormApplyNoWeightKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>,
+            int>(RMSNormApplyNoWeightImpl);
     }
 }

@@ -160,6 +160,14 @@ public class GraphExecutor : IDisposable
     /// for fused dequantization during MatMul.</summary>
     private readonly Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? _quantizedWeights;
 
+    /// <summary>The quantized weight byte-view map this executor was constructed with (null when the
+    /// model has no quantized weights). A shape-recompiled executor MUST be constructed with the SAME
+    /// map as the base executor — quantized weights are session-lifetime GPU buffers shared across all
+    /// per-shape executors. InferenceSession.RecompileForShapes reads it from here; omitting it routes
+    /// every quantized MatMul/Gather to the F32 path against a ShapeOnly tensor's empty view (a CUDA
+    /// illegal memory access at the first quantized node — the gemma4 seq&gt;1 fault, 2026-06-12).</summary>
+    internal Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? QuantizedWeights => _quantizedWeights;
+
     /// <summary>Names of tensors whose ONNX-declared dtype is integer
     /// (INT8/16/32/64, UINT8/16/32/64, BOOL). Built once at session-init by
     /// walking initializer dtypes + integer-producing op outputs + propagating

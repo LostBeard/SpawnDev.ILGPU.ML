@@ -15,7 +15,18 @@ public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Reshape";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] }; // Resolved from shape tensor at graph compile time
+    {
+        // opset-1 form: the target shape is a "shape" ATTRIBUTE (the GGUF builder emits this).
+        // opset-5+ form: it's a second input tensor, resolved at compile time elsewhere → keep inputs[0].
+        var attrShape = GetShapeAttr(attrs);
+        if (attrShape != null)
+        {
+            int inputElems = inputs[0].Aggregate(1, (a, b) => a * b);
+            var resolved = ResolveReshape(attrShape, inputs[0], inputElems);
+            if (resolved != null) return new[] { resolved };
+        }
+        return new[] { inputs[0] }; // resolved from the shape input at graph compile time
+    }
     public void Execute(OnnxOpContext ctx)
     {
         // Copy input to output
@@ -24,28 +35,49 @@ public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
             reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count),
                 ctx.Outputs[0].Data.SubView(0, count), count, 1f);
 
-        // If target shape is available in runtime constants, apply it to the output tensor.
-        // This fixes the case where the pre-allocated output buffer has the wrong compiled shape
-        // but the runtime Reshape target (from Concat of Shape values) is correct.
-        var targetShape = ctx.TryGetInputValues(1);
-        if (targetShape != null && targetShape.Length > 0)
+        // Target shape: the opset-5 shape INPUT (from a Concat of Shape values) takes precedence; otherwise
+        // the opset-1 "shape" ATTRIBUTE (the GGUF builder's form — e.g. attention reshapes to [1,seq,heads,dim]).
+        // Without this the output keeps its compiled rank and a downstream Transpose's perm length no longer
+        // matches the rank → it falls back to a reverse permutation and silently corrupts the result.
+        var targetShape = ctx.TryGetInputValues(1); // float[] from a runtime shape input, if present
+        long[]? target = (targetShape != null && targetShape.Length > 0)
+            ? targetShape.Select(v => (long)v).ToArray()
+            : GetShapeAttr(ctx.Attributes);
+        if (target != null && target.Length > 0)
         {
-            var resolved = targetShape.Select(v => (int)v).ToArray();
-            int inputElems = ctx.Inputs[0].ElementCount;
-            // Handle -1 (infer) and 0 (copy from input)
-            for (int j = 0; j < resolved.Length; j++)
-                if (resolved[j] == 0 && j < ctx.Inputs[0].Shape.Length) resolved[j] = ctx.Inputs[0].Shape[j];
-            int negIdx = Array.IndexOf(resolved, -1);
-            if (negIdx >= 0)
-            {
-                int known = 1;
-                for (int j = 0; j < resolved.Length; j++) if (j != negIdx && resolved[j] > 0) known *= resolved[j];
-                resolved[negIdx] = known > 0 ? inputElems / known : 1;
-            }
-            // Validate element count matches
-            if (resolved.All(d => d > 0) && resolved.Aggregate(1L, (a, b) => a * b) == inputElems)
-                ctx.Outputs[0].Shape = resolved;
+            var resolved = ResolveReshape(target, ctx.Inputs[0].Shape, ctx.Inputs[0].ElementCount);
+            if (resolved != null) ctx.Outputs[0].Shape = resolved;
         }
+    }
+
+    private static long[]? GetShapeAttr(Dictionary<string, object> attrs)
+    {
+        if (!attrs.TryGetValue("shape", out var v)) return null;
+        return v switch
+        {
+            long[] l => l,
+            int[] i => i.Select(x => (long)x).ToArray(),
+            System.Text.Json.JsonElement je when je.ValueKind == System.Text.Json.JsonValueKind.Array
+                => je.EnumerateArray().Select(e => e.GetInt64()).ToArray(),
+            _ => null,
+        };
+    }
+
+    /// <summary>Resolve a reshape target against the input (handle -1 infer and 0 copy-from-input);
+    /// returns null if it doesn't divide the element count evenly.</summary>
+    private static int[]? ResolveReshape(long[] target, int[] inShape, int inputElems)
+    {
+        var resolved = target.Select(v => (int)v).ToArray();
+        for (int j = 0; j < resolved.Length; j++)
+            if (resolved[j] == 0 && j < inShape.Length) resolved[j] = inShape[j];
+        int negIdx = Array.IndexOf(resolved, -1);
+        if (negIdx >= 0)
+        {
+            int known = 1;
+            for (int j = 0; j < resolved.Length; j++) if (j != negIdx && resolved[j] > 0) known *= resolved[j];
+            resolved[negIdx] = known > 0 ? inputElems / known : 1;
+        }
+        return resolved.All(d => d > 0) && resolved.Aggregate(1L, (a, b) => a * b) == inputElems ? resolved : null;
     }
 }
 

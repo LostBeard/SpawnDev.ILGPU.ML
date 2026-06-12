@@ -227,6 +227,12 @@ public static class GraphOptimizer
             var matmulNode = graph.Nodes[i];
             if (matmulNode.OpType != "MatMul") continue;
 
+            // Do NOT fuse a WEIGHT matmul (B = a graph initializer). FusedScaledMatMul is an F32
+            // activation×activation op meant for attention Q·Kᵀ·scale; a quantized weight B (e.g. the
+            // gemma tied LM head, Q6_K) would be read as F32 — ~5x past the compressed buffer → illegal
+            // memory access. Weight matmuls take the dequant/weight path; the scale stays a separate node.
+            if (matmulNode.Inputs.Count >= 2 && graph.Initializers.ContainsKey(matmulNode.Inputs[1])) continue;
+
             string matmulOutput = matmulNode.Outputs[0];
             if (outputConsumerCount.GetValueOrDefault(matmulOutput, 0) != 1) continue;
 

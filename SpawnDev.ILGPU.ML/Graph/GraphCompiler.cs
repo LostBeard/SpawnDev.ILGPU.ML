@@ -84,14 +84,17 @@ public class GraphCompiler
             if (shape != null) knownShapes[name] = shape;
         }
         // Pre-register graph output shapes (overrides inferred shapes for Reshape etc.)
+        // Stored RAW (dynamic dims stay <=0): a declared dynamic dim must NEVER clobber a
+        // correctly-inferred runtime dim. The old code resolved -1 -> 1 here and overrode
+        // unconditionally below, pinning e.g. a GGUF decoder's declared logits [1,-1,vocab]
+        // to [1,1,vocab] even when inference had the true seq>1 - so the output buffer was
+        // allocated one position big and the LM-head MatMul (which sizes M from its RUNTIME
+        // input) silently wrote seq*vocab floats past it (2026-06-12).
         var graphOutputShapes = new Dictionary<string, int[]>();
         foreach (var output in graph.Outputs)
         {
             if (output.Shape.Length > 0)
-            {
-                var shape = output.Shape.Select(d => d <= 0 ? 1 : d).ToArray();
-                graphOutputShapes[output.Name] = shape;
-            }
+                graphOutputShapes[output.Name] = output.Shape;
         }
 
         // Compile each node
@@ -666,8 +669,20 @@ public class GraphCompiler
                 if (knownShapes.TryGetValue(outName, out var existingShape)
                     && existingShape.Length > 1 && outputShapes[i].Length <= 1)
                     outputShapes[i] = existingShape;
-                if (graphOutputShapes.TryGetValue(outName, out var knownOutShape))
-                    outputShapes[i] = knownOutShape; // Use known graph output shape
+                if (graphOutputShapes.TryGetValue(outName, out var declaredOutShape))
+                {
+                    // Declared graph-output shape vs inferred: a fully-STATIC declaration wins
+                    // (the original rescue for ops whose inference is weak, e.g. Reshape). A
+                    // declaration with dynamic dims (<=0) only contributes its static dims;
+                    // every dynamic dim keeps the INFERRED value (resolving -1 -> 1 here pinned
+                    // dynamic decoders to seq=1 and undersized their output buffers).
+                    if (declaredOutShape.All(d => d > 0))
+                        outputShapes[i] = declaredOutShape;
+                    else if (declaredOutShape.Length == outputShapes[i].Length)
+                        outputShapes[i] = declaredOutShape
+                            .Zip(outputShapes[i], (dec, inf) => dec > 0 ? dec : inf).ToArray();
+                    // else: dynamic declaration with a rank mismatch - trust the inference.
+                }
                 knownShapes[outName] = outputShapes[i];
             }
 
