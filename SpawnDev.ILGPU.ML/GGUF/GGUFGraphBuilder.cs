@@ -82,6 +82,22 @@ public static class GGUFGraphBuilder
             graph.Initializers[embedWeight.Name] = embedWeight.Shape.Reverse().ToArray();
             AddNode(graph, "Gather", new[] { embedWeight.Name, prevOutput }, new[] { "embed_out" });
             prevOutput = "embed_out";
+
+            // gemma scales the token embeddings by sqrt(n_embd) right after the lookup
+            // (llama.cpp `ggml_scale(inpL, sqrtf(n_embd))`; HF `inputs_embeds * hidden_size**0.5`).
+            // There is no metadata key for it - it is a hardcoded gemma constant. RMSNorm is
+            // scale-invariant, so the attention/FFN paths don't notice the scale; but the RESIDUAL
+            // stream carries the token-identity signal, and without the ~62x boost that signal sits
+            // at <1% of the (RMS-normed) sublayer outputs - so every position collapses to the same
+            // argmax. Gemma-only; other archs add the embedding to the residual unscaled.
+            if (isGemma)
+            {
+                const string embScaleName = "embed_scale";
+                weights[embScaleName] = new[] { MathF.Sqrt(embedDim) };
+                graph.Initializers[embScaleName] = new[] { 1 };
+                AddNode(graph, "Mul", new[] { "embed_out", embScaleName }, new[] { "embed_scaled" });
+                prevOutput = "embed_scaled";
+            }
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -94,7 +110,7 @@ public static class GGUFGraphBuilder
 
             // ── Attention norm ──
             string normOut = $"{pfx}_attn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm, isGemma);
+            AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm);
 
             // ── Per-layer attention geometry ──
             // head_dim VARIES per layer (gemma4: 256 sliding / 512 global) — NEVER embedDim/nHeads.
@@ -135,11 +151,11 @@ public static class GGUFGraphBuilder
 
             // Q/K: reshape → QK-norm → RoPE → transpose. V: reshape → weightless-norm → transpose (no RoPE).
             string qReshaped = EmitAttnHead(graph, model, weights, pfx, "q", qOut, nHeads, hd, cfg,
-                gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, isGemma, doRope: true, weightlessNorm: false);
+                gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, doRope: true, weightlessNorm: false);
             string kReshaped = EmitAttnHead(graph, model, weights, pfx, "k", kOut, cfg.NKVHeads, hd, cfg,
-                gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, isGemma, doRope: true, weightlessNorm: false);
+                gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, doRope: true, weightlessNorm: false);
             string vReshaped = EmitAttnHead(graph, model, weights, pfx, "v", vSrc, cfg.NKVHeads, hd, cfg,
-                qkNormTensor: null, freqFactors: null, isGemma, doRope: false, weightlessNorm: gemmaAttn);
+                qkNormTensor: null, freqFactors: null, doRope: false, weightlessNorm: gemmaAttn);
 
             // ── Fused masked attention: softmax(QKᵀ·scale [+ causal/SWA mask]) · V in one dispatch ──
             // (GQA: n_kv_heads < n_heads; window 0 = global, else sliding.) The scale attr is OMITTED →
@@ -177,7 +193,7 @@ public static class GGUFGraphBuilder
             if (FindTensor(model, $"{pfx}.post_attention_norm.weight") != null)
             {
                 string postAttnOut = $"{pfx}_post_attn_norm";
-                AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm, isGemma);
+                AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm);
                 attnResInput = postAttnOut;
             }
 
@@ -187,7 +203,7 @@ public static class GGUFGraphBuilder
 
             // ── FFN norm ──
             string ffnNormOut = $"{pfx}_ffn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm, isGemma);
+            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
 
             // ── FFN: gate + up → activation → down ──
             string gateOut = $"{pfx}_gate", upOut = $"{pfx}_up";
@@ -222,7 +238,7 @@ public static class GGUFGraphBuilder
             if (FindTensor(model, $"{pfx}.post_ffw_norm.weight") != null)
             {
                 string postFfwOut = $"{pfx}_post_ffw_norm";
-                AddNorm(graph, model, weights, $"{pfx}.post_ffw_norm", ffnOut, postFfwOut, embedDim, useRMSNorm, isGemma);
+                AddNorm(graph, model, weights, $"{pfx}.post_ffw_norm", ffnOut, postFfwOut, embedDim, useRMSNorm);
                 ffnResInput = postFfwOut;
             }
 
@@ -252,7 +268,7 @@ public static class GGUFGraphBuilder
         //  3. Final norm
         // ═══════════════════════════════════════════════════════════
         string finalNormOut = "final_norm_out";
-        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm, isGemma);
+        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm);
 
         // ═══════════════════════════════════════════════════════════
         //  4. LM head (output projection)
@@ -429,7 +445,7 @@ public static class GGUFGraphBuilder
     /// </summary>
     private static string EmitAttnHead(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
         string pfx, string tag, string projOut, int heads, int hd, LayerAttnConfig cfg,
-        string? qkNormTensor, string? freqFactors, bool isGemma, bool doRope, bool weightlessNorm)
+        string? qkNormTensor, string? freqFactors, bool doRope, bool weightlessNorm)
     {
         string r4d = $"{pfx}_{tag}_4d";
         AddNode(graph, "Reshape", new[] { projOut }, new[] { r4d },
@@ -440,7 +456,7 @@ public static class GGUFGraphBuilder
         if (qkNormTensor != null && FindTensor(model, $"{qkNormTensor}.weight") != null)
         {
             string normed = $"{pfx}_{tag}_qknorm";
-            AddNorm(graph, model, weights, qkNormTensor, cur, normed, hd, useRMSNorm: true, addOneToNormWeight: isGemma);
+            AddNorm(graph, model, weights, qkNormTensor, cur, normed, hd, useRMSNorm: true);
             cur = normed;
         }
 
@@ -491,19 +507,21 @@ public static class GGUFGraphBuilder
         => new() { [key] = JsonSerializer.SerializeToElement(value) };
 
     private static void AddNorm(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
-        string tensorPrefix, string input, string output, int dim, bool useRMSNorm, bool addOneToNormWeight = false)
+        string tensorPrefix, string input, string output, int dim, bool useRMSNorm)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
         {
             // Norm weights are 1-D vectors with no fused dequant consumer: F32/F16 only
             // (a quantized norm weight throws in ExtractWeight - honest failure).
+            // gemma's `output = x_normed * (1 + weight)` convention is ALREADY BAKED INTO THE GGUF:
+            // llama.cpp's convert (conversion/gemma.py, Gemma3/Gemma4 `modify_tensors`) does
+            // `data_torch = data_torch + 1` for every `*norm.weight` at conversion, and the graph then
+            // uses the stored weight RAW. So the GGUF weights are NOT centered at 0 (verified: gemma4
+            // attn_norm ranges -143..193, output_norm up to 604) - they are the final gains. Folding a
+            // second +1 here double-counted; for the small-valued qk/post norms (k_norm = 0.1221) that
+            // ~9x-inflated the gain and collapsed attention. Use the stored weights verbatim.
             ExtractWeight(model, weightTensor, weights);
-            // gemma RMSNorm convention: output = x_normed * (1 + weight). gemma stores the weights centered
-            // at 0, so fold the +1 in at load — mathematically identical and the generic norm op needs no
-            // change. (Applies to every gemma norm: attn/ffn, the post-norm sandwich, and the final norm.)
-            if (addOneToNormWeight && weights.TryGetValue(weightTensor.Name, out var nw))
-                for (int i = 0; i < nw.Length; i++) nw[i] += 1f;
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
         }
 

@@ -72,12 +72,16 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Gemma4_GraphBuilder_RMSNormPlusOne() => await RunTest(async accelerator =>
+    public async Task Gemma4_GraphBuilder_NormWeightsRaw_NoDoublePlusOne() => await RunTest(async accelerator =>
     {
-        var (_, weights, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
+        var (graph, weights, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
 
-        // gemma RMSNorm convention output = x_normed * (1 + weight); the builder folds the +1 into the
-        // weight at load. Every norm (attn/ffn + the post-norm sandwich + the final norm) gets it.
+        // gemma's `output = x_normed * (1 + weight)` is BAKED INTO THE GGUF at conversion time
+        // (llama.cpp conversion/gemma.py Gemma3/Gemma4 modify_tensors: `data_torch = data_torch + 1`
+        // for every *norm.weight). The graph must then use the stored weight RAW. A second +1 here
+        // double-counts: harmless on the big norms, but ~9x-inflates the small qk/post norms
+        // (real gemma4 k_norm = 0.1221) and collapses attention into the final-logit soft-cap.
+        // Synthetic norms are filled with 0.05 → must stay 0.05, NOT 1.05.
         foreach (var name in new[]
         {
             "blk.0.attn_norm.weight", "blk.0.post_attention_norm.weight",
@@ -85,11 +89,36 @@ public abstract partial class MLTestBase
         })
         {
             var w = weights[name];
-            if (Math.Abs(w[0] - 1.05f) > 1e-5f)  // raw 0.05 + 1
-                throw new Exception($"{name}: gemma RMSNorm weight should be raw+1 (0.05+1=1.05), got {w[0]}.");
+            if (Math.Abs(w[0] - 0.05f) > 1e-6f)
+                throw new Exception($"{name}: gemma norm weight must be used RAW (stored 0.05), got {w[0]} " +
+                    "— the +1 is already baked at GGUF conversion; folding another is the double-count bug.");
         }
 
-        Console.WriteLine("[Gemma4] RMSNorm (1+weight) offset folded at load for all norms");
+        Console.WriteLine("[Gemma4] norm weights used raw (no double +1 — conversion already baked it)");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Gemma4_GraphBuilder_EmbeddingScaleSqrtNEmbd() => await RunTest(async accelerator =>
+    {
+        // gemma scales token embeddings by sqrt(n_embd) right after the lookup (llama.cpp
+        // `ggml_scale(inpL, sqrtf(n_embd))`). Without it the token-identity signal in the residual
+        // stream is ~sqrt(n_embd)x too weak vs the RMS-normed sublayer outputs and every position
+        // collapses to the same argmax. embd=8 → scale = sqrt(8).
+        var (graph, weights, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
+
+        var scaleMul = graph.Nodes.FirstOrDefault(n => n.OpType == "Mul"
+            && n.Inputs.Contains("embed_out") && n.Outputs.Contains("embed_scaled"));
+        if (scaleMul == null)
+            throw new Exception("gemma4 must scale the token embedding by sqrt(n_embd) (Mul embed_out -> embed_scaled).");
+        float expected = MathF.Sqrt(8f);
+        if (!weights.TryGetValue("embed_scale", out var es) || Math.Abs(es[0] - expected) > 1e-5f)
+            throw new Exception($"embed_scale must be sqrt(n_embd)={expected}, got {(weights.TryGetValue("embed_scale", out var e2) ? e2[0].ToString() : "absent")}.");
+        // The first transformer block must consume the SCALED embedding, not the raw Gather output.
+        if (!graph.Nodes.Any(n => n.OpType == "RMSNormalization" && n.Inputs.Contains("embed_scaled")))
+            throw new Exception("blk.0 attn_norm must consume embed_scaled (the scaled embedding feeds the residual stream).");
+
+        Console.WriteLine($"[Gemma4] token embedding scaled by sqrt(n_embd)={expected:F4}");
         await Task.CompletedTask;
     });
 
