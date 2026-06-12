@@ -67,7 +67,7 @@ public class FusedAttentionKernel : IDisposable
             causal: false, window: int.MaxValue, kvOffset: 0);
 
     /// <summary>
-    /// Fused attention with index-computed masking.
+    /// Fused attention with index-computed masking (Q and K/V share head count).
     /// Query position = <paramref name="kvOffset"/> + sq (pass the KV-cache length for
     /// single-token decode). <paramref name="causal"/> hides kv &gt; qPos.
     /// <paramref name="window"/> additionally hides kv &lt;= qPos - window (sliding-window
@@ -79,9 +79,30 @@ public class FusedAttentionKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> V,
         ArrayView1D<float, Stride1D.Dense> output,
         int batchHeads, int seqQ, int seqKV, int headDim,
-        bool causal, int window, int kvOffset)
+        bool causal, int window, int kvOffset) =>
+        Forward(Q, K, V, output, batchHeads, batchHeads, seqQ, seqKV, headDim,
+            causal, window, kvOffset, scale: 0f);
+
+    /// <summary>
+    /// Fused attention with masking, GROUPED-QUERY heads, and an explicit scale.
+    /// Q [nHeads, seqQ, D]; K, V [kvHeads, seqKV, D]; output [nHeads, seqQ, D] - query
+    /// head h attends kv head h / (nHeads / kvHeads) (GQA; gemma4 runs 8 kv heads on
+    /// sliding layers and 1 on global layers). <paramref name="scale"/> &lt;= 0 means the
+    /// default 1/sqrt(headDim); gemma-family models pass their query_pre_attn_scalar-
+    /// derived value instead.
+    /// </summary>
+    public void Forward(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<float, Stride1D.Dense> K,
+        ArrayView1D<float, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
+        bool causal, int window, int kvOffset, float scale)
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
+        if (kvHeads <= 0 || nHeads % kvHeads != 0)
+            throw new ArgumentOutOfRangeException(nameof(kvHeads),
+                $"kvHeads ({kvHeads}) must evenly divide nHeads ({nHeads}) for grouped-query attention.");
         // Clamp so the in-kernel sign-bit arithmetic cannot underflow int.MinValue:
         // any window >= seqKV + seqQ + kvOffset constrains nothing.
         long noConstraint = (long)seqKV + seqQ + Math.Max(kvOffset, 0) + 1;
@@ -89,12 +110,13 @@ public class FusedAttentionKernel : IDisposable
 
         // Exact float scale passed as raw bits (the old (int)(scale*10000) quantized the
         // scale to 1e-4 - a real precision loss for large headDim).
-        float scale = 1f / MathF.Sqrt(headDim);
+        float effScale = scale > 0f ? scale : 1f / MathF.Sqrt(headDim);
         var paramsData = new int[]
         {
-            batchHeads, seqQ, seqKV, headDim,
-            BitConverter.SingleToInt32Bits(scale),
+            nHeads, seqQ, seqKV, headDim,
+            BitConverter.SingleToInt32Bits(effScale),
             causal ? 1 : 0, effWindow, kvOffset,
+            nHeads / kvHeads, // GQA group size: query head h reads kv head h / group
         };
 
         var slot = _ringNext;
@@ -107,8 +129,8 @@ public class FusedAttentionKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
 
-        // One thread per output element: batchHeads * seqQ * headDim
-        _kernel(batchHeads * seqQ * headDim, Q, K, V, output, _paramsRing[slot]!.View);
+        // One thread per output element: nHeads * seqQ * headDim
+        _kernel(nHeads * seqQ * headDim, Q, K, V, output, _paramsRing[slot]!.View);
     }
 
     /// <summary>
@@ -131,6 +153,7 @@ public class FusedAttentionKernel : IDisposable
         int causal = p[5];
         int window = p[6];
         int kvOffset = p[7];
+        int gqaGroup = p[8]; // nHeads / kvHeads; query head bh reads kv head bh / gqaGroup
 
         // Decompose index: [bh, sq, d]
         int d = idx % D;
@@ -139,6 +162,7 @@ public class FusedAttentionKernel : IDisposable
 
         if (bh >= BH) return;
 
+        int kvHead = bh / gqaGroup;
         int qBase = (bh * SQ + sq) * D;
         int qPos = kvOffset + sq;
 
@@ -148,7 +172,7 @@ public class FusedAttentionKernel : IDisposable
 
         for (int kv = 0; kv < SKV; kv++)
         {
-            int kBase = (bh * SKV + kv) * D;
+            int kBase = (kvHead * SKV + kv) * D;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += Q[qBase + dd] * K[kBase + dd];

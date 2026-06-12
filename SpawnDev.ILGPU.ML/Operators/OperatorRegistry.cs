@@ -37,7 +37,7 @@ public class OperatorRegistry : IDisposable
         "ConstantOfShape", "Conv", "ConvInteger", "ConvTranspose", "Cos", "Cosh", "CumSum", "DFT",
         "DeformConv", "DepthToSpace", "DequantizeLinear", "Det", "Div", "Dropout", "DynamicQuantizeLinear", "Einsum",
         "Elu", "Equal", "Erf", "Exp", "Expand", "EyeLike", "Flatten", "Floor",
-        "FusedLinear", "FusedScaledMatMul", "GRU", "Gather", "GatherElements", "GatherND", "Gelu", "Gemm",
+        "FusedAttention", "FusedLinear", "FusedScaledMatMul", "GRU", "Gather", "GatherElements", "GatherND", "Gelu", "Gemm",
         "GlobalAveragePool", "GlobalLpPool", "GlobalMaxPool", "Greater", "GreaterOrEqual", "GridSample", "GroupNormalization", "HammingWindow",
         "HannWindow", "HardSigmoid", "HardSwish", "Hardmax", "Identity", "If", "ImageDecoder", "InstanceNormalization",
         "IsInf", "IsNaN", "LRN", "LSTM", "LayerNormalization", "LeakyRelu", "Less", "LessOrEqual",
@@ -47,6 +47,7 @@ public class OperatorRegistry : IDisposable
         "OneHot", "Optional", "OptionalGetElement", "OptionalHasElement", "Or", "PRelu", "Pad", "Pow",
         "QLinearConv", "QLinearMatMul", "QuantizeLinear", "RNN", "RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike",
         "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
+        "RoPE",
         "ReduceMin", "ReduceProd", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize", "ReverseSequence",
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
         "SequenceAt", "SequenceConstruct", "SequenceEmpty", "SequenceErase", "SequenceInsert", "SequenceLength", "SequenceMap", "Shape",
@@ -74,6 +75,8 @@ public class OperatorRegistry : IDisposable
     public ConvTranspose2DKernel ConvTranspose { get; }
     public Kernels.FusedDequantMatMul FusedDequant { get; }
     public Kernels.FusedDequantGather FusedDequantGather { get; }
+    public Kernels.RoPEKernel RoPE { get; }
+    public Kernels.FusedAttentionKernel FusedAttention { get; }
     public Kernels.SliceKernel Slice { get; }
     public Kernels.ConcatKernel Concat { get; }
     public Kernels.MissingElementWiseKernels MissingElementWise { get; }
@@ -111,6 +114,8 @@ public class OperatorRegistry : IDisposable
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
         FusedDequantGather = new Kernels.FusedDequantGather(accelerator);
+        RoPE = new Kernels.RoPEKernel(accelerator);
+        FusedAttention = new Kernels.FusedAttentionKernel(accelerator);
         Slice = new Kernels.SliceKernel(accelerator);
         Concat = new Kernels.ConcatKernel(accelerator);
         MissingElementWise = new Kernels.MissingElementWiseKernels(accelerator);
@@ -358,6 +363,9 @@ public class OperatorRegistry : IDisposable
         // Fused operators (created by GraphOptimizer)
         Register(new FusedLinearOperator(this));
         Register(new FusedScaledMatMulOperator(this));
+        // gemma4 fused-attention layer (graph builder emits per-layer nodes)
+        Register(new RoPEOperator(this));
+        Register(new FusedAttentionOperator(this));
     }
 
     public void Dispose()
@@ -385,6 +393,8 @@ public class OperatorRegistry : IDisposable
         try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
         try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
         try { (FusedDequantGather as IDisposable)?.Dispose(); } catch { }
+        try { (RoPE as IDisposable)?.Dispose(); } catch { }
+        try { (FusedAttention as IDisposable)?.Dispose(); } catch { }
         try { (Slice as IDisposable)?.Dispose(); } catch { }
         try { (Concat as IDisposable)?.Dispose(); } catch { }
         try { (MissingElementWise as IDisposable)?.Dispose(); } catch { }

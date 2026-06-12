@@ -36,7 +36,7 @@ public class RoPEKernel
     private readonly float _base;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int, float, int, int>? _ropeKernel;
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, float, int, int, int>? _ropeKernel;
 
     public RoPEKernel(Accelerator accelerator, float ropeBase = 10000f)
     {
@@ -64,18 +64,36 @@ public class RoPEKernel
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int numPositions, int headDim, int startPosition,
-        float ropeBase, int rotaryDim, bool interleaved)
+        float ropeBase, int rotaryDim, bool interleaved) =>
+        Apply(input, output, numPositions, headDim, startPosition,
+            ropeBase, rotaryDim, interleaved, rowsPerPosition: 1);
+
+    /// <summary>
+    /// Apply RoPE where each SEQUENCE position spans several consecutive [headDim] rows -
+    /// the multi-head pre-transpose layout [seq, heads, headDim] passes
+    /// rowsPerPosition = heads, so all of a position's heads rotate by that position's
+    /// angle (sequence position = rowIndex / rowsPerPosition + startPosition).
+    /// numPositions counts ROWS here (seq * heads), matching the input's row count.
+    /// </summary>
+    public void Apply(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int numPositions, int headDim, int startPosition,
+        float ropeBase, int rotaryDim, bool interleaved, int rowsPerPosition)
     {
         if (rotaryDim <= 0 || rotaryDim > headDim || (rotaryDim & 1) != 0)
             throw new ArgumentOutOfRangeException(nameof(rotaryDim),
                 $"rotaryDim must be even and in (0, headDim]; got {rotaryDim} for headDim {headDim}");
+        if (rowsPerPosition <= 0)
+            throw new ArgumentOutOfRangeException(nameof(rowsPerPosition));
 
         // One thread per scalar output (gather, not scatter — WebGL TF compatible).
         _ropeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, float, int, int>(RoPEImpl);
+            int, int, int, float, int, int, int>(RoPEImpl);
         _ropeKernel(numPositions * headDim, input, output,
-            numPositions, headDim, startPosition, ropeBase, rotaryDim, interleaved ? 1 : 0);
+            numPositions, headDim, startPosition, ropeBase, rotaryDim,
+            interleaved ? 1 : 0, rowsPerPosition);
     }
 
     /// <summary>Apply RoPE in-place (original API).</summary>
@@ -94,14 +112,15 @@ public class RoPEKernel
     private static void RoPEImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
-        int numPos, int D, int startPos, float ropeBase, int rotDim, int interleaved)
+        int numPos, int D, int startPos, float ropeBase, int rotDim, int interleaved,
+        int rowsPerPos)
     {
-        // idx = (pos * D + k). Branch shape: the pass-through/rotate split and the
+        // idx = (row * D + k). Branch shape: the pass-through/rotate split and the
         // style selects below are TOP-LEVEL (not inside any loop) - safe for the
         // WebGL emitter (cf. the loop-body branch explosion documented on
         // FusedDequantMatMul; this kernel has no loops at all).
         int k = idx % D;
-        int pos = idx / D + startPos;
+        int pos = (idx / D) / rowsPerPos + startPos;
         int rowStart = (idx / D) * D;
 
         if (k >= rotDim)
