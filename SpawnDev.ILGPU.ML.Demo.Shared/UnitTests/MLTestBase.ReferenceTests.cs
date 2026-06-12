@@ -138,7 +138,7 @@ public abstract partial class MLTestBase
     /// trivially satisfied by a single saturated 1.0 spike from un-clipped Relu6 activations.
     /// Comparing against ORT's actual keypoint coordinates+confidences is the real bar.
     /// </summary>
-    [TestMethod(Timeout = 180000)]
+    [TestMethod(Timeout = 180000, Category = "WasmHeavy")]
     public async Task Reference_MoveNetLightning_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
@@ -216,7 +216,7 @@ public abstract partial class MLTestBase
 
     // ── Style Transfer Reference Tests ──
 
-    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu,WasmHeavy")]
     public async Task Reference_StyleMosaic_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,
@@ -399,7 +399,7 @@ public abstract partial class MLTestBase
 
     // ── Object Detection Reference Test ──
 
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "WasmHeavy")]
     public async Task Reference_YOLOv8_MatchesOnnxRuntime() => await RunTest(async accelerator =>
     {
         await RunReferenceComparisonGpu(accelerator,

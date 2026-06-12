@@ -94,7 +94,7 @@ public abstract partial class MLTestBase
     /// dispatch 60 more Scale kernels to reach 126 total dispatches.
     /// Tests if MapAsync hangs with real inference + extra dispatches.
     /// </summary>
-    [TestMethod(Timeout = 30000)]
+    [TestMethod(Timeout = 30000, Category = "WasmHeavy")]
     public async Task Diagnostic_MapAsync_After_SqueezeNet_PlusExtra() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();

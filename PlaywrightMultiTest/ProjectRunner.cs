@@ -292,6 +292,7 @@ namespace PlaywrightMultiTest
                         }").ConfigureAwait(false);
 
                         var excludedCats = ExcludedCategories();
+                    var wasmExcludedCats = WasmExcludedCategories();
                         int totalRows = rowsJson.GetArrayLength();
                         int excludedByCategory = 0;
                         for (int i = 0; i < totalRows; i++)
@@ -315,8 +316,9 @@ namespace PlaywrightMultiTest
                             // exactly where the orphan-on-timeout overlap bug bites. To deliberately
                             // run a heavy test, clear the set (PMT_EXCLUDE_CATEGORIES=) and scope by
                             // name, or set PMT_EXCLUDE_CATEGORIES to a different category list.
-                            if (!string.IsNullOrEmpty(category)
-                                && excludedCats.Contains(category, StringComparer.OrdinalIgnoreCase))
+                            // "WasmHeavy" is additionally skipped on Wasm-lane rows only (see
+                            // WasmExcludedCategories).
+                            if (IsCategoryExcluded(category, typeName, excludedCats, wasmExcludedCats))
                             {
                                 excludedByCategory++;
                                 continue;
@@ -367,6 +369,7 @@ namespace PlaywrightMultiTest
                     // UseShellExecute=false without overriding EnvironmentVariables).
                     Environment.SetEnvironmentVariable("PMT_EMIT_CATEGORY", "1");
                     var excludedCats = ExcludedCategories();
+                    var wasmExcludedCats = WasmExcludedCategories();
                     int excludedByCategory = 0;
                     LogStatus($"Enumerating tests from {Path.GetFileName(publishedBinary)}...");
                     var result = await ProcessRunner.Run(publishedBinary).ConfigureAwait(false);
@@ -404,8 +407,7 @@ namespace PlaywrightMultiTest
 
                         // Same HeavyModel-style category gate as the browser branch, applied
                         // REGARDLESS of PMT_FILTER. Clear PMT_EXCLUDE_CATEGORIES to run them.
-                        if (!string.IsNullOrEmpty(category)
-                            && excludedCats.Contains(category, StringComparer.OrdinalIgnoreCase))
+                        if (IsCategoryExcluded(category, typeName, excludedCats, wasmExcludedCats))
                         {
                             excludedByCategory++;
                             continue;
@@ -1077,12 +1079,42 @@ namespace PlaywrightMultiTest
         // "HeavyModel" = slow big-model end-to-end tests (minutes each via per-node shape
         // readbacks). Override via env PMT_EXCLUDE_CATEGORIES (comma-separated; empty string
         // = exclude nothing / run everything).
+        // A test's Category may itself be comma-separated ("HeavyCpu,WasmHeavy") - it is
+        // excluded if ANY of its categories is in the active exclusion set.
         private static readonly string[] DefaultExcludedCategories = { "HeavyModel" };
         private static string[] ExcludedCategories()
         {
             var env = Environment.GetEnvironmentVariable("PMT_EXCLUDE_CATEGORIES");
             if (env == null) return DefaultExcludedCategories;
             return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        // LANE-SCOPED exclusions: categories skipped ONLY on the Wasm lane (test TypeName
+        // contains "Wasm"). "WasmHeavy" = tests that exceed the Wasm lane's interpreted-IL
+        // time budget but PASS within budget on every other backend (Captain's 2026-06-12
+        // timeout-policy decision: keep full coverage on the fast lanes, skip-by-default on
+        // Wasm, run deliberately via PMT_EXCLUDE_CATEGORIES_WASM= + a name filter).
+        private static readonly string[] DefaultWasmExcludedCategories = { "WasmHeavy" };
+        private static string[] WasmExcludedCategories()
+        {
+            var env = Environment.GetEnvironmentVariable("PMT_EXCLUDE_CATEGORIES_WASM");
+            if (env == null) return DefaultWasmExcludedCategories;
+            return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        /// <summary>True when the test's (comma-separable) category list intersects the
+        /// global exclusion set, or - for Wasm-lane rows - the Wasm-scoped exclusion set.</summary>
+        private static bool IsCategoryExcluded(string? category, string? typeName,
+            string[] excludedCats, string[] wasmExcludedCats)
+        {
+            if (string.IsNullOrEmpty(category)) return false;
+            bool isWasmRow = typeName?.Contains("Wasm", StringComparison.OrdinalIgnoreCase) ?? false;
+            foreach (var cat in category.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (excludedCats.Contains(cat, StringComparer.OrdinalIgnoreCase)) return true;
+                if (isWasmRow && wasmExcludedCats.Contains(cat, StringComparer.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         // Per-console-test hard cap (subprocess kill, ms). Default 10 min. A genuinely heavy test whose
@@ -1267,7 +1299,9 @@ namespace PlaywrightMultiTest
         }
         private static bool IsCpuHeavy(ProjectTest t) =>
             !string.IsNullOrEmpty(t.Category)
-            && CpuHeavyCategories().Contains(t.Category, StringComparer.OrdinalIgnoreCase);
+            // A test's Category may be comma-separated ("HeavyCpu,WasmHeavy") - match any part.
+            && t.Category.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .Any(c => CpuHeavyCategories().Contains(c, StringComparer.OrdinalIgnoreCase));
 
         /// <summary>
         /// CPU desktop lane: run the light tests at the lane cap (parallelism hides per-process

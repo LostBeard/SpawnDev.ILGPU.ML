@@ -21,7 +21,7 @@ public abstract partial class MLTestBase
     /// Each case loads known inputs, runs the operator, and compares
     /// output element-by-element against numpy-verified expected values.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "WasmHeavy")]
     public async Task OperatorRef_AllCases_MatchNumpy() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
