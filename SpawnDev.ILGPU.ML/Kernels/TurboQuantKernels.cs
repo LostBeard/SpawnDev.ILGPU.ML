@@ -349,6 +349,8 @@ public class TurboQuantKernels
     /// Fused attention with quantized KV cache.
     /// Dequantizes K and V on-the-fly during attention computation.
     /// Scalars packed into params buffer to stay within WebGPU parameter limits.
+    /// Dispatched ONE THREAD PER OUTPUT ELEMENT (numQueries * headDim) — see the kernel
+    /// doc for why this shape is mandatory.
     /// </summary>
     public void FusedQuantizedAttention(
         ArrayView1D<float, Stride1D.Dense> Q,
@@ -362,9 +364,12 @@ public class TurboQuantKernels
         int numQueries, int numKV, int headDim, float scale,
         int bitsPerValue = 4, int valuesPerInt = 8)
     {
-        // Pack scalars into int buffer to reduce kernel param count
+        // Pack scalars into int buffer to reduce kernel param count.
+        // Scale travels as EXACT IEEE-754 bits (Interop.IntAsFloat in the kernel) —
+        // the old (int)(scale*10000) quantization lost precision for free.
         int indexMask = (1 << bitsPerValue) - 1; // 0x7 for 3-bit, 0xF for 4-bit
-        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt, bitsPerValue, indexMask };
+        var paramsData = new int[] { numQueries, numKV, headDim,
+            BitConverter.SingleToInt32Bits(scale), valuesPerInt, bitsPerValue, indexMask };
         // Don't dispose previous — it may still be in the WebGPU command encoder
         if (_fusedParamsBuf != null) _oldParamsBufs.Add(_fusedParamsBuf);
         _fusedParamsBuf = _accelerator.Allocate1D(paramsData);
@@ -376,15 +381,27 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
-        _fusedAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
+        _fusedAttentionKernel(numQueries * headDim, Q, K_packed, K_codebook, V_packed, V_codebook,
             K_norms, V_norms, output, _fusedParamsBuf.View);
     }
 
     /// <summary>
-    /// Per-query fused attention with packed params buffer.
-    /// params[0]=numQ, params[1]=numKV, params[2]=headDim, params[3]=scale*10000
+    /// Per-OUTPUT-ELEMENT fused attention with packed params buffer.
+    /// idx = queryIdx * headDim + d; params[0]=numQ, params[1]=numKV, params[2]=headDim,
+    /// params[3]=scale (exact IEEE-754 bits).
+    ///
+    /// KERNEL SHAPE CONTRACT: one thread = ONE output element, single static store at the
+    /// end, all loop state in REGISTERS, loops only READ global memory. The previous
+    /// per-QUERY form (one thread loop-writing all D output elements with global
+    /// read-modify-write) produced SILENT GARBAGE on WebGL: the Transform-Feedback
+    /// multi-store model maps store-site s of vertex v to output element v*storeCount+s
+    /// (glWorker.js), so a one-vertex kernel landed 3 stale values in elements 0..2 and
+    /// left the rest zero (found 2026-06-12: FlashAttention cosine 0.0 vs two-pass; the
+    /// two-pass test's near-zero WARNING had been hiding the same corpse). Per-element
+    /// threads also drop the D global RMWs per KV step on every backend; the redundant
+    /// per-thread K-dot recompute is ALU, not bandwidth (same trade as DecodeQ4KElement).
     /// </summary>
-    private static void FusedAttentionImpl(Index1D queryIdx,
+    private static void FusedAttentionImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> Q,
         ArrayView1D<int, Stride1D.Dense> K_packed,
         ArrayView1D<float, Stride1D.Dense> K_codebook,
@@ -398,16 +415,18 @@ public class TurboQuantKernels
         int numQ = paramsArr[0];
         int numKV = paramsArr[1];
         int D = paramsArr[2];
-        float scale = paramsArr[3] / 10000f;
+        float scale = Interop.IntAsFloat((uint)paramsArr[3]);
         int valuesPerInt = paramsArr[4]; // 8 for 4-bit/3BitQJL, 10 for pure 3-bit
         int bitsPerValue = paramsArr[5]; // 3 for pure 3-bit, 4 for 4-bit/3BitQJL
         int indexMask = paramsArr[6];    // 0x7 for 3-bit codebook, 0xF for 4-bit codebook
         int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
+        int queryIdx = idx / D;
+        int d = idx % D;
+        if (queryIdx >= numQ) return;
 
-        // Step 1: Compute attention scores QK^T (dequantize K on-the-fly)
+        // Pass 1: find max score (full K-row dots; identical work in every d-thread of a
+        // query — redundant ALU, zero shared state, loops only read)
         float maxScore = -1e10f;
-
-        // Pass 1: find max score
         for (int kv = 0; kv < numKV; kv++)
         {
             float dot = 0f;
@@ -417,19 +436,20 @@ public class TurboQuantKernels
                 int packed = K_packed[kv * packedDim + p];
                 for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
-                    float kVal = K_codebook[idx] * kNorm;
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    float kVal = K_codebook[cIdx] * kNorm;
                     dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
                 }
             }
             float score = dot * scale;
-            if (score > maxScore) maxScore = score;
+            maxScore = MathF.Max(maxScore, score);
         }
 
-        // Pass 2: compute exp(score - max) and sum for softmax, and accumulate weighted V
+        // Pass 2: softmax sum + this element's weighted-V accumulation, all in registers
         float sumExp = 0f;
-        for (int d = 0; d < D; d++)
-            output[queryIdx * D + d] = 0f;
+        float acc = 0f;
+        int vp = d / valuesPerInt;
+        int vShift = (d % valuesPerInt) * bitsPerValue;
 
         for (int kv = 0; kv < numKV; kv++)
         {
@@ -441,32 +461,21 @@ public class TurboQuantKernels
                 int packed = K_packed[kv * packedDim + p];
                 for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
-                    float kVal = K_codebook[idx] * kNorm;
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    float kVal = K_codebook[cIdx] * kNorm;
                     dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
                 }
             }
             float weight = MathF.Exp(dot * scale - maxScore);
             sumExp += weight;
 
-            // Accumulate weighted V (dequantize on-the-fly)
-            float vNorm = V_norms[kv];
-            for (int p = 0; p < packedDim; p++)
-            {
-                int packed = V_packed[kv * packedDim + p];
-                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
-                {
-                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
-                    float vVal = V_codebook[idx] * vNorm;
-                    output[queryIdx * D + p * valuesPerInt + b] += weight * vVal;
-                }
-            }
+            // This element's V contribution only (dequantize one value in-register)
+            int vIdx = (V_packed[kv * packedDim + vp] >> vShift) & indexMask;
+            acc += weight * V_codebook[vIdx] * V_norms[kv];
         }
 
-        // Normalize by softmax sum
-        float invSum = 1f / (sumExp + 1e-10f);
-        for (int d = 0; d < D; d++)
-            output[queryIdx * D + d] *= invSum;
+        // Single static store — the only output write in the kernel
+        output[idx] = acc / (sumExp + 1e-10f);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -504,8 +513,11 @@ public class TurboQuantKernels
     {
         // bitsPerValue: 3 for pure 3Bit (10 per int), 4 for 4Bit and 3BitQJL (8 per int)
         // valuesPerInt: 10 for pure 3Bit, 8 for 4Bit and 3BitQJL
+        // Scale travels as EXACT IEEE-754 bits; dispatch is one thread per OUTPUT ELEMENT
+        // (see FusedAttentionImpl's kernel-shape contract).
         int indexMask = (1 << bitsPerValue) - 1; // 0x7 for 3-bit, 0xF for 4-bit
-        var paramsData = new int[] { numQueries, numKV, headDim, (int)(scale * 10000f), valuesPerInt, bitsPerValue, indexMask };
+        var paramsData = new int[] { numQueries, numKV, headDim,
+            BitConverter.SingleToInt32Bits(scale), valuesPerInt, bitsPerValue, indexMask };
         if (_flashParamsBuf != null) _oldParamsBufs.Add(_flashParamsBuf);
         _flashParamsBuf = _accelerator.Allocate1D(paramsData);
 
@@ -516,27 +528,30 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlashAttentionImpl);
-        _flashAttentionKernel(numQueries, Q, K_packed, K_codebook, V_packed, V_codebook,
+        _flashAttentionKernel(numQueries * headDim, Q, K_packed, K_codebook, V_packed, V_codebook,
             K_norms, V_norms, output, _flashParamsBuf.View);
     }
 
     /// <summary>
-    /// Single-pass Flash Attention with Online Softmax.
-    /// Each thread processes one query position across all KV positions in one pass.
+    /// Single-pass Flash Attention with Online Softmax, one thread per OUTPUT ELEMENT
+    /// (idx = queryIdx * headDim + d). Same kernel-shape contract as
+    /// <see cref="FusedAttentionImpl"/>: single static store, all online-softmax state
+    /// (running max/sum AND this element's accumulator) in REGISTERS, loops only read.
+    /// The previous per-query form rescaled/accumulated the output in GLOBAL memory —
+    /// silent garbage on WebGL (TF multi-store slot contract) and D wasted global RMWs
+    /// per KV step everywhere else.
     ///
-    /// Algorithm: for each KV position j:
-    ///   1. Compute score_j = Q @ K_j * scale (with fused dequant)
-    ///   2. If score_j > running_max:
-    ///        correction = exp(old_max - score_j)
-    ///        running_sum *= correction
-    ///        output[d] *= correction  (rescale accumulated output)
-    ///        running_max = score_j
-    ///   3. weight_j = exp(score_j - running_max)
-    ///   4. running_sum += weight_j
-    ///   5. output[d] += weight_j * V_j[d]  (with fused dequant)
-    ///   After all KV: output[d] /= running_sum
+    /// Algorithm (Milakov &amp; Gimelshein 2018), per element d of query q:
+    ///   for each KV position j:
+    ///     1. score_j = Q_q @ K_j * scale (fused dequant, full row)
+    ///     2. newMax = max(running_max, score_j); correction = exp(running_max - newMax)
+    ///        running_sum *= correction; acc *= correction; running_max = newMax
+    ///        (branchless: correction == 1 when the max didn't move)
+    ///     3. weight_j = exp(score_j - running_max); running_sum += weight_j
+    ///     4. acc += weight_j * V_j[d] (fused dequant, ONE value)
+    ///   output[idx] = acc / running_sum
     /// </summary>
-    private static void FlashAttentionImpl(Index1D queryIdx,
+    private static void FlashAttentionImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> Q,
         ArrayView1D<int, Stride1D.Dense> K_packed,
         ArrayView1D<float, Stride1D.Dense> K_codebook,
@@ -550,19 +565,21 @@ public class TurboQuantKernels
         int numQ = paramsArr[0];
         int numKV = paramsArr[1];
         int D = paramsArr[2];
-        float scale = paramsArr[3] / 10000f;
+        float scale = Interop.IntAsFloat((uint)paramsArr[3]);
         int valuesPerInt = paramsArr[4]; // 8 for 4-bit/3BitQJL, 10 for pure 3-bit
         int bitsPerValue = paramsArr[5]; // 3 for pure 3-bit, 4 for 4-bit/3BitQJL
         int indexMask = paramsArr[6];    // 0x7 for 3-bit codebook, 0xF for 4-bit codebook
         int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
+        int queryIdx = idx / D;
+        int d = idx % D;
+        if (queryIdx >= numQ) return;
 
-        // Initialize Online Softmax state
+        // Online Softmax state — registers only
         float runningMax = -1e10f;
         float runningSum = 0f;
-
-        // Zero the output accumulator
-        for (int d = 0; d < D; d++)
-            output[queryIdx * D + d] = 0f;
+        float acc = 0f;
+        int vp = d / valuesPerInt;
+        int vShift = (d % valuesPerInt) * bitsPerValue;
 
         // Single pass over all KV positions
         for (int kv = 0; kv < numKV; kv++)
@@ -575,45 +592,30 @@ public class TurboQuantKernels
                 int packed = K_packed[kv * packedDim + p];
                 for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
                 {
-                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
-                    float kVal = K_codebook[idx] * kNorm;
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    float kVal = K_codebook[cIdx] * kNorm;
                     dot += Q[queryIdx * D + p * valuesPerInt + b] * kVal;
                 }
             }
             float score = dot * scale;
 
-            // ── Online Softmax update ──
-            if (score > runningMax)
-            {
-                // New max found — rescale all accumulated state
-                float correction = MathF.Exp(runningMax - score);
-                runningSum *= correction;
-                for (int d = 0; d < D; d++)
-                    output[queryIdx * D + d] *= correction;
-                runningMax = score;
-            }
+            // ── Online Softmax update (branchless — correction is 1 when max holds) ──
+            float newMax = MathF.Max(runningMax, score);
+            float correction = MathF.Exp(runningMax - newMax);
+            runningSum *= correction;
+            acc *= correction;
+            runningMax = newMax;
 
             float weight = MathF.Exp(score - runningMax);
             runningSum += weight;
 
-            // ── Accumulate weighted V (fused dequant) ──
-            float vNorm = V_norms[kv];
-            for (int p = 0; p < packedDim; p++)
-            {
-                int packed = V_packed[kv * packedDim + p];
-                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
-                {
-                    int idx = (packed >> (b * bitsPerValue)) & indexMask;
-                    float vVal = V_codebook[idx] * vNorm;
-                    output[queryIdx * D + p * valuesPerInt + b] += weight * vVal;
-                }
-            }
+            // ── This element's V contribution (fused dequant, one value) ──
+            int vIdx = (V_packed[kv * packedDim + vp] >> vShift) & indexMask;
+            acc += weight * V_codebook[vIdx] * V_norms[kv];
         }
 
-        // Final normalization
-        float invSum = 1f / (runningSum + 1e-10f);
-        for (int d = 0; d < D; d++)
-            output[queryIdx * D + d] *= invSum;
+        // Single static store — the only output write in the kernel
+        output[idx] = acc / (runningSum + 1e-10f);
     }
 
     // ═══════════════════════════════════════════════════════════

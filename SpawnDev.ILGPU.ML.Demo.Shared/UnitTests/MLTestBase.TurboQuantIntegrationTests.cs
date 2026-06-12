@@ -236,12 +236,689 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[TurboQuant] FP32 first5: [{string.Join(",", fp32Output.Take(5).Select(v => v.ToString("F4")))}]");
         Console.WriteLine($"[TurboQuant] Quant first5: [{string.Join(",", quantizedOutput.Take(5).Select(v => v.ToString("F4")))}]");
 
-        // 4-bit quantization should maintain reasonable accuracy
-        // Cosine > 0 means at least some correlation (quantization is lossy)
+        // 4-bit quantization should maintain reasonable accuracy.
+        // A near-zero output is a HARD FAILURE, not a warning: the warn-and-pass version
+        // of this check let the WebGL TF multi-store garbage (output ≈ zeros) slide for
+        // months while the strict FlashAttention test caught the identical corpse
+        // (2026-06-12). A test that warns on the broken case is a fake test.
         if (normB < 1e-8f)
-            Console.WriteLine("[TurboQuant] WARNING: quantized output is near-zero — fused attention kernel may need debugging");
-        else if (cosineSim < 0.5f)
+            throw new Exception(
+                "Quantized attention output is near-zero — the fused attention kernel wrote " +
+                "nothing (norm² " + normB + "). On WebGL this is the TF multi-store kernel-" +
+                "shape contract; see FusedAttentionImpl's doc.");
+        if (cosineSim < 0.5f)
             throw new Exception($"Quantized attention cosine similarity {cosineSim:F4} too low — expected > 0.5");
+    });
+
+    /// <summary>
+    /// DISCRIMINATOR for the WebGL FP32-mismatch (2026-06-12): the attention kernels now
+    /// agree with each other on WebGL but BOTH disagree with the CPU reference, which
+    /// points UPSTREAM — at the 16-iteration per-vector encode loop (Normalize → Quantize
+    /// → BitPack4 → Scale) writing OFFSET SUBVIEWS, a shape the single-shot round-trip
+    /// tests never exercise. Encodes the same vectors two ways and compares each against
+    /// a CPU reference encode:
+    ///   A) the production shape — shared scratch, packed/norm outputs via SubView(kv*…)
+    ///   B) per-vector DEDICATED buffers — no offset subviews, no scratch reuse
+    /// A bad + B good  → offset-subview TF writeback / loop-reuse bug (backend);
+    /// A bad + B bad   → pipeline kernels themselves;
+    /// A good + B good → the encode is clean and the attention kernels' input reads are
+    ///                   the remaining suspect.
+    /// </summary>
+    [TestMethod]
+    public async Task TurboQuant_EncodeLoop_SubViewVsDedicated_MatchesCPU() => await RunTest(async accelerator =>
+    {
+        const int headDim = 64, numKV = 16, numCentroids = 16;
+        int packedDim = headDim / 8;
+        var rng = new Random(42);
+        var kData = new float[numKV * headDim];
+        for (int i = 0; i < kData.Length; i++) kData[i] = (float)(rng.NextDouble() * 2 - 1);
+        var codebook = TurboQuantKernels.Codebook4Bit;
+
+        // ── CPU reference encode ──
+        var refPacked = new int[numKV * packedDim];
+        var refNorms = new float[numKV];
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float sumSq = 0;
+            for (int i = 0; i < headDim; i++) sumSq += kData[kv * headDim + i] * kData[kv * headDim + i];
+            float norm = MathF.Sqrt(sumSq);
+            refNorms[kv] = norm;
+            float invNorm = norm > 1e-12f ? 1f / norm : 0f;
+            for (int i = 0; i < headDim; i++)
+            {
+                float val = kData[kv * headDim + i] * invNorm;
+                int best = 0; float bestDist = MathF.Abs(val - codebook[0]);
+                for (int c = 1; c < numCentroids; c++)
+                {
+                    float dist = MathF.Abs(val - codebook[c]);
+                    if (dist < bestDist) { bestDist = dist; best = c; }
+                }
+                refPacked[kv * packedDim + i / 8] |= best << ((i % 8) * 4);
+            }
+        }
+
+        var tq = new TurboQuantKernels(accelerator);
+        using var kAllBuf = accelerator.Allocate1D(kData);
+        using var codebookBuf = accelerator.Allocate1D(codebook);
+
+        // ── Variant A: production shape (shared scratch + offset-subview outputs) ──
+        using var aPacked = accelerator.Allocate1D<int>(numKV * packedDim);
+        using var aNorms = accelerator.Allocate1D<float>(numKV);
+        using var tempNorm = accelerator.Allocate1D<float>(headDim);
+        using var tempNormVal = accelerator.Allocate1D<float>(1);
+        using var tempIndices = accelerator.Allocate1D<int>(headDim);
+        var ew = new ElementWiseKernels(accelerator);
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            tq.Normalize(kAllBuf.View.SubView(kv * headDim, headDim), tempNorm.View, tempNormVal.View, 1, headDim);
+            tq.Quantize(tempNorm.View, codebookBuf.View, tempIndices.View, headDim, numCentroids);
+            tq.BitPack4(tempIndices.View, aPacked.View.SubView(kv * packedDim, packedDim), headDim);
+            ew.Scale(tempNormVal.View.SubView(0, 1), aNorms.View.SubView(kv, 1), 1, 1f);
+        }
+        await accelerator.SynchronizeAsync();
+        var aPackedHost = await aPacked.CopyToHostAsync<int>(0, numKV * packedDim);
+        var aNormsHost = await aNorms.CopyToHostAsync<float>(0, numKV);
+
+        // ── Variant B: per-vector dedicated buffers (no offset subviews, no reuse) ──
+        var bPackedHost = new int[numKV * packedDim];
+        var bNormsHost = new float[numKV];
+        var dedicated = new List<IDisposable>();
+        try
+        {
+            var perKvPacked = new global::ILGPU.Runtime.MemoryBuffer1D<int, global::ILGPU.Stride1D.Dense>[numKV];
+            var perKvNorm = new global::ILGPU.Runtime.MemoryBuffer1D<float, global::ILGPU.Stride1D.Dense>[numKV];
+            for (int kv = 0; kv < numKV; kv++)
+            {
+                var nOut = accelerator.Allocate1D<float>(headDim);
+                var nVal = accelerator.Allocate1D<float>(1);
+                var qIdx = accelerator.Allocate1D<int>(headDim);
+                var pOut = accelerator.Allocate1D<int>(packedDim);
+                dedicated.Add(nOut); dedicated.Add(nVal); dedicated.Add(qIdx); dedicated.Add(pOut);
+                perKvPacked[kv] = pOut; perKvNorm[kv] = nVal;
+                tq.Normalize(kAllBuf.View.SubView(kv * headDim, headDim), nOut.View, nVal.View, 1, headDim);
+                tq.Quantize(nOut.View, codebookBuf.View, qIdx.View, headDim, numCentroids);
+                tq.BitPack4(qIdx.View, pOut.View, headDim);
+            }
+            await accelerator.SynchronizeAsync();
+            for (int kv = 0; kv < numKV; kv++)
+            {
+                var p = await perKvPacked[kv].CopyToHostAsync<int>(0, packedDim);
+                Array.Copy(p, 0, bPackedHost, kv * packedDim, packedDim);
+                bNormsHost[kv] = (await perKvNorm[kv].CopyToHostAsync<float>(0, 1))[0];
+            }
+        }
+        finally { foreach (var d in dedicated) d.Dispose(); }
+
+        // ── Compare both variants against the CPU reference (reconstructed values, so a
+        //    rare fp-boundary centroid flip can't fail the test; garbage cannot pass) ──
+        void Verify(string label, int[] gotPacked, float[] gotNorms)
+        {
+            int badVals = 0, badNorms = 0;
+            for (int kv = 0; kv < numKV; kv++)
+            {
+                if (MathF.Abs(gotNorms[kv] - refNorms[kv]) > MathF.Abs(refNorms[kv]) * 1e-4f + 1e-5f) badNorms++;
+                for (int i = 0; i < headDim; i++)
+                {
+                    float got = codebook[(gotPacked[kv * packedDim + i / 8] >> ((i % 8) * 4)) & 0xF];
+                    float want = codebook[(refPacked[kv * packedDim + i / 8] >> ((i % 8) * 4)) & 0xF];
+                    if (MathF.Abs(got - want) > 0.3f) badVals++; // > one centroid gap = real corruption
+                }
+            }
+            if (badVals > 0 || badNorms > 0)
+                throw new Exception($"{label}: encode diverges from CPU reference — " +
+                    $"{badVals}/{numKV * headDim} centroid values off by >0.3, {badNorms}/{numKV} norms wrong. " +
+                    $"norms got=[{string.Join(",", gotNorms.Take(4).Select(v => v.ToString("F3")))}] " +
+                    $"want=[{string.Join(",", refNorms.Take(4).Select(v => v.ToString("F3")))}]");
+            Console.WriteLine($"[TurboQuant] {label}: encode matches CPU reference");
+        }
+        Verify("VariantA(subview-loop)", aPackedHost, aNormsHost);
+        Verify("VariantB(dedicated)", bPackedHost, bNormsHost);
+
+        // ── Variant C: the attention KERNEL on the proven-clean encoded data, vs a CPU
+        //    oracle computing the EXACT same math (attention over the codebook-
+        //    reconstructed K/V — no quantization-loss tolerance excuse). The encode above
+        //    verified clean on every backend, so a failure here is the attention kernel's
+        //    arithmetic/reads on this backend, with the numbers in the message. ──
+        var qData = new float[headDim];
+        for (int i = 0; i < headDim; i++) qData[i] = (float)(rng.NextDouble() * 2 - 1);
+        float scale = 1f / MathF.Sqrt(headDim);
+
+        // CPU oracle over the reconstruction
+        var recon = new float[numKV * headDim];
+        for (int kv = 0; kv < numKV; kv++)
+            for (int i = 0; i < headDim; i++)
+                recon[kv * headDim + i] =
+                    codebook[(refPacked[kv * packedDim + i / 8] >> ((i % 8) * 4)) & 0xF] * refNorms[kv];
+        var oracle = new float[headDim];
+        {
+            var w = new float[numKV];
+            float maxScore = float.MinValue;
+            for (int kv = 0; kv < numKV; kv++)
+            {
+                float dot = 0;
+                for (int i = 0; i < headDim; i++) dot += qData[i] * recon[kv * headDim + i];
+                w[kv] = dot * scale;
+                maxScore = MathF.Max(maxScore, w[kv]);
+            }
+            float sum = 0;
+            for (int kv = 0; kv < numKV; kv++) { w[kv] = MathF.Exp(w[kv] - maxScore); sum += w[kv]; }
+            for (int i = 0; i < headDim; i++)
+            {
+                float acc = 0;
+                for (int kv = 0; kv < numKV; kv++) acc += w[kv] * recon[kv * headDim + i];
+                oracle[i] = acc / sum;
+            }
+        }
+
+        using var qBuf = accelerator.Allocate1D(qData);
+        using var vCB = accelerator.Allocate1D(codebook); // separate codebook (aliasing)
+
+        async Task VerifyAttn(string label,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> kp,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> kn,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> vp,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> vn)
+        {
+            using var attnOut = accelerator.Allocate1D<float>(headDim);
+            tq.FusedQuantizedAttention(qBuf.View, kp, codebookBuf.View,
+                vp, vCB.View, kn, vn, attnOut.View, 1, numKV, headDim, scale);
+            await accelerator.SynchronizeAsync();
+            var gotAttn = await attnOut.CopyToHostAsync<float>(0, headDim);
+            int badAttn = 0; int worstI = -1; float worstDiff = 0;
+            for (int i = 0; i < headDim; i++)
+            {
+                float diff = MathF.Abs(gotAttn[i] - oracle[i]);
+                float tol = MathF.Max(1e-3f, MathF.Abs(oracle[i]) * 1e-3f);
+                if (diff > tol || float.IsNaN(gotAttn[i])) { badAttn++; if (diff > worstDiff) { worstDiff = diff; worstI = i; } }
+            }
+            if (badAttn > 0)
+                throw new Exception($"{label}: {badAttn}/{headDim} elements diverge from the exact-math CPU " +
+                    $"oracle (worst @{worstI}: got {gotAttn[worstI]}, want {oracle[worstI]}). " +
+                    $"got=[{string.Join(",", gotAttn.Take(6).Select(v => v.ToString("F4")))}] " +
+                    $"want=[{string.Join(",", oracle.Take(6).Select(v => v.ToString("F4")))}]");
+            Console.WriteLine($"[TurboQuant] {label}: matches the exact-math CPU oracle");
+        }
+
+        // C0: the REAL FusedAttentionImpl method, but dispatched by the TEST (own kernel
+        // load via reflection, own params buffer, host-uploaded inputs, extent numKV*D).
+        // Same IL as the wrapper's kernel — if C0 passes where C2 fails, the kernel method
+        // is exonerated and the difference is the WRAPPER's dispatch context alone.
+        {
+            var mi = typeof(TurboQuantKernels).GetMethod("FusedAttentionImpl",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+            var del = (Action<global::ILGPU.Index1D,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>>)
+                Delegate.CreateDelegate(typeof(Action<global::ILGPU.Index1D,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+                global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>>), mi);
+            var kern = accelerator.LoadAutoGroupedStreamKernel(del);
+            // CANONICAL REPRO of the WebGL frozen-TF-capture bug (routed to Geordi,
+            // seven-to-geordi 2026-06-12): ALL-FRESH buffers, the proven kernel method
+            // (TurboQuant_AttentionRealShape_Probe passes this exact code in a clean test),
+            // sentinel-prefilled output — yet after this test's ~112 mixed-vertex-count
+            // encode dispatches, EVERY subsequent attention dispatch on WebGL returns the
+            // SAME frozen values (plausible normalized-vector leftovers from an encode
+            // capture). Eliminated: kernel code, params reads, buffer identity/provenance,
+            // input staleness, draw vertex count (sentinel IS overwritten), GL console
+            // errors (none). Remaining suspect: glWorker TF-capture reuse/growth state.
+            using var kp0 = accelerator.Allocate1D(aPackedHost);
+            using var kn0 = accelerator.Allocate1D(aNormsHost);
+            using var vp0 = accelerator.Allocate1D(aPackedHost);
+            using var vn0 = accelerator.Allocate1D(aNormsHost);
+            using var q0 = accelerator.Allocate1D(qData);
+            using var kcb0 = accelerator.Allocate1D(codebook);
+            using var vcb0 = accelerator.Allocate1D(codebook);
+            using var out0 = accelerator.Allocate1D(Enumerable.Repeat(777f, headDim).ToArray());
+            using var par0 = accelerator.Allocate1D(new int[] { 1, numKV, headDim,
+                BitConverter.SingleToInt32Bits(scale), 8, 4, 0xF });
+            kern(headDim, q0.View, kp0.View, kcb0.View, vp0.View, vcb0.View,
+                kn0.View, vn0.View, out0.View, par0.View);
+            await accelerator.SynchronizeAsync();
+            var got0 = await out0.CopyToHostAsync<float>(0, headDim);
+            int bad0 = 0;
+            for (int i = 0; i < headDim; i++)
+                if (MathF.Abs(got0[i] - oracle[i]) > MathF.Max(1e-3f, MathF.Abs(oracle[i]) * 1e-3f) || float.IsNaN(got0[i])) bad0++;
+            if (bad0 > 0)
+                throw new Exception($"VariantC0(all-fresh, post-encode dispatches): {bad0}/{headDim} diverge — " +
+                    "the WebGL frozen-TF-capture bug (see comment; routed to the ILGPU lane). " +
+                    $"got=[{string.Join(",", got0.Take(6).Select(v => v.ToString("F4")))}] " +
+                    $"want=[{string.Join(",", oracle.Take(6).Select(v => v.ToString("F4")))}]");
+            Console.WriteLine("[TurboQuant] VariantC0(all-fresh): matches oracle");
+        }
+
+        // C2: ALL inputs re-uploaded from HOST (the verified readbacks) — isolates whether
+        // GPU-WRITTEN input buffers (vs CPU-uploaded) are what breaks the attention kernel.
+        using (var kp2 = accelerator.Allocate1D(aPackedHost))
+        using (var kn2 = accelerator.Allocate1D(aNormsHost))
+        using (var vp2 = accelerator.Allocate1D(aPackedHost))
+        using (var vn2 = accelerator.Allocate1D(aNormsHost))
+            await VerifyAttn("VariantC2(host-uploaded inputs)", kp2.View, kn2.View, vp2.View, vn2.View);
+
+        // C3: K side = the kernel-WRITTEN buffers, V side = host-uploaded — splits
+        // kernel-written-texture staleness (K) from the GPU→GPU CopyFromAsync path (V, C1).
+        using (var vp3 = accelerator.Allocate1D(aPackedHost))
+        using (var vn3 = accelerator.Allocate1D(aNormsHost))
+            await VerifyAttn("VariantC3(K=kernel-written, V=host)", aPacked.View, aNorms.View, vp3.View, vn3.View);
+
+        // C1: the original failing shape — K = kernel-written, V = GPU→GPU CopyFromAsync.
+        using var vPacked2 = accelerator.Allocate1D<int>(numKV * packedDim);
+        using var vNorms2 = accelerator.Allocate1D<float>(numKV);
+        await vPacked2.View.CopyFromAsync(aPacked.View);
+        await vNorms2.View.CopyFromAsync(aNorms.View);
+        await VerifyAttn("VariantC1(K=kernel-written, V=gpu-copy)", aPacked.View, aNorms.View, vPacked2.View, vNorms2.View);
+    });
+
+    /// <summary>PROBE for the WebGL VariantC failure: echoes the params-buffer values the
+    /// kernel actually SEES (same 9-view signature as the TurboQuant attention kernels,
+    /// same int-params read pattern + IntAsFloat). If WebGL shows zeros/garbage here, the
+    /// params plumbing is the bug; if correct, the fault is further into the kernel.</summary>
+    private static void ParamsEchoImpl(global::ILGPU.Index1D idx,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> Q,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> K_packed,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> K_codebook,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> V_packed,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> V_codebook,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> K_norms,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> V_norms,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> output,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> paramsArr)
+    {
+        // Slots 0..6: raw params as float. Slot 7: IntAsFloat(params[3]) (the scale path).
+        // Slot 8: K_norms[0]. Slot 9: K_codebook[1]. Slot 10: K_packed[0] low nibble.
+        int s = idx % 11;
+        float v = 0f;
+        if (s < 7) v = (float)paramsArr[s];
+        else if (s == 7) v = global::ILGPU.Interop.IntAsFloat((uint)paramsArr[3]);
+        else if (s == 8) v = K_norms[0];
+        else if (s == 9) v = K_codebook[1];
+        else v = (float)(K_packed[0] & 0xF);
+        output[idx] = v + 0f * (Q[0] + V_codebook[0] + V_norms[0] + (float)V_packed[0]);
+    }
+
+    /// <summary>STAGE PROBE: replicates the two-pass attention kernel body at REAL sizes
+    /// (headDim=64, packedDim=8, numKV=16) but outputs a chosen INTERMEDIATE per slot —
+    /// dot(kv=0), maxScore, sumExp, acc, final — so one run shows the FIRST stage that
+    /// diverges on a backend (the params/read probe above already proved inputs clean).</summary>
+    private static void AttnStagesImpl(global::ILGPU.Index1D idx,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> Q,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> K_packed,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> K_codebook,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> V_packed,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> V_codebook,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> K_norms,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> V_norms,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> output,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> paramsArr)
+    {
+        int numQ = paramsArr[0];
+        int numKV = paramsArr[1];
+        int D = paramsArr[2];
+        float scale = global::ILGPU.Interop.IntAsFloat((uint)paramsArr[3]);
+        int valuesPerInt = paramsArr[4];
+        int bitsPerValue = paramsArr[5];
+        int indexMask = paramsArr[6];
+        int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
+        // Thread idx selects the reported stage; d is fixed to 5 so every stage is scalar.
+        int stage = idx % 8;
+        int queryIdx = 0;
+        int d = 5;
+        if (queryIdx >= numQ) { output[idx] = -999f; return; }
+
+        float maxScore = -1e10f;
+        float dot0 = 0f;
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
+                {
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * K_codebook[cIdx] * kNorm;
+                }
+            }
+            if (kv == 0) dot0 = dot;
+            maxScore = MathF.Max(maxScore, dot * scale);
+        }
+
+        float sumExp = 0f;
+        float acc = 0f;
+        int vp = d / valuesPerInt;
+        int vShift = (d % valuesPerInt) * bitsPerValue;
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
+                {
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * K_codebook[cIdx] * kNorm;
+                }
+            }
+            float weight = MathF.Exp(dot * scale - maxScore);
+            sumExp += weight;
+            int vIdx = (V_packed[kv * packedDim + vp] >> vShift) & indexMask;
+            acc += weight * V_codebook[vIdx] * V_norms[kv];
+        }
+
+        float v = 0f;
+        if (stage == 0) v = dot0;
+        else if (stage == 1) v = maxScore;
+        else if (stage == 2) v = sumExp;
+        else if (stage == 3) v = acc;
+        else if (stage == 4) v = acc / (sumExp + 1e-10f);
+        else if (stage == 5) v = MathF.Exp(-1.5f);          // bare exp sanity
+        else if (stage == 6) v = MathF.Max(-1e10f, 2.5f);   // bare max sanity
+        else v = scale;
+        output[idx] = v;
+    }
+
+    /// <summary>REAL-SHAPE probe: verbatim copy of FusedAttentionImpl's body with a MODE
+    /// param toggling the structural differences from the (passing) stage probe:
+    /// mode 0 = exact real shape (per-thread d, bare early return), mode 1 = early return
+    /// ASSIGNS output first, mode 2 = d fixed to 5 (the passing probe's shape).</summary>
+    private static void AttnRealShapeImpl(global::ILGPU.Index1D idx,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> Q,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> K_packed,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> K_codebook,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> V_packed,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> V_codebook,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> K_norms,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> V_norms,
+        global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense> output,
+        global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense> paramsArr)
+    {
+        int numQ = paramsArr[0];
+        int numKV = paramsArr[1];
+        int D = paramsArr[2];
+        float scale = global::ILGPU.Interop.IntAsFloat((uint)paramsArr[3]);
+        int valuesPerInt = paramsArr[4];
+        int bitsPerValue = paramsArr[5];
+        int indexMask = paramsArr[6];
+        int mode = paramsArr[7];
+        int packedDim = (D + valuesPerInt - 1) / valuesPerInt;
+        int queryIdx = idx / D;
+        int d = mode == 2 ? 5 : idx % D;
+        if (queryIdx >= numQ)
+        {
+            if (mode == 1) output[idx] = -999f;
+            return;
+        }
+
+        float maxScore = -1e10f;
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
+                {
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * K_codebook[cIdx] * kNorm;
+                }
+            }
+            maxScore = MathF.Max(maxScore, dot * scale);
+        }
+
+        float sumExp = 0f;
+        float acc = 0f;
+        int vp = d / valuesPerInt;
+        int vShift = (d % valuesPerInt) * bitsPerValue;
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float dot = 0f;
+            float kNorm = K_norms[kv];
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = K_packed[kv * packedDim + p];
+                for (int b = 0; b < valuesPerInt && p * valuesPerInt + b < D; b++)
+                {
+                    int cIdx = (packed >> (b * bitsPerValue)) & indexMask;
+                    dot += Q[queryIdx * D + p * valuesPerInt + b] * K_codebook[cIdx] * kNorm;
+                }
+            }
+            float weight = MathF.Exp(dot * scale - maxScore);
+            sumExp += weight;
+            int vIdx = (V_packed[kv * packedDim + vp] >> vShift) & indexMask;
+            acc += weight * V_codebook[vIdx] * V_norms[kv];
+        }
+        output[idx] = acc / (sumExp + 1e-10f);
+    }
+
+    [TestMethod]
+    public async Task TurboQuant_AttentionRealShape_Probe() => await RunTest(async accelerator =>
+    {
+        const int headDim = 64, numKV = 16;
+        int packedDim = headDim / 8;
+        var rng = new Random(7);
+        var codebook = TurboQuantKernels.Codebook4Bit;
+        var kPackedData = new int[numKV * packedDim];
+        var vPackedData = new int[numKV * packedDim];
+        for (int i = 0; i < kPackedData.Length; i++) kPackedData[i] = rng.Next(int.MinValue, int.MaxValue);
+        for (int i = 0; i < vPackedData.Length; i++) vPackedData[i] = rng.Next(int.MinValue, int.MaxValue);
+        var kNormsData = new float[numKV];
+        var vNormsData = new float[numKV];
+        for (int i = 0; i < numKV; i++) { kNormsData[i] = 1f + (float)rng.NextDouble(); vNormsData[i] = 1f + (float)rng.NextDouble(); }
+        var qData = new float[headDim];
+        for (int i = 0; i < headDim; i++) qData[i] = (float)(rng.NextDouble() * 2 - 1);
+        float scale = 1f / MathF.Sqrt(headDim);
+
+        // CPU oracle (per element d)
+        float Dot(int kv)
+        {
+            float dot = 0;
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = kPackedData[kv * packedDim + p];
+                for (int b = 0; b < 8; b++)
+                    dot += qData[p * 8 + b] * codebook[(packed >> (b * 4)) & 0xF] * kNormsData[kv];
+            }
+            return dot;
+        }
+        float cMax = -1e10f;
+        for (int kv = 0; kv < numKV; kv++) cMax = MathF.Max(cMax, Dot(kv) * scale);
+        float OracleAt(int d)
+        {
+            float cSum = 0, cAcc = 0;
+            for (int kv = 0; kv < numKV; kv++)
+            {
+                float w = MathF.Exp(Dot(kv) * scale - cMax);
+                cSum += w;
+                cAcc += w * codebook[(vPackedData[kv * packedDim + d / 8] >> ((d % 8) * 4)) & 0xF] * vNormsData[kv];
+            }
+            return cAcc / (cSum + 1e-10f);
+        }
+
+        using var qBuf = accelerator.Allocate1D(qData);
+        using var kPacked = accelerator.Allocate1D(kPackedData);
+        using var vPacked = accelerator.Allocate1D(vPackedData);
+        using var kCB = accelerator.Allocate1D(codebook);
+        using var vCB = accelerator.Allocate1D(codebook);
+        using var kNorms = accelerator.Allocate1D(kNormsData);
+        using var vNorms = accelerator.Allocate1D(vNormsData);
+
+        var kernel = accelerator.LoadAutoGroupedStreamKernel<global::ILGPU.Index1D,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>>(AttnRealShapeImpl);
+
+        var fails = new List<string>();
+        for (int mode = 0; mode <= 2; mode++)
+        {
+            using var outBuf = accelerator.Allocate1D(Enumerable.Repeat(777f, headDim).ToArray());
+            using var paramsBuf = accelerator.Allocate1D(new int[] { 1, numKV, headDim,
+                BitConverter.SingleToInt32Bits(scale), 8, 4, 0xF, mode });
+            kernel(headDim, qBuf.View, kPacked.View, kCB.View, vPacked.View, vCB.View,
+                kNorms.View, vNorms.View, outBuf.View, paramsBuf.View);
+            await accelerator.SynchronizeAsync();
+            var got = await outBuf.CopyToHostAsync<float>(0, headDim);
+            int bad = 0;
+            for (int i = 0; i < headDim; i++)
+            {
+                float want = OracleAt(mode == 2 ? 5 : i);
+                if (MathF.Abs(got[i] - want) > MathF.Max(1e-4f, MathF.Abs(want) * 1e-4f) || float.IsNaN(got[i])) bad++;
+            }
+            if (bad > 0)
+                fails.Add($"mode{mode}: {bad}/{headDim} bad, got=[{string.Join(",", got.Take(5).Select(v => v.ToString("F4")))}] " +
+                    $"want=[{string.Join(",", Enumerable.Range(0, 5).Select(i => OracleAt(mode == 2 ? 5 : i).ToString("F4")))}]");
+            else
+                Console.WriteLine($"[TurboQuant] RealShape mode{mode}: matches oracle");
+        }
+        if (fails.Count > 0) throw new Exception($"RealShape probe: {string.Join(" || ", fails)}");
+    });
+
+    [TestMethod]
+    public async Task TurboQuant_AttentionStages_Probe() => await RunTest(async accelerator =>
+    {
+        const int headDim = 64, numKV = 16, numCentroids = 16;
+        int packedDim = headDim / 8;
+        var rng = new Random(7);
+        var codebook = TurboQuantKernels.Codebook4Bit;
+
+        // Synthetic packed data + norms + Q, fully CPU-replicable
+        var kPackedData = new int[numKV * packedDim];
+        var vPackedData = new int[numKV * packedDim];
+        for (int i = 0; i < kPackedData.Length; i++) kPackedData[i] = rng.Next(int.MinValue, int.MaxValue);
+        for (int i = 0; i < vPackedData.Length; i++) vPackedData[i] = rng.Next(int.MinValue, int.MaxValue);
+        var kNormsData = new float[numKV];
+        var vNormsData = new float[numKV];
+        for (int i = 0; i < numKV; i++) { kNormsData[i] = 1f + (float)rng.NextDouble(); vNormsData[i] = 1f + (float)rng.NextDouble(); }
+        var qData = new float[headDim];
+        for (int i = 0; i < headDim; i++) qData[i] = (float)(rng.NextDouble() * 2 - 1);
+        float scale = 1f / MathF.Sqrt(headDim);
+
+        // CPU replication of every stage (identical arithmetic order)
+        float Dot(int kv)
+        {
+            float dot = 0;
+            for (int p = 0; p < packedDim; p++)
+            {
+                int packed = kPackedData[kv * packedDim + p];
+                for (int b = 0; b < 8; b++)
+                    dot += qData[p * 8 + b] * codebook[(packed >> (b * 4)) & 0xF] * kNormsData[kv];
+            }
+            return dot;
+        }
+        float cMax = -1e10f;
+        for (int kv = 0; kv < numKV; kv++) cMax = MathF.Max(cMax, Dot(kv) * scale);
+        float cSum = 0, cAcc = 0;
+        const int dFixed = 5;
+        for (int kv = 0; kv < numKV; kv++)
+        {
+            float w = MathF.Exp(Dot(kv) * scale - cMax);
+            cSum += w;
+            cAcc += w * codebook[(vPackedData[kv * packedDim + dFixed / 8] >> ((dFixed % 8) * 4)) & 0xF] * vNormsData[kv];
+        }
+        var want = new float[8] { Dot(0), cMax, cSum, cAcc, cAcc / (cSum + 1e-10f), MathF.Exp(-1.5f), 2.5f, scale };
+
+        using var qBuf = accelerator.Allocate1D(qData);
+        using var kPacked = accelerator.Allocate1D(kPackedData);
+        using var vPacked = accelerator.Allocate1D(vPackedData);
+        using var kCB = accelerator.Allocate1D(codebook);
+        using var vCB = accelerator.Allocate1D(codebook);
+        using var kNorms = accelerator.Allocate1D(kNormsData);
+        using var vNorms = accelerator.Allocate1D(vNormsData);
+        using var outBuf = accelerator.Allocate1D<float>(8);
+        using var paramsBuf = accelerator.Allocate1D(new int[] { 1, numKV, headDim,
+            BitConverter.SingleToInt32Bits(scale), 8, 4, 0xF });
+
+        var kernel = accelerator.LoadAutoGroupedStreamKernel<global::ILGPU.Index1D,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>>(AttnStagesImpl);
+        kernel(8, qBuf.View, kPacked.View, kCB.View, vPacked.View, vCB.View,
+            kNorms.View, vNorms.View, outBuf.View, paramsBuf.View);
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, 8);
+
+        var names = new[] { "dot0", "maxScore", "sumExp", "acc", "final", "exp(-1.5)", "max", "scale" };
+        var bad = new List<string>();
+        for (int s = 0; s < 8; s++)
+            if (MathF.Abs(got[s] - want[s]) > MathF.Abs(want[s]) * 1e-4f + 1e-5f || float.IsNaN(got[s]))
+                bad.Add($"{names[s]}: got {got[s]:G6}, want {want[s]:G6}");
+        if (bad.Count > 0)
+            throw new Exception($"Attention stage(s) diverge: {string.Join("; ", bad)}");
+        Console.WriteLine("[TurboQuant] AttentionStages probe: all stages match CPU");
+    });
+
+    [TestMethod]
+    public async Task TurboQuant_AttentionParamsEcho_Probe() => await RunTest(async accelerator =>
+    {
+        const int headDim = 64, numKV = 16;
+        int packedDim = headDim / 8;
+        var codebook = TurboQuantKernels.Codebook4Bit;
+        using var qBuf = accelerator.Allocate1D(new float[headDim]);
+        using var kPacked = accelerator.Allocate1D(Enumerable.Range(0, numKV * packedDim).Select(i => 0x5A5A5A57).ToArray());
+        using var vPacked = accelerator.Allocate1D<int>(numKV * packedDim);
+        using var kCB = accelerator.Allocate1D(codebook);
+        using var vCB = accelerator.Allocate1D(codebook);
+        using var kNorms = accelerator.Allocate1D(Enumerable.Repeat(3.25f, numKV).ToArray());
+        using var vNorms = accelerator.Allocate1D<float>(numKV);
+        using var outBuf = accelerator.Allocate1D<float>(22);
+
+        float scale = 0.125f;
+        var paramsData = new int[] { 1, numKV, headDim, BitConverter.SingleToInt32Bits(scale), 8, 4, 0xF };
+        using var paramsBuf = accelerator.Allocate1D(paramsData);
+
+        var kernel = accelerator.LoadAutoGroupedStreamKernel<global::ILGPU.Index1D,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<float, global::ILGPU.Stride1D.Dense>,
+            global::ILGPU.Runtime.ArrayView1D<int, global::ILGPU.Stride1D.Dense>>(ParamsEchoImpl);
+        kernel(22, qBuf.View, kPacked.View, kCB.View, vPacked.View, vCB.View,
+            kNorms.View, vNorms.View, outBuf.View, paramsBuf.View);
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, 22);
+
+        var want = new float[11];
+        for (int s = 0; s < 7; s++) want[s] = paramsData[s];
+        want[7] = scale; want[8] = 3.25f; want[9] = codebook[1]; want[10] = 0x5A5A5A57 & 0xF;
+        var bad = new List<string>();
+        for (int i = 0; i < 22; i++)
+            if (MathF.Abs(got[i] - want[i % 11]) > MathF.Abs(want[i % 11]) * 1e-6f + 1e-6f)
+                bad.Add($"slot{i % 11}@{i}: got {got[i]}, want {want[i % 11]}");
+        if (bad.Count > 0)
+            throw new Exception($"Params echo diverges ({bad.Count}/22): {string.Join("; ", bad.Take(8))}");
+        Console.WriteLine("[TurboQuant] ParamsEcho probe: kernel sees correct params/buffer values");
     });
 
     /// <summary>
