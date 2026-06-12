@@ -375,3 +375,7 @@ SpawnDev.ILGPU.ML.Demo/wwwroot/models/gpt2/
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-tiny/
 **/distilgpt2/
 .aider*
+
+# Diagnostic scratch (GGUF capture/teacher-forcing dumps, probe scripts, fetched refs)
+_scratch/
+Examples/04.GGUFTextGen.Console/*.txt

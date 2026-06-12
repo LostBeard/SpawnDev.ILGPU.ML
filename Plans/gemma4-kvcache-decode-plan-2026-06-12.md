@@ -65,3 +65,40 @@ session-owned GPU buffers, outside the graph quantizer:
    output token-for-token (regression guard) and measure tokens/s.
 5. PMT: add a small CPU-backed decode-equivalence test at gemma4 geometry (synthetic tiny model).
 6. Later/optional: route the cache through TurboQuant as opt-in compression (re-enables QuantizedKVCache).
+
+## Concrete integration blueprint (reverse-engineered from the code 2026-06-12)
+Exact wiring, so execution is mechanical:
+
+- **Where attention reads seq:** `FusedAttentionOperator.Execute` (Operators/AttentionOperators.cs)
+  derives `seqQ = q.ElementCount/(nHeads*headDim)` and `seqKV = k.ElementCount/(kvHeads*headDim)`,
+  and honors `kv_offset`. So decode = feed q with 1 token + k/v with cacheLen+1 tokens +
+  `kv_offset=cacheLen`. NO kernel change needed.
+- **The cache must be injected BEFORE the FusedAttention node**, on the per-layer K/V chain. In the
+  builder the K/V reaching FusedAttention is `{pfx}_k_t` / `{pfx}_v_t` (post transpose, layout
+  [1, kvHeads, seq, hd]). The cache concatenates along the seq axis: `cachedK[1,kvHeads,n,hd] ++
+  newK[1,kvHeads,1,hd] -> [1,kvHeads,n+1,hd]`.
+- **State:** a new `GGUFDecodeKVCache` (mirror `QuantizedKVCache`'s member-buffer + geometric-grow +
+  retire-at-Dispose pattern, but FULL-PRECISION float, no codebook/packing). Per layer: `float[]`
+  K and V grow buffers sized `maxSeq*kvHeads*hd`, a `Length` counter, session-owned (browser
+  dispose-after-drain rule). Lives on `GraphExecutor` (sibling to `_kvCache`) or a `GGUFDecodeState`
+  held by `InferenceSession`.
+- **Executor hook:** tag each FusedAttention node with its layer index at build time (e.g. attr
+  `layer:i`). In `GraphExecutor` decode mode, intercept the FusedAttention node like the existing
+  present-KV interception (GraphExecutor.cs ~1449): before running the kernel, append the node's
+  current K/V (the `_t` inputs) to `GGUFDecodeKVCache[layer]`, then substitute the full cache as the
+  kernel's K/V and set `kv_offset = cacheLenBefore`. Prefill (step 0, seq=N) appends all N then runs
+  normally with kv_offset=0.
+- **Builder decode-mode emission:** set `kv_offset` is already 0 in the static graph; the executor
+  overrides it at runtime from the cache length, so the builder needs only the `layer:i` tag on
+  FusedAttention (and to NOT recompute K/V for cached tokens — in decode mode the input is seq=1, so
+  the K/V projections naturally produce 1 token; the executor supplies history from the cache).
+- **Session API:** `InferenceSession` gains a decode entry: first call = prefill (seq=prompt), then
+  per-token calls feed seq=1; the executor is REUSED (no recompile after prefill since seq=1 is fixed)
+  — also removes the per-step recompile.
+- **Validation (no PMT needed):** `Examples/04` decode-equivalence — incremental-decode output MUST
+  equal the current full-recompute argmax token-for-token (already have the full-recompute reference:
+  `<|channel>thought ... Paris ... <turn|>`). Run on CUDA console. PMT CPU-oracle synthetic-model test
+  is the cross-backend guard, added when the harness frees.
+- **Risk:** the FusedAttention interception path is near the present-KV interception that touches
+  `_kvCache` (QuantizedKVCache, Seven's). Keep `GGUFDecodeKVCache` a SEPARATE field/code path; do not
+  reuse `_kvCache`. Heads-up to Seven before editing GraphExecutor's KV region.
