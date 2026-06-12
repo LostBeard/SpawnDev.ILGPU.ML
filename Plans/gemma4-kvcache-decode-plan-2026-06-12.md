@@ -1,6 +1,19 @@
 # GGUF decode KV-cache — design plan (2026-06-12, Tuvok)
 
-**Status:** scoped, not started. Written while the PMT harness was occupied (Seven running). Execute
+**STATUS: SHIPPED** (`40c804c` + `b4452c6`, pushed master). Approach B implemented as designed:
+full-precision `GGUFDecodeKVCache` + gated executor FusedAttention/RoPE intercept (kv_offset=pastLen)
++ session `EnableGGUFDecode`/`RunDecodeStepAsync` + builder layer-tag. Validated: decode == full-
+recompute, numerically identical on the real gemma4 (same "...Paris..." tokens+logits) AND
+cross-backend via `GGUFDecodeKVCache_IncrementalMatchesFullRecompute` (8/8 all 6 backends). One extra
+finding vs the plan: on Wasm a CopyFrom of a node output is NOT kernel-ordered, so the cache read stale
+K/V — fixed with WASM-ONLY SynchronizeAsync drains around the cache write/repack (other 5 backends order
+it correctly, not pessimized). REMAINING PERF (separate item): decode is ~3.4s/token CONSTANT (O(n) goal
+met) but that residual is per-node graph-execution overhead at seq=1 (1438 nodes), not attention — a
+graph-fusion / fewer-nodes optimization, not KV-cache. Original plan below for reference.
+
+---
+
+**Status (original):** scoped, not started. Written while the PMT harness was occupied (Seven running). Execute
 when the harness frees + after a coordination note to Seven (touches `QuantizedKVCache`).
 
 **Context:** the gemma4:12b GGUF forward is now CORRECT end-to-end (see memory
