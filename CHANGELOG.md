@@ -2,6 +2,33 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — gemma4:12b GGUF forward is CORRECT end-to-end (CUDA)
+
+gemma4:12b greedy-decodes coherent thinking-model text through the pure-ILGPU engine
+("What is the capital of France?" -> a `<|channel>thought` reasoning block then "The capital
+of France is Paris.", clean self-stop on `<turn|>`). Verified 12/12 token-for-token against
+ollama's bundled llama.cpp (`llama-server.exe`) on the same gguf. Three forward-correctness
+bugs in `GGUFGraphBuilder`, each root-caused against the llama.cpp source:
+
+- **Token embedding scale** — gemma multiplies the token embedding by `sqrt(n_embd)` right
+  after the lookup (`gemma4.cpp`; no metadata key). Missing it left the token-identity signal
+  at <1% of the RMS-normed residual stream -> every position collapsed to one argmax.
+- **Norm `(1+weight)` was double-counted** — `conversion/gemma.py` (Gemma3/Gemma4) bakes the
+  `+1` into the GGUF norm weights AT CONVERSION, so the graph must use them RAW. Folding a
+  second `+1` 9x-inflated the small qk/post norms (k_norm 0.12 -> 1.12) -> QK blowup -> logits
+  pinned at the 30 soft-cap. Now uses the stored weights verbatim.
+- **Attention scale = 1.0, not 1/sqrt(head_dim)** — `gemma4.cpp`: `f_attention_scale = 1.0f`
+  (the QK-norm folds the scale away). Defaulting to 1/sqrt(512) on the global heads made
+  softmax ~22x too flat -> attention averaged all positions (cross-position cosine -> 1 by
+  layer ~23) -> generation degenerated to whitespace. Now emits scale=1.0 on gemma4 attention.
+
+Tests: `Gemma4_GraphBuilder_NormWeightsRaw_NoDoublePlusOne`,
+`Gemma4_GraphBuilder_EmbeddingScaleSqrtNEmbd`, `Gemma4_Attn_AttentionScaleIsOne`
+(scoped PMT Gemma4 74/74). `Examples/04.GGUFTextGen.Console` gains greedy decode + the gemma4
+chat template, a teacher-forcing per-position comparison vs a reference, and GGUF_PROBE /
+cross-position-cosine diagnostics. Decode is currently full-recompute (~7s/token); KV-cache is
+planned (`Plans/gemma4-kvcache-decode-plan-2026-06-12.md`).
+
 ## Unreleased — gemma4 decode-path kernels (GEMV routing, masked flash attention, RoPE generalization)
 
 The three kernel prerequisites for the gemma4 bring-up (the graph wiring selects and
