@@ -18,8 +18,13 @@ public class FWHTKernel
 {
     private readonly Accelerator _accelerator;
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _fwhtKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, int>? _fwhtBatchInPlaceKernel;
+    // One-store-per-thread out-of-place butterfly (WebGL Transform-Feedback safe; correct on all
+    // backends). The old in-place 2-store butterfly silently corrupts on the WebGL TF vertex path
+    // (the vertex shader maps a thread's store-site s to output index v*storeCount+s, so a thread's
+    // SECOND store lands at the wrong index and only the first survives). The multi-pass path now
+    // ping-pongs between a work buffer and a scratch buffer with this single-store kernel.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _fwhtBatchOutKernel;
 
     // Pooled padding scratch for the non-power-of-2 batched path. MUST be a member buffer:
     // a method-local `using var` is disposed when ForwardBatch returns — before the CALLER
@@ -32,7 +37,60 @@ public class FWHTKernel
     private int _padCapacity;
     private readonly System.Collections.Generic.List<MemoryBuffer1D<float, Stride1D.Dense>> _oldPadBufs = new();
 
+    // Ping-pong scratch for the one-store-per-thread multi-pass FWHT (see _fwhtBatchOutKernel).
+    // Same grow-and-retain discipline as _padBuf: never disposed mid-flight (it may still sit in an
+    // unsubmitted command encoder), reused across calls, grown only when a larger request arrives.
+    private MemoryBuffer1D<float, Stride1D.Dense>? _pingBuf;
+    private int _pingCapacity;
+
     public FWHTKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>
+    /// (Re)allocate the ping-pong scratch so it covers <paramref name="count"/> floats. Grow-and-retain:
+    /// the previous buffer is retained (never freed mid-flight) since it may still sit in a pending
+    /// command encoder. Returns a view of exactly <paramref name="count"/> elements.
+    /// </summary>
+    private ArrayView1D<float, Stride1D.Dense> EnsurePingBuffer(int count)
+    {
+        if (_pingBuf == null || _pingCapacity < count)
+        {
+            if (_pingBuf != null) _oldPadBufs.Add(_pingBuf);
+            _pingBuf = _accelerator.Allocate1D<float>(count);
+            _pingCapacity = count;
+        }
+        return _pingBuf.View.SubView(0, count);
+    }
+
+    /// <summary>
+    /// Run all log2(d) FWHT butterfly stages with one-store-per-thread ping-pong between
+    /// <paramref name="work"/> and <paramref name="scratch"/> (both must hold <paramref name="total"/>
+    /// floats; the initial data must already be in <paramref name="work"/>). Returns true if the
+    /// result ended up in <paramref name="work"/>, false if it ended up in <paramref name="scratch"/>.
+    /// No normalization is applied — the caller fuses the 1/sqrt(d) scale into its final write.
+    /// </summary>
+    private bool RunButterflyStagesPingPong(
+        ArrayView1D<float, Stride1D.Dense> work,
+        ArrayView1D<float, Stride1D.Dense> scratch,
+        int d, int total)
+    {
+        _fwhtBatchOutKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(
+                FWHTBatchStageOutOfPlaceImpl);
+
+        int numStages = 0;
+        for (int s = d; s > 1; s >>= 1) numStages++;
+
+        var src = work;
+        var dst = scratch;
+        for (int stage = 0; stage < numStages; stage++)
+        {
+            int halfSize = 1 << stage;
+            _fwhtBatchOutKernel(total, src, dst, halfSize);
+            (src, dst) = (dst, src);
+        }
+        // After numStages swaps starting from src=work: result is in `work` iff numStages is even.
+        return (numStages & 1) == 0;
+    }
 
     /// <summary>
     /// In-place FWHT on a single vector of length d (must be power of 2).
@@ -42,23 +100,24 @@ public class FWHTKernel
 
     public void Forward(ArrayView1D<float, Stride1D.Dense> data, int d)
     {
-        // FWHT butterfly: log2(d) sequential passes, each parallelizable
-        int numStages = 0;
-        for (int s = d; s > 1; s >>= 1) numStages++;
+        // FWHT butterfly: log2(d) sequential passes via one-store-per-thread ping-pong
+        // (WebGL Transform-Feedback safe). Initial data is already in `data`; ping-pong with
+        // a scratch buffer, then fuse the 1/sqrt(d) normalization into the final write back.
+        var scratch = EnsurePingBuffer(d);
+        bool inData = RunButterflyStagesPingPong(data, scratch, d, d);
 
-        for (int stage = 0; stage < numStages; stage++)
-        {
-            int halfSize = 1 << stage;
-            _fwhtKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, int>(FWHTStageImpl);
-            _fwhtKernel(d / 2, data, halfSize);
-        }
-
-        // Normalize by 1/sqrt(d) — in-place to avoid WebGPU buffer aliasing
         float scale = 1f / MathF.Sqrt(d);
-        _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
-        _scaleInPlaceKernel(d, data, scale);
+        if (inData)
+        {
+            _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+            _scaleInPlaceKernel(d, data, scale);
+        }
+        else
+        {
+            // Result landed in scratch — normalize it back into `data` in one pass.
+            new ElementWiseKernels(_accelerator).Scale(scratch, data, d, scale);
+        }
     }
 
     private static void ScaleInPlaceImpl(Index1D idx,
@@ -114,43 +173,39 @@ public class FWHTKernel
             for (int b = 0; b < batchSize; b++)
                 ew.Scale(input.SubView(b * d, d), padView.SubView(b * dPad, d), d, 1f);
 
-            int numStagesPad = 0;
-            for (int s = dPad; s > 1; s >>= 1) numStagesPad++;
-            for (int stage = 0; stage < numStagesPad; stage++)
-            {
-                int halfSize = 1 << stage;
-                _fwhtBatchInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                    ArrayView1D<float, Stride1D.Dense>, int>(FWHTBatchStageInPlaceImpl);
-                _fwhtBatchInPlaceKernel(padCount / 2, padView, halfSize);
-            }
+            // One-store-per-thread ping-pong butterfly (WebGL TF safe). padView holds the data;
+            // ping-pong against a same-size scratch, then copy the first d elements of each padded
+            // row to output with the 1/sqrt(d) normalization fused in.
+            var padScratch = EnsurePingBuffer(padCount);
+            bool inPad = RunButterflyStagesPingPong(padView, padScratch, dPad, padCount);
+            var padResult = inPad ? padView : padScratch;
 
-            // Copy first d elements of each padded row to output, with normalization
             float scalePad = 1f / MathF.Sqrt(d);
             for (int b = 0; b < batchSize; b++)
-                ew.Scale(padView.SubView(b * dPad, d), output.SubView(b * d, d), d, scalePad);
+                ew.Scale(padResult.SubView(b * dPad, d), output.SubView(b * d, d), d, scalePad);
             return;
         }
 
-        // Power-of-2: copy input → output, then in-place butterfly
+        // Power-of-2: copy input → output, then one-store-per-thread ping-pong butterfly
+        // (WebGL TF safe). The butterfly writes alternate between `output` and a scratch buffer.
         int total = batchSize * d;
         ew.Scale(input.SubView(0, total), output.SubView(0, total), total, 1f);
 
-        int numStages = 0;
-        for (int s = d; s > 1; s >>= 1) numStages++;
+        var scratch = EnsurePingBuffer(total);
+        bool inOutput = RunButterflyStagesPingPong(output.SubView(0, total), scratch, d, total);
 
-        for (int stage = 0; stage < numStages; stage++)
-        {
-            int halfSize = 1 << stage;
-            _fwhtBatchInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, int>(FWHTBatchStageInPlaceImpl);
-            _fwhtBatchInPlaceKernel(total / 2, output, halfSize);
-        }
-
-        // Normalize in-place
+        // Normalize, fusing the final copy-to-output when the result is in scratch.
         float scale = 1f / MathF.Sqrt(d);
-        _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
-        _scaleInPlaceKernel(total, output, scale);
+        if (inOutput)
+        {
+            _scaleInPlaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+            _scaleInPlaceKernel(total, output, scale);
+        }
+        else
+        {
+            ew.Scale(scratch, output.SubView(0, total), total, scale);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -238,41 +293,28 @@ public class FWHTKernel
     }
 
     /// <summary>
-    /// One butterfly stage of the FWHT. Each thread handles one pair.
+    /// One butterfly stage of the FWHT, ONE store per thread (out-of-place, double-buffered).
+    /// Each thread owns exactly one OUTPUT element <c>e</c> and writes <c>dst[e]</c> by reading
+    /// its butterfly partner from <paramref name="src"/>. Dispatched over the full element count
+    /// (not pairs), so it never relies on a thread writing two locations — which is required on
+    /// the WebGL Transform-Feedback path, where a thread's second store silently lands at the
+    /// wrong index. The caller ping-pongs <paramref name="src"/>/<paramref name="dst"/> per stage.
+    ///
+    /// For block size 2*halfSize: the lower half (offset &lt; halfSize) is an "i" position and gets
+    /// <c>src[e] + src[e+halfSize]</c>; the upper half is a "j" position and gets
+    /// <c>src[e-halfSize] - src[e]</c>. This reproduces the in-place butterfly exactly.
     /// </summary>
-    private static void FWHTStageImpl(Index1D pairIdx,
-        ArrayView1D<float, Stride1D.Dense> data,
+    private static void FWHTBatchStageOutOfPlaceImpl(Index1D index,
+        ArrayView1D<float, Stride1D.Dense> src,
+        ArrayView1D<float, Stride1D.Dense> dst,
         int halfSize)
     {
+        int e = index;
         int blockSize = halfSize * 2;
-        int block = pairIdx / halfSize;
-        int offset = pairIdx % halfSize;
-        int i = block * blockSize + offset;
-        int j = i + halfSize;
-
-        float a = data[i];
-        float b = data[j];
-        data[i] = a + b;
-        data[j] = a - b;
-    }
-
-    /// <summary>
-    /// In-place batched butterfly stage. Single buffer — avoids WebGPU aliasing detection.
-    /// Butterfly reads both values before writing, so in-place is correct.
-    /// </summary>
-    private static void FWHTBatchStageInPlaceImpl(Index1D globalPairIdx,
-        ArrayView1D<float, Stride1D.Dense> data,
-        int halfSize)
-    {
-        int blockSize = halfSize * 2;
-        int block = globalPairIdx / halfSize;
-        int offset = globalPairIdx % halfSize;
-        int i = block * blockSize + offset;
-        int j = i + halfSize;
-
-        float a = data[i];
-        float b = data[j];
-        data[i] = a + b;
-        data[j] = a - b;
+        int offset = e % blockSize;
+        if (offset < halfSize)
+            dst[e] = src[e] + src[e + halfSize];   // "i" (lower-half) position
+        else
+            dst[e] = src[e - halfSize] - src[e];   // "j" (upper-half) position
     }
 }
