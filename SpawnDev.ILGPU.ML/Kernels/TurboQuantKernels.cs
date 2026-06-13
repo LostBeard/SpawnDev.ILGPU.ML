@@ -19,6 +19,13 @@ public class TurboQuantKernels
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
     private readonly FWHTKernel _fwht;
 
+    // Normalize is TWO kernels (one-store-per-thread, WebGL-TF-safe): compute the per-vector norm
+    // (one thread/vector, single norms[] store), then divide per element (one thread/element, single
+    // output[] store). The old single per-VECTOR kernel looped writing all d output elements from one
+    // thread — a d-store-per-thread shape that WebGL Transform-Feedback maps to vertex*storeCount+s, so
+    // only element 0 landed (silent garbage; same multi-store trap documented on FusedAttentionImpl).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _computeNormsKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int>? _normalizeKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -50,15 +57,20 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> norms,
         int numVecs, int d)
     {
+        // Pass 1: one thread per VECTOR — compute its L2 norm, single store to norms[vecIdx].
+        _computeNormsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(ComputeNormsImpl);
+        _computeNormsKernel(numVecs, input, norms, d);
+        // Pass 2: one thread per ELEMENT — divide by its vector's norm, single store to output[idx].
         _normalizeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int>(NormalizeImpl);
-        _normalizeKernel(numVecs, input, output, norms, d);
+            ArrayView1D<float, Stride1D.Dense>, int>(NormalizeElementsImpl);
+        _normalizeKernel(numVecs * d, input, output, norms, d);
     }
 
-    private static void NormalizeImpl(Index1D vecIdx,
+    // Pass 1: one thread per vector. Loops only READ input; single store to norms[vecIdx]. WebGL-safe.
+    private static void ComputeNormsImpl(Index1D vecIdx,
         ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> norms,
         int d)
     {
@@ -66,11 +78,20 @@ public class TurboQuantKernels
         float sumSq = 0f;
         for (int i = 0; i < d; i++)
             sumSq += input[offset + i] * input[offset + i];
-        float norm = MathF.Sqrt(sumSq);
-        norms[vecIdx] = norm;
+        norms[vecIdx] = MathF.Sqrt(sumSq);
+    }
+
+    // Pass 2: one thread per output element. Reads norms[vecIdx] (computed in pass 1); single store. WebGL-safe.
+    private static void NormalizeElementsImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> norms,
+        int d)
+    {
+        int vecIdx = idx / d;
+        float norm = norms[vecIdx];
         float invNorm = norm > 1e-12f ? 1f / norm : 0f;
-        for (int i = 0; i < d; i++)
-            output[offset + i] = input[offset + i] * invNorm;
+        output[idx] = input[idx] * invNorm;
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -632,21 +653,22 @@ public class TurboQuantKernels
         ArrayView1D<float, Stride1D.Dense> norms,
         int numVecs, int d)
     {
+        // One thread per ELEMENT, single store to output[idx] — same WebGL-TF-safe shape as Normalize
+        // pass 2. The old per-VECTOR form looped writing all d elements from one thread (multi-store),
+        // which WebGL TF collapses to element 0 only (silent garbage).
         _denormalizeKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int>(DenormalizeImpl);
-        _denormalizeKernel(numVecs, input, output, norms, d);
+        _denormalizeKernel(numVecs * d, input, output, norms, d);
     }
 
-    private static void DenormalizeImpl(Index1D vecIdx,
+    private static void DenormalizeImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> norms,
         int d)
     {
-        int offset = vecIdx * d;
-        float norm = norms[vecIdx];
-        for (int i = 0; i < d; i++)
-            output[offset + i] = input[offset + i] * norm;
+        int vecIdx = idx / d;
+        output[idx] = input[idx] * norms[vecIdx];
     }
 }
