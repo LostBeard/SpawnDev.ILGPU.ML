@@ -703,15 +703,17 @@ public class GraphExecutor : IDisposable
             node.Operator.Execute(ctx);
             if (VerboseLogging && nodeSw != null)
             {
-                _accelerator.Synchronize();
+                _accelerator.Flush();   // submit (4.12.0: Synchronize() throws on browser)
                 nodeSw.Stop();
                 Console.WriteLine($"[GraphExecutor]   -> {node.OpType} took {nodeSw.Elapsed.TotalMilliseconds:F0}ms");
                 Console.Out.Flush();
             }
 
-            // Flush GPU command buffer periodically (64 nodes between syncs)
+            // Flush GPU command buffer periodically (64 nodes between flushes).
+            // Flush() not Synchronize(): the intent is to submit the encoder, not block-wait;
+            // and Synchronize() throws on browser in 4.12.0 (submit+wait is desktop-only).
             if (nodeIdx > 0 && nodeIdx % 64 == 0)
-                _accelerator.Synchronize();
+                _accelerator.Flush();
 
             // Register outputs
             for (int i = 0; i < node.OutputNames.Length; i++)
@@ -763,8 +765,11 @@ public class GraphExecutor : IDisposable
             nodeIdx++;
         }
 
-        // Flush all dispatches before readback
-        _accelerator.Synchronize();
+        // Flush all dispatches before readback. Flush() (submit) not Synchronize() (submit+wait,
+        // which throws on browser in 4.12.0): Run() returns GPU tensor REFERENCES, and callers
+        // read them via the async readback path (CopyToHostAsync) which drains on its own; a
+        // desktop sync read also synchronizes implicitly, so no completion is lost here.
+        _accelerator.Flush();
 
         // Collect requested outputs
         var results = new Dictionary<string, Tensor>();

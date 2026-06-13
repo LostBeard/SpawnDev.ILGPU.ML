@@ -31,16 +31,16 @@ public abstract partial class MLTestBase
                 ew.Scale(bufB.View, bufA.View, bigSize, 1.0f);
             // Flush every 16 to match the inference pattern
             if (i > 0 && i % 16 == 0)
-                accelerator.Synchronize();
+                accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         }
-        accelerator.Synchronize(); // Final flush
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains) // Final flush
 
         Console.WriteLine($"[DiagMapAsync] 4 dispatches on {bigSize}-element buffers done, attempting CopyToHostAsync...");
 
         // Now try CopyToHostAsync on a SMALL fresh buffer
         var tinyData = new float[] { 1f, 2f, 3f, 4f };
         using var tinyBuf = accelerator.Allocate1D(tinyData);
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         var result = await tinyBuf.CopyToHostAsync<float>(0, 4);
         Console.WriteLine($"[DiagMapAsync] CopyToHostAsync succeeded: {result[0]}, {result[1]}, {result[2]}, {result[3]}");
 
@@ -58,11 +58,11 @@ public abstract partial class MLTestBase
         using var convOut = accelerator.Allocate1D<float>(outC * outH2 * outW2);
         conv.Forward(convIn.View, convWeight.View, convBias.View, convOut.View,
             inC, inH, inW, outC, kH, kW, 1, pad);
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         Console.WriteLine("[DiagMapAsync] Conv2D dispatched, testing MapAsync...");
         var convTestData = new float[] { 99f, 98f, 97f, 96f };
         using var convTestBuf = accelerator.Allocate1D(convTestData);
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         var convResult = await convTestBuf.CopyToHostAsync<float>(0, 4);
         Console.WriteLine($"[DiagMapAsync] Conv2D + MapAsync: {convResult[0]}, {convResult[1]}, {convResult[2]}, {convResult[3]}");
 
@@ -77,14 +77,14 @@ public abstract partial class MLTestBase
         using var padOutput = accelerator.Allocate1D<float>(padInC * padOutH * padOutW);
         var padKernel = new Kernels.PadKernel(accelerator);
         padKernel.Forward(padInput.View, padOutput.View, padInShape, padPads, 2, 0f); // mode=2=reflect
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         Console.WriteLine("[DiagMapAsync] Pad done, running Conv on padded output...");
         conv.Forward(padOutput.View, convWeight.View, convBias.View, convOut.View,
             padInC, padOutH, padOutW, outC, kH, kW, 1, 0); // no padding in conv, pad already applied
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         Console.WriteLine("[DiagMapAsync] Pad→Conv done, testing MapAsync...");
         using var padConvTestBuf = accelerator.Allocate1D(new float[] { 77f, 78f, 79f, 80f });
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         var padConvResult = await padConvTestBuf.CopyToHostAsync<float>(0, 4);
         Console.WriteLine($"[DiagMapAsync] Pad→Conv + MapAsync: {padConvResult[0]}, {padConvResult[1]}");
     });
@@ -121,9 +121,9 @@ public abstract partial class MLTestBase
         {
             if (i % 2 == 0) ew.Scale(bufA.View, bufB.View, 1024, 1.0f);
             else ew.Scale(bufB.View, bufA.View, 1024, 1.0f);
-            if (i % 16 == 0) accelerator.Synchronize();
+            if (i % 16 == 0) accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
         }
-        accelerator.Synchronize();
+        accelerator.Flush();   // 4.12.0: submit (Synchronize() throws on browser; readback via CopyToHostAsync drains)
 
         // Try CopyToHostAsync after 66 + 60 = 126 total dispatches
         Console.WriteLine("[DiagMapAsync2] 126 total dispatches, attempting CopyToHostAsync...");

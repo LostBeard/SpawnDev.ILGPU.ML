@@ -1433,8 +1433,11 @@ public class InferenceSession : IDisposable
                         registry.Transpose.Transpose(temp.View, final.Data,
                             new[] { shape[1], shape[0] }, new[] { 1, 0 });
                         // Flush so the transpose is no longer pending in a command encoder.
-                        accelerator.Synchronize();
-                        // On the BROWSER backends Synchronize() only FLUSHES — it cannot drain
+                        // Flush() (sync submit) is the 4.12.0 contract here — NOT Synchronize(),
+                        // which now throws on browser (submit+wait is desktop-only). The intent was
+                        // always submit-only, as the note below describes.
+                        accelerator.Flush();
+                        // On the BROWSER backends this only FLUSHES — it cannot drain
                         // in-flight work on the single Blazor thread, so the transpose may still
                         // be queued and the temp buffer must OUTLIVE this sync entry point.
                         // Disposing it here made the deferred Wasm dispatch read a freed
