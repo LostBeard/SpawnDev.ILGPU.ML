@@ -233,8 +233,13 @@ public abstract partial class MLTestBase
         var cache = new SpawnDev.ILGPU.ML.Training.QuantizedKVCache(
             accelerator, numLayers: 1, numHeads: 1, headDim: 64, maxSeqLen: 32);
 
-        // Append 16 tokens
+        // Append 16 tokens. AppendKV dispatches quantize kernels that READ kBuf/vBuf; on WebGPU
+        // those dispatches are batched and not submitted until a flush, so the input buffers must
+        // stay alive until then. Keep them in a list and dispose only after SynchronizeAsync —
+        // a `using var` that frees them at end-of-iteration triggers "buffer used in submit while
+        // destroyed" (the exact dispose-before-flush footgun in CLAUDE.md).
         var rng = new Random(42);
+        var inputBufs = new List<IDisposable>();
         for (int t = 0; t < 16; t++)
         {
             var kData = new float[64];
@@ -244,24 +249,23 @@ public abstract partial class MLTestBase
                 kData[i] = (float)(rng.NextDouble() * 2 - 1);
                 vData[i] = (float)(rng.NextDouble() * 2 - 1);
             }
-            using var kBuf = accelerator.Allocate1D(kData);
-            using var vBuf = accelerator.Allocate1D(vData);
+            var kBuf = accelerator.Allocate1D(kData);
+            var vBuf = accelerator.Allocate1D(vData);
+            inputBufs.Add(kBuf);
+            inputBufs.Add(vBuf);
             cache.AppendKV(0, 0, kBuf.View, vBuf.View);
             cache.IncrementSeqLen();
         }
+        await accelerator.SynchronizeAsync();
+        foreach (var b in inputBufs) b.Dispose();
 
         float ratio = cache.CompressionRatio;
-        long compressed = cache.CompressedMemoryBytes;
-        long uncompressed = cache.UncompressedMemoryBytes;
-
-        Console.WriteLine($"[TurboQuant] KV cache: {uncompressed} bytes → {compressed} bytes, ratio={ratio:F1}x");
 
         // 4-bit should give ~4-8x compression depending on overhead
         if (ratio < 2f)
             throw new Exception($"Compression ratio {ratio:F1}x too low — expected ≥ 2x");
 
         cache.Dispose();
-        await Task.CompletedTask;
     });
 
     // ═══════════════════════════════════════════════════════════
