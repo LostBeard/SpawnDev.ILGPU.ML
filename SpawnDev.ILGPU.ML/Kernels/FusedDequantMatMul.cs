@@ -64,7 +64,7 @@ public class FusedDequantMatMul : IDisposable
     private const int GemvGroupSize = 64;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K;
 
     // Params buffers cached per (M,K,N). Never disposed mid-session: a WebGPU dispatch
     // that referenced the buffer may still be pending in the command encoder, and
@@ -126,6 +126,12 @@ public class FusedDequantMatMul : IDisposable
                         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_KImpl);
                     _gemvQ4_K(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
+                case GGMLType.Q6_K:
+                    _gemvQ6_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ6_KImpl);
+                    _gemvQ6_K(gemvConfig, input, intView, output, paramsBuf.View);
                     return;
             }
         }
@@ -303,6 +309,73 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Q6_K GEMV (M==1): same group-per-column + coalesced strided-k + shared-mem
+    //  reduction as Q4_K, using the per-element DecodeQ6KElement layout inverse.
+    // ─────────────────────────────────────────────────────────────────────────
+    private static void GemvDequantQ6_KImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int tid = Group.IdxX;
+
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 210;
+            int rowBase = n * bytesPerRow;
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeQ6KElement(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="col"/> of a Q6_K-quantized row whose blocks start at
+    /// byte <paramref name="rowByteBase"/>. The single-element inverse of the FusedDequantQ6_KImpl block
+    /// layout (210B/256: [ql:128][qh:64][scales:16×int8][d:fp16@208], two 128-elem halves). Used by the
+    /// M==1 GEMV. PURE INTEGER ARITHMETIC + the branchless HalfToFloatFinite (no branches/selects), same
+    /// WebGL-emitter discipline as DecodeQ4KElement.</summary>
+    internal static float DecodeQ6KElement(
+        ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int sbOff = rowByteBase + (col >> 8) * 210;
+        int r = col & 255;
+        int half = r >> 7;           // 0 or 1 (which 128-element half)
+        int rh = r & 127;            // 0..127 within the half
+        int variant = rh >> 5;       // 0..3 -> el l / l+32 / l+64 / l+96
+        int l = rh & 31;             // 0..31
+
+        int qlBase = sbOff + 64 * half;
+        int qhBase = sbOff + 128 + 32 * half;
+        int scBase = sbOff + 192 + 8 * half;
+
+        // ql index: variant 0,2 use byte l; variant 1,3 use byte l+32.
+        int qlByte = ReadByte(w, qlBase + l + (variant & 1) * 32);
+        int qh = ReadByte(w, qhBase + l);
+        // nibble: variant 0,1 -> low nibble; variant 2,3 -> high nibble.
+        int isHigh = variant >> 1;
+        int qlNib = isHigh == 1 ? (qlByte >> 4) : (qlByte & 0xF);
+        // qh bits: variant v -> bits 2v..2v+1.
+        int qhBits = (qh >> (2 * variant)) & 3;
+        int q = ((qlNib | (qhBits << 4)) - 32);
+
+        int sc = SignExtend8(ReadByte(w, scBase + (l >> 4) + 2 * variant));
+        float d = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+        return d * sc * q;
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q4_K-quantized row whose
