@@ -116,7 +116,15 @@ public class FusedDequantMatMul : IDisposable
 
         // M==1 GEMV: coalesced group-per-column path (see field comment). Per-type; types without a
         // GEMV kernel yet fall through to the general M*N kernel below (correct, just not coalesced).
-        if (M == 1)
+        //
+        // WebGL EXCLUDED: the GEMV uses SharedMemory.Allocate + Group.Barrier (a tree reduction), and
+        // WebGL (GLSL ES 3.0 Transform-Feedback, vertex-shader path) has NO workgroup shared memory and
+        // NO barriers - a hard capability wall, not an emitter quirk. The GLSL codegen throws
+        // UnsupportedKernelFeatureException at compile for exactly this (confirmed by Geordi, the ILGPU
+        // WebGL emitter owner, 2026-06-13). WebGPU has native var<workgroup> + workgroupBarrier(), so the
+        // GEMV runs there. On WebGL, M==1 falls through to the general per-element kernel below
+        // (uncoalesced but correct; WebGL is not the perf target for a 12B GGUF model).
+        if (M == 1 && _accelerator.AcceleratorType != AcceleratorType.WebGL)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             switch (type)
