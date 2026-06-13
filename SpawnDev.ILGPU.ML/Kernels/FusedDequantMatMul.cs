@@ -47,6 +47,25 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K;
 
+    // ── M=1 (GEMV) coalesced path ──
+    // At seq=1 decode, M=1, so the general one-thread-per-output-element kernel above launches only N
+    // threads, each STREAMING an entire weight row — consecutive threads read consecutive rows (strided
+    // by bytesPerRow), so the warp's loads are uncoalesced (~32x bandwidth waste), and N threads with no
+    // K-parallelism leaves the GPU under-occupied. MEASURED: this is 96.9% of gemma4:12b decode time
+    // (~25ms per MLP down-proj at ~0.26% of card bandwidth). The GEMV kernels below assign a GROUP of
+    // GemvGroupSize threads to ONE output column n; thread tid strides k=tid,tid+G,... so consecutive
+    // lanes read consecutive k = consecutive weight bytes (coalesced), then a shared-memory tree reduction
+    // sums the per-thread partials. Same per-type decode (DecodeQ4KElement etc.) — only the parallel shape
+    // changes — so the M>1 oracle correctness carries over. Dispatched only when M==1; M>1 keeps the GEMM.
+    // Group size is 64 = the LOWEST max-group-per-dim across our backends (the ILGPU CPU accelerator caps
+    // groupDim at 64; WebGPU/WebGL allow 256, CUDA 1024). A larger group would throw
+    // "Invalid group dimensions (128,...) exceeds maximum (64,64,64)" on CPU. 64 = 2 warps, still fully
+    // coalesced per warp and ample K-parallelism; must stay a power of two for the tree reduction.
+    private const int GemvGroupSize = 64;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K;
+
     // Params buffers cached per (M,K,N). Never disposed mid-session: a WebGPU dispatch
     // that referenced the buffer may still be pending in the command encoder, and
     // disposing before the flush makes the GPU read freed memory (see CLAUDE.md
@@ -94,6 +113,22 @@ public class FusedDequantMatMul : IDisposable
         // All backends read bytes from packed int words (see class doc). The upload
         // must be padded to a 4-byte multiple or the tail bytes vanish in the Cast.
         var intView = weightQuant.Cast<byte, int>();
+
+        // M==1 GEMV: coalesced group-per-column path (see field comment). Per-type; types without a
+        // GEMV kernel yet fall through to the general M*N kernel below (correct, just not coalesced).
+        if (M == 1)
+        {
+            var gemvConfig = new KernelConfig(N, GemvGroupSize);
+            switch (type)
+            {
+                case GGMLType.Q4_K:
+                    _gemvQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_KImpl);
+                    _gemvQ4_K(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
+            }
+        }
 
         switch (type)
         {
@@ -230,6 +265,44 @@ public class FusedDequantMatMul : IDisposable
         for (int k = 0; k < K; k++)
             sum += input[inBase + k] * DecodeQ4KElement(w, rowBase, k);
         output[idx] = sum;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Q4_K GEMV (M==1): one thread GROUP per output column n. Thread tid accumulates
+    //  input[k]·W[n,k] over k = tid, tid+G, tid+2G, … (consecutive lanes → consecutive k →
+    //  coalesced weight bytes), then a shared-memory tree reduction sums the partials → output[n].
+    //  Reuses DecodeQ4KElement (same layout inverse as the M>1 kernel), so GPU==CPU oracle holds.
+    //  M is 1 by construction (GEMV dispatch), so input base is 0.
+    // ─────────────────────────────────────────────────────────────────────────
+    private static void GemvDequantQ4_KImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;       // one group per output column
+        int tid = Group.IdxX;    // 0..GemvGroupSize-1
+
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 144;
+            int rowBase = n * bytesPerRow;
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeQ4KElement(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+
+        // Tree reduction over the group (GemvGroupSize is a power of two).
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q4_K-quantized row whose

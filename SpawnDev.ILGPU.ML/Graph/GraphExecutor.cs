@@ -227,6 +227,19 @@ public class GraphExecutor : IDisposable
     /// Used to decide whether those readbacks are even needed downstream (vs pure-data waste).</summary>
     public static List<string> LastRunReadbackNames = new();
 
+    /// <summary>DIAGNOSTIC: total wall-clock ms of the entire most-recent RunAsync (executor-internal,
+    /// excludes the session's recompile and the caller's logits readback). Combined with
+    /// <see cref="LastRunReadbackMs"/> and <see cref="LastRunSyncDrainMs"/> this partitions per-token
+    /// decode time into readback round-trips / periodic GPU sync-drains / (dispatch+CPU+alloc) residual.
+    /// Reset per RunAsync.</summary>
+    public static double LastRunTotalMs;
+    /// <summary>DIAGNOSTIC: count of the periodic <see cref="SyncIntervalNodes"/> command-buffer drains
+    /// plus the one final drain in the most recent RunAsync (each an <c>await SynchronizeAsync()</c> that
+    /// forces GPU completion). These are NOT the shape readbacks — they carry no host copy. Reset per RunAsync.</summary>
+    public static int LastRunSyncDrainCount;
+    /// <summary>DIAGNOSTIC: total wall-clock ms spent in those periodic + final GPU sync-drains. Reset per RunAsync.</summary>
+    public static double LastRunSyncDrainMs;
+
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
         Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null,
@@ -777,6 +790,10 @@ public class GraphExecutor : IDisposable
         LastRunReadbackCount = 0;
         LastRunReadbackMs = 0;
         LastRunReadbackNames.Clear();
+        LastRunSyncDrainCount = 0;
+        LastRunSyncDrainMs = 0;
+        var _runSw = System.Diagnostics.Stopwatch.StartNew();
+        var _drainSw = new System.Diagnostics.Stopwatch();
         var tensors = new Dictionary<string, Tensor>();
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
@@ -1448,6 +1465,7 @@ public class GraphExecutor : IDisposable
             // latency dominates large-graph forward time on WebGPU/Blazor.
             if (nodeIdx % SyncIntervalNodes == 0)
             {
+                _drainSw.Restart();
                 try { await _accelerator.SynchronizeAsync(); }
                 catch (Exception syncEx)
                 {
@@ -1459,6 +1477,7 @@ public class GraphExecutor : IDisposable
                     throw new Exception(
                         $"[GE node-{nodeIdx} sync] {syncEx.Message} || last {tailLen} ops: {tail}");
                 }
+                _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
                 // Now safe to return deferred buffers — GPU has finished reading them
                 foreach (var t in pendingReleases)
                     _pool.Return(t);
@@ -1472,6 +1491,7 @@ public class GraphExecutor : IDisposable
 
         // Final yield + sync
         await Task.Yield();
+        _drainSw.Restart();
         try { await _accelerator.SynchronizeAsync(); }
         catch (Exception syncEx)
         {
@@ -1481,6 +1501,7 @@ public class GraphExecutor : IDisposable
             throw new Exception(
                 $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || last {tailLen} ops: {tail}");
         }
+        _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
         // Release any remaining deferred buffers
         foreach (var t in pendingReleases)
             _pool.Return(t);
@@ -1550,6 +1571,7 @@ public class GraphExecutor : IDisposable
             }
         }
 
+        _runSw.Stop(); LastRunTotalMs = _runSw.Elapsed.TotalMilliseconds;
         return results;
     }
 

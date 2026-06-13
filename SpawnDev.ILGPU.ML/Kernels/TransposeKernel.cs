@@ -21,12 +21,19 @@ public class TransposeKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _transposeKernel;
 
-    // Per-call fresh paramsBuf - eliminates the shared-state race under async dispatch
-    // on Wasm where a queued dispatch could read paramsBuf.SharedBuffer AFTER a subsequent
-    // CopyFromCPU overwrites it. LOAD-BEARING for StyleMosaic Wasm even at rc.16 dispatcher
-    // - removing this workaround causes StyleMosaic to hang (verified 2026-05-04 bisect).
-    // Same pattern as PadKernel, Conv2DKernel, PoolingKernels, NormalizationKernels.
+    // Content-keyed paramsBuf cache (key = the packed [rank,shape,perm,inStrides,outStrides] ints).
+    // The params for a given (shape,perm) are CONSTANT, so this allocates + uploads the tiny params
+    // buffer ONCE per distinct transpose configuration and reuses it on every later call with the same
+    // shape/perm. This kills a per-call `Allocate1D` (cudaMalloc) + synchronous `CopyFromCPU` that was
+    // forcing a mid-layer device sync — on gemma4 seq=1 decode the 192 per-token transposes were 98.9%
+    // of CPU dispatch time (~1.6s/token), because each malloc-sync blocked on the preceding projection
+    // matmul. Each cache entry is written exactly ONCE and never overwritten, so it PRESERVES the Wasm
+    // safety invariant the old per-call-fresh code guaranteed (a queued dispatch can never read a buffer
+    // that a later CopyFromCPU has clobbered — there is no later CopyFromCPU on a cache hit). Same
+    // per-call-alloc pathology exists in PadKernel/Conv2DKernel/PoolingKernels/NormalizationKernels;
+    // they're not on the gemma4 decode path but want the same treatment.
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _allParamsBufs = new();
+    private readonly Dictionary<string, MemoryBuffer1D<int, Stride1D.Dense>> _paramsCache = new();
 
     public TransposeKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -100,7 +107,6 @@ public class TransposeKernel : IDisposable
         for (int i = 0; i < rank; i++) totalElements *= inputShape[i];
 
         // Pack params: [rank, inShape..., perm..., inStrides..., outStrides...]
-        // Fresh allocation per call - avoids the cross-call SharedBuffer race on Wasm.
         int paramsSize = 1 + 4 * rank;
         var paramsData = new int[paramsSize];
         paramsData[0] = rank;
@@ -108,9 +114,19 @@ public class TransposeKernel : IDisposable
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = perm[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = inStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 3 * rank + i] = outStrides[i];
-        var paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
-        paramsBuf.View.CopyFromCPU(paramsData);
-        _allParamsBufs.Add(paramsBuf);
+
+        // Cache the GPU params buffer by content — the (shape,perm) for a given transpose node is
+        // constant across decode steps, so this allocates + uploads once and reuses thereafter,
+        // eliminating the per-call cudaMalloc + sync HtoD that dominated gemma4 decode. Each buffer
+        // is written exactly once on its miss and never overwritten (Wasm-safe; see field comment).
+        var key = string.Join(",", paramsData);
+        if (!_paramsCache.TryGetValue(key, out var paramsBuf))
+        {
+            paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
+            paramsBuf.View.CopyFromCPU(paramsData);
+            _paramsCache[key] = paramsBuf;
+            _allParamsBufs.Add(paramsBuf);
+        }
 
         _transposeKernel!(totalElements, input, output, paramsBuf.View);
     }

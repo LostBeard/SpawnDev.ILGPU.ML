@@ -154,6 +154,16 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         Console.WriteLine($"[KV-cache decode] {nLayers} layers, maxSeq={ids.Count + maxNew + 8}");
     }
 
+    // GGUF_NODE_TIMING=1 → per-node Execute timing (decomposes the residual: which ops eat the CPU
+    // dispatch time). Dumped after the last (steady-state seq=1) step, aggregated by op type.
+    bool nodeTiming = Environment.GetEnvironmentVariable("GGUF_NODE_TIMING") == "1";
+    if (nodeTiming) SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new();
+    // GGUF_PEROP_SYNC=1 with node timing → each node's captured time includes its OWN GPU drain,
+    // giving TRUE per-op GPU compute attribution (vs the sync-blocking attribution of the default
+    // path, where async kernel work surfaces at the next sync point, not its real producer).
+    if (nodeTiming && Environment.GetEnvironmentVariable("GGUF_PEROP_SYNC") == "1")
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true;
+
     var gen = new List<int>();
     var sw = Stopwatch.StartNew();
     int[] stepIds = ids.ToArray();  // KV path: prefill = whole prompt, then 1 token/step
@@ -163,10 +173,12 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         var idf = cur.Select(i => (float)i).ToArray();
         using var inBuf = accelerator.Allocate1D(idf);
         var input = new Tensor(inBuf.View, new[] { 1, cur.Length }, "input_ids");
+        var stepSw = Stopwatch.StartNew();
         var outputs = useKV
             ? await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = input })
             : await session.RunAsync(new Dictionary<string, Tensor> { ["input_ids"] = input });
         await accelerator.SynchronizeAsync();
+        stepSw.Stop();
         var logits = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
         int vocab = logits.Shape[^1];
         int seqOut = logits.ElementCount / vocab;  // KV decode step => 1; prefill/full => cur.Length
@@ -175,11 +187,46 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         int last = (seqOut - 1) * vocab, arg = 0; float best = host[last];
         for (int v = 1; v < vocab; v++) if (host[last + v] > best) { best = host[last + v]; arg = v; }
         gen.Add(arg);
-        Console.WriteLine($"  step {step,2}: token {arg,7} '{tok.Decode(new[] { arg })}' (logit {best:F3})");
+        // PERF BREAKDOWN (Rule 4 measurement): partition the step into executor-total / readback round-trips /
+        // GPU sync-drains / recompile, so we KNOW where decode time goes instead of guessing. The residual
+        // (execMs - readbackMs - drainMs) is pure per-node dispatch + CPU + buffer-alloc cost.
+        double execMs = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunTotalMs;
+        double rbMs = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunReadbackMs;
+        int rbCount = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunReadbackCount;
+        double drainMs = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunSyncDrainMs;
+        int drainCount = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunSyncDrainCount;
+        double recompMs = session.LastRecompileMs;
+        double residMs = execMs - rbMs - drainMs;
+        Console.WriteLine($"  step {step,2}: token {arg,7} '{tok.Decode(new[] { arg })}' (logit {best:F3})  "
+            + $"| seq={cur.Length} wall={stepSw.Elapsed.TotalMilliseconds,7:F1}ms exec={execMs,7:F1} "
+            + $"readback={rbMs,6:F1}({rbCount}) drain={drainMs,6:F1}({drainCount}) recompile={recompMs,6:F1} "
+            + $"residual={residMs,7:F1} bufs={session.LastExecutorBufferCount}");
         if (arg == turnC || arg == eos) { Console.WriteLine("  [stop token]"); break; }
         stepIds = new[] { arg };  // decode: feed only the new token (KV path)
     }
     sw.Stop();
+
+    if (nodeTiming && SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs is { } nt && nt.Count > 0)
+    {
+        // Key format: "{idx:D3}_{OpType}_{outName}". Aggregate by op type (the lever-relevant axis).
+        var byOp = new Dictionary<string, (double ms, int n)>();
+        foreach (var (k, ms) in nt)
+        {
+            var parts = k.Split('_', 3);
+            string op = parts.Length >= 2 ? parts[1] : k;
+            var cur = byOp.GetValueOrDefault(op, (0, 0));
+            byOp[op] = (cur.ms + ms, cur.n + 1);
+        }
+        double totalMs = nt.Values.Sum();
+        Console.WriteLine($"\n=== PER-NODE EXECUTE TIMING (last steady-state step; {nt.Count} nodes, sum {totalMs:F1}ms) ===");
+        Console.WriteLine("  by op type (sum ms desc):");
+        foreach (var (op, v) in byOp.OrderByDescending(x => x.Value.ms))
+            Console.WriteLine($"    {op,-22} sum={v.ms,8:F1}ms  n={v.n,4}  avg={v.ms / v.n,6:F3}ms  ({100 * v.ms / totalMs,5:F1}%)");
+        Console.WriteLine("  top 15 individual nodes:");
+        foreach (var (k, ms) in nt.OrderByDescending(x => x.Value).Take(15))
+            Console.WriteLine($"    {ms,8:F3}ms  {k}");
+    }
+
     kvCache?.Dispose();
     Console.WriteLine($"\n=== GENERATED ({gen.Count} tokens, {sw.Elapsed.TotalSeconds:F1}s) ===");
     Console.WriteLine(tok.Decode(gen.ToArray()));
