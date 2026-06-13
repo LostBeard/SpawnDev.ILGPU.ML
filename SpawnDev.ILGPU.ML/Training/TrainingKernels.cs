@@ -11,8 +11,20 @@ public class TrainingKernels
 {
     private readonly Accelerator _accelerator;
 
+    // Softmax-CE forward is split into TWO single-store-per-thread kernels: a per-sample stats
+    // kernel (writes max + invSum + loss, one element each) and a per-element probs kernel. The old
+    // one-thread-per-sample kernel looped to write all C probs = multi-store-per-thread, which
+    // silently corrupts on the WebGL Transform-Feedback path (only one store per thread lands, so
+    // probs did not sum to 1). See the matching split in TurboQuantKernels.Normalize.
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _softmaxCrossEntropyForwardKernel;
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int>? _softmaxStatsKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _softmaxProbsKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _softmaxMax;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _softmaxInvSum;
+    private int _softmaxStatsCapacity;
+    private readonly System.Collections.Generic.List<MemoryBuffer1D<float, Stride1D.Dense>> _oldSoftmaxBufs = new();
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int>? _softmaxCrossEntropyBackwardKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -46,18 +58,41 @@ public class TrainingKernels
         ArrayView1D<int, Stride1D.Dense> targets,
         int batchSize, int numClasses)
     {
-        _softmaxCrossEntropyForwardKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        // Grow-and-retain per-sample scratch for max + invSum (never freed mid-flight; reused).
+        if (_softmaxMax == null || _softmaxStatsCapacity < batchSize)
+        {
+            if (_softmaxMax != null) _oldSoftmaxBufs.Add(_softmaxMax);
+            if (_softmaxInvSum != null) _oldSoftmaxBufs.Add(_softmaxInvSum);
+            _softmaxMax = _accelerator.Allocate1D<float>(batchSize);
+            _softmaxInvSum = _accelerator.Allocate1D<float>(batchSize);
+            _softmaxStatsCapacity = batchSize;
+        }
+
+        // Kernel A: one thread per sample → max, invSum, loss (one store each).
+        _softmaxStatsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
-            int, int>(SoftmaxCEForwardImpl);
-        _softmaxCrossEntropyForwardKernel(batchSize, logits, probs, loss, targets, batchSize, numClasses);
+            ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int>(SoftmaxCEStatsImpl);
+        _softmaxStatsKernel(batchSize, logits, loss, targets,
+            _softmaxMax.View, _softmaxInvSum.View, batchSize, numClasses);
+
+        // Kernel B: one thread per (sample, class) element → probs[idx] (one store).
+        _softmaxProbsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(SoftmaxCEProbsImpl);
+        _softmaxProbsKernel(batchSize * numClasses, logits, probs,
+            _softmaxMax.View, _softmaxInvSum.View, numClasses);
     }
 
-    private static void SoftmaxCEForwardImpl(Index1D batch,
+    // One thread per SAMPLE: reduce to max + invSum (sum of exp) and the cross-entropy loss.
+    // Each thread writes ONE element to each of maxOut / invSumOut / loss — never a per-class loop
+    // into a shared output, so it is safe on the WebGL Transform-Feedback path.
+    private static void SoftmaxCEStatsImpl(Index1D batch,
         ArrayView1D<float, Stride1D.Dense> logits,
-        ArrayView1D<float, Stride1D.Dense> probs,
         ArrayView1D<float, Stride1D.Dense> loss,
         ArrayView1D<int, Stride1D.Dense> targets,
+        ArrayView1D<float, Stride1D.Dense> maxOut,
+        ArrayView1D<float, Stride1D.Dense> invSumOut,
         int B, int C)
     {
         int offset = batch * C;
@@ -70,24 +105,31 @@ public class TrainingKernels
             if (v > maxVal) maxVal = v;
         }
 
-        // Compute exp and sum
+        // Sum of exp(logits - max)
         float sumExp = 0f;
         for (int c = 0; c < C; c++)
-        {
-            float e = MathF.Exp(logits[offset + c] - maxVal);
-            probs[offset + c] = e;
-            sumExp += e;
-        }
+            sumExp += MathF.Exp(logits[offset + c] - maxVal);
 
-        // Normalize to get probabilities
         float invSum = 1f / sumExp;
-        for (int c = 0; c < C; c++)
-            probs[offset + c] *= invSum;
+        maxOut[batch] = maxVal;
+        invSumOut[batch] = invSum;
 
-        // Cross-entropy loss: -log(prob[target])
+        // Cross-entropy loss: -log(prob[target]); prob[target] = exp(logit_t - max) * invSum
         int target = targets[batch];
-        float prob = probs[offset + target];
+        float prob = MathF.Exp(logits[offset + target] - maxVal) * invSum;
         loss[batch] = -MathF.Log(prob + 1e-10f); // epsilon to prevent log(0)
+    }
+
+    // One thread per (sample, class) element: write the single normalized probability.
+    private static void SoftmaxCEProbsImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> logits,
+        ArrayView1D<float, Stride1D.Dense> probs,
+        ArrayView1D<float, Stride1D.Dense> maxArr,
+        ArrayView1D<float, Stride1D.Dense> invSumArr,
+        int C)
+    {
+        int batch = idx / C;
+        probs[idx] = MathF.Exp(logits[idx] - maxArr[batch]) * invSumArr[batch];
     }
 
     /// <summary>
