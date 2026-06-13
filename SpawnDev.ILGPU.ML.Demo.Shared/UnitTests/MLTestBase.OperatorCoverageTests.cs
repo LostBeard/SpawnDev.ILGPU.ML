@@ -2643,9 +2643,20 @@ public abstract partial class MLTestBase
         reg.Resolve("TopK")!.Execute(ctx);
         await accelerator.SynchronizeAsync();
         var vals = await valBuf.CopyToHostAsync<float>(0, 3);
-        // Top 3: 9, 6, 5
-        if (vals[0] != 9f) throw new Exception($"TopK expected 9, got {vals[0]}");
-        Console.WriteLine($"[TopK] top3: {vals[0]},{vals[1]},{vals[2]} — PASS");
+        var idxs = await idxBuf.CopyToHostAsync<float>(0, 3);
+        // Top 3 of {3,1,4,1,5,9,2,6}: values 9,6,5 at indices 5,7,4.
+        // Assert ALL k slots (not just slot 0): the old one-thread-per-row kernel wrote all k slots
+        // per thread (multi-store), which silently dropped slots 1..k-1 on WebGL Transform-Feedback.
+        // Checking only vals[0] hid that — assert the full ranking AND indices.
+        float[] expV = { 9f, 6f, 5f };
+        float[] expI = { 5f, 7f, 4f };
+        for (int i = 0; i < 3; i++)
+        {
+            if (vals[i] != expV[i])
+                throw new Exception($"TopK value[{i}] expected {expV[i]}, got {vals[i]} (full: {vals[0]},{vals[1]},{vals[2]})");
+            if (idxs[i] != expI[i])
+                throw new Exception($"TopK index[{i}] expected {expI[i]}, got {idxs[i]} (full: {idxs[0]},{idxs[1]},{idxs[2]})");
+        }
     });
 
     // ── Sequence/Optional/String pass-through operators ──

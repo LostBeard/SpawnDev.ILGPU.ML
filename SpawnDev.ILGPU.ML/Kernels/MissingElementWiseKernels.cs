@@ -249,47 +249,71 @@ public class MissingElementWiseKernels : IDisposable
     /// Input: [rows, cols], Output values: [rows, K], Output indices: [rows, K]
     /// Uses simple selection (fine for K ≤ ~50, which covers all ML use cases).
     /// </summary>
-    // Indices stored as float to avoid Wasm Int32Array alignment issues; caller gets float-cast ints
-    private static void TopKImpl(Index1D rowIdx,
+    // Indices stored as float to avoid Wasm Int32Array alignment issues; caller gets float-cast ints.
+    //
+    // ONE thread per OUTPUT slot, each writing EXACTLY ONE element at its OWN index. The previous
+    // version was one-thread-per-row writing all k slots in a loop — multi-store-per-thread, which
+    // silently corrupts on the WebGL Transform-Feedback path (a vertex captures only one output, AND
+    // only at its own vertex index — no scatter). So the dispatch is rows*k threads (thread g owns
+    // output slot g) and each thread finds its (row, ki) result SELF-CONTAINED — no cross-thread/
+    // cross-slot reads — via ki+1 rounds of "largest element strictly below the previous round's
+    // pick" under a strict total order (value descending, index ascending on ties). That order makes
+    // duplicate values deterministic and matches the old greedy+dedup result on all backends.
+    private static void TopKStageImpl(Index1D g,
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> outputValues,
         ArrayView1D<float, Stride1D.Dense> outputIndices,
         int cols, int k)
     {
-        int rowStart = rowIdx * cols;
-        int outStart = rowIdx * k;
+        int row = g / k;
+        int ki = g % k;
+        int rowStart = row * cols;
 
-        // Simple O(n*k) selection — fine for small k
-        for (int ki = 0; ki < k; ki++)
+        // Round 0 finds the global max; each later round finds the largest element strictly below
+        // the previous round's pick. After ki+1 rounds, (bestVal, bestIdx) is the ki-th largest
+        // (0-indexed). Strict order is value descending, index ascending on ties; using `v > bestVal`
+        // (strict) with ascending-c iteration keeps the lowest index on a tie automatically.
+        //
+        // Deliberately written with ONLY the constructs proven to run correctly on the interpreted
+        // ILGPU Wasm backend: a float `-inf` accumulator plus `if (v > bestVal)`. Combining a `bool`
+        // local guard (`if (isBelow) { ... }`) with a nested `if (bestIdx < 0) ... else if ...`
+        // selection mis-executes on that backend (the body never fires → all -inf), even though each
+        // construct works in isolation — so the inner selection is kept flat: one `if (v > bestVal)`.
+        float bestVal = float.NegativeInfinity;
+        int bestIdx = 0;
+        for (int c = 0; c < cols; c++)
         {
-            float bestVal = float.NegativeInfinity;
-            int bestIdx = 0;
+            float v = input[rowStart + c];
+            if (v > bestVal) { bestVal = v; bestIdx = c; }
+        }
 
+        for (int r = 1; r <= ki; r++)
+        {
+            float prevVal = bestVal;
+            int prevIdx = bestIdx;
+            bestVal = float.NegativeInfinity;
+            bestIdx = 0;
             for (int c = 0; c < cols; c++)
             {
-                float val = input[rowStart + c];
-                if (val > bestVal)
+                float v = input[rowStart + c];
+                // Candidate must be strictly below (prevVal, prevIdx): either a smaller value, or
+                // the same value at a higher index. Two flat branches, each a single `if (v > bestVal)`.
+                if (v < prevVal)
                 {
-                    bool alreadySelected = false;
-                    for (int prev = 0; prev < ki; prev++)
+                    if (v > bestVal) { bestVal = v; bestIdx = c; }
+                }
+                else if (v == prevVal)
+                {
+                    if (c > prevIdx)
                     {
-                        if ((int)outputIndices[outStart + prev] == c)
-                        {
-                            alreadySelected = true;
-                            break;
-                        }
-                    }
-                    if (!alreadySelected)
-                    {
-                        bestVal = val;
-                        bestIdx = c;
+                        if (v > bestVal) { bestVal = v; bestIdx = c; }
                     }
                 }
             }
-
-            outputValues[outStart + ki] = bestVal;
-            outputIndices[outStart + ki] = (float)bestIdx;
         }
+
+        outputValues[g] = bestVal;
+        outputIndices[g] = (float)bestIdx;
     }
 
     public void TopK(
@@ -302,7 +326,7 @@ public class MissingElementWiseKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
-            int, int>(TopKImpl);
+            int, int>(TopKStageImpl);
 
         ArrayView1D<float, Stride1D.Dense> idxView;
         if (outputIndices.Length >= rows * k)
@@ -320,7 +344,10 @@ public class MissingElementWiseKernels : IDisposable
             }
             idxView = _topKIdxBuf.View;
         }
-        _topKKernel(rows, input, outputValues, idxView, cols, k);
+        // One thread per output slot (rows*k): thread g owns slot g and writes it at its own index
+        // (WebGL Transform-Feedback requires write-index == thread-index — no scatter). Each thread
+        // is self-contained (see TopKStageImpl), so a single dispatch suffices.
+        _topKKernel(rows * k, input, outputValues, idxView, cols, k);
     }
 
     /// <summary>
