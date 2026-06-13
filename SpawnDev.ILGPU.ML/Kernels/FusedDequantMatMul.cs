@@ -64,7 +64,7 @@ public class FusedDequantMatMul : IDisposable
     private const int GemvGroupSize = 64;
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0;
 
     // Params buffers cached per (M,K,N). Never disposed mid-session: a WebGPU dispatch
     // that referenced the buffer may still be pending in the command encoder, and
@@ -132,6 +132,18 @@ public class FusedDequantMatMul : IDisposable
                         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ6_KImpl);
                     _gemvQ6_K(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
+                case GGMLType.Q8_0:
+                    _gemvQ8_0 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ8_0Impl);
+                    _gemvQ8_0(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
+                case GGMLType.Q4_0:
+                    _gemvQ4_0 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_0Impl);
+                    _gemvQ4_0(gemvConfig, input, intView, output, paramsBuf.View);
                     return;
             }
         }
@@ -376,6 +388,83 @@ public class FusedDequantMatMul : IDisposable
         int sc = SignExtend8(ReadByte(w, scBase + (l >> 4) + 2 * variant));
         float d = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
         return d * sc * q;
+    }
+
+    // ── Q8_0 GEMV (M==1): 34B/32 = [d:fp16][32×int8], value = q·d ──
+    private static void GemvDequantQ8_0Impl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int rowBase = n * (K / 32 * 34);
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeQ8_0Element(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="col"/> of a Q8_0 row (34B/32: [d:fp16][32×int8]; value = q·d).</summary>
+    internal static float DecodeQ8_0Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int bOff = rowByteBase + (col >> 5) * 34;   // 32 values per block
+        float d = HalfToFloatFinite(ReadByte(w, bOff) | (ReadByte(w, bOff + 1) << 8));
+        int q = SignExtend8(ReadByte(w, bOff + 2 + (col & 31)));
+        return q * d;
+    }
+
+    // ── Q4_0 GEMV (M==1): 18B/32 = [d:fp16][16 packed nibbles]; el j=low nibble of byte j, el j+16=high; value=(nib-8)·d ──
+    private static void GemvDequantQ4_0Impl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int rowBase = n * (K / 32 * 18);
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeQ4_0Element(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="col"/> of a Q4_0 row (18B/32: [d:fp16][16 nibble bytes];
+    /// el j = low nibble of byte j, el j+16 = high nibble of byte j; value = (nibble-8)·d).</summary>
+    internal static float DecodeQ4_0Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int within = col & 31;                       // 0..31 within the 32-value block
+        int bOff = rowByteBase + (col >> 5) * 18;
+        float d = HalfToFloatFinite(ReadByte(w, bOff) | (ReadByte(w, bOff + 1) << 8));
+        int packed = ReadByte(w, bOff + 2 + (within & 15));
+        int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);  // within>=16 -> high nibble
+        return (nib - 8) * d;
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q4_K-quantized row whose
