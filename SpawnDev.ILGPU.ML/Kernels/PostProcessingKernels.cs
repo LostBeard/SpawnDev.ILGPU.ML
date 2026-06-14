@@ -14,6 +14,28 @@ public class PostProcessingKernels
 
     public PostProcessingKernels(Accelerator accelerator) => _accelerator = accelerator;
 
+    // Per-row scratch for the single-store-per-thread normalize/softmax split (see L2NormalizeRows /
+    // SoftmaxRows). Grow-and-retain (never freed mid-flight; reused across calls). One-thread-per-row
+    // looping to write all of a row's elements is multi-store-per-thread and silently corrupts on the
+    // WebGL Transform-Feedback path (only one store per thread lands), so the row reduction is split
+    // off and the element writes are one-store-per-thread at the element's own index.
+    private MemoryBuffer1D<float, Stride1D.Dense>? _rowScratch0;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _rowScratch1;
+    private int _rowScratchRows;
+    private readonly System.Collections.Generic.List<MemoryBuffer1D<float, Stride1D.Dense>> _oldRowScratch = new();
+
+    private void EnsureRowScratch(int rows)
+    {
+        if (_rowScratch0 == null || _rowScratchRows < rows)
+        {
+            if (_rowScratch0 != null) _oldRowScratch.Add(_rowScratch0);
+            if (_rowScratch1 != null) _oldRowScratch.Add(_rowScratch1);
+            _rowScratch0 = _accelerator.Allocate1D<float>(rows);
+            _rowScratch1 = _accelerator.Allocate1D<float>(rows);
+            _rowScratchRows = rows;
+        }
+    }
+
     // ──────────────────────────────────────────────
     //  YOLO output transpose: [1, 84, 8400] → per-detection access
     // ──────────────────────────────────────────────
@@ -158,10 +180,15 @@ public class PostProcessingKernels
         ArrayView1D<float, Stride1D.Dense> embeddings,
         int numRows, int dim)
     {
-        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(
-            (Index1D idx, ArrayView1D<float, Stride1D.Dense> emb) =>
+        EnsureRowScratch(numRows);
+        var invNorm = _rowScratch0!.View;
+
+        // Pass 1: one thread per row → invNorm[row] (one store). 1f leaves a ~0 row unchanged.
+        var statsKernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(
+            (Index1D row, ArrayView1D<float, Stride1D.Dense> emb, ArrayView1D<float, Stride1D.Dense> invN) =>
             {
-                int offset = idx * dim;
+                int offset = row * dim;
                 float sumSq = 0f;
                 for (int d = 0; d < dim; d++)
                 {
@@ -169,17 +196,19 @@ public class PostProcessingKernels
                     sumSq += v * v;
                 }
                 float norm = MathF.Sqrt(sumSq);
-                if (norm > 1e-10f)
-                {
-                    float invNorm = 1f / norm;
-                    for (int d = 0; d < dim; d++)
-                    {
-                        emb[offset + d] *= invNorm;
-                    }
-                }
+                invN[row] = norm > 1e-10f ? 1f / norm : 1f;
             });
+        statsKernel((Index1D)numRows, embeddings, invNorm);
 
-        kernel((Index1D)numRows, embeddings);
+        // Pass 2: one thread per element → in-place scale at its OWN index (WebGL-TF safe).
+        var applyKernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(
+            (Index1D idx, ArrayView1D<float, Stride1D.Dense> emb, ArrayView1D<float, Stride1D.Dense> invN) =>
+            {
+                int row = idx / dim;
+                emb[idx] *= invN[row];
+            });
+        applyKernel((Index1D)(numRows * dim), embeddings, invNorm);
     }
 
     // ──────────────────────────────────────────────
@@ -195,37 +224,44 @@ public class PostProcessingKernels
         ArrayView1D<float, Stride1D.Dense> data,
         int numRows, int rowSize)
     {
-        var kernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(
-            (Index1D idx, ArrayView1D<float, Stride1D.Dense> d) =>
-            {
-                int offset = idx * rowSize;
+        EnsureRowScratch(numRows);
+        var maxArr = _rowScratch0!.View;
+        var invSumArr = _rowScratch1!.View;
 
-                // Find max
+        // Pass 1: one thread per row → max + invSum (one store each). Reads originals only.
+        var statsKernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(
+            (Index1D row, ArrayView1D<float, Stride1D.Dense> d,
+             ArrayView1D<float, Stride1D.Dense> mx, ArrayView1D<float, Stride1D.Dense> isum) =>
+            {
+                int offset = row * rowSize;
                 float maxVal = d[offset];
                 for (int i = 1; i < rowSize; i++)
                 {
                     float v = d[offset + i];
                     if (v > maxVal) maxVal = v;
                 }
-
-                // Exp and sum
                 float sum = 0f;
                 for (int i = 0; i < rowSize; i++)
-                {
-                    float e = MathF.Exp(d[offset + i] - maxVal);
-                    d[offset + i] = e;
-                    sum += e;
-                }
-
-                // Normalize
-                float invSum = 1f / sum;
-                for (int i = 0; i < rowSize; i++)
-                {
-                    d[offset + i] *= invSum;
-                }
+                    sum += MathF.Exp(d[offset + i] - maxVal);
+                mx[row] = maxVal;
+                isum[row] = 1f / sum;
             });
+        statsKernel((Index1D)numRows, data, maxArr, invSumArr);
 
-        kernel((Index1D)numRows, data);
+        // Pass 2: one thread per element → in-place softmax at its OWN index (WebGL-TF safe).
+        // Pass 1 already consumed the originals, so the in-place overwrite here is race-free.
+        var applyKernel = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>>(
+            (Index1D idx, ArrayView1D<float, Stride1D.Dense> d,
+             ArrayView1D<float, Stride1D.Dense> mx, ArrayView1D<float, Stride1D.Dense> isum) =>
+            {
+                int row = idx / rowSize;
+                d[idx] = MathF.Exp(d[idx] - mx[row]) * isum[row];
+            });
+        applyKernel((Index1D)(numRows * rowSize), data, maxArr, invSumArr);
     }
 
     // ──────────────────────────────────────────────

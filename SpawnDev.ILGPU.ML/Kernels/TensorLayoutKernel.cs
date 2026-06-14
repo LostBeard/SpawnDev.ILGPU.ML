@@ -38,14 +38,16 @@ public class TensorLayoutKernel
         int C = p[0]; int H = p[1]; int W = p[2];
         int HW = H * W;
 
-        // Input index in NCHW: c * H * W + y * W + x
-        int c = idx / HW;
-        int rem = idx % HW;
-        int y = rem / W;
+        // GATHER, not scatter: the thread owns the OUTPUT element idx and writes nhwc[idx] (its own
+        // index) — required on the WebGL Transform-Feedback path, which can only write at the thread's
+        // vertex index. The previous form wrote nhwc[scattered] = nchw[idx] (write-index != thread-
+        // index), which silently produced garbage on WebGL.
+        // NHWC output index idx = y * W * C + x * C + c.
+        int c = idx % C;
+        int rem = idx / C;
         int x = rem % W;
-
-        // Output index in NHWC: y * W * C + x * C + c
-        nhwc[y * W * C + x * C + c] = nchw[idx];
+        int y = rem / W;
+        nhwc[idx] = nchw[c * HW + y * W + x];
     }
 
     public void NCHWToNHWC(
@@ -75,15 +77,15 @@ public class TensorLayoutKernel
         ArrayView1D<int, Stride1D.Dense> p)
     {
         int C = p[0]; int H = p[1]; int W = p[2];
+        int HW = H * W;
 
-        // Input index in NHWC: y * W * C + x * C + c
-        int y = idx / (W * C);
-        int rem = idx % (W * C);
-        int x = rem / C;
-        int c = rem % C;
-
-        // Output index in NCHW: c * H * W + y * W + x
-        nchw[c * H * W + y * W + x] = nhwc[idx];
+        // GATHER, not scatter (see NCHWToNHWCImpl): thread owns OUTPUT element idx, writes nchw[idx].
+        // NCHW output index idx = c * H * W + y * W + x.
+        int c = idx / HW;
+        int rem = idx % HW;
+        int y = rem / W;
+        int x = rem % W;
+        nchw[idx] = nhwc[y * W * C + x * C + c];
     }
 
     public void NHWCToNCHW(

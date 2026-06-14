@@ -21,6 +21,13 @@ correct. A sweep of every ML GPU kernel found and fixed the violators:
   selection mis-executed (all -inf) where each piece worked alone — flattened to `if (v > bestVal)`.
 - **`TrainingKernels.SoftmaxCrossEntropy` forward** — split per-sample stats + per-element probs.
   (`Training_SoftmaxCE_Backward` saw probs summing to 1.149 on WebGL.)
+- **`PostProcessingKernels.L2NormalizeRows` / `SoftmaxRows`** (multi-store) and **`TensorLayoutKernel`
+  NCHW<->NHWC** (scatter: `out[reindexed] = in[thread]`, flipped to gather) — found by a follow-up
+  audit; all unused in production today but shipped public API. Now covered by
+  `MLTestBase.PostProcessingKernelTests` (CPU-reference, distinct values).
+
+In all, **nine** ML kernels violated the WebGL TF "one store at the thread's own index" contract;
+every one is now fixed and tested. (Filed an ILGPU request for a compile-time fail-loud guard.)
 
 **Migrated to SpawnDev.ILGPU 4.12.0** (the sync/async contract: `Synchronize()` now throws on browser
 backends — submit+wait is desktop-only — while `Flush()` is the sync submit everywhere). ML built
