@@ -118,20 +118,17 @@ public class FusedDequantMatMul : IDisposable
         // GEMV kernel yet fall through to the general M*N kernel below (correct, just not coalesced).
         //
         // The GEMV uses SharedMemory.Allocate + Group.Barrier (a tree reduction). Verified CORRECT on
-        // CPU / CUDA / OpenCL / Wasm (oracle-green). Both browser-GPU backends are EXCLUDED:
+        // CPU / CUDA / OpenCL / Wasm / WebGPU (oracle-green). Only WebGL is EXCLUDED:
         //  - WebGL: NO workgroup shared memory / barriers (GLSL ES 3.0 Transform-Feedback vertex path) -
         //    a hard capability wall; the GLSL codegen would throw UnsupportedKernelFeatureException.
-        //  - WebGPU: HAS native var<workgroup> + workgroupBarrier() and the kernel COMPILES, but the
-        //    emitted WGSL reduction produces WRONG values (verified 2026-06-13: all 4 quantized Gemv
-        //    oracle tests fail on WebGPU with structured-but-wrong output, e.g. Q4_K got 25.7 want 876.5,
-        //    while CPU/CUDA/OpenCL/Wasm/WebGL-fallback pass). Root cause under investigation (WGSL
-        //    workgroup-size / shared-mem reduction translation); re-enable WebGPU once fixed - it's the
-        //    primary browser perf target. // TODO(tuvok): re-enable WebGPU GEMV after WGSL reduction fix.
-        // On WebGL/WebGPU, M==1 falls through to the general per-element kernel below (correct, the
-        // pre-GEMV behavior; uncoalesced but right).
-        bool gpuBrowser = _accelerator.AcceleratorType == AcceleratorType.WebGL
-                       || _accelerator.AcceleratorType == AcceleratorType.WebGPU;
-        if (M == 1 && !gpuBrowser)
+        //    M==1 on WebGL falls through to the general per-element kernel below (correct, uncoalesced).
+        // WebGPU is RE-ENABLED as of SpawnDev.ILGPU 4.12.1-local.2: Geordi fixed the WGSL emitter bug
+        // where the GEMV's barrier-free inner K-tile loop (k=tid; k<K; k+=G) was given a synthetic
+        // group grid-stride break, truncating the accumulation (~K/G x too small, WebGPU-only). The
+        // emitter now patches the break only for loops that actually emit a barrier (two-pass scan of
+        // the generated text), so the barrier-free GEMV K-loop keeps its natural k<K bound.
+        bool webgl = _accelerator.AcceleratorType == AcceleratorType.WebGL;
+        if (M == 1 && !webgl)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             switch (type)
