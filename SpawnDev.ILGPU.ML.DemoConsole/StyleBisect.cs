@@ -53,6 +53,17 @@ public static class StyleBisect
             return;
         }
 
+        // BLAZEFACE mode: reproduce the CPUTests.Pipeline_BlazeFace "Test run failed" native
+        // subprocess crash in isolation, with GraphExecutor.VerboseLogging on (per-node log is
+        // autoflushed) so the LAST "[GraphExecutor] Node N/M: OpType ..." line before the process
+        // dies names the faulting CPU-backend operator. Mirrors the test's model selection
+        // (mediapipe download first, local fallback). Investigation diagnostic, not a PMT substitute.
+        if (args.Length > 1 && args[1] == "BLAZEFACE")
+        {
+            await BlazeFaceCpu();
+            return;
+        }
+
         string modelName = args.Length > 1 ? args[1] : "style-pointilism";
         string modelPath = Path.Combine(WwwRoot, "models", modelName, "model.onnx");
         string inputPath = Path.Combine(WwwRoot, "references", modelName, "cat_input_nchw.bin");
@@ -129,6 +140,69 @@ public static class StyleBisect
         {
             Console.WriteLine("[StyleBisect] No node diverged beyond threshold — CPU matches CUDA per-node. " +
                 "Divergence may be in elements beyond the capture window, or in the final readback/postprocess.");
+        }
+    }
+
+    /// <summary>
+    /// Reproduce the CPU-backend BlazeFace crash in isolation. The PMT desktop CPU lane runs this
+    /// test as a subprocess; it dies natively (bypassing the managed UnhandledException handler in
+    /// Program.cs) before emitting a TEST: line, which PMT reports as the generic "Test run failed".
+    /// With VerboseLogging on, the last autoflushed per-node line names the faulting operator.
+    /// </summary>
+    static async Task BlazeFaceCpu()
+    {
+        string localModel = Path.Combine(WwwRoot, "models", "blaze-face", "model.tflite");
+        string inputPath = Path.Combine(WwwRoot, "references", "blaze-face", "cat_input.bin");
+        if (!File.Exists(inputPath)) { Console.WriteLine($"[BlazeFaceCpu] input not found: {inputPath}"); return; }
+        var inputFloats = ReadFloats(inputPath);
+
+        // Mirror the test: mediapipe download first, local fallback.
+        byte[] modelBytes;
+        try
+        {
+            using var http = new System.Net.Http.HttpClient();
+            Console.WriteLine("[BlazeFaceCpu] downloading mediapipe blaze_face_short_range.tflite ...");
+            modelBytes = await http.GetByteArrayAsync(
+                "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite");
+            Console.WriteLine($"[BlazeFaceCpu] downloaded {modelBytes.Length} bytes (mediapipe variant — what PMT uses)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BlazeFaceCpu] download failed ({ex.Message}); using local {localModel}");
+            modelBytes = File.ReadAllBytes(localModel);
+        }
+        Console.WriteLine($"[BlazeFaceCpu] model bytes={modelBytes.Length}, inputElems={inputFloats.Length} (expect 49152 = 1x128x128x3)");
+        Console.Out.Flush();
+
+        Context? context = null; Accelerator? acc = null;
+        try
+        {
+            context = MLContext.CreateContext();
+            acc = context.CreateCPUAccelerator(0);
+            GraphExecutor.VerboseLogging = true; // autoflushed per-node => last line before native crash = culprit
+            using var session = InferenceSession.CreateFromFile(acc, modelBytes);
+            Console.WriteLine($"[BlazeFaceCpu] session created. inputs=[{string.Join(",", session.InputNames)}] outputs=[{string.Join(",", session.OutputNames)}]");
+            using var inBuf = acc.Allocate1D(inputFloats);
+            var inputTensor = new Tensor(inBuf.View, new[] { 1, 128, 128, 3 });
+            Console.WriteLine("[BlazeFaceCpu] running CPU inference (watch for the last Node line before a crash) ...");
+            Console.Out.Flush();
+            var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+            {
+                [session.InputNames[0]] = inputTensor
+            });
+            await acc.SynchronizeAsync();
+            Console.WriteLine($"[BlazeFaceCpu] COMPLETED WITHOUT CRASH — outputs={outputs.Count}. (Crash may be model-variant specific.)");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BlazeFaceCpu] MANAGED EXCEPTION (not the native crash): {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+        }
+        finally
+        {
+            GraphExecutor.VerboseLogging = false;
+            try { acc?.Dispose(); } catch { }
+            try { context?.Dispose(); } catch { }
         }
     }
 

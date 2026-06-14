@@ -1181,6 +1181,20 @@ public class ConcatOperator(OperatorRegistry reg) : IOnnxOperator
                 }
             }
 
+            // The fused kernel writes output[idx] for idx in [0, launchTotal); launchTotal must fit the
+            // output buffer. It can overrun when an upstream shape op (e.g. a Reshape that failed to
+            // resolve its target) leaves the concat inputs with mismatched non-axis dims — outer/inner
+            // are taken from input0 alone, so a differing input1 makes launchTotal != the true output
+            // size. The CPU backend caught this as a hard "X index out of bounds" abort; the GPU
+            // backends wrote out of bounds SILENTLY. Fail loud with a precise diagnostic instead.
+            long launchTotal = (long)outer * totalConcatDim * inner;
+            if (launchTotal > output.Length)
+                throw new InvalidOperationException(
+                    $"Concat fused launch extent {launchTotal} (outer={outer} * totalConcatDim={totalConcatDim} * inner={inner}) " +
+                    $"exceeds output buffer {output.Length}. Inputs [{string.Join("; ", ctx.Inputs.Select(t => "[" + string.Join(",", t.Shape) + "]"))}] " +
+                    $"axis={axis} -> output [{string.Join(",", ctx.Outputs[0].Shape)}]. An upstream shape op did not resolve " +
+                    "its target shape (mismatched concat inputs). Failing loud instead of writing out of bounds.");
+
             switch (ctx.Inputs.Length)
             {
                 case 2:

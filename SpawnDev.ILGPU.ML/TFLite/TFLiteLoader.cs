@@ -321,6 +321,13 @@ public static class TFLiteLoader
 
         switch (builtinCode)
         {
+            case 2: // CONCATENATION
+                // ConcatenationOptions.axis (field 0). Without this the concat defaulted to axis 0,
+                // so e.g. BlazeFace's [1,512,1]+[1,384,1] -> [1,896,1] (axis 1) computed the wrong
+                // launch extent and overran the output buffer. fused_activation (field 1) is ignored
+                // (None for these models).
+                attrs["axis"] = JsonSerializer.SerializeToElement((long)fb.ReadFieldInt32(optOffset, 0, 0));
+                break;
             case 3: // CONV_2D
             case 4: // DEPTHWISE_CONV_2D
                 ExtractConvAttributes(fb, optOffset, builtinCode, attrs);
@@ -330,13 +337,32 @@ public static class TFLiteLoader
                 ExtractPoolAttributes(fb, optOffset, attrs);
                 break;
             case 22: // RESHAPE
-                // Reshape target shape comes from the second input tensor
+                // Reshape target shape comes from the second input tensor when present...
                 if (op.Inputs.Length > 1 && op.Inputs[1] >= 0)
                 {
                     var shapeTensor = sg.Tensors[op.Inputs[1]];
                     var shapeData = model.GetTensorData(shapeTensor);
                     if (shapeData != null)
                         attrs["shape"] = JsonSerializer.SerializeToElement(shapeData.Select(v => (long)v).ToArray());
+                }
+                // ...otherwise (single-input reshape — MediaPipe BlazeFace's classificators/regressors
+                // reshapes) the target is in ReshapeOptions.new_shape (field 0, vector of int). Without
+                // reading it the Reshape became a no-op, leaving the downstream Concat to run over the
+                // un-flattened 4D shapes — its launch extent overran the output buffer, crashing the CPU
+                // backend ("X index out of bounds") and silently corrupting the GPU backends.
+                if (!attrs.ContainsKey("shape"))
+                {
+                    int nsOff = fb.ReadFieldOffset(optOffset, 0); // ReshapeOptions.new_shape
+                    if (nsOff != 0)
+                    {
+                        int n = fb.VectorLength(nsOff);
+                        if (n > 0)
+                        {
+                            var ns = new long[n];
+                            for (int k = 0; k < n; k++) ns[k] = fb.VectorInt32(nsOff, k);
+                            attrs["shape"] = JsonSerializer.SerializeToElement(ns);
+                        }
+                    }
                 }
                 break;
             case 25: // SOFTMAX
