@@ -2,6 +2,39 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — WebGL multi-store kernel fixes + SpawnDev.ILGPU 4.12.0 migration
+
+**WebGL Transform-Feedback "one store at the thread's own index" contract.** On the WebGL TF
+vertex path a kernel thread may write exactly ONE output element, at its own index — no multi-store
+(a per-element loop into a shared output) and no scatter (`out[reindexed] = in[thread]`). Violations
+land only one store per thread and SILENTLY produce garbage on WebGL while every other backend is
+correct. A sweep of every ML GPU kernel found and fixed the violators:
+
+- **`TurboQuantKernels.Normalize`/`Denormalize`** — split the per-vector loop into a per-vector
+  reduction + a per-element write. (`TurboQuant_QuantizedAttention` was cosine -0.0088 on WebGL.)
+- **`FWHTKernel`** butterfly (batched + single-vector) — the in-place butterfly wrote two non-adjacent
+  elements per thread; replaced with a one-store-per-thread out-of-place butterfly that ping-pongs
+  between a work buffer and scratch. (`TurboQuant_KVCache_FlashAttention_EndToEnd` was 0.654 on WebGL.)
+- **`MissingElementWiseKernels` TopK operator** — one-thread-per-row writing all k slots; now
+  `rows*k` threads, each self-contained, writing its own slot. (Top-3 returned `9,0,0` on WebGL.)
+  Also worked around an interpreted-Wasm codegen quirk: a `bool`-guard + nested `if/else if`
+  selection mis-executed (all -inf) where each piece worked alone — flattened to `if (v > bestVal)`.
+- **`TrainingKernels.SoftmaxCrossEntropy` forward** — split per-sample stats + per-element probs.
+  (`Training_SoftmaxCE_Backward` saw probs summing to 1.149 on WebGL.)
+
+**Migrated to SpawnDev.ILGPU 4.12.0** (the sync/async contract: `Synchronize()` now throws on browser
+backends — submit+wait is desktop-only — while `Flush()` is the sync submit everywhere). ML built
+clean, but several browser code paths called sync `Synchronize()` purely to flush a command encoder
+(a no-op-flush on 4.10.0, a throw on 4.12.0); a full sweep caught 11 such runtime failures the build
+could not. Fixed by `Synchronize()` -> `Flush()` at the flush-intent sites in `GraphExecutor.Run()`
+and the GGUF weight-load transpose; the wait-before-sync-read sites are desktop-only by nature.
+
+**Test-harness memory-cascade guard.** A capture-enabled test that times out never runs its `finally`
+to null `GraphExecutor.CapturedOutputs` (and the instance-norm GPU-buffer capture), so the leaked
+static kept accumulating every later test's per-node tensors — turning a long Wasm lane into a
+DistilGPT2 OutOfMemory + a cascade of follow-on timeouts. `RunTest` now evicts the static capture
+state at each test's start (deterministic, like the existing zombie-accelerator eviction).
+
 ## Unreleased — gemma4:12b GGUF forward is CORRECT end-to-end (CUDA)
 
 gemma4:12b greedy-decodes coherent thinking-model text through the pure-ILGPU engine
