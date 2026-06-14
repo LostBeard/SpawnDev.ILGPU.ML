@@ -86,6 +86,17 @@ public abstract partial class MLTestBase : IDisposable
         _prevAccelerator = null;
         _prevContext = null;
 
+        // STATIC CAPTURE-STATE EVICTION (memory-cascade guard): the GraphExecutor diagnostic
+        // captures (CapturedOutputs/NodeInfo/NodeTimingsMs) and NormalizationKernels' captured GPU
+        // buffers are opt-in STATICS. A capture-enabled test that TIMES OUT never reaches its
+        // finally that nulls them, so they stay non-null — and then EVERY subsequent test's
+        // GraphExecutor.Run appends its per-node tensors into the leaked dict unboundedly. In a long
+        // sequential lane (the Wasm phase) that climbs until a heavy model (DistilGPT2) hits
+        // OutOfMemory and the tests after it time out. Reset deterministically at each test's START
+        // (a leaked-but-still-running zombie's later finally cannot resurrect it) so capture state
+        // never crosses a test boundary. A test that legitimately wants capture sets it AFTER this.
+        ResetStaticCaptureState();
+
         var (context, accelerator) = await CreateAcceleratorAsync();
         _prevAccelerator = accelerator;
         _prevContext = context;
@@ -125,6 +136,36 @@ public abstract partial class MLTestBase : IDisposable
         _prevAccelerator = null;
         try { _prevContext?.Dispose(); } catch { }
         _prevContext = null;
+        ResetStaticCaptureState();
+    }
+
+    /// <summary>
+    /// Null out the opt-in GraphExecutor / NormalizationKernels static diagnostic-capture state so
+    /// it can never leak across a test boundary. A capture-enabled test that times out skips its own
+    /// finally; without this, the leaked dict keeps accumulating every later test's per-node tensors
+    /// (and the instance-norm capture keeps live GPU buffers), which is what turned the long Wasm
+    /// lane into a DistilGPT2 OutOfMemory + cascade of follow-on timeouts. Disposes the captured
+    /// GPU buffers before dropping them.
+    /// </summary>
+    private static void ResetStaticCaptureState()
+    {
+        try { Graph.GraphExecutor.CapturedOutputs = null; } catch { }
+        try { Graph.GraphExecutor.CapturedNodeInfo = null; } catch { }
+        try { Graph.GraphExecutor.CapturedNodeTimingsMs = null; } catch { }
+        try
+        {
+            var inorm = Kernels.NormalizationKernels.CapturedInstanceNormPass1Outputs;
+            if (inorm != null)
+            {
+                foreach (var e in inorm)
+                {
+                    try { e.means?.Dispose(); } catch { }
+                    try { e.invStds?.Dispose(); } catch { }
+                }
+                Kernels.NormalizationKernels.CapturedInstanceNormPass1Outputs = null;
+            }
+        }
+        catch { }
     }
 
     #region Helpers
