@@ -118,17 +118,20 @@ public class FusedDequantMatMul : IDisposable
         // GEMV kernel yet fall through to the general M*N kernel below (correct, just not coalesced).
         //
         // The GEMV uses SharedMemory.Allocate + Group.Barrier (a tree reduction). Verified CORRECT on
-        // CPU / CUDA / OpenCL / Wasm / WebGPU (oracle-green). Only WebGL is EXCLUDED:
+        // CPU / CUDA / OpenCL / Wasm (oracle-green) AND now WebGPU too (4.12.1-local.2 fixed the WGSL
+        // grid-stride emitter bug). But both browser-GPU backends are EXCLUDED for different reasons:
         //  - WebGL: NO workgroup shared memory / barriers (GLSL ES 3.0 Transform-Feedback vertex path) -
         //    a hard capability wall; the GLSL codegen would throw UnsupportedKernelFeatureException.
-        //    M==1 on WebGL falls through to the general per-element kernel below (correct, uncoalesced).
-        // WebGPU is RE-ENABLED as of SpawnDev.ILGPU 4.12.1-local.2: Geordi fixed the WGSL emitter bug
-        // where the GEMV's barrier-free inner K-tile loop (k=tid; k<K; k+=G) was given a synthetic
-        // group grid-stride break, truncating the accumulation (~K/G x too small, WebGPU-only). The
-        // emitter now patches the break only for loops that actually emit a barrier (two-pass scan of
-        // the generated text), so the barrier-free GEMV K-loop keeps its natural k<K bound.
-        bool webgl = _accelerator.AcceleratorType == AcceleratorType.WebGL;
-        if (M == 1 && !webgl)
+        //  - WebGPU: PERF, not correctness. The shared-mem/barrier cooperative GEMV is now correct on
+        //    WebGPU but ~75x SLOWER than the per-element fallback there (MEASURED 2026-06-13, M=1
+        //    K=4096 N=8192 Q4_K, consistent across per-iter-sync / batched-same-output / batched-diff-
+        //    output: WebGPU GEMV ~530 ms/dispatch vs WebGL per-element ~7 ms and CUDA GEMV ~1 ms). The
+        //    workgroup-reduction maps catastrophically onto Tint/Dawn. Until that's fixed, M==1 on
+        //    WebGPU stays on the per-element kernel below. Tracked with Geordi (WGSL workgroup perf).
+        // Both fall through to the general per-element M*N kernel below (correct; the pre-GEMV path).
+        bool gpuBrowser = _accelerator.AcceleratorType == AcceleratorType.WebGL
+                       || _accelerator.AcceleratorType == AcceleratorType.WebGPU;
+        if (M == 1 && !gpuBrowser)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             switch (type)
