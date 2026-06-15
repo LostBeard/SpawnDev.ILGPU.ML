@@ -399,8 +399,21 @@ public class FusedDequantMatMul : IDisposable
         {
             int bytesPerRow = K / 256 * 210;
             int rowBase = n * bytesPerRow;
-            for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeQ6KElement(w, rowBase, k);
+            // Block-structured (same as the Q4_K GEMV): decode the block's fp16 d ONCE per 256-block instead
+            // of per element (Pathology #3); each thread owns 256/G=4 elements per block, same coalesced access.
+            int numBlocks = K / 256;
+            int perThread = 256 / GemvGroupSize;
+            for (int blk = 0; blk < numBlocks; blk++)
+            {
+                int sbOff = rowBase + blk * 210;
+                float d = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+                int kBase = blk * 256;
+                for (int sub = 0; sub < perThread; sub++)
+                {
+                    int r = tid + sub * GemvGroupSize;
+                    partial += input[kBase + r] * DecodeQ6KScaled(w, sbOff, r, d);
+                }
+            }
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -410,6 +423,28 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="r"/> (0..255) within a Q6_K super-block at byte
+    /// <paramref name="sbOff"/>, given the block's already-decoded fp16 <paramref name="d"/> (hoisted out of
+    /// the per-element GEMV loop). Quant + sub-block scale math identical to <see cref="DecodeQ6KElement"/>.</summary>
+    private static float DecodeQ6KScaled(ArrayView1D<int, Stride1D.Dense> w, int sbOff, int r, float d)
+    {
+        int half = r >> 7;
+        int rh = r & 127;
+        int variant = rh >> 5;
+        int l = rh & 31;
+        int qlBase = sbOff + 64 * half;
+        int qhBase = sbOff + 128 + 32 * half;
+        int scBase = sbOff + 192 + 8 * half;
+        int qlByte = ReadByte(w, qlBase + l + (variant & 1) * 32);
+        int qh = ReadByte(w, qhBase + l);
+        int isHigh = variant >> 1;
+        int qlNib = isHigh == 1 ? (qlByte >> 4) : (qlByte & 0xF);
+        int qhBits = (qh >> (2 * variant)) & 3;
+        int q = (qlNib | (qhBits << 4)) - 32;
+        int sc = SignExtend8(ReadByte(w, scBase + (l >> 4) + 2 * variant));
+        return d * sc * q;
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q6_K-quantized row whose blocks start at
