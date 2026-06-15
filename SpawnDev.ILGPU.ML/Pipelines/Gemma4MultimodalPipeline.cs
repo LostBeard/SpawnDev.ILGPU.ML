@@ -153,35 +153,49 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         Text(prompt); Ctrl(_turnC); Text("\n");
         Ctrl(_turnO); Text("model\n");
 
-        int seq = rows.Count;
-        var prefill = new float[(long)seq * _nEmbd];
-        for (int i = 0; i < seq; i++) Array.Copy(rows[i], 0, prefill, (long)i * _nEmbd, _nEmbd);
+        // Prefill TOKEN-BY-TOKEN (seq=1 per row) instead of one batched seq=N forward. The graph executor's
+        // per-node CPU residual scales super-linearly with sequence length (a batched seq=32 forward measured
+        // ~107x a seq=1 step, not 32x), so N cheap KV-cache steps beat one big prefill — and only the LAST
+        // prompt position's logits matter (they predict the first generated token), so intermediate readbacks
+        // are skipped entirely.
+        float[] last = null!;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            bool needLogits = i == rows.Count - 1;
+            var outputs = await ForwardAsync(rows[i]);
+            if (needLogits) last = await ReadLastLogitsAsync(outputs);
+        }
 
         var generated = new List<int>();
-        float[] stepEmb = prefill; int stepSeq = seq;       // prefill, then 1 token/step
         for (int step = 0; step < maxNewTokens; step++)
         {
-            using var inBuf = _accel.Allocate1D(stepEmb);
-            var outputs = await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
-            { ["inputs_embeds"] = new Tensor(inBuf.View, new[] { 1, stepSeq, _nEmbd }, "inputs_embeds") });
-
-            var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
-            int vocab = logitsT.Shape[^1];
-            int seqOut = logitsT.ElementCount / vocab;
-            long lastOff = (long)(seqOut - 1) * vocab;
-            // Browser-portable readback of the last position's logits (async, no sync CopyToCPU).
-            using var read = _accel.Allocate1D<float>(vocab);
-            await read.View.CopyFromAsync(logitsT.Data.SubView(lastOff, vocab));
-            await _accel.SynchronizeAsync();
-            var logits = await read.CopyToHostAsync<float>(0, vocab);
-
-            int next = TextGenerationSampler.Greedy(logits);
+            int next = TextGenerationSampler.Greedy(last);
             generated.Add(next);
             if (onToken != null) await onToken(generated.Count, _tok.Decode(generated.ToArray()));
-            if (next == _turnC || next == _eos) break;
-            stepEmb = ScaledRow(next); stepSeq = 1;
+            if (next == _turnC || next == _eos || step == maxNewTokens - 1) break;
+            last = await ReadLastLogitsAsync(await ForwardAsync(ScaledRow(next)));
         }
         return _tok.Decode(generated.ToArray());
+    }
+
+    /// <summary>Run one seq=1 inputs_embeds forward (KV-cache decode step) for a single [n_embd] embedding row.</summary>
+    private async Task<Dictionary<string, Tensor>> ForwardAsync(float[] embRow)
+    {
+        using var inBuf = _accel.Allocate1D(embRow);
+        return await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
+        { ["inputs_embeds"] = new Tensor(inBuf.View, new[] { 1, 1, _nEmbd }, "inputs_embeds") });
+    }
+
+    /// <summary>Browser-portable readback of the last position's logits (async — no sync CopyToCPU).</summary>
+    private async Task<float[]> ReadLastLogitsAsync(Dictionary<string, Tensor> outputs)
+    {
+        var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
+        int vocab = logitsT.Shape[^1];
+        long lastOff = (long)(logitsT.ElementCount / vocab - 1) * vocab;
+        using var read = _accel.Allocate1D<float>(vocab);
+        await read.View.CopyFromAsync(logitsT.Data.SubView(lastOff, vocab));
+        await _accel.SynchronizeAsync();
+        return await read.CopyToHostAsync<float>(0, vocab);
     }
 
     /// <summary>Gather token <paramref name="t"/>'s embedding row from token_embd and scale by sqrt(n_embd)
