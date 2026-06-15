@@ -12,6 +12,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+    <!-- Pure-managed, cross-platform image decode for the console (PNG/JPEG/...). Example-only dependency. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
   </ItemGroup>
 
 </Project>
