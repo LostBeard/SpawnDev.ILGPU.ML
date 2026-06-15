@@ -1486,11 +1486,11 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static async Task<InferenceSession> CreateFromGGUFFileAsync(
         Accelerator accelerator, string ggufPath,
-        Action<string, int>? onProgress = null, CancellationToken ct = default)
+        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false)
     {
         await using var fs = new FileStream(ggufPath, FileMode.Open, FileAccess.Read, FileShare.Read,
             bufferSize: 1 << 20, useAsync: true);
-        return await CreateFromGGUFStreamAsync(accelerator, fs, onProgress, ct);
+        return await CreateFromGGUFStreamAsync(accelerator, fs, onProgress, ct, acceptInputsEmbeds);
     }
 
     /// <summary>
@@ -2063,7 +2063,11 @@ public class InferenceSession : IDisposable
         {
             var result = await exec.RunAsync(inputs);
             LastExecutorBufferCount = exec.AllocatedBufferCount;
-            int seq = inputs.TryGetValue("input_ids", out var t) ? t.Shape[^1] : 1;
+            // Advance the KV cursor by the step's sequence length. input_ids is [1, seq] (seq = last dim);
+            // the multimodal inputs_embeds path is [1, seq, n_embd] (seq = the MIDDLE dim, not n_embd).
+            int seq = inputs.TryGetValue("input_ids", out var t) ? t.Shape[^1]
+                : inputs.TryGetValue("inputs_embeds", out var e) ? (e.Shape.Length >= 2 ? e.Shape[^2] : 1)
+                : 1;
             DecodePastLen += seq;
             return result;
         }

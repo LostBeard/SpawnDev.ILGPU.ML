@@ -147,6 +147,100 @@ public class GGUFModel
         or GGMLType.Q5_0 or GGMLType.Q5_1 or GGMLType.Q8_0 or GGMLType.Q8_1
         or GGMLType.Q2_K or GGMLType.Q3_K or GGMLType.Q4_K or GGMLType.Q5_K or GGMLType.Q6_K;
 
+    /// <summary>
+    /// Dequantize a SINGLE row (the contiguous ne0 run) of a 2D tensor to float32, reading just that row's
+    /// bytes via <see cref="SourceBytes"/> (works on both the in-memory and streaming paths). For
+    /// <c>token_embd.weight</c> [n_embd, vocab] this returns token <paramref name="rowIndex"/>'s embedding
+    /// without dequantizing the whole multi-GB table. The row length (ne0) is block-aligned for all the
+    /// quant types here (256 | 3840 for K-quants, 32 | 3840), so each row decodes independently.
+    /// Used by the gemma4 multimodal generation harness to gather text-token embeddings host-side.
+    /// </summary>
+    public float[]? GetTensorRowFloat32(GGUFTensorInfo tensor, int rowIndex)
+    {
+        int rowLen = (int)tensor.Dimensions[0];
+        if (rowLen <= 0) return null;
+        long rowBytes = GGMLTypes.TypeSize(tensor.Type, rowLen);
+        long absOffset = GetTensorDataOffset(tensor) + (long)rowIndex * rowBytes;
+        var (buf, b) = SourceBytes(absOffset, (int)rowBytes);
+        return tensor.Type switch
+        {
+            GGMLType.F32 => RowF32(buf, b, rowLen),
+            GGMLType.F16 => RowF16(buf, b, rowLen),
+            GGMLType.BF16 => RowBF16(buf, b, rowLen),
+            GGMLType.Q6_K => RowQ6_K(buf, b, rowLen),
+            GGMLType.Q8_0 => RowQ8_0(buf, b, rowLen),
+            _ => throw new NotSupportedException(
+                $"GetTensorRowFloat32: per-row dequant not implemented for {tensor.Type} (tensor '{tensor.Name}'). " +
+                $"Supported: F32, F16, BF16, Q6_K, Q8_0. Add the window dequant for this type if a model needs it.")
+        };
+    }
+
+    private static float[] RowF32(byte[] buf, int b, int n)
+    {
+        var r = new float[n];
+        Buffer.BlockCopy(buf, b, r, 0, n * 4);
+        return r;
+    }
+
+    private static float[] RowF16(byte[] buf, int b, int n)
+    {
+        var r = new float[n];
+        for (int i = 0; i < n; i++) r[i] = HalfToFloat((ushort)(buf[b + i * 2] | (buf[b + i * 2 + 1] << 8)));
+        return r;
+    }
+
+    private static float[] RowBF16(byte[] buf, int b, int n)
+    {
+        var r = new float[n];
+        for (int i = 0; i < n; i++) r[i] = BitConverter.Int32BitsToSingle((buf[b + i * 2] | (buf[b + i * 2 + 1] << 8)) << 16);
+        return r;
+    }
+
+    private static float[] RowQ8_0(byte[] buf, int b, int n)
+    {
+        var r = new float[n];
+        int blocks = n / 32;
+        for (int blk = 0; blk < blocks; blk++)
+        {
+            int o = b + blk * 34;
+            float scale = HalfToFloat((ushort)(buf[o] | (buf[o + 1] << 8)));
+            for (int i = 0; i < 32; i++) r[blk * 32 + i] = (sbyte)buf[o + 2 + i] * scale;
+        }
+        return r;
+    }
+
+    /// <summary>Q6_K window dequant — a byte-window port of <see cref="DequantizeQ6_K"/> (same block math).</summary>
+    private static float[] RowQ6_K(byte[] buf, int b, int n)
+    {
+        var r = new float[n];
+        int blocks = n / 256;
+        for (int blk = 0; blk < blocks; blk++)
+        {
+            int bOff = b + blk * 210;
+            float d = HalfToFloat((ushort)(buf[bOff + 208] | (buf[bOff + 209] << 8)));
+            int ql = bOff, qh = bOff + 128, sc = bOff + 192;
+            int y = blk * 256;
+            for (int seg = 0; seg < 256; seg += 128)
+            {
+                for (int l = 0; l < 32; l++)
+                {
+                    int isIdx = l / 16;
+                    int hbits = buf[qh + l];
+                    int q1 = ((buf[ql + l] & 0x0F) | (((hbits >> 0) & 3) << 4)) - 32;
+                    int q2 = ((buf[ql + l + 32] & 0x0F) | (((hbits >> 2) & 3) << 4)) - 32;
+                    int q3 = ((buf[ql + l] >> 4) | (((hbits >> 4) & 3) << 4)) - 32;
+                    int q4 = ((buf[ql + l + 32] >> 4) | (((hbits >> 6) & 3) << 4)) - 32;
+                    r[y + l] = d * (sbyte)buf[sc + isIdx] * q1;
+                    r[y + l + 32] = d * (sbyte)buf[sc + isIdx + 2] * q2;
+                    r[y + l + 64] = d * (sbyte)buf[sc + isIdx + 4] * q3;
+                    r[y + l + 96] = d * (sbyte)buf[sc + isIdx + 6] * q4;
+                }
+                y += 128; ql += 64; qh += 32; sc += 8;
+            }
+        }
+        return r;
+    }
+
     /// <summary>Get tensor data as float32 (dequantizes if needed).</summary>
     public float[]? GetTensorFloat32(GGUFTensorInfo tensor)
     {
@@ -663,16 +757,12 @@ public class GGUFModel
         return result;
     }
 
-    private static float HalfToFloat(ushort h)
-    {
-        int sign = (h >> 15) & 1;
-        int exp = (h >> 10) & 0x1F;
-        int mant = h & 0x3FF;
-        if (exp == 0) return sign == 0 ? 0f : -0f;
-        if (exp == 31) return mant == 0 ? (sign == 0 ? float.PositiveInfinity : float.NegativeInfinity) : float.NaN;
-        float val = MathF.Pow(2, exp - 15) * (1f + mant / 1024f);
-        return sign == 0 ? val : -val;
-    }
+    // Canonical IEEE-754 half→float widening. The previous hand-rolled version FLUSHED SUBNORMALS TO ZERO
+    // (exp==0 → 0f), which silently zeroed any K-quant block whose fp16 scale `d` is subnormal — gemma4's
+    // token_embd (Q6_K) has many such small scales, so host-side dequant returned all-zero embedding rows
+    // while the GPU path (which decodes subnormals correctly) was fine. BitConverter.UInt16BitsToHalf
+    // handles subnormals, ±inf, and NaN correctly, matching the GPU FusedDequantMatMul.HalfToFloat.
+    private static float HalfToFloat(ushort h) => (float)BitConverter.UInt16BitsToHalf(h);
 }
 
 /// <summary>
