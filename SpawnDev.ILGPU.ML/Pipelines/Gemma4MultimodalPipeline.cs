@@ -69,6 +69,9 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         model.SourceStream = stream;
         var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, textGgufPath, acceptInputsEmbeds: true);
         var projector = new Gemma4MultimodalProjector(MmprojModel.Load(mmprojPath));
+        // (Tried raising GraphExecutor.SyncIntervalNodes to drop the mid-forward drains — it was SLOWER:
+        // the periodic command-buffer flushes let the GPU start work while the CPU keeps dispatching, so the
+        // default 64 stays. The token-by-token prefill is the real win.)
         return new Gemma4MultimodalPipeline(accelerator, stream, model, session, projector, maxSeqLen, ownsSession: true);
     }
 
