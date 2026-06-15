@@ -323,8 +323,25 @@ public class FusedDequantMatMul : IDisposable
         {
             int bytesPerRow = K / 256 * 144;
             int rowBase = n * bytesPerRow;
-            for (int k = tid; k < K; k += GemvGroupSize)
-                partial += input[k] * DecodeQ4KElement(w, rowBase, k);
+            // BLOCK-STRUCTURED: with GemvGroupSize=64 each thread owns exactly 256/64=4 elements per 256-block
+            // (r = tid, tid+64, tid+128, tid+192 — same coalesced access as the strided-k loop). The block's
+            // fp16 d/dmin are IDENTICAL for all 256 elements, so decode them ONCE per block (was per element =
+            // 2 HalfToFloatFinite × ~20 ALU ops wasted 256x — Pathology #3). The per-element work is then just
+            // the 6-bit sub-block scale + the nibble.
+            int numBlocks = K / 256;
+            int perThread = 256 / GemvGroupSize;
+            for (int blk = 0; blk < numBlocks; blk++)
+            {
+                int sbOff = rowBase + blk * 144;
+                float d = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+                float dmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+                int kBase = blk * 256;
+                for (int sub = 0; sub < perThread; sub++)
+                {
+                    int r = tid + sub * GemvGroupSize;
+                    partial += input[kBase + r] * DecodeQ4KScaled(w, sbOff, r, d, dmin);
+                }
+            }
         }
         sh[tid] = partial;
         Group.Barrier();
@@ -336,6 +353,30 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="r"/> (0..255) within a Q4_K super-block at byte
+    /// <paramref name="sbOff"/>, given the block's already-decoded fp16 <paramref name="d"/>/<paramref name="dmin"/>
+    /// (hoisted out of the per-element loop in the GEMV). The 6-bit sub-block scale/min + nibble are identical
+    /// to <see cref="DecodeQ4KElement"/>; only the redundant fp16 decode is lifted.</summary>
+    private static float DecodeQ4KScaled(ArrayView1D<int, Stride1D.Dense> w, int sbOff, int r, float d, float dmin)
+    {
+        int t = r >> 6;
+        int c = r & 63;
+        int l = c & 31;
+        int hi = (c >> 5) & 1;
+        int scOff = sbOff + 4;
+        int j = 2 * t + hi;
+        int lowBit = ((j - 4) >> 31) & 1;
+        int hiBit = 1 - lowBit;
+        int bj = ReadByte(w, scOff + j);
+        int bj4 = ReadByte(w, scOff + j + 4);
+        int bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+        int sc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+        int mn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+        int packed = ReadByte(w, sbOff + 16 + 32 * t + l);
+        int nibble = (packed >> (4 * hi)) & 0xF;
+        return d * sc * nibble - dmin * mn;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
