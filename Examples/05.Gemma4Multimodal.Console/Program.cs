@@ -30,7 +30,7 @@ Console.WriteLine($"  audio  encoder : {mm.HasAudioEncoder}  ({mm.AudioProjector
 Console.WriteLine($"  image size     : {mm.VisionImageSize}   patch {mm.VisionPatchSize} (effective 48 via n_merge=3)");
 Console.WriteLine($"  vision embed/proj : {mm.VisionEmbeddingLength} / {mm.VisionProjectionDim}");
 Console.WriteLine($"  image mean/std : [{string.Join(",", mm.VisionImageMean)}] / [{string.Join(",", mm.VisionImageStd)}]");
-Console.WriteLine($"  audio frame/embed/proj : {mm.AudioFrameLength} / {mm.AudioEmbeddingLength} / {mm.AudioProjectionDim}");
+Console.WriteLine($"  audio frame/proj : {mm.AudioFrameLength} / {mm.AudioProjectionDim}");
 
 Console.WriteLine($"\n=== tensors ({mm.Gguf.Tensors.Length}) ===");
 foreach (var t in mm.Gguf.Tensors.OrderBy(t => t.Name, StringComparer.Ordinal))
@@ -47,8 +47,34 @@ foreach (var name in new[] { "mm.input_projection.weight", "mm.a.input_projectio
     Console.WriteLine($"\n  {name} (bf16→f32): n={w.Length}  min={mn:F4} max={mx:F4} mean={sum / w.Length:F6}  nan/inf={nan}  first=[{string.Join(", ", w.Take(5).Select(v => v.ToString("F4")))}]");
 }
 
-Console.WriteLine("\n[OK] mmproj loaded + bf16 projections dequantized.");
+// ── Step 2: smoke-test the projector forward on the real weights (dummy inputs) ───────────────────
+// Confirms the production EncodeImage/EncodeAudio paths run end-to-end and emit finite [N,3840] vectors.
+// Correctness vs the llama.cpp mtmd oracle comes once the image/audio preprocessing lands.
+var proj = new SpawnDev.ILGPU.ML.Multimodal.Gemma4MultimodalProjector(mm);
+Console.WriteLine($"\n=== projector smoke (EmbedDim={proj.EmbedDim} PatchLen={proj.PatchLen} AudioFrameLen={proj.AudioFrameLen} PosTableLen={proj.PosTableLen}) ===");
+
+var rng = new Random(1);
+int gridC = 2, gridR = 2, nPatches = gridC * gridR;
+var dummyPatches = new float[nPatches * proj.PatchLen];
+for (int i = 0; i < dummyPatches.Length; i++) dummyPatches[i] = (float)rng.NextDouble();   // /255-range stand-in
+var imgEmb = proj.EncodeImage(dummyPatches, nPatches, gridC, gridR);
+ReportEmb("vision", imgEmb, nPatches, proj.EmbedDim);
+
+int nFrames = 3;
+var dummyAudio = new float[nFrames * proj.AudioFrameLen];
+for (int i = 0; i < dummyAudio.Length; i++) dummyAudio[i] = (float)(rng.NextDouble() * 2 - 1);  // [-1,1] PCM stand-in
+var audEmb = proj.EncodeAudio(dummyAudio, nFrames);
+ReportEmb("audio", audEmb, nFrames, proj.EmbedDim);
+
+Console.WriteLine("\n[OK] mmproj loaded + projector forward runs (correctness vs oracle pending preprocessing).");
 return 0;
+
+static void ReportEmb(string tag, float[] emb, int n, int d)
+{
+    double mn = emb[0], mx = emb[0], sum = 0; int bad = 0;
+    foreach (var v in emb) { if (float.IsNaN(v) || float.IsInfinity(v)) bad++; else { mn = Math.Min(mn, v); mx = Math.Max(mx, v); sum += v; } }
+    Console.WriteLine($"  {tag}: [{n},{d}] min={mn:F4} max={mx:F4} mean={sum / emb.Length:F6} nan/inf={bad}  row0=[{string.Join(", ", emb.Take(5).Select(v => v.ToString("F4")))}]");
+}
 
 static string? ArgPath(int idx)
 {

@@ -67,9 +67,12 @@ public sealed class MmprojModel
     public float[] VisionImageMean => Gguf.GetMetadataFloatArray("clip.vision.image_mean") ?? new[] { 0f, 0f, 0f };
     public float[] VisionImageStd => Gguf.GetMetadataFloatArray("clip.vision.image_std") ?? new[] { 1f, 1f, 1f };
 
-    /// <summary>Audio "mel bins" — a misnomer for gemma4ua: it is the RAW waveform frame length (640 samples).</summary>
-    public int AudioFrameLength => (int)Gguf.GetMetadataInt("clip.audio.num_mel_bins", 640);
-    public int AudioEmbeddingLength => (int)Gguf.GetMetadataInt("clip.audio.embedding_length", 640);
+    /// <summary>RAW waveform frame length fed to mm.a.input_projection (640 samples @ 16 kHz = 40 ms).
+    /// Derived from the projection weight's input dim (ne0) — authoritative. NOTE: the metadata field
+    /// <c>clip.audio.num_mel_bins</c> is a MISNOMER here (it reads 128 and is unused — gemma4ua is raw
+    /// waveform, no mel); <c>clip.audio.embedding_length</c> (640) matches but the weight is the source of truth.</summary>
+    public int AudioFrameLength =>
+        GetTensorShape("mm.a.input_projection.weight")?[0] ?? (int)Gguf.GetMetadataInt("clip.audio.embedding_length", 640);
     public int AudioProjectionDim => (int)Gguf.GetMetadataInt("clip.audio.projection_dim", 3840);
 
     // ── tensors ────────────────────────────────────────────────────────────────────────────────────
