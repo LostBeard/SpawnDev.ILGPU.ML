@@ -1343,7 +1343,7 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static InferenceSession CreateFromGGUF(
         Accelerator accelerator, byte[] ggufBytes,
-        Action<string, int>? onProgress = null)
+        Action<string, int>? onProgress = null, bool acceptInputsEmbeds = false)
     {
         // Parse GGUF
         onProgress?.Invoke("parse", 0);
@@ -1352,7 +1352,7 @@ public class InferenceSession : IDisposable
 
         // Build transformer graph from architecture metadata
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values
@@ -1503,7 +1503,7 @@ public class InferenceSession : IDisposable
     /// </summary>
     public static async Task<InferenceSession> CreateFromGGUFStreamAsync(
         Accelerator accelerator, Stream stream,
-        Action<string, int>? onProgress = null, CancellationToken ct = default)
+        Action<string, int>? onProgress = null, CancellationToken ct = default, bool acceptInputsEmbeds = false)
     {
         if (!stream.CanSeek)
             throw new ArgumentException("CreateFromGGUFStreamAsync requires a seekable stream.", nameof(stream));
@@ -1514,7 +1514,7 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("parse", 100);
 
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel);
+        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
         onProgress?.Invoke("build_graph", 100);
 
         // Small constants (identical to CreateFromGGUF).

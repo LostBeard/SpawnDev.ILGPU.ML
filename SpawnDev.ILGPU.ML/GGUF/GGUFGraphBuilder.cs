@@ -31,9 +31,14 @@ public sealed record GGUFQuantizedWeight(byte[] Bytes, GGMLType Type, long Strea
 
 public static class GGUFGraphBuilder
 {
+    /// <param name="acceptInputsEmbeds">When true, the graph takes a pre-computed <c>inputs_embeds</c>
+    /// [1, seq, n_embd] tensor and SKIPS the token Gather + gemma sqrt(n_embd) scale. The caller supplies the
+    /// full embedding sequence (text rows gathered+scaled host-side, multimodal rows = RAW projected
+    /// embeddings — gemma4 splices media embeddings unscaled). The default false path is the unchanged
+    /// input_ids text path.</param>
     public static (ModelGraph Graph, Dictionary<string, float[]> Weights,
         Dictionary<string, GGUFQuantizedWeight> QuantizedWeights,
-        HashSet<string> TransposeOnUpload) BuildGraph(GGUFModel model)
+        HashSet<string> TransposeOnUpload) BuildGraph(GGUFModel model, bool acceptInputsEmbeds = false)
     {
         var arch = model.Architecture.ToLowerInvariant();
         var graph = new ModelGraph { Name = $"{model.Name} ({arch})" };
@@ -61,15 +66,12 @@ public static class GGUFGraphBuilder
         bool useSiLU = !isGemma
             && arch is not "phi" and not "phi3" and not "gpt2" and not "falcon" and not "bloom" and not "mpt";
 
-        // Graph input: token IDs [1, seq_len]
-        graph.Inputs.Add(new GraphValueInfo { Name = "input_ids", Shape = new[] { 1, -1 } });
         graph.Outputs.Add(new GraphValueInfo { Name = "logits", Shape = new[] { 1, -1, vocabSize } });
 
-        string prevOutput = "input_ids";
-
         // ═══════════════════════════════════════════════════════════
-        //  1. Token embedding lookup
+        //  1. Token embedding lookup (or pre-computed inputs_embeds)
         // ═══════════════════════════════════════════════════════════
+        // token_embd is extracted REGARDLESS of the entry mode — it doubles as the tied LM head below.
         var embedWeight = FindTensor(model, "token_embd.weight");
         if (embedWeight != null)
         {
@@ -80,23 +82,42 @@ public static class GGUFGraphBuilder
             // stored; no transpose, no F32 expansion.
             ExtractWeight(model, embedWeight, weights, quantizedBytes);
             graph.Initializers[embedWeight.Name] = embedWeight.Shape.Reverse().ToArray();
-            AddNode(graph, "Gather", new[] { embedWeight.Name, prevOutput }, new[] { "embed_out" });
-            prevOutput = "embed_out";
+        }
 
-            // gemma scales the token embeddings by sqrt(n_embd) right after the lookup
-            // (llama.cpp `ggml_scale(inpL, sqrtf(n_embd))`; HF `inputs_embeds * hidden_size**0.5`).
-            // There is no metadata key for it - it is a hardcoded gemma constant. RMSNorm is
-            // scale-invariant, so the attention/FFN paths don't notice the scale; but the RESIDUAL
-            // stream carries the token-identity signal, and without the ~62x boost that signal sits
-            // at <1% of the (RMS-normed) sublayer outputs - so every position collapses to the same
-            // argmax. Gemma-only; other archs add the embedding to the residual unscaled.
-            if (isGemma)
+        string prevOutput;
+        if (acceptInputsEmbeds)
+        {
+            // Multimodal entry: the caller supplies the full [1, seq, n_embd] embedding sequence (text rows
+            // gathered+scaled host-side; media rows = RAW projected embeddings). Skip Gather + gemma scale.
+            graph.Inputs.Add(new GraphValueInfo { Name = "inputs_embeds", Shape = new[] { 1, -1, embedDim } });
+            prevOutput = "inputs_embeds";
+        }
+        else
+        {
+            // Text entry: token IDs [1, seq_len] → Gather → (gemma) sqrt(n_embd) scale.
+            graph.Inputs.Add(new GraphValueInfo { Name = "input_ids", Shape = new[] { 1, -1 } });
+            prevOutput = "input_ids";
+            if (embedWeight != null)
             {
-                const string embScaleName = "embed_scale";
-                weights[embScaleName] = new[] { MathF.Sqrt(embedDim) };
-                graph.Initializers[embScaleName] = new[] { 1 };
-                AddNode(graph, "Mul", new[] { "embed_out", embScaleName }, new[] { "embed_scaled" });
-                prevOutput = "embed_scaled";
+                AddNode(graph, "Gather", new[] { embedWeight.Name, prevOutput }, new[] { "embed_out" });
+                prevOutput = "embed_out";
+
+                // gemma scales the token embeddings by sqrt(n_embd) right after the lookup
+                // (llama.cpp `ggml_scale(inpL, sqrtf(n_embd))`; HF `inputs_embeds * hidden_size**0.5`).
+                // There is no metadata key for it - it is a hardcoded gemma constant. RMSNorm is
+                // scale-invariant, so the attention/FFN paths don't notice the scale; but the RESIDUAL
+                // stream carries the token-identity signal, and without the ~62x boost that signal sits
+                // at <1% of the (RMS-normed) sublayer outputs - so every position collapses to the same
+                // argmax. Gemma-only; other archs add the embedding to the residual unscaled.
+                // (Multimodal media embeddings are spliced RAW host-side, so they intentionally bypass this.)
+                if (isGemma)
+                {
+                    const string embScaleName = "embed_scale";
+                    weights[embScaleName] = new[] { MathF.Sqrt(embedDim) };
+                    graph.Initializers[embScaleName] = new[] { 1 };
+                    AddNode(graph, "Mul", new[] { "embed_out", embScaleName }, new[] { "embed_scaled" });
+                    prevOutput = "embed_scaled";
+                }
             }
         }
 
