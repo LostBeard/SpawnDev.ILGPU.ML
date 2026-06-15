@@ -161,6 +161,7 @@ public class GGUFModel
         {
             GGMLType.F32 => ReadF32(offset, elements),
             GGMLType.F16 => ReadF16(offset, elements),
+            GGMLType.BF16 => ReadBF16(offset, elements),
             GGMLType.Q8_0 => DequantizeQ8_0(offset, elements),
             GGMLType.Q4_0 => DequantizeQ4_0(offset, elements),
             GGMLType.Q4_1 => DequantizeQ4_1(offset, elements),
@@ -355,6 +356,24 @@ public class GGUFModel
             int pos = b + (int)(i * 2);
             ushort fp16 = (ushort)(bytes[pos] | (bytes[pos + 1] << 8));
             result[i] = HalfToFloat(fp16);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Read BF16 (GGML type 30) as float32. BF16 is simply the upper 16 bits of an IEEE-754 float32
+    /// (1 sign, 8 exponent, 7 mantissa bits), so widening is a pure left-shift into the high half — no
+    /// table, no rounding. Used by gemma4's mmproj projection weights (mm.input_projection / mm.a.input_projection).
+    /// </summary>
+    private float[] ReadBF16(long offset, long count)
+    {
+        var result = new float[count];
+        var (bytes, b) = SourceBytes(offset, (int)count * 2);
+        for (long i = 0; i < count; i++)
+        {
+            int pos = b + (int)(i * 2);
+            ushort bf16 = (ushort)(bytes[pos] | (bytes[pos + 1] << 8));
+            result[i] = BitConverter.Int32BitsToSingle(bf16 << 16);
         }
         return result;
     }
@@ -699,6 +718,7 @@ public enum GGMLType : uint
     I64 = 27,
     F64 = 28,
     IQ1_M = 29,
+    BF16 = 30,
 }
 
 /// <summary>GGUF metadata value types.</summary>
@@ -727,6 +747,7 @@ public static class GGMLTypes
     {
         GGMLType.F32 => elements * 4,
         GGMLType.F16 => elements * 2,
+        GGMLType.BF16 => elements * 2,
         GGMLType.Q4_0 => elements / 32 * 18,   // 32 elements per block, 18 bytes per block
         GGMLType.Q4_1 => elements / 32 * 20,
         GGMLType.Q5_0 => elements / 32 * 22,
