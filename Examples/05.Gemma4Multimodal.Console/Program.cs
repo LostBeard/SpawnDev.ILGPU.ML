@@ -114,22 +114,27 @@ async Task<int> GenerateAsync(string textPath, string mmprojPath, string prompt,
         return o;
     }
 
-    // ── image → raw projected embeddings (if provided) ──
-    float[]? imageEmb = null; int nImg = 0, imgCols = 0, imgRows = 0;
+    // ── image(s) → raw projected embeddings. GEMMA4_IMAGE may be comma-separated = multiple images, which
+    //    is also how VIDEO works (sampled frames, each through the image path, spliced in sequence). ──
+    var imageBlocks = new List<(float[] emb, int n)>();
     if (!string.IsNullOrEmpty(imagePath))
     {
-        if (!File.Exists(imagePath)) { Console.Error.WriteLine($"image not found: {imagePath}"); return 1; }
-        using var img = Image.Load<Rgb24>(imagePath);
-        int iw = img.Width, ih = img.Height;
-        var rgb = new byte[(long)iw * ih * 3];
-        img.CopyPixelDataTo(rgb);
-        var (patches, nCols, nRows) = Gemma4ImagePreprocessor.Preprocess(rgb, iw, ih);
-        imgCols = nCols; imgRows = nRows; nImg = nCols * nRows;
         var mmProj = MmprojModel.Load(mmprojPath);
         var projector = new Gemma4MultimodalProjector(mmProj);
-        imageEmb = projector.EncodeImage(patches, nImg, nCols, nRows);   // raw [nImg, nEmbd]
-        Console.WriteLine($"Image: {imagePath} {iw}x{ih} -> grid {nCols}x{nRows} = {nImg} tokens (raw embeddings)");
+        foreach (var ip in imagePath.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!File.Exists(ip)) { Console.Error.WriteLine($"image not found: {ip}"); return 1; }
+            using var img = Image.Load<Rgb24>(ip);
+            int iw = img.Width, ih = img.Height;
+            var rgb = new byte[(long)iw * ih * 3];
+            img.CopyPixelDataTo(rgb);
+            var (patches, nCols, nRows) = Gemma4ImagePreprocessor.Preprocess(rgb, iw, ih);
+            int n = nCols * nRows;
+            imageBlocks.Add((projector.EncodeImage(patches, n, nCols, nRows), n));   // raw [n, nEmbd]
+            Console.WriteLine($"Image: {ip} {iw}x{ih} -> grid {nCols}x{nRows} = {n} tokens");
+        }
     }
+    int nImg = imageBlocks.Sum(b => b.n);
 
     // ── audio → raw projected embeddings (if provided) ──
     float[]? audioEmb = null; int nAud = 0;
@@ -152,13 +157,16 @@ async Task<int> GenerateAsync(string textPath, string mmprojPath, string prompt,
     if (bos >= 0) Control(bos);
     Control(turnO); Text("system\n"); Control(Id("<|think|>")); Text("\n"); Control(turnC); Text("\n");
     Control(turnO); Text("user\n");
-    if (imageEmb != null)
+    if (imageBlocks.Count > 0)
     {
         int imgBegin = Id("<|image>"), imgEnd = Id("<image|>");
         if (imgBegin < 0 || imgEnd < 0) throw new Exception("gemma4 image marker tokens <|image>/<image|> not in vocab.");
-        Control(imgBegin);
-        for (int p = 0; p < nImg; p++) { var o = new float[nEmbd]; Array.Copy(imageEmb, (long)p * nEmbd, o, 0, nEmbd); rows.Add(o); }
-        Control(imgEnd);
+        foreach (var (emb, n) in imageBlocks)   // one <|image>…<image|> block per image/frame
+        {
+            Control(imgBegin);
+            for (int p = 0; p < n; p++) { var o = new float[nEmbd]; Array.Copy(emb, (long)p * nEmbd, o, 0, nEmbd); rows.Add(o); }
+            Control(imgEnd);
+        }
     }
     if (audioEmb != null)
     {
