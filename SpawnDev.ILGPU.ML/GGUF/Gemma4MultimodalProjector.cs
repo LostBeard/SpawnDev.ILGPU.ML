@@ -36,6 +36,11 @@ public sealed class Gemma4MultimodalProjector
     // Audio weights.
     private readonly float[]? _mmAInputProjW; // [out=3840, in=640]
 
+    /// <summary>True if the mmproj carries the vision projector (gemma4uv).</summary>
+    public bool SupportsVision => _patchEmbdW != null;
+    /// <summary>True if the mmproj carries the audio projector (gemma4ua).</summary>
+    public bool SupportsAudio => _mmAInputProjW != null;
+
     /// <summary>Embedding dim of the LLM (projection output), 3840 for gemma4 12B.</summary>
     public int EmbedDim { get; }
     /// <summary>Flattened patch length the vision path consumes (6912 = 48*48*3).</summary>
