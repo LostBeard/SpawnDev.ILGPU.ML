@@ -83,6 +83,12 @@ vision final projection, one in the audio path.
 - Per media item, mtmd emits **3 chunks**: `[text: begin marker]`, `[media chunk reserving N empty slots]`,
   `[text: end marker]`. The projected `[3840, N]` embeddings overwrite the N reserved positions
   (`mtmd.cpp:1033-1221,1402-1456`). One chunk per image for gemma4 (no llava-uhd slicing).
+- **DEFINITIVE — splice media embeddings RAW (no sqrt(n_embd) scale).** `src/models/gemma4.cpp:181-182`:
+  `inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);` — the embedding scale applies ONLY
+  to gathered token embeddings; provided multimodal embeddings (the `ubatch.embd` path) get ×1.0. mtmd encode
+  adds no scaling either. So our integration: keep the graph's `input_ids → Gather(token_embd) → ×sqrt(n_embd)`
+  for text positions; OVERWRITE the media positions with the RAW projector output. (gemma4 `f_embedding_scale==0`,
+  so the Granite-style extra scale is also a no-op.)
 - Chat template (`google/gemma-4-12B-it/chat_template.jinja`, verified verbatim — NOT Gemma 3's):
   - turn open `<|turn>` + role + `\n`; turn close `<turn|>\n`; gen prompt `<|turn>model\n` (assistant role = `model`)
   - media markers in prompt text: **`<|image|>` / `<|audio|>` / `<|video|>`** (pipes both sides)
@@ -107,13 +113,21 @@ llama.cpp `llama-mtmd-cli` / `mtmd` produces the per-media embedding tensors and
 the node-level + end-to-end oracle (same pattern as the text bring-up used llama-server). Teacher-force identical
 inputs and compare the `[3840, N]` projected embeddings, then the generated tokens.
 
-## Unverified (carry as hypotheses, confirm during impl)
-1. Exact `image_resize_pad` runtime effect (PAD_CEIL default; black letterbox possible but typically ~0 after the
-   mult-of-48 smart resize). Confirm by tracing a real image.
-2. kx-vs-ky inner nesting inside each 6912 patch vector (channel-planar R/G/B blocks confirmed; within-channel
-   row-major vs col-major is ggml im2col convention, not line-cited). Confirm against a reference embedding.
-3. Server-side `<|image|>` → `<__media__>` marker substitution glue line (mechanism verified, exact line not).
-4. HF `preprocessor_config.json` for `google/gemma-4-12B` (repo gated). llama.cpp values match our GGUF anchors.
+## RESOLVED (was Unverified) — verbatim snippets in `Plans/gemma4-llamacpp-reference-snippets.md`
+1. **Resize formula** (`mtmd-image.cpp:145-169` `calc_size_preserved_ratio`): `round_by_factor(x)=round(x/48)*48`
+   (round = half-AWAY-from-zero → C# `MidpointRounding.AwayFromZero`); `h_bar=max(48,round(h))`, `w_bar=max(48,round(w))`;
+   if `h_bar*w_bar > max_pixels(645120)`: `beta=sqrt(h*w/max)`, `h_bar=max(48,floor(h/beta/48)*48)`, same w;
+   else if `< min_pixels(92160)`: `beta=sqrt(min/(h*w))`, `h_bar=ceil(h*beta/48)*48`, same w. Bilinear.
+   Then **PAD_CEIL** (`mtmd-image.cpp:58-99`): `scale=min(scale_w,scale_h)`, `new=min(ceil(src*scale),target)`,
+   black fill, CENTER composite — must implement (independent W/H rounding can leave a thin black border; a plain
+   stretch diverges).
+2. **im2col within-patch order** (`ggml-cpu/ops.cpp:6207-6280`): `dst[iic*(KH*KW) + ikh*KW + ikw]` =
+   `[channel][ky][kx]`, channel-outermost, row-major within channel (R 48×48 block, then G, then B). Patch order
+   `p = gy*n_cols + gx` (gx fastest). pos_x=p%n_cols, pos_y=p/n_cols, n_cols=resized_W/48.
+3. **Media-embedding scale** (`models/gemma4.cpp:181-182`): RAW, ×1.0 — see SPLICING section above. (mtmd encode
+   adds no scaling.)
+4. (informational) HF `preprocessor_config.json` for `google/gemma-4-12B` still not independently fetched (repo
+   gated); llama.cpp values match our GGUF metadata anchors exactly, so the llama.cpp path IS the reference.
 
 ## Notes
 - mmproj projections are bf16 (GGUF type 30). Our GGUF loader already dequants to F32 — not blocked on Geordi's
