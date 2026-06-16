@@ -171,8 +171,26 @@ public sealed class Gemma4MultimodalProjectorGpu : IDisposable
         return outp;
     }
 
+    /// <summary>Upload host patches, run the vision forward on the GPU, return the [nPatches, EmbedDim] GPU
+    /// buffer (caller owns + disposes) — NO host readback. The zero-copy splice path: the result stays GPU-side
+    /// and its rows are fed straight into the decoder as <c>inputs_embeds</c>.</summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> EncodeImageToBufferAsync(
+        float[] patches, int nPatches, int nCols, int nRows)
+    {
+        using var pin = _accel.Allocate1D(patches); // EncodeImageToBufferAsync drains before returning → safe to dispose
+        return await EncodeImageToBufferAsync(pin.View, nPatches, nCols, nRows);
+    }
+
+    /// <summary>Upload host frames, run the audio forward on the GPU, return the [nFrames, EmbedDim] GPU buffer
+    /// (caller owns + disposes) — NO host readback.</summary>
+    public async Task<MemoryBuffer1D<float, Stride1D.Dense>> EncodeAudioToBufferAsync(float[] frames, int nFrames)
+    {
+        using var pin = _accel.Allocate1D(frames);
+        return await EncodeAudioToBufferAsync(pin.View, nFrames);
+    }
+
     /// <summary>Host-returning vision forward (uploads patches, runs on GPU, reads back). Matches the CPU
-    /// reference's <see cref="Gemma4MultimodalProjector.EncodeImage"/> signature for the current host splice.</summary>
+    /// reference's <see cref="Gemma4MultimodalProjector.EncodeImage"/> signature; used by the equivalence tests.</summary>
     public async Task<float[]> EncodeImageAsync(float[] patches, int nPatches, int nCols, int nRows)
     {
         using var pin = _accel.Allocate1D(patches);

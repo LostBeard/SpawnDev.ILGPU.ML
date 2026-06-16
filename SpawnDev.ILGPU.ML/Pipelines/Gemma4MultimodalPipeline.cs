@@ -151,16 +151,19 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     {
         _session.ResetGGUFDecode();
         var (imageBlocks, audioBlocks) = await ProjectMediaAsync(images, audio);
-
-        // Full single-turn gemma4 chat template (BOS + system + user[+media] + model), media spliced RAW.
-        var rows = new List<float[]>();
-        if (_bos >= 0) await CtrlAsync(rows, _bos);
-        await CtrlAsync(rows, _turnO); await TextAsync(rows, "system\n"); if (thinking && _think >= 0) await CtrlAsync(rows, _think); await TextAsync(rows, "\n"); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
-        await CtrlAsync(rows, _turnO); await TextAsync(rows, "user\n");
-        await AppendMediaAsync(rows, imageBlocks, audioBlocks);
-        await TextAsync(rows, prompt); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
-        await CtrlAsync(rows, _turnO); await TextAsync(rows, "model\n");
-        return await PrefillAndGenerateAsync(rows, maxNewTokens, onToken);
+        try
+        {
+            // Full single-turn gemma4 chat template (BOS + system + user[+media] + model), media spliced RAW.
+            var rows = new List<EmbRow>();
+            if (_bos >= 0) await CtrlAsync(rows, _bos);
+            await CtrlAsync(rows, _turnO); await TextAsync(rows, "system\n"); if (thinking && _think >= 0) await CtrlAsync(rows, _think); await TextAsync(rows, "\n"); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+            await CtrlAsync(rows, _turnO); await TextAsync(rows, "user\n");
+            await AppendMediaAsync(rows, imageBlocks, audioBlocks);
+            await TextAsync(rows, prompt); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+            await CtrlAsync(rows, _turnO); await TextAsync(rows, "model\n");
+            return await PrefillAndGenerateAsync(rows, maxNewTokens, onToken);
+        }
+        finally { DisposeBlocks(imageBlocks); DisposeBlocks(audioBlocks); }
     }
 
     /// <summary>Start a multi-turn chat. The KV cache is reused ACROSS turns (only each new turn is
@@ -178,61 +181,79 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio, int maxNewTokens, Func<int, string, Task>? onToken)
     {
         var (imageBlocks, audioBlocks) = await ProjectMediaAsync(images, audio);
-        var rows = new List<float[]>();
-        if (chat.Turn == 0)
+        try
         {
-            if (_bos >= 0) await CtrlAsync(rows, _bos);
-            await CtrlAsync(rows, _turnO); await TextAsync(rows, "system\n"); if (chat.Thinking && _think >= 0) await CtrlAsync(rows, _think); await TextAsync(rows, "\n"); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+            var rows = new List<EmbRow>();
+            if (chat.Turn == 0)
+            {
+                if (_bos >= 0) await CtrlAsync(rows, _bos);
+                await CtrlAsync(rows, _turnO); await TextAsync(rows, "system\n"); if (chat.Thinking && _think >= 0) await CtrlAsync(rows, _think); await TextAsync(rows, "\n"); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+            }
+            else
+            {
+                await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");   // close the previous model turn (its <turn|> was generated but not cached)
+            }
+            await CtrlAsync(rows, _turnO); await TextAsync(rows, "user\n");
+            await AppendMediaAsync(rows, imageBlocks, audioBlocks);
+            await TextAsync(rows, text); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+            await CtrlAsync(rows, _turnO); await TextAsync(rows, "model\n");
+            chat.Turn++;
+            return await PrefillAndGenerateAsync(rows, maxNewTokens, onToken);
         }
-        else
-        {
-            await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");   // close the previous model turn (its <turn|> was generated but not cached)
-        }
-        await CtrlAsync(rows, _turnO); await TextAsync(rows, "user\n");
-        await AppendMediaAsync(rows, imageBlocks, audioBlocks);
-        await TextAsync(rows, text); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
-        await CtrlAsync(rows, _turnO); await TextAsync(rows, "model\n");
-        chat.Turn++;
-        return await PrefillAndGenerateAsync(rows, maxNewTokens, onToken);
+        finally { DisposeBlocks(imageBlocks); DisposeBlocks(audioBlocks); }
     }
 
     // ── shared building blocks (one-shot GenerateAsync + multi-turn ChatTurnAsync use the same path) ──
 
-    /// <summary>Project each media item to its RAW [n, n_embd] embedding block (gemma4 splices media unscaled).
-    /// The projection runs on the GPU (<see cref="Gemma4MultimodalProjectorGpu"/>); the small result is read
-    /// back to host for the current row-by-row splice (a fully GPU-resident splice is a follow-up).</summary>
-    private async Task<(List<float[]> images, List<float[]> audio)> ProjectMediaAsync(IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio)
+    /// <summary>One prefill embedding row, kept ZERO-COPY where possible: a text/control token is gathered
+    /// host-side from the GGUF stream (<see cref="Host"/> = the scaled [n_embd] row); a media row is a
+    /// sub-view into a GPU projector-output block (<see cref="Gpu"/> + <see cref="Offset"/>) fed straight into
+    /// the decoder, no GPU→host→GPU round-trip.</summary>
+    private readonly record struct EmbRow(float[]? Host, MemoryBuffer1D<float, Stride1D.Dense>? Gpu, long Offset);
+
+    /// <summary>Project each media item to its RAW [n, n_embd] embedding block (gemma4 splices media unscaled),
+    /// kept GPU-RESIDENT: the projector (<see cref="Gemma4MultimodalProjectorGpu"/>) returns a GPU buffer whose
+    /// rows are spliced as <c>inputs_embeds</c> sub-views — no readback. Caller disposes the returned buffers
+    /// after the prefill consumes them.</summary>
+    private async Task<(List<MemoryBuffer1D<float, Stride1D.Dense>> images, List<MemoryBuffer1D<float, Stride1D.Dense>> audio)>
+        ProjectMediaAsync(IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio)
     {
         if (images is { Count: > 0 } && !SupportsImages) throw new InvalidOperationException("mmproj has no vision encoder.");
         if (audio is { Count: > 0 } && !SupportsAudio) throw new InvalidOperationException("mmproj has no audio encoder.");
-        var imageBlocks = new List<float[]>();
+        var imageBlocks = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
         if (images != null)
             foreach (var im in images)
             {
                 var (patches, nCols, nRows) = Gemma4ImagePreprocessor.Preprocess(im.Rgb, im.Width, im.Height);
-                imageBlocks.Add(await _projector.EncodeImageAsync(patches, nCols * nRows, nCols, nRows));
+                imageBlocks.Add(await _projector.EncodeImageToBufferAsync(patches, nCols * nRows, nCols, nRows));
             }
-        var audioBlocks = new List<float[]>();
+        var audioBlocks = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
         if (audio != null)
             foreach (var wav in audio)
             {
                 var (frames, nFrames) = Gemma4AudioPreprocessor.Frame(wav);
-                audioBlocks.Add(await _projector.EncodeAudioAsync(frames, nFrames));
+                audioBlocks.Add(await _projector.EncodeAudioToBufferAsync(frames, nFrames));
             }
         return (imageBlocks, audioBlocks);
     }
 
+    private static void DisposeBlocks(List<MemoryBuffer1D<float, Stride1D.Dense>> blocks)
+    {
+        foreach (var b in blocks) b.Dispose();
+    }
+
     // Token-row helpers gather token_embd rows over the (possibly async, browser) stream — all async.
-    private async Task TextAsync(List<float[]> rows, string s) { foreach (var t in _tok.Encode(s)) rows.Add(await ScaledRowAsync(t)); }
-    private async Task CtrlAsync(List<float[]> rows, int t) => rows.Add(await ScaledRowAsync(t));
-    private async Task MediaAsync(List<float[]> rows, float[] block, int begin, int end)
+    private async Task TextAsync(List<EmbRow> rows, string s) { foreach (var t in _tok.Encode(s)) rows.Add(new EmbRow(await ScaledRowAsync(t), null, 0)); }
+    private async Task CtrlAsync(List<EmbRow> rows, int t) => rows.Add(new EmbRow(await ScaledRowAsync(t), null, 0));
+    private async Task MediaAsync(List<EmbRow> rows, MemoryBuffer1D<float, Stride1D.Dense> block, int begin, int end)
     {
         await CtrlAsync(rows, begin);
-        int n = block.Length / _nEmbd;
-        for (int p = 0; p < n; p++) { var o = new float[_nEmbd]; Array.Copy(block, (long)p * _nEmbd, o, 0, _nEmbd); rows.Add(o); }
+        int n = (int)(block.Length / _nEmbd);
+        for (int p = 0; p < n; p++) rows.Add(new EmbRow(null, block, (long)p * _nEmbd)); // GPU sub-view, no readback
         await CtrlAsync(rows, end);
     }
-    private async Task AppendMediaAsync(List<float[]> rows, List<float[]> imageBlocks, List<float[]> audioBlocks)
+    private async Task AppendMediaAsync(List<EmbRow> rows,
+        List<MemoryBuffer1D<float, Stride1D.Dense>> imageBlocks, List<MemoryBuffer1D<float, Stride1D.Dense>> audioBlocks)
     {
         foreach (var b in imageBlocks) await MediaAsync(rows, b, _imgBegin, _imgEnd);
         foreach (var b in audioBlocks) await MediaAsync(rows, b, _audBegin, _audEnd);
@@ -244,7 +265,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     /// big prefill; only the LAST prefill position's logits matter (they predict token 0), so intermediate
     /// readbacks are skipped. The trailing stop token (&lt;turn|&gt;/&lt;eos&gt;) is NOT fed into the cache —
     /// the next chat turn re-emits &lt;turn|&gt; to close the model turn in-context.</summary>
-    internal async Task<string> PrefillAndGenerateAsync(List<float[]> rows, int maxNewTokens, Func<int, string, Task>? onToken)
+    private async Task<string> PrefillAndGenerateAsync(List<EmbRow> rows, int maxNewTokens, Func<int, string, Task>? onToken)
     {
         float[] last = null!;
         for (int i = 0; i < rows.Count; i++)
@@ -260,17 +281,24 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
             generated.Add(next);
             if (onToken != null) await onToken(generated.Count, _tok.Decode(generated.ToArray()));
             if (next == _turnC || next == _eos || step == maxNewTokens - 1) break;
-            last = await ReadLastLogitsAsync(await ForwardAsync(await ScaledRowAsync(next)));
+            last = await ReadLastLogitsAsync(await ForwardAsync(new EmbRow(await ScaledRowAsync(next), null, 0)));
         }
         // Strip the trailing stop token from the RETURNED text (it stays out of the cache either way).
         if (generated.Count > 0 && (generated[^1] == _turnC || generated[^1] == _eos)) generated.RemoveAt(generated.Count - 1);
         return _tok.Decode(generated.ToArray());
     }
 
-    /// <summary>Run one seq=1 inputs_embeds forward (KV-cache decode step) for a single [n_embd] embedding row.</summary>
-    private async Task<Dictionary<string, Tensor>> ForwardAsync(float[] embRow)
+    /// <summary>Run one seq=1 inputs_embeds forward (KV-cache decode step) for a single [n_embd] embedding row.
+    /// A media row feeds its GPU block sub-view DIRECTLY (zero-copy); a host text/control row is uploaded.</summary>
+    private async Task<Dictionary<string, Tensor>> ForwardAsync(EmbRow row)
     {
-        using var inBuf = _accel.Allocate1D(embRow);
+        if (row.Gpu != null)
+        {
+            var view = row.Gpu.View.SubView(row.Offset, _nEmbd);
+            return await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
+            { ["inputs_embeds"] = new Tensor(view, new[] { 1, 1, _nEmbd }, "inputs_embeds") });
+        }
+        using var inBuf = _accel.Allocate1D(row.Host!);
         return await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
         { ["inputs_embeds"] = new Tensor(inBuf.View, new[] { 1, 1, _nEmbd }, "inputs_embeds") });
     }
