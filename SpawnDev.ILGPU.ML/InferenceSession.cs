@@ -2046,6 +2046,10 @@ public class InferenceSession : IDisposable
     /// <summary>Reset the decode cursor to begin a fresh sequence (reuses the cache allocation).</summary>
     public void ResetGGUFDecode() => DecodePastLen = 0;
 
+    /// <summary>Detach the KV-cache: clears the session's reference and resets the cursor. Call before
+    /// disposing the cache so the session never holds a dangling reference to freed GPU buffers.</summary>
+    public void DisableGGUFDecode() { _decodeCache = null; DecodePastLen = 0; }
+
     /// <summary>Run ONE decode/prefill step with the KV-cache active. The step's tokens are written at
     /// the current <see cref="DecodePastLen"/> and attended against all cached history; the cursor then
     /// advances by the input sequence length. Prefill = the first call with the full prompt (seq=N);

@@ -40,6 +40,46 @@ public class GGUFModel
         return (buf, 0);
     }
 
+    /// <summary>Async twin of <see cref="SourceBytes"/> for browser streams (TorrentReadStream etc. are
+    /// async-only). In-memory path completes synchronously; streaming path awaits ReadAsync.</summary>
+    private async Task<(byte[] bytes, int baseIdx)> SourceBytesAsync(long absOffset, int byteCount)
+    {
+        if (SourceStream == null) return (RawData, (int)absOffset);
+        var buf = new byte[byteCount];
+        SourceStream.Seek(absOffset, SeekOrigin.Begin);
+        int got = 0;
+        while (got < byteCount)
+        {
+            int n = await SourceStream.ReadAsync(buf.AsMemory(got, byteCount - got));
+            if (n == 0) throw new EndOfStreamException($"GGUF stream ended {byteCount - got} bytes short at offset {absOffset}.");
+            got += n;
+        }
+        return (buf, 0);
+    }
+
+    /// <summary>Async twin of <see cref="GetTensorRowFloat32"/> — gathers one row over an async stream so the
+    /// browser (async-only TorrentReadStream/OPFS) can do the gemma4 host-side token-embedding gather. The
+    /// per-type decode is identical to the sync path; only the byte fetch is awaited.</summary>
+    public async Task<float[]?> GetTensorRowFloat32Async(GGUFTensorInfo tensor, int rowIndex)
+    {
+        int rowLen = (int)tensor.Dimensions[0];
+        if (rowLen <= 0) return null;
+        long rowBytes = GGMLTypes.TypeSize(tensor.Type, rowLen);
+        long absOffset = GetTensorDataOffset(tensor) + (long)rowIndex * rowBytes;
+        var (buf, b) = await SourceBytesAsync(absOffset, (int)rowBytes);
+        return tensor.Type switch
+        {
+            GGMLType.F32 => RowF32(buf, b, rowLen),
+            GGMLType.F16 => RowF16(buf, b, rowLen),
+            GGMLType.BF16 => RowBF16(buf, b, rowLen),
+            GGMLType.Q6_K => RowQ6_K(buf, b, rowLen),
+            GGMLType.Q8_0 => RowQ8_0(buf, b, rowLen),
+            _ => throw new NotSupportedException(
+                $"GetTensorRowFloat32Async: per-row dequant not implemented for {tensor.Type} (tensor '{tensor.Name}'). " +
+                $"Supported: F32, F16, BF16, Q6_K, Q8_0.")
+        };
+    }
+
     // ── Metadata helpers ──
 
     public string? GetMetadataString(string key) =>

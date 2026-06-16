@@ -2,7 +2,27 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased — WebGL multi-store kernel fixes + SpawnDev.ILGPU 4.12.0 migration
+## Unreleased — Gemma 4 multimodal chat + selectable-precision decode KV cache + SpawnDev.ILGPU 4.13.0 migration
+
+**Gemma 4 multimodal CHAT.** `Gemma4MultimodalPipeline.StartChat()` returns a `Gemma4Chat` for multi-turn
+conversation — the KV cache is REUSED across turns (each turn prefills only its new tokens, O(new) not
+O(whole conversation)), so it stays coherent like llama.cpp/ollama chat. Text + image + audio in any turn.
+`InferenceSession.DisableGGUFDecode()` detaches the cache (clears the session reference + resets the cursor)
+so a caller never holds a dangling reference to freed GPU buffers. Example 05 is now an interactive chat
+console (startup → chat until `/exit`; `/image`, `/audio`, `/reset` commands).
+
+**Selectable-precision GGUF decode KV cache.** `GGUFDecodeKVCache` gains a `KVCachePrecision` option
+(`F32` | `BF16`). F32 (exact) is the **current default**; the regression suite uses it for a tight
+layout/RoPE/kv_offset gate. BF16 storage (~half the KV-cache VRAM — VRAM is the binding constraint running
+gemma4:12b's 7 GB weights on a 12 GB card) is fully implemented on SpawnDev.ILGPU's first-class `BFloat16`
+type (4.13.0-local.3) but **temporarily BLOCKED**: ILGPU's BFloat16 CUDA codegen mis-compiles an
+`ArrayView<BFloat16>` store/load (returns zeros once a launch exceeds ~128 elements, and under repeated
+launches) — a library bug handed to the ILGPU owner with an airtight repro (DevComms
+`tuvok-to-geordi-ILGPU-BFloat16-cuda-store-zeros-2026-06-15`). The default flips to BF16 and the test's bf16
+arm re-enables once that lands. (This BF16 path also replaces an earlier manual `ushort`+bit-shift version
+that the WebGL GLSL emitter mis-compiled at ~17% error — the native type is the right fix.)
+
+### WebGL multi-store kernel fixes + SpawnDev.ILGPU 4.12.0 migration
 
 **WebGL Transform-Feedback "one store at the thread's own index" contract.** On the WebGL TF
 vertex path a kernel thread may write exactly ONE output element, at its own index — no multi-store

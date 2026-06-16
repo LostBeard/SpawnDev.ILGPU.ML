@@ -1,0 +1,333 @@
+@page "/gemma-chat"
+@using global::ILGPU.Runtime
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.WebTorrent
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@implements IAsyncDisposable
+@inject BlazorJSRuntime JS
+@inject WebTorrentClient WebTorrent
+@inject HttpClient Http
+
+<PageTitle>Gemma 4 Multimodal Chat</PageTitle>
+
+<div class="gemma-chat">
+    <h1>Gemma 4 — Multimodal Chat <span class="badge">100% on-device</span></h1>
+    <p class="sub">Text + image + audio → text, running entirely in your browser on WebGPU. No server inference.</p>
+
+    @if (_state == LoadState.Idle)
+    {
+        <div class="optin">
+            <h2>Load the model</h2>
+            <p>
+                This demo runs <b>@_ollamaModel:@_ollamaTag</b> locally on your GPU. The weights are large and are
+                <b>not</b> downloaded until you opt in below. They stream from the SpawnDev hub (pulled from the
+                ollama registry, seeded over WebTorrent) and are cached in your browser (OPFS) — manage or evict
+                them on the <a href="/cache">Model Cache</a> page.
+            </p>
+            <ul class="sizes">
+                <li><b>Text decoder</b> (<code>model</code> layer): @_modelSize</li>
+                <li><b>Vision/audio projector</b> (<code>projector</code> layer): @_projSize</li>
+                <li class="total"><b>Total download</b>: @_totalSize — requires a WebGPU GPU with enough VRAM.</li>
+            </ul>
+            <details class="coords">
+                <summary>Model source (ollama registry via hub)</summary>
+                <label>Model <input @bind="_ollamaModel" /></label>
+                <label>Tag <input @bind="_ollamaTag" /></label>
+            </details>
+            <button class="primary" @onclick="LoadModelAsync">Download &amp; Load (@_totalSize)</button>
+            <p class="warn">⚠️ Large download. On a metered or low-storage device, visit <a href="/cache">Model Cache</a> first.</p>
+        </div>
+    }
+    else if (_state == LoadState.Loading)
+    {
+        <div class="loading">
+            <div class="spinner"></div>
+            <p>@_status</p>
+        </div>
+    }
+    else if (_state == LoadState.Error)
+    {
+        <div class="error">
+            <h2>Could not load</h2>
+            <pre>@_status</pre>
+            <button @onclick="() => _state = LoadState.Idle">Back</button>
+        </div>
+    }
+    else // Ready
+    {
+        <div class="chat">
+            <div class="transcript">
+                @foreach (var m in _messages)
+                {
+                    <div class="msg @m.Role">
+                        <div class="who">@(m.Role == "user" ? "You" : "Gemma 4")</div>
+                        @if (m.ImageUrl != null)
+                        {
+                            <img class="att" src="@m.ImageUrl" alt="attached image" />
+                        }
+                        @if (m.AudioName != null)
+                        {
+                            <div class="att-audio">🔊 @m.AudioName</div>
+                        }
+                        <div class="text">@m.Text</div>
+                    </div>
+                }
+                @if (_busy)
+                {
+                    <div class="msg model"><div class="who">Gemma 4</div><div class="text typing">@_streaming…</div></div>
+                }
+            </div>
+
+            <div class="composer">
+                @if (_pendingImageUrl != null)
+                {
+                    <div class="pending"><img src="@_pendingImageUrl" alt="pending" /><button @onclick="ClearImage">✕</button></div>
+                }
+                @if (_pendingAudioName != null)
+                {
+                    <div class="pending audio">🔊 @_pendingAudioName <button @onclick="ClearAudio">✕</button></div>
+                }
+                <div class="row">
+                    <textarea @bind="_input" @bind:event="oninput" @onkeydown="OnKeyDown" placeholder="Ask about an image, an audio clip, or anything…" disabled="@_busy"></textarea>
+                    <div class="attach">
+                        <label class="iconbtn" title="Attach image">🖼️
+                            <InputFile OnChange="OnImagePicked" accept="image/*" hidden />
+                        </label>
+                        <label class="iconbtn" title="Attach audio">🎵
+                            <InputFile OnChange="OnAudioPicked" accept="audio/*" hidden />
+                        </label>
+                        <button class="primary" @onclick="SendAsync" disabled="@(_busy || string.IsNullOrWhiteSpace(_input))">Send</button>
+                    </div>
+                </div>
+                <div class="controls">
+                    <label><input type="checkbox" @bind="_thinking" disabled="@_busy" /> thinking</label>
+                    <button class="link" @onclick="ResetChat" disabled="@_busy">New conversation</button>
+                    <a class="link" href="/cache">Model Cache</a>
+                </div>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    enum LoadState { Idle, Loading, Ready, Error }
+    LoadState _state = LoadState.Idle;
+    string _status = "";
+
+    // Ollama model coordinates (editable in the opt-in panel). The hub's OllamaProxy pulls these layers
+    // from registry.ollama.ai, seeds them as torrents, and the WebTorrent client streams them here.
+    string _ollamaModel = "gemma4";
+    string _ollamaTag = "12b";
+    const string _modelSize = "~6.9 GB";   // application/vnd.ollama.image.model  (GGUF weights)
+    const string _projSize = "~167 MB";    // application/vnd.ollama.image.projector (mmproj)
+    const string _totalSize = "~7.1 GB";
+
+    global::ILGPU.Context? _context;
+    Accelerator? _accelerator;
+    Gemma4MultimodalPipeline? _pipeline;
+    Gemma4Chat? _chat;
+    readonly List<HubModelStream.HubModel> _openModels = new();
+
+    sealed class ChatMessage { public string Role = "user"; public string Text = ""; public string? ImageUrl; public string? AudioName; }
+    readonly List<ChatMessage> _messages = new();
+
+    string _input = "";
+    bool _busy;
+    bool _thinking = true;
+    string _streaming = "";
+
+    // Pending attachments for the next message.
+    ImageInput? _pendingImage;
+    string? _pendingImageUrl;
+    float[]? _pendingAudio;
+    string? _pendingAudioName;
+
+    async Task LoadModelAsync()
+    {
+        _state = LoadState.Loading;
+        _status = "Initializing WebGPU…";
+        StateHasChanged();
+        try
+        {
+            var builder = MLContext.Create();
+            await builder.AllAcceleratorsAsync();
+            _context = builder.ToContext();
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) { Fail("No WebGPU accelerator available in this browser."); return; }
+            JS.Log($"[GemmaChat] accelerator: {_accelerator.Name} ({_accelerator.AcceleratorType})");
+
+            var hub = new HubModelStream(WebTorrent, Http) { PrepareTimeout = TimeSpan.FromMinutes(30) }; // cold 6.9 GB pull
+            _status = $"Fetching the projector layer ({_projSize}) from the hub…";
+            StateHasChanged();
+            var mm = await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "projector");
+            _openModels.Add(mm);
+
+            // The pipeline needs two independent seekable readers of the text GGUF (weight upload + token
+            // gather). Open the ollama "model" layer once; CreateReadStream gives a fresh seekable reader
+            // each call over the same cached torrent.
+            _status = $"Streaming the model layer ({_modelSize}) to the GPU… first load downloads; later loads use cache.";
+            StateHasChanged();
+            var textHub = await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model");
+            _openModels.Add(textHub);
+            Func<Task<Stream>> openText = () => Task.FromResult<Stream>(textHub.File.CreateReadStream());
+
+            _pipeline = await Gemma4MultimodalPipeline.CreateFromStreamsAsync(
+                _accelerator, openText, mm.Stream,
+                onProgress: (stage, pct) => { _status = $"{stage} {pct}%"; InvokeAsync(StateHasChanged); });
+
+            _chat = _pipeline.StartChat(_thinking);
+            _state = LoadState.Ready;
+            _status = "";
+            JS.Log("[GemmaChat] model ready");
+        }
+        catch (Exception ex)
+        {
+            JS.LogError($"[GemmaChat] load failed: {ex.GetType().Name}: {ex.Message}");
+            Fail($"{ex.GetType().Name}: {ex.Message}");
+        }
+        StateHasChanged();
+    }
+
+    void Fail(string msg) { _status = msg; _state = LoadState.Error; }
+
+    async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey) { await SendAsync(); }
+    }
+
+    async Task SendAsync()
+    {
+        if (_busy || _chat == null || string.IsNullOrWhiteSpace(_input)) return;
+        var text = _input.Trim();
+        _input = "";
+        var img = _pendingImage;
+        var imgUrl = _pendingImageUrl;
+        var aud = _pendingAudio;
+        var audName = _pendingAudioName;
+        ClearImage(); ClearAudio();
+
+        _messages.Add(new ChatMessage { Role = "user", Text = text, ImageUrl = imgUrl, AudioName = audName });
+        _busy = true; _streaming = "";
+        StateHasChanged();
+
+        var images = img is { } ii ? new List<ImageInput> { ii } : null;
+        var audio = aud is { } aa ? new List<float[]> { aa } : null;
+        try
+        {
+            string answer = await _chat.SendAsync(text, images: images, audio: audio, maxNewTokens: 512,
+                onToken: (n, soFar) => { _streaming = Clean(soFar); InvokeAsync(StateHasChanged); return Task.CompletedTask; });
+            _messages.Add(new ChatMessage { Role = "model", Text = Clean(answer) });
+        }
+        catch (Exception ex)
+        {
+            JS.LogError($"[GemmaChat] generate failed: {ex.Message}");
+            _messages.Add(new ChatMessage { Role = "model", Text = $"[error: {ex.Message}]" });
+        }
+        _busy = false; _streaming = "";
+        StateHasChanged();
+    }
+
+    void ResetChat()
+    {
+        if (_pipeline == null) return;
+        _chat = _pipeline.StartChat(_thinking);
+        _messages.Clear();
+        ClearImage(); ClearAudio();
+    }
+
+    // Strip gemma4 control markers; label the thinking channel.
+    static string Clean(string s) => s
+        .Replace("<|channel>thought", "[thinking] ").Replace("<|channel>", "[thinking] ")
+        .Replace("<channel|>", "\n[answer] ")
+        .Replace("<turn|>", "").Replace("<|turn>", "").Replace("<eos>", "").Replace("<|think|>", "");
+
+    void ClearImage() { _pendingImage = null; _pendingImageUrl = null; }
+    void ClearAudio() { _pendingAudio = null; _pendingAudioName = null; }
+
+    async Task OnImagePicked(InputFileChangeEventArgs e)
+    {
+        try
+        {
+            var file = e.File;
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(20 * 1024 * 1024).CopyToAsync(ms);
+            var bytes = ms.ToArray();
+            // Decode to RGB via canvas (browser-native).
+            using var blob = new Blob(new[] { bytes }, new BlobOptions { Type = file.ContentType });
+            using var window = JS.Get<Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width, h = (int)bitmap.Height;
+            using var canvas = new HTMLCanvasElement();
+            canvas.Width = w; canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            var rgba = data.Read<byte>();          // RGBA bytes, length w*h*4
+            var rgb = new byte[(long)w * h * 3];
+            for (long p = 0, s = 0, d = 0; p < (long)w * h; p++, s += 4, d += 3)
+            { rgb[d] = rgba[s]; rgb[d + 1] = rgba[s + 1]; rgb[d + 2] = rgba[s + 2]; }
+            _pendingImage = new ImageInput(rgb, w, h);
+            _pendingImageUrl = $"data:{file.ContentType};base64,{Convert.ToBase64String(bytes)}";
+            StateHasChanged();
+        }
+        catch (Exception ex) { JS.LogError($"[GemmaChat] image decode: {ex.Message}"); }
+    }
+
+    async Task OnAudioPicked(InputFileChangeEventArgs e)
+    {
+        try
+        {
+            var file = e.File;
+            using var ms = new MemoryStream();
+            await file.OpenReadStream(50 * 1024 * 1024).CopyToAsync(ms);
+            var bytes = ms.ToArray();
+            // Decode + resample to 16 kHz mono via Web Audio.
+            using var u8 = new Uint8Array(bytes);
+            using var ab = u8.Buffer;
+            using var actx = new AudioContext();
+            using var buf = await actx.DecodeAudioData(ab);
+            using var ch0 = buf.GetChannelData(0);
+            var samples = ch0.Read<float>();
+            int srcRate = (int)buf.SampleRate;
+            _pendingAudio = ResampleTo16k(samples, srcRate);
+            _pendingAudioName = file.Name;
+            await actx.Close();
+            StateHasChanged();
+        }
+        catch (Exception ex) { JS.LogError($"[GemmaChat] audio decode: {ex.Message}"); }
+    }
+
+    // Linear-interpolation resample to 16 kHz mono (gemma4 audio expects 16 kHz).
+    static float[] ResampleTo16k(float[] src, int srcRate)
+    {
+        if (srcRate == 16000) return src;
+        long outLen = (long)src.Length * 16000 / Math.Max(1, srcRate);
+        var dst = new float[outLen];
+        double step = (double)srcRate / 16000.0;
+        for (long i = 0; i < outLen; i++)
+        {
+            double pos = i * step;
+            long i0 = (long)pos; double frac = pos - i0;
+            float a = src[Math.Min(i0, src.Length - 1)];
+            float b = src[Math.Min(i0 + 1, src.Length - 1)];
+            dst[i] = (float)(a + (b - a) * frac);
+        }
+        return dst;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            _pipeline?.Dispose();
+            foreach (var m in _openModels) { try { await new HubModelStream(WebTorrent, Http).RemoveAsync(m); } catch { } }
+            _accelerator?.Dispose();
+            _context?.Dispose();
+        }
+        catch (Exception ex) { JS.LogError($"[GemmaChat] dispose: {ex.Message}"); }
+    }
+}

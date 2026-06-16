@@ -75,6 +75,36 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         return new Gemma4MultimodalPipeline(accelerator, stream, model, session, projector, maxSeqLen, ownsSession: true);
     }
 
+    /// <summary>
+    /// Browser/stream create: build the pipeline from async, seekable streams instead of file paths — so a
+    /// hub <c>TorrentReadStream</c> / OPFS source can feed it (no local file). <paramref name="openTextGguf"/>
+    /// opens a FRESH seekable read stream over the text GGUF each call; it's called TWICE — once for the
+    /// session's weight upload, once kept open for the per-row token-embedding gather (two concurrent seekable
+    /// readers over the same cached torrent are fine). <paramref name="mmprojStream"/> is read fully to bytes
+    /// (the mmproj is small next to the text model). The caller owns the accelerator.
+    /// </summary>
+    public static async Task<Gemma4MultimodalPipeline> CreateFromStreamsAsync(
+        Accelerator accelerator, Func<Task<Stream>> openTextGguf, Stream mmprojStream,
+        int maxSeqLen = 4096, Action<string, int>? onProgress = null)
+    {
+        // 1) Upload the text decoder weights to the GPU from one stream (disposed after upload).
+        InferenceSession session;
+        await using (var uploadStream = await openTextGguf())
+            session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, uploadStream, onProgress, default, acceptInputsEmbeds: true);
+
+        // 2) Keep a second seekable stream open for the host-side token-row gather.
+        var gatherStream = await openTextGguf();
+        var model = await GGUFParser.ParseHeaderAsync(gatherStream);
+        model.SourceStream = gatherStream;
+
+        // 3) mmproj: read to bytes, load the projector.
+        using var ms = new MemoryStream();
+        await mmprojStream.CopyToAsync(ms);
+        var projector = new Gemma4MultimodalProjector(MmprojModel.Load(ms.ToArray()));
+
+        return new Gemma4MultimodalPipeline(accelerator, gatherStream, model, session, projector, maxSeqLen, ownsSession: true);
+    }
+
     private Gemma4MultimodalPipeline(Accelerator accelerator, Stream textStream, GGUFModel model,
         InferenceSession session, Gemma4MultimodalProjector projector, int maxSeqLen, bool ownsSession)
     {
@@ -103,6 +133,9 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         var kvHeads = new int[nLayers]; var hd = new int[nLayers];
         for (int L = 0; L < nLayers; L++)
         { var cfg = GGUFGraphBuilder.GetLayerAttnConfig(model, L, nHeads, defNKV, defHd); kvHeads[L] = cfg.NKVHeads; hd[L] = cfg.HeadDim; }
+        // F32 KV cache (the default). bf16 (~½ KV VRAM) is implemented but BLOCKED on an ILGPU BFloat16
+        // CUDA store/load codegen bug (DevComms tuvok-to-geordi-ILGPU-BFloat16-cuda-store-zeros-2026-06-15);
+        // pass KVCachePrecision.BF16 here once that lands.
         _cache = new GGUFDecodeKVCache(accelerator, kvHeads, hd, maxSeqLen);
         _session.EnableGGUFDecode(_cache);
     }
@@ -117,11 +150,60 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         IReadOnlyList<ImageInput>? images = null, IReadOnlyList<float[]>? audio = null,
         int maxNewTokens = 256, bool thinking = true, Func<int, string, Task>? onToken = null)
     {
+        _session.ResetGGUFDecode();
+        var (imageBlocks, audioBlocks) = ProjectMedia(images, audio);
+
+        // Full single-turn gemma4 chat template (BOS + system + user[+media] + model), media spliced RAW.
+        var rows = new List<float[]>();
+        if (_bos >= 0) await CtrlAsync(rows, _bos);
+        await CtrlAsync(rows, _turnO); await TextAsync(rows, "system\n"); if (thinking && _think >= 0) await CtrlAsync(rows, _think); await TextAsync(rows, "\n"); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+        await CtrlAsync(rows, _turnO); await TextAsync(rows, "user\n");
+        await AppendMediaAsync(rows, imageBlocks, audioBlocks);
+        await TextAsync(rows, prompt); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+        await CtrlAsync(rows, _turnO); await TextAsync(rows, "model\n");
+        return await PrefillAndGenerateAsync(rows, maxNewTokens, onToken);
+    }
+
+    /// <summary>Start a multi-turn chat. The KV cache is reused ACROSS turns (only each new turn is
+    /// prefilled — O(new tokens), not O(whole conversation)), so it stays coherent like llama.cpp/ollama
+    /// chat. One chat at a time per pipeline (single KV cache); starting a new chat resets the cache.</summary>
+    public Gemma4Chat StartChat(bool thinking = true) => new Gemma4Chat(this, thinking);
+
+    internal void ResetForChat() => _session.ResetGGUFDecode();
+
+    /// <summary>One chat turn: append the user turn (+media) at the RUNNING KV cursor (no reset), generate
+    /// the model turn. Turn 0 emits BOS + the system block; later turns first close the prior model turn
+    /// (the stop token wasn't cached) before opening the new user turn — so the cached context matches the
+    /// canonical multi-turn transcript exactly.</summary>
+    internal async Task<string> ChatTurnAsync(Gemma4Chat chat, string text,
+        IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio, int maxNewTokens, Func<int, string, Task>? onToken)
+    {
+        var (imageBlocks, audioBlocks) = ProjectMedia(images, audio);
+        var rows = new List<float[]>();
+        if (chat.Turn == 0)
+        {
+            if (_bos >= 0) await CtrlAsync(rows, _bos);
+            await CtrlAsync(rows, _turnO); await TextAsync(rows, "system\n"); if (chat.Thinking && _think >= 0) await CtrlAsync(rows, _think); await TextAsync(rows, "\n"); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+        }
+        else
+        {
+            await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");   // close the previous model turn (its <turn|> was generated but not cached)
+        }
+        await CtrlAsync(rows, _turnO); await TextAsync(rows, "user\n");
+        await AppendMediaAsync(rows, imageBlocks, audioBlocks);
+        await TextAsync(rows, text); await CtrlAsync(rows, _turnC); await TextAsync(rows, "\n");
+        await CtrlAsync(rows, _turnO); await TextAsync(rows, "model\n");
+        chat.Turn++;
+        return await PrefillAndGenerateAsync(rows, maxNewTokens, onToken);
+    }
+
+    // ── shared building blocks (one-shot GenerateAsync + multi-turn ChatTurnAsync use the same path) ──
+
+    /// <summary>Project each media item to its RAW [n, n_embd] embedding block (gemma4 splices media unscaled).</summary>
+    private (List<float[]> images, List<float[]> audio) ProjectMedia(IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio)
+    {
         if (images is { Count: > 0 } && !SupportsImages) throw new InvalidOperationException("mmproj has no vision encoder.");
         if (audio is { Count: > 0 } && !SupportsAudio) throw new InvalidOperationException("mmproj has no audio encoder.");
-        _session.ResetGGUFDecode();
-
-        // Project each media item to its RAW [n, n_embd] embedding block (gemma4 splices media unscaled).
         var imageBlocks = new List<float[]>();
         if (images != null)
             foreach (var im in images)
@@ -136,37 +218,38 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
                 var (frames, nFrames) = Gemma4AudioPreprocessor.Frame(wav);
                 audioBlocks.Add(_projector.EncodeAudio(frames, nFrames));
             }
+        return (imageBlocks, audioBlocks);
+    }
 
-        // Assemble the prefill embedding sequence (gemma4 chat template + media blocks in the user turn).
-        var rows = new List<float[]>();
-        void Text(string s) { foreach (var t in _tok.Encode(s)) rows.Add(ScaledRow(t)); }
-        void Ctrl(int t) => rows.Add(ScaledRow(t));
-        void Media(float[] block, int begin, int end)
-        {
-            Ctrl(begin);
-            int n = block.Length / _nEmbd;
-            for (int p = 0; p < n; p++) { var o = new float[_nEmbd]; Array.Copy(block, (long)p * _nEmbd, o, 0, _nEmbd); rows.Add(o); }
-            Ctrl(end);
-        }
-        if (_bos >= 0) Ctrl(_bos);
-        Ctrl(_turnO); Text("system\n"); if (thinking && _think >= 0) Ctrl(_think); Text("\n"); Ctrl(_turnC); Text("\n");
-        Ctrl(_turnO); Text("user\n");
-        foreach (var b in imageBlocks) Media(b, _imgBegin, _imgEnd);
-        foreach (var b in audioBlocks) Media(b, _audBegin, _audEnd);
-        Text(prompt); Ctrl(_turnC); Text("\n");
-        Ctrl(_turnO); Text("model\n");
+    // Token-row helpers gather token_embd rows over the (possibly async, browser) stream — all async.
+    private async Task TextAsync(List<float[]> rows, string s) { foreach (var t in _tok.Encode(s)) rows.Add(await ScaledRowAsync(t)); }
+    private async Task CtrlAsync(List<float[]> rows, int t) => rows.Add(await ScaledRowAsync(t));
+    private async Task MediaAsync(List<float[]> rows, float[] block, int begin, int end)
+    {
+        await CtrlAsync(rows, begin);
+        int n = block.Length / _nEmbd;
+        for (int p = 0; p < n; p++) { var o = new float[_nEmbd]; Array.Copy(block, (long)p * _nEmbd, o, 0, _nEmbd); rows.Add(o); }
+        await CtrlAsync(rows, end);
+    }
+    private async Task AppendMediaAsync(List<float[]> rows, List<float[]> imageBlocks, List<float[]> audioBlocks)
+    {
+        foreach (var b in imageBlocks) await MediaAsync(rows, b, _imgBegin, _imgEnd);
+        foreach (var b in audioBlocks) await MediaAsync(rows, b, _audBegin, _audEnd);
+    }
 
-        // Prefill TOKEN-BY-TOKEN (seq=1 per row) instead of one batched seq=N forward. The graph executor's
-        // per-node CPU residual scales super-linearly with sequence length (a batched seq=32 forward measured
-        // ~107x a seq=1 step, not 32x), so N cheap KV-cache steps beat one big prefill — and only the LAST
-        // prompt position's logits matter (they predict the first generated token), so intermediate readbacks
-        // are skipped entirely.
+    /// <summary>Prefill the rows TOKEN-BY-TOKEN (seq=1 each) then greedily generate the model turn. Prefill
+    /// token-by-token (not one batched seq=N forward) because the executor's per-node CPU residual scales
+    /// super-linearly with sequence length (~107x for seq=32 vs seq=1), so N cheap KV-cache steps beat one
+    /// big prefill; only the LAST prefill position's logits matter (they predict token 0), so intermediate
+    /// readbacks are skipped. The trailing stop token (&lt;turn|&gt;/&lt;eos&gt;) is NOT fed into the cache —
+    /// the next chat turn re-emits &lt;turn|&gt; to close the model turn in-context.</summary>
+    internal async Task<string> PrefillAndGenerateAsync(List<float[]> rows, int maxNewTokens, Func<int, string, Task>? onToken)
+    {
         float[] last = null!;
         for (int i = 0; i < rows.Count; i++)
         {
-            bool needLogits = i == rows.Count - 1;
             var outputs = await ForwardAsync(rows[i]);
-            if (needLogits) last = await ReadLastLogitsAsync(outputs);
+            if (i == rows.Count - 1) last = await ReadLastLogitsAsync(outputs);
         }
 
         var generated = new List<int>();
@@ -176,8 +259,10 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
             generated.Add(next);
             if (onToken != null) await onToken(generated.Count, _tok.Decode(generated.ToArray()));
             if (next == _turnC || next == _eos || step == maxNewTokens - 1) break;
-            last = await ReadLastLogitsAsync(await ForwardAsync(ScaledRow(next)));
+            last = await ReadLastLogitsAsync(await ForwardAsync(await ScaledRowAsync(next)));
         }
+        // Strip the trailing stop token from the RETURNED text (it stays out of the cache either way).
+        if (generated.Count > 0 && (generated[^1] == _turnC || generated[^1] == _eos)) generated.RemoveAt(generated.Count - 1);
         return _tok.Decode(generated.ToArray());
     }
 
@@ -203,9 +288,9 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
 
     /// <summary>Gather token <paramref name="t"/>'s embedding row from token_embd and scale by sqrt(n_embd)
     /// (the gemma token-embedding scale; media rows bypass this and are spliced raw).</summary>
-    private float[] ScaledRow(int t)
+    private async Task<float[]> ScaledRowAsync(int t)
     {
-        var r = _model.GetTensorRowFloat32(_tokenEmbd, t) ?? throw new InvalidOperationException($"no embedding row for token {t}.");
+        var r = await _model.GetTensorRowFloat32Async(_tokenEmbd, t) ?? throw new InvalidOperationException($"no embedding row for token {t}.");
         var o = new float[_nEmbd];
         for (int e = 0; e < _nEmbd; e++) o[e] = r[e] * _embScale;
         return o;
@@ -218,4 +303,36 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         if (_ownsSession) _session.Dispose();
         _textStream.Dispose();
     }
+}
+
+/// <summary>
+/// A multi-turn chat session over a <see cref="Gemma4MultimodalPipeline"/>. Holds the turn counter; the
+/// conversation state itself lives in the pipeline's KV cache (reused across turns). Create with
+/// <see cref="Gemma4MultimodalPipeline.StartChat"/>; each <see cref="SendAsync"/> appends a user turn
+/// (optionally with images/audio) and returns the model's reply. The same chat works behind the console
+/// and the browser demos.
+/// </summary>
+public sealed class Gemma4Chat
+{
+    private readonly Gemma4MultimodalPipeline _pipe;
+
+    internal Gemma4Chat(Gemma4MultimodalPipeline pipe, bool thinking)
+    {
+        _pipe = pipe;
+        Thinking = thinking;
+        _pipe.ResetForChat();   // fresh KV cache for this conversation
+    }
+
+    /// <summary>Turns sent so far (0 before the first <see cref="SendAsync"/>).</summary>
+    public int Turn { get; internal set; }
+
+    /// <summary>Whether the system turn requests gemma4's thinking channel (set at construction).</summary>
+    public bool Thinking { get; }
+
+    /// <summary>Send one user message (+ optional images / 16 kHz mono audio) and get the model's reply.
+    /// <paramref name="onToken"/> streams (tokenCount, textSoFar) as it generates.</summary>
+    public Task<string> SendAsync(string text,
+        IReadOnlyList<ImageInput>? images = null, IReadOnlyList<float[]>? audio = null,
+        int maxNewTokens = 256, Func<int, string, Task>? onToken = null)
+        => _pipe.ChatTurnAsync(this, text, images, audio, maxNewTokens, onToken);
 }

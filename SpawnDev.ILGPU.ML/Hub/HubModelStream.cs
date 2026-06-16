@@ -130,6 +130,68 @@ public class HubModelStream
         return new HubModel(torrent, file, file.CreateReadStream());
     }
 
+    /// <summary>Ask the hub for the magnet URI of an OLLAMA model layer. The hub's OllamaProxy resolves the
+    /// ollama registry manifest, fetches the layer blob, and seeds it as a torrent — same retry-on-prepare
+    /// semantics as <see cref="GetMagnetAsync"/>. <paramref name="layer"/> ∈ <c>model</c> | <c>projector</c>
+    /// (the GGUF weights / the mmproj), also <c>params</c>|<c>template</c>|<c>license</c>.</summary>
+    public async Task<string> GetOllamaMagnetAsync(string model, string tag, string layer, CancellationToken ct = default)
+    {
+        // Poll the NON-BLOCKING /ollama-model endpoint (not blocking /ollama-magnet). On a cold cache a large
+        // layer (gemma4's ~6.9 GB) takes minutes to fetch+seed server-side; the blocking endpoint would hold
+        // the connection past the hub's reverse-proxy gateway timeout, and that gateway 504 carries NO CORS
+        // header — so a browser fetch reports it as a CORS error, not a retriable 504. The non-blocking
+        // endpoint instead returns a fast 200 ("preparing" until ready) every poll, always CORS-clean.
+        var url = $"{HubBaseUrl.TrimEnd('/')}/ollama-model/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(PrepareTimeout);
+        var delay = TimeSpan.FromSeconds(2);
+        try
+        {
+            while (true)
+            {
+                using var resp = await _http.GetAsync(url, cts.Token).ConfigureAwait(false);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var result = await resp.Content.ReadFromJsonAsync<HubOllamaPrep>(cts.Token).ConfigureAwait(false);
+                    if (string.Equals(result?.Status, "ready", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(result!.MagnetUri))
+                        return result.MagnetUri;
+                    // "preparing" — the hub is still fetching/seeding the blob; wait and poll again.
+                }
+                else
+                {
+                    int status = (int)resp.StatusCode;
+                    if (status != 502 && status != 503 && status != 504)
+                        throw new HttpRequestException($"Hub /ollama-model for '{model}:{tag}/{layer}' failed: HTTP {status} ({url}).");
+                }
+                await Task.Delay(delay, cts.Token).ConfigureAwait(false);
+                if (delay < TimeSpan.FromSeconds(15)) delay += TimeSpan.FromSeconds(2);
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException($"Hub did not finish preparing ollama '{model}:{tag}/{layer}' within {PrepareTimeout.TotalSeconds:F0}s ({url}). Large cold-cache layers can take a while; retry.");
+        }
+    }
+
+    /// <summary>Shape of the hub's non-blocking <c>/ollama-model</c> response (status + magnet when ready).</summary>
+    private sealed record HubOllamaPrep(string? Status, string? MagnetUri);
+
+    /// <summary>Open a seekable read stream over an OLLAMA model layer served by the hub (twin of
+    /// <see cref="OpenAsync"/>). The returned file can be re-streamed with <c>HubModel.File.CreateReadStream()</c>
+    /// for callers needing two concurrent readers (e.g. weight upload + token gather).</summary>
+    public async Task<HubModel> OpenOllamaAsync(string model, string tag, string layer, bool deselect = false, CancellationToken ct = default)
+    {
+        var magnet = await GetOllamaMagnetAsync(model, tag, layer, ct).ConfigureAwait(false);
+        using var metaCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        metaCts.CancelAfter(MetadataTimeout);
+        var opts = deselect ? new AddTorrentOptions { Deselect = true } : null;
+        var torrent = await _client.AddAsync(magnet, opts, metaCts.Token).ConfigureAwait(false);
+        if (torrent.Files == null || torrent.Files.Length == 0)
+            throw new InvalidOperationException($"Ollama torrent for '{model}:{tag}/{layer}' resolved metadata but exposes no files.");
+        var file = torrent.Files[0];
+        return new HubModel(torrent, file, file.CreateReadStream());
+    }
+
     /// <summary>
     /// Remove a previously-<see cref="OpenAsync"/>'d model's torrent from the client. Call this once the
     /// model is fully loaded (after disposing its <see cref="HubModel.Stream"/>) so the per-file torrents
