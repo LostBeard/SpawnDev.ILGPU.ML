@@ -324,7 +324,10 @@
         try
         {
             _pipeline?.Dispose();
-            foreach (var m in _openModels) { try { await new HubModelStream(WebTorrent, Http).RemoveAsync(m); } catch { } }
+            // Do NOT remove the torrents — they persist in the WebTorrent client's OPFS store so a later visit
+            // reuses the cached pieces instead of re-downloading. The Model Cache page (/cache) is where the
+            // user cancels/removes/seeds them. (GPU buffers are freed by disposing the accelerator; a reload
+            // re-streams from the cached OPFS torrent, which is fast.)
             _accelerator?.Dispose();
             _context?.Dispose();
         }

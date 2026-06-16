@@ -327,17 +327,14 @@ public class BufferPool : IDisposable
         if (byteLength == 0) return buffer;
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
-        const int CHUNK = 4 * 1024 * 1024; // 4 MB
-        var byteBuf = new byte[Math.Min(CHUNK, byteLength)];
-        int uploaded = 0;
-        while (uploaded < byteLength)
-        {
-            int n = Math.Min(byteBuf.Length, byteLength - uploaded);
-            await ReadExactAsync(stream, byteBuf, n, ct).ConfigureAwait(false);
-            // CopyFromCPU is immediate (queue.writeBuffer on WebGPU) — no temp-buffer/command-encoder hazard.
-            buffer.View.SubView(uploaded, n).CopyFromCPU(n == byteBuf.Length ? byteBuf : byteBuf[..n]);
-            uploaded += n;
-        }
+        const int CHUNK = 4 * 1024 * 1024; // 4 MB (4-byte aligned, preserves the zero-copy gate below)
+        // CopyFromStreamAsync auto-selects the ZERO-COPY browser path: when `stream` is an IJSReadStream
+        // (TorrentReadStream / OPFS) and the (offset,length,chunk) are 4-byte aligned, each chunk's Uint8Array
+        // goes STRAIGHT to the GPU via queue.writeBuffer (CopyFromJS) — never entering the .NET/WASM managed
+        // heap (the whole point on a 7 GB model). 4-aligned weights (the bulk; K-quant block sizes are mostly
+        // even) take that path; an odd-length tail gracefully falls back to the managed read. Desktop always
+        // takes the managed path. Replaces the old hand-rolled ReadExactAsync + CopyFromCPU marshal loop.
+        await buffer.View.SubView(0, byteLength).CopyFromStreamAsync(stream, CHUNK, ct).ConfigureAwait(false);
         return buffer;
     }
 
