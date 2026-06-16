@@ -40,7 +40,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     private readonly GGUFModel _model;
     private readonly InferenceSession _session;
     private readonly SentencePieceTokenizer _tok;
-    private readonly Gemma4MultimodalProjector _projector;
+    private readonly Gemma4MultimodalProjectorGpu _projector;
     private readonly GGUFTensorInfo _tokenEmbd;
     private readonly GGUFDecodeKVCache _cache;
     private readonly bool _ownsSession;
@@ -68,7 +68,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         var model = await GGUFParser.ParseHeaderAsync(stream);
         model.SourceStream = stream;
         var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, textGgufPath, acceptInputsEmbeds: true);
-        var projector = new Gemma4MultimodalProjector(MmprojModel.Load(mmprojPath));
+        var projector = new Gemma4MultimodalProjectorGpu(accelerator, MmprojModel.Load(mmprojPath));
         // (Tried raising GraphExecutor.SyncIntervalNodes to drop the mid-forward drains — it was SLOWER:
         // the periodic command-buffer flushes let the GPU start work while the CPU keeps dispatching, so the
         // default 64 stays. The token-by-token prefill is the real win.)
@@ -100,13 +100,13 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         // 3) mmproj: read to bytes, load the projector.
         using var ms = new MemoryStream();
         await mmprojStream.CopyToAsync(ms);
-        var projector = new Gemma4MultimodalProjector(MmprojModel.Load(ms.ToArray()));
+        var projector = new Gemma4MultimodalProjectorGpu(accelerator, MmprojModel.Load(ms.ToArray()));
 
         return new Gemma4MultimodalPipeline(accelerator, gatherStream, model, session, projector, maxSeqLen, ownsSession: true);
     }
 
     private Gemma4MultimodalPipeline(Accelerator accelerator, Stream textStream, GGUFModel model,
-        InferenceSession session, Gemma4MultimodalProjector projector, int maxSeqLen, bool ownsSession)
+        InferenceSession session, Gemma4MultimodalProjectorGpu projector, int maxSeqLen, bool ownsSession)
     {
         _accel = accelerator;
         _textStream = textStream;
@@ -150,7 +150,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         int maxNewTokens = 256, bool thinking = true, Func<int, string, Task>? onToken = null)
     {
         _session.ResetGGUFDecode();
-        var (imageBlocks, audioBlocks) = ProjectMedia(images, audio);
+        var (imageBlocks, audioBlocks) = await ProjectMediaAsync(images, audio);
 
         // Full single-turn gemma4 chat template (BOS + system + user[+media] + model), media spliced RAW.
         var rows = new List<float[]>();
@@ -177,7 +177,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     internal async Task<string> ChatTurnAsync(Gemma4Chat chat, string text,
         IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio, int maxNewTokens, Func<int, string, Task>? onToken)
     {
-        var (imageBlocks, audioBlocks) = ProjectMedia(images, audio);
+        var (imageBlocks, audioBlocks) = await ProjectMediaAsync(images, audio);
         var rows = new List<float[]>();
         if (chat.Turn == 0)
         {
@@ -198,8 +198,10 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
 
     // ── shared building blocks (one-shot GenerateAsync + multi-turn ChatTurnAsync use the same path) ──
 
-    /// <summary>Project each media item to its RAW [n, n_embd] embedding block (gemma4 splices media unscaled).</summary>
-    private (List<float[]> images, List<float[]> audio) ProjectMedia(IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio)
+    /// <summary>Project each media item to its RAW [n, n_embd] embedding block (gemma4 splices media unscaled).
+    /// The projection runs on the GPU (<see cref="Gemma4MultimodalProjectorGpu"/>); the small result is read
+    /// back to host for the current row-by-row splice (a fully GPU-resident splice is a follow-up).</summary>
+    private async Task<(List<float[]> images, List<float[]> audio)> ProjectMediaAsync(IReadOnlyList<ImageInput>? images, IReadOnlyList<float[]>? audio)
     {
         if (images is { Count: > 0 } && !SupportsImages) throw new InvalidOperationException("mmproj has no vision encoder.");
         if (audio is { Count: > 0 } && !SupportsAudio) throw new InvalidOperationException("mmproj has no audio encoder.");
@@ -208,14 +210,14 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
             foreach (var im in images)
             {
                 var (patches, nCols, nRows) = Gemma4ImagePreprocessor.Preprocess(im.Rgb, im.Width, im.Height);
-                imageBlocks.Add(_projector.EncodeImage(patches, nCols * nRows, nCols, nRows));
+                imageBlocks.Add(await _projector.EncodeImageAsync(patches, nCols * nRows, nCols, nRows));
             }
         var audioBlocks = new List<float[]>();
         if (audio != null)
             foreach (var wav in audio)
             {
                 var (frames, nFrames) = Gemma4AudioPreprocessor.Frame(wav);
-                audioBlocks.Add(_projector.EncodeAudio(frames, nFrames));
+                audioBlocks.Add(await _projector.EncodeAudioAsync(frames, nFrames));
             }
         return (imageBlocks, audioBlocks);
     }
@@ -298,6 +300,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     /// <summary>Disposes the KV-cache, the owned session, and the text stream. The accelerator is caller-owned.</summary>
     public void Dispose()
     {
+        _projector.Dispose();
         _cache.Dispose();
         if (_ownsSession) _session.Dispose();
         _textStream.Dispose();

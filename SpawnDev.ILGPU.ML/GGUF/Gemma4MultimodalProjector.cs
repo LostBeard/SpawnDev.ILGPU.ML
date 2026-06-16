@@ -8,9 +8,9 @@ namespace SpawnDev.ILGPU.ML.Multimodal;
 /// embedding stream. There is NO vision tower / audio encoder — just the lightweight linear layers held
 /// in the mmproj GGUF (see <see cref="MmprojModel"/>).
 ///
-/// This is the CORRECTNESS-FIRST reference forward (plain C#, runs on the few-hundred-row media tensors
-/// where it is not a bottleneck — the 7 GB decoder dominates). A GPU/zero-copy port (Rule 4) follows once
-/// the embeddings are verified bit-for-bit against the llama.cpp mtmd oracle.
+/// This is the CORRECTNESS-FIRST reference forward (plain C#). The GPU/zero-copy port (Rule 4) is
+/// <see cref="Gemma4MultimodalProjectorGpu"/> — the production path (the pipeline uses it); this CPU
+/// reference remains the oracle the GPU port is verified against (Gemma4ProjectorGpu_*_MatchesCpu PMT tests).
 ///
 /// Forward spec + verbatim llama.cpp citations: Plans/gemma4-multimodal-bringup.md and
 /// Plans/gemma4-llamacpp-reference-snippets.md.
@@ -21,8 +21,6 @@ public sealed class Gemma4MultimodalProjector
     // the weightless pre-projection RMSNorms use hparams.eps = 1e-6.
     private const float LayerNormEps = 1e-5f;
     private const float RmsNormEps = 1e-6f;
-
-    private readonly MmprojModel _mm;
 
     // Vision weights (raw ggml layout; the matmul indexes W[o,i] = data[o*in + i] directly, no transpose).
     private readonly float[]? _patchEmbdW;   // [out=3840, in=6912]
@@ -50,29 +48,25 @@ public sealed class Gemma4MultimodalProjector
     /// <summary>Position-embedding table length (1120) — caps the resized grid to 1120 patches per axis.</summary>
     public int PosTableLen { get; }
 
-    public Gemma4MultimodalProjector(MmprojModel mm)
-    {
-        _mm = mm;
-        EmbedDim = mm.VisionProjectionDim;        // 3840
-        PatchLen = mm.GetTensorShape("v.patch_embd.weight")?[0] ?? 6912; // ne0 = in = 6912
-        AudioFrameLen = mm.AudioFrameLength;       // 640
-        PosTableLen = mm.GetTensorShape("v.position_embd.weight")?[1] ?? 1120; // ne1 = positions
+    public Gemma4MultimodalProjector(MmprojModel mm) : this(Gemma4ProjectorWeights.FromMmproj(mm)) { }
 
-        if (mm.HasVisionEncoder)
-        {
-            _patchEmbdW = mm.GetTensorF32("v.patch_embd.weight");
-            _patchEmbdB = mm.GetTensorF32("v.patch_embd.bias");
-            _patchNorm1W = mm.GetTensorF32("v.patch_norm.1.weight");
-            _patchNorm1B = mm.GetTensorF32("v.patch_norm.1.bias");
-            _patchNorm2W = mm.GetTensorF32("v.patch_norm.2.weight");
-            _patchNorm2B = mm.GetTensorF32("v.patch_norm.2.bias");
-            _patchNorm3W = mm.GetTensorF32("v.patch_norm.3.weight");
-            _patchNorm3B = mm.GetTensorF32("v.patch_norm.3.bias");
-            _posEmbd = mm.GetTensorF32("v.position_embd.weight");
-            _mmInputProjW = mm.GetTensorF32("mm.input_projection.weight");
-        }
-        if (mm.HasAudioEncoder)
-            _mmAInputProjW = mm.GetTensorF32("mm.a.input_projection.weight");
+    /// <summary>Build directly from the raw projector weights (the path the GPU port and the equivalence
+    /// unit test share — both run the same forward on the same weights).</summary>
+    public Gemma4MultimodalProjector(Gemma4ProjectorWeights w)
+    {
+        EmbedDim = w.EmbedDim;
+        PatchLen = w.PatchLen;
+        AudioFrameLen = w.AudioFrameLen;
+        PosTableLen = w.PosTableLen;
+
+        _patchEmbdW = w.PatchEmbdW;
+        _patchEmbdB = w.PatchEmbdB;
+        _patchNorm1W = w.PatchNorm1W; _patchNorm1B = w.PatchNorm1B;
+        _patchNorm2W = w.PatchNorm2W; _patchNorm2B = w.PatchNorm2B;
+        _patchNorm3W = w.PatchNorm3W; _patchNorm3B = w.PatchNorm3B;
+        _posEmbd = w.PosEmbd;
+        _mmInputProjW = w.MmInputProjW;
+        _mmAInputProjW = w.MmAInputProjW;
     }
 
     /// <summary>
