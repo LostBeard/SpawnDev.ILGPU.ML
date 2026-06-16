@@ -78,6 +78,16 @@ public class GraphExecutor : IDisposable
     /// memory for latency.</summary>
     public static int SyncIntervalNodes = 64;
 
+    /// <summary>Memory bound on the async deferred-release window: when the bytes of buffers awaiting
+    /// release (dead by refcount, but held until a drain so a still-queued kernel can't read freed memory)
+    /// exceed this, force the sync+return EARLY — independent of <see cref="SyncIntervalNodes"/>. Bounds the
+    /// peak GPU working set to ~(true live set + this cap) instead of "sum of up to N nodes' intermediates",
+    /// which is what blew a 512² VAE decode to ~10 GB (227 large feature maps released only every 64 nodes).
+    /// A small-tensor graph (LLM token decode) never hits the cap, so it keeps the cheap N-node cadence.
+    /// 512 MiB default = generous headroom vs the latency of an extra drain. Exact: changes only WHEN buffers
+    /// are recycled, never the math.</summary>
+    public static long MaxPendingReleaseBytes = 512L * 1024 * 1024;
+
     /// <summary>
     /// DIAGNOSTIC: when set, RunAsync's main loop breaks after executing
     /// `BreakAtNode` nodes (1-indexed). Used to bisect which operator triggers
@@ -855,6 +865,7 @@ public class GraphExecutor : IDisposable
 
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
+        long pendingReleaseBytes = 0; // bytes of buffers in pendingReleases; triggers an early drain past the cap
         foreach (var node in _graph.Nodes)
         {
             if (VerboseLogging)
@@ -1450,7 +1461,10 @@ public class GraphExecutor : IDisposable
                 {
                     refCounts[inputName] = rc - 1;
                     if (rc - 1 <= 0 && tensors.TryGetValue(inputName, out var releaseTensor))
+                    {
                         pendingReleases.Add(releaseTensor);
+                        pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float);
+                    }
                 }
             }
 
@@ -1459,8 +1473,11 @@ public class GraphExecutor : IDisposable
 
             // Flush GPU command buffer periodically to prevent massive single submissions.
             // Interval tunable via SyncIntervalNodes — each flush is an async round-trip whose
-            // latency dominates large-graph forward time on WebGPU/Blazor.
-            if (nodeIdx % SyncIntervalNodes == 0)
+            // latency dominates large-graph forward time on WebGPU/Blazor. ALSO drain early when the
+            // deferred-release backlog exceeds MaxPendingReleaseBytes, so a big-activation graph (VAE
+            // decode) recycles its feature maps instead of holding 64 nodes' worth at once → bounds peak
+            // GPU memory to ~(live set + cap). Small-tensor graphs never hit the cap (cheap N-node cadence).
+            if (nodeIdx % SyncIntervalNodes == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
             {
                 _drainSw.Restart();
                 try { await _accelerator.SynchronizeAsync(); }
@@ -1479,6 +1496,7 @@ public class GraphExecutor : IDisposable
                 foreach (var t in pendingReleases)
                     _pool.Return(t);
                 pendingReleases.Clear();
+                pendingReleaseBytes = 0;
             }
 
             // DIAGNOSTIC: stop early at requested node count to bisect failures.

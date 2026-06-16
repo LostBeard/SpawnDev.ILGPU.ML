@@ -40,6 +40,30 @@ public class BufferPool : IDisposable
     /// the zero-copy path actually fired instead of the .NET byte[] fallback.</summary>
     public long ZeroCopyWeightBytes { get; private set; }
 
+    // ── Opt-in peak instrumentation (default OFF = zero cost). Measures whether the pool's high-water is
+    //    the SUM of intermediates (reuse failure → memory planning fixes it) or a genuinely large LIVE set
+    //    (→ needs fp16 activations / tiling). Static so a console measurement reads it without wiring. ──
+    /// <summary>Enable peak-bytes tracking on Rent (diagnostic; default false).</summary>
+    public static bool TrackPeaks = false;
+    /// <summary>Max total fp32+fp16 bytes ever allocated by ANY pool at one Rent (sum of all live buffers).</summary>
+    public static long PeakTotalBytes;
+    /// <summary>Max simultaneously-RENTED (named/live, not yet Returned) bytes at one Rent — the true working set.</summary>
+    public static long PeakLiveBytes;
+    /// <summary>Reset the peak counters before a measured run.</summary>
+    public static void ResetPeaks() { PeakTotalBytes = 0; PeakLiveBytes = 0; }
+
+    private void UpdatePeaks()
+    {
+        if (!TrackPeaks) return;
+        long total = 0;
+        foreach (var b in _allBuffers) total += b.LengthInBytes;
+        foreach (var b in _allHalfBuffers) total += b.LengthInBytes;
+        long live = 0;
+        foreach (var kv in _namedBuffers) live += kv.Value.LengthInBytes;
+        if (total > PeakTotalBytes) PeakTotalBytes = total;
+        if (live > PeakLiveBytes) PeakLiveBytes = live;
+    }
+
     public BufferPool(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>Rent a tensor with the given shape. May reuse a pooled buffer.</summary>
@@ -55,6 +79,7 @@ public class BufferPool : IDisposable
             var buffer = stack.Pop();
             var tensor = new Tensor(buffer.View, shape, name);
             if (name != null) _namedBuffers[name] = buffer;
+            UpdatePeaks();
             return tensor;
         }
 
@@ -79,6 +104,7 @@ public class BufferPool : IDisposable
         _allBuffers.Add(newBuffer);
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) _namedBuffers[name] = newBuffer;
+        UpdatePeaks();
         return newTensor;
     }
 

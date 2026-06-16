@@ -92,9 +92,14 @@ async Task<int> Generate(string prompt, int? seed, string? outPath, bool ci)
         pipe.GuidanceScale = 0f;     // SD-Turbo uses no classifier-free guidance
         if (seed.HasValue) pipe.Seed = seed.Value;
 
+        SpawnDev.ILGPU.ML.Tensors.BufferPool.TrackPeaks = true;
+        SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetPeaks();
+
         Console.WriteLine($"Generating: \"{prompt}\"" + (seed.HasValue ? $" (seed {seed})" : ""));
         var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = prompt });
         Console.WriteLine($"{result.Width}x{result.Height} in {result.InferenceTimeMs:F0}ms ({result.NumSteps} step)");
+        Console.WriteLine($"[POOL] peak TOTAL allocated = {SpawnDev.ILGPU.ML.Tensors.BufferPool.PeakTotalBytes / 1048576.0:F0} MiB" +
+                          $" | peak LIVE (working set) = {SpawnDev.ILGPU.ML.Tensors.BufferPool.PeakLiveBytes / 1048576.0:F0} MiB");
 
         outPath ??= $"sdturbo_{Sanitize(prompt)}.bmp";
         WriteBmp(outPath, result.ImageRGBA, result.Width, result.Height);
