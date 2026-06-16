@@ -103,6 +103,22 @@ piece 2/n `BufferPool.RentHalf`/`ReturnHalf` (`181a5a1`, 8/0). Now wire `GraphEx
   — generic `INumber<T>` where INumber-expressible; mixed read-(float)-compute-write-(low-p) for SiLU/GELU/Softmax
   (INumber has no exp).
 
+### ⚠ MEASURED RESULT (2026-06-16): approach (ii) is CORRECT but does NOT reduce peak — needs (i) or immediate-free
+Executor mixed-precision SHIPPED + verified (`cc085e5`, `MixedPrecision` 8/0 all backends; SD-Turbo VAE image
+stays SHARP at F16 = mechanism correct). BUT wiring the VAE session to F16 **raised** peak GPU memory
+**3507 → 4030 MiB** (live unchanged 2194). Root cause (verified-by-design, not guessed): the fp32 op-output is
+**deferred-released** (added to `pendingReleases`, freed only at the byte-cap/N-node drain — the 823b3f8 fix), so
+between drains the accumulated fp32 outputs coexist with their new fp16 copies + the fp32 convert-temps → MORE,
+not less. The fp16 storage saving is negated by the transient/deferred fp32.
+**So VAE-F16 via (ii) was NOT shipped (reverted the pipeline wiring).** The executor mechanism is KEPT (correct,
+F32-guarded off-by-default, the dtype template Geordi's types plug into, the foundation for (i)).
+**To actually win memory, ONE of:** (a) approach (i) precision-aware ops — Conv/GroupNorm read+write fp16
+directly (NO fp32 temp, no convert-around) → true half-size I/O; the real fix, bigger (per-op). (b) free the
+converted fp32 op-output IMMEDIATELY (not deferred) after its convert — safe on in-order backends (the convert
+is the buffer's last reader, queued before any reuse), needs care on the Wasm pool. (c) note the WEIGHTS
+(~5GB, fp32 in the ONNX for text_enc/unet — measured) + sequential model residency are the BIGGER 11.5GB
+levers anyway; activations matter more at higher resolution / batch. Re-measure each.
+
 ## NOT this (kept separate, also on the roadmap)
 Sequential model residency, tiled VAE (exact GroupNorm-sync). Those cut the OTHER parts of the 11.5 GB (the
 co-resident weights, the VAE peak); this doc is the activation-precision lever. All three compound.
