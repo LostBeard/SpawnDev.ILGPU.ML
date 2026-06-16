@@ -24,6 +24,13 @@ public class BufferPool : IDisposable
     // fp16 weight buffers (ILGPU.Half) — half the bytes of the fp32 _allBuffers. Tracked separately for
     // disposal (different element type). See AllocateHalfWeightFromStreamAsync.
     private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _allHalfBuffers = new();
+    // fp16 ACTIVATION pool (mixed-precision activations): bucketed Half buffers for graph intermediates,
+    // the half-bytes counterpart to the fp32 _buckets/_namedBuffers. Returned buffers reuse by size bucket.
+    private readonly Dictionary<int, Stack<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>> _halfBuckets = new();
+    private readonly Dictionary<string, MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _halfNamedBuffers = new();
+
+    /// <summary>Total fp16 (Half) buffers this pool has allocated (weights + activations).</summary>
+    public int AllocatedHalfBufferCount => _allHalfBuffers.Count;
 
     /// <summary>Total number of GPU buffers allocated by this pool.</summary>
     public int AllocatedBufferCount => _allBuffers.Count;
@@ -60,6 +67,7 @@ public class BufferPool : IDisposable
         foreach (var b in _allHalfBuffers) total += b.LengthInBytes;
         long live = 0;
         foreach (var kv in _namedBuffers) live += kv.Value.LengthInBytes;
+        foreach (var kv in _halfNamedBuffers) live += kv.Value.LengthInBytes;
         if (total > PeakTotalBytes) PeakTotalBytes = total;
         if (live > PeakLiveBytes) PeakLiveBytes = live;
     }
@@ -126,6 +134,16 @@ public class BufferPool : IDisposable
                 buf.Dispose();
             }
         _buckets.Clear();
+        // Also reclaim returned-not-live fp16 activation buffers.
+        foreach (var stack in _halfBuckets.Values)
+            while (stack.Count > 0)
+            {
+                var buf = stack.Pop();
+                freed += buf.LengthInBytes;
+                _allHalfBuffers.Remove(buf);
+                buf.Dispose();
+            }
+        _halfBuckets.Clear();
         return freed;
     }
 
@@ -141,6 +159,52 @@ public class BufferPool : IDisposable
             {
                 stack = new Stack<MemoryBuffer1D<float, Stride1D.Dense>>();
                 _buckets[bucketSize] = stack;
+            }
+            stack.Push(buffer);
+        }
+    }
+
+    /// <summary>Rent an fp16 (<see cref="ILGPU.Half"/>) ACTIVATION tensor — half the bytes of <see cref="Rent"/>.
+    /// Reuses a pooled Half buffer of the right size bucket when free; else allocates (with the same
+    /// under-pressure reclaim as the fp32 path). The mixed-precision-activation counterpart to Rent — the
+    /// executor keeps heavy intermediates fp16 and converts at fp32 boundaries
+    /// (Plans/fp16-bf16-mixed-precision-activations-2026-06-16.md).</summary>
+    public HalfTensor RentHalf(int[] shape, string? name = null)
+    {
+        int count = TensorHelpers.ElementCount(shape);
+        int bucketSize = NextPowerOf2(count);
+
+        if (_halfBuckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
+        {
+            var buffer = stack.Pop();
+            if (name != null) _halfNamedBuffers[name] = buffer;
+            UpdatePeaks();
+            return new HalfTensor(buffer.View, shape, name);
+        }
+
+        var newBuffer = _accelerator.AllocateWithReclaim(
+            () => _accelerator.Allocate1D<global::ILGPU.Half>(bucketSize),
+            DisposeBucketedBuffers,
+            reclaimed => $"GPU out of memory renting fp16 '{name}' (+{bucketSize * 2L / 1048576}MB) after reclaiming " +
+                         $"{reclaimed / 1048576}MB of pooled buffers; {_allHalfBuffers.Count} fp16 + {_allBuffers.Count} fp32 live. Exceeds VRAM.");
+        _allHalfBuffers.Add(newBuffer);
+        if (name != null) _halfNamedBuffers[name] = newBuffer;
+        UpdatePeaks();
+        return new HalfTensor(newBuffer.View, shape, name);
+    }
+
+    /// <summary>Return an fp16 (Half) tensor's buffer to the pool for reuse by name.</summary>
+    public void ReturnHalf(HalfTensor tensor)
+    {
+        var name = tensor.Name;
+        if (name != null && _halfNamedBuffers.TryGetValue(name, out var buffer))
+        {
+            _halfNamedBuffers.Remove(name);
+            int bucketSize = (int)buffer.Length;
+            if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
+            {
+                stack = new Stack<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>();
+                _halfBuckets[bucketSize] = stack;
             }
             stack.Push(buffer);
         }
