@@ -57,7 +57,13 @@ public class BufferPool : IDisposable
     /// <summary>Max simultaneously-RENTED (named/live, not yet Returned) bytes at one Rent — the true working set.</summary>
     public static long PeakLiveBytes;
     /// <summary>Reset the peak counters before a measured run.</summary>
-    public static void ResetPeaks() { PeakTotalBytes = 0; PeakLiveBytes = 0; }
+    public static void ResetPeaks() { PeakTotalBytes = 0; PeakLiveBytes = 0; PeakLiveSnapshot = null; }
+
+    /// <summary>When TrackLivePeakComposition is set, holds the (name, bytes, isHalf) of every live buffer at the
+    /// moment the LIVE peak was last raised — i.e. exactly what dominates the working set. Diagnostic only.</summary>
+    public static List<(string name, long bytes, bool isHalf)>? PeakLiveSnapshot;
+    /// <summary>Capture <see cref="PeakLiveSnapshot"/> on each new LIVE peak (extra cost; default off).</summary>
+    public static bool TrackLivePeakComposition = false;
 
     private void UpdatePeaks()
     {
@@ -69,7 +75,20 @@ public class BufferPool : IDisposable
         foreach (var kv in _namedBuffers) live += kv.Value.LengthInBytes;
         foreach (var kv in _halfNamedBuffers) live += kv.Value.LengthInBytes;
         if (total > PeakTotalBytes) PeakTotalBytes = total;
-        if (live > PeakLiveBytes) PeakLiveBytes = live;
+        if (live > PeakLiveBytes)
+        {
+            // Throttle the (O(buffers)) composition snapshot: only re-capture when the peak jumps by >2 MiB,
+            // else thousands of micro-peak-raises each trigger a full snapshot and dominate runtime.
+            bool bigJump = live - PeakLiveBytes > 2L * 1024 * 1024;
+            PeakLiveBytes = live;
+            if (TrackLivePeakComposition && (bigJump || PeakLiveSnapshot == null))
+            {
+                var snap = new List<(string, long, bool)>();
+                foreach (var kv in _namedBuffers) snap.Add((kv.Key, kv.Value.LengthInBytes, false));
+                foreach (var kv in _halfNamedBuffers) snap.Add((kv.Key, kv.Value.LengthInBytes, true));
+                PeakLiveSnapshot = snap;
+            }
+        }
     }
 
     public BufferPool(Accelerator accelerator) => _accelerator = accelerator;

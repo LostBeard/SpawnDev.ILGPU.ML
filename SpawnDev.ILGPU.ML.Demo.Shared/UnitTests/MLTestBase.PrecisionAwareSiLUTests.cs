@@ -52,6 +52,35 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[PrecisionAwareSiLU] Half read+fp32-compute+write matches fp32 SiLU on {BackendName}");
     });
 
+    private static float SigmoidCpu(float v) => v > 30f ? 1f : v < -30f ? 0f : 1f / (1f + MathF.Exp(-v));
+
+    [TestMethod]
+    public async Task PrecisionAwareSigmoid_Half_MatchesFp32_AllBackends() => await RunTest(async accelerator =>
+    {
+        // SD VAE SiLU = Sigmoid * Mul; this is the Sigmoid half.
+        const int n = 513;
+        var rng = new Random(45);
+        var x = new float[n];
+        for (int i = 0; i < n; i++) x[i] = (float)(rng.NextDouble() * 12 - 6);
+
+        var xh = new global::ILGPU.Half[n]; for (int i = 0; i < n; i++) xh[i] = (global::ILGPU.Half)x[i];
+        using var inBuf = accelerator.Allocate1D(xh);
+        using var outBuf = accelerator.Allocate1D<global::ILGPU.Half>(n);
+        var pa = new PrecisionAwareKernels(accelerator);
+        pa.Sigmoid<global::ILGPU.Half>(inBuf.View, outBuf.View, n);
+        await accelerator.SynchronizeAsync();
+        var gotH = await outBuf.CopyToHostAsync<global::ILGPU.Half>(0, n);
+
+        for (int i = 0; i < n; i++)
+        {
+            float got = (float)gotH[i];
+            float expected = SigmoidCpu((float)xh[i]);
+            if (MathF.Abs(got - expected) > MathF.Max(8e-3f, MathF.Abs(expected) * 8e-3f))
+                throw new Exception($"Half precision-aware Sigmoid @{i}: got {got}, want {expected} (in {x[i]}) on {BackendName}");
+        }
+        Console.WriteLine($"[PrecisionAwareSigmoid] Half read+fp32-compute+write matches fp32 on {BackendName}");
+    });
+
     [TestMethod]
     public async Task PrecisionAwareSiLU_BFloat16_MatchesFp32_AllBackends() => await RunTest(async accelerator =>
     {

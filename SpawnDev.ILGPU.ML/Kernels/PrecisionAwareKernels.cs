@@ -28,6 +28,7 @@ public sealed class PrecisionAwareKernels : IDisposable
     private readonly ConcurrentDictionary<Type, object> _mulCache = new();
     private readonly ConcurrentDictionary<Type, object> _groupNormCache = new();
     private readonly ConcurrentDictionary<Type, object> _conv2dCache = new();
+    private readonly ConcurrentDictionary<Type, object> _conv2dHalfWCache = new();
 
     public PrecisionAwareKernels(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -259,6 +260,17 @@ public sealed class PrecisionAwareKernels : IDisposable
         if (output.Length < totalOutputElements)
             throw new InvalidOperationException(
                 $"Conv2D<{typeof(T).Name}> NCHW output buffer too small: output.Length={output.Length} < {totalOutputElements} elements.");
+        // Bounds guards: the kernel reads input[(inC-1)*inH*inW + ...] and weight[(outC-1)*inC*kH*kW + ...]; a
+        // buffer smaller than that is a silent OOB (CUDA "illegal memory access"). Name the mismatch instead.
+        if (input.Length < (long)inC * inH * inW)
+            throw new InvalidOperationException(
+                $"Conv2D<{typeof(T).Name}> input buffer too small: input.Length={input.Length} < inC*inH*inW={inC}*{inH}*{inW}={(long)inC * inH * inW}.");
+        if (weight.Length < (long)outC * inC * kH * kW)
+            throw new InvalidOperationException(
+                $"Conv2D<{typeof(T).Name}> weight buffer too small: weight.Length={weight.Length} < outC*inC*kH*kW={outC}*{inC}*{kH}*{kW}={(long)outC * inC * kH * kW}.");
+        if (bias.Length < outC)
+            throw new InvalidOperationException(
+                $"Conv2D<{typeof(T).Name}> bias buffer too small: bias.Length={bias.Length} < outC={outC}.");
         var k = (Action<Index1D, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
             int, int, int, int, int, int, int, int, int, int>)
@@ -266,6 +278,95 @@ public sealed class PrecisionAwareKernels : IDisposable
                 ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
                 int, int, int, int, int, int, int, int, int, int>(Conv2DImpl<T>));
+        k(totalOutputElements, input, weight, bias, output,
+            inC, inH, inW, outC, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
+    }
+
+    // ── Conv2D NCHW (group 1) with fp16 (ILGPU.Half) WEIGHTS — read low-p input AND low-p weight, double
+    //    accumulate, write low-p output. The VAE loads most conv weights as fp16, so this is the path that
+    //    actually fires there (the fp32-weight Conv2D<T> handles the rest). bias stays fp32 (tiny). ──
+    private static void Conv2DHalfWeightImpl<T>(
+        Index1D idx,
+        ArrayView1D<T, Stride1D.Dense> input,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<T, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kH, int kW,
+        int stride, int padTL, int outHW, int dilHW)
+        where T : unmanaged, INumber<T>
+    {
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
+        int ox = idx % outW;
+        int rem = idx / outW;
+        int oy = rem % outH;
+        int oc = rem / outH;
+
+        double sum = (double)bias[oc];
+
+        for (int ic = 0; ic < inC; ic++)
+        {
+            int icBase = ic * inH * inW;
+            int wcBase = oc * inC * kH * kW + ic * kH * kW;
+            for (int ky = 0; ky < kH; ky++)
+            {
+                int iy = oy * stride + ky * dilationH - padTop;
+                if (iy < 0 || iy >= inH) continue;
+
+                for (int kx = 0; kx < kW; kx++)
+                {
+                    int ix = ox * stride + kx * dilationW - padLeft;
+                    if (ix < 0 || ix >= inW) continue;
+
+                    sum += (double)PrecisionConvert.ConvertToSingle(input[icBase + iy * inW + ix])
+                         * (double)(float)weight[wcBase + ky * kW + kx];
+                }
+            }
+        }
+
+        output[idx] = PrecisionConvert.ConvertFromSingle<T>((float)sum);
+    }
+
+    /// <summary>Conv2D NCHW (group 1) with fp16 (ILGPU.Half) weights, low-p activation T in/out. See <see cref="Conv2D"/>;
+    /// identical math but the weight is read as ILGPU.Half (half the weight bytes). The VAE's fp16-weight convs.</summary>
+    public void Conv2DHalfWeight<T>(
+        ArrayView1D<T, Stride1D.Dense> input,
+        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<T, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
+        where T : unmanaged, INumber<T>
+    {
+        int effKH = dilationH * (kH - 1) + 1;
+        int effKW = dilationW * (kW - 1) + 1;
+        int outH = (inH + padTop + padBottom - effKH) / stride + 1;
+        int outW = (inW + padLeft + padRight - effKW) / stride + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"Conv2DHalfWeight<{typeof(T).Name}> output dims invalid: outH={outH}, outW={outW}.");
+        int totalOutputElements = outC * outH * outW;
+        if (output.Length < totalOutputElements)
+            throw new InvalidOperationException(
+                $"Conv2DHalfWeight<{typeof(T).Name}> output too small: {output.Length} < {totalOutputElements}.");
+        if (input.Length < (long)inC * inH * inW)
+            throw new InvalidOperationException(
+                $"Conv2DHalfWeight<{typeof(T).Name}> input too small: {input.Length} < {inC}*{inH}*{inW}.");
+        if (weight.Length < (long)outC * inC * kH * kW)
+            throw new InvalidOperationException(
+                $"Conv2DHalfWeight<{typeof(T).Name}> weight too small: {weight.Length} < {outC}*{inC}*{kH}*{kW}.");
+        if (bias.Length < outC)
+            throw new InvalidOperationException(
+                $"Conv2DHalfWeight<{typeof(T).Name}> bias too small: {bias.Length} < {outC}.");
+        var k = (Action<Index1D, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            int, int, int, int, int, int, int, int, int, int>)
+            _conv2dHalfWCache.GetOrAdd(typeof(T), _ => _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                int, int, int, int, int, int, int, int, int, int>(Conv2DHalfWeightImpl<T>));
         k(totalOutputElements, input, weight, bias, output,
             inC, inH, inW, outC, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
     }

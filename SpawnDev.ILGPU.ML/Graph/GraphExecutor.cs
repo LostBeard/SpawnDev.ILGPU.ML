@@ -38,6 +38,13 @@ public class GraphExecutor : IDisposable
     // Plan: Plans/fp16-bf16-mixed-precision-activations-2026-06-16.md.
     /// <summary>Activation storage precision for graph intermediates (default F32 = unchanged).</summary>
     public ActivationPrecision ActivationDtype { get; set; } = ActivationPrecision.F32;
+    // Optional allowlist of OpTypes permitted to take the F16 precision-aware pass-through. Null = all eligible
+    // ops pass through (the default). Env `PA_OPS=Conv,Relu` restricts it (bisection / escape hatch); the
+    // disallowed ops fall back to the fp32 convert-around-node path. Read once from env at construction.
+    private static readonly HashSet<string>? _paOpsAllowlist =
+        Environment.GetEnvironmentVariable("PA_OPS") is { Length: > 0 } s
+            ? new HashSet<string>(s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            : null;
     private Kernels.PrecisionConvertKernels? _convert;
 
     // TurboQuant KV cache (auto-detected)
@@ -957,6 +964,7 @@ public class GraphExecutor : IDisposable
         // set (the convert-around-node path keeps an fp32 temp live next to the fp32 output, so it does not).
         HalfTensor? TryPrecisionAwarePassThrough(CompiledNode n, IPrecisionAwareOperator pao)
         {
+            if (_paOpsAllowlist != null && !_paOpsAllowlist.Contains(n.OpType)) return null;
             if (n.OutputNames.Length != 1) return null;
             var outName = n.OutputNames[0];
             if (string.IsNullOrEmpty(outName)) return null;

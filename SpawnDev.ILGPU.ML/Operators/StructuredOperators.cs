@@ -305,8 +305,8 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         if (ctx.Format != DataFormat.NCHW) return false;
         if (inputs.Length < 2) return false;
         var xIn = inputs[0]; var wIn = inputs[1];
-        // Activation input must be low-p; weight must be fp32 (the half-weight conv is a separate fallback path).
-        if (!xIn.IsHalf || wIn.IsHalf || wIn.Float == null) return false;
+        // Activation input must be low-p; weight must be a Tensor (fp32 .Data OR fp16 .HalfData — both handled).
+        if (!xIn.IsHalf || wIn.Float == null) return false;
         var xShape = xIn.Half!.Shape; var wShape = wIn.Float.Shape;
         if (xShape.Length != 4 || wShape.Length != 4) return false;
 
@@ -319,13 +319,24 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         var (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
             ResolveConv2DSpatialParams(ctx, xShape, wShape, ctx.Format);
 
-        // Bias: fp32 input[2] if present, else the shared zero-bias buffer.
-        ArrayView1D<float, Stride1D.Dense> bias =
-            (inputs.Length > 2 && inputs[2].Float != null) ? inputs[2].Float!.Data
-            : reg.GetOrCreateZeroBias(outC);
+        // Bias: fp32 input[2] if present (and fp32 — fall back if it's a fp16-stored bias, which is rare/tiny),
+        // else the shared zero-bias buffer.
+        ArrayView1D<float, Stride1D.Dense> bias;
+        if (inputs.Length > 2 && inputs[2].Float != null)
+        {
+            if (inputs[2].Float!.IsHalf) return false;   // fp16 bias has no fp32 Data — fall back to fp32 conv
+            bias = inputs[2].Float!.Data;
+        }
+        else bias = reg.GetOrCreateZeroBias(outC);
 
-        pak.Conv2D<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.Data, bias, output.Data,
-            inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+        // The VAE loads most conv weights as fp16: a Tensor with IsHalf=true has an EMPTY .Data (fp32) and a
+        // populated .HalfData. Route to the half-weight kernel; only genuinely fp32 weights use Conv2D<T>.
+        if (wIn.Float.IsHalf)
+            pak.Conv2DHalfWeight<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.HalfData, bias, output.Data,
+                inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+        else
+            pak.Conv2D<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.Data, bias, output.Data,
+                inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
         return true;
     }
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
@@ -1331,7 +1342,8 @@ public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator, IPrecis
     public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, HalfTensor output, Kernels.PrecisionAwareKernels pak)
     {
         if (inputs.Length < 3 || !inputs[0].IsHalf) return false;
-        if (inputs[1].Float == null || inputs[2].Float == null) return false;   // scale/bias must be fp32
+        // scale/bias must be fp32 Tensors (a fp16-stored Tensor has empty .Data → fall back; they're tiny anyway).
+        if (inputs[1].Float is not { IsHalf: false } || inputs[2].Float is not { IsHalf: false }) return false;
         var shape = inputs[0].Half!.Shape;
         var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
             : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);

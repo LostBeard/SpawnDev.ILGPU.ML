@@ -1,4 +1,5 @@
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
@@ -132,11 +133,17 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             pipe._vaeDecoder = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, vaeModel.Stream,
                 onProgress: (s, p) => { Console.WriteLine($"[GenLoad {Environment.TickCount64}ms] vae_decoder/{s} {p}%"); onProgress?.Invoke($"vae_decoder:{s}", p); },
                 inputShapes: new Dictionary<string, int[]> { ["latent_sample"] = new[] { 1, 4, 64, 64 } });
-        // NOTE: VAE fp16-activation storage (executor ActivationDtype=F16) was MEASURED to NOT reduce peak GPU
-        // memory here (3507->4030 MiB) — image stays sharp, but the convert-around-node approach holds the fp32
-        // op-output (deferred-released at the byte-cap drain) alongside its fp16 copy + fp32 convert-temps, so
-        // total goes UP. The real win needs precision-AWARE ops (true fp16 I/O, no fp32 temps) or an immediate
-        // safe free of the converted fp32. Left fp32 until that lands. See the plan doc + the mixed-precision memory.
+        // VAE fp16-activation storage via the precision-AWARE pass-through (approach i): Conv/InstanceNorm/
+        // Sigmoid/Mul/Add/Relu read+write fp16 DIRECTLY (no fp32 temp). The mechanism is correct (image
+        // bit-near-identical + sharp) and PROVEN to cut the working set on the controlled de-risk graph
+        // (MixedPrecisionExecutorTests, F16 peak < F32 all 6 backends). BUT on the FULL SD-Turbo VAE it does NOT
+        // yet reduce peak: the working-set peak (~2194 MiB) is set by ops that still fall back to fp32 — the
+        // mid-block attention (MatMul/Softmax/Transpose) + Reshape/Resize — and each fallback op that reads a
+        // half input spawns an fp32 convert-temp. Measured (RTX 4070, "a nice house"): peak TOTAL fp32=3507 →
+        // F16=3698 MiB, peak LIVE 2194 unchanged. So F16 is OPT-IN (VAE_ACT_F16=1) until those fallback ops are
+        // covered (the real win). Default stays F32 = no regression. See the plan doc.
+        if (Environment.GetEnvironmentVariable("VAE_ACT_F16") == "1")
+            pipe._vaeDecoder.Executor.ActivationDtype = ActivationPrecision.F16;
         onProgress?.Invoke("vae_decoder", 100);
 
         pipe._alphasCumprod = DiffusionScheduler.ComputeAlphasCumprod();

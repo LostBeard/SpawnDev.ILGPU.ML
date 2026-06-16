@@ -122,3 +122,35 @@ levers anyway; activations matter more at higher resolution / batch. Re-measure 
 ## NOT this (kept separate, also on the roadmap)
 Sequential model residency, tiled VAE (exact GroupNorm-sync). Those cut the OTHER parts of the 11.5 GB (the
 co-resident weights, the VAE peak); this doc is the activation-precision lever. All three compound.
+
+## ✅ APPROACH (i) BUILT + ⚠ MEASURED ON REAL VAE (2026-06-16, session 2)
+Precision-aware pass-through SHIPPED: `IPrecisionAwareOperator` + `PrecisionAwareKernels` generic
+`where T:INumber<T>` ops (Conv group-1 NCHW incl. **fp16-weight** variant, InstanceNorm=GroupNorm(G=C),
+Sigmoid, Mul, Add, Relu, SiLU) read low-p in / write low-p out, fp32-accumulate, NO fp32 temp. Executor
+`GraphExecutor` dispatches them when `ActivationDtype==F16` + inputs low-p + output ≥4096 + not a graph
+output; everything else falls back to the convert-around-node fp32 path. `PA_OPS` env allowlist = bisect/escape.
+
+GATES (all 6 backends): `PMT_FILTER=PrecisionAware` (SiLU/Sigmoid/Add/Mul/GroupNorm/Conv/Conv-half-weight,
+Half+bf16 vs CPU fp32 ref) green; **controlled de-risk `MixedPrecisionExecutorTests` asserts F16 peak LIVE <
+F32** on a 64-ch Conv/Relu chain — PROVES the mechanism cuts the working set.
+
+⚠ **BUT on the FULL SD-Turbo VAE it does NOT yet win** (RTX 4070, "a nice house", seed 42):
+| run | peak TOTAL | peak LIVE | image |
+| fp32 | 3507 MiB | 2194 MiB | ref |
+| F16 all precision-aware ops | 3698 MiB | **2194 (unchanged)** | bit-near-identical (maxAbs=1/255), equally sharp (Laplacian 18.85==18.85) |
+
+The image is correct + sharp; only the memory win is absent. peak LIVE identical fp32↔F16 ⇒ the working-set
+peak is set by ops that STILL fall back to fp32: the **mid-block attention (MatMul/Softmax/Transpose)** +
+**Reshape/Resize**, and every fallback op reading a half input spawns an fp32 convert-temp. F16 also ran much
+slower (convert kernels per fallback node). So **F16 is OPT-IN (`VAE_ACT_F16=1`), default F32 = no regression.**
+
+### NEXT to actually win the VAE peak (the real fix, not deferred):
+1. **Find the exact peak-setting buffers** — `BufferPool.TrackLivePeakComposition` dump added (env
+   `PEAK_COMPOSITION=1` on Example 03), but the full-pipeline run is expensive; get it via a VAE-only harness
+   or end-of-decode one-shot dump (don't re-run the whole pipeline 6×).
+2. **Cover the dominant fallback ops** precision-aware: almost certainly the attention block (a precision-aware
+   MatMul + Softmax + Transpose) and Reshape/Resize (Reshape of a half tensor = zero-copy half view; Resize
+   nearest = gather, trivially low-p). Each removes both an fp32 op-output AND its convert-temps.
+3. Re-measure peak LIVE (must DROP) + keep image sharp. Then flip default to F16.
+4. Address the F16 perf regression (fewer converts once fallbacks are covered; the convert kernels themselves
+   may need fusing).

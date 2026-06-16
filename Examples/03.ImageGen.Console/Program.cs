@@ -94,6 +94,8 @@ async Task<int> Generate(string prompt, int? seed, string? outPath, bool ci)
         if (seed.HasValue) pipe.Seed = seed.Value;
 
         SpawnDev.ILGPU.ML.Tensors.BufferPool.TrackPeaks = true;
+        if (Environment.GetEnvironmentVariable("PEAK_COMPOSITION") == "1")
+            SpawnDev.ILGPU.ML.Tensors.BufferPool.TrackLivePeakComposition = true;
         SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetPeaks();
 
         Console.WriteLine($"Generating: \"{prompt}\"" + (seed.HasValue ? $" (seed {seed})" : ""));
@@ -101,6 +103,14 @@ async Task<int> Generate(string prompt, int? seed, string? outPath, bool ci)
         Console.WriteLine($"{result.Width}x{result.Height} in {result.InferenceTimeMs:F0}ms ({result.NumSteps} step)");
         Console.WriteLine($"[POOL] peak TOTAL allocated = {SpawnDev.ILGPU.ML.Tensors.BufferPool.PeakTotalBytes / 1048576.0:F0} MiB" +
                           $" | peak LIVE (working set) = {SpawnDev.ILGPU.ML.Tensors.BufferPool.PeakLiveBytes / 1048576.0:F0} MiB");
+        var snap = SpawnDev.ILGPU.ML.Tensors.BufferPool.PeakLiveSnapshot;
+        if (snap != null)
+        {
+            Console.WriteLine($"[POOL] LIVE-peak composition: {snap.Count} buffers, " +
+                $"{snap.Count(s => s.isHalf)} fp16 / {snap.Count(s => !s.isHalf)} fp32; top 15 by bytes:");
+            foreach (var s in snap.OrderByDescending(s => s.bytes).Take(15))
+                Console.WriteLine($"    {s.bytes / 1048576.0,7:F2} MiB  {(s.isHalf ? "f16" : "f32")}  {s.name}");
+        }
 
         outPath ??= $"sdturbo_{Sanitize(prompt)}.bmp";
         WriteBmp(outPath, result.ImageRGBA, result.Width, result.Height);

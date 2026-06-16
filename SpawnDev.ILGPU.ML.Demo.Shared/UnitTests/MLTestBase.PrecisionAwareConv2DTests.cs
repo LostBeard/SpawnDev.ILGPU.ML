@@ -81,6 +81,45 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task PrecisionAwareConv2D_HalfWeight_Half_MatchesFp32_AllBackends() => await RunTest(async accelerator =>
+    {
+        // The VAE path: Half activation AND fp16 (ILGPU.Half) weight. Mirrors PrecisionAwareConv2D_Half but the
+        // weight is quantized to Half and read via Conv2DHalfWeight<Half>.
+        const int inC = 3, inH = 8, inW = 8, outC = 4, kH = 3, kW = 3, stride = 1, pad = 1;
+        const int outH = (inH + 2 * pad - kH) / stride + 1;
+        const int outW = (inW + 2 * pad - kW) / stride + 1;
+        int nIn = inC * inH * inW, nW = outC * inC * kH * kW, nOut = outC * outH * outW;
+        var rng = new Random(305);
+        var x = new float[nIn]; for (int i = 0; i < nIn; i++) x[i] = (float)(rng.NextDouble() * 4 - 2);
+        var weight = new float[nW]; for (int i = 0; i < nW; i++) weight[i] = (float)(rng.NextDouble() * 0.6 - 0.3);
+        var bias = new float[outC]; for (int i = 0; i < outC; i++) bias[i] = (float)(rng.NextDouble() * 0.4 - 0.2);
+
+        var xh = new global::ILGPU.Half[nIn]; for (int i = 0; i < nIn; i++) xh[i] = (global::ILGPU.Half)x[i];
+        var wh = new global::ILGPU.Half[nW]; for (int i = 0; i < nW; i++) wh[i] = (global::ILGPU.Half)weight[i];
+        var xq = new float[nIn]; for (int i = 0; i < nIn; i++) xq[i] = (float)xh[i];
+        var wq = new float[nW]; for (int i = 0; i < nW; i++) wq[i] = (float)wh[i];
+        var expected = Conv2DCpu(xq, wq, bias, inC, inH, inW, outC, kH, kW, stride, pad, pad, outH, outW);
+
+        using var inBuf = accelerator.Allocate1D(xh);
+        using var wBuf = accelerator.Allocate1D(wh);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<global::ILGPU.Half>(nOut);
+        var pa = new PrecisionAwareKernels(accelerator);
+        pa.Conv2DHalfWeight<global::ILGPU.Half>(inBuf.View, wBuf.View, bBuf.View, outBuf.View,
+            inC, inH, inW, outC, kH, kW, stride, pad, pad, pad, pad);
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<global::ILGPU.Half>(0, nOut);
+
+        for (int i = 0; i < nOut; i++)
+        {
+            float g = (float)got[i];
+            if (MathF.Abs(g - expected[i]) > MathF.Max(2e-2f, MathF.Abs(expected[i]) * 2e-2f))
+                throw new Exception($"Half-weight precision-aware Conv2D @{i}: got {g}, want {expected[i]} on {BackendName}");
+        }
+        Console.WriteLine($"[PrecisionAwareConv2D] Half act + fp16 weight matches fp32 on {BackendName}");
+    });
+
+    [TestMethod]
     public async Task PrecisionAwareConv2D_BFloat16_MatchesFp32_AllBackends() => await RunTest(async accelerator =>
     {
         const int inC = 3, inH = 8, inW = 8, outC = 4, kH = 3, kW = 3, stride = 1, pad = 1;
