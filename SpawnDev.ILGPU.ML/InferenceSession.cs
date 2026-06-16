@@ -241,6 +241,7 @@ public class InferenceSession : IDisposable
         {
             Format = _executor.Format,
             CacheShapeReadbacks = _cacheShapeReadbacks,
+            ActivationDtype = _executor.ActivationDtype, // carry the activation precision to the recompiled executor
         };
         recompileSw.Stop();
         LastRecompileMs = recompileSw.Elapsed.TotalMilliseconds;

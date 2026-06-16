@@ -6,6 +6,12 @@ using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Graph;
 
+/// <summary>Storage precision for graph ACTIVATION intermediates (weights are handled separately).
+/// F32 = the default all-fp32 path. F16 = store eligible large float feature-maps as fp16 (half the held
+/// GPU bytes); operators still compute fp32 (convert at boundaries). Extensible to bf16/fp8 as Geordi's
+/// low-precision types land — add an enum value + a switch case in RunAsync's convert/rent.</summary>
+public enum ActivationPrecision { F32, F16 }
+
 /// <summary>
 /// Executes a compiled graph on GPU.
 /// Manages tensor allocation, operator dispatch, and buffer lifecycle.
@@ -21,6 +27,15 @@ public class GraphExecutor : IDisposable
     private readonly Dictionary<string, float[]>? _constantValues;
     private readonly ElementWiseKernels _ew;
     private readonly Operators.OperatorRegistry? _registry;
+
+    // Mixed-precision activations (opt-in). When != F32, RunAsync stores eligible large float feature-map
+    // intermediates in low precision (half the held GPU bytes) and converts at fp32 op boundaries — operators
+    // stay fp32 (zero per-op risk). F32 (default) is byte-identical to the all-fp32 path (the whole mechanism
+    // is guarded off). dtype-parameterized: a new low-p type = one switch case + its convert + a RentX pool.
+    // Plan: Plans/fp16-bf16-mixed-precision-activations-2026-06-16.md.
+    /// <summary>Activation storage precision for graph intermediates (default F32 = unchanged).</summary>
+    public ActivationPrecision ActivationDtype { get; set; } = ActivationPrecision.F32;
+    private Kernels.PrecisionConvertKernels? _convert;
 
     // TurboQuant KV cache (auto-detected)
     private readonly KVCacheAnalyzer.KVCacheInfo? _kvCacheInfo;
@@ -866,6 +881,11 @@ public class GraphExecutor : IDisposable
         int nodeIdx = 0;
         var pendingReleases = new List<Tensor>();
         long pendingReleaseBytes = 0; // bytes of buffers in pendingReleases; triggers an early drain past the cap
+        // Mixed-precision activations (ActivationDtype != F32): eligible float feature-map intermediates are
+        // stored low-p here (NOT in `tensors`); consumers convert back to an fp32 temp at input-gather.
+        // Empty + untouched when ActivationDtype == F32 (the whole path is guarded), so F32 is unchanged.
+        var halfTensors = new Dictionary<string, HalfTensor>();
+        var pendingHalfReleases = new List<HalfTensor>();
         foreach (var node in _graph.Nodes)
         {
             if (VerboseLogging)
@@ -892,6 +912,18 @@ public class GraphExecutor : IDisposable
             {
                 var name = node.InputNames[i];
                 if (string.IsNullOrEmpty(name)) continue;
+                // Mixed-precision: an input stored low-p → convert to an fp32 temp for the (fp32) operator.
+                // The temp is deferred-released after the op (ordered, browser-safe) via pendingReleases.
+                if (halfTensors.TryGetValue(name, out var htIn))
+                {
+                    EnsureConvert();
+                    var tmp = _pool.Rent(htIn.Shape, $"__f32in_{nodeIdx}_{i}");
+                    _convert!.HalfToFloat(htIn.Data, tmp.Data.SubView(0, htIn.ElementCount), htIn.ElementCount);
+                    nodeInputs[i] = tmp;
+                    pendingReleases.Add(tmp);
+                    pendingReleaseBytes += (long)htIn.ElementCount * sizeof(float);
+                    continue;
+                }
                 if (!tensors.TryGetValue(name, out var tensor))
                     throw new InvalidOperationException($"Tensor '{name}' not found (needed by {node.OpType})");
                 nodeInputs[i] = tensor;
@@ -1453,6 +1485,33 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Mixed-precision: store eligible LARGE float feature-map outputs as low precision (half the held
+            // bytes). The op ran fp32; convert its fp32 output to fp16 storage, move it to `halfTensors`, and
+            // free the fp32 buffer. Runs AFTER the runtime-const/capture sections above (they read the fp32
+            // output first). Guarded entirely off when ActivationDtype == F32 (→ byte-identical to the fp32
+            // path). Excludes graph outputs (caller reads fp32), integer/shape/runtime-const + small tensors,
+            // and retained (shape-cache) buffers. dtype seam: extend the convert/rent switch for bf16/fp8.
+            if (ActivationDtype != ActivationPrecision.F32 && !shapeCacheHit)
+            {
+                EnsureConvert();
+                for (int oi = 0; oi < node.OutputNames.Length; oi++)
+                {
+                    var outName = node.OutputNames[oi];
+                    var outT = oi < nodeOutputs.Length ? nodeOutputs[oi] : null;
+                    if (string.IsNullOrEmpty(outName) || outT == null || outT.ElementCount < 4096) continue;
+                    if (_graph.OutputNames.Contains(outName) || _integerTensorNames.Contains(outName)
+                        || runtimeConstants.ContainsKey(outName)) continue;
+                    if (node.OpType is "Shape" or "ConstantOfShape" or "Cast" or "NonZero" or "Range") continue;
+                    if (refCounts.TryGetValue(outName, out var orc) && orc >= int.MaxValue) continue; // retained
+                    var half = _pool.RentHalf(outT.Shape, outName);              // ActivationDtype==F16 (only value today)
+                    _convert!.FloatToHalf(outT.Data.SubView(0, outT.ElementCount), half.Data, outT.ElementCount);
+                    halfTensors[outName] = half;
+                    tensors.Remove(outName);                                     // consumers now read it from halfTensors
+                    pendingReleases.Add(outT);                                   // free the fp32 buffer (deferred → ordered after the convert)
+                    pendingReleaseBytes += (long)outT.ElementCount * sizeof(float);
+                }
+            }
+
             // Defer buffer release to sync points to prevent reuse while GPU is in-flight
             foreach (var inputName in node.InputNames)
             {
@@ -1460,10 +1519,20 @@ public class GraphExecutor : IDisposable
                 if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
                 {
                     refCounts[inputName] = rc - 1;
-                    if (rc - 1 <= 0 && tensors.TryGetValue(inputName, out var releaseTensor))
+                    if (rc - 1 <= 0)
                     {
-                        pendingReleases.Add(releaseTensor);
-                        pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float);
+                        // Release low-p OR fp32 storage, whichever holds this tensor (deferred to the drain).
+                        if (halfTensors.TryGetValue(inputName, out var hrel))
+                        {
+                            halfTensors.Remove(inputName);
+                            pendingHalfReleases.Add(hrel);
+                            pendingReleaseBytes += (long)hrel.ElementCount * 2;
+                        }
+                        else if (tensors.TryGetValue(inputName, out var releaseTensor))
+                        {
+                            pendingReleases.Add(releaseTensor);
+                            pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float);
+                        }
                     }
                 }
             }
@@ -1495,7 +1564,10 @@ public class GraphExecutor : IDisposable
                 // Now safe to return deferred buffers — GPU has finished reading them
                 foreach (var t in pendingReleases)
                     _pool.Return(t);
+                foreach (var h in pendingHalfReleases)
+                    _pool.ReturnHalf(h);
                 pendingReleases.Clear();
+                pendingHalfReleases.Clear();
                 pendingReleaseBytes = 0;
             }
 
@@ -1520,7 +1592,10 @@ public class GraphExecutor : IDisposable
         // Release any remaining deferred buffers
         foreach (var t in pendingReleases)
             _pool.Return(t);
+        foreach (var h in pendingHalfReleases)
+            _pool.ReturnHalf(h);
         pendingReleases.Clear();
+        pendingHalfReleases.Clear();
 
         var results = new Dictionary<string, Tensor>();
         foreach (var name in _graph.OutputNames)
@@ -1638,7 +1713,11 @@ public class GraphExecutor : IDisposable
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _ew.Dispose();
+        _convert?.Dispose();
     }
+
+    /// <summary>Lazily create the fp32↔low-precision convert kernels (used only in mixed-precision mode).</summary>
+    private void EnsureConvert() => _convert ??= new Kernels.PrecisionConvertKernels(_accelerator);
 
     // ── Mid-graph readback skip set ──────────────────────────────────────────────
     // The async executor eagerly reads back EVERY ≤64-elem node output into runtimeConstants so that
