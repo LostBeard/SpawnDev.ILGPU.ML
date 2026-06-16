@@ -1511,6 +1511,10 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("parse", 0);
         var ggufModel = await GGUF.GGUFParser.ParseHeaderAsync(stream, ct).ConfigureAwait(false);
         ggufModel.SourceStream = stream; // small F32/F16 tensors are read on demand during BuildGraph
+        // Pre-read the small non-quantized tensors ASYNC so BuildGraph's synchronous dequant never does a
+        // sync Stream.Read — which throws on an async-only browser stream (TorrentReadStream/OPFS). The big
+        // quantized weights stream async to the GPU later (AllocateQuantizedBytesFromStreamAsync).
+        await ggufModel.HydrateNonQuantizedAsync(ct).ConfigureAwait(false);
         onProgress?.Invoke("parse", 100);
 
         onProgress?.Invoke("build_graph", 0);

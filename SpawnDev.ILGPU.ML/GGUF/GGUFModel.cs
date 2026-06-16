@@ -23,10 +23,19 @@ public class GGUFModel
     /// </summary>
     public Stream? SourceStream { get; set; }
 
+    /// <summary>Async-load region cache, keyed by absolute byte offset. <see cref="HydrateNonQuantizedAsync"/>
+    /// pre-reads every non-quantized tensor's data region into this so the SYNCHRONOUS <see cref="SourceBytes"/>
+    /// path (BuildGraph's small-tensor dequant) is served from memory and never touches an async-only browser
+    /// stream. Null on the desktop/in-memory paths (no hydration needed).</summary>
+    private Dictionary<long, byte[]>? _regionCache;
+
     /// <summary>Get a byte window for a tensor region: a zero-copy view into RawData (byte[] path) or a freshly
     /// read slice from <see cref="SourceStream"/> (streaming path). Returns the backing array + the base index.</summary>
     private (byte[] bytes, int baseIdx) SourceBytes(long absOffset, int byteCount)
     {
+        // Pre-hydrated region (browser async-load): serve the sync path from memory, never the async-only stream.
+        if (_regionCache != null && _regionCache.TryGetValue(absOffset, out var hit) && hit.Length >= byteCount)
+            return (hit, 0);
         if (SourceStream == null) return (RawData, (int)absOffset);
         var buf = new byte[byteCount];
         SourceStream.Seek(absOffset, SeekOrigin.Begin);
@@ -55,6 +64,30 @@ public class GGUFModel
             got += n;
         }
         return (buf, 0);
+    }
+
+    /// <summary>Async-prefetch every NON-quantized tensor's data region into <see cref="_regionCache"/> so the
+    /// synchronous BuildGraph dequant path (<see cref="GetTensorFloat32"/> → <see cref="SourceBytes"/>) works
+    /// over an async-only browser stream (TorrentReadStream/OPFS). Quantized weights are NOT hydrated — they
+    /// stream straight to GPU byte buffers later — so the cache holds only a quantized model's small tensors
+    /// (norms/biases), bounded memory. No-op on the in-memory path. Call once after setting
+    /// <see cref="SourceStream"/>, before BuildGraph.</summary>
+    public async Task HydrateNonQuantizedAsync(CancellationToken ct = default)
+    {
+        if (SourceStream == null) return;
+        _regionCache ??= new Dictionary<long, byte[]>();
+        foreach (var t in Tensors)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (IsQuantized(t.Type)) continue;            // streamed to GPU; never read by the sync dequant path
+            long off = GetTensorDataOffset(t);
+            if (_regionCache.ContainsKey(off)) continue;  // tied/aliased tensors can share a data offset
+            long count = 1; foreach (var d in t.Dimensions) count *= d;
+            int byteSize = (int)GGMLTypes.TypeSize(t.Type, (int)count);
+            if (byteSize <= 0) continue;
+            var (buf, _) = await SourceBytesAsync(off, byteSize).ConfigureAwait(false);
+            _regionCache[off] = buf;
+        }
     }
 
     /// <summary>Async twin of <see cref="GetTensorRowFloat32"/> — gathers one row over an async stream so the
