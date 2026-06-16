@@ -133,9 +133,8 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         var kvHeads = new int[nLayers]; var hd = new int[nLayers];
         for (int L = 0; L < nLayers; L++)
         { var cfg = GGUFGraphBuilder.GetLayerAttnConfig(model, L, nHeads, defNKV, defHd); kvHeads[L] = cfg.NKVHeads; hd[L] = cfg.HeadDim; }
-        // F32 KV cache (the default). bf16 (~½ KV VRAM) is implemented but BLOCKED on an ILGPU BFloat16
-        // CUDA store/load codegen bug (DevComms tuvok-to-geordi-ILGPU-BFloat16-cuda-store-zeros-2026-06-15);
-        // pass KVCachePrecision.BF16 here once that lands.
+        // bf16 KV cache (the default — ~½ KV VRAM). Geordi's BFloat16 CUDA store/load fix shipped in
+        // SpawnDev.ILGPU 4.13.0-local.4; bf16 store/load is now correct on CUDA/OpenCL/WebGPU/WebGL/Wasm.
         _cache = new GGUFDecodeKVCache(accelerator, kvHeads, hd, maxSeqLen);
         _session.EnableGGUFDecode(_cache);
     }

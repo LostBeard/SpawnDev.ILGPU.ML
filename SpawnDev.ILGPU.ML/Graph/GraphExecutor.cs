@@ -1237,20 +1237,12 @@ public class GraphExecutor : IDisposable
                     int dHd = DecodeKVCache.HeadDim(dLayer), dKvH = DecodeKVCache.KvHeads(dLayer);
                     int dSeqQ = nodeInputs[1]!.ElementCount / (dKvH * dHd);
                     int dTotal = DecodePastLen + dSeqQ;
-                    // WASM ONLY: drain the K/V producers (QK-norm/RoPE/transpose) before copying their
-                    // outputs into the cache. On the Wasm worker-pool backend a CopyFrom of a node output
-                    // is NOT ordered against the producing kernel the way a kernel-INPUT read is, so the
-                    // cache otherwise reads stale K/V (Wasm step-0 divergence; CUDA/OpenCL/WebGPU/WebGL all
-                    // order it correctly and need no drain). SynchronizeAsync is the portable drain (sync
-                    // Synchronize would throw on browser).
-                    bool dDrain = _accelerator.AcceleratorType == AcceleratorType.Wasm;
-                    if (dDrain) await _accelerator.SynchronizeAsync();
-                    DecodeKVCache.Write(dLayer, nodeInputs[1]!.Data, nodeInputs[2]!.Data, DecodePastLen, dSeqQ);
-                    nodeInputs[1] = new Tensor(DecodeKVCache.PackedK(dLayer, dTotal), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[1]);
-                    nodeInputs[2] = new Tensor(DecodeKVCache.PackedV(dLayer, dTotal), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[2]);
-                    // Drain the cache Write + repack copies so the packed K/V are visible to the
-                    // FusedAttention kernel that reads them next (same Wasm-ordering reason).
-                    if (dDrain) await _accelerator.SynchronizeAsync();
+                    // ONE async path, all backends: WriteAsync/PackedKAsync use CopyFromAsync, which orders the
+                    // copy against the producing kernel on the Wasm worker pool (a sync CopyFrom of a node OUTPUT
+                    // silently races there). No backend-specific drain needed — the async copies self-order.
+                    await DecodeKVCache.WriteAsync(dLayer, nodeInputs[1]!.Data, nodeInputs[2]!.Data, DecodePastLen, dSeqQ).ConfigureAwait(false);
+                    nodeInputs[1] = new Tensor(await DecodeKVCache.PackedKAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[1]);
+                    nodeInputs[2] = new Tensor(await DecodeKVCache.PackedVAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[2]);
                     decodeAttrs = new Dictionary<string, object>(node.Attributes) { ["kv_offset"] = (long)DecodePastLen };
                 }
             }

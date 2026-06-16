@@ -14,6 +14,61 @@ if (args.Length > 0 && args[0] == "STYLEBISECT")
     return 0;
 }
 
+// Investigation diagnostic (NOT a PMT test): tight-loop repro for the intermittent CPU-backend
+// non-determinism in GGUFDecodeKVCache. Discriminates which path (full-recompute shared kernels
+// vs decode-specific) is non-deterministic. Usage: KVRACE [iters] [CPU|Cuda|OpenCL]
+if (args.Length > 0 && args[0] == "KVRACE")
+{
+    int iters = args.Length > 1 && int.TryParse(args[1], out var n) ? n : 200;
+    string backend = args.Length > 2 ? args[2] : "CPU";
+    SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase harness = backend switch
+    {
+        "Cuda" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CudaTests(),
+        "OpenCL" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.OpenCLTests(),
+        _ => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CPUTests(),
+    };
+    await harness.DiagnoseKVDecodeRace(iters);
+    return 0;
+}
+
+// Investigation diagnostic (NOT a PMT test): isolates the CPU shared-memory tree reduction (the GEMV
+// mechanism) and stresses it for determinism — the CPU analog of the Wasm stale-read visibility bug.
+// Usage: SHMEMRACE [reps] [CPU|Cuda|OpenCL]
+if (args.Length > 0 && args[0] == "SHMEMRACE")
+{
+    int reps = args.Length > 1 && int.TryParse(args[1], out var n) ? n : 2000;
+    string backend = args.Length > 2 ? args[2] : "CPU";
+    SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase harness = backend switch
+    {
+        "Cuda" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CudaTests(),
+        "OpenCL" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.OpenCLTests(),
+        _ => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CPUTests(),
+    };
+    await harness.DiagnoseSharedMemReduction(reps);
+    return 0;
+}
+
+// Investigation diagnostic (NOT a PMT test): runs the REAL committed
+// GGUFDecodeKVCache_IncrementalMatchesFullRecompute test method directly on the chosen backend in a
+// plain console (null SynchronizationContext) with wall-clock timing + PID print. If it blocks here
+// too, the CPU hang is a genuine deadlock/block, NOT an NUnit-sync-context artifact. Capture the hung
+// managed stacks externally: dotnet-stack report -p <PID>. Usage: KVTEST [CPU|Cuda|OpenCL]
+if (args.Length > 0 && args[0] == "KVTEST")
+{
+    string backend = args.Length > 1 ? args[1] : "CPU";
+    SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase harness = backend switch
+    {
+        "Cuda" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CudaTests(),
+        "OpenCL" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.OpenCLTests(),
+        _ => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CPUTests(),
+    };
+    Console.WriteLine($"[KVTEST:{backend}] PID={Environment.ProcessId} running GGUFDecodeKVCache_IncrementalMatchesFullRecompute (real committed test)...");
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    await harness.GGUFDecodeKVCache_IncrementalMatchesFullRecompute();
+    Console.WriteLine($"[KVTEST:{backend}] COMPLETED OK in {sw.ElapsedMilliseconds} ms");
+    return 0;
+}
+
 // Catch ILGPU assertion failures (CPU backend bounds checks) that would
 // otherwise show "unknown hard error" dialogs and kill the process.
 // Write a proper TEST: JSON line so PlaywrightMultiTest captures the error.

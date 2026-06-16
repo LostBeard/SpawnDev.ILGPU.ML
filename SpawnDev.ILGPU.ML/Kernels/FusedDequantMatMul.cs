@@ -62,6 +62,13 @@ public class FusedDequantMatMul : IDisposable
     // "Invalid group dimensions (128,...) exceeds maximum (64,64,64)" on CPU. 64 = 2 warps, still fully
     // coalesced per warp and ample K-parallelism; must stay a power of two for the tree reduction.
     private const int GemvGroupSize = 64;
+
+    // DIAGNOSTIC TOGGLE (env GGUF_GEMV_OFF=1): force M==1 onto the per-element M*N kernel instead of
+    // the shared-memory/barrier GEMV. A/B switch for isolating the M=1 GEMV as a suspect in the CPU
+    // KV-decode non-determinism investigation (2026-06-15). Read once; zero cost in production.
+    internal static readonly bool ForcePerElementGemv =
+        Environment.GetEnvironmentVariable("GGUF_GEMV_OFF") == "1";
+
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0;
@@ -131,7 +138,7 @@ public class FusedDequantMatMul : IDisposable
         // Both fall through to the general per-element M*N kernel below (correct; the pre-GEMV path).
         bool gpuBrowser = _accelerator.AcceleratorType == AcceleratorType.WebGL
                        || _accelerator.AcceleratorType == AcceleratorType.WebGPU;
-        if (M == 1 && !gpuBrowser)
+        if (M == 1 && !gpuBrowser && !ForcePerElementGemv)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
             switch (type)

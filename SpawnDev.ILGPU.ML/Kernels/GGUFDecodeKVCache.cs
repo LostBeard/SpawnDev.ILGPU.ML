@@ -6,17 +6,13 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// <summary>Storage precision for the GGUF decode K/V cache.</summary>
 public enum KVCachePrecision
 {
-    /// <summary>16-bit <see cref="BFloat16"/> store — HALF the VRAM, ~0.4% per-value relative error.
-    /// The intended production default (on a 12 GB card next to a 7 GB model the KV cache is the binding
-    /// constraint). BLOCKED as of 2026-06-15: ILGPU's BFloat16 CUDA codegen mis-compiles an
-    /// ArrayView&lt;BFloat16&gt; store/load (returns zeros once a launch exceeds ~128 elements, and under
-    /// repeated launches) — a library bug handed to Geordi (DevComms
-    /// tuvok-to-geordi-ILGPU-BFloat16-cuda-store-zeros-2026-06-15). Flip <see cref="GGUFDecodeKVCache"/>'s
-    /// default back to BF16 + re-enable the test's bf16 arm once that lands.</summary>
+    /// <summary>16-bit <see cref="BFloat16"/> store — HALF the VRAM, ~0.4% per-value relative error. The
+    /// production default: on a 12 GB card next to a 7 GB model the KV cache is the binding constraint.
+    /// (Was briefly blocked on an ILGPU BFloat16 CUDA store bug — fixed in SpawnDev.ILGPU 4.13.0-local.4,
+    /// Geordi; re-enabled 2026-06-16.)</summary>
     BF16,
-    /// <summary>32-bit float store — exact (no storage rounding). The SAFE default while bf16 is blocked;
-    /// also what the regression test uses for its tight layout/RoPE/kv_offset gate (bf16 rounding would
-    /// mask a subtle indexing bug there).</summary>
+    /// <summary>32-bit float store — exact (no storage rounding). What the regression test uses for its
+    /// tight layout/RoPE/kv_offset gate (bf16 rounding would mask a subtle indexing bug there).</summary>
     F32,
 }
 
@@ -59,14 +55,21 @@ public sealed class GGUFDecodeKVCache : IDisposable
         public MemoryBuffer1D<float, Stride1D.Dense>? PackK;  // f32 repack scratch [kvHeads, len, hd], grow-only
         public MemoryBuffer1D<float, Stride1D.Dense>? PackV;
         public int PackCapacityTokens;
+        // bf16 path: a CONTIGUOUS bf16 conversion scratch so the f32↔bf16 convert kernel writes at its own
+        // index (WebGL-safe), and the strided store↔contiguous moves are CopyFrom (also WebGL-safe). Grow-only.
+        public MemoryBuffer1D<BFloat16, Stride1D.Dense>? Bf16Scratch;
+        public int Bf16ScratchTokens;
     }
 
     private readonly LayerCache[] _layers;
     private readonly List<IDisposable> _retired = new();
 
-    // F32 path uses per-head CopyFrom (no kernel — WebGL-safe). bf16 path: f32↔bf16 conversion kernels.
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, int, int, int, int, int>? _writeB;
-    private Action<Index1D, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _packB;
+    // bf16 path (ONE path, all backends): a CONTIGUOUS element-wise convert kernel (write-index == thread-index
+    // — WebGL-safe, no Transform-Feedback scatter), then CopyFromAsync between the contiguous scratch and the
+    // maxSeq-strided store. CopyFromAsync (not sync CopyFrom) is what orders the copy against the convert kernel
+    // on the Wasm worker pool — exactly what it was added for; sync CopyFrom silently races there.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>? _f32ToBf16;
+    private Action<Index1D, ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _bf16ToF32;
 
     /// <summary>Max tokens the cache can hold.</summary>
     public int MaxSeqLen => _maxSeqLen;
@@ -80,11 +83,10 @@ public sealed class GGUFDecodeKVCache : IDisposable
     /// <summary>
     /// Allocate the cache. <paramref name="kvHeadsPerLayer"/> / <paramref name="headDimPerLayer"/> are the
     /// per-layer attention geometry (gemma4 interleaves sliding/global with different values).
-    /// <paramref name="precision"/> defaults to F32 (the SAFE default while <see cref="KVCachePrecision.BF16"/>
-    /// is blocked on an ILGPU BFloat16 CUDA codegen bug — see that enum member).
+    /// <paramref name="precision"/> defaults to bf16 (the production VRAM win — half the KV footprint).
     /// </summary>
     public GGUFDecodeKVCache(Accelerator accelerator, int[] kvHeadsPerLayer, int[] headDimPerLayer,
-        int maxSeqLen = 4096, KVCachePrecision precision = KVCachePrecision.F32)
+        int maxSeqLen = 4096, KVCachePrecision precision = KVCachePrecision.BF16)
     {
         if (kvHeadsPerLayer.Length != headDimPerLayer.Length)
             throw new ArgumentException("kvHeadsPerLayer and headDimPerLayer must have the same length (one per layer).");
@@ -116,7 +118,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
     /// <paramref name="k"/>/<paramref name="v"/> are the post-transpose head-major f32 slices the graph
     /// produced: flat [kvHeads, nTokens, hd]. Decode step: nTokens=1. Prefill: nTokens=prompt length, atToken=0.
     /// </summary>
-    public void Write(int layer, ArrayView1D<float, Stride1D.Dense> k, ArrayView1D<float, Stride1D.Dense> v, int atToken, int nTokens)
+    public async Task WriteAsync(int layer, ArrayView1D<float, Stride1D.Dense> k, ArrayView1D<float, Stride1D.Dense> v, int atToken, int nTokens)
     {
         var lc = _layers[layer];
         if (atToken + nTokens > _maxSeqLen)
@@ -124,38 +126,50 @@ public sealed class GGUFDecodeKVCache : IDisposable
         int hd = lc.HeadDim, kvHeads = lc.KvHeads;
         if (_precision == KVCachePrecision.BF16)
         {
-            // bf16 store needs an f32→bf16 conversion, so a kernel (not CopyFrom). NOTE: this scatters into the
-            // maxSeq-strided store (write-index ≠ thread-index), which the WebGL Transform-Feedback path
-            // corrupts — bf16 is currently blocked on the ILGPU BFloat16 CUDA bug anyway; a WebGL-safe bf16
-            // write (one store per thread at its own index) is part of un-blocking it later.
+            // Convert f32→bf16 into a CONTIGUOUS scratch (kernel writes its OWN index — WebGL-safe, no scatter),
+            // then CopyFromAsync scratch → the maxSeq-strided store. CopyFromAsync orders the copy against the
+            // convert kernel on the Wasm worker pool (sync CopyFrom silently races there). Batched per K/V.
             int total = kvHeads * nTokens * hd;
-            _writeB ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>, int, int, int, int, int>(WriteBF16Impl);
-            _writeB(total, k, lc.Kb!.View, kvHeads, nTokens, hd, atToken, _maxSeqLen);
-            _writeB(total, v, lc.Vb!.View, kvHeads, nTokens, hd, atToken, _maxSeqLen);
+            EnsureBf16Scratch(lc, nTokens);
+            var scratch = lc.Bf16Scratch!.View;
+            _f32ToBf16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>(F32ToBf16Impl);
+            _f32ToBf16(total, k, scratch);
+            var tasks = new List<Task>(kvHeads);
+            for (int h = 0; h < kvHeads; h++)
+                tasks.Add(lc.Kb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
+                    .CopyFromAsync(scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            _f32ToBf16(total, v, scratch);
+            tasks.Clear();
+            for (int h = 0; h < kvHeads; h++)
+                tasks.Add(lc.Vb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
+                    .CopyFromAsync(scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         else
         {
-            // F32: per-head native CopyFrom (GPU→GPU). Works on ALL backends — WebGL included — because it's a
-            // buffer copy, not a Transform-Feedback scatter (a write-index≠thread-index kernel silently
-            // corrupts on WebGL). store[h, atToken : atToken+nTokens, :] = src[h, 0:nTokens, :].
+            // F32: per-head CopyFromAsync (k/v are graph node OUTPUTS; the async copy orders against their
+            // producing kernel on Wasm — a sync CopyFrom of a node output silently races there).
+            var tasks = new List<Task>(kvHeads * 2);
             for (int h = 0; h < kvHeads; h++)
             {
-                lc.Kf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
-                    .CopyFrom(k.SubView((long)h * nTokens * hd, (long)nTokens * hd));
-                lc.Vf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
-                    .CopyFrom(v.SubView((long)h * nTokens * hd, (long)nTokens * hd));
+                tasks.Add(lc.Kf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
+                    .CopyFromAsync(k.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+                tasks.Add(lc.Vf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
+                    .CopyFromAsync(v.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
             }
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
     }
 
     /// <summary>Repack the first <paramref name="totalLen"/> tokens of one layer into a CONTIGUOUS f32
     /// [kvHeads, totalLen, hd] buffer (store → f32), for FusedAttention. Grow-only scratch.</summary>
-    public ArrayView1D<float, Stride1D.Dense> PackedK(int layer, int totalLen) => Packed(layer, totalLen, isKey: true);
+    public Task<ArrayView1D<float, Stride1D.Dense>> PackedKAsync(int layer, int totalLen) => PackedAsync(layer, totalLen, isKey: true);
     /// <summary>Repack the first <paramref name="totalLen"/> tokens' V into contiguous f32 [kvHeads, totalLen, hd].</summary>
-    public ArrayView1D<float, Stride1D.Dense> PackedV(int layer, int totalLen) => Packed(layer, totalLen, isKey: false);
+    public Task<ArrayView1D<float, Stride1D.Dense>> PackedVAsync(int layer, int totalLen) => PackedAsync(layer, totalLen, isKey: false);
 
-    private ArrayView1D<float, Stride1D.Dense> Packed(int layer, int totalLen, bool isKey)
+    private async Task<ArrayView1D<float, Stride1D.Dense>> PackedAsync(int layer, int totalLen, bool isKey)
     {
         var lc = _layers[layer];
         int hd = lc.HeadDim, kvHeads = lc.KvHeads;
@@ -163,18 +177,29 @@ public sealed class GGUFDecodeKVCache : IDisposable
         var pack = (isKey ? lc.PackK : lc.PackV)!.View;
         if (_precision == KVCachePrecision.BF16)
         {
+            // CopyFromAsync the strided bf16 store → a CONTIGUOUS scratch (ordered on Wasm), then convert scratch
+            // → f32 pack (the convert KERNEL reads scratch — a kernel-input read IS ordered after the copy).
             var store = (isKey ? lc.Kb : lc.Vb)!.View;
-            _packB ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(PackBF16Impl);
-            _packB(kvHeads * totalLen * hd, store, pack, kvHeads, totalLen, hd, _maxSeqLen);
+            EnsureBf16Scratch(lc, totalLen);
+            var scratch = lc.Bf16Scratch!.View;
+            var tasks = new List<Task>(kvHeads);
+            for (int h = 0; h < kvHeads; h++)
+                tasks.Add(scratch.SubView((long)h * totalLen * hd, (long)totalLen * hd)
+                    .CopyFromAsync(store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            _bf16ToF32 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Bf16ToF32Impl);
+            _bf16ToF32(kvHeads * totalLen * hd, scratch.SubView(0, (long)kvHeads * totalLen * hd), pack);
         }
         else
         {
-            // F32: per-head native CopyFrom (store maxSeq-stride → contiguous pack). WebGL-safe (buffer copy).
+            // F32: per-head CopyFromAsync (store maxSeq-stride → contiguous pack).
             var store = (isKey ? lc.Kf : lc.Vf)!.View;
+            var tasks = new List<Task>(kvHeads);
             for (int h = 0; h < kvHeads; h++)
-                pack.SubView((long)h * totalLen * hd, (long)totalLen * hd)
-                    .CopyFrom(store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd));
+                tasks.Add(pack.SubView((long)h * totalLen * hd, (long)totalLen * hd)
+                    .CopyFromAsync(store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         return pack.SubView(0, (long)kvHeads * totalLen * hd);
     }
@@ -191,27 +216,29 @@ public sealed class GGUFDecodeKVCache : IDisposable
         lc.PackCapacityTokens = cap;
     }
 
-    // ── kernels: index math is identical across precisions; only the element type/conversion differs ──
-
-    // The (BFloat16)float cast is ILGPU's verified round-to-nearest-even narrowing (correct on every backend).
-    private static void WriteBF16Impl(Index1D idx,
-        ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> store,
-        int kvHeads, int nTokens, int hd, int atToken, int maxSeq)
+    /// <summary>Grow-only contiguous bf16 conversion scratch, sized to hold <paramref name="tokens"/> tokens.</summary>
+    private void EnsureBf16Scratch(LayerCache lc, int tokens)
     {
-        int total = kvHeads * nTokens * hd;
-        if (idx >= total) return;
-        int d = idx % hd, t = (idx / hd) % nTokens, h = idx / (nTokens * hd);
-        store[(long)h * maxSeq * hd + (long)(atToken + t) * hd + d] = (BFloat16)src[(long)h * nTokens * hd + (long)t * hd + d];
+        if (lc.Bf16Scratch != null && tokens <= lc.Bf16ScratchTokens) return;
+        int cap = Math.Max(tokens, lc.Bf16ScratchTokens == 0 ? Math.Min(64, _maxSeqLen) : lc.Bf16ScratchTokens * 2);
+        cap = Math.Min(cap, _maxSeqLen);
+        if (lc.Bf16Scratch != null) _retired.Add(lc.Bf16Scratch);
+        lc.Bf16Scratch = _accelerator.Allocate1D<BFloat16>((long)lc.KvHeads * cap * lc.HeadDim);
+        lc.Bf16ScratchTokens = cap;
     }
 
-    private static void PackBF16Impl(Index1D idx,
-        ArrayView1D<BFloat16, Stride1D.Dense> store, ArrayView1D<float, Stride1D.Dense> pack,
-        int kvHeads, int totalLen, int hd, int maxSeq)
+    // ── contiguous element-wise converts: one store per thread at its OWN index (WebGL-safe). The strided
+    //    store↔scratch moves are CopyFrom (also WebGL-safe). The (BFloat16)float cast is ILGPU's verified RNE. ──
+    private static void F32ToBf16Impl(Index1D idx, ArrayView1D<float, Stride1D.Dense> src, ArrayView1D<BFloat16, Stride1D.Dense> dst)
     {
-        int total = kvHeads * totalLen * hd;
-        if (idx >= total) return;
-        int d = idx % hd, t = (idx / hd) % totalLen, h = idx / (totalLen * hd);
-        pack[(long)h * totalLen * hd + (long)t * hd + d] = (float)store[(long)h * maxSeq * hd + (long)t * hd + d];
+        if (idx >= dst.Length) return;
+        dst[idx] = (BFloat16)src[idx];
+    }
+
+    private static void Bf16ToF32Impl(Index1D idx, ArrayView1D<BFloat16, Stride1D.Dense> src, ArrayView1D<float, Stride1D.Dense> dst)
+    {
+        if (idx >= dst.Length) return;
+        dst[idx] = (float)src[idx];
     }
 
     /// <summary>Per-layer kvHeads (for the FusedAttention attrs at read time).</summary>
@@ -227,6 +254,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
             lc.Kf?.Dispose(); lc.Vf?.Dispose();
             lc.Kb?.Dispose(); lc.Vb?.Dispose();
             lc.PackK?.Dispose(); lc.PackV?.Dispose();
+            lc.Bf16Scratch?.Dispose();
         }
         foreach (var r in _retired) r.Dispose();
         _retired.Clear();

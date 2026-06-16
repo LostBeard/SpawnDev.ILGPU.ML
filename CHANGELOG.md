@@ -4,6 +4,17 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased — Gemma 4 multimodal chat + selectable-precision decode KV cache + SpawnDev.ILGPU 4.13.0 migration
 
+**Browser model delivery: WebTorrent → OPFS → zero-copy GPU.** The browser gemma4 chat (and the WebTorrent
+load path generally) now: (1) streams weights **zero-copy** — `AllocateQuantizedBytesFromStreamAsync` uses
+`ArrayView.CopyFromStreamAsync`, which on browser backends pipes each torrent `IJSReadStream` chunk's
+`Uint8Array` straight to the GPU via `queue.writeBuffer`, never entering the .NET/WASM managed heap (verified
+313 MB distilgpt2, 312 MB zero-copy); (2) PARSES the GGUF header + small non-quantized tensors via an async
+gather (`GGUFModel.HydrateNonQuantizedAsync` / `GetTensorRowFloat32Async`) so no synchronous `Stream.Read`
+hits the async-only browser stream; (3) PERSISTS to OPFS — the demo wires the WebTorrent client to the OPFS
+`IAsyncFS` and calls `RestoreFromStorageAsync` on startup, so a reload reuses the cached pieces instead of
+re-downloading (verified: fresh client restores + re-reads from OPFS, no re-download). The `/cache` page lists
+live WebTorrent transfers (progress, ↓/↑ share speed, peers, cancel/remove/seed).
+
 **Gemma 4 multimodal CHAT.** `Gemma4MultimodalPipeline.StartChat()` returns a `Gemma4Chat` for multi-turn
 conversation — the KV cache is REUSED across turns (each turn prefills only its new tokens, O(new) not
 O(whole conversation)), so it stays coherent like llama.cpp/ollama chat. Text + image + audio in any turn.
@@ -11,16 +22,22 @@ O(whole conversation)), so it stays coherent like llama.cpp/ollama chat. Text + 
 so a caller never holds a dangling reference to freed GPU buffers. Example 05 is now an interactive chat
 console (startup → chat until `/exit`; `/image`, `/audio`, `/reset` commands).
 
-**Selectable-precision GGUF decode KV cache.** `GGUFDecodeKVCache` gains a `KVCachePrecision` option
-(`F32` | `BF16`). F32 (exact) is the **current default**; the regression suite uses it for a tight
-layout/RoPE/kv_offset gate. BF16 storage (~half the KV-cache VRAM — VRAM is the binding constraint running
-gemma4:12b's 7 GB weights on a 12 GB card) is fully implemented on SpawnDev.ILGPU's first-class `BFloat16`
-type (4.13.0-local.3) but **temporarily BLOCKED**: ILGPU's BFloat16 CUDA codegen mis-compiles an
-`ArrayView<BFloat16>` store/load (returns zeros once a launch exceeds ~128 elements, and under repeated
-launches) — a library bug handed to the ILGPU owner with an airtight repro (DevComms
-`tuvok-to-geordi-ILGPU-BFloat16-cuda-store-zeros-2026-06-15`). The default flips to BF16 and the test's bf16
-arm re-enables once that lands. (This BF16 path also replaces an earlier manual `ushort`+bit-shift version
-that the WebGL GLSL emitter mis-compiled at ~17% error — the native type is the right fix.)
+**Selectable-precision GGUF decode KV cache — BF16 now the default.** `GGUFDecodeKVCache` gains a
+`KVCachePrecision` option (`F32` | `BF16`). **BF16 is now the default** (~half the KV-cache VRAM — VRAM is
+the binding constraint running gemma4:12b's 7 GB weights on a 12 GB card), built on SpawnDev.ILGPU's
+first-class `BFloat16` type; the earlier BFloat16 CUDA store/load codegen bug is fixed in 4.13.0-local.4, so
+bf16 store/load is correct on CUDA/OpenCL/WebGPU/WebGL/Wasm. F32 (exact) remains available; the regression
+suite runs BOTH arms (F32 for a tight layout/RoPE/kv_offset gate, BF16 argmax-strict with bf16 tolerance).
+The cache write/read is ONE async path on every backend: a contiguous element-wise f32↔bf16 convert kernel
+(write-index == thread-index, so WebGL-Transform-Feedback-safe — no scatter) plus `CopyFromAsync` between the
+contiguous scratch and the maxSeq-strided store. `CopyFromAsync` (not sync `CopyFrom`) is what orders the
+copy against the producing kernel on the Wasm worker pool — a sync `CopyFrom` of a kernel output silently
+races there. Scoped PMT: passes on CUDA/OpenCL/WebGPU/WebGL/Wasm (5/6). The CPU desktop lane is held out by a
+separate, tracked SpawnDev.ILGPU CPU-backend async-path deadlock (reproduces on a plain console forward,
+before any KV-cache code, and on committed HEAD — DevComms
+`tuvok-to-geordi-CopyFrom-silent-wasm-race-and-cpu-decode-hang-2026-06-16`), not by this cache. (This BF16
+path also replaces an earlier manual `ushort`+bit-shift version that the WebGL GLSL emitter mis-compiled at
+~17% error — the native type is the right fix.)
 
 ### WebGL multi-store kernel fixes + SpawnDev.ILGPU 4.12.0 migration
 

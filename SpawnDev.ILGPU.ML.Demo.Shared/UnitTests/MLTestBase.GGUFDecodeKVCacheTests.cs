@@ -16,7 +16,8 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// per position, as a single full-recompute <see cref="InferenceSession.RunAsync"/> over the whole
 /// sequence. If the cache write/read layout, the RoPE offset, or the FusedAttention kv_offset is
 /// wrong, the incremental logits diverge from the full-recompute reference — caught here on every
-/// backend the harness runs (the intercept is CopyFrom-only, so this also proves browser parity).
+/// backend the harness runs. The cache write/read is one async CopyFromAsync path (orders the copy
+/// against the producing kernel on the Wasm worker pool), so this also proves browser parity.
 /// </summary>
 public partial class MLTestBase
 {
@@ -103,10 +104,6 @@ public partial class MLTestBase
         }
 
         await RunPrecision(KVCachePrecision.F32, relTol: 2e-3f, absFloor: 2e-3f);   // exact store: tight layout gate
-        // BF16 arm GATED: bf16 storage is correct in this code, but ILGPU's BFloat16 CUDA codegen
-        // mis-compiles the ArrayView<BFloat16> store/load (zeros once a launch exceeds ~128 elements / under
-        // repeated launches) — a library bug in Geordi's lane with a tracked repro
-        // (DevComms tuvok-to-geordi-ILGPU-BFloat16-cuda-store-zeros-2026-06-15). Re-enable when that lands:
-        // await RunPrecision(KVCachePrecision.BF16, relTol: 6e-2f, absFloor: 6e-2f);  // bf16 store: argmax-strict, bf16 tol
+        await RunPrecision(KVCachePrecision.BF16, relTol: 6e-2f, absFloor: 6e-2f);  // bf16 store: argmax-strict, bf16 tol
     });
 }
