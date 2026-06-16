@@ -75,6 +75,7 @@ async Task<int> Generate(string prompt, int? seed, string? outPath, bool ci)
                   : opencl.Count > 0 ? (Device)opencl[0]
                   : context.GetPreferredDevice(preferCPU: false);
     using var accelerator = device.CreateAccelerator(context);
+    if (Environment.GetEnvironmentVariable("ML_VERBOSE") == "1") InferenceSession.VerboseLogging = true;
     Console.WriteLine($"Accelerator: {accelerator.Name} ({accelerator.AcceleratorType})");
 
     // Model acquisition: the SpawnDev hub streams SD-Turbo's ONNX weights (cached after first run).
