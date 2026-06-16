@@ -157,6 +157,61 @@ public abstract partial class MLTestBase
         }
     });
 
+    // RELOAD PERSISTENCE (browser, real OPFS path): proves a model downloaded over WebTorrent SURVIVES a
+    // page reload — download to OPFS, then a FRESH client RestoreFromStorageAsync() re-adds the torrent from
+    // the persisted state and RE-READS its file from the OPFS pieces (the exact re-access that was reported to
+    // throw OPFS NotReadableError). Success means a reload reuses the cache instead of re-downloading.
+    // Throws its result so the browser lane (drops Console.WriteLine) surfaces it: "[OPFS RELOAD OK]" = pass.
+    [TestMethod(Timeout = 180000, Category = "HeavyModel")]
+    public async Task WebTorrent_OpfsReloadPersistence() => await RunTest(async accelerator =>
+    {
+        var client = GetWebTorrentClient();
+        if (client == null) throw new UnsupportedTestException("OPFS WebTorrentClient only wired in the browser demo lane");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var fs = GetAsyncFS();
+        if (fs == null) throw new UnsupportedTestException("OPFS AsyncFS not available");
+
+        if (await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true); // clean cold start
+
+        var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http);
+        const string repo = "Xenova/distilgpt2";
+        const string file = "tokenizer.json"; // small, WebTorrent-served by the hub
+        try
+        {
+            // Session 1: download fully to OPFS.
+            string infoHash; long len;
+            {
+                var m = await hub.OpenAsync(repo, file);
+                infoHash = m.Torrent.WireInfoHashHex; len = m.File.Length;
+                await using var s = m.Stream;
+                var buf = new byte[len]; int got = 0;
+                while (got < len) { int n = await s.ReadAsync(buf.AsMemory(got, (int)len - got)); if (n == 0) break; got += n; }
+                if (got != len) throw new Exception($"session-1 read {got}/{len}");
+            }
+
+            // RELOAD: a fresh client over the SAME OPFS restores the torrent from persisted state.
+            var client2 = new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs });
+            await client2.RestoreFromStorageAsync();
+            var restored = client2.Torrents.FirstOrDefault(t => t.WireInfoHashHex == infoHash)
+                ?? throw new Exception($"[OPFS RELOAD FAIL] torrent {infoHash} was NOT restored from OPFS — a reload would re-download.");
+
+            // Re-READ the file from the restored torrent's OPFS pieces (the NotReadableError-prone access).
+            var f2 = restored.Files![0];
+            await using var rs = f2.CreateReadStream();
+            var buf2 = new byte[len]; int got2 = 0;
+            while (got2 < len) { int n = await rs.ReadAsync(buf2.AsMemory(got2, (int)len - got2)); if (n == 0) break; got2 += n; }
+            if (got2 != len) throw new Exception($"[OPFS RELOAD FAIL] re-read {got2}/{len} from restored torrent");
+
+            throw new Exception($"[OPFS RELOAD OK] {repo}/{file} {len}B persisted + restored on a FRESH client + re-read from OPFS (reload reuses cache, no re-download). progress={restored.Progress:P0}");
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
+        {
+            throw new UnsupportedTestException($"hub/network unavailable: {ex.Message}");
+        }
+    });
+
     // CORRECTNESS guard for the fp16/half zero-copy weight path (the SD-Turbo case): uploading raw fp16 bytes
     // straight into a GPU ILGPU.Half buffer via IBrowserMemoryBuffer.CopyFromJS must be byte-identical to the
     // .NET byte[] path (CopyFromCPU of the decoded Half[]). This proves the layout assumption - ILGPU.Half is

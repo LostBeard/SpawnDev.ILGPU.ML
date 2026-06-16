@@ -24,7 +24,14 @@ builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
 // AsyncFS exposes JS-typed writes (TypedArray/Blob/ArrayBuffer) so piece bytes stay JS-side (no .NET byte[]
 // hop), and the loader streams them straight to the GPU via CopyFromStreamAsync's zero-copy IJSReadStream.
 builder.Services.AddSingleton<WebTorrentClient>(sp =>
-    new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = sp.GetRequiredService<IAsyncFS>() }));
+{
+    var client = new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = sp.GetRequiredService<IAsyncFS>() });
+    // Restore persisted torrents from OPFS so a page reload REUSES the downloaded pieces instead of
+    // re-downloading (the ML demo never did this — unlike the WebTorrent demo — so every refresh re-pulled
+    // the model). Fire-and-forget; runs when the client is first resolved (after the OPFS FS has started).
+    _ = client.RestoreFromStorageAsync();
+    return client;
+});
 
 // Shared OPFS model cache (browser). One instance so every demo + the cache-management page see the same
 // cached models. ModelCache reads/writes the persistent OPFS "ilgpu-ml-models" dir, so even multiple
