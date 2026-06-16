@@ -1,6 +1,9 @@
 @page "/cache"
 @using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.WebTorrent
+@implements IDisposable
 @inject ModelCache Cache
+@inject WebTorrentClient WebTorrent
 
 <PageTitle>Model Cache — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -48,6 +51,41 @@
         </table>
     }
 
+    <h2 class="cache-h2">Peer-to-peer model transfers <span class="cache-sub">(WebTorrent)</span></h2>
+    <p class="cache-desc">
+        Models stream from the SpawnDev hub over WebTorrent and seed back to other users while a demo is open
+        (sharing) — so popular models get faster for everyone. Cancel a download or stop seeding by removing
+        its torrent here.
+    </p>
+    @if (_torrents.Count == 0)
+    {
+        <p class="cache-muted">No active model torrents. Open a demo that loads a hub model to start one.</p>
+    }
+    else
+    {
+        <div class="cache-summary">
+            <div class="cache-summary-stat">↓ <span class="cache-num">@FormatSpeed(WebTorrent.DownloadSpeed)</span></div>
+            <div class="cache-summary-stat">↑ <span class="cache-num">@FormatSpeed(WebTorrent.UploadSpeed)</span> shared</div>
+        </div>
+        <table class="cache-table">
+            <thead><tr><th>Torrent</th><th class="cache-right">Size</th><th class="cache-right">Progress</th><th class="cache-right">↓</th><th class="cache-right">↑ share</th><th class="cache-right">Peers</th><th></th></tr></thead>
+            <tbody>
+                @foreach (var t in _torrents)
+                {
+                    <tr>
+                        <td class="cache-key">@t.DisplayNameShort <span class="cache-badge @(t.Done ? "seed" : "dl")">@(t.Done ? "seeding" : "downloading")</span></td>
+                        <td class="cache-right cache-size">@FormatBytes(t.Length)</td>
+                        <td class="cache-right">@($"{t.Progress * 100:0.#}%")</td>
+                        <td class="cache-right">@FormatSpeed(t.DownloadSpeed)</td>
+                        <td class="cache-right">@FormatSpeed(t.UploadSpeed)</td>
+                        <td class="cache-right">@t.NumPeers</td>
+                        <td class="cache-right"><button class="cache-btn danger small" @onclick="() => RemoveTorrent(t)" disabled="@_busy">@(t.Done ? "Stop" : "Cancel")</button></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
     @if (_status != null) { <p class="cache-status">@_status</p> }
 </div>
 
@@ -73,6 +111,11 @@
     .cache-muted { color: #64748b; font-size: 0.9rem; }
     .cache-warn { color: #fbbf24; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.85rem; }
     .cache-status { margin-top: 1rem; color: #86efac; font-size: 0.85rem; }
+    .cache-h2 { font-size: 1.2rem; margin: 2rem 0 0.5rem; }
+    .cache-sub { color: #64748b; font-weight: 400; font-size: 0.9rem; }
+    .cache-badge { font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 5px; margin-left: 0.4rem; vertical-align: middle; }
+    .cache-badge.dl { background: rgba(56,189,248,0.15); color: #38bdf8; }
+    .cache-badge.seed { background: rgba(134,239,172,0.15); color: #86efac; }
 </style>
 
 @code {
@@ -82,8 +125,46 @@
     private bool _busy;
     private bool _opfsAvailable = true;
     private string? _status;
+    private List<Torrent> _torrents = new();
+    private System.Threading.PeriodicTimer? _timer;
 
-    protected override async Task OnInitializedAsync() => await Refresh();
+    protected override async Task OnInitializedAsync()
+    {
+        await Refresh();
+        _torrents = WebTorrent.Torrents.ToList();
+        _ = PollTorrentsAsync();   // live-update progress / speeds / peers
+    }
+
+    private async Task PollTorrentsAsync()
+    {
+        _timer = new System.Threading.PeriodicTimer(TimeSpan.FromSeconds(1));
+        try
+        {
+            while (await _timer.WaitForNextTickAsync())
+            {
+                _torrents = WebTorrent.Torrents.ToList();
+                StateHasChanged();
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private async Task RemoveTorrent(Torrent t)
+    {
+        _busy = true; StateHasChanged();
+        try
+        {
+            bool wasDone = t.Done;
+            await WebTorrent.RemoveAsync(t);
+            _status = wasDone ? $"Stopped seeding \"{t.DisplayNameShort}\"." : $"Cancelled download of \"{t.DisplayNameShort}\".";
+        }
+        catch (Exception ex) { _status = $"Remove failed: {ex.Message}"; }
+        finally { _busy = false; }
+        _torrents = WebTorrent.Torrents.ToList();
+        StateHasChanged();
+    }
+
+    public void Dispose() => _timer?.Dispose();
 
     private async Task Refresh()
     {
@@ -133,4 +214,7 @@
         while (size >= 1024 && unit < units.Length - 1) { size /= 1024; unit++; }
         return $"{size:0.#} {units[unit]}";
     }
+
+    private static string FormatSpeed(double bytesPerSec) =>
+        bytesPerSec < 1 ? "—" : $"{FormatBytes((long)bytesPerSec)}/s";
 }
