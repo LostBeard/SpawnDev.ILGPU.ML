@@ -18,18 +18,13 @@ builder.Services.AddBlazorJSRuntime();
 // Cross-platform persistent file system (OPFS in browser, native on desktop)
 builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
 
-// WebTorrent client for P2P model delivery (direct stream access, no service worker needed).
-// The download store needs a Uint8Array-capable IAsyncBrowserFileSystem for the zero-copy browser path to
-// fire (each piece's bytes stay in JS: fetch -> SubtleCrypto -> store, no .NET byte[] hop). The OPFS FS
-// (AsyncFSFileSystemDirectoryHandle) qualifies on paper, but was NOT reliably triggering zero-copy at
-// runtime (the model download fell back to the byte[] path: 4 concurrent web-seed connections + ~10s
-// stalls). AsyncFSMemory is an in-memory IAsyncBrowserFileSystem (JS Blob storage, browser-managed) that
-// supports Uint8Array reliably, so zero-copy ALWAYS fires; Blob storage also avoids the WASM-heap OOM a
-// .NET byte[] store hits on multi-GB models. Persistence (OPFS) stays available via the IAsyncFS singleton
-// for the model cache; the per-download store is ephemeral (re-downloaded each session, which the SD-Turbo
-// path does anyway).
+// WebTorrent client for P2P model delivery. Persist torrents + pieces to OPFS (the IAsyncFS singleton =
+// navigator.getDirectory()) so a downloaded model SURVIVES page reloads — the client restores its torrents
+// on startup instead of re-downloading — and so the /cache page can list/cancel/remove/seed them. The
+// AsyncFS exposes JS-typed writes (TypedArray/Blob/ArrayBuffer) so piece bytes stay JS-side (no .NET byte[]
+// hop), and the loader streams them straight to the GPU via CopyFromStreamAsync's zero-copy IJSReadStream.
 builder.Services.AddSingleton<WebTorrentClient>(sp =>
-    new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = new AsyncFSMemory() }));
+    new WebTorrentClient(new WebTorrentClientOptions { AsyncFileSystem = sp.GetRequiredService<IAsyncFS>() }));
 
 // Shared OPFS model cache (browser). One instance so every demo + the cache-management page see the same
 // cached models. ModelCache reads/writes the persistent OPFS "ilgpu-ml-models" dir, so even multiple
