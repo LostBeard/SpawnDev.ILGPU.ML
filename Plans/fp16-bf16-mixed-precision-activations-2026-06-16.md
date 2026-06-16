@@ -70,6 +70,39 @@ OpenCL/WebGPU/WebGL/Wasm) via a CPU-oracle PMT test BEFORE moving on. SD-Turbo i
 - Pool interaction: low-p buffers are half the bytes → the byte-bounded release cap (`MaxPendingReleaseBytes`)
   and bucket reuse must account for element size (currently fp32-bytes assumed).
 
+## EXECUTOR INTEGRATION — precise design (piece 3/n, the core cut). Built dtype-PARAMETERIZED (Geordi is
+## wiring more low-p types; a new type = one `switch(dtype)` case + its convert kernel + a RentX pool — TJ).
+Foundation DONE + verified all-backends: piece 1/n `PrecisionConvertKernels` fp32↔fp16/bf16 (`74ce795`, 14/0),
+piece 2/n `BufferPool.RentHalf`/`ReturnHalf` (`181a5a1`, 8/0). Now wire `GraphExecutor.RunAsync`:
+
+- **Opt-in** `GraphExecutor.ActivationPrecision` (enum `F32` default | `F16` | later BF16/…), set per
+  `InferenceSession` (SD-Turbo VAE session → F16). F32 = byte-identical to today (zero change when off).
+- **Approach (ii) convert-around-node (FIRST cut — operators stay fp32; lowest risk, real win, dtype-generic):**
+  store eligible intermediates low-p; convert at node boundaries. NO operator rewrites.
+  - **Eligible intermediate** = node OUTPUT that is a float feature map AND NOT: a graph output, a weight
+    (`_weights`), an integer/shape/runtime-constant tensor (`_integerTensorNames`/`runtimeConstants`/Shape/
+    ConstantOfShape), or a KV-cache tensor. Conservative — when unsure, keep fp32.
+  - Mixed storage: parallel `Dictionary<string,HalfTensor> _halfTensors` ALONGSIDE `tensors` (least invasive;
+    don't widen `tensors`). A name resolves to whichever holds it.
+  - Per node: gather inputs — any input in `_halfTensors` → RentHalf-free fp32 temp via `HalfToFloat` (return
+    right after the op). Run op (fp32, unchanged). Each ELIGIBLE fp32 output → RentHalf + `FloatToHalf` into it,
+    register in `_halfTensors`, Return the fp32 temp. Non-eligible outputs stay fp32 in `tensors`.
+  - Release: `ReturnHalf` for `_halfTensors`, `Return` for `tensors` (extend pendingReleases; count low-p at
+    2 B/elem in `MaxPendingReleaseBytes`). Graph OUTPUTS stay/convert to fp32 (caller reads fp32).
+- **dtype seam:** convert+rent `switch(ActivationPrecision)` (F16: RentHalf + Float<->Half). Adding BF16/fp8 =
+  a case + `RentBFloat16` + the bf16 convert (already in PrecisionConvertKernels) — THE practice for Geordi's types.
+- **VERIFY (measure twice):** (1) CONTROLLED minimal-graph executor unit test (tiny Conv/Relu/Add graph, F32 vs
+  F16, assert ≈ within fp16 tol on ALL backends) — de-risk the wiring in isolation BEFORE the VAE. (2) SD-Turbo
+  pipeline with the VAE session `ActivationPrecision=F16`: image SHARP vs `_Models/ort_vae_oracle.cs` + working-set
+  drop measured (`BufferPool.TrackPeaks`).
+- **Risk:** the hot RunAsync loop interleaves shape-inference / runtime-const capture / shape-cache / KV-cache /
+  refcount — the convert insertion only touches eligible FLOAT feature-map I/O and must not perturb those.
+  Approach (ii) keeps every operator fp32 = zero per-op correctness risk; risk is purely executor wiring →
+  hence the controlled-graph test first. Do this cut DELIBERATELY (core path, every model), not rushed.
+- **Later (perf, not first cut):** approach (i) precision-aware hot ops (Conv/GroupNorm low-p I/O, no fp32 temps)
+  — generic `INumber<T>` where INumber-expressible; mixed read-(float)-compute-write-(low-p) for SiLU/GELU/Softmax
+  (INumber has no exp).
+
 ## NOT this (kept separate, also on the roadmap)
 Sequential model residency, tiled VAE (exact GroupNorm-sync). Those cut the OTHER parts of the 11.5 GB (the
 co-resident weights, the VAE peak); this doc is the activation-precision lever. All three compound.
