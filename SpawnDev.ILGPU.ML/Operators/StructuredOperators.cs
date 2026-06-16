@@ -1469,15 +1469,26 @@ public class ResizeOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] }; // Requires sizes input — resolved at runtime
     public void Execute(OnnxOpContext ctx)
     {
-        // Simplified: NCHW bilinear resize using sizes from output shape
         var inShape = ctx.Inputs[0].Shape;
         var outShape = ctx.Outputs[0].Shape;
         int C = inShape[0] * inShape[1]; // N*C for batch
         int inH = inShape[2]; int inW = inShape[3];
         int outH = outShape[2]; int outW = outShape[3];
-        // Use align_corners based on coordinate_transform_mode attribute
-        var mode = ctx.GetString("coordinate_transformation_mode", "half_pixel");
-        if (mode == "align_corners")
+
+        // ONNX Resize `mode`: "nearest" (the op's DEFAULT) | "linear" | "cubic". We previously IGNORED it and
+        // always bilinear-resized — which low-passes a nearest Resize, blurring the whole image. The SD-Turbo
+        // VAE decoder upsamples with mode="nearest" (diffusers Upsample2D F.interpolate nearest), so bilinear
+        // smoothing made every generated image soft. Honor `mode` (matches UpsampleOperator). Verified: with
+        // nearest, our VAE decode matches the ONNX Runtime oracle (sharp) instead of the soft bilinear output.
+        var mode = ctx.GetString("mode", "nearest");
+        if (mode == "nearest")
+        {
+            reg.ElementWise.NearestUpsample(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].Shape, ctx.Outputs[0].Shape);
+            return;
+        }
+        // linear/cubic → bilinear (cubic approximated). align_corners per the coordinate-transform mode.
+        var ctMode = ctx.GetString("coordinate_transformation_mode", "half_pixel");
+        if (ctMode == "align_corners")
             reg.ElementWise.BilinearUpsampleAlignCorners(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);
         else
             reg.ElementWise.BilinearUpsample(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);

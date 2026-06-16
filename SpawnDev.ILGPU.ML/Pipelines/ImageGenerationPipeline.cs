@@ -268,6 +268,19 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             noiseData.Length, vaeScaleFactor);
         await _accelerator.SynchronizeAsync();
 
+        // DIAGNOSTIC (desktop only, opt-in): dump the EXACT post-scale latent fed to our VAE as raw float32,
+        // so an ONNX Runtime oracle can decode the identical [1,4,latH,latW] tensor and we can diff its image
+        // vs ours — isolates a VAE-op fidelity bug from upstream (UNet/latent). Env: SDTURBO_DUMP_LATENT=path.
+        var _dumpLatentPath = Environment.GetEnvironmentVariable("SDTURBO_DUMP_LATENT");
+        if (!string.IsNullOrEmpty(_dumpLatentPath))
+        {
+            var _lat = await ReadTensorToCpu(latentTensor, noiseData.Length);
+            var _bytes = new byte[_lat.Length * sizeof(float)];
+            Buffer.BlockCopy(_lat, 0, _bytes, 0, _bytes.Length);
+            await File.WriteAllBytesAsync(_dumpLatentPath, _bytes);
+            Console.WriteLine($"[DUMP] VAE-input latent [1,4,{latentH},{latentW}] ({_lat.Length} floats) -> {_dumpLatentPath}");
+        }
+
         // ═══════════════════════════════════════════════════════════
         //  Step 6: VAE decode → [1, 3, 512, 512] RGB
         // ═══════════════════════════════════════════════════════════
