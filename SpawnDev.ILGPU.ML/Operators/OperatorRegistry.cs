@@ -81,6 +81,9 @@ public class OperatorRegistry : IDisposable
     public Kernels.SliceKernel Slice { get; }
     public Kernels.ConcatKernel Concat { get; }
     public Kernels.MissingElementWiseKernels MissingElementWise { get; }
+    /// <summary>Approach-(i) precision-aware op kernels (read+write low-p activations, no fp32 temp).
+    /// Used by <see cref="IPrecisionAwareOperator"/> implementations under the F16 executor path.</summary>
+    public Kernels.PrecisionAwareKernels PrecisionAware { get; }
 
     /// <summary>
     /// GGML quantization type per quantized-weight tensor name, set by the GGUF loader
@@ -120,6 +123,7 @@ public class OperatorRegistry : IDisposable
         Slice = new Kernels.SliceKernel(accelerator);
         Concat = new Kernels.ConcatKernel(accelerator);
         MissingElementWise = new Kernels.MissingElementWiseKernels(accelerator);
+        PrecisionAware = new Kernels.PrecisionAwareKernels(accelerator);
 
         // Register built-in operators
         RegisterBuiltins();
@@ -402,6 +406,7 @@ public class OperatorRegistry : IDisposable
         try { (Slice as IDisposable)?.Dispose(); } catch { }
         try { (Concat as IDisposable)?.Dispose(); } catch { }
         try { (MissingElementWise as IDisposable)?.Dispose(); } catch { }
+        try { (PrecisionAware as IDisposable)?.Dispose(); } catch { }
 
         // Dispose cached zero-bias buffers (one per distinct outC seen).
         foreach (var b in _zeroBiasCache.Values) try { b.Dispose(); } catch { }

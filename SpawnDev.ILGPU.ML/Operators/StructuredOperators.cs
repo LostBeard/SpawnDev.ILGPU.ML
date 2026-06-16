@@ -256,9 +256,78 @@ public class BatchNormOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── Conv ──
 
-public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
+public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "Conv";
+
+    /// <summary>Resolve the 2D conv spatial params (stride, asymmetric pads [top,left,bottom,right], dilations)
+    /// from ctx attributes + input/weight shapes. Shared by <see cref="Execute"/> and the precision-aware path so
+    /// the SAME_UPPER/SAME_LOWER and asymmetric-pad logic has a single source of truth.</summary>
+    internal static (int stride, int padTop, int padLeft, int padBottom, int padRight, int dilationH, int dilationW)
+        ResolveConv2DSpatialParams(OnnxOpContext ctx, int[] xShape, int[] wShape, DataFormat fmt)
+    {
+        var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
+        // ONNX `pads` = [x1_begin, x2_begin, x1_end, x2_end] = [top, left, bottom, right] for 2D.
+        // Stride-2 SAME convs export asymmetric pads like [0,0,1,1] — keep all four (collapsing shears the grid).
+        var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap) ? ap.ToString()! : "NOTSET";
+        int padTop, padLeft, padBottom, padRight;
+        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
+        {
+            int inH = xShape.Length >= 4 ? xShape[LayoutHelper.HeightAxis(fmt)] : (xShape.Length >= 3 ? xShape[2] : 1);
+            int inW = xShape.Length >= 4 ? xShape[LayoutHelper.WidthAxis(fmt)] : 1;
+            int kHa = wShape.Length >= 4 ? wShape[LayoutHelper.HeightAxis(fmt)] : (wShape.Length >= 3 ? wShape[2] : 1);
+            int kWa = wShape.Length >= 4 ? wShape[LayoutHelper.WidthAxis(fmt)] : (wShape.Length >= 3 ? (wShape.Length > 3 ? wShape[3] : 1) : 1);
+            int strideW = strides.Length > 1 ? strides[1] : stride;
+            int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kHa - inH);
+            int padW = Math.Max(0, ((int)Math.Ceiling((double)inW / strideW) - 1) * strideW + kWa - inW);
+            if (autoPad == "SAME_UPPER") { padTop = padH / 2; padBottom = padH - padH / 2; padLeft = padW / 2; padRight = padW - padW / 2; }
+            else { padTop = padH - padH / 2; padBottom = padH / 2; padLeft = padW - padW / 2; padRight = padW / 2; }
+        }
+        else
+        {
+            var pads = ctx.GetInts("pads");
+            padTop    = pads.Length > 0 ? pads[0] : 0;
+            padLeft   = pads.Length > 1 ? pads[1] : 0;
+            padBottom = pads.Length > 2 ? pads[2] : padTop;
+            padRight  = pads.Length > 3 ? pads[3] : padLeft;
+        }
+        var dilationsAttr = ctx.GetInts("dilations");
+        int dilationH = dilationsAttr.Length > 0 ? dilationsAttr[0] : 1;
+        int dilationW = dilationsAttr.Length > 1 ? dilationsAttr[1] : dilationH;
+        return (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+    }
+
+    /// <summary>Precision-aware (F16) path: standard group-1 NCHW 2D Conv with a low-p activation input and an
+    /// fp32 weight/bias → low-p output, double-accumulate, NO fp32 temp. Returns false (→ fp32 fallback) for any
+    /// other case (Conv1D, depthwise, grouped, NHWC, fp16 weight, fp32 input).</summary>
+    public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
+        if (ctx.Format != DataFormat.NCHW) return false;
+        if (inputs.Length < 2) return false;
+        var xIn = inputs[0]; var wIn = inputs[1];
+        // Activation input must be low-p; weight must be fp32 (the half-weight conv is a separate fallback path).
+        if (!xIn.IsHalf || wIn.IsHalf || wIn.Float == null) return false;
+        var xShape = xIn.Half!.Shape; var wShape = wIn.Float.Shape;
+        if (xShape.Length != 4 || wShape.Length != 4) return false;
+
+        int group = ctx.GetInt("group", 1);
+        var (_, inC, inH, inW) = LayoutHelper.GetDims(xShape, ctx.Format);
+        if (group == -1) group = inC;
+        int outC = wShape[0];
+        if (group != 1) return false;               // only standard (non-grouped, non-depthwise) here
+        var (_, _, kH, kW) = LayoutHelper.GetWeightDims(wShape, ctx.Format);
+        var (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
+            ResolveConv2DSpatialParams(ctx, xShape, wShape, ctx.Format);
+
+        // Bias: fp32 input[2] if present, else the shared zero-bias buffer.
+        ArrayView1D<float, Stride1D.Dense> bias =
+            (inputs.Length > 2 && inputs[2].Float != null) ? inputs[2].Float!.Data
+            : reg.GetOrCreateZeroBias(outC);
+
+        pak.Conv2D<global::ILGPU.Half>(xIn.Half!.Data, wIn.Float.Data, bias, output.Data,
+            inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+        return true;
+    }
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var x = inputs[0]; var w = inputs[1];
@@ -345,39 +414,9 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
         var fmt = ctx.Format;
-        var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
-
-        // Resolve ONNX padding into the FOUR asymmetric components [top, left, bottom, right].
-        // ONNX `pads` = [x1_begin, x2_begin, x1_end, x2_end] = [top, left, bottom, right] for 2D.
-        // CRITICAL: stride-2 SAME convs (e.g. MobileNetV2) export asymmetric pads like [0,0,1,1].
-        // Collapsing these to a single symmetric value silently truncated the output grid
-        // (192->95 instead of 96) and sheared every downstream feature map. Keep all four.
-        var autoPad = ctx.Attributes.TryGetValue("auto_pad", out var ap) ? ap.ToString()! : "NOTSET";
-        int padTop, padLeft, padBottom, padRight;
-        if (autoPad == "SAME_UPPER" || autoPad == "SAME_LOWER")
-        {
-            int inH = x.Shape.Length >= 4 ? x.Shape[LayoutHelper.HeightAxis(fmt)] : (x.Shape.Length >= 3 ? x.Shape[2] : 1);
-            int inW = x.Shape.Length >= 4 ? x.Shape[LayoutHelper.WidthAxis(fmt)] : 1;
-            int kHa = w.Shape.Length >= 4 ? w.Shape[LayoutHelper.HeightAxis(fmt)] : (w.Shape.Length >= 3 ? w.Shape[2] : 1);
-            int kWa = w.Shape.Length >= 4 ? w.Shape[LayoutHelper.WidthAxis(fmt)] : (w.Shape.Length >= 3 ? (w.Shape.Length > 3 ? w.Shape[3] : 1) : 1);
-            int strideW = strides.Length > 1 ? strides[1] : stride;
-            int padH = Math.Max(0, ((int)Math.Ceiling((double)inH / stride) - 1) * stride + kHa - inH);
-            int padW = Math.Max(0, ((int)Math.Ceiling((double)inW / strideW) - 1) * strideW + kWa - inW);
-            if (autoPad == "SAME_UPPER") { padTop = padH / 2; padBottom = padH - padH / 2; padLeft = padW / 2; padRight = padW - padW / 2; }
-            else { padTop = padH - padH / 2; padBottom = padH / 2; padLeft = padW - padW / 2; padRight = padW / 2; }
-        }
-        else
-        {
-            var pads = ctx.GetInts("pads");
-            padTop    = pads.Length > 0 ? pads[0] : 0;
-            padLeft   = pads.Length > 1 ? pads[1] : 0;
-            padBottom = pads.Length > 2 ? pads[2] : padTop;
-            padRight  = pads.Length > 3 ? pads[3] : padLeft;
-        }
+        var (stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW) =
+            ResolveConv2DSpatialParams(ctx, x.Shape, w.Shape, fmt);
         int pad = padTop; // Conv1D below uses the (symmetric) begin pad
-        var dilationsAttr = ctx.GetInts("dilations");
-        int dilationH = dilationsAttr.Length > 0 ? dilationsAttr[0] : 1;
-        int dilationW = dilationsAttr.Length > 1 ? dilationsAttr[1] : dilationH;
         int group = ctx.GetInt("group", 1);
         var (_, inC_from_x, _, _) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, fmt) : (1, x.Shape.Length > 1 ? x.Shape[1] : 1, 1, 1);
         // group = -1 is the TFLite depthwise sentinel — resolve to inC
@@ -1272,7 +1311,7 @@ public class GroupNormOperator : IOnnxOperator
 
 // ── InstanceNormalization ──
 
-public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator
+public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "InstanceNormalization";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
@@ -1285,6 +1324,21 @@ public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator
         int spatial = ctx.Inputs[0].ElementCount / (N * C);
         reg.Normalization.InstanceNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
             ctx.Inputs[1].Data, ctx.Inputs[2].Data, N, C, spatial);
+    }
+    /// <summary>Precision-aware (F16) path: InstanceNorm == GroupNorm with one group per channel (G=C). Reads the
+    /// low-p activation, accumulates mean/var in fp32, writes low-p; scale/bias stay fp32. eps=1e-5f matches the
+    /// fp32 InstanceNorm kernel. Returns false unless input[0] is low-p and scale/bias are fp32.</summary>
+    public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
+        if (inputs.Length < 3 || !inputs[0].IsHalf) return false;
+        if (inputs[1].Float == null || inputs[2].Float == null) return false;   // scale/bias must be fp32
+        var shape = inputs[0].Half!.Shape;
+        var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
+            : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
+        int spatial = inputs[0].ElementCount / (N * C);
+        pak.GroupNorm<global::ILGPU.Half>(inputs[0].Half!.Data, output.Data,
+            inputs[1].Float!.Data, inputs[2].Float!.Data, N, C, spatial, numGroups: C, epsilon: 1e-5f);
+        return true;
     }
 }
 

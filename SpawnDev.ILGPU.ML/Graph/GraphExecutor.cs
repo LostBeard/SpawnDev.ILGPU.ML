@@ -26,6 +26,9 @@ public class GraphExecutor : IDisposable
     private readonly Dictionary<string, Tensor> _weights;
     private readonly Dictionary<string, float[]>? _constantValues;
     private readonly ElementWiseKernels _ew;
+    // Precision-aware (F16 pass-through) op kernels — owned here (not via the optional _registry, which is null
+    // in registry-less executor uses like the controlled mixed-precision test). Stateless kernel caches.
+    private readonly PrecisionAwareKernels _precisionAware;
     private readonly Operators.OperatorRegistry? _registry;
 
     // Mixed-precision activations (opt-in). When != F32, RunAsync stores eligible large float feature-map
@@ -278,6 +281,7 @@ public class GraphExecutor : IDisposable
         _quantizedWeights = quantizedWeights;
         _registry = registry;
         _ew = new ElementWiseKernels(accelerator);
+        _precisionAware = new PrecisionAwareKernels(accelerator);
         LastInitializerDataTypesCount = graph.InitializerDataTypes?.Count ?? -1;
         _integerTensorNames = BuildIntegerTensorNames(graph);
         LastIntegerTensorCount = _integerTensorNames.Count;
@@ -886,6 +890,116 @@ public class GraphExecutor : IDisposable
         // Empty + untouched when ActivationDtype == F32 (the whole path is guarded), so F32 is unchanged.
         var halfTensors = new Dictionary<string, HalfTensor>();
         var pendingHalfReleases = new List<HalfTensor>();
+
+        // Decrement each consumed input's refcount and, when it hits zero, defer-release its buffer (low-p or
+        // fp32) until the next drain (ordered, browser-safe). Shared by the normal fp32 path and the F16
+        // precision-aware pass-through below — single source of truth for input lifetime.
+        void ReleaseConsumedInputs(CompiledNode n)
+        {
+            foreach (var inputName in n.InputNames)
+            {
+                if (string.IsNullOrEmpty(inputName)) continue;
+                if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
+                {
+                    refCounts[inputName] = rc - 1;
+                    if (rc - 1 <= 0)
+                    {
+                        // Release low-p OR fp32 storage, whichever holds this tensor (deferred to the drain).
+                        if (halfTensors.TryGetValue(inputName, out var hrel))
+                        {
+                            halfTensors.Remove(inputName);
+                            pendingHalfReleases.Add(hrel);
+                            pendingReleaseBytes += (long)hrel.ElementCount * 2;
+                        }
+                        else if (tensors.TryGetValue(inputName, out var releaseTensor))
+                        {
+                            pendingReleases.Add(releaseTensor);
+                            pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Periodic GPU command-buffer drain: flush + wait every SyncIntervalNodes nodes, or early when the
+        // deferred-release backlog exceeds MaxPendingReleaseBytes, then return the deferred buffers. Shared by
+        // both execution paths so peak GPU memory is bounded to ~(live set + cap) regardless of which path ran.
+        async Task DrainPointAsync()
+        {
+            if (nodeIdx % SyncIntervalNodes == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
+            {
+                _drainSw.Restart();
+                try { await _accelerator.SynchronizeAsync(); }
+                catch (Exception syncEx)
+                {
+                    var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
+                    var tailLen = LastRunOpLog.Count - tailStart;
+                    var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                    throw new Exception(
+                        $"[GE node-{nodeIdx} sync] {syncEx.Message} || last {tailLen} ops: {tail}");
+                }
+                _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
+                // Now safe to return deferred buffers — GPU has finished reading them
+                foreach (var t in pendingReleases)
+                    _pool.Return(t);
+                foreach (var h in pendingHalfReleases)
+                    _pool.ReturnHalf(h);
+                pendingReleases.Clear();
+                pendingHalfReleases.Clear();
+                pendingReleaseBytes = 0;
+            }
+        }
+
+        // F16 precision-aware pass-through: when an op implements IPrecisionAwareOperator AND all its inputs are
+        // resolvable (low-p or fp32) AND its output is half-eligible, run it reading low-p inputs and writing a
+        // RentHalf output DIRECTLY — NO fp32 temp. Returns the half output on success (caller stores it), or null
+        // to fall back to the fp32 convert-around-node path. This is what actually cuts the activation working
+        // set (the convert-around-node path keeps an fp32 temp live next to the fp32 output, so it does not).
+        HalfTensor? TryPrecisionAwarePassThrough(CompiledNode n, IPrecisionAwareOperator pao)
+        {
+            if (n.OutputNames.Length != 1) return null;
+            var outName = n.OutputNames[0];
+            if (string.IsNullOrEmpty(outName)) return null;
+            if (_graph.OutputNames.Contains(outName)) return null;                  // graph outputs stay fp32 for the caller
+            if (_integerTensorNames.Contains(outName)) return null;
+            if (runtimeConstants.ContainsKey(outName)) return null;
+            if (refCounts.TryGetValue(outName, out var orc) && orc >= int.MaxValue) return null;  // retained (shape-cache)
+            if (n.OutputShapes.Length < 1) return null;
+            var rawShape = n.OutputShapes[0];
+            var outShape = new int[rawShape.Length];
+            for (int d = 0; d < rawShape.Length; d++) outShape[d] = rawShape[d] <= 0 ? 1 : rawShape[d];
+            if (TensorHelpers.ElementCount(outShape) < 4096) return null;           // small tensors stay fp32 (parity with store floor)
+
+            var mixed = new PrecisionAwareInput[n.InputNames.Length];
+            for (int i = 0; i < n.InputNames.Length; i++)
+            {
+                var name = n.InputNames[i];
+                if (string.IsNullOrEmpty(name)) return null;                        // these ops have no empty-optional inputs we pass through
+                if (halfTensors.TryGetValue(name, out var h)) mixed[i] = new PrecisionAwareInput(h);
+                else if (tensors.TryGetValue(name, out var t)) mixed[i] = new PrecisionAwareInput(t);
+                else return null;                                                   // input not materialized → can't pass through
+            }
+
+            var halfOut = _pool.RentHalf(outShape, outName);
+            var pctx = new OnnxOpContext
+            {
+                Inputs = Array.Empty<Tensor>(),
+                Outputs = Array.Empty<Tensor>(),
+                Attributes = n.Attributes,
+                Pool = _pool,
+                Format = Format,
+                InputNames = n.InputNames,
+                ConstantValues = runtimeConstants,
+                IntegerTensorNames = _integerTensorNames,
+                Registry = _registry,
+            };
+            bool ok;
+            try { ok = pao.TryExecuteHalf(pctx, mixed, halfOut, _precisionAware); }
+            catch { _pool.ReturnHalf(halfOut); throw; }   // a real kernel failure must surface, not silently fall back
+            if (!ok) { _pool.ReturnHalf(halfOut); return null; }
+            return halfOut;
+        }
+
         foreach (var node in _graph.Nodes)
         {
             if (VerboseLogging)
@@ -905,6 +1019,25 @@ public class GraphExecutor : IDisposable
                     tensors[outName] = _pool.Rent(shape, outName);
                 }
                 continue;
+            }
+
+            // ── F16 precision-aware pass-through (approach i) ──
+            // Before the fp32 gather, if this op can run read-low-p / write-low-p with no fp32 temp, do so. On
+            // success the node is fully handled here (output stored low-p, inputs released, drain advanced) and
+            // we skip the fp32 path. On a miss (null) we fall through to the convert-around-node fp32 path.
+            if (ActivationDtype == ActivationPrecision.F16 && node.Operator is IPrecisionAwareOperator pao)
+            {
+                var halfOut = TryPrecisionAwarePassThrough(node, pao);
+                if (halfOut != null)
+                {
+                    halfTensors[node.OutputNames[0]] = halfOut;
+                    ReleaseConsumedInputs(node);
+                    nodeIdx++;
+                    LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~f16");
+                    await DrainPointAsync();
+                    if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
+                    continue;
+                }
             }
 
             var nodeInputs = new Tensor[node.InputNames.Length];
@@ -1513,63 +1646,14 @@ public class GraphExecutor : IDisposable
             }
 
             // Defer buffer release to sync points to prevent reuse while GPU is in-flight
-            foreach (var inputName in node.InputNames)
-            {
-                if (string.IsNullOrEmpty(inputName)) continue;
-                if (refCounts.TryGetValue(inputName, out var rc) && rc < int.MaxValue)
-                {
-                    refCounts[inputName] = rc - 1;
-                    if (rc - 1 <= 0)
-                    {
-                        // Release low-p OR fp32 storage, whichever holds this tensor (deferred to the drain).
-                        if (halfTensors.TryGetValue(inputName, out var hrel))
-                        {
-                            halfTensors.Remove(inputName);
-                            pendingHalfReleases.Add(hrel);
-                            pendingReleaseBytes += (long)hrel.ElementCount * 2;
-                        }
-                        else if (tensors.TryGetValue(inputName, out var releaseTensor))
-                        {
-                            pendingReleases.Add(releaseTensor);
-                            pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float);
-                        }
-                    }
-                }
-            }
+            ReleaseConsumedInputs(node);
 
             nodeIdx++;
             LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}");
 
-            // Flush GPU command buffer periodically to prevent massive single submissions.
-            // Interval tunable via SyncIntervalNodes — each flush is an async round-trip whose
-            // latency dominates large-graph forward time on WebGPU/Blazor. ALSO drain early when the
-            // deferred-release backlog exceeds MaxPendingReleaseBytes, so a big-activation graph (VAE
-            // decode) recycles its feature maps instead of holding 64 nodes' worth at once → bounds peak
-            // GPU memory to ~(live set + cap). Small-tensor graphs never hit the cap (cheap N-node cadence).
-            if (nodeIdx % SyncIntervalNodes == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
-            {
-                _drainSw.Restart();
-                try { await _accelerator.SynchronizeAsync(); }
-                catch (Exception syncEx)
-                {
-                    // Inline augmentation (no InnerException) - SpawnDev.UnitTesting.UnitTestRunner
-                    // unwraps InnerException when reporting test errors, so wrapping loses our context.
-                    var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
-                    var tailLen = LastRunOpLog.Count - tailStart;
-                    var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
-                    throw new Exception(
-                        $"[GE node-{nodeIdx} sync] {syncEx.Message} || last {tailLen} ops: {tail}");
-                }
-                _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
-                // Now safe to return deferred buffers — GPU has finished reading them
-                foreach (var t in pendingReleases)
-                    _pool.Return(t);
-                foreach (var h in pendingHalfReleases)
-                    _pool.ReturnHalf(h);
-                pendingReleases.Clear();
-                pendingHalfReleases.Clear();
-                pendingReleaseBytes = 0;
-            }
+            // Flush GPU command buffer periodically (every SyncIntervalNodes, or early when the deferred-release
+            // backlog exceeds MaxPendingReleaseBytes) and return the drained buffers. See DrainPointAsync.
+            await DrainPointAsync();
 
             // DIAGNOSTIC: stop early at requested node count to bisect failures.
             if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value)
@@ -1713,6 +1797,7 @@ public class GraphExecutor : IDisposable
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _ew.Dispose();
+        _precisionAware.Dispose();
         _convert?.Dispose();
     }
 

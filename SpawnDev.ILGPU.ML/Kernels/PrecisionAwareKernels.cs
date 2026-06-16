@@ -22,6 +22,8 @@ public sealed class PrecisionAwareKernels : IDisposable
     private readonly Accelerator _accelerator;
     // Per-element-type kernel cache (one compiled kernel per T per op). Keyed by typeof(T).
     private readonly ConcurrentDictionary<Type, object> _siluCache = new();
+    private readonly ConcurrentDictionary<Type, object> _reluCache = new();
+    private readonly ConcurrentDictionary<Type, object> _sigmoidCache = new();
     private readonly ConcurrentDictionary<Type, object> _addCache = new();
     private readonly ConcurrentDictionary<Type, object> _mulCache = new();
     private readonly ConcurrentDictionary<Type, object> _groupNormCache = new();
@@ -50,6 +52,46 @@ public sealed class PrecisionAwareKernels : IDisposable
         var k = (Action<Index1D, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>>)
             _siluCache.GetOrAdd(typeof(T), _ => _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>>(SiLUImpl<T>));
+        k(count, input, output);
+    }
+
+    // ── ReLU (max(0, x)) — read T, write T. No fp32 temp. ──
+    private static void ReluImpl<T>(Index1D i, ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output)
+        where T : unmanaged, INumber<T>
+    {
+        float x = PrecisionConvert.ConvertToSingle(input[i]);
+        output[i] = PrecisionConvert.ConvertFromSingle<T>(x > 0f ? x : 0f);
+    }
+
+    /// <summary>ReLU max(0, x) in precision T (float/Half/bf16). Low-precision I/O, no fp32 temp.</summary>
+    public void Relu<T>(ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output, int count)
+        where T : unmanaged, INumber<T>
+    {
+        var k = (Action<Index1D, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>>)
+            _reluCache.GetOrAdd(typeof(T), _ => _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>>(ReluImpl<T>));
+        k(count, input, output);
+    }
+
+    // ── Sigmoid (1 / (1 + e^-x)) — read T, fp32 compute (exp), write T. SD VAE SiLU = Sigmoid·Mul. ──
+    private static void SigmoidImpl<T>(Index1D i, ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output)
+        where T : unmanaged, INumber<T>
+    {
+        float x = PrecisionConvert.ConvertToSingle(input[i]);
+        float s;
+        if (x > 30f) s = 1f;
+        else if (x < -30f) s = 0f;
+        else s = 1f / (1f + XMath.Exp(-x));
+        output[i] = PrecisionConvert.ConvertFromSingle<T>(s);
+    }
+
+    /// <summary>Sigmoid 1/(1+e^-x) in precision T (float/Half/bf16). Reads low-p, fp32 compute, writes low-p, no fp32 temp.</summary>
+    public void Sigmoid<T>(ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output, int count)
+        where T : unmanaged, INumber<T>
+    {
+        var k = (Action<Index1D, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>>)
+            _sigmoidCache.GetOrAdd(typeof(T), _ => _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>>(SigmoidImpl<T>));
         k(count, input, output);
     }
 

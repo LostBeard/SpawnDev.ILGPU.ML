@@ -132,7 +132,7 @@ internal static class BroadcastHelper
 
 // ── Activations ──
 
-public class ReluOperator(OperatorRegistry reg) : IOnnxOperator
+public class ReluOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "Relu";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
@@ -140,6 +140,12 @@ public class ReluOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         reg.ElementWise.ReLU(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+    }
+    public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, Tensors.HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
+        if (inputs.Length < 1 || !inputs[0].IsHalf) return false;
+        pak.Relu<global::ILGPU.Half>(inputs[0].Half!.Data, output.Data, output.ElementCount);
+        return true;
     }
 }
 
@@ -154,7 +160,7 @@ public class GeluOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class SigmoidOperator(OperatorRegistry reg) : IOnnxOperator
+public class SigmoidOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "Sigmoid";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
@@ -164,6 +170,12 @@ public class SigmoidOperator(OperatorRegistry reg) : IOnnxOperator
         // Copy then in-place
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
         reg.Activations.SigmoidInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+    }
+    public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, Tensors.HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
+        if (inputs.Length < 1 || !inputs[0].IsHalf) return false;
+        pak.Sigmoid<global::ILGPU.Half>(inputs[0].Half!.Data, output.Data, output.ElementCount);
+        return true;
     }
 }
 
@@ -252,11 +264,19 @@ public class ClipOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── Binary element-wise ──
 
-public class AddOperator(OperatorRegistry reg) : IOnnxOperator
+public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "Add";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, Tensors.HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
+        // Only the elementwise, no-broadcast, both-low-p residual add (the large case). Broadcast / fp32 → fallback.
+        if (inputs.Length < 2 || !inputs[0].IsHalf || !inputs[1].IsHalf) return false;
+        if (inputs[0].ElementCount != output.ElementCount || inputs[1].ElementCount != output.ElementCount) return false;
+        pak.Add<global::ILGPU.Half>(inputs[0].Half!.Data, inputs[1].Half!.Data, output.Data, output.ElementCount);
+        return true;
+    }
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
@@ -310,11 +330,19 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
-public class MulOperator(OperatorRegistry reg) : IOnnxOperator
+public class MulOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "Mul";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
+    public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, Tensors.HalfTensor output, Kernels.PrecisionAwareKernels pak)
+    {
+        // Only the elementwise, no-broadcast, both-low-p gate (e.g. SiLU = x·sigmoid(x)). Broadcast / fp32 → fallback.
+        if (inputs.Length < 2 || !inputs[0].IsHalf || !inputs[1].IsHalf) return false;
+        if (inputs[0].ElementCount != output.ElementCount || inputs[1].ElementCount != output.ElementCount) return false;
+        pak.Mul<global::ILGPU.Half>(inputs[0].Half!.Data, inputs[1].Half!.Data, output.Data, output.ElementCount);
+        return true;
+    }
     public void Execute(OnnxOpContext ctx)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
