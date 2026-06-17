@@ -1381,15 +1381,15 @@ public class GraphExecutor : IDisposable
                 }
             }
 
-            // ── Zero-copy Reshape (metadata-only) ──
-            // A Reshape just reinterprets the same data at a new shape, but ReshapeOperator.Execute COPIES into a
-            // freshly-rented buffer (the 256 MiB VAE GroupNorm reshape was a pure duplicate). When the data input
-            // is a single-consumer pooled fp32 intermediate (the common case), HAND OFF its buffer to the output
-            // as a view (Tensor over the same Data, new shape) + transfer the pool ownership — no Rent, no copy.
-            // Single-consumer = provably safe (no aliasing): the reshape is the buffer's last reader. Falls
-            // through to the copy path for shared / graph-IO / fp16 / shape-cached inputs.
-            if (node.OpType == "Reshape" && !shapeCacheHit && node.OutputNames.Length == 1
-                && nodeInputs.Length >= 1 && nodeInputs[0] != null)
+            // ── Zero-copy metadata-only ops (Reshape / Squeeze / Unsqueeze / Flatten) ──
+            // These just reinterpret the same data at a new shape, but their Execute COPIES into a freshly-rented
+            // buffer (the 256 MiB VAE GroupNorm reshape was a pure duplicate). When the data input is a
+            // single-consumer pooled fp32 intermediate (the common case), HAND OFF its buffer to the output as a
+            // view (Tensor over the same Data, new shape) + transfer the pool ownership — no Rent, no copy.
+            // Single-consumer = provably safe (no aliasing): this op is the buffer's last reader. Falls through to
+            // the copy path for shared / graph-IO / fp16 / shape-cached inputs (and tiny / shape-value ones).
+            if ((node.OpType is "Reshape" or "Squeeze" or "Unsqueeze" or "Flatten") && !shapeCacheHit
+                && node.OutputNames.Length == 1 && nodeInputs.Length >= 1 && nodeInputs[0] != null)
             {
                 var src = nodeInputs[0];
                 var srcName = node.InputNames[0];
@@ -1421,7 +1421,7 @@ public class GraphExecutor : IDisposable
                             }
                         }
                         nodeIdx++;
-                        LastRunOpLog.Add($"{nodeIdx:D4} Reshape~view");
+                        LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~view");
                         await DrainPointAsync();
                         if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
                         continue;
