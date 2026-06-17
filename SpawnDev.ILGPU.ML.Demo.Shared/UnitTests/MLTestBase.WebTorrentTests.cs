@@ -123,9 +123,10 @@ public abstract partial class MLTestBase
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var m = await hub.OpenAsync(repo, file, deselect: true);   // on-demand: only read-touched pieces fetch
-            long total = m.File.Length;
-            int pieceLen = m.Torrent.PieceLength;
-            m.Torrent.MaxWebConns = 1;                                 // polite single web-seed connection
+            if (m.Torrent == null) throw new UnsupportedTestException("hub served the model cold (raw-HTTP, no torrent) — this web-seed download test needs the P2P/torrent path");
+            long total = m.File!.Length;
+            int pieceLen = m.Torrent!.PieceLength;
+            m.Torrent!.MaxWebConns = 1;                                // polite single web-seed connection
             SpawnDev.ILGPU.ML.InferenceSession s;
             await using (m.Stream)
                 s = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxStreamAsync(
@@ -183,7 +184,8 @@ public abstract partial class MLTestBase
             string infoHash; long len;
             {
                 var m = await hub.OpenAsync(repo, file);
-                infoHash = m.Torrent.WireInfoHashHex; len = m.File.Length;
+                if (m.Torrent == null) throw new UnsupportedTestException("hub served the model cold (no torrent) — the reload-persistence test needs the torrent path");
+                infoHash = m.Torrent!.WireInfoHashHex; len = m.File!.Length;
                 await using var s = m.Stream;
                 var buf = new byte[len]; int got = 0;
                 while (got < len) { int n = await s.ReadAsync(buf.AsMemory(got, (int)len - got)); if (n == 0) break; got += n; }

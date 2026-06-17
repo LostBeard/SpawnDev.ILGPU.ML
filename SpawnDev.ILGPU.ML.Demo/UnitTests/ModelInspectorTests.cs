@@ -635,7 +635,7 @@ public class ModelInspectorTests
 
             // Open DESELECTED so only touched (structure) pieces download.
             var model = await hub.OpenAsync(repoId, filePath, deselect: true, cts.Token);
-            if (model.File.Length <= 0) throw new Exception($"hub model file length={model.File.Length}");
+            if (model.Length <= 0) throw new Exception($"hub model file length={model.Length}");
 
             InspectionResult r;
             await using (model.Stream)
@@ -649,11 +649,17 @@ public class ModelInspectorTests
             // (b) Inspecting structure must NOT pull the whole model. Without deselect + seek-past-weights
             // the default select-all would download every byte. Degree of saving is layout/piece-size
             // dependent, so the robust, non-flaky claim is simply: strictly less than the full file.
-            long downloaded = model.Torrent.Downloaded;
-            if (downloaded >= model.File.Length)
-                throw new Exception(
-                    $"inspect-by-URL downloaded {downloaded} of {model.File.Length} bytes (the whole file) — " +
-                    "deselect / seek-past-weights was not effective; weights were pulled");
+            // The cold raw-HTTP web-seed path has no torrent and inherently fetches only the touched ranges, so
+            // the "didn't pull the whole file" guarantee holds without a download counter. Assert it only for
+            // the P2P/torrent path, which CAN over-fetch if deselect/seek-past-weights isn't effective.
+            if (model.Torrent != null)
+            {
+                long downloaded = model.Torrent.Downloaded;
+                if (downloaded >= model.Length)
+                    throw new Exception(
+                        $"inspect-by-URL downloaded {downloaded} of {model.Length} bytes (the whole file) — " +
+                        "deselect / seek-past-weights was not effective; weights were pulled");
+            }
         }
         finally
         {

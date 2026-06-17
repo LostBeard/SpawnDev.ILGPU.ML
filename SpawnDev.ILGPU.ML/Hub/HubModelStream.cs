@@ -55,8 +55,15 @@ public class HubModelStream
     /// <summary>JSON shape returned by the hub's <c>/magnet</c> endpoint.</summary>
     public sealed record HubMagnetResult(string MagnetUri, string RepoId, string FilePath, string WebSeed);
 
-    /// <summary>A model opened from the hub: the live torrent, its file entry, and a seekable read stream.</summary>
-    public sealed record HubModel(Torrent Torrent, TorrentFileInfo File, Stream Stream);
+    /// <summary>A model opened from the hub: a seekable read stream, plus the live torrent + file entry when it
+    /// is served over P2P. For a COLD load — the hub is still preparing the torrent — the model streams raw over
+    /// the always-serving /hf web seed and <see cref="Torrent"/> + <see cref="File"/> are null; use
+    /// <see cref="Length"/> (which falls back to the stream) and <see cref="Stream"/>.</summary>
+    public sealed record HubModel(Torrent? Torrent, TorrentFileInfo? File, Stream Stream)
+    {
+        /// <summary>Total file length — from the torrent file entry (P2P) or the stream (raw-HTTP cold load).</summary>
+        public long Length => File?.Length ?? Stream.Length;
+    }
 
     /// <summary>
     /// Ask the hub for the magnet URI for a model file. Blocks server-side until the file is fetched
@@ -115,20 +122,59 @@ public class HubModelStream
     /// </param>
     public async Task<HubModel> OpenAsync(string repoId, string filePath, bool deselect = false, CancellationToken ct = default)
     {
-        var magnet = await GetMagnetAsync(repoId, filePath, ct).ConfigureAwait(false);
+        // Ask the hub (NON-blocking) whether a torrent is ready. Ready ⇒ use it (P2P / warm load). Otherwise the
+        // hub is still preparing it (cold / first load) — stream raw over the /hf web seed, which always serves
+        // (the hub fetches + caches the missing chunks on demand), so the load starts IMMEDIATELY instead of
+        // blocking until the hub finishes its first full server-side download.
+        var status = await GetModelStatusAsync($"{HubBaseUrl.TrimEnd('/')}/model/{repoId.Trim('/')}/{filePath.TrimStart('/')}", ct).ConfigureAwait(false);
+        if (status != null && string.Equals(status.Status, "ready", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(status.MagnetUri))
+            return await OpenTorrentAsync(status.MagnetUri!, repoId, filePath, deselect, ct).ConfigureAwait(false);
 
+        var hfUrl = $"{HubBaseUrl.TrimEnd('/')}/hf/{repoId.Trim('/')}/{filePath.TrimStart('/')}";
+        long size = await ProbeSizeAsync(hfUrl, ct).ConfigureAwait(false);
+        return new HubModel(null, null, new HttpRangeStream(_http, hfUrl, size));
+    }
+
+    /// <summary>Add a magnet and open a seekable read stream over its (single) file — the P2P / warm path.</summary>
+    private async Task<HubModel> OpenTorrentAsync(string magnet, string repoId, string filePath, bool deselect, CancellationToken ct)
+    {
         using var metaCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         metaCts.CancelAfter(MetadataTimeout);
         var opts = deselect ? new AddTorrentOptions { Deselect = true } : null;
         var torrent = await _client.AddAsync(magnet, opts, metaCts.Token).ConfigureAwait(false);
-
         if (torrent.Files == null || torrent.Files.Length == 0)
-            throw new InvalidOperationException(
-                $"Torrent for '{repoId}/{filePath}' resolved metadata but exposes no files.");
-
+            throw new InvalidOperationException($"Torrent for '{repoId}/{filePath}' resolved metadata but exposes no files.");
         var file = torrent.Files[0];
         return new HubModel(torrent, file, file.CreateReadStream());
     }
+
+    /// <summary>Non-blocking hub status (one GET to /model | /ollama-model): "ready" (with a magnet) or
+    /// "preparing". Best-effort — any failure returns null so the caller falls back to the cold web-seed stream.</summary>
+    private async Task<HubModelResult?> GetModelStatusAsync(string url, CancellationToken ct)
+    {
+        try
+        {
+            using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode) return null;
+            return await resp.Content.ReadFromJsonAsync<HubModelResult>(ct).ConfigureAwait(false);
+        }
+        catch { return null; }
+    }
+
+    /// <summary>Total size of a hub web-seed resource via a 0-0 range probe (Content-Range '…/TOTAL').</summary>
+    private async Task<long> ProbeSizeAsync(string url, CancellationToken ct)
+    {
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+        long size = resp.Content.Headers.ContentRange?.Length ?? resp.Content.Headers.ContentLength ?? -1;
+        if (size <= 0) throw new InvalidOperationException($"Hub web seed did not report a size for {url}.");
+        return size;
+    }
+
+    /// <summary>JSON shape of the hub's non-blocking /model | /ollama-model status response.</summary>
+    private sealed record HubModelResult(string? Status, string? MagnetUri, string? WebSeed);
 
     /// <summary>Ask the hub for the magnet URI of an OLLAMA model layer. The hub's OllamaProxy resolves the
     /// ollama registry manifest, fetches the layer blob, and seeds it as a torrent — same retry-on-prepare
@@ -181,15 +227,16 @@ public class HubModelStream
     /// for callers needing two concurrent readers (e.g. weight upload + token gather).</summary>
     public async Task<HubModel> OpenOllamaAsync(string model, string tag, string layer, bool deselect = false, CancellationToken ct = default)
     {
-        var magnet = await GetOllamaMagnetAsync(model, tag, layer, ct).ConfigureAwait(false);
-        using var metaCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        metaCts.CancelAfter(MetadataTimeout);
-        var opts = deselect ? new AddTorrentOptions { Deselect = true } : null;
-        var torrent = await _client.AddAsync(magnet, opts, metaCts.Token).ConfigureAwait(false);
-        if (torrent.Files == null || torrent.Files.Length == 0)
-            throw new InvalidOperationException($"Ollama torrent for '{model}:{tag}/{layer}' resolved metadata but exposes no files.");
-        var file = torrent.Files[0];
-        return new HubModel(torrent, file, file.CreateReadStream());
+        // Non-blocking status: ready ⇒ torrent (P2P / warm); preparing ⇒ stream raw over the always-serving
+        // /ollama web seed (the hub fetches + caches the missing chunks on demand) — the cold load starts now.
+        var statusUrl = $"{HubBaseUrl.TrimEnd('/')}/ollama-model/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
+        var status = await GetModelStatusAsync(statusUrl, ct).ConfigureAwait(false);
+        if (status != null && string.Equals(status.Status, "ready", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(status.MagnetUri))
+            return await OpenTorrentAsync(status.MagnetUri!, model, $"{tag}/{layer}", deselect, ct).ConfigureAwait(false);
+
+        var seedUrl = $"{HubBaseUrl.TrimEnd('/')}/ollama/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
+        long size = await ProbeSizeAsync(seedUrl, ct).ConfigureAwait(false);
+        return new HubModel(null, null, new HttpRangeStream(_http, seedUrl, size));
     }
 
     /// <summary>
@@ -204,7 +251,8 @@ public class HubModelStream
     public Task RemoveAsync(HubModel model)
     {
         ArgumentNullException.ThrowIfNull(model);
-        return _client.RemoveAsync(model.Torrent);
+        // A cold raw-HTTP model has no torrent in the client — nothing to remove.
+        return model.Torrent != null ? _client.RemoveAsync(model.Torrent) : Task.CompletedTask;
     }
 
     /// <summary>

@@ -172,7 +172,12 @@
             StateHasChanged();
             var textHub = await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model");
             _openModels.Add(textHub);
-            Func<Task<Stream>> openText = () => Task.FromResult<Stream>(textHub.File.CreateReadStream());
+            // Two independent seekable readers (weight upload + token gather). Warm (torrent): a fresh
+            // CreateReadStream over the cached torrent. Cold (raw-HTTP web seed, no torrent): re-open for a fresh
+            // HttpRangeStream each call (each seeks/reads independently).
+            Func<Task<Stream>> openText = textHub.File != null
+                ? () => Task.FromResult<Stream>(textHub.File.CreateReadStream())
+                : async () => (await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model")).Stream;
 
             _pipeline = await Gemma4MultimodalPipeline.CreateFromStreamsAsync(
                 _accelerator, openText, mm.Stream,

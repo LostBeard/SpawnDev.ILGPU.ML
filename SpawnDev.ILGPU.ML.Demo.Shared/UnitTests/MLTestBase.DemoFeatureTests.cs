@@ -362,8 +362,8 @@ public abstract partial class MLTestBase
 
             // Open the model file as a seekable stream (deselect:false → we need the weights).
             var model = await hub.OpenAsync(repoId, "onnx/decoder_model.onnx", deselect: false, cts.Token);
-            if (model.File.Length < 1_000_000)
-                throw new Exception($"hub model file length={model.File.Length}, expected ~330MB");
+            if (model.Length < 1_000_000)
+                throw new Exception($"hub model file length={model.Length}, expected ~330MB");
 
             InferenceSession session;
             await using (model.Stream)
