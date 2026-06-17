@@ -366,6 +366,10 @@ FodyWeavers.xsd
 _debugdump/
 _mldump/
 
+# Scratch image-gen outputs (Example 03 writes .bmp next to the prompt)
+sdturbo_*.bmp
+Examples/03.ImageGen.Console/*.bmp
+
 # ML model files — small models (<100MB) are self-hosted for instant demo loading.
 # Large models (>100MB) load from HuggingFace CDN at runtime.
 # Exclude only models that exceed GitHub's 100MB file size limit:
