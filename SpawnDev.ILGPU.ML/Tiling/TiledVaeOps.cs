@@ -32,7 +32,7 @@ public sealed class TiledVaeOps : IDisposable
         ArrayView1D<float, Stride1D.Dense> b, int inC, int outC)
     {
         inMap.RefreshHalos();
-        var outMap = TiledFeatureMap.Allocate(outC, inMap.Height, inMap.Width, inMap.Rows, inMap.Cols, inMap.Halo);
+        var outMap = TiledFeatureMap.AllocateExplicit(outC, inMap.CoreHeights, inMap.CoreWidths, inMap.Halo);
         for (int r = 0; r < inMap.Rows; r++)
             for (int c = 0; c < inMap.Cols; c++)
             {
@@ -53,7 +53,7 @@ public sealed class TiledVaeOps : IDisposable
         ArrayView1D<float, Stride1D.Dense> b, int inC, int outC)
     {
         inMap.RefreshHalos();
-        var outMap = TiledFeatureMap.Allocate(outC, inMap.Height, inMap.Width, inMap.Rows, inMap.Cols, inMap.Halo);
+        var outMap = TiledFeatureMap.AllocateExplicit(outC, inMap.CoreHeights, inMap.CoreWidths, inMap.Halo);
         for (int r = 0; r < inMap.Rows; r++)
             for (int c = 0; c < inMap.Cols; c++)
             {
@@ -74,7 +74,7 @@ public sealed class TiledVaeOps : IDisposable
     public async Task<TiledFeatureMap> Conv1x1(TiledFeatureMap inMap, Tensor w,
         ArrayView1D<float, Stride1D.Dense> b, int inC, int outC)
     {
-        var outMap = TiledFeatureMap.Allocate(outC, inMap.Height, inMap.Width, inMap.Rows, inMap.Cols, inMap.Halo);
+        var outMap = TiledFeatureMap.AllocateExplicit(outC, inMap.CoreHeights, inMap.CoreWidths, inMap.Halo);
         for (int r = 0; r < inMap.Rows; r++)
             for (int c = 0; c < inMap.Cols; c++)
             {
@@ -95,7 +95,7 @@ public sealed class TiledVaeOps : IDisposable
     public async Task<TiledFeatureMap> Conv1x1(TiledFeatureMap inMap, ArrayView1D<float, Stride1D.Dense> w,
         ArrayView1D<float, Stride1D.Dense> b, int inC, int outC)
     {
-        var outMap = TiledFeatureMap.Allocate(outC, inMap.Height, inMap.Width, inMap.Rows, inMap.Cols, inMap.Halo);
+        var outMap = TiledFeatureMap.AllocateExplicit(outC, inMap.CoreHeights, inMap.CoreWidths, inMap.Halo);
         for (int r = 0; r < inMap.Rows; r++)
             for (int c = 0; c < inMap.Cols; c++)
             {

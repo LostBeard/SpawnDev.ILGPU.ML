@@ -141,23 +141,22 @@ public class NormalizationKernels : IDisposable
         int spatial, float eps)
     {
         int ncBase = sliceIdx * spatial;
-        // Double-accumulate (was float): over large spatial spans (e.g. 256×256 GroupNorm groups) a float running
-        // sum drifts ~1e-3 relative, and in ill-conditioned norms (near-zero-variance groups → invStd up to
-        // 1/√eps) that drift is amplified downstream. Double is order-independent + exact enough that the tiled
-        // decode's (necessarily reordered) global-stat combine MATCHES this full-pass result — the seam-free key.
-        double sum = 0;
+        // FLOAT accumulate (NOT double): f64 in this kernel triggers the WebGPU/WebGL f64-emulation path which
+        // produces NaN/Inf here (PMT InstanceNorm tests went red on both browser backends). The tiled VAE decode
+        // matches this by ALSO using float partial-stat kernels (same order at grid=1) — see InstanceNormPartialStats.
+        float sum = 0f;
         for (int i = 0; i < spatial; i++)
             sum += input[ncBase + i];
-        double mean = sum / spatial;
-        means[sliceIdx] = (float)mean;
+        float mean = sum / spatial;
+        means[sliceIdx] = mean;
 
-        double varSum = 0;
+        float varSum = 0f;
         for (int i = 0; i < spatial; i++)
         {
-            double d = input[ncBase + i] - mean;
+            float d = input[ncBase + i] - mean;
             varSum += d * d;
         }
-        invStds[sliceIdx] = (float)(1.0 / Math.Sqrt(varSum / spatial + eps));
+        invStds[sliceIdx] = 1f / MathF.Sqrt(varSum / spatial + eps);
     }
 
     /// <summary>
@@ -205,14 +204,17 @@ public class NormalizationKernels : IDisposable
         int spatial)
     {
         int ncBase = sliceIdx * spatial;
-        double sum = 0, sumSq = 0;
+        // FLOAT accumulate (NOT double): keeps the tiled GroupNorm browser-safe (f64 in-kernel NaNs on WebGPU/WebGL)
+        // AND order-matched to the full decode's float InstanceNorm (so at grid=1 the per-tile partial == the full
+        // single-pass sum, exactly). The host combines these float partials in double (BufferPool-side, not a kernel).
+        float sum = 0f, sumSq = 0f;
         for (int i = 0; i < spatial; i++)
         {
-            double v = input[ncBase + i];
+            float v = input[ncBase + i];
             sum += v; sumSq += v * v;
         }
-        sums[sliceIdx] = (float)sum;
-        sumSqs[sliceIdx] = (float)sumSq;
+        sums[sliceIdx] = sum;
+        sumSqs[sliceIdx] = sumSq;
     }
 
     /// <summary>Partial sum of squared deviations from an EXTERNALLY-supplied per-slice mean: Σ(x - means[slice])²
@@ -226,13 +228,15 @@ public class NormalizationKernels : IDisposable
         int spatial)
     {
         int ncBase = sliceIdx * spatial;
-        double mean = means[sliceIdx], sumSq = 0;
+        // FLOAT accumulate (browser-safe; see InstanceNormPartialStats). Stable two-pass Σ(x-mean)² from a known
+        // global mean — avoids the Σx²−(Σx)² cancellation when a group has a large mean + small variance.
+        float mean = means[sliceIdx], sumSq = 0f;
         for (int i = 0; i < spatial; i++)
         {
-            double d = input[ncBase + i] - mean;
+            float d = input[ncBase + i] - mean;
             sumSq += d * d;
         }
-        sqDevs[sliceIdx] = (float)sumSq;
+        sqDevs[sliceIdx] = sumSq;
     }
 
     // ── Public API ──

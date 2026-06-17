@@ -58,6 +58,10 @@ public sealed class TiledFeatureMap
 
     public int CoreH(int r) => _coreH[r];
     public int CoreW(int c) => _coreW[c];
+    /// <summary>The exact per-row / per-col core sizes — so an op producing a new map preserves THIS map's tile
+    /// bands (an even re-split would shift boundaries for uneven grids, e.g. 64/3, and corrupt WriteCore).</summary>
+    public int[] CoreHeights => (int[])_coreH.Clone();
+    public int[] CoreWidths => (int[])_coreW.Clone();
     /// <summary>The padded (core + 2*Halo) data buffer for tile (r,c). Indexed [ch, y, x] with
     /// y,x in [0, core+2*Halo); the core occupies [Halo, Halo+core).</summary>
     public float[] Tile(int r, int c) => _tiles[r * Cols + c];
