@@ -275,6 +275,85 @@ public abstract partial class MLTestBase
     });
 
     // ═══════════════════════════════════════════════════════════
+    //  REGRESSION — [C,1,1] per-channel γ/β with C == W (the exact SD-VAE bug).
+    //
+    //  When C equals the spatial last dim (the SD-Turbo VAE's up_blocks.2.norm2 runs on a [1,256,256,256]
+    //  map, so C==H==W==256), a per-channel weight b=[C,1,1] satisfies b.ElementCount == a.Shape[^1] and
+    //  PRE-FIX took the last-dim fast path (AddBias / BroadcastMul) — applying γ/β over the W axis instead
+    //  of the CHANNEL axis. Every decode was silently mis-scaled. The fix added a second guard
+    //  (b.Shape[^1] == b.ElementCount) so [C,1,1] falls through to the correct N-D broadcast.
+    //
+    //  The existing BroadcastAdd_NCHW_PerChannelBias_ConstB above uses C=128,W=256 (C != W) so it never
+    //  triggers the misfire. THESE use C == W, the actual bug condition, for Mul (γ scale) and Add (β bias),
+    //  on both the constant-b path (VAE γ/β are initializers) and the non-constant GPU N-D kernel path.
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task BroadcastMul_PerChannel_CequalsW_ConstB() => await RunTest(async accelerator =>
+        await VerifyPerChannelCequalsW(accelerator, "Mul", constB: true));
+
+    [TestMethod]
+    public async Task BroadcastAdd_PerChannel_CequalsW_ConstB() => await RunTest(async accelerator =>
+        await VerifyPerChannelCequalsW(accelerator, "Add", constB: true));
+
+    [TestMethod]
+    public async Task BroadcastMul_PerChannel_CequalsW_GpuPath() => await RunTest(async accelerator =>
+        await VerifyPerChannelCequalsW(accelerator, "Mul", constB: false));
+
+    [TestMethod]
+    public async Task BroadcastAdd_PerChannel_CequalsW_GpuPath() => await RunTest(async accelerator =>
+        await VerifyPerChannelCequalsW(accelerator, "Add", constB: false));
+
+    /// <summary>a=[1,C,H,W] with C==W (so a.Shape[^1]==C, the bug trigger) op b=[C,1,1] per-channel.
+    /// Verifies the result is a per-CHANNEL apply (out[c]=a op γ/β[c]), NOT a per-W apply. constB toggles
+    /// whether b is supplied as a folded constant (the VAE γ/β initializer path → expand-b branch) or left
+    /// as a pure GPU tensor (the general N-D broadcast kernel path).</summary>
+    private async Task VerifyPerChannelCequalsW(Accelerator accelerator, string opType, bool constB)
+    {
+        const int C = 128, H = 128, W = 128;       // C == W == 128 is the misfire condition (a.Shape[^1]==C)
+        int n = C * H * W;                          // 2.1M elems
+        var aData = new float[n];
+        var bData = new float[C];
+        for (int i = 0; i < n; i++) aData[i] = ((i % 17) - 8) * 0.1f;
+        for (int c = 0; c < C; c++) bData[c] = 0.5f + c * 0.01f;   // distinct per channel so a per-W misfire diverges
+
+        using var aBuf = accelerator.Allocate1D(aData);
+        using var bBuf = accelerator.Allocate1D(bData);
+        using var outBuf = accelerator.Allocate1D<float>(n);
+        using var pool = new BufferPool(accelerator);
+
+        var reg = new OperatorRegistry(accelerator);
+        reg.Resolve(opType).Execute(new OnnxOpContext
+        {
+            Inputs = new[] { new Tensor(aBuf.View, new[] { 1, C, H, W }), new Tensor(bBuf.View, new[] { C, 1, 1 }) },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { 1, C, H, W }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = pool,
+            InputNames = new[] { "a", "b" },
+            ConstantValues = constB
+                ? new Dictionary<string, float[]> { ["b"] = bData }   // initializer path (expand-b branch)
+                : new Dictionary<string, float[]>(),                  // pure GPU tensor → N-D kernel path
+        });
+        await accelerator.SynchronizeAsync();
+        var result = await outBuf.CopyToHostAsync<float>(0, n);
+
+        // CPU reference: per-CHANNEL. A per-W misfire would instead use b[w] and blow this up massively.
+        float maxErr = 0;
+        for (int c = 0; c < C; c++)
+            for (int hw = 0; hw < H * W; hw++)
+            {
+                int idx = c * H * W + hw;
+                float want = opType == "Mul" ? aData[idx] * bData[c] : aData[idx] + bData[c];
+                maxErr = MathF.Max(maxErr, MathF.Abs(result[idx] - want));
+            }
+        if (maxErr > 1e-4f)
+            throw new Exception($"{opType} [1,{C},{H},{W}] op [{C},1,1] per-channel (C==W, constB={constB}) " +
+                $"mis-broadcast: maxErr={maxErr:E3} (per-W misfire applies γ/β over the wrong axis).");
+
+        Console.WriteLine($"[{opType}_PerChannel_CequalsW constB={constB}] PASS — maxErr={maxErr:E1}");
+    }
+
+    // ═══════════════════════════════════════════════════════════
     //  HELPER — runs any binary operator and verifies output
     // ═══════════════════════════════════════════════════════════
 
