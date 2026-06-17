@@ -29,6 +29,9 @@ public class GraphExecutor : IDisposable
     // Precision-aware (F16 pass-through) op kernels — owned here (not via the optional _registry, which is null
     // in registry-less executor uses like the controlled mixed-precision test). Stateless kernel caches.
     private readonly PrecisionAwareKernels _precisionAware;
+    // Owned (not via the optional _registry, which is null for ONNX-model executors) — used for the in-place
+    // InstanceNorm executor path.
+    private readonly NormalizationKernels _normalization;
     private readonly Operators.OperatorRegistry? _registry;
 
     // Mixed-precision activations (opt-in). When != F32, RunAsync stores eligible large float feature-map
@@ -289,6 +292,7 @@ public class GraphExecutor : IDisposable
         _registry = registry;
         _ew = new ElementWiseKernels(accelerator);
         _precisionAware = new PrecisionAwareKernels(accelerator);
+        _normalization = new NormalizationKernels(accelerator);
         LastInitializerDataTypesCount = graph.InitializerDataTypes?.Count ?? -1;
         _integerTensorNames = BuildIntegerTensorNames(graph);
         LastIntegerTensorCount = _integerTensorNames.Count;
@@ -1429,6 +1433,51 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // ── In-place InstanceNormalization ──
+            // InstanceNorm's pass-2 reads in[idx] then writes out[idx]; with a single read_write buffer (the
+            // in-place kernel) it can write back over its input. When that input is a single-consumer pooled fp32
+            // intermediate (refCount==1 → the norm is its last reader; a residual/shortcut share would make it >1
+            // and fall through to the two-buffer copy), normalize IN PLACE and hand the buffer to the output —
+            // dropping the separate output feature map (256 MiB in the SD VAE at 512²). fp32 scale/bias only.
+            if (node.OpType == "InstanceNormalization" && !shapeCacheHit
+                && node.OutputNames.Length == 1 && nodeInputs.Length >= 3
+                && nodeInputs[0] != null && nodeInputs[1] != null && nodeInputs[2] != null)
+            {
+                var src = nodeInputs[0]; var srcName = node.InputNames[0]; var outName = node.OutputNames[0];
+                if (!string.IsNullOrEmpty(srcName) && !string.IsNullOrEmpty(outName)
+                    && !src.IsHalf && !nodeInputs[1].IsHalf && !nodeInputs[2].IsHalf && src.ElementCount >= 4096
+                    && tensors.TryGetValue(srcName, out var st) && ReferenceEquals(st, src)
+                    && refCounts.TryGetValue(srcName, out var rc) && rc == 1
+                    && !_graph.OutputNames.Contains(srcName) && _pool.Rename(srcName, outName))
+                {
+                    var shape = src.Shape;
+                    var (nN, nC, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, Format)
+                        : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
+                    int sp = src.ElementCount / (nN * nC);
+                    _normalization.InstanceNormInPlace(src.Data, nodeInputs[1].Data, nodeInputs[2].Data, nN, nC, sp);
+                    tensors[outName] = new Tensor(src.Data, shape, outName);
+                    tensors.Remove(srcName);
+                    refCounts[srcName] = 0;
+                    // Release the scale/bias inputs (the data input was handed off in place).
+                    for (int ii = 1; ii < node.InputNames.Length; ii++)
+                    {
+                        var inN = node.InputNames[ii];
+                        if (string.IsNullOrEmpty(inN)) continue;
+                        if (refCounts.TryGetValue(inN, out var brc) && brc < int.MaxValue)
+                        {
+                            refCounts[inN] = brc - 1;
+                            if (brc - 1 <= 0 && tensors.TryGetValue(inN, out var rt))
+                            { pendingReleases.Add(rt); pendingReleaseBytes += (long)rt.ElementCount * sizeof(float); }
+                        }
+                    }
+                    nodeIdx++;
+                    LastRunOpLog.Add($"{nodeIdx:D4} InstanceNormalization~inplace");
+                    await DrainPointAsync();
+                    if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
+                    continue;
+                }
+            }
+
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
@@ -1854,6 +1903,7 @@ public class GraphExecutor : IDisposable
         _kvCacheFlagBuf?.Dispose();
         _ew.Dispose();
         _precisionAware.Dispose();
+        _normalization.Dispose();
         _convert?.Dispose();
     }
 

@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// BatchNorm (inference mode), GroupNorm, InstanceNorm, RMSNorm.
 /// All use auto-grouped 1D dispatch.
 /// </summary>
-public class NormalizationKernels
+public class NormalizationKernels : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -37,6 +37,16 @@ public class NormalizationKernels
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int>? _instanceNormApplyKernel;
+
+    // In-place apply: ONE feature buffer (data, read+write) instead of separate input+output. A SINGLE
+    // read_write binding, so WebGPU's "no buffer bound to two storage slots" rule is satisfied (unlike calling
+    // the two-param apply with input==output). Pass-2 reads data[idx] then writes the same [idx] AFTER pass-1
+    // computed the per-slice stats → correct in-place. The executor uses this on a single-consumer input to
+    // drop the 256 MiB VAE GroupNorm output buffer.
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int>? _instanceNormApplyInPlaceKernel;
 
     public NormalizationKernels(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -154,6 +164,22 @@ public class NormalizationKernels
         int c = (idx / spatial) % C;
         int sliceIdx = idx / spatial;
         output[idx] = scale[c] * (input[idx] - means[sliceIdx]) * invStds[sliceIdx] + bias[c];
+    }
+
+    /// <summary>InstanceNorm Pass 2, IN PLACE: one read_write buffer (<paramref name="data"/>). Identical math
+    /// to <see cref="InstanceNormApplyImpl"/> but reads and writes the same element of one buffer — a single
+    /// binding (WebGPU-legal). Each thread reads data[idx] then writes it; stats were already computed in pass 1.</summary>
+    private static void InstanceNormApplyInPlaceImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> scale,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int N, int C, int spatial)
+    {
+        int c = (idx / spatial) % C;
+        int sliceIdx = idx / spatial;
+        data[idx] = scale[c] * (data[idx] - means[sliceIdx]) * invStds[sliceIdx] + bias[c];
     }
 
     // ── Public API ──
@@ -277,11 +303,38 @@ public class NormalizationKernels
         _instanceNormApplyKernel!(N * C * spatial, input, output, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
+    /// <summary>InstanceNorm IN PLACE: normalize <paramref name="data"/> over each (N,C) slice, writing back into
+    /// the SAME buffer (no separate output). Saves the output buffer (a 256 MiB feature map in the SD VAE). Pass-1
+    /// reads data for the per-slice mean/invStd; pass-2 reads+writes data in place via a single read_write binding
+    /// (WebGPU-legal). Numerically identical to <see cref="InstanceNorm"/> with output==input.</summary>
+    public void InstanceNormInPlace(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> scale,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        int N, int C, int spatial)
+    {
+        EnsureLoaded();
+        int numSlices = N * C;
+        var inMeans = _accelerator.Allocate1D<float>(numSlices);
+        var inInvStds = _accelerator.Allocate1D<float>(numSlices);
+        _allTempBufs.Add(inMeans);
+        _allTempBufs.Add(inInvStds);
+        _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, 1e-5f);
+        _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
+    }
+
     // Per-call temp buffers for InstanceNorm and RMSNorm two-pass kernels.
     // Sharing across calls would race: Pass 1 of call N+1 overwrites mean/invStd/invRms
     // before Pass 2 of call N has finished reading. Buffers stay alive in this list
     // until Dispose() (typical InferenceSession lifetime).
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allTempBufs = new();
+
+    /// <summary>Free the per-call mean/invStd/invRms temp buffers (held alive across calls to avoid the two-pass
+    /// race). Previously these leaked until the accelerator was torn down; now released with the kernel owner.</summary>
+    public void Dispose()
+    {
+        foreach (var b in _allTempBufs) try { b.Dispose(); } catch { }
+        _allTempBufs.Clear();
+    }
 
     private void EnsureLoaded()
     {
@@ -300,6 +353,11 @@ public class NormalizationKernels
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int>(InstanceNormApplyImpl);
+        _instanceNormApplyInPlaceKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int>(InstanceNormApplyInPlaceImpl);
         _rmsNormStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
