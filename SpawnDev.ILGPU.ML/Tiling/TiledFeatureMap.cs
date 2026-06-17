@@ -134,6 +134,19 @@ public sealed class TiledFeatureMap
         return tile[(long)ch * PaddedH(r) * pw + ly * pw + lx];
     }
 
+    /// <summary>Read tile (r,c)'s CORE into a packed [C, coreH, coreW] buffer (halo dropped).</summary>
+    public float[] ReadCore(int r, int c)
+    {
+        var tile = _tiles[r * Cols + c];
+        int ph = PaddedH(r), pw = PaddedW(c), ch0 = _coreH[r], cw0 = _coreW[c];
+        var core = new float[(long)Channels * ch0 * cw0 is var n && n <= int.MaxValue ? (int)n : throw new OverflowException()];
+        for (int ch = 0; ch < Channels; ch++)
+            for (int yy = 0; yy < ch0; yy++)
+                for (int xx = 0; xx < cw0; xx++)
+                    core[(long)ch * ch0 * cw0 + yy * cw0 + xx] = tile[(long)ch * ph * pw + (yy + Halo) * pw + (xx + Halo)];
+        return core;
+    }
+
     /// <summary>Recombine the tile CORES into a full [C,H,W] tensor (halos discarded).</summary>
     public float[] ToFull()
     {
