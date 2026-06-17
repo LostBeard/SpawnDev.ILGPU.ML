@@ -298,22 +298,45 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         // ═══════════════════════════════════════════════════════════
         OnProgress?.Invoke(steps + 1, steps + 2);
 
-        var vaeInputs = new Dictionary<string, Tensor>
-        {
-            [_vaeDecoder!.InputNames[0]] = latentTensor,
-        };
         // Measurement aid: reset the (global, cross-session) peak counters right before VAE decode so the
         // reported peak is VAE-ONLY — disambiguates whether the pipeline peak is the UNet or the VAE.
         if (Environment.GetEnvironmentVariable("VAE_PEAK_ONLY") == "1")
             SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetPeaks();
-        var vaeOutputs = await _vaeDecoder.RunAsync(vaeInputs);
-        var imageOutput = vaeOutputs[_vaeDecoder.OutputNames[0]]; // [1, 3, 512, 512]
+        // Experiment knob: the deferred-release backlog cap (default 512 MiB) sets how many dead buffers stay
+        // resident between drains — it DOMINATES the VAE peak. A lower cap trades a few more GPU drains (slightly
+        // slower) for a lower peak. VAE_BYTECAP_MB overrides it for the VAE decode.
+        long _savedByteCap = Graph.GraphExecutor.MaxPendingReleaseBytes;
+        if (int.TryParse(Environment.GetEnvironmentVariable("VAE_BYTECAP_MB"), out var capMb) && capMb > 0)
+            Graph.GraphExecutor.MaxPendingReleaseBytes = (long)capMb * 1024 * 1024;
+
+        int imagePixels = Width * Height;                // latentH/latentW computed above (Height/8, Width/8)
+        float[] rgbData;                                 // NCHW [3, Height, Width] in [-1,1]
+
+        // Tiled VAE decode (opt-in, for low-VRAM): VAE_TILE_LATENT=N decodes the latent in NxN-ish overlapping
+        // tiles, bounding the GPU peak to one tile's decode (the full peak scales with spatial AREA). Default
+        // (unset / 0) = the full single-pass decode, unchanged.
+        int tileLatent = int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_LATENT"), out var tl) ? tl : 0;
+        if (tileLatent > 0 && tileLatent < Math.Max(latentH, latentW))
+        {
+            int overlapLatent = int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_OVERLAP"), out var ov)
+                ? ov : Math.Max(2, tileLatent / 2);
+            // The genuine working set is what bounds VRAM; tiling shrinks it ONLY if the deferred-release backlog
+            // is also bounded (else the byte-cap refills with more small buffers). So tiling auto-lowers the cap
+            // (unless VAE_BYTECAP_MB overrode it) — together they cut the SD VAE peak LIVE ~896→450 MiB.
+            if (capMb <= 0) Graph.GraphExecutor.MaxPendingReleaseBytes = 96L * 1024 * 1024;
+            rgbData = await TiledVaeDecodeAsync(latentTensor, latentH, latentW, tileLatent, overlapLatent);
+        }
+        else
+        {
+            var vaeOutputs = await _vaeDecoder!.RunAsync(new Dictionary<string, Tensor>
+                { [_vaeDecoder.InputNames[0]] = latentTensor });
+            rgbData = await ReadTensorToCpu(vaeOutputs[_vaeDecoder.OutputNames[0]], 3 * imagePixels);
+        }
+        Graph.GraphExecutor.MaxPendingReleaseBytes = _savedByteCap;
 
         // ═══════════════════════════════════════════════════════════
         //  Step 7: Convert NCHW [-1,1] → RGBA [0,255]
         // ═══════════════════════════════════════════════════════════
-        int imagePixels = Width * Height;
-        var rgbData = await ReadTensorToCpu(imageOutput, 3 * imagePixels);
 
         var rgba = new byte[4 * imagePixels];
         for (int i = 0; i < imagePixels; i++)
@@ -342,6 +365,102 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             NumSteps = steps,
             InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
         };
+    }
+
+    /// <summary>
+    /// Tiled VAE decode: split the latent into overlapping tiles, decode each independently (the
+    /// InferenceSession recompiles for the tile shape — pure CPU, weights shared, kernels accelerator-cached),
+    /// and linearly blend the overlapping image tiles. Bounds the GPU working set to ONE tile's decode (the full
+    /// decode's peak scales with spatial AREA, so e.g. a half-size tile is ~¼ the peak). Per-tile GroupNorm stats
+    /// differ slightly from a global decode; the linear ramp blend across the overlap hides the seam (the
+    /// standard diffusers VAE-tiling technique). Returns NCHW [3, H, W] in [-1,1], identical layout to the full
+    /// decode. Edge tiles get a full (weight-1) contribution on their image-boundary side (no neighbor to blend).
+    ///
+    /// ⚠ QUALITY TRADEOFF (opt-in, low-VRAM only): per-tile GroupNorm normalizes brightness/contrast over each
+    /// tile's content, so tiles can differ in brightness — the linear blend SMOOTHS the transition but cannot
+    /// fully remove the mismatch. On SD-Turbo (single-step, less robust) the seams are VISIBLE (measured maxAbs
+    /// ~114/255 vs the full decode at 40-latent tiles). The seam-free fix is exact GLOBAL GroupNorm stats, which
+    /// is impractical for a memory-bounded decode (it needs the full feature map). So this is an escape hatch for
+    /// cards that would otherwise OOM (it cut peak LIVE 896→450 MiB), NOT the default. Larger tiles + more
+    /// overlap reduce the seams at the cost of less VRAM saving.
+    /// </summary>
+    private async Task<float[]> TiledVaeDecodeAsync(Tensor latent, int latentH, int latentW, int tileLatent, int overlapLatent)
+    {
+        const int up = 8;                                    // VAE upsample factor (latent → image)
+        int imgH = latentH * up, imgW = latentW * up;
+        var lat = await ReadTensorToCpu(latent, 4 * latentH * latentW);   // [4, latentH, latentW]
+
+        var acc = new float[3 * imgH * imgW];                // weighted RGB accumulator (NCHW)
+        var wsum = new float[imgH * imgW];                   // per-pixel weight sum
+        var ys = TilePositions(latentH, tileLatent, overlapLatent);
+        var xs = TilePositions(latentW, tileLatent, overlapLatent);
+        int overlapPx = overlapLatent * up;
+        string inName = _vaeDecoder!.InputNames[0], outName = _vaeDecoder.OutputNames[0];
+
+        foreach (int ly in ys)
+            foreach (int lx in xs)
+            {
+                int th = Math.Min(tileLatent, latentH - ly), tw = Math.Min(tileLatent, latentW - lx);
+                var tileData = new float[4 * th * tw];
+                for (int c = 0; c < 4; c++)
+                    for (int yy = 0; yy < th; yy++)
+                        for (int xx = 0; xx < tw; xx++)
+                            tileData[(c * th + yy) * tw + xx] = lat[(c * latentH + (ly + yy)) * latentW + (lx + xx)];
+
+                using var tileBuf = _accelerator.Allocate1D(tileData);
+                var outs = await _vaeDecoder.RunAsync(new Dictionary<string, Tensor>
+                    { [inName] = new Tensor(tileBuf.View, new[] { 1, 4, th, tw }, inName) });
+                int oh = th * up, ow = tw * up;
+                var img = await ReadTensorToCpu(outs[outName], 3 * oh * ow);   // [3, oh, ow]
+
+                int oy = ly * up, ox = lx * up;
+                bool blendTop = ly > 0, blendBottom = ly + th < latentH;
+                bool blendLeft = lx > 0, blendRight = lx + tw < latentW;
+                for (int yy = 0; yy < oh; yy++)
+                {
+                    float wy = EdgeRamp(yy, oh, overlapPx, blendTop, blendBottom);
+                    int gy = oy + yy;
+                    for (int xx = 0; xx < ow; xx++)
+                    {
+                        float w = wy * EdgeRamp(xx, ow, overlapPx, blendLeft, blendRight);
+                        int gx = ox + xx, gi = gy * imgW + gx;
+                        wsum[gi] += w;
+                        for (int c = 0; c < 3; c++)
+                            acc[(c * imgH + gy) * imgW + gx] += w * img[(c * oh + yy) * ow + xx];
+                    }
+                }
+            }
+
+        var rgb = new float[3 * imgH * imgW];
+        for (int p = 0; p < imgH * imgW; p++)
+        {
+            float w = wsum[p] > 0 ? wsum[p] : 1f;
+            for (int c = 0; c < 3; c++) rgb[c * imgH * imgW + p] = acc[c * imgH * imgW + p] / w;
+        }
+        return rgb;
+    }
+
+    /// <summary>Overlapping tile start positions covering [0,size): stride = tile-overlap, with the last tile
+    /// flush to the edge so the full extent is covered.</summary>
+    private static List<int> TilePositions(int size, int tile, int overlap)
+    {
+        if (tile >= size) return new List<int> { 0 };
+        int stride = Math.Max(1, tile - overlap);
+        var ps = new List<int>();
+        for (int p = 0; p + tile < size; p += stride) ps.Add(p);
+        if (ps.Count == 0 || ps[^1] != size - tile) ps.Add(size - tile);
+        return ps;
+    }
+
+    /// <summary>Linear blend weight along one axis: 1 in the tile interior, ramping 0→1 over the leading overlap
+    /// (when there's a previous tile to blend with) and 1→0 over the trailing overlap (when there's a next tile).
+    /// Image-boundary edges (blendStart/blendEnd false) stay at weight 1.</summary>
+    private static float EdgeRamp(int i, int len, int overlapPx, bool blendStart, bool blendEnd)
+    {
+        float w = 1f;
+        if (blendStart && overlapPx > 0 && i < overlapPx) w *= (i + 0.5f) / overlapPx;
+        if (blendEnd && overlapPx > 0 && i >= len - overlapPx) w *= (len - i - 0.5f) / overlapPx;
+        return w;
     }
 
     private async Task<float[]> ReadTensorToCpu(Tensor tensor, int count)
