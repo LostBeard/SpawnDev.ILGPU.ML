@@ -183,6 +183,19 @@ public class BufferPool : IDisposable
         }
     }
 
+    /// <summary>Transfer a live (rented) fp32 buffer's pool ownership from one name to another — the zero-copy
+    /// Reshape ownership-handoff (the executor rebinds a single-consumer input's buffer to the reshape output
+    /// instead of renting+copying). After this, <see cref="Return"/>(tensor named <paramref name="newName"/>)
+    /// frees the buffer. No-op if <paramref name="oldName"/> isn't a live named buffer. Returns true if moved.</summary>
+    public bool Rename(string oldName, string newName)
+    {
+        if (oldName == newName) return true;
+        if (!_namedBuffers.TryGetValue(oldName, out var buf)) return false;
+        _namedBuffers.Remove(oldName);
+        _namedBuffers[newName] = buf;   // overwrites any prior newName entry (the reshape never pre-rents one)
+        return true;
+    }
+
     /// <summary>Rent an fp16 (<see cref="ILGPU.Half"/>) ACTIVATION tensor — half the bytes of <see cref="Rent"/>.
     /// Reuses a pooled Half buffer of the right size bucket when free; else allocates (with the same
     /// under-pressure reclaim as the fp32 path). The mixed-precision-activation counterpart to Rent — the

@@ -1381,6 +1381,54 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // ── Zero-copy Reshape (metadata-only) ──
+            // A Reshape just reinterprets the same data at a new shape, but ReshapeOperator.Execute COPIES into a
+            // freshly-rented buffer (the 256 MiB VAE GroupNorm reshape was a pure duplicate). When the data input
+            // is a single-consumer pooled fp32 intermediate (the common case), HAND OFF its buffer to the output
+            // as a view (Tensor over the same Data, new shape) + transfer the pool ownership — no Rent, no copy.
+            // Single-consumer = provably safe (no aliasing): the reshape is the buffer's last reader. Falls
+            // through to the copy path for shared / graph-IO / fp16 / shape-cached inputs.
+            if (node.OpType == "Reshape" && !shapeCacheHit && node.OutputNames.Length == 1
+                && nodeInputs.Length >= 1 && nodeInputs[0] != null)
+            {
+                var src = nodeInputs[0];
+                var srcName = node.InputNames[0];
+                var outName = node.OutputNames[0];
+                if (!string.IsNullOrEmpty(srcName) && !string.IsNullOrEmpty(outName) && !src.IsHalf
+                    && src.ElementCount >= 4096                                  // only LARGE reshapes (the memory win);
+                    && !runtimeConstants.ContainsKey(outName)                    // not a value a downstream reads on CPU
+                    && tensors.TryGetValue(srcName, out var srcT) && ReferenceEquals(srcT, src)
+                    && refCounts.TryGetValue(srcName, out var srcRc) && srcRc == 1
+                    && !_graph.OutputNames.Contains(srcName))
+                {
+                    var rshape = (runtimeOutputShapes.Length > 0 ? runtimeOutputShapes[0] : node.OutputShapes[0]).ToArray();
+                    for (int d = 0; d < rshape.Length; d++) if (rshape[d] <= 0) rshape[d] = 1;
+                    if (TensorHelpers.ElementCount(rshape) == src.ElementCount && _pool.Rename(srcName, outName))
+                    {
+                        tensors[outName] = new Tensor(src.Data, rshape, outName);
+                        tensors.Remove(srcName);
+                        refCounts[srcName] = 0;   // buffer handed off to outName; never re-release srcName
+                        // Release this Reshape's OTHER inputs (e.g. the shape tensor) — the data input was handed off.
+                        for (int ii = 1; ii < node.InputNames.Length; ii++)
+                        {
+                            var inN = node.InputNames[ii];
+                            if (string.IsNullOrEmpty(inN)) continue;
+                            if (refCounts.TryGetValue(inN, out var rc) && rc < int.MaxValue)
+                            {
+                                refCounts[inN] = rc - 1;
+                                if (rc - 1 <= 0 && tensors.TryGetValue(inN, out var rt))
+                                { pendingReleases.Add(rt); pendingReleaseBytes += (long)rt.ElementCount * sizeof(float); }
+                            }
+                        }
+                        nodeIdx++;
+                        LastRunOpLog.Add($"{nodeIdx:D4} Reshape~view");
+                        await DrainPointAsync();
+                        if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value) break;
+                        continue;
+                    }
+                }
+            }
+
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
