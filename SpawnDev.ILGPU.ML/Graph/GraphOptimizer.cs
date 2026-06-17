@@ -60,6 +60,12 @@ public static class GraphOptimizer
         // Pass 3: Fuse MatMul → Add (bias) → Activation into FusedLinear
         int fusedLinear = FuseLinearLayers(optimized);
 
+        // Pass 3b: Fuse a full decomposed self-attention subgraph (Q·Kᵀ → scale → [+zero-bias] → Softmax →
+        // [Cast] → probs·V) into ONE flash-style FusedAttention node — never materializes the [B·H, S, S]
+        // scores. Runs BEFORE FuseScaledMatMul so the Q·Kᵀ MatMul is still raw. This is the SD-UNet memory
+        // win (the [8,4096,4096] scores at down_block.0 were the pipeline peak).
+        int fusedAttn = FuseAttention(optimized);
+
         // Pass 4: Fuse MatMul → Mul/Div (scale) into FusedScaledMatMul (attention Q*K^T/sqrt(d))
         int fusedScaled = FuseScaledMatMul(optimized);
 
@@ -72,9 +78,9 @@ public static class GraphOptimizer
         // Pass 7: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
-        int totalOpt = fusedLinear + fusedScaled + eliminated + dead + folded + reduced;
+        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
-            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {reduced} strength-reduced, {dead} dead");
+            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {reduced} strength-reduced, {dead} dead");
 
         return optimized;
     }
@@ -274,6 +280,161 @@ public static class GraphOptimizer
         foreach (var idx in nodesToRemove.OrderByDescending(i => i))
             graph.Nodes.RemoveAt(idx);
 
+        return fusedCount;
+    }
+
+    /// <summary>
+    /// Fuse a full decomposed self-attention subgraph into ONE <c>FusedAttention</c> node (flash-style online
+    /// softmax — the [B·H, seq, seq] scores are never materialized). Matches the standard diffusers/torch ONNX
+    /// export shape, anchored at the <c>Softmax</c>:
+    ///   K → Transpose ─┐
+    ///   Q ────────────→ MatMul(Q·Kᵀ) → Mul(×scale) → [Add(+zero-bias)] → Softmax → [Cast] → MatMul(probs·V) → out
+    /// becomes <c>FusedAttention(Q, K, V) → out</c> with attrs causal=0, window=0, scale (read from the scale
+    /// constant). Q/K/V are the [B·H, seq, head_dim] tensors feeding the MatMuls (their producing reshapes stay).
+    /// The zero-bias branch (ConstantOfShape → Mul × 0 → Add) becomes dead and is removed by dead-node
+    /// elimination. The operator derives n_heads/head_dim from the rank-3 Q at runtime, so this is shape-agnostic
+    /// (works for every attention block/resolution). Guards: single-consumer on every fused tensor, both QKᵀ
+    /// inputs must be activations (not a weight MatMul), K must be transposed. Falls through (no fusion) on any
+    /// mismatch — correctness is never at risk, only the memory/perf win.
+    /// </summary>
+    private static int FuseAttention(ModelGraph graph)
+    {
+        int fusedCount = 0;
+        var nodes = graph.Nodes;
+
+        var producer = new Dictionary<string, int>();
+        for (int i = 0; i < nodes.Count; i++)
+            foreach (var o in nodes[i].Outputs)
+                if (!string.IsNullOrEmpty(o)) producer[o] = i;
+        var consumerCount = new Dictionary<string, int>();
+        foreach (var n in nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp)) consumerCount[inp] = consumerCount.GetValueOrDefault(inp, 0) + 1;
+
+        bool IsActivation(string name) => !string.IsNullOrEmpty(name) && !graph.Initializers.ContainsKey(name);
+        int Prod(string name) => producer.TryGetValue(name, out var idx) ? idx : -1;
+        int SingleConsumer(string name)
+        {
+            for (int i = 0; i < nodes.Count; i++) if (nodes[i].Inputs.Contains(name)) return i;
+            return -1;
+        }
+        float? ScalarConst(string name)
+        {
+            if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var f) && f.Length >= 1) return f[0];
+            if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var d) && d.Length >= 1) return d[0];
+            return null;
+        }
+        // Walk back through Mul/Div/Cast from `name`; true if it reaches a MatMul of two activations (the scores
+        // branch) rather than a ConstantOfShape (the zero-bias branch).
+        bool ReachesScoresMatMul(string name, int depth)
+        {
+            if (depth > 4) return false;
+            int p = Prod(name);
+            if (p < 0) return false;
+            var n = nodes[p];
+            if (n.OpType == "MatMul" && n.Inputs.Count == 2 && IsActivation(n.Inputs[0]) && IsActivation(n.Inputs[1])) return true;
+            if (n.OpType is "Mul" or "Div" or "Cast")
+                foreach (var inp in n.Inputs)
+                    if (IsActivation(inp) && ReachesScoresMatMul(inp, depth + 1)) return true;
+            return false;
+        }
+
+        var remove = new HashSet<int>();
+
+        for (int si = 0; si < nodes.Count; si++)
+        {
+            if (remove.Contains(si)) continue;
+            var softmax = nodes[si];
+            if (softmax.OpType != "Softmax" || softmax.Inputs.Count < 1 || softmax.Outputs.Count < 1) continue;
+
+            var between = new List<int>();
+            string scoresName = softmax.Inputs[0];
+            if (consumerCount.GetValueOrDefault(scoresName, 0) != 1) continue;   // scores feed only softmax
+
+            // Optional additive bias: Add(scaledScores, zeroBias). Keep the scores branch, drop the Add.
+            int pAdd = Prod(scoresName);
+            if (pAdd >= 0 && nodes[pAdd].OpType == "Add" && nodes[pAdd].Inputs.Count == 2)
+            {
+                var addN = nodes[pAdd];
+                string br = ReachesScoresMatMul(addN.Inputs[0], 0) ? addN.Inputs[0]
+                          : ReachesScoresMatMul(addN.Inputs[1], 0) ? addN.Inputs[1] : null!;
+                if (br == null) continue;
+                if (consumerCount.GetValueOrDefault(br, 0) != 1) continue;
+                between.Add(pAdd);
+                scoresName = br;
+            }
+
+            // Scale: Mul/Div by a scalar const on the QKᵀ output. (Absent → kernel default 1/sqrt(head_dim).)
+            float scale = 0f;
+            string matmulOut = scoresName;
+            int pScale = Prod(scoresName);
+            if (pScale >= 0 && (nodes[pScale].OpType == "Mul" || nodes[pScale].OpType == "Div") && nodes[pScale].Inputs.Count == 2)
+            {
+                var sN = nodes[pScale];
+                float? sc = ScalarConst(sN.Inputs[1]); string actIn = sN.Inputs[0];
+                if (sc == null) { sc = ScalarConst(sN.Inputs[0]); actIn = sN.Inputs[1]; }
+                if (sc != null && IsActivation(actIn))
+                {
+                    if (consumerCount.GetValueOrDefault(actIn, 0) != 1) continue;
+                    scale = sN.OpType == "Div" ? 1f / sc.Value : sc.Value;
+                    matmulOut = actIn;
+                    between.Add(pScale);
+                }
+            }
+
+            // Scores MatMul (Q · Kᵀ), both activations.
+            int pMM = Prod(matmulOut);
+            if (pMM < 0 || nodes[pMM].OpType != "MatMul" || nodes[pMM].Inputs.Count != 2) continue;
+            var mm = nodes[pMM];
+            string qName = mm.Inputs[0], kTName = mm.Inputs[1];
+            if (!IsActivation(qName) || !IsActivation(kTName)) continue;
+            if (consumerCount.GetValueOrDefault(kTName, 0) != 1) continue;
+            between.Add(pMM);
+
+            // K transpose.
+            int pKT = Prod(kTName);
+            if (pKT < 0 || nodes[pKT].OpType != "Transpose" || nodes[pKT].Inputs.Count < 1) continue;
+            string kName = nodes[pKT].Inputs[0];
+            between.Add(pKT);
+
+            // Forward: softmax → [Cast] → MatMul(probs, V).
+            string probs = softmax.Outputs[0];
+            if (consumerCount.GetValueOrDefault(probs, 0) != 1) continue;
+            int cIdx = SingleConsumer(probs);
+            if (cIdx < 0) continue;
+            if (nodes[cIdx].OpType == "Cast")
+            {
+                between.Add(cIdx);
+                probs = nodes[cIdx].Outputs[0];
+                if (consumerCount.GetValueOrDefault(probs, 0) != 1) continue;
+                cIdx = SingleConsumer(probs);
+                if (cIdx < 0) continue;
+            }
+            var av = nodes[cIdx];
+            if (av.OpType != "MatMul" || av.Inputs.Count != 2) continue;
+            string vName = av.Inputs[0] == probs ? av.Inputs[1] : av.Inputs[0];
+            if (!IsActivation(vName)) continue;
+            string attnOut = av.Outputs[0];
+
+            // Replace the probs·V MatMul (produces the kept output) with FusedAttention; remove the rest.
+            nodes[cIdx] = new GraphNode
+            {
+                OpType = "FusedAttention",
+                Inputs = new List<string> { qName, kName, vName },
+                Outputs = new List<string> { attnOut },
+                Attributes = new Dictionary<string, JsonElement>
+                {
+                    ["causal"] = JsonSerializer.SerializeToElement(0),
+                    ["window"] = JsonSerializer.SerializeToElement(0),
+                    ["scale"] = JsonSerializer.SerializeToElement(scale),
+                }
+            };
+            remove.Add(si);
+            foreach (var b in between) remove.Add(b);
+            fusedCount++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(i => i)) nodes.RemoveAt(idx);
         return fusedCount;
     }
 
@@ -581,33 +742,33 @@ public static class GraphOptimizer
     private static int EliminateDeadNodes(ModelGraph graph)
     {
         var graphOutputNames = new HashSet<string>(graph.Outputs.Select(o => o.Name));
-        var consumedOutputs = new HashSet<string>(graphOutputNames);
+        int totalEliminated = 0;
 
-        // Collect all consumed tensor names
-        foreach (var node in graph.Nodes)
-            foreach (var input in node.Inputs)
-                if (!string.IsNullOrEmpty(input))
-                    consumedOutputs.Add(input);
-
-        int eliminated = 0;
-        var nodesToRemove = new List<int>();
-
-        for (int i = 0; i < graph.Nodes.Count; i++)
+        // Iterate to a fixpoint: removing a dead node can make its (now-unconsumed) producer dead too. A single
+        // pass only catches one layer — e.g. fusing attention leaves Add dead; pass 1 removes Add, which leaves
+        // Mul dead; pass 2 removes Mul, which leaves the [B·H,S,S] ConstantOfShape zero-bias dead; pass 3 removes
+        // THAT (a 512 MiB buffer per attention block). Looping collects the whole transitive dead chain.
+        bool changed = true;
+        while (changed)
         {
-            var node = graph.Nodes[i];
-            // Check if ANY of this node's outputs are consumed
-            bool anyConsumed = node.Outputs.Any(o => consumedOutputs.Contains(o));
-            if (!anyConsumed)
-            {
-                nodesToRemove.Add(i);
-                eliminated++;
-            }
+            changed = false;
+            var consumedOutputs = new HashSet<string>(graphOutputNames);
+            foreach (var node in graph.Nodes)
+                foreach (var input in node.Inputs)
+                    if (!string.IsNullOrEmpty(input))
+                        consumedOutputs.Add(input);
+
+            var nodesToRemove = new List<int>();
+            for (int i = 0; i < graph.Nodes.Count; i++)
+                if (!graph.Nodes[i].Outputs.Any(o => consumedOutputs.Contains(o)))
+                    nodesToRemove.Add(i);
+
+            foreach (var idx in nodesToRemove.OrderByDescending(i => i))
+                graph.Nodes.RemoveAt(idx);
+            if (nodesToRemove.Count > 0) { changed = true; totalEliminated += nodesToRemove.Count; }
         }
 
-        foreach (var idx in nodesToRemove.OrderByDescending(i => i))
-            graph.Nodes.RemoveAt(idx);
-
-        return eliminated;
+        return totalEliminated;
     }
 
     /// <summary>

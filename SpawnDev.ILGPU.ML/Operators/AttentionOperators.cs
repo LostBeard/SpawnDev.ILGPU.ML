@@ -82,9 +82,19 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
 
         int nHeads = ctx.GetInt("n_heads", 0);
         int headDim = ctx.GetInt("head_dim", 0);
+        // When the attrs are absent (the graph-fusion path — see GraphOptimizer.FuseAttention), derive the
+        // layout from q's runtime shape: rank-3 [batch·heads, seq, head_dim] or rank-4 [batch, heads, seq,
+        // head_dim]. This makes one FusedAttention node work for any heads/head_dim/resolution without the
+        // fusion pass having to know shapes at compile time (it doesn't). The gemma4 path keeps passing attrs.
         if (nHeads <= 0 || headDim <= 0)
-            throw new InvalidOperationException(
-                "FusedAttention requires n_heads and head_dim attributes.");
+        {
+            var qs = q.Shape;
+            if (qs.Length == 3) { nHeads = qs[0]; headDim = qs[2]; }
+            else if (qs.Length == 4) { nHeads = qs[0] * qs[1]; headDim = qs[3]; }
+            else
+                throw new InvalidOperationException(
+                    $"FusedAttention needs n_heads+head_dim attrs, or a rank-3/4 q to derive them; got q rank {qs.Length}.");
+        }
         int kvHeads = ctx.GetInt("n_kv_heads", nHeads);
         bool causal = ctx.GetInt("causal", 1) == 1;
         int window = ctx.GetInt("window", 0);
