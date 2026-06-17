@@ -76,6 +76,43 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[TiledResnet] tiled GroupNorm→SiLU→Conv→GroupNorm→SiLU→Conv+res == full (worst |Δ|={worst:E3}) on {BackendName}");
     });
 
+    [TestMethod]
+    public async Task TiledUpsampler_MatchesFull_AllBackends() => await RunTest(async accelerator =>
+    {
+        // The VAE upsampler: nearest-2× Resize then a 3×3 SAME conv. Tiled == full.
+        const int C = 32, H = 12, W = 16, rows = 2, cols = 2, halo = 1;
+        int n = C * H * W, n2 = C * (2 * H) * (2 * W);
+        var rng = new Random(923);
+        var x = new float[n]; for (int i = 0; i < n; i++) x[i] = (float)(rng.NextDouble() * 4 - 2);
+        var WC = Rand(C * C * 9, rng, -0.1f, 0.1f); var BC = Rand(C, rng, -0.05f, 0.05f);
+
+        var ew = new ElementWiseKernels(accelerator); var conv = new Conv2DKernel(accelerator);
+        using var wB = accelerator.Allocate1D(WC); using var bB = accelerator.Allocate1D(BC);
+
+        float[] expected;
+        {
+            using var inB = accelerator.Allocate1D(x);
+            using var upB = accelerator.Allocate1D<float>(n2);
+            ew.NearestUpsample(inB.View, upB.View, new[] { 1, C, H, W }, new[] { 1, C, 2 * H, 2 * W });
+            using var outB = accelerator.Allocate1D<float>(n2);
+            conv.ForwardPadded(upB.View, wB.View, bB.View, outB.View, C, 2 * H, 2 * W, C, 3, 3, 1, 1, 1, 1, 1, 1, 1);
+            await accelerator.SynchronizeAsync();
+            expected = await outB.CopyToHostAsync<float>(0, n2);
+        }
+
+        using var ops = new TiledVaeOps(accelerator);
+        var map = TiledFeatureMap.FromFull(x, C, H, W, rows, cols, halo);
+        map = await ops.Resize2x(map, C);
+        map = await ops.Conv3x3(map, wB.View, bB.View, C, C);
+        var got = map.ToFull();
+
+        float worst = 0;
+        for (int i = 0; i < n2; i++) worst = MathF.Max(worst, MathF.Abs(got[i] - expected[i]));
+        if (worst > 1e-4f)
+            throw new Exception($"tiled upsampler diverged from full (worst |Δ|={worst:E3}) on {BackendName}");
+        Console.WriteLine($"[TiledUpsampler] tiled Resize2x→Conv3x3 == full (worst |Δ|={worst:E3}) on {BackendName}");
+    });
+
     private static float[] Rand(int n, Random rng, float lo, float hi)
     {
         var a = new float[n]; for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * (hi - lo) + lo); return a;

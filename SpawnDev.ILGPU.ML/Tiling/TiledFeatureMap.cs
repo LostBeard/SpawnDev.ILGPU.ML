@@ -38,6 +38,24 @@ public sealed class TiledFeatureMap
                 _tiles[r * cols + cc] = new float[(long)c * (_coreH[r] + 2 * halo) * (_coreW[cc] + 2 * halo) is var n && n <= int.MaxValue ? (int)n : throw new OverflowException()];
     }
 
+    // Explicit per-row/col core sizes (used after a 2× upsample, where tile bands must be EXACTLY 2× the source
+    // bands so the grid stays aligned — an even re-split of 2H/rows would shift the boundaries).
+    private TiledFeatureMap(int channels, int halo, int[] coreH, int[] coreW)
+    {
+        Channels = channels; Halo = halo; Rows = coreH.Length; Cols = coreW.Length;
+        _coreH = coreH; _coreW = coreW; _y0 = new int[Rows]; _x0 = new int[Cols];
+        int y = 0; for (int r = 0; r < Rows; r++) { _y0[r] = y; y += coreH[r]; } Height = y;
+        int x = 0; for (int c = 0; c < Cols; c++) { _x0[c] = x; x += coreW[c]; } Width = x;
+        _tiles = new float[Rows * Cols][];
+        for (int r = 0; r < Rows; r++)
+            for (int c = 0; c < Cols; c++)
+                _tiles[r * Cols + c] = new float[(long)channels * (coreH[r] + 2 * halo) * (coreW[c] + 2 * halo) is var n && n <= int.MaxValue ? (int)n : throw new OverflowException()];
+    }
+
+    /// <summary>Allocate an empty grid with EXPLICIT per-row/col core sizes (cores+halos zeroed).</summary>
+    public static TiledFeatureMap AllocateExplicit(int channels, int[] coreH, int[] coreW, int halo)
+        => new TiledFeatureMap(channels, halo, coreH, coreW);
+
     public int CoreH(int r) => _coreH[r];
     public int CoreW(int c) => _coreW[c];
     /// <summary>The padded (core + 2*Halo) data buffer for tile (r,c). Indexed [ch, y, x] with

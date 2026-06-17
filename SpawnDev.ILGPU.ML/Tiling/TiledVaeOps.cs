@@ -63,6 +63,27 @@ public sealed class TiledVaeOps : IDisposable
         return outMap;
     }
 
+    /// <summary>Nearest-2× upsample (the VAE upsampler's Resize), per tile (local — no halo): each tile's core
+    /// [C,ch,cw] → [C,2ch,2cw]. The output grid keeps the same rows×cols with bands EXACTLY 2× the source, so it
+    /// stays aligned with the latent-tile grid through the up-blocks.</summary>
+    public async Task<TiledFeatureMap> Resize2x(TiledFeatureMap inMap, int C)
+    {
+        var coreH = new int[inMap.Rows]; for (int r = 0; r < inMap.Rows; r++) coreH[r] = inMap.CoreH(r) * 2;
+        var coreW = new int[inMap.Cols]; for (int c = 0; c < inMap.Cols; c++) coreW[c] = inMap.CoreW(c) * 2;
+        var outMap = TiledFeatureMap.AllocateExplicit(C, coreH, coreW, inMap.Halo);
+        for (int r = 0; r < inMap.Rows; r++)
+            for (int c = 0; c < inMap.Cols; c++)
+            {
+                int ch = inMap.CoreH(r), cw = inMap.CoreW(c);
+                using var inB = _acc.Allocate1D(inMap.ReadCore(r, c));
+                using var outB = _acc.Allocate1D<float>(C * (2 * ch) * (2 * cw));
+                _ew.NearestUpsample(inB.View, outB.View, new[] { 1, C, ch, cw }, new[] { 1, C, 2 * ch, 2 * cw });
+                await _acc.SynchronizeAsync();
+                outMap.WriteCore(r, c, await outB.CopyToHostAsync<float>(0, C * (2 * ch) * (2 * cw)));
+            }
+        return outMap;
+    }
+
     /// <summary>SiLU (x·sigmoid(x)) in place on the cores (pointwise — no halo needed).</summary>
     public async Task SiLU(TiledFeatureMap map, int C)
     {
