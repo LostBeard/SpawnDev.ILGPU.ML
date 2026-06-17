@@ -48,6 +48,10 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int>? _instanceNormApplyInPlaceKernel;
 
+    // Per-slice partial sum + sumSq (exact tiled decode global-stat combine).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _instanceNormPartialStatsKernel;
+
     public NormalizationKernels(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -180,6 +184,27 @@ public class NormalizationKernels : IDisposable
         int c = (idx / spatial) % C;
         int sliceIdx = idx / spatial;
         data[idx] = scale[c] * (data[idx] - means[sliceIdx]) * invStds[sliceIdx] + bias[c];
+    }
+
+    /// <summary>Partial InstanceNorm stats per (N,C) slice: sum and sum-of-squares over <paramref name="spatial"/>
+    /// elements (one thread per slice). For exact tiled decode — each tile contributes its partial sum/sumSq/count
+    /// over its NON-overlap core; the caller combines across tiles into global mean/var, then applies with
+    /// <see cref="InstanceNormApplyWithStats"/>. Double-precision accumulate keeps the combine exact.</summary>
+    private static void InstanceNormPartialStatsImpl(Index1D sliceIdx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sums,
+        ArrayView1D<float, Stride1D.Dense> sumSqs,
+        int spatial)
+    {
+        int ncBase = sliceIdx * spatial;
+        double sum = 0, sumSq = 0;
+        for (int i = 0; i < spatial; i++)
+        {
+            double v = input[ncBase + i];
+            sum += v; sumSq += v * v;
+        }
+        sums[sliceIdx] = (float)sum;
+        sumSqs[sliceIdx] = (float)sumSq;
     }
 
     // ── Public API ──
@@ -322,6 +347,29 @@ public class NormalizationKernels : IDisposable
         _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
+    /// <summary>Compute per-(N,C)-slice partial sum and sumSq over <paramref name="spatial"/> elements of
+    /// <paramref name="input"/>. For exact tiled decode: combine these across tiles (× per-tile core counts) into
+    /// global mean/invStd. <paramref name="sums"/>/<paramref name="sumSqs"/> are length N*C.</summary>
+    public void InstanceNormPartialStats(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sums, ArrayView1D<float, Stride1D.Dense> sumSqs,
+        int N, int C, int spatial)
+    {
+        EnsureLoaded();
+        _instanceNormPartialStatsKernel!(N * C, input, sums, sumSqs, spatial);
+    }
+
+    /// <summary>Apply InstanceNorm IN PLACE using EXTERNALLY-provided per-slice means/invStds (skips the local
+    /// stat pass). For exact tiled decode: each tile applies the GLOBAL stats so there are no per-tile brightness
+    /// seams. <paramref name="means"/>/<paramref name="invStds"/> are length N*C; single read_write binding.</summary>
+    public void InstanceNormApplyWithStats(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> scale, ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> means, ArrayView1D<float, Stride1D.Dense> invStds,
+        int N, int C, int spatial)
+    {
+        EnsureLoaded();
+        _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, means, invStds, N, C, spatial);
+    }
+
     // Per-call temp buffers for InstanceNorm and RMSNorm two-pass kernels.
     // Sharing across calls would race: Pass 1 of call N+1 overwrites mean/invStd/invRms
     // before Pass 2 of call N has finished reading. Buffers stay alive in this list
@@ -358,6 +406,9 @@ public class NormalizationKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int>(InstanceNormApplyInPlaceImpl);
+        _instanceNormPartialStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialStatsImpl);
         _rmsNormStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
