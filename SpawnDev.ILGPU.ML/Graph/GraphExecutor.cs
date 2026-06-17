@@ -150,6 +150,12 @@ public class GraphExecutor : IDisposable
     /// feature channels (e.g. a 48x48x17 heatmap = 39168) when hunting a spatial bug.</summary>
     public static int CaptureMaxElements = 1024;
 
+    /// <summary>When non-null (and <see cref="CapturedOutputs"/> is set), restrict capture to ONLY the listed
+    /// node output names, and capture those in FULL (ignoring <see cref="CaptureMaxElements"/>). Used to pull a
+    /// single intermediate tensor out of a graph cheaply — e.g. the tiled VAE decoder captures just the mid-block
+    /// output (combined with <see cref="BreakAtNode"/> so the rest of the graph never runs).</summary>
+    public static HashSet<string>? CaptureOutputNames { get; set; }
+
     /// <summary>
     /// DIAGNOSTIC: when non-null, captures per-node Execute() wall-clock time in
     /// milliseconds keyed by the same node key as <see cref="CapturedOutputs"/>.
@@ -1688,9 +1694,14 @@ public class GraphExecutor : IDisposable
             if (!shapeCacheHit && CapturedOutputs != null && nodeOutputs.Length > 0 && nodeOutputs[0] != null)
             {
                 var captureOutput = nodeOutputs[0];
+                bool nameFiltered = CaptureOutputNames != null;
+                if (nameFiltered && !CaptureOutputNames!.Contains(node.OutputNames[0]))
+                    goto skipCapture;
                 // Capture enough values to get a meaningful absMax (at least one full
                 // channel for Conv outputs). 1024 covers most shape tensors and small features.
-                int captureCount = Math.Min(CaptureMaxElements, captureOutput.ElementCount);
+                // A name-filtered capture takes the FULL tensor (the caller wants this exact intermediate).
+                int captureCount = nameFiltered ? captureOutput.ElementCount
+                                                : Math.Min(CaptureMaxElements, captureOutput.ElementCount);
                 if (captureCount > 0)
                 {
                     try
@@ -1721,6 +1732,7 @@ public class GraphExecutor : IDisposable
                     }
                     catch { /* Don't crash on capture failure */ }
                 }
+                skipCapture: ;
             }
 
             // Mixed-precision: store eligible LARGE float feature-map outputs as low precision (half the held

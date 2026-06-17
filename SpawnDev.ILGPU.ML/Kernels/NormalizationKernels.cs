@@ -52,6 +52,10 @@ public class NormalizationKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _instanceNormPartialStatsKernel;
 
+    // Per-slice partial Σ(x-mean)² given an external mean (stable two-pass variance for tiled GroupNorm).
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _instanceNormPartialSqDevKernel;
+
     public NormalizationKernels(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -137,19 +141,23 @@ public class NormalizationKernels : IDisposable
         int spatial, float eps)
     {
         int ncBase = sliceIdx * spatial;
-        float sum = 0f;
+        // Double-accumulate (was float): over large spatial spans (e.g. 256×256 GroupNorm groups) a float running
+        // sum drifts ~1e-3 relative, and in ill-conditioned norms (near-zero-variance groups → invStd up to
+        // 1/√eps) that drift is amplified downstream. Double is order-independent + exact enough that the tiled
+        // decode's (necessarily reordered) global-stat combine MATCHES this full-pass result — the seam-free key.
+        double sum = 0;
         for (int i = 0; i < spatial; i++)
             sum += input[ncBase + i];
-        float mean = sum / spatial;
-        means[sliceIdx] = mean;
+        double mean = sum / spatial;
+        means[sliceIdx] = (float)mean;
 
-        float varSum = 0f;
+        double varSum = 0;
         for (int i = 0; i < spatial; i++)
         {
-            float d = input[ncBase + i] - mean;
+            double d = input[ncBase + i] - mean;
             varSum += d * d;
         }
-        invStds[sliceIdx] = 1f / MathF.Sqrt(varSum / spatial + eps);
+        invStds[sliceIdx] = (float)(1.0 / Math.Sqrt(varSum / spatial + eps));
     }
 
     /// <summary>
@@ -205,6 +213,26 @@ public class NormalizationKernels : IDisposable
         }
         sums[sliceIdx] = (float)sum;
         sumSqs[sliceIdx] = (float)sumSq;
+    }
+
+    /// <summary>Partial sum of squared deviations from an EXTERNALLY-supplied per-slice mean: Σ(x - means[slice])²
+    /// over <paramref name="spatial"/> (one thread per slice, double accumulate). The numerically-stable second
+    /// pass for the tiled GroupNorm — pairs with a global-mean first pass to avoid the catastrophic cancellation
+    /// of Σx² − (Σx)² when a group has a large mean and small variance (conv-biased feature maps).</summary>
+    private static void InstanceNormPartialSqDevImpl(Index1D sliceIdx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sqDevs,
+        ArrayView1D<float, Stride1D.Dense> means,
+        int spatial)
+    {
+        int ncBase = sliceIdx * spatial;
+        double mean = means[sliceIdx], sumSq = 0;
+        for (int i = 0; i < spatial; i++)
+        {
+            double d = input[ncBase + i] - mean;
+            sumSq += d * d;
+        }
+        sqDevs[sliceIdx] = (float)sumSq;
     }
 
     // ── Public API ──
@@ -358,6 +386,16 @@ public class NormalizationKernels : IDisposable
         _instanceNormPartialStatsKernel!(N * C, input, sums, sumSqs, spatial);
     }
 
+    /// <summary>Partial Σ(x-mean)² per slice given an external per-slice <paramref name="means"/> (length N*C).
+    /// The stable second pass for the tiled GroupNorm variance combine. See <see cref="InstanceNormPartialSqDevImpl"/>.</summary>
+    public void InstanceNormPartialSqDev(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sqDevs, ArrayView1D<float, Stride1D.Dense> means,
+        int N, int C, int spatial)
+    {
+        EnsureLoaded();
+        _instanceNormPartialSqDevKernel!(N * C, input, sqDevs, means, spatial);
+    }
+
     /// <summary>Apply InstanceNorm IN PLACE using EXTERNALLY-provided per-slice means/invStds (skips the local
     /// stat pass). For exact tiled decode: each tile applies the GLOBAL stats so there are no per-tile brightness
     /// seams. <paramref name="means"/>/<paramref name="invStds"/> are length N*C; single read_write binding.</summary>
@@ -409,6 +447,9 @@ public class NormalizationKernels : IDisposable
         _instanceNormPartialStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialStatsImpl);
+        _instanceNormPartialSqDevKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialSqDevImpl);
         _rmsNormStatsKernel ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

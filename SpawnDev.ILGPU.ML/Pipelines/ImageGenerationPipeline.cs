@@ -3,6 +3,7 @@ using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using SpawnDev.ILGPU.ML.Tiling;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
@@ -317,6 +318,20 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         // Tiled VAE decode (opt-in, for low-VRAM): VAE_TILE_LATENT=N decodes the latent in NxN-ish overlapping
         // tiles, bounding the GPU peak to one tile's decode (the full peak scales with spatial AREA). Default
         // (unset / 0) = the full single-pass decode, unchanged.
+        // Exact-stat SEAM-FREE tiled decode (VAE_TILE_EXACT=N → NxN tile grid). Runs the decoder HEAD whole and
+        // the UP-BLOCKS tiled with global GroupNorm stats + halo-refreshed convs, so the result is bit-near-
+        // identical to the full decode (no seams) at a much lower GPU peak. VAE_EXACT_VERIFY=1 additionally runs
+        // the full fp32 decode and reports tiled-vs-full max/mean abs diff (the correctness gate).
+        int exactTile = int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_EXACT"), out var ext) ? ext : 0;
+        bool exactVerify = Environment.GetEnvironmentVariable("VAE_EXACT_VERIFY") == "1";
+        if (exactTile > 0 || exactVerify)
+        {
+            int grid = exactTile > 0 ? exactTile : 2;
+            rgbData = await ExactTiledVaeDecodeAsync(latentTensor, 3 * imagePixels, grid, exactVerify);
+            Graph.GraphExecutor.MaxPendingReleaseBytes = _savedByteCap;
+            goto haveRgb;
+        }
+
         int tileLatent = int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_LATENT"), out var tl) ? tl : 0;
         if (tileLatent > 0 && tileLatent < Math.Max(latentH, latentW))
         {
@@ -336,6 +351,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         }
         Graph.GraphExecutor.MaxPendingReleaseBytes = _savedByteCap;
 
+        haveRgb:
         // ═══════════════════════════════════════════════════════════
         //  Step 7: Convert NCHW [-1,1] → RGBA [0,255]
         // ═══════════════════════════════════════════════════════════
@@ -367,6 +383,104 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             NumSteps = steps,
             InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
         };
+    }
+
+    /// <summary>
+    /// Exact-stat SEAM-FREE tiled VAE decode. Phase A runs the decoder HEAD whole (post_quant_conv → conv_in →
+    /// mid_block, cheap at 64²) via the session with <see cref="Graph.GraphExecutor.BreakAtNode"/>, capturing the
+    /// mid-block output. Phase B runs up_blocks 0-3 + conv_norm_out + conv_out tiled (<see cref="TiledVaeUpDecoder"/>)
+    /// with GLOBAL per-group GroupNorm stats + halo-refreshed convs — exact, so no brightness seams (unlike the
+    /// approximate <see cref="TiledVaeDecodeAsync"/>), at a GPU peak bounded by one tile. Returns NCHW [3,H,W] in
+    /// [-1,1]. When <paramref name="verify"/>, also runs the full fp32 decode and prints tiled-vs-full max/mean
+    /// abs diff (the correctness gate) before returning the TILED result.
+    /// </summary>
+    private async Task<float[]> ExactTiledVaeDecodeAsync(Tensor latent, int outCount, int grid, bool verify)
+    {
+        var exec = _vaeDecoder!.Executor;
+        string inName = _vaeDecoder.InputNames[0], finalName = _vaeDecoder.OutputNames[0];
+
+        // Locate the mid-block output node (Phase-A → Phase-B boundary) in the compiled graph.
+        int midIdx = -1;
+        for (int i = 0; i < _vaeDecoder.NodeCount; i++)
+        {
+            var (_, _, outs) = _vaeDecoder.GetNode(i);
+            if (outs.Length > 0 && outs[0] == TiledVaeUpDecoder.MidBlockOutputName) { midIdx = i; break; }
+        }
+        if (midIdx < 0)
+            throw new InvalidOperationException($"VAE mid-block output '{TiledVaeUpDecoder.MidBlockOutputName}' not found in graph.");
+
+        // ── Phase A: run the head only (break right after the mid node), capturing just the mid output. ──
+        var savedCap = Graph.GraphExecutor.CapturedOutputs;
+        var savedNames = Graph.GraphExecutor.CaptureOutputNames;
+        var savedBreak = Graph.GraphExecutor.BreakAtNode;
+        var savedDtype = exec.ActivationDtype;
+        float[] mid;
+        try
+        {
+            exec.ActivationDtype = ActivationPrecision.F32;     // fp32 head → clean (matches the tiled fp32 activations)
+            Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+            Graph.GraphExecutor.CaptureOutputNames = new HashSet<string> { TiledVaeUpDecoder.MidBlockOutputName };
+            Graph.GraphExecutor.BreakAtNode = midIdx + 1;       // loop breaks when nodeIdx >= this (after running midIdx)
+            await _vaeDecoder.RunAsync(new Dictionary<string, Tensor> { [inName] = latent });
+            var midKey = Graph.GraphExecutor.CapturedOutputs.Keys.FirstOrDefault(k => k.EndsWith(TiledVaeUpDecoder.MidBlockOutputName))
+                ?? throw new InvalidOperationException("Phase-A capture missed the mid-block output.");
+            mid = Graph.GraphExecutor.CapturedOutputs[midKey];
+        }
+        finally
+        {
+            Graph.GraphExecutor.CapturedOutputs = savedCap;
+            Graph.GraphExecutor.CaptureOutputNames = savedNames;
+            Graph.GraphExecutor.BreakAtNode = savedBreak;
+        }
+
+        // ── Verify reference: capture the full fp32 decode + per-stage boundary tensors FIRST. ──
+        Dictionary<string, float[]>? refStages = null;
+        float[]? full = null;
+        if (verify)
+        {
+            var boundaryNames = new List<string> { finalName };
+            for (int b = 0; b <= 3; b++) for (int r = 0; r <= 2; r++) boundaryNames.Add($"/decoder/up_blocks.{b}/resnets.{r}/Add_output_0");
+            for (int b = 0; b <= 2; b++) boundaryNames.Add($"/decoder/up_blocks.{b}/upsamplers.0/conv/Conv_output_0");
+            try
+            {
+                exec.ActivationDtype = ActivationPrecision.F32;
+                Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
+                Graph.GraphExecutor.CaptureOutputNames = new HashSet<string>(boundaryNames);
+                var refOut = await _vaeDecoder.RunAsync(new Dictionary<string, Tensor> { [inName] = latent });
+                full = await ReadTensorToCpu(refOut[finalName], outCount);
+                refStages = new Dictionary<string, float[]>();
+                foreach (var kv in Graph.GraphExecutor.CapturedOutputs)
+                {
+                    string outName = kv.Key[(kv.Key.IndexOf('_', kv.Key.IndexOf('_') + 1) + 1)..]; // strip "NNN_OpType_"
+                    refStages[outName] = kv.Value;
+                }
+            }
+            finally { Graph.GraphExecutor.CapturedOutputs = savedCap; Graph.GraphExecutor.CaptureOutputNames = savedNames; }
+        }
+
+        // ── Phase B: tiled up-blocks (compare each stage to the reference when verifying). ──
+        float[] tiled;
+        using (var dec = new TiledVaeUpDecoder(_vaeDecoder, _accelerator))
+        {
+            if (verify && refStages != null)
+                dec.OnStage = (name, cur) =>
+                {
+                    if (!refStages.TryGetValue(name, out var refv)) return;
+                    double mx = 0, sm = 0; int n = Math.Min(refv.Length, cur.Length);
+                    for (int i = 0; i < n; i++) { double d = Math.Abs((double)cur[i] - refv[i]); if (d > mx) mx = d; sm += d; }
+                    Console.WriteLine($"[VAE_EXACT]   stage {name} [{cur.Length}]: maxAbs={mx:E3} meanAbs={sm / n:E3}");
+                };
+            tiled = await dec.DecodeUpBlocksAsync(mid, grid, grid);
+        }
+
+        if (verify && full != null)
+        {
+            double maxAbs = 0, sum = 0; int n = Math.Min(full.Length, tiled.Length);
+            for (int i = 0; i < n; i++) { double d = Math.Abs((double)tiled[i] - full[i]); if (d > maxAbs) maxAbs = d; sum += d; }
+            Console.WriteLine($"[VAE_EXACT] grid={grid}x{grid} tiled-vs-full(fp32): maxAbs={maxAbs:E4} meanAbs={sum / n:E4} (range [-1,1])");
+        }
+        exec.ActivationDtype = savedDtype;
+        return tiled;
     }
 
     /// <summary>

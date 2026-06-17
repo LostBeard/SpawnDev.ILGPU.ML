@@ -165,6 +165,16 @@ public sealed class TiledFeatureMap
         return core;
     }
 
+    /// <summary>Deep copy (independent tile buffers + grid). Used for a resnet's residual branch: GroupNorm/SiLU
+    /// mutate the map in place, so the residual path needs an untouched copy of the block input.</summary>
+    public TiledFeatureMap Clone()
+    {
+        var coreH = (int[])_coreH.Clone(); var coreW = (int[])_coreW.Clone();
+        var t = new TiledFeatureMap(Channels, Halo, coreH, coreW);   // explicit-size ctor preserves exact bands
+        for (int i = 0; i < _tiles.Length; i++) t._tiles[i] = (float[])_tiles[i].Clone();
+        return t;
+    }
+
     /// <summary>Recombine the tile CORES into a full [C,H,W] tensor (halos discarded).</summary>
     public float[] ToFull()
     {

@@ -289,9 +289,12 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
             reg.ElementWise.AddInPlace(output.Data, b.Data, a.ElementCount);
         }
-        else if (b.ElementCount == a.Shape[^1])
+        else if (b.ElementCount == a.Shape[^1] && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
         {
-            // Last-dim broadcast: copy a → output, then AddBias in-place
+            // Last-dim broadcast: copy a → output, then AddBias in-place. The second guard (all of b's
+            // elements in its LAST dim) keeps a per-channel bias shaped [C,1,1] — which also satisfies
+            // ElementCount==a.Shape[^1] when C==W (SD-VAE GroupNorm β [256,1,1]) — from being applied per-W;
+            // it falls through to the general N-D broadcast (correct per-channel). See MulOperator for detail.
             reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
             reg.ElementWise.AddBias(output.Data, b.Data, a.ElementCount, b.ElementCount);
         }
@@ -354,9 +357,13 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             reg.ElementWise.Mul(a.Data, bb.Data, ctx.Outputs[0].Data, a.ElementCount);
             if (rented != null) ctx.Pool.Return(rented);
         }
-        else if (b.ElementCount == a.Shape[^1])
+        else if (b.ElementCount == a.Shape[^1] && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
         {
-            // Last-dim broadcast: a[..., C] * b[C]
+            // Last-dim broadcast: a[..., C] * b[C]. The second guard (all of b's elements in its LAST dim)
+            // is essential: a per-channel weight shaped [C,1,1] also has ElementCount==a.Shape[^1] when C==W
+            // (e.g. SD-VAE GroupNorm γ [256,1,1] on a [1,256,256,256] map), but it must broadcast over the
+            // CHANNEL axis, not the last (W) axis. Such [C,1,1] tensors fall through to the general N-D
+            // broadcast below (which maps strides per-axis correctly). Without this, γ/β were applied per-W.
             reg.ElementWise.BroadcastMul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount, b.ElementCount);
         }
         else if (b.ElementCount == 1)

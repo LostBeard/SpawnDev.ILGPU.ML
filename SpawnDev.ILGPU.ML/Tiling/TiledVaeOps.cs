@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
+using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Tiling;
 
@@ -41,6 +42,51 @@ public sealed class TiledVaeOps : IDisposable
                 _conv.ForwardPadded(inB.View, w, b, outB.View, inC, ph, pw, outC, 3, 3, 1, 0, 0, 0, 0, 1, 1);
                 await _acc.SynchronizeAsync();
                 outMap.WriteCore(r, c, await outB.CopyToHostAsync<float>(0, outC * oh * ow));
+            }
+        return outMap;
+    }
+
+    /// <summary>3×3 SAME conv, weight as a <see cref="Tensor"/> (the VAE convs are fp16): routes fp16 weights to
+    /// the half-weight kernel (no fp32 upconvert — keeps the tiling memory win), fp32 weights to the float kernel.
+    /// Bias is fp32 (caller upconverts the small per-channel vector once).</summary>
+    public async Task<TiledFeatureMap> Conv3x3(TiledFeatureMap inMap, Tensor w,
+        ArrayView1D<float, Stride1D.Dense> b, int inC, int outC)
+    {
+        inMap.RefreshHalos();
+        var outMap = TiledFeatureMap.Allocate(outC, inMap.Height, inMap.Width, inMap.Rows, inMap.Cols, inMap.Halo);
+        for (int r = 0; r < inMap.Rows; r++)
+            for (int c = 0; c < inMap.Cols; c++)
+            {
+                int ph = inMap.PaddedH(r), pw = inMap.PaddedW(c), oh = ph - 2, ow = pw - 2;
+                using var inB = _acc.Allocate1D(inMap.Tile(r, c));
+                using var outB = _acc.Allocate1D<float>(outC * oh * ow);
+                if (w.IsHalf)
+                    _conv.ForwardPaddedHalfWeight(inB.View, w.HalfData, b, outB.View, inC, ph, pw, outC, 3, 3, 1, 0, 0, 0, 0, 1, 1);
+                else
+                    _conv.ForwardPadded(inB.View, w.Data, b, outB.View, inC, ph, pw, outC, 3, 3, 1, 0, 0, 0, 0, 1, 1);
+                await _acc.SynchronizeAsync();
+                outMap.WriteCore(r, c, await outB.CopyToHostAsync<float>(0, outC * oh * ow));
+            }
+        return outMap;
+    }
+
+    /// <summary>1×1 conv (resnet shortcut), weight as a <see cref="Tensor"/>: half/float branch like the 3×3.</summary>
+    public async Task<TiledFeatureMap> Conv1x1(TiledFeatureMap inMap, Tensor w,
+        ArrayView1D<float, Stride1D.Dense> b, int inC, int outC)
+    {
+        var outMap = TiledFeatureMap.Allocate(outC, inMap.Height, inMap.Width, inMap.Rows, inMap.Cols, inMap.Halo);
+        for (int r = 0; r < inMap.Rows; r++)
+            for (int c = 0; c < inMap.Cols; c++)
+            {
+                int ch = inMap.CoreH(r), cw = inMap.CoreW(c);
+                using var inB = _acc.Allocate1D(inMap.ReadCore(r, c));
+                using var outB = _acc.Allocate1D<float>(outC * ch * cw);
+                if (w.IsHalf)
+                    _conv.ForwardPaddedHalfWeight(inB.View, w.HalfData, b, outB.View, inC, ch, cw, outC, 1, 1, 1, 0, 0, 0, 0, 1, 1);
+                else
+                    _conv.ForwardPadded(inB.View, w.Data, b, outB.View, inC, ch, cw, outC, 1, 1, 1, 0, 0, 0, 0, 1, 1);
+                await _acc.SynchronizeAsync();
+                outMap.WriteCore(r, c, await outB.CopyToHostAsync<float>(0, outC * ch * cw));
             }
         return outMap;
     }
@@ -120,8 +166,9 @@ public sealed class TiledVaeOps : IDisposable
         ArrayView1D<float, Stride1D.Dense> beta, int C, int groups, float eps)
     {
         int cpg = C / groups;
-        // Pass 1: global per-group sum/sumSq/count.
-        var gSum = new double[groups]; var gSq = new double[groups]; long gCount = 0;
+        // STABLE two-pass variance (NOT Σx²−(Σx)²: that catastrophically cancels when a group has a large mean +
+        // small variance — conv-biased feature maps — and blows invStd up). Pass 1: global per-group MEAN.
+        var gSum = new double[groups]; long gCount = 0;
         for (int r = 0; r < map.Rows; r++)
             for (int c = 0; c < map.Cols; c++)
             {
@@ -130,19 +177,32 @@ public sealed class TiledVaeOps : IDisposable
                 using var sums = _acc.Allocate1D<float>(groups); using var sqs = _acc.Allocate1D<float>(groups);
                 _norm.InstanceNormPartialStats(buf.View, sums.View, sqs.View, 1, groups, groupSpan);
                 await _acc.SynchronizeAsync();
-                var s = await sums.CopyToHostAsync<float>(0, groups); var q = await sqs.CopyToHostAsync<float>(0, groups);
-                for (int g = 0; g < groups; g++) { gSum[g] += s[g]; gSq[g] += q[g]; }
+                var s = await sums.CopyToHostAsync<float>(0, groups);
+                for (int g = 0; g < groups; g++) gSum[g] += s[g];
                 gCount += groupSpan;
             }
-        var means = new float[groups]; var inv = new float[groups];
-        for (int g = 0; g < groups; g++)
-        {
-            double mean = gSum[g] / gCount, var = gSq[g] / gCount - mean * mean;
-            means[g] = (float)mean; inv[g] = (float)(1.0 / Math.Sqrt(var + eps));
-        }
+        var means = new float[groups];
+        for (int g = 0; g < groups; g++) means[g] = (float)(gSum[g] / gCount);
+        using var gMeanB = _acc.Allocate1D(means);
+
+        // Pass 1b: global per-group Σ(x − globalMean)² using the just-computed mean.
+        var gSqDev = new double[groups];
+        for (int r = 0; r < map.Rows; r++)
+            for (int c = 0; c < map.Cols; c++)
+            {
+                int coreSp = map.CoreH(r) * map.CoreW(c), groupSpan = cpg * coreSp;
+                using var buf = _acc.Allocate1D(map.ReadCore(r, c));
+                using var sqs = _acc.Allocate1D<float>(groups);
+                _norm.InstanceNormPartialSqDev(buf.View, sqs.View, gMeanB.View, 1, groups, groupSpan);
+                await _acc.SynchronizeAsync();
+                var q = await sqs.CopyToHostAsync<float>(0, groups);
+                for (int g = 0; g < groups; g++) gSqDev[g] += q[g];
+            }
+        var inv = new float[groups];
+        for (int g = 0; g < groups; g++) inv[g] = (float)(1.0 / Math.Sqrt(gSqDev[g] / gCount + eps));
         var onesG = new float[groups]; var zerosG = new float[groups]; for (int g = 0; g < groups; g++) onesG[g] = 1f;
         var zerosC = new float[C]; var onesCinv = new float[C]; for (int i = 0; i < C; i++) onesCinv[i] = 1f;
-        using var meansB = _acc.Allocate1D(means); using var invB = _acc.Allocate1D(inv);
+        using var invB = _acc.Allocate1D(inv);                       // means already on GPU as gMeanB
         using var onesGB = _acc.Allocate1D(onesG); using var zerosGB = _acc.Allocate1D(zerosG);
         using var zerosCB = _acc.Allocate1D(zerosC); using var onesCinvB = _acc.Allocate1D(onesCinv);
 
@@ -152,7 +212,7 @@ public sealed class TiledVaeOps : IDisposable
             {
                 int coreSp = map.CoreH(r) * map.CoreW(c), groupSpan = cpg * coreSp;
                 using var buf = _acc.Allocate1D(map.ReadCore(r, c));
-                _norm.InstanceNormApplyWithStats(buf.View, onesGB.View, zerosGB.View, meansB.View, invB.View, 1, groups, groupSpan);
+                _norm.InstanceNormApplyWithStats(buf.View, onesGB.View, zerosGB.View, gMeanB.View, invB.View, 1, groups, groupSpan);
                 _norm.InstanceNormApplyWithStats(buf.View, gamma, beta, zerosCB.View, onesCinvB.View, 1, C, coreSp);
                 await _acc.SynchronizeAsync();
                 map.WriteCore(r, c, await buf.CopyToHostAsync<float>(0, C * coreSp));
