@@ -31,6 +31,8 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
     private InferenceSession? _textEncoder;
     private InferenceSession? _unet;
     private InferenceSession? _vaeDecoder;
+    /// <summary>The VAE decoder session (for tiled-decode weight extraction / introspection).</summary>
+    public InferenceSession? VaeDecoder => _vaeDecoder;
     private BPETokenizer? _tokenizer;
     private float[]? _alphasCumprod;
 

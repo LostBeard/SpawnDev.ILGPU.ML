@@ -89,6 +89,22 @@ async Task<int> Generate(string prompt, int? seed, string? outPath, bool ci)
     using (pipe)
     {
         if (!pipe.IsReady) throw new Exception("SD-Turbo pipeline not ready (a sub-model failed to load).");
+
+        // Introspection for the tiled-decode weight walk: dump the VAE up-block node sequence (OpType +
+        // inputs→outputs) so we can see the real conv/γ/β tensor names. VAE_INTROSPECT=1 dumps + exits.
+        if (Environment.GetEnvironmentVariable("VAE_INTROSPECT") == "1")
+        {
+            var vae = pipe.VaeDecoder!;
+            Console.WriteLine($"[INTROSPECT] VAE nodes={vae.NodeCount}, weights={vae.WeightCount}");
+            for (int i = 0; i < vae.NodeCount; i++)
+            {
+                var (op, ins, outs) = vae.GetNode(i);
+                string outName = outs.Length > 0 ? outs[0] : "";
+                Console.WriteLine($"  [{i,3}] {op,-22} in=[{string.Join(", ", ins)}] -> {outName}");
+            }
+            Console.WriteLine("[INTROSPECT] done"); return 0;
+        }
+
         pipe.NumInferenceSteps = 1;  // SD-Turbo is single-step
         pipe.GuidanceScale = 0f;     // SD-Turbo uses no classifier-free guidance
         if (seed.HasValue) pipe.Seed = seed.Value;

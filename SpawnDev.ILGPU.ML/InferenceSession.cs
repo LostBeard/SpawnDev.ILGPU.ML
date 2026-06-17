@@ -118,6 +118,14 @@ public class InferenceSession : IDisposable
         return (n.OpType, n.OutputNames.Length > 0 ? n.OutputNames[0] : "?");
     }
 
+    /// <summary>Full compiled-node view (OpType + input/output tensor names) by index — for the tiled VAE
+    /// decoder's weight walk (map conv/γ/β tensor names to nodes). The arrays are the live node's; do not mutate.</summary>
+    public (string opType, string[] inputs, string[] outputs) GetNode(int idx)
+    {
+        var n = _compiled.Nodes[idx];
+        return (n.OpType, n.InputNames, n.OutputNames);
+    }
+
     /// <summary>Model name (from graph metadata).</summary>
     public string ModelName { get; private set; } = "";
 
