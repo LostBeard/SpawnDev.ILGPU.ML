@@ -302,6 +302,10 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         {
             [_vaeDecoder!.InputNames[0]] = latentTensor,
         };
+        // Measurement aid: reset the (global, cross-session) peak counters right before VAE decode so the
+        // reported peak is VAE-ONLY — disambiguates whether the pipeline peak is the UNet or the VAE.
+        if (Environment.GetEnvironmentVariable("VAE_PEAK_ONLY") == "1")
+            SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetPeaks();
         var vaeOutputs = await _vaeDecoder.RunAsync(vaeInputs);
         var imageOutput = vaeOutputs[_vaeDecoder.OutputNames[0]]; // [1, 3, 512, 512]
 
