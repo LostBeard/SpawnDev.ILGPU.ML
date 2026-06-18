@@ -71,7 +71,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4;
 
     // Params buffers cached per (M,K,N). Never disposed mid-session: a WebGPU dispatch
     // that referenced the buffer may still be pending in the command encoder, and
@@ -166,6 +166,12 @@ public class FusedDequantMatMul : IDisposable
                         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_0Impl);
                     _gemvQ4_0(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
+                case GGMLType.MXFP4:
+                    _gemvMXFP4 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantMXFP4Impl);
+                    _gemvMXFP4(gemvConfig, input, intView, output, paramsBuf.View);
                     return;
             }
         }
@@ -597,6 +603,50 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    // MXFP4 GEMV (M==1 decode hot path): one thread GROUP per output column n, coalesced strided-k read +
+    // shared-mem tree reduction. Mirror of GemvDequantQ4_0Impl with the MXFP4 row stride (17B/block) and
+    // decode. Browser-GPU backends are excluded by the caller (WebGL = no shared mem; WebGPU = perf) and
+    // fall through to the per-element GEMM — same as every other type.
+    private static void GemvDequantMXFP4Impl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int rowBase = n * (K / 32 * 17);
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeMXFP4Element(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="col"/> of an MXFP4 row (17B/32: [e:E8M0][16 nibble bytes];
+    /// el j = low nibble of byte j, el j+16 = high nibble of byte j; value = kvalues_mxfp4[nibble]·e8m0_half(e)).
+    /// Shared by the MXFP4 GEMV; same layout inverse as the GEMM kernel.</summary>
+    internal static float DecodeMXFP4Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int within = col & 31;
+        int bOff = rowByteBase + (col >> 5) * 17;
+        float d = E8M0HalfToFloat(ReadByte(w, bOff));
+        int packed = ReadByte(w, bOff + 1 + (within & 15));
+        int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);  // within>=16 -> high nibble
+        return DecodeMXFP4Kvalue(nib) * d;
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q4_0 row (18B/32: [d:fp16][16 nibble bytes];
