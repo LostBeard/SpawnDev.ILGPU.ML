@@ -85,7 +85,7 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
         // executor (e.g. a shape-recompiled executor constructed without quantizedWeights — the
         // gemma4 seq>1 CUDA illegal-access, 2026-06-12). Dispatching the empty view is a GPU
         // null-pointer read; this exception names the actual cause instead.
-        if (!b.IsHalf && b.Data.Length < (long)K * N)
+        if (!LowPWeightDispatch.IsLowP(b) && b.Data.Length < (long)K * N)
             throw new InvalidOperationException(
                 $"MatMul: B '{bName ?? b.Name ?? "?"}' has no usable F32 data (view length {b.Data.Length}, " +
                 $"needs K*N={(long)K * N}). " +
@@ -94,18 +94,19 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
                       "quantized byte-view map (shape-recompiled executor missing quantizedWeights?)."
                     : $"ctx.QuantizedWeights has {ctx.QuantizedWeights.Count} entries but not '{bName}'."));
 
-        // f16-native weights: if B is a half-backed weight (fp16, no float buffer), route to the
-        // half-weight kernel (reads ILGPU.Half, fp32 accumulate). Activations (A) stay fp32.
+        // Native low-p weights: if B is a low-p-backed weight (Half/bf16/FP8, no float buffer), route to the
+        // generic low-p-weight kernel (reads the native type, converts in-register, fp32 accumulate, no f32
+        // temp). Activations (A) stay fp32. fp32 weights take the all-fp32 path.
         if (a.Rank == 2 && b.Rank == 2)
         {
-            if (b.IsHalf) reg.MatMul.MatMulHalfWeight(a.Data, b.HalfData, ctx.Outputs[0].Data, M, K, N);
+            if (LowPWeightDispatch.IsLowP(b)) LowPWeightDispatch.MatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, M, K, N);
             else reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
         }
         else
         {
             int batch = a.ElementCount / (M * K);
-            if (b.IsHalf)
-                reg.MatMul.BatchedMatMulHalfWeight(a.Data, b.HalfData, ctx.Outputs[0].Data, batch, M, K, N);
+            if (LowPWeightDispatch.IsLowP(b))
+                LowPWeightDispatch.BatchedMatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, batch, M, K, N);
             else
                 reg.MatMul.BatchedMatMul(a.Data, b.Data, ctx.Outputs[0].Data, batch, M, K, N);
         }
@@ -438,10 +439,10 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         // which fp16 weights load as half (only those whose consumer is half-capable), so this should never
         // fire — it's a hard guard so a half weight can't silently reach a path with no half kernel (its
         // float Data is empty). Add depthwise/NHWC/grouped/Conv1D half kernels to widen this.
-        if (w.IsHalf && (group != 1 || fmt != DataFormat.NCHW || x.Shape.Length != 4))
+        if (LowPWeightDispatch.IsLowP(w) && (group != 1 || fmt != DataFormat.NCHW || x.Shape.Length != 4))
             throw new NotSupportedException(
-                $"f16 Conv weight reached an unsupported path (group={group}, fmt={fmt}, rank={x.Shape.Length}); " +
-                "only standard NCHW group-1 2D Conv has a half-weight kernel so far.");
+                $"low-p ({w.DType}) Conv weight reached an unsupported path (group={group}, fmt={fmt}, rank={x.Shape.Length}); " +
+                "only standard NCHW group-1 2D Conv has a low-p-weight kernel so far.");
 
         // Always provide a valid bias buffer (zero-filled if no bias input)
         ArrayView1D<float, Stride1D.Dense> bias;
@@ -488,8 +489,8 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                 if (fmt == DataFormat.NHWC)
                     reg.Conv2D.ForwardNHWCPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
-                else if (w.IsHalf) // fp16 weight (NCHW group-1, per the guard above) -> half kernel, fp32 accumulate
-                    reg.Conv2D.ForwardPaddedHalfWeight(x.Data, w.HalfData, bias, ctx.Outputs[0].Data,
+                else if (LowPWeightDispatch.IsLowP(w)) // native low-p weight (NCHW group-1) -> generic low-p kernel, fp32 accumulate
+                    LowPWeightDispatch.Conv2DPadded(reg.Conv2D, x.Data, w, bias, ctx.Outputs[0].Data,
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
                 else
                     reg.Conv2D.ForwardPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,

@@ -262,6 +262,71 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The op-dispatch generalization: MatMulOperator.Execute routes a bf16-backed weight (Tensor.FromLowP&lt;
+    /// BFloat16&gt;, DType=BFloat16) through LowPWeightDispatch -> MatMulLowPWeight&lt;BFloat16&gt;, NOT the
+    /// fp32 path (which would read the empty .Data). Proves dispatch keys on the real DType, not the old
+    /// IsHalf bool - so a non-fp16 low-p weight stays native end to end. Matches a fp32 ref with the same
+    /// bf16-rounded weights.
+    /// </summary>
+    [TestMethod]
+    public Task F16_MatMulOperator_RoutesBFloat16Weight() => RunTest(async accelerator =>
+    {
+        int M = 4, K = 8, N = 4;
+        var rng = new Random(11);
+        var a = new float[M * K];
+        var w = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            var wBf16 = new global::ILGPU.BFloat16[w.Length];
+            for (int i = 0; i < w.Length; i++) wBf16[i] = (global::ILGPU.BFloat16)w[i];
+            using var wBuf = accelerator.Allocate1D(wBf16);
+            var bLowP = Tensor.FromLowP(wBuf.View, TensorDataType.BFloat16, new[] { K, N }, "b");
+            if (bLowP.DType != TensorDataType.BFloat16) throw new Exception("FromLowP should set DType=BFloat16");
+            if (bLowP.IsHalf) throw new Exception("a bf16 weight must NOT report IsHalf (that is fp16-only)");
+
+            using var aBuf = accelerator.Allocate1D(a);
+            using var outBuf = accelerator.Allocate1D<float>(M * N);
+            var aT = new Tensor(aBuf.View, new[] { M, K }, "a");
+            var outT = new Tensor(outBuf.View, new[] { M, N }, "out");
+
+            var registry = new OperatorRegistry(accelerator);
+            var op = new MatMulOperator(registry);
+            var ctx = new OnnxOpContext
+            {
+                Inputs = new[] { aT, bLowP },
+                Outputs = new[] { outT },
+                Attributes = new Dictionary<string, object>(),
+                Pool = pool,
+                InputNames = new[] { "a", "b" },
+                Registry = registry,
+            };
+            op.Execute(ctx);
+            await accelerator.SynchronizeAsync();
+            var gpuC = await outBuf.CopyToHostAsync<float>(0, M * N);
+
+            var cpuC = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++)
+                        s += a[r * K + k] * (float)wBf16[k * N + c];
+                    cpuC[r * N + c] = s;
+                }
+            float maxErr = 0f;
+            for (int i = 0; i < cpuC.Length; i++)
+                maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+            if (maxErr > 1e-3f)
+                throw new Exception($"MatMul operator bf16-weight routing maxErr={maxErr:E3} (expected < 1e-3)");
+        }
+        finally { pool.Dispose(); }
+    });
+
+    /// <summary>
     /// Slice 5: Conv2DKernel.ForwardHalfWeight (fp16 filter, fp32 accumulate) — Conv is the UNet's bulk, so
     /// this is the big SD-Turbo memory win. Matches a fp32 reference conv computed with the same fp16-rounded
     /// weights (isolates kernel correctness). NCHW, asymmetric-pad-capable, double accumulate like the float kernel.
