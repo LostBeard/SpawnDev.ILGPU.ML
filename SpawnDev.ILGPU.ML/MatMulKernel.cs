@@ -286,6 +286,32 @@ public class MatMulKernel
         C[idx] = sum;
     }
 
+    /// <summary>
+    /// MatMul with a TRANSPOSED native low-precision weight: C[M,N] = A[M,K] (fp32) × B[N,K]^T, i.e. B is
+    /// stored row-major [N,K] (the ONNX Gemm <c>transB=1</c> layout that Linear/Dense layers export). Reads
+    /// B row <c>n</c> contiguously (coalesced) and converts each element to float in-register via
+    /// PrecisionConvert - so the weight stays native (no f32 transpose temp; Rule 4 zero-copy). fp32 accumulate.
+    /// Mirror of <see cref="SimpleMatMulLowPWeightImpl{T}"/> with B indexed [n,k] instead of [k,n].
+    /// </summary>
+    private static void SimpleMatMulLowPWeightTransBImpl<T>(
+        Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<T, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+        where T : unmanaged, INumber<T>
+    {
+        int col = idx % N;
+        int row = idx / N;
+        if (row >= M) return;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[row * K + k] * PrecisionConvert.ConvertToSingle(B[col * K + k]);
+        C[idx] = sum;
+    }
+
+    private readonly Dictionary<Type, object> _simpleMatMulLowPWeightTransBKernels = new();
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -368,6 +394,27 @@ public class MatMulKernel
             _simpleMatMulLowPWeightKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulLowPWeightImpl<T>);
+        ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int>)k)(M * N, A, B, C, M, K, N);
+    }
+
+    /// <summary>
+    /// Matrix multiply with a TRANSPOSED native low-precision weight: C[M,N] = A[M,K] (fp32) × B[N,K]^T
+    /// (B stored row-major [N,K] = ONNX Gemm <c>transB=1</c>). The weight stays native (no f32 transpose
+    /// temp); each element converted to float in-register via PrecisionConvert, fp32 accumulate. Simple
+    /// (non-tiled) path - the same simple-kernel basis as <see cref="MatMulLowPWeight{T}"/>.
+    /// </summary>
+    public void MatMulLowPWeightTransB<T>(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<T, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+        where T : unmanaged, INumber<T>
+    {
+        if (!_simpleMatMulLowPWeightTransBKernels.TryGetValue(typeof(T), out var k))
+            _simpleMatMulLowPWeightTransBKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulLowPWeightTransBImpl<T>);
         ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int, int>)k)(M * N, A, B, C, M, K, N);
     }

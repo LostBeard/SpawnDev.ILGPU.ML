@@ -327,6 +327,83 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Gemm gate-widen: GemmOperator.Execute routes a NATIVE bf16-backed weight (Tensor.FromLowP, DType=BFloat16)
+    /// through LowPWeightDispatch — NOT the fp32 path (which would transpose the empty .Data). Covers BOTH ONNX
+    /// Gemm weight layouts: transB=0 (B=[K,N], via MatMulLowPWeight) and transB=1 (B=[N,K], the Linear/Dense
+    /// export, via the new transposed-low-p kernel MatMulLowPWeightTransB — zero-copy, no f32 transpose temp).
+    /// alpha=1/beta=0/no-bias isolates the weight routing (the alpha/beta/bias path is shared fp32 code).
+    /// Matches a fp32 reference computed with the same bf16-rounded weights.
+    /// </summary>
+    [TestMethod]
+    public Task F16_GemmOperator_RoutesBFloat16Weight() => RunTest(async accelerator =>
+    {
+        int M = 4, K = 8, N = 5;
+        var rng = new Random(23);
+        var a = new float[M * K];
+        var w = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+        var wBf16 = new global::ILGPU.BFloat16[w.Length];
+        for (int i = 0; i < w.Length; i++) wBf16[i] = (global::ILGPU.BFloat16)w[i];
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            // For transB=1 the weight is stored [N,K] (= the [K,N] values transposed). Same underlying bf16
+            // values, different layout — so the transposed kernel must read B[col*K+k] and still match.
+            var wBf16T = new global::ILGPU.BFloat16[w.Length]; // [N,K]
+            for (int kk = 0; kk < K; kk++)
+                for (int nn = 0; nn < N; nn++)
+                    wBf16T[nn * K + kk] = wBf16[kk * N + nn];
+
+            foreach (var transB in new[] { 0, 1 })
+            {
+                var wData = transB == 0 ? wBf16 : wBf16T;
+                var wShape = transB == 0 ? new[] { K, N } : new[] { N, K };
+                using var wBuf = accelerator.Allocate1D(wData);
+                var bLowP = Tensor.FromLowP(wBuf.View, TensorDataType.BFloat16, wShape, "b");
+                if (bLowP.DType != TensorDataType.BFloat16) throw new Exception("FromLowP should set DType=BFloat16");
+
+                using var aBuf = accelerator.Allocate1D(a);
+                using var outBuf = accelerator.Allocate1D<float>(M * N);
+                var aT = new Tensor(aBuf.View, new[] { M, K }, "a");
+                var outT = new Tensor(outBuf.View, new[] { M, N }, "out");
+
+                var registry = new OperatorRegistry(accelerator);
+                var op = new GemmOperator(registry);
+                var ctx = new OnnxOpContext
+                {
+                    Inputs = new[] { aT, bLowP },
+                    Outputs = new[] { outT },
+                    Attributes = new Dictionary<string, object> { ["transB"] = (long)transB, ["alpha"] = 1f, ["beta"] = 0f },
+                    Pool = pool,
+                    InputNames = new[] { "a", "b" },
+                    Registry = registry,
+                };
+                op.Execute(ctx);
+                await accelerator.SynchronizeAsync();
+                var gpuC = await outBuf.CopyToHostAsync<float>(0, M * N);
+
+                var cpuC = new float[M * N];
+                for (int r = 0; r < M; r++)
+                    for (int c = 0; c < N; c++)
+                    {
+                        float s = 0f;
+                        for (int k = 0; k < K; k++)
+                            s += a[r * K + k] * (float)wBf16[k * N + c]; // reference always uses [K,N] values
+                        cpuC[r * N + c] = s;
+                    }
+                float maxErr = 0f;
+                for (int i = 0; i < cpuC.Length; i++)
+                    maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+                if (maxErr > 1e-3f)
+                    throw new Exception($"Gemm bf16-weight routing (transB={transB}) maxErr={maxErr:E3} (expected < 1e-3)");
+            }
+        }
+        finally { pool.Dispose(); }
+    });
+
+    /// <summary>
     /// Slice 5: Conv2DKernel.ForwardHalfWeight (fp16 filter, fp32 accumulate) — Conv is the UNet's bulk, so
     /// this is the big SD-Turbo memory win. Matches a fp32 reference conv computed with the same fp16-rounded
     /// weights (isolates kernel correctness). NCHW, asymmetric-pad-capable, double accumulate like the float kernel.

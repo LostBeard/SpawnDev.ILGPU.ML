@@ -1437,15 +1437,28 @@ public class GemmOperator(OperatorRegistry reg) : IOnnxOperator
             aData = aTransposed.Data;
         }
 
-        if (transB != 0)
+        // NATIVE low-p weight (Half/bf16/FP8, no f32 .Data): keep it native - the kernel converts each weight
+        // to float in-register (PrecisionConvert), fp32 accumulate, no f32 transpose temp (Rule 4 zero-copy).
+        // transB=1 (B stored [N,K] - the Linear/Dense export) uses the transposed-weight kernel directly;
+        // transB=0 (B is [K,N]) uses the standard low-p matmul. A is the fp32 activation (transA handled above).
+        if (LowPWeightDispatch.IsLowP(b))
         {
-            // B is [N, K], need [K, N] for MatMul
-            bTransposed = ctx.Pool.Rent(new[] { K, N }, "_gemm_bT");
-            reg.Transpose.Transpose(b.Data, bTransposed.Data, b.Shape.Length == 2 ? b.Shape : new[] { N, K }, new[] { 1, 0 });
-            bData = bTransposed.Data;
+            if (transB != 0)
+                LowPWeightDispatch.MatMulTransB(reg.MatMul, aData, b, ctx.Outputs[0].Data, M, K, N);
+            else
+                LowPWeightDispatch.MatMul(reg.MatMul, aData, b, ctx.Outputs[0].Data, M, K, N);
         }
-
-        reg.MatMul.MatMul(aData, bData, ctx.Outputs[0].Data, M, K, N);
+        else
+        {
+            if (transB != 0)
+            {
+                // B is [N, K], need [K, N] for MatMul
+                bTransposed = ctx.Pool.Rent(new[] { K, N }, "_gemm_bT");
+                reg.Transpose.Transpose(b.Data, bTransposed.Data, b.Shape.Length == 2 ? b.Shape : new[] { N, K }, new[] { 1, 0 });
+                bData = bTransposed.Data;
+            }
+            reg.MatMul.MatMul(aData, bData, ctx.Outputs[0].Data, M, K, N);
+        }
 
         if (aTransposed != null) ctx.Pool.Return(aTransposed);
         if (bTransposed != null) ctx.Pool.Return(bTransposed);

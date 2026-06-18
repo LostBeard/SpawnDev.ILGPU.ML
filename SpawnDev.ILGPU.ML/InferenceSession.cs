@@ -1073,9 +1073,10 @@ public class InferenceSession : IDisposable
 
         // ── f16 weight gating ──
         // An fp16 initializer is loaded as HALF (ILGPU.Half — half the GPU bytes) only if EVERY node that
-        // consumes it does so as the WEIGHT operand (input index 1) of a HALF-CAPABLE op: MatMul, or a
-        // standard NCHW group-1 Conv. Anything else (shared weight, non-weight use, depthwise/grouped Conv,
-        // ConvTranspose, Gemm — none wired for half yet) keeps it fp32. The MatMul/Conv operator guards are
+        // consumes it does so as the WEIGHT operand (input index 1) of a HALF-CAPABLE op: MatMul, Gemm
+        // (both transB layouts — native low-p + transposed-low-p kernels), or a standard NCHW group-1 Conv.
+        // Anything else (shared weight, non-weight use, depthwise/grouped Conv, ConvTranspose — not wired for
+        // half yet) keeps it fp32. The MatMul/Conv operator guards are
         // the runtime safety net: a mis-gated half weight throws clearly instead of corrupting. (Generic
         // kernels later will let the loader half ALL fp16 weights with no gating; until then, conservative.)
         var halfEligible = new HashSet<string>();
@@ -1091,7 +1092,7 @@ public class InferenceSession : IDisposable
                 var inName = ins[oi];
                 if (string.IsNullOrEmpty(inName)) continue;
                 int convGroup = node.OpType == "Conv" && node.Attributes.TryGetValue("group", out var gv) && gv is long gl ? (int)gl : 1;
-                bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || (node.OpType == "Conv" && convGroup == 1));
+                bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || node.OpType == "Gemm" || (node.OpType == "Conv" && convGroup == 1));
                 if (okAsWeight) halfEligible.Add(inName);
                 else
                 {

@@ -37,6 +37,21 @@ internal static class LowPWeightDispatch
         }
     }
 
+    /// <summary>MatMul C[M,N] = A[M,K] (fp32) × B[N,K]^T (native low-p, transB layout), fp32 accumulate.</summary>
+    public static void MatMulTransB(MatMulKernel mm,
+        ArrayView1D<float, Stride1D.Dense> a, Tensor b, ArrayView1D<float, Stride1D.Dense> c,
+        int M, int K, int N)
+    {
+        switch (b.DType)
+        {
+            case TensorDataType.Float16: mm.MatMulLowPWeightTransB(a, b.AsView<global::ILGPU.Half>(), c, M, K, N); break;
+            case TensorDataType.BFloat16: mm.MatMulLowPWeightTransB(a, b.AsView<BFloat16>(), c, M, K, N); break;
+            case TensorDataType.Float8E4M3: mm.MatMulLowPWeightTransB(a, b.AsView<Float8E4M3>(), c, M, K, N); break;
+            case TensorDataType.Float8E5M2: mm.MatMulLowPWeightTransB(a, b.AsView<Float8E5M2>(), c, M, K, N); break;
+            default: throw Unexpected(b);
+        }
+    }
+
     /// <summary>Batched MatMul C[b] = A[b] × B (native low-p, shared weight), fp32 accumulate.</summary>
     public static void BatchedMatMul(MatMulKernel mm,
         ArrayView1D<float, Stride1D.Dense> a, Tensor b, ArrayView1D<float, Stride1D.Dense> c,
