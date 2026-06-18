@@ -43,7 +43,7 @@ public class OperatorRegistry : IDisposable
         "IsInf", "IsNaN", "LRN", "LSTM", "LayerNormalization", "LeakyRelu", "Less", "LessOrEqual",
         "Log", "LogSoftmax", "Loop", "LpNormalization", "LpPool", "MatMul", "MatMulInteger", "Max",
         "MaxPool", "MaxRoiPool", "MaxUnpool", "Mean", "MeanVarianceNormalization", "MelWeightMatrix", "Min", "Mish",
-        "Mod", "Mul", "Multinomial", "Neg", "NegativeLogLikelihoodLoss", "NonMaxSuppression", "NonZero", "Not",
+        "MoE", "Mod", "Mul", "Multinomial", "Neg", "NegativeLogLikelihoodLoss", "NonMaxSuppression", "NonZero", "Not",
         "OneHot", "Optional", "OptionalGetElement", "OptionalHasElement", "Or", "PRelu", "Pad", "Pow",
         "QLinearConv", "QLinearMatMul", "QuantizeLinear", "RNN", "RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike",
         "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
@@ -76,6 +76,7 @@ public class OperatorRegistry : IDisposable
     public ConvTranspose2DKernel ConvTranspose { get; }
     public Kernels.FusedDequantMatMul FusedDequant { get; }
     public Kernels.FusedDequantGather FusedDequantGather { get; }
+    public Kernels.MoEKernels MoE { get; }
     public Kernels.RoPEKernel RoPE { get; }
     public Kernels.FusedAttentionKernel FusedAttention { get; }
     public Kernels.SliceKernel Slice { get; }
@@ -118,6 +119,7 @@ public class OperatorRegistry : IDisposable
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
         FusedDequantGather = new Kernels.FusedDequantGather(accelerator);
+        MoE = new Kernels.MoEKernels(accelerator);
         RoPE = new Kernels.RoPEKernel(accelerator);
         FusedAttention = new Kernels.FusedAttentionKernel(accelerator);
         Slice = new Kernels.SliceKernel(accelerator);
@@ -208,6 +210,7 @@ public class OperatorRegistry : IDisposable
         Register(new SliceOperator(this));
         Register(new DropoutOperator(this));
         Register(new GemmOperator(this));
+        Register(new MoEOperator(this));
         Register(new InstanceNormOperator(this));
         Register(new GroupNormOperator(_accelerator));
         Register(new ConstantOperator());
