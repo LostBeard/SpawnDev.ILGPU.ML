@@ -47,15 +47,49 @@ public class Tensor
     // fp32 (IsHalf == false). The f16 spike (2026-06-05) proved ILGPU.Half storage + fp32 compute on all
     // 6 backends; a generic-math (System.Half) kernel does not compile (BitCast intrinsic).
 
-    /// <summary>True if the data is fp16 in <see cref="HalfData"/> (a weight), not fp32 in <see cref="Data"/>.</summary>
-    public bool IsHalf { get; }
+    /// <summary>Storage element type. <see cref="TensorDataType.Float32"/> = activations / fp32 weights (data in
+    /// <see cref="Data"/>); any low-precision value = a native-typed weight (data in the low-p view, <see cref="Data"/>
+    /// empty). Replaces the old <c>bool IsHalf</c> — a bool could only say fp16-or-fp32; weights now stay native in
+    /// any low-p type and convert to f32 only at the arithmetic, in-kernel, via <c>ILGPU.PrecisionConvert</c>.</summary>
+    public TensorDataType DType { get; } = TensorDataType.Float32;
 
-    /// <summary>fp16 GPU data view — valid IFF <see cref="IsHalf"/>. Length == ElementCount.</summary>
-    public ArrayView1D<global::ILGPU.Half, Stride1D.Dense> HalfData { get; }
+    /// <summary>True iff the data is fp16 (<c>ILGPU.Half</c>) in <see cref="HalfData"/>, not fp32 in <see cref="Data"/>.
+    /// Back-compat alias for <c>DType == TensorDataType.Float16</c> — existing weight consumers that branch on this keep
+    /// working unchanged (only fp16 weights are loaded low-p today; bf16/FP8 land as the op dispatch moves to DType).</summary>
+    public bool IsHalf => DType == TensorDataType.Float16;
+
+    // Low-precision weight storage: the native-typed GPU view (ILGPU.Half / BFloat16 / Float8E*) is boxed once
+    // (a weight is created once) and read back via AsView<T>(). NO float buffer is allocated (Data is empty); the
+    // op kernel reads the native type + converts to f32 in-register via PrecisionConvert (no f32 temp buffer).
+    private readonly object? _lowPView;
+
+    /// <summary>The native low-precision GPU view as <typeparamref name="T"/> — must match <see cref="DType"/>
+    /// (Half↔Float16, BFloat16↔BFloat16, Float8E4M3/E5M2↔FP8). Length == ElementCount. Throws if this tensor is not
+    /// stored as <typeparamref name="T"/> (e.g. an fp32 activation, or a dtype mismatch) — fails loud, never silent.</summary>
+    public ArrayView1D<T, Stride1D.Dense> AsView<T>() where T : unmanaged
+        => _lowPView is ArrayView1D<T, Stride1D.Dense> v
+            ? v
+            : throw new InvalidOperationException($"Tensor '{Name}' is {DType}; cannot view it as {typeof(T).Name}.");
+
+    /// <summary>fp16 GPU data view — valid IFF <see cref="IsHalf"/>. Back-compat alias for <c>AsView&lt;Half&gt;()</c>.</summary>
+    public ArrayView1D<global::ILGPU.Half, Stride1D.Dense> HalfData
+        => _lowPView is ArrayView1D<global::ILGPU.Half, Stride1D.Dense> v ? v : default;
 
     /// <summary>Wrap a fp16 <see cref="HalfTensor"/> as a half-backed Tensor for the graph (carries shape
     /// + the ILGPU.Half view; NO float buffer). The executor map stays Tensor-typed; handlers check IsHalf.</summary>
     public static Tensor FromHalf(HalfTensor half) => new Tensor(half.Data, half.Shape, half.Name);
+
+    /// <summary>Wrap a native low-precision GPU view (<c>ILGPU.Half</c> / <c>BFloat16</c> / <c>Float8E4M3</c> /
+    /// <c>Float8E5M2</c>) as a low-p-backed Tensor (carries shape + the typed view; NO float buffer). The executor
+    /// map stays Tensor-typed; weight handlers switch on <see cref="DType"/> and read via <see cref="AsView{T}"/>.</summary>
+    public static Tensor FromLowP<T>(ArrayView1D<T, Stride1D.Dense> view, TensorDataType dtype, int[] shape, string? name = null)
+        where T : unmanaged
+    {
+        int count = TensorHelpers.ElementCount(shape);
+        if (view.Length < count)
+            throw new ArgumentException($"Low-p data length {view.Length} < shape element count {count}");
+        return new Tensor((object)view.SubView(0, count), dtype, shape, name);
+    }
 
     /// <summary>
     /// A shape-only tensor with NO backing buffer - for graph entries whose real data
@@ -80,12 +114,22 @@ public class Tensor
         int count = TensorHelpers.ElementCount(shape);
         if (halfData.Length < count)
             throw new ArgumentException($"Half data length {halfData.Length} < shape element count {count}");
-        HalfData = halfData.SubView(0, count);
-        IsHalf = true;
+        _lowPView = halfData.SubView(0, count);
+        DType = TensorDataType.Float16;
         Shape = shape;
         Strides = TensorHelpers.ComputeStrides(shape);
         Name = name;
-        // Data (float) intentionally left empty — a half-backed tensor has NO float buffer.
+        // Data (float) intentionally left empty — a low-p-backed tensor has NO float buffer.
+    }
+
+    private Tensor(object lowPView, TensorDataType dtype, int[] shape, string? name)
+    {
+        _lowPView = lowPView;
+        DType = dtype;
+        Shape = shape;
+        Strides = TensorHelpers.ComputeStrides(shape);
+        Name = name;
+        // Data (float) intentionally left empty — a low-p-backed tensor has NO float buffer.
     }
 
     /// <summary>Number of dimensions.</summary>
