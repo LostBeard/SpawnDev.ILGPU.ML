@@ -15,6 +15,64 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 public abstract partial class MLTestBase
 {
+    /// <summary>
+    /// Attention sinks (gpt-oss): a per-head learned logit joins the softmax denominator (its value is 0).
+    /// FusedAttentionKernel with sinks vs a CPU softmax-with-sink reference. Also implicitly proves the
+    /// no-sinks path is unchanged (sinkCount=0 leaves the kernel identical).
+    /// </summary>
+    [TestMethod]
+    public Task Attention_Sinks_MatchesCpuReference() => RunTest(async accelerator =>
+    {
+        int nHeads = 2, seqQ = 2, seqKV = 3, D = 4;
+        float scale = 1f / MathF.Sqrt(D);
+        var rng = new Random(83);
+        float R() => (float)(rng.NextDouble() * 2 - 1);
+        var Q = new float[nHeads * seqQ * D];
+        var K = new float[nHeads * seqKV * D];
+        var V = new float[nHeads * seqKV * D];
+        var sinks = new float[nHeads];
+        foreach (var a in new[] { Q, K, V, sinks }) for (int i = 0; i < a.Length; i++) a[i] = R();
+
+        // CPU reference: bidirectional (no mask), sink in the softmax max + denominator, 0 value contribution.
+        var expected = new float[nHeads * seqQ * D];
+        for (int h = 0; h < nHeads; h++)
+            for (int q = 0; q < seqQ; q++)
+            {
+                var sc = new float[seqKV];
+                float m = sinks[h];
+                for (int kv = 0; kv < seqKV; kv++)
+                {
+                    float dot = 0f;
+                    for (int dd = 0; dd < D; dd++) dot += Q[(h * seqQ + q) * D + dd] * K[(h * seqKV + kv) * D + dd];
+                    sc[kv] = dot * scale; m = MathF.Max(m, sc[kv]);
+                }
+                float denom = MathF.Exp(sinks[h] - m);
+                for (int kv = 0; kv < seqKV; kv++) denom += MathF.Exp(sc[kv] - m);
+                for (int dd = 0; dd < D; dd++)
+                {
+                    float acc = 0f;
+                    for (int kv = 0; kv < seqKV; kv++) acc += MathF.Exp(sc[kv] - m) * V[(h * seqKV + kv) * D + dd];
+                    expected[(h * seqQ + q) * D + dd] = acc / denom;
+                }
+            }
+
+        using var qb = accelerator.Allocate1D(Q);
+        using var kb = accelerator.Allocate1D(K);
+        using var vb = accelerator.Allocate1D(V);
+        using var sb = accelerator.Allocate1D(sinks);
+        using var ob = accelerator.Allocate1D<float>(nHeads * seqQ * D);
+        using var attn = new Kernels.FusedAttentionKernel(accelerator);
+        int bigWindow = seqKV + seqQ + 8;
+        attn.Forward(qb.View, kb.View, vb.View, ob.View, nHeads, nHeads, seqQ, seqKV, D,
+            causal: false, window: bigWindow, kvOffset: 0, scale: scale, sinks: sb.View, sinkCount: nHeads);
+        await accelerator.SynchronizeAsync();
+        var gpu = await ob.CopyToHostAsync<float>(0, nHeads * seqQ * D);
+
+        float maxErr = 0f;
+        for (int i = 0; i < expected.Length; i++) maxErr = MathF.Max(maxErr, MathF.Abs(gpu[i] - expected[i]));
+        if (maxErr > 1e-4f) throw new Exception($"Attention sinks vs CPU maxErr={maxErr:E3} (expected < 1e-4)");
+    });
+
     [TestMethod]
     public Task MoE_GptOss_MatchesCpuReference() => RunTest(async accelerator =>
     {

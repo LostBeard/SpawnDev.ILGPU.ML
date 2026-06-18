@@ -38,7 +38,12 @@ public class FusedAttentionKernel : IDisposable
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _kernel;
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _kernel;
+
+    // Dummy 1-element sinks buffer for the no-sinks case (the kernel always takes a sinks view but only
+    // reads it when sinkCount > 0). gpt-oss/OpenAI-MoE attention passes real per-head sink logits.
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dummySinks;
 
     // Params-buffer ring: each call gets its own buffer (per-layer window/kvOffset/seqKV
     // differ within one batched command encoder, so a single mutated buffer would feed
@@ -97,7 +102,8 @@ public class FusedAttentionKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> V,
         ArrayView1D<float, Stride1D.Dense> output,
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
-        bool causal, int window, int kvOffset, float scale)
+        bool causal, int window, int kvOffset, float scale,
+        ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0)
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
         if (kvHeads <= 0 || nHeads % kvHeads != 0)
@@ -117,6 +123,7 @@ public class FusedAttentionKernel : IDisposable
             BitConverter.SingleToInt32Bits(effScale),
             causal ? 1 : 0, effWindow, kvOffset,
             nHeads / kvHeads, // GQA group size: query head h reads kv head h / group
+            sinkCount,        // p[9]: >0 => fold per-head sink logit into the softmax denominator
         };
 
         var slot = _ringNext;
@@ -127,10 +134,13 @@ public class FusedAttentionKernel : IDisposable
         _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
+
+        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
+        var sinksView = sinks ?? _dummySinks.View;
 
         // One thread per output element: nHeads * seqQ * headDim
-        _kernel(nHeads * seqQ * headDim, Q, K, V, output, _paramsRing[slot]!.View);
+        _kernel(nHeads * seqQ * headDim, Q, K, V, output, sinksView, _paramsRing[slot]!.View);
     }
 
     /// <summary>
@@ -146,6 +156,7 @@ public class FusedAttentionKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> K,
         ArrayView1D<float, Stride1D.Dense> V,
         ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
         ArrayView1D<int, Stride1D.Dense> p)
     {
         int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
@@ -154,6 +165,7 @@ public class FusedAttentionKernel : IDisposable
         int window = p[6];
         int kvOffset = p[7];
         int gqaGroup = p[8]; // nHeads / kvHeads; query head bh reads kv head bh / gqaGroup
+        int sinkCount = p[9]; // 0 => no sinks; else per-head sink logit count (gpt-oss attention sinks)
 
         // Decompose index: [bh, sq, d]
         int d = idx % D;
@@ -200,6 +212,20 @@ public class FusedAttentionKernel : IDisposable
             runningMax = newMax;
         }
 
+        // Attention sinks (gpt-oss): a per-head learned logit joins the softmax as if it were one more score
+        // whose value vector is 0 - it participates in the max + denominator but adds nothing to the numerator.
+        // Equivalent to concatenating the sink to the scores before softmax. sinkCount is uniform across all
+        // threads (no warp divergence). sink index = head within the batch (bh % sinkCount).
+        if (sinkCount > 0)
+        {
+            float sink = sinks[bh % sinkCount];
+            float newMax = MathF.Max(runningMax, sink);
+            float correction = MathF.Exp(runningMax - newMax);
+            runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+            weightedV = weightedV * correction; // sink contributes 0 to the value sum
+            runningMax = newMax;
+        }
+
         output[idx] = weightedV / (runningSum + 1e-10f);
     }
 
@@ -207,5 +233,7 @@ public class FusedAttentionKernel : IDisposable
     {
         foreach (var buf in _paramsRing) buf?.Dispose();
         Array.Clear(_paramsRing);
+        _dummySinks?.Dispose();
+        _dummySinks = null;
     }
 }
