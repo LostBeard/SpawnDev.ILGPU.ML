@@ -21,6 +21,13 @@ public static class OnnxLoader
     /// <summary>
     /// Load an ONNX model from raw bytes.
     /// Returns the model graph info and weight store ready for InferenceSession.
+    /// <para>
+    /// MATERIALIZES THE WHOLE MODEL in the managed heap (parses every weight to <c>float[]</c>). In Blazor
+    /// WASM prefer the streaming load path - <see cref="InferenceSession.CreateFromOnnxStreamAsync"/> over a
+    /// seekable JS-backed <see cref="System.IO.Stream"/> (an <see cref="SpawnDev.BlazorJS.Toolbox.IJSReadStream"/>
+    /// such as a WebTorrent piece stream / <c>HttpRangeStream</c> / <c>BlobStream</c>) - which streams each
+    /// weight JS-side straight to the GPU via <c>CopyFromJS</c> without ever entering the .NET heap.
+    /// </para>
     /// </summary>
     /// <param name="onnxBytes">Raw .onnx file bytes</param>
     /// <param name="accelerator">GPU accelerator for weight upload</param>
@@ -166,6 +173,13 @@ public static class OnnxLoader
     /// <summary>
     /// Parse an ONNX file and return just the model info (no weights).
     /// Useful for inspecting a model before loading weights to GPU.
+    /// <para>
+    /// Although only the graph metadata is returned, this overload still reads the ENTIRE <paramref name="onnxBytes"/>
+    /// into the managed heap to parse it. For metadata-only inspection of a large / remote model in Blazor WASM,
+    /// use the streaming inspector (<see cref="ModelInspectorHelper"/> streaming APIs / <c>HubModelStream.InspectAsync</c>)
+    /// or <see cref="OnnxParser.ParseFromStreamAsync"/> over a seekable stream - both SEEK PAST every weight blob,
+    /// so only the few hundred KB of graph structure is ever read (never the weights).
+    /// </para>
     /// </summary>
     public static OnnxModelInfo ParseModelInfo(byte[] onnxBytes)
     {
@@ -175,6 +189,11 @@ public static class OnnxLoader
 
     /// <summary>
     /// Get a summary of an ONNX model (for display/logging).
+    /// <para>
+    /// MATERIALIZES THE WHOLE MODEL in the managed heap. In Blazor WASM prefer the streaming inspector
+    /// (<c>HubModelStream.InspectAsync</c> / <see cref="ModelInspectorHelper"/> streaming APIs), which reads
+    /// only graph structure and seeks past every weight blob.
+    /// </para>
     /// </summary>
     public static string GetModelSummary(byte[] onnxBytes)
     {
