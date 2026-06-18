@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using System.Numerics;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -28,14 +29,10 @@ public class Conv2DKernel : IDisposable
         int, int, int, int, int, int, int, int, int, int>?
         _conv2dKernel;
 
-    // f16 weights: identical to _conv2dKernel but the WEIGHT (2nd view) is ILGPU.Half (half the bytes).
-    private Action<Index1D,
-        ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>,
-        int, int, int, int, int, int, int, int, int, int>?
-        _conv2dHalfWeightKernel;
+    // Native low-precision weights: identical to _conv2dKernel but the WEIGHT (2nd view) is a low-p type T
+    // (ILGPU.Half / BFloat16 / Float8E*). One compiled kernel per concrete T, cached; lazily loaded on first
+    // use of that type. object-typed because each delegate is T-specific.
+    private readonly Dictionary<Type, object> _conv2dLowPWeightKernels = new();
 
     // params: C, inH, inW, kH, kW, stride, padTL(packed), outHW(packed), dilHW(packed)
     private Action<Index1D,
@@ -119,19 +116,21 @@ public class Conv2DKernel : IDisposable
     }
 
     /// <summary>
-    /// Conv2D NCHW with fp16 (ILGPU.Half) WEIGHTS — identical math to Conv2DImpl, but each filter weight is
-    /// read as ILGPU.Half and upconverted to float for the double-precision accumulation. Half the weight
-    /// memory, no accuracy loss (input/bias/output stay fp32). The UNet is mostly Conv, so this is the bulk
-    /// of the f16 memory win for SD-Turbo. The f16 spike proved ILGPU.Half storage + fp32 compute on all 6.
+    /// Conv2D NCHW with NATIVE low-precision WEIGHTS (<typeparamref name="T"/> = ILGPU.Half / BFloat16 /
+    /// Float8E*) — identical math to Conv2DImpl, but each filter weight is read NATIVELY and converted to
+    /// float in-register (PrecisionConvert) for the double-precision accumulation. The weight stays native in
+    /// GPU memory (no f32 temp buffer); input/bias/output stay fp32, no accuracy loss. The UNet is mostly
+    /// Conv, so this is the bulk of the low-p memory win for SD-Turbo.
     /// </summary>
-    private static void Conv2DHalfWeightImpl(
+    private static void Conv2DLowPWeightImpl<T>(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
-        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
+        ArrayView1D<T, Stride1D.Dense> weight,
         ArrayView1D<float, Stride1D.Dense> bias,
         ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW, int outC, int kH, int kW,
         int stride, int padTL, int outHW, int dilHW)
+        where T : unmanaged, INumber<T>
     {
         int padTop = padTL >> 8, padLeft = padTL & 0xFF;
         int outH = outHW >> 16, outW = outHW & 0xFFFF;
@@ -157,7 +156,7 @@ public class Conv2DKernel : IDisposable
                     int ix = ox * stride + kx * dilationW - padLeft;
                     if (ix < 0 || ix >= inW) continue;
 
-                    sum += (double)input[icBase + iy * inW + ix] * (double)(float)weight[wcBase + ky * kW + kx];
+                    sum += (double)input[icBase + iy * inW + ix] * (double)PrecisionConvert.ConvertToSingle(weight[wcBase + ky * kW + kx]);
                 }
             }
         }
@@ -230,8 +229,8 @@ public class Conv2DKernel : IDisposable
         }
     }
 
-    /// <summary>fp16-weight Conv2D NCHW (asymmetric ONNX pads). Identical to <see cref="ForwardPadded"/>
-    /// but the weight is ILGPU.Half (half the bytes); routes to the half-weight kernel (fp32 accumulate).</summary>
+    /// <summary>fp16-weight Conv2D NCHW (asymmetric ONNX pads). T=Half wrapper over
+    /// <see cref="ForwardPaddedLowPWeight{T}"/> (callers unchanged).</summary>
     public void ForwardPaddedHalfWeight(
         ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<global::ILGPU.Half, Stride1D.Dense> weight,
@@ -241,23 +240,55 @@ public class Conv2DKernel : IDisposable
         int outC, int kH, int kW,
         int stride, int padTop, int padLeft, int padBottom, int padRight,
         int dilationH = 1, int dilationW = 1)
+        => ForwardPaddedLowPWeight(input, weight, bias, output, inC, inH, inW, outC, kH, kW,
+            stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+
+    /// <summary>Conv2D NCHW (asymmetric ONNX pads) with NATIVE low-precision weights (<typeparamref name="T"/>
+    /// = ILGPU.Half / BFloat16 / Float8E*). Identical to <see cref="ForwardPadded"/> but the weight stays
+    /// native in GPU memory (no f32 temp); each weight is converted to float in-register via PrecisionConvert,
+    /// fp32/fp64 accumulate.</summary>
+    public void ForwardPaddedLowPWeight<T>(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<T, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW,
+        int outC, int kH, int kW,
+        int stride, int padTop, int padLeft, int padBottom, int padRight,
+        int dilationH = 1, int dilationW = 1)
+        where T : unmanaged, INumber<T>
     {
-        EnsureLoaded();
+        var kernel = GetConv2DLowPWeightKernel<T>();
         int effKH = dilationH * (kH - 1) + 1;
         int effKW = dilationW * (kW - 1) + 1;
         int outH = (inH + padTop + padBottom - effKH) / stride + 1;
         int outW = (inW + padLeft + padRight - effKW) / stride + 1;
         if (outH <= 0 || outW <= 0)
             throw new InvalidOperationException(
-                $"Conv2D(f16) output dims invalid: outH={outH}, outW={outW} (inH={inH}, inW={inW}, kH={kH}, kW={kW}, " +
+                $"Conv2D(low-p) output dims invalid: outH={outH}, outW={outW} (inH={inH}, inW={inW}, kH={kH}, kW={kW}, " +
                 $"stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}).");
         int totalOutputElements = outC * outH * outW;
         _convCallCount++;
         if (output.Length < totalOutputElements)
             throw new InvalidOperationException(
-                $"Conv2D(f16) NCHW output buffer too small: output.Length={output.Length} < {totalOutputElements} elements.");
-        _conv2dHalfWeightKernel!(totalOutputElements, input, weight, bias, output,
+                $"Conv2D(low-p) NCHW output buffer too small: output.Length={output.Length} < {totalOutputElements} elements.");
+        kernel(totalOutputElements, input, weight, bias, output,
             inC, inH, inW, outC, kH, kW, stride, (padTop << 8) | padLeft, (outH << 16) | outW, (dilationH << 8) | dilationW);
+    }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int> GetConv2DLowPWeightKernel<T>()
+        where T : unmanaged, INumber<T>
+    {
+        if (!_conv2dLowPWeightKernels.TryGetValue(typeof(T), out var k))
+            _conv2dLowPWeightKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                int, int, int, int, int, int, int, int, int, int>(Conv2DLowPWeightImpl<T>);
+        return (Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int, int, int, int, int, int>)k;
     }
 
     /// <summary>fp16-weight Conv2D NCHW (symmetric padding). See <see cref="Forward"/>.</summary>
@@ -524,12 +555,7 @@ public class Conv2DKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int, int, int, int, int, int, int>(Conv2DImpl);
-        _conv2dHalfWeightKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>,
-            int, int, int, int, int, int, int, int, int, int>(Conv2DHalfWeightImpl);
+        // Low-p-weight conv kernels are lazy per concrete T (see ForwardPaddedLowPWeight / GetConv2DLowPWeightKernel).
         _depthwiseKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,

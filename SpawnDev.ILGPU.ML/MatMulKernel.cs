@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace SpawnDev.ILGPU.ML;
@@ -242,31 +243,34 @@ public class MatMulKernel
     /// accuracy loss vs the all-fp32 kernel. One thread per output element, no shared memory (works on
     /// every backend incl. WGSL; the f16 spike proved ILGPU.Half storage + fp32 compute everywhere).
     /// </summary>
-    private static void SimpleMatMulHalfWeightImpl(
+    private static void SimpleMatMulLowPWeightImpl<T>(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> A,
-        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
+        ArrayView1D<T, Stride1D.Dense> B,
         ArrayView1D<float, Stride1D.Dense> C,
         int M, int K, int N)
+        where T : unmanaged, INumber<T>
     {
         int col = idx % N;
         int row = idx / N;
         if (row >= M) return;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[row * K + k] * (float)B[k * N + col];
+            sum += A[row * K + k] * PrecisionConvert.ConvertToSingle(B[k * N + col]);
         C[idx] = sum;
     }
 
-    /// <summary>Batched MatMul with fp16 (ILGPU.Half) weights in B — e.g. SD-Turbo attention projections
-    /// (2D weight, rank-3 activation -> batched path; batch=1 so bOff=0 reads the shared weight). Upconverts
-    /// each weight to float, fp32 accumulate. Mirrors SimpleBatchedMatMulImpl.</summary>
-    private static void SimpleBatchedMatMulHalfWeightImpl(
+    /// <summary>Batched MatMul with native low-precision weights in B (ILGPU.Half / BFloat16 / Float8E*) —
+    /// e.g. SD-Turbo attention projections (2D weight, rank-3 activation -> batched path; batch=1 so bOff=0
+    /// reads the shared weight). Converts each weight to float in-register (PrecisionConvert), fp32 accumulate.
+    /// Mirrors SimpleBatchedMatMulImpl.</summary>
+    private static void SimpleBatchedMatMulLowPWeightImpl<T>(
         Index1D idx,
         ArrayView1D<float, Stride1D.Dense> A,
-        ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
+        ArrayView1D<T, Stride1D.Dense> B,
         ArrayView1D<float, Stride1D.Dense> C,
         int batchSize, int M, int K, int N)
+        where T : unmanaged, INumber<T>
     {
         int elementsPerBatch = M * N;
         int batch = idx / elementsPerBatch;
@@ -278,7 +282,7 @@ public class MatMulKernel
         int bOff = batch * K * N;
         float sum = 0f;
         for (int k = 0; k < K; k++)
-            sum += A[aOff + row * K + k] * (float)B[bOff + k * N + col];
+            sum += A[aOff + row * K + k] * PrecisionConvert.ConvertToSingle(B[bOff + k * N + col]);
         C[idx] = sum;
     }
 
@@ -286,10 +290,10 @@ public class MatMulKernel
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int>? _simpleMatMulHalfWeightKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedMatMulHalfWeightKernel;
+    // One compiled low-p-weight kernel per concrete weight type T (Half / BFloat16 / Float8E*), cached.
+    // object-typed because each delegate is T-specific; lazily loaded on first use of that type.
+    private readonly Dictionary<Type, object> _simpleMatMulLowPWeightKernels = new();
+    private readonly Dictionary<Type, object> _simpleBatchedMatMulLowPWeightKernels = new();
 
     // ─────────────────────────────────────────────────────────────
     //  Public API
@@ -345,9 +349,27 @@ public class MatMulKernel
         ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
         ArrayView1D<float, Stride1D.Dense> C,
         int M, int K, int N)
+        => MatMulLowPWeight(A, B, C, M, K, N);
+
+    /// <summary>
+    /// Matrix multiply with NATIVE low-precision weights: C[M,N] = A[M,K] (fp32) × B[K,N] (low-p
+    /// <typeparamref name="T"/> = ILGPU.Half / BFloat16 / Float8E*). The weight stays native in GPU memory
+    /// (no f32 temp buffer); each element is converted to float in-register via PrecisionConvert and the
+    /// product accumulated in fp32 (no accuracy loss vs the all-fp32 MatMul). Simple (non-tiled) path.
+    /// </summary>
+    public void MatMulLowPWeight<T>(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<T, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+        where T : unmanaged, INumber<T>
     {
-        EnsureKernelsLoaded(_accelerator);
-        _simpleMatMulHalfWeightKernel!(M * N, A, B, C, M, K, N);
+        if (!_simpleMatMulLowPWeightKernels.TryGetValue(typeof(T), out var k))
+            _simpleMatMulLowPWeightKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulLowPWeightImpl<T>);
+        ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int>)k)(M * N, A, B, C, M, K, N);
     }
 
     /// <summary>
@@ -359,9 +381,26 @@ public class MatMulKernel
         ArrayView1D<global::ILGPU.Half, Stride1D.Dense> B,
         ArrayView1D<float, Stride1D.Dense> C,
         int batchSize, int M, int K, int N)
+        => BatchedMatMulLowPWeight(A, B, C, batchSize, M, K, N);
+
+    /// <summary>
+    /// Batched matrix multiply with NATIVE low-precision weights: C[b] = A[b] × B (low-p
+    /// <typeparamref name="T"/>), fp32 accumulate. For SD-Turbo attention (2D weight shared across batch=1).
+    /// Weight stays native; converted in-register via PrecisionConvert. Simple (non-tiled) path.
+    /// </summary>
+    public void BatchedMatMulLowPWeight<T>(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<T, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int batchSize, int M, int K, int N)
+        where T : unmanaged, INumber<T>
     {
-        EnsureKernelsLoaded(_accelerator);
-        _simpleBatchedMatMulHalfWeightKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
+        if (!_simpleBatchedMatMulLowPWeightKernels.TryGetValue(typeof(T), out var k))
+            _simpleBatchedMatMulLowPWeightKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulLowPWeightImpl<T>);
+        ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>)k)(batchSize * M * N, A, B, C, batchSize, M, K, N);
     }
 
     /// <summary>
@@ -402,12 +441,7 @@ public class MatMulKernel
         _simpleBatchedMatMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulImpl);
-        _simpleMatMulHalfWeightKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int, int>(SimpleMatMulHalfWeightImpl);
-        _simpleBatchedMatMulHalfWeightKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<global::ILGPU.Half, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulHalfWeightImpl);
+        // Low-p-weight kernels are lazy per concrete T (see MatMulLowPWeight / BatchedMatMulLowPWeight).
 
         _matMulKernel ??= accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>,

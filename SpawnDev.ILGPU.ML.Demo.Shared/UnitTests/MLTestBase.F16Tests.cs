@@ -8,12 +8,17 @@ using SpawnDev.UnitTesting;
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 /// <summary>
-/// f16-native weights/compute tests (task: f16). The spike (2026-06-05) settled the kernel architecture
-/// across all 6 backends: a GENERIC-MATH kernel (System.Half + INumber&lt;T&gt;) FAILS everywhere
-/// ("Not supported intrinsic type 'BitCast'"), but native <c>ILGPU.Half</c> storage + fp32 compute WORKS
-/// everywhere (incl. WebGPU/WGSL). So f16 = store weights as ILGPU.Half (half the bytes), read + upconvert
-/// to float, accumulate fp32 (ORT-style mixed precision; no accuracy loss). Dedicated half-input kernels,
-/// no generics.
+/// f16-native weights/compute tests (task: f16). The spike (2026-06-05) settled the storage architecture
+/// across all 6 backends: native <c>ILGPU.Half</c> storage + fp32 compute WORKS everywhere (incl.
+/// WebGPU/WGSL) — store weights as ILGPU.Half (half the bytes), read + upconvert to float, accumulate fp32
+/// (ORT-style mixed precision; no accuracy loss).
+///
+/// UPDATE (2026-06-17): the original spike's "generic-math kernels FAIL everywhere (BitCast intrinsic)"
+/// finding is SUPERSEDED by Geordi's <c>ILGPU.PrecisionConvert</c> (4.13.0-local.9+) — a single generic
+/// <c>where T : unmanaged, INumber&lt;T&gt;</c> kernel using <c>PrecisionConvert.ConvertToSingle(B[i])</c>
+/// now transpiles + runs bit-exact on all 6 backends for Half / BFloat16 / Float8E*. The half-weight matmul
+/// kernels are now ONE generic <c>MatMulLowPWeight&lt;T&gt;</c> (MatMulHalfWeight = the T=Half wrapper), so
+/// bf16/fp8 weights stay native too (no f32 temp). See <c>F16_MatMulBFloat16Weight_MatchesFp32Reference</c>.
 /// </summary>
 public abstract partial class MLTestBase
 {
@@ -85,6 +90,54 @@ public abstract partial class MLTestBase
             maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
         if (maxErr > 1e-3f)
             throw new Exception($"MatMulHalfWeight maxErr={maxErr:E3} vs fp16-weight fp32 reference (expected < 1e-3)");
+    });
+
+    /// <summary>
+    /// The generic native-low-p weight path on a SECOND type: MatMulKernel.MatMulLowPWeight&lt;BFloat16&gt;
+    /// (the same generic kernel MatMulHalfWeight uses with T=Half) reads bf16 weights NATIVELY and matches a
+    /// fp32 reference computed with the SAME bf16-rounded weights — isolating kernel correctness from bf16
+    /// rounding. Proves the no-needless-conversion generalization: bf16 weights stay native (no f32 temp),
+    /// converted in-register via PrecisionConvert, on all 6 backends. (Pre-PrecisionConvert this generic
+    /// kernel could not compile; see the class doc.)
+    /// </summary>
+    [TestMethod]
+    public Task F16_MatMulBFloat16Weight_MatchesFp32Reference() => RunTest(async accelerator =>
+    {
+        int M = 8, K = 16, N = 8;
+        var rng = new Random(42);
+        var a = new float[M * K];
+        var bf = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < bf.Length; i++) bf[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // bf16-rounded weights (what the GPU actually reads), and the fp32 reference using THOSE weights.
+        var bBf16 = new global::ILGPU.BFloat16[bf.Length];
+        for (int i = 0; i < bf.Length; i++) bBf16[i] = (global::ILGPU.BFloat16)bf[i];
+        var cpuC = new float[M * N];
+        for (int r = 0; r < M; r++)
+            for (int c = 0; c < N; c++)
+            {
+                float s = 0f;
+                for (int k = 0; k < K; k++)
+                    s += a[r * K + k] * (float)bBf16[k * N + c];
+                cpuC[r * N + c] = s;
+            }
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(bBf16);
+        using var cBuf = accelerator.Allocate1D<float>(M * N);
+        var mm = new MatMulKernel(accelerator);
+        mm.MatMulLowPWeight(aBuf.View, bBuf.View, cBuf.View, M, K, N);
+        await accelerator.SynchronizeAsync();
+        var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
+
+        // bf16->f32 widening is lossless and accumulation is fp32, so the GPU must match the CPU ref that used
+        // the same bf16-rounded weights to ~kernel precision (same bar as the fp16 test).
+        float maxErr = 0f;
+        for (int i = 0; i < cpuC.Length; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+        if (maxErr > 1e-3f)
+            throw new Exception($"MatMulLowPWeight<BFloat16> maxErr={maxErr:E3} vs bf16-weight fp32 reference (expected < 1e-3)");
     });
 
     /// <summary>
@@ -275,6 +328,67 @@ public abstract partial class MLTestBase
                 throw new Exception($"Conv2D half-weight maxErr={maxErr:E3} vs fp16-weight fp32 reference (expected < 1e-3)");
         }
         finally { pool.Dispose(); }
+    });
+
+    /// <summary>
+    /// The generic native-low-p Conv weight path on a SECOND type: Conv2DKernel.ForwardPaddedLowPWeight&lt;
+    /// BFloat16&gt; (the same generic kernel ForwardHalfWeight uses with T=Half) reads bf16 filter weights
+    /// NATIVELY and matches a fp32 reference conv computed with the SAME bf16-rounded weights. Proves the
+    /// no-needless-conversion generalization on Conv: bf16 weights stay native (no f32 temp), converted
+    /// in-register via PrecisionConvert, on all 6 backends.
+    /// </summary>
+    [TestMethod]
+    public Task F16_Conv2DBFloat16Weight_MatchesFp32Reference() => RunTest(async accelerator =>
+    {
+        int inC = 2, inH = 5, inW = 5, outC = 3, kH = 3, kW = 3, stride = 1, pad = 1;
+        int outH = (inH + 2 * pad - kH) / stride + 1;
+        int outW = (inW + 2 * pad - kW) / stride + 1;
+        var rng = new Random(13);
+        var input = new float[inC * inH * inW];
+        var wf = new float[outC * inC * kH * kW];
+        var bias = new float[outC];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < wf.Length; i++) wf[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < bias.Length; i++) bias[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // bf16-rounded weights (what the GPU reads) and the fp32 reference using THOSE weights.
+        var wBf16 = new global::ILGPU.BFloat16[wf.Length];
+        var wRounded = new float[wf.Length];
+        for (int i = 0; i < wf.Length; i++) { wBf16[i] = (global::ILGPU.BFloat16)wf[i]; wRounded[i] = (float)wBf16[i]; }
+
+        var cpuOut = new float[outC * outH * outW];
+        for (int oc = 0; oc < outC; oc++)
+            for (int oy = 0; oy < outH; oy++)
+                for (int ox = 0; ox < outW; ox++)
+                {
+                    double sum = bias[oc];
+                    for (int ic = 0; ic < inC; ic++)
+                        for (int ky = 0; ky < kH; ky++)
+                            for (int kx = 0; kx < kW; kx++)
+                            {
+                                int iy = oy * stride + ky - pad, ix = ox * stride + kx - pad;
+                                if (iy < 0 || iy >= inH || ix < 0 || ix >= inW) continue;
+                                sum += (double)input[ic * inH * inW + iy * inW + ix]
+                                     * (double)wRounded[oc * inC * kH * kW + ic * kH * kW + ky * kW + kx];
+                            }
+                    cpuOut[oc * outH * outW + oy * outW + ox] = (float)sum;
+                }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(wBf16);
+        using var biasBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(outC * outH * outW);
+        var conv = new Conv2DKernel(accelerator);
+        conv.ForwardPaddedLowPWeight(inBuf.View, wBuf.View, biasBuf.View, outBuf.View,
+            inC, inH, inW, outC, kH, kW, stride, pad, pad, pad, pad);
+        await accelerator.SynchronizeAsync();
+        var gpuOut = await outBuf.CopyToHostAsync<float>(0, outC * outH * outW);
+
+        float maxErr = 0f;
+        for (int i = 0; i < cpuOut.Length; i++)
+            maxErr = MathF.Max(maxErr, MathF.Abs(gpuOut[i] - cpuOut[i]));
+        if (maxErr > 1e-3f)
+            throw new Exception($"Conv2D ForwardPaddedLowPWeight<BFloat16> maxErr={maxErr:E3} vs bf16-weight fp32 reference (expected < 1e-3)");
     });
 
     /// <summary>
