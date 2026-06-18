@@ -1080,6 +1080,9 @@ public class InferenceSession : IDisposable
         // kernels later will let the loader half ALL fp16 weights with no gating; until then, conservative.)
         var halfEligible = new HashSet<string>();
         var halfBlocked = new HashSet<string>();
+        // Diagnostic (VerboseLogging): for each blocked weight, the op-type(s) that force it off the native
+        // low-p path — so we can see which op still needs a native low-p kernel to widen the gate.
+        var blockingOps = new Dictionary<string, HashSet<string>>();
         foreach (var node in compiled.Nodes)
         {
             var ins = node.InputNames;
@@ -1090,11 +1093,19 @@ public class InferenceSession : IDisposable
                 int convGroup = node.OpType == "Conv" && node.Attributes.TryGetValue("group", out var gv) && gv is long gl ? (int)gl : 1;
                 bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || (node.OpType == "Conv" && convGroup == 1));
                 if (okAsWeight) halfEligible.Add(inName);
-                else halfBlocked.Add(inName);
+                else
+                {
+                    halfBlocked.Add(inName);
+                    if (!blockingOps.TryGetValue(inName, out var ops)) blockingOps[inName] = ops = new HashSet<string>();
+                    ops.Add($"{node.OpType}[in{oi}]");
+                }
             }
         }
         halfEligible.ExceptWith(halfBlocked); // used EXCLUSIVELY as a half-capable weight operand
         int halfLoaded = 0;
+        // no-needless-conversion diagnostic: fp16 weights forced to f32 because a consumer has no native low-p path.
+        int blockedFp16Count = 0; long blockedFp16Elems = 0;
+        var blockedByOp = new Dictionary<string, (int count, long elems)>();
 
         // Stream weights to GPU: large tensors are seeked to + chunk-uploaded straight from the stream
         // (never materialized); small/inline tensors use the in-memory chunked/standard path.
@@ -1113,8 +1124,16 @@ public class InferenceSession : IDisposable
                 halfLoaded++;
             }
             else if (tensor.RawDataStreamOffset >= 0)
+            {
+                if (tensor.DataType == 10) // a BLOCKED fp16 weight: no native consumer -> downcast to f32 (the unpacking)
+                {
+                    blockedFp16Count++; blockedFp16Elems += expectedElems;
+                    if (blockingOps.TryGetValue(name, out var bops))
+                        foreach (var op in bops) { var c = blockedByOp.GetValueOrDefault(op); blockedByOp[op] = (c.count + 1, c.elems + expectedElems); }
+                }
                 gpuWeights[name] = await pool.AllocatePermanentFromStreamAsync(
                     stream, tensor.RawDataStreamOffset, tensor.RawDataLength, tensor.DataType, shape, name, ct).ConfigureAwait(false);
+            }
             else if (tensor.ElementCount == 0 && expectedElems > 0)
                 gpuWeights[name] = pool.AllocatePermanent(new float[expectedElems], shape, name);
             else
@@ -1124,7 +1143,18 @@ public class InferenceSession : IDisposable
             if (uploadPct != lastUploadPct) { lastUploadPct = uploadPct; onProgress?.Invoke("upload", uploadPct); }
         }
         if (VerboseLogging)
+        {
             Console.WriteLine($"[InferenceSession] f16 weights: {halfLoaded} loaded as fp16 (half GPU bytes) of {halfEligible.Count} half-eligible; the rest fp32.");
+            if (blockedFp16Count > 0)
+            {
+                double mb16 = blockedFp16Elems * 2 / 1048576.0, mb32 = blockedFp16Elems * 4 / 1048576.0;
+                var top = string.Join(", ", blockedByOp.OrderByDescending(k => k.Value.elems)
+                    .Take(8).Select(k => $"{k.Key} x{k.Value.count} ({k.Value.elems * 2 / 1048576.0:F1}MB)"));
+                Console.WriteLine($"[InferenceSession] no-native-path: {blockedFp16Count} fp16 weights downcast to f32 " +
+                    $"({mb16:F1}MB fp16 source -> {mb32:F1}MB f32 on GPU). Top blocking ops: {top}. " +
+                    "Give these ops a native low-p path to keep their weights native.");
+            }
+        }
         foreach (var name in compiled.InitializerNames)
         {
             if (gpuWeights.ContainsKey(name)) continue;

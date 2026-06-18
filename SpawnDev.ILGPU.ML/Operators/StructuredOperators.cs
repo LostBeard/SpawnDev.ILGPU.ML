@@ -308,6 +308,10 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         var xIn = inputs[0]; var wIn = inputs[1];
         // Activation input must be low-p; weight must be a Tensor (fp32 .Data OR fp16 .HalfData — both handled).
         if (!xIn.IsHalf || wIn.Float == null) return false;
+        // This precision-aware path only handles an fp32 OR fp16 weight (pak.Conv2DHalfWeight is Half-typed).
+        // A non-fp16 low-p weight (bf16/FP8) falls back to the main ConvOperator.Execute path, which routes it
+        // natively via LowPWeightDispatch — so it stays native, just not on this F16-activation fast path.
+        if (LowPWeightDispatch.IsLowP(wIn.Float) && !wIn.Float.IsHalf) return false;
         var xShape = xIn.Half!.Shape; var wShape = wIn.Float.Shape;
         if (xShape.Length != 4 || wShape.Length != 4) return false;
 
@@ -325,7 +329,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         ArrayView1D<float, Stride1D.Dense> bias;
         if (inputs.Length > 2 && inputs[2].Float != null)
         {
-            if (inputs[2].Float!.IsHalf) return false;   // fp16 bias has no fp32 Data — fall back to fp32 conv
+            if (LowPWeightDispatch.IsLowP(inputs[2].Float!)) return false;   // any low-p bias has no fp32 Data — fall back to fp32 conv
             bias = inputs[2].Float!.Data;
         }
         else bias = reg.GetOrCreateZeroBias(outC);
@@ -1343,8 +1347,9 @@ public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator, IPrecis
     public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, HalfTensor output, Kernels.PrecisionAwareKernels pak)
     {
         if (inputs.Length < 3 || !inputs[0].IsHalf) return false;
-        // scale/bias must be fp32 Tensors (a fp16-stored Tensor has empty .Data → fall back; they're tiny anyway).
-        if (inputs[1].Float is not { IsHalf: false } || inputs[2].Float is not { IsHalf: false }) return false;
+        // scale/bias must be fp32 Tensors (any low-p Tensor has empty .Data → fall back; they're tiny anyway).
+        if (inputs[1].Float is not { } s || LowPWeightDispatch.IsLowP(s)
+            || inputs[2].Float is not { } b || LowPWeightDispatch.IsLowP(b)) return false;
         var shape = inputs[0].Half!.Shape;
         var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
             : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
