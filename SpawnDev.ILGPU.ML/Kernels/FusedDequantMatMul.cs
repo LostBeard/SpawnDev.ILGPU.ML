@@ -45,7 +45,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K;
+        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4;
 
     // ── M=1 (GEMV) coalesced path ──
     // At seq=1 decode, M=1, so the general one-thread-per-output-element kernel above launches only N
@@ -85,7 +85,7 @@ public class FusedDequantMatMul : IDisposable
     /// loader routes only these to the fused path; everything else dequantizes to F32
     /// on the CPU at load time.</summary>
     public static bool Supports(GGMLType type) =>
-        type is GGMLType.Q4_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K;
+        type is GGMLType.Q4_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K or GGMLType.MXFP4;
 
     /// <summary>Elements per quantization block for a supported type.</summary>
     private static int BlockElements(GGMLType type) =>
@@ -188,6 +188,10 @@ public class FusedDequantMatMul : IDisposable
                 _kernelQ6_K ??= LoadKernel(FusedDequantQ6_KImpl);
                 _kernelQ6_K(M * N, input, intView, output, paramsBuf.View);
                 break;
+            case GGMLType.MXFP4:
+                _kernelMXFP4 ??= LoadKernel(FusedDequantMXFP4Impl);
+                _kernelMXFP4(M * N, input, intView, output, paramsBuf.View);
+                break;
         }
     }
 
@@ -230,6 +234,48 @@ public class FusedDequantMatMul : IDisposable
                 int packed = ReadByte(w, bOff + 2 + j);
                 sum += input[inBase + kBase + j] * (((packed & 0xF) - 8) * d);
                 sum += input[inBase + kBase + j + 16] * (((packed >> 4) - 8) * d);
+            }
+        }
+        output[idx] = sum;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  MXFP4 (ggml GGML_TYPE_MXFP4 = 39, used by gpt-oss): 17 bytes per 32 values —
+    //  [e:E8M0 (1 byte)][16 × packed FP4 nibbles]. Element j (0..15) = LOW nibble of
+    //  byte j; element j+16 = HIGH nibble of byte j (ggml split order, like Q4_0).
+    //  Exact port of ggml dequantize_row_mxfp4: value = kvalues_mxfp4[nibble] · d,
+    //  d = ggml_e8m0_to_fp32_half(e). kvalues_mxfp4 = {0,1,2,3,4,6,8,12, 0,-1,-2,-3,
+    //  -4,-6,-8,-12} = 2× the OCP E2M1 values, paired with the HALVED E8M0 scale, so
+    //  the product equals E2M1[nibble]·2^(e-127). DecodeMXFP4Kvalue computes that table
+    //  by bit math (no LUT — keeps the WebGL GLSL small, same discipline as Q4_K).
+    // ─────────────────────────────────────────────────────────────────────────
+    private static void FusedDequantMXFP4Impl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int m = idx / N;
+        int n = idx % N;
+        if (m >= M) return;
+
+        int blocksPerRow = K / 32;
+        int bytesPerRow = blocksPerRow * 17;
+        int inBase = m * K;
+
+        float sum = 0f;
+        for (int block = 0; block < blocksPerRow; block++)
+        {
+            int bOff = n * bytesPerRow + block * 17;
+            float d = E8M0HalfToFloat(ReadByte(w, bOff));
+            int kBase = block * 32;
+
+            for (int j = 0; j < 16; j++)
+            {
+                int packed = ReadByte(w, bOff + 1 + j);
+                sum += input[inBase + kBase + j] * (DecodeMXFP4Kvalue(packed & 0xF) * d);
+                sum += input[inBase + kBase + j + 16] * (DecodeMXFP4Kvalue(packed >> 4) * d);
             }
         }
         output[idx] = sum;
@@ -717,6 +763,24 @@ public class FusedDequantMatMul : IDisposable
         float magNorm = (1f + frac) * MathF.Pow(2f, exp - 15);
         float magSub = frac * (1f / 16384f);
         return (1 - 2 * sign) * (isNorm * magNorm + (1 - isNorm) * magSub);
+    }
+
+    /// <summary>ggml E8M0 scale (HALF form) → float. Port of ggml_e8m0_to_fp32_half: for every e in
+    /// 0..255 the result is exactly 2^(e-128) (the e&lt;2 denormal patterns 0x00200000&lt;&lt;e equal
+    /// 2^-128 / 2^-127, which ARE 2^(e-128)). Arithmetic 2^(e-128) avoids an int→float bit reinterpret,
+    /// matching the HalfToFloat MathF.Pow style (WebGL-safe). NaN (e=255 in the full form) is not used by
+    /// MXFP4 weights, same as ggml.</summary>
+    internal static float E8M0HalfToFloat(int e) => MathF.Pow(2f, e - 128f);
+
+    /// <summary>ggml kvalues_mxfp4[q] (= 2× the OCP E2M1 value) by bit math, no LUT. q is a 4-bit nibble:
+    /// bit3 = sign, bits[2:1] = exp, bit0 = mantissa. Returns {0,1,2,3,4,6,8,12} for q=0..7 and their
+    /// negatives for q=8..15 — verified element-for-element against ggml's table.</summary>
+    internal static int DecodeMXFP4Kvalue(int q)
+    {
+        int exp = (q >> 1) & 3;
+        int mant = q & 1;
+        int mag = exp == 0 ? mant : ((1 << exp) + (mant << (exp - 1)));
+        return (q & 8) != 0 ? -mag : mag;
     }
 
     /// <summary>Convert FP16 bits to float.</summary>

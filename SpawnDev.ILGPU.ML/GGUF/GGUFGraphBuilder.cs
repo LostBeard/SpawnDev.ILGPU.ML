@@ -454,7 +454,7 @@ public static class GGUFGraphBuilder
                 $"GGUF tensor '{tensor.Name}' uses {tensor.Type}" +
                 (quantizedBytes == null
                     ? " in a role with no fused dequant kernel (norm/bias)."
-                    : ", which has no fused GPU dequant kernel yet (supported: Q4_0, Q8_0, Q4_K, Q6_K).") +
+                    : ", which has no fused GPU dequant kernel yet (supported: Q4_0, Q8_0, Q4_K, Q6_K, MXFP4).") +
                 " CPU dequantization is deliberately not performed (heavy CPU passes are " +
                 "unacceptable in the browser). Re-quantize the model or request a kernel for this type.");
         }

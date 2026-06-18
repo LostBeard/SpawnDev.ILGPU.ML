@@ -107,9 +107,10 @@ public class GGUFModel
             GGMLType.BF16 => RowBF16(buf, b, rowLen),
             GGMLType.Q6_K => RowQ6_K(buf, b, rowLen),
             GGMLType.Q8_0 => RowQ8_0(buf, b, rowLen),
+            GGMLType.MXFP4 => RowMXFP4(buf, b, rowLen),
             _ => throw new NotSupportedException(
                 $"GetTensorRowFloat32Async: per-row dequant not implemented for {tensor.Type} (tensor '{tensor.Name}'). " +
-                $"Supported: F32, F16, BF16, Q6_K, Q8_0.")
+                $"Supported: F32, F16, BF16, Q6_K, Q8_0, MXFP4.")
         };
     }
 
@@ -218,7 +219,8 @@ public class GGUFModel
     /// <summary>True if tensor type is a quantized format that FusedDequantMatMul supports.</summary>
     public static bool IsQuantized(GGMLType type) => type is GGMLType.Q4_0 or GGMLType.Q4_1
         or GGMLType.Q5_0 or GGMLType.Q5_1 or GGMLType.Q8_0 or GGMLType.Q8_1
-        or GGMLType.Q2_K or GGMLType.Q3_K or GGMLType.Q4_K or GGMLType.Q5_K or GGMLType.Q6_K;
+        or GGMLType.Q2_K or GGMLType.Q3_K or GGMLType.Q4_K or GGMLType.Q5_K or GGMLType.Q6_K
+        or GGMLType.MXFP4;
 
     /// <summary>
     /// Dequantize a SINGLE row (the contiguous ne0 run) of a 2D tensor to float32, reading just that row's
@@ -242,9 +244,10 @@ public class GGUFModel
             GGMLType.BF16 => RowBF16(buf, b, rowLen),
             GGMLType.Q6_K => RowQ6_K(buf, b, rowLen),
             GGMLType.Q8_0 => RowQ8_0(buf, b, rowLen),
+            GGMLType.MXFP4 => RowMXFP4(buf, b, rowLen),
             _ => throw new NotSupportedException(
                 $"GetTensorRowFloat32: per-row dequant not implemented for {tensor.Type} (tensor '{tensor.Name}'). " +
-                $"Supported: F32, F16, BF16, Q6_K, Q8_0. Add the window dequant for this type if a model needs it.")
+                $"Supported: F32, F16, BF16, Q6_K, Q8_0, MXFP4. Add the window dequant for this type if a model needs it.")
         };
     }
 
@@ -278,6 +281,25 @@ public class GGUFModel
             int o = b + blk * 34;
             float scale = HalfToFloat((ushort)(buf[o] | (buf[o + 1] << 8)));
             for (int i = 0; i < 32; i++) r[blk * 32 + i] = (sbyte)buf[o + 2 + i] * scale;
+        }
+        return r;
+    }
+
+    /// <summary>MXFP4 window dequant — byte-window port of <see cref="DequantizeMXFP4"/> (17 B/block:
+    /// [e:E8M0][16 nibble bytes]; low nibble of byte i = element i, high nibble = element i+16).</summary>
+    private static float[] RowMXFP4(byte[] buf, int b, int n)
+    {
+        var r = new float[n];
+        int blocks = n / 32;
+        for (int blk = 0; blk < blocks; blk++)
+        {
+            int o = b + blk * 17;
+            float d = MathF.Pow(2f, buf[o] - 128f); // e8m0_half
+            for (int i = 0; i < 16; i++)
+            {
+                r[blk * 32 + i] = MXFP4Kvalue(buf[o + 1 + i] & 0x0F) * d;
+                r[blk * 32 + i + 16] = MXFP4Kvalue(buf[o + 1 + i] >> 4) * d;
+            }
         }
         return r;
     }
@@ -340,6 +362,7 @@ public class GGUFModel
             GGMLType.Q4_K => DequantizeQ4_K(offset, elements),
             GGMLType.Q5_K => DequantizeQ5_K(offset, elements),
             GGMLType.Q6_K => DequantizeQ6_K(offset, elements),
+            GGMLType.MXFP4 => DequantizeMXFP4(offset, elements),
             _ => null // IQ types not yet supported
         };
     }
@@ -404,6 +427,43 @@ public class GGUFModel
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// Dequantize MXFP4 (ggml GGML_TYPE_MXFP4): 32 elements per block, 17 bytes
+    /// ([e:E8M0 1 byte][16 packed FP4 nibbles]). Exact port of ggml dequantize_row_mxfp4:
+    /// value = kvalues_mxfp4[nibble] * ggml_e8m0_to_fp32_half(e). Low nibble of byte i is
+    /// element i, high nibble is element i+16 (ggml split order). This is the CPU oracle the
+    /// GPU FusedDequantMatMul MXFP4 kernel is asserted against.
+    /// </summary>
+    private float[] DequantizeMXFP4(long offset, long elements)
+    {
+        var result = new float[elements];
+        int numBlocks = (int)(elements / 32);
+        for (int block = 0; block < numBlocks; block++)
+        {
+            int blockOffset = (int)offset + block * 17;
+            float d = MathF.Pow(2f, RawData[blockOffset] - 128f); // ggml_e8m0_to_fp32_half(e) = 2^(e-128)
+            int resultBase = block * 32;
+            for (int i = 0; i < 16; i++)
+            {
+                byte packed = RawData[blockOffset + 1 + i];
+                result[resultBase + i] = MXFP4Kvalue(packed & 0x0F) * d;
+                result[resultBase + i + 16] = MXFP4Kvalue(packed >> 4) * d;
+            }
+        }
+        return result;
+    }
+
+    /// <summary>ggml kvalues_mxfp4[q] (= 2× the OCP E2M1 value) by bit math: {0,1,2,3,4,6,8,12} for
+    /// q=0..7, negated for q=8..15. Mirrors FusedDequantMatMul.DecodeMXFP4Kvalue (one definition of the
+    /// table, two call sites — CPU oracle + GPU kernel).</summary>
+    private static int MXFP4Kvalue(int q)
+    {
+        int exp = (q >> 1) & 3;
+        int mant = q & 1;
+        int mag = exp == 0 ? mant : ((1 << exp) + (mant << (exp - 1)));
+        return (q & 8) != 0 ? -mag : mag;
     }
 
     /// <summary>
@@ -882,6 +942,7 @@ public enum GGMLType : uint
     F64 = 28,
     IQ1_M = 29,
     BF16 = 30,
+    MXFP4 = 39, // OCP MXFP4 (block of 32: 1 E8M0 byte + 16 packed FP4 nibbles); used by gpt-oss
 }
 
 /// <summary>GGUF metadata value types.</summary>
@@ -922,6 +983,7 @@ public static class GGMLTypes
         GGMLType.Q4_K => elements / 256 * 144,
         GGMLType.Q5_K => elements / 256 * 176,
         GGMLType.Q6_K => elements / 256 * 210,
+        GGMLType.MXFP4 => elements / 32 * 17,  // 32 elements per block: 1 E8M0 byte + 16 nibble bytes
         GGMLType.I8 => elements,
         GGMLType.I16 => elements * 2,
         GGMLType.I32 => elements * 4,

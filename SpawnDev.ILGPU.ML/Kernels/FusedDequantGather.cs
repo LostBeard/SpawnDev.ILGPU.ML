@@ -28,7 +28,7 @@ public class FusedDequantGather : IDisposable
 
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K;
+        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4;
 
     // Per-shape params cache; never disposed mid-session (WebGPU pending-dispatch rule).
     private readonly Dictionary<(int numIdx, int rowLength, int rows), MemoryBuffer1D<int, Stride1D.Dense>> _paramsBufs = new();
@@ -84,6 +84,15 @@ public class FusedDequantGather : IDisposable
                 _kernelQ6_K ??= Load(GatherQ6_KImpl);
                 _kernelQ6_K(total, intView, indices, output, paramsBuf.View);
                 break;
+            case GGMLType.MXFP4:
+                _kernelMXFP4 ??= Load(GatherMXFP4Impl);
+                _kernelMXFP4(total, intView, indices, output, paramsBuf.View);
+                break;
+            default:
+                // Supports() admitted this type but no kernel case handles it - fail loud rather than leave
+                // output unwritten (silent garbage). Any type added to Supports MUST get a case above.
+                throw new NotSupportedException(
+                    $"FusedDequantGather.Supports admits {type} but no gather kernel handles it - add the case.");
         }
     }
 
@@ -120,6 +129,32 @@ public class FusedDequantGather : IDisposable
         int packed = FusedDequantMatMul.ReadByte(w, bOff + 2 + (i < 16 ? i : i - 16));
         int nibble = i < 16 ? (packed & 0xF) : (packed >> 4);
         output[idx] = (nibble - 8) * d;
+    }
+
+    // MXFP4 (17 B/block: [e:E8M0][16 nibble bytes]). Same ggml split order as Q4_0 (element i<16 = low nibble
+    // of byte i, i>=16 = high nibble of byte i-16); value = kvalues_mxfp4[nibble] * e8m0_half(e). Mirrors
+    // FusedDequantMatMul's MXFP4 decode (E8M0HalfToFloat + DecodeMXFP4Kvalue).
+    private static void GatherMXFP4Impl(Index1D idx,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int numIdx = p[0], rowLength = p[1], rows = p[2];
+        int gatherIdx = idx / rowLength;
+        int col = idx % rowLength;
+        if (gatherIdx >= numIdx) return;
+        int row = (int)indices[gatherIdx];
+        if (row < 0) row += rows;
+        if (row < 0 || row >= rows) { output[idx] = 0f; return; }
+
+        int bytesPerRow = rowLength / 32 * 17;
+        int bOff = row * bytesPerRow + (col / 32) * 17;
+        int i = col % 32;
+        float d = FusedDequantMatMul.E8M0HalfToFloat(FusedDequantMatMul.ReadByte(w, bOff));
+        int packed = FusedDequantMatMul.ReadByte(w, bOff + 1 + (i < 16 ? i : i - 16));
+        int nibble = i < 16 ? (packed & 0xF) : (packed >> 4);
+        output[idx] = FusedDequantMatMul.DecodeMXFP4Kvalue(nibble) * d;
     }
 
     private static void GatherQ8_0Impl(Index1D idx,

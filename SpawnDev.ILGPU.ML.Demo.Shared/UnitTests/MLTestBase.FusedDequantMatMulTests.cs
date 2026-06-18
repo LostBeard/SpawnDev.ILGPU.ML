@@ -38,6 +38,7 @@ public abstract partial class MLTestBase
         {
             GGMLType.Q4_0, GGMLType.Q4_1, GGMLType.Q5_0, GGMLType.Q5_1, GGMLType.Q8_0,
             GGMLType.Q2_K, GGMLType.Q3_K, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K,
+            GGMLType.MXFP4,
         };
         foreach (var type in types)
         {
@@ -58,7 +59,7 @@ public abstract partial class MLTestBase
                         $"{type}: CPU dequant diverges from the ggml reference at element {i}: " +
                         $"got {got[i]}, want {want[i]} (first divergence shown).");
         }
-        Console.WriteLine("[GGUFDequant] CPU dequant matches the ggml reference for all 10 types");
+        Console.WriteLine("[GGUFDequant] CPU dequant matches the ggml reference for all 11 types");
     });
 
     // ═════════════════════════════════════════════════════════════════════
@@ -73,6 +74,8 @@ public abstract partial class MLTestBase
     public async Task FusedDequantMatMul_MatchesOracle_Q4_K() => await FusedMatMulOracle(GGMLType.Q4_K);
     [TestMethod]
     public async Task FusedDequantMatMul_MatchesOracle_Q6_K() => await FusedMatMulOracle(GGMLType.Q6_K);
+    [TestMethod]
+    public async Task FusedDequantMatMul_MatchesOracle_MXFP4() => await FusedMatMulOracle(GGMLType.MXFP4);
 
     private async Task FusedMatMulOracle(GGMLType type) => await RunTest(async accelerator =>
     {
@@ -125,6 +128,8 @@ public abstract partial class MLTestBase
     public async Task FusedDequantGather_MatchesOracle_Q4_K() => await FusedGatherOracle(GGMLType.Q4_K);
     [TestMethod]
     public async Task FusedDequantGather_MatchesOracle_Q6_K() => await FusedGatherOracle(GGMLType.Q6_K);
+    [TestMethod]
+    public async Task FusedDequantGather_MatchesOracle_MXFP4() => await FusedGatherOracle(GGMLType.MXFP4);
 
     private async Task FusedGatherOracle(GGMLType type) => await RunTest(async accelerator =>
     {
@@ -337,6 +342,7 @@ public abstract partial class MLTestBase
         GGMLType.Q8_0 => 34,
         GGMLType.Q2_K => 84, GGMLType.Q3_K => 110, GGMLType.Q4_K => 144,
         GGMLType.Q5_K => 176, GGMLType.Q6_K => 210,
+        GGMLType.MXFP4 => 17,
         _ => throw new ArgumentException($"no block size for {t}"),
     };
 
@@ -354,6 +360,15 @@ public abstract partial class MLTestBase
         int bs = BlockBytes(type);
         var bytes = new byte[nBlocks * bs];
         rng.NextBytes(bytes);
+        // MXFP4: the per-block scale is a single E8M0 byte (no fp16 fields). Random bytes decode fine, but
+        // patch the scale byte to a sane exponent (~127 -> scale ~O(1)) so magnitudes stay comparable to the
+        // other types (a random e up to 255 would give 2^127). The 16 nibble bytes stay fully random.
+        if (type == GGMLType.MXFP4)
+        {
+            for (int b = 0; b < nBlocks; b++)
+                bytes[b * bs] = (byte)(126 + rng.Next(0, 4)); // e in 126..129 -> 2^(e-128) in 0.25..2
+            return bytes;
+        }
         int[] halfOffsets = type switch
         {
             GGMLType.Q4_0 or GGMLType.Q5_0 or GGMLType.Q8_0 => new[] { 0 },
@@ -386,10 +401,31 @@ public abstract partial class MLTestBase
         GGMLType.Q4_K => RefQ4_K(data, elements),
         GGMLType.Q5_K => RefQ5_K(data, elements),
         GGMLType.Q6_K => RefQ6_K(data, elements),
+        GGMLType.MXFP4 => RefMXFP4(data, elements),
         _ => throw new ArgumentException($"{type}"),
     };
 
     private static float Half(byte[] d, int off) => HalfToFloatCPU(d[off] | (d[off + 1] << 8));
+
+    /// <summary>ggml dequantize_row_mxfp4: 17 B/block ([e:E8M0][16 nibble bytes]); low nibble of byte j is
+    /// element j, high nibble is element j+16; value = kvalues_mxfp4[nibble] * 2^(e-128). kvalues table
+    /// {0,1,2,3,4,6,8,12, 0,-1,..,-12} written out literally here (independent of the production bit-math).</summary>
+    private static readonly int[] KvaluesMXFP4 = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+    private static float[] RefMXFP4(byte[] d, int n)
+    {
+        var y = new float[n];
+        for (int i = 0; i < n / 32; i++)
+        {
+            int o = i * 17;
+            float s = MathF.Pow(2f, d[o] - 128f);
+            for (int j = 0; j < 16; j++)
+            {
+                y[i * 32 + j] = KvaluesMXFP4[d[o + 1 + j] & 0xF] * s;
+                y[i * 32 + j + 16] = KvaluesMXFP4[d[o + 1 + j] >> 4] * s;
+            }
+        }
+        return y;
+    }
 
     private static float[] RefQ4_0(byte[] d, int n)
     {
