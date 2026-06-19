@@ -137,4 +137,74 @@ public class TransposeKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(TransposeImpl);
     }
+
+    // ── Generic transpose over any element type (additive; the f32 path above is untouched). ──
+    // Transpose is pure index remap (no arithmetic), so it works for any unmanaged T. Used to transpose a
+    // NATIVE low-precision weight (e.g. BFloat16 [N,K] -> [K,N]) at load WITHOUT upcasting to f32 — keeps the
+    // bytes low-p end to end (no-needless-conversion). One compiled kernel per concrete T, cached.
+    private readonly Dictionary<Type, object> _transposeKernelT = new();
+
+    private static void TransposeImplT<T>(Index1D idx,
+        ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p) where T : unmanaged
+    {
+        int rank = p[0];
+        int remaining = idx;
+        int srcIdx = 0;
+        for (int d = 0; d < rank; d++)
+        {
+            int outStride = p[1 + 3 * rank + d];
+            int coord = remaining / outStride;
+            remaining = remaining % outStride;
+            int srcDim = p[1 + rank + d];
+            int inStride = p[1 + 2 * rank + srcDim];
+            srcIdx += coord * inStride;
+        }
+        output[idx] = input[srcIdx];
+    }
+
+    /// <summary>Generic transpose: <paramref name="output"/> = <paramref name="input"/> permuted by
+    /// <paramref name="perm"/> (perm[i] = which input dim maps to output dim i), for any unmanaged element
+    /// type. Keeps low-precision weights native (no f32 upcast). Shares the content-keyed params-buffer cache.</summary>
+    public void Transpose<T>(ArrayView1D<T, Stride1D.Dense> input, ArrayView1D<T, Stride1D.Dense> output,
+        int[] inputShape, int[] perm) where T : unmanaged
+    {
+        int rank = inputShape.Length;
+        if (perm.Length != rank) throw new ArgumentException("Perm length must match rank");
+
+        var inStrides = new int[rank];
+        var outShape = new int[rank];
+        var outStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * inputShape[i + 1];
+        for (int i = 0; i < rank; i++) outShape[i] = inputShape[perm[i]];
+        outStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) outStrides[i] = outStrides[i + 1] * outShape[i + 1];
+        int totalElements = 1;
+        for (int i = 0; i < rank; i++) totalElements *= inputShape[i];
+
+        int paramsSize = 1 + 4 * rank;
+        var paramsData = new int[paramsSize];
+        paramsData[0] = rank;
+        for (int i = 0; i < rank; i++) paramsData[1 + i] = inputShape[i];
+        for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = perm[i];
+        for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = inStrides[i];
+        for (int i = 0; i < rank; i++) paramsData[1 + 3 * rank + i] = outStrides[i];
+
+        var key = "T:" + string.Join(",", paramsData);
+        if (!_paramsCache.TryGetValue(key, out var paramsBuf))
+        {
+            paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
+            paramsBuf.View.CopyFromCPU(paramsData);
+            _paramsCache[key] = paramsBuf;
+            _allParamsBufs.Add(paramsBuf);
+        }
+
+        if (!_transposeKernelT.TryGetValue(typeof(T), out var k))
+            _transposeKernelT[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<int, Stride1D.Dense>>(TransposeImplT<T>);
+        ((Action<Index1D, ArrayView1D<T, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>>)k)(totalElements, input, output, paramsBuf.View);
+    }
 }
