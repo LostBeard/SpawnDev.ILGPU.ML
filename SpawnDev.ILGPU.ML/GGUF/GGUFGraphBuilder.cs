@@ -204,7 +204,18 @@ public static class GGUFGraphBuilder
             };
             if (gemmaAttn)
                 faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);
-            AddNode(graph, "FusedAttention", new[] { qReshaped, kReshaped, vReshaped }, new[] { attnValues }, faAttrs);
+            // Attention sinks (gpt-oss): a per-head learned logit ([n_head]) added to the softmax
+            // denominator (0 value contribution). Presence-based 4th input; absent elsewhere.
+            var sinksTensor = FindTensor(model, $"{pfx}.attn_sinks");
+            string[] faInputs;
+            if (sinksTensor != null)
+            {
+                ExtractWeight(model, sinksTensor, weights);
+                graph.Initializers[sinksTensor.Name] = sinksTensor.Shape;
+                faInputs = new[] { qReshaped, kReshaped, vReshaped, sinksTensor.Name };
+            }
+            else faInputs = new[] { qReshaped, kReshaped, vReshaped };
+            AddNode(graph, "FusedAttention", faInputs, new[] { attnValues }, faAttrs);
 
             // ── Merge heads: [1, nHeads, seq, hd] → [1, seq, nHeads*hd] ──
             // (nHeads*hd, NOT embedDim: gemma4 attn_output input is 16*256=4096 sliding / 16*512=8192 global.)
@@ -215,9 +226,10 @@ public static class GGUFGraphBuilder
             AddNode(graph, "Reshape", new[] { attnTransposed }, new[] { attnMerged },
                 Attrs("shape", new long[] { 1, -1, (long)(nHeads * hd) }));
 
-            // ── Output projection ──
+            // ── Output projection ── (gpt-oss names it attn_out; llama/gemma/etc. use attn_output)
             string attnOut = $"{pfx}_attn_out";
-            AddLinear(graph, model, weights, $"{pfx}.attn_output", attnMerged, attnOut, quantizedBytes, transposeOnUpload);
+            string attnOutPrefix = FindTensor(model, $"{pfx}.attn_output.weight") != null ? $"{pfx}.attn_output" : $"{pfx}.attn_out";
+            AddLinear(graph, model, weights, attnOutPrefix, attnMerged, attnOut, quantizedBytes, transposeOnUpload);
 
             // ── Post-attention norm (gemma 2/3/4 norm-sandwich: normalize the sublayer OUTPUT before the
             //    residual add). Presence-based — llama/mistral/etc. have no such tensor and are unaffected. ──
@@ -237,33 +249,42 @@ public static class GGUFGraphBuilder
             string ffnNormOut = $"{pfx}_ffn_norm";
             AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
 
-            // ── FFN: gate + up → activation → down ──
-            string gateOut = $"{pfx}_gate", upOut = $"{pfx}_up";
-            AddLinear(graph, model, weights, $"{pfx}.ffn_gate", ffnNormOut, gateOut, quantizedBytes, transposeOnUpload);
-            AddLinear(graph, model, weights, $"{pfx}.ffn_up", ffnNormOut, upOut, quantizedBytes, transposeOnUpload);
-
-            string activated;
-            if (useSiLU)
+            // ── FFN: dense gate/up → activation → down, OR a Mixture-of-Experts block when the model carries
+            //    a router (ffn_gate_inp, e.g. gpt-oss). ──
+            string ffnOut = $"{pfx}_ffn_out";
+            if (FindTensor(model, $"{pfx}.ffn_gate_inp.weight") != null)
             {
-                // SiLU(x) = x * sigmoid(x)
-                string sigOut = $"{pfx}_gate_sig";
-                AddNode(graph, "Sigmoid", new[] { gateOut }, new[] { sigOut });
-                string siluOut = $"{pfx}_gate_silu";
-                AddNode(graph, "Mul", new[] { gateOut, sigOut }, new[] { siluOut });
-                activated = $"{pfx}_ffn_act";
-                AddNode(graph, "Mul", new[] { siluOut, upOut }, new[] { activated });
+                AddMoEFFN(graph, model, weights, pfx, ffnNormOut, ffnOut, quantizedBytes, transposeOnUpload);
             }
             else
             {
-                // GELU
-                string geluOut = $"{pfx}_gate_gelu";
-                AddNode(graph, "Gelu", new[] { gateOut }, new[] { geluOut });
-                activated = $"{pfx}_ffn_act";
-                AddNode(graph, "Mul", new[] { geluOut, upOut }, new[] { activated });
-            }
+                // ── Dense FFN: gate + up → activation → down ──
+                string gateOut = $"{pfx}_gate", upOut = $"{pfx}_up";
+                AddLinear(graph, model, weights, $"{pfx}.ffn_gate", ffnNormOut, gateOut, quantizedBytes, transposeOnUpload);
+                AddLinear(graph, model, weights, $"{pfx}.ffn_up", ffnNormOut, upOut, quantizedBytes, transposeOnUpload);
 
-            string ffnOut = $"{pfx}_ffn_out";
-            AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes, transposeOnUpload);
+                string activated;
+                if (useSiLU)
+                {
+                    // SiLU(x) = x * sigmoid(x)
+                    string sigOut = $"{pfx}_gate_sig";
+                    AddNode(graph, "Sigmoid", new[] { gateOut }, new[] { sigOut });
+                    string siluOut = $"{pfx}_gate_silu";
+                    AddNode(graph, "Mul", new[] { gateOut, sigOut }, new[] { siluOut });
+                    activated = $"{pfx}_ffn_act";
+                    AddNode(graph, "Mul", new[] { siluOut, upOut }, new[] { activated });
+                }
+                else
+                {
+                    // GELU
+                    string geluOut = $"{pfx}_gate_gelu";
+                    AddNode(graph, "Gelu", new[] { gateOut }, new[] { geluOut });
+                    activated = $"{pfx}_ffn_act";
+                    AddNode(graph, "Mul", new[] { geluOut, upOut }, new[] { activated });
+                }
+
+                AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes, transposeOnUpload);
+            }
 
             // ── Post-FFN norm (gemma norm-sandwich), presence-based. ──
             string ffnResInput = ffnOut;
@@ -609,5 +630,56 @@ public static class GGUFGraphBuilder
             graph.Initializers[biasTensor.Name] = biasTensor.Shape;
             AddNode(graph, "Add", new[] { matmulOut, biasTensor.Name }, new[] { output });
         }
+    }
+
+    /// <summary>
+    /// Emit a Mixture-of-Experts FFN block (gpt-oss / OpenAI-MoE) as one fused "MoE" node. Extracts the
+    /// router (ffn_gate_inp +bias, F32) and the per-expert gate/up/down weights (+biases) — the expert
+    /// weights are typically MXFP4 (stay raw, decode in-register via FusedDequantMatMul; the MoEOperator
+    /// slices per-expert). Input order matches MoEOperator: [x, gate_inp, gate_inp.b, gate_exps, gate_exps.b,
+    /// up_exps, up_exps.b, down_exps, down_exps.b]. n_ff is derived from the gate_exps shape (ggml
+    /// [n_embd, n_ff, n_expert]); n_expert / n_expert_used from arch metadata. gpt-oss = SwiGLU-OAI
+    /// (alpha 1.702, limit 7) — the MoEOperator defaults match, so no override needed.
+    /// </summary>
+    private static void AddMoEFFN(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
+        string pfx, string input, string output,
+        Dictionary<string, GGUFQuantizedWeight>? quantizedBytes, HashSet<string>? transposeOnUpload)
+    {
+        string Reg(string suffix)
+        {
+            var t = FindTensor(model, $"{pfx}.{suffix}")
+                ?? throw new InvalidDataException($"MoE layer '{pfx}': required tensor '{pfx}.{suffix}' missing.");
+            // exps are quantized (MXFP4) -> raw bytes via quantizedBytes; router + biases are F32. No transpose:
+            // the MoEOperator reads the ggml [N][K] / [.,n_expert] layout natively (FusedDequant + in-op transpose).
+            ExtractWeight(model, t, weights, quantizedBytes, transposeOnUpload);
+            graph.Initializers[t.Name] = t.Shape;
+            return t.Name;
+        }
+
+        var gateExps = FindTensor(model, $"{pfx}.ffn_gate_exps.weight")
+            ?? throw new InvalidDataException($"MoE layer '{pfx}': ffn_gate_exps.weight missing.");
+        // ggml expert weight shape [n_embd, n_ff, n_expert]; n_ff = Dimensions[1].
+        int nFf = gateExps.Dimensions.Length >= 2 ? (int)gateExps.Dimensions[1] : 0;
+        string a = model.Architecture;
+        int nExpert = (int)model.GetMetadataInt($"{a}.expert_count", gateExps.Dimensions.Length >= 3 ? (int)gateExps.Dimensions[2] : 0);
+        int nExpertUsed = (int)model.GetMetadataInt($"{a}.expert_used_count", 0);
+        if (nFf <= 0 || nExpert <= 0 || nExpertUsed <= 0)
+            throw new InvalidDataException($"MoE layer '{pfx}': bad shape/hparams n_ff={nFf} n_expert={nExpert} n_expert_used={nExpertUsed}.");
+
+        var inputs = new[]
+        {
+            input,
+            Reg("ffn_gate_inp.weight"), Reg("ffn_gate_inp.bias"),
+            Reg("ffn_gate_exps.weight"), Reg("ffn_gate_exps.bias"),
+            Reg("ffn_up_exps.weight"), Reg("ffn_up_exps.bias"),
+            Reg("ffn_down_exps.weight"), Reg("ffn_down_exps.bias"),
+        };
+        var attrs = new Dictionary<string, JsonElement>
+        {
+            ["n_expert"] = JsonSerializer.SerializeToElement((long)nExpert),
+            ["n_expert_used"] = JsonSerializer.SerializeToElement((long)nExpertUsed),
+            ["n_ff"] = JsonSerializer.SerializeToElement((long)nFf),
+        };
+        AddNode(graph, "MoE", inputs, new[] { output }, attrs);
     }
 }
