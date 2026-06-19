@@ -62,7 +62,8 @@ public static class GGUFGraphBuilder
         // gemma generation is recognized without a hardcoded version list (gemma4 fell to LayerNorm+SiLU,
         // both wrong, before this).
         bool isGemma = arch.StartsWith("gemma", StringComparison.Ordinal);
-        bool useRMSNorm = isGemma || arch is "llama" or "mistral" or "qwen" or "qwen2";
+        // gpt-oss (gptoss) uses RMSNorm (attention.layer_norm_rms_epsilon; llama.cpp openai-moe = LLM_NORM_RMS).
+        bool useRMSNorm = isGemma || arch is "llama" or "mistral" or "qwen" or "qwen2" or "gptoss";
         bool useSiLU = !isGemma
             && arch is not "phi" and not "phi3" and not "gpt2" and not "falcon" and not "bloom" and not "mpt";
 
@@ -413,12 +414,16 @@ public static class GGUFGraphBuilder
         float baseFull = model.GetMetadataFloat($"{a}.rope.freq_base", 10000f);
         float ropeBase = isGlobal ? baseFull : model.GetMetadataFloat($"{a}.rope.freq_base_swa", baseFull);
 
-        int dimFull = (int)model.GetMetadataInt($"{a}.rope.dimension_count", defaultHeadDim);
-        int rotaryDim = isGlobal ? dimFull : (int)model.GetMetadataInt($"{a}.rope.dimension_count_swa", dimFull);
-
+        // Resolve the REAL head_dim first (key_length), then default the rope dimension to IT — not to
+        // embedDim/nHeads. gpt-oss heads don't tile the embedding (64 heads x 64 != 2880), so the caller's
+        // defaultHeadDim = embedDim/nHeads = 45 is wrong; key_length = 64 is the truth. With no explicit
+        // rope.dimension_count, rotary = full head_dim (llama.cpp openai-moe n_rot = key_length).
         int klFull = (int)model.GetMetadataInt($"{a}.attention.key_length", defaultHeadDim);
         int headDim = isGlobal ? klFull : (int)model.GetMetadataInt($"{a}.attention.key_length_swa", klFull);
         if (headDim <= 0) headDim = defaultHeadDim;
+
+        int dimFull = (int)model.GetMetadataInt($"{a}.rope.dimension_count", headDim);
+        int rotaryDim = isGlobal ? dimFull : (int)model.GetMetadataInt($"{a}.rope.dimension_count_swa", dimFull);
         if (rotaryDim <= 0) rotaryDim = headDim;
 
         return new LayerAttnConfig(isGlobal, window, ropeBase, rotaryDim, nkv, headDim);
