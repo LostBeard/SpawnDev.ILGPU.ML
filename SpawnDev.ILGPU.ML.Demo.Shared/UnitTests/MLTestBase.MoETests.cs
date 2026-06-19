@@ -71,6 +71,40 @@ public abstract partial class MLTestBase
         float maxErr = 0f;
         for (int i = 0; i < expected.Length; i++) maxErr = MathF.Max(maxErr, MathF.Abs(gpu[i] - expected[i]));
         if (maxErr > 1e-4f) throw new Exception($"Attention sinks vs CPU maxErr={maxErr:E3} (expected < 1e-4)");
+
+        // Also exercise the OPERATOR path: a 4th input (sinks) must route to the kernel's sink fold.
+        var registry = new OperatorRegistry(accelerator);
+        using var ob2 = accelerator.Allocate1D<float>(nHeads * seqQ * D);
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            var ctx = new OnnxOpContext
+            {
+                Inputs = new[]
+                {
+                    new Tensor(qb.View, new[] { nHeads, seqQ, D }, "q"),
+                    new Tensor(kb.View, new[] { nHeads, seqKV, D }, "k"),
+                    new Tensor(vb.View, new[] { nHeads, seqKV, D }, "v"),
+                    new Tensor(sb.View, new[] { nHeads }, "sinks"),
+                },
+                Outputs = new[] { new Tensor(ob2.View, new[] { nHeads, seqQ, D }, "out") },
+                Attributes = new Dictionary<string, object>
+                {
+                    ["n_heads"] = (long)nHeads, ["n_kv_heads"] = (long)nHeads, ["head_dim"] = (long)D,
+                    ["causal"] = 0L, ["window"] = (long)bigWindow, ["scale"] = scale,
+                },
+                Pool = pool,
+                InputNames = new[] { "q", "k", "v", "sinks" },
+                Registry = registry,
+            };
+            new FusedAttentionOperator(registry).Execute(ctx);
+            await accelerator.SynchronizeAsync();
+            var gpuOp = await ob2.CopyToHostAsync<float>(0, nHeads * seqQ * D);
+            float opErr = 0f;
+            for (int i = 0; i < expected.Length; i++) opErr = MathF.Max(opErr, MathF.Abs(gpuOp[i] - expected[i]));
+            if (opErr > 1e-4f) throw new Exception($"FusedAttentionOperator sinks (4th input) vs CPU maxErr={opErr:E3}");
+        }
+        finally { pool.Dispose(); }
     });
 
     [TestMethod]

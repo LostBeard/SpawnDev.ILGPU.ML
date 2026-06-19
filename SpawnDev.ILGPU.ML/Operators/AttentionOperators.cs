@@ -111,7 +111,19 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
         // Contract: window 0 OR >= seqKV both mean global (no window constraint).
         int effWindow = window <= 0 ? int.MaxValue : window;
 
-        reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
-            nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale);
+        // Optional 4th input = per-head attention sinks (gpt-oss attn_sinks, [n_head]): a learned logit
+        // folded into the softmax denominator (0 value contribution). Absent => sinkCount 0 = plain attention.
+        if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null && ctx.Inputs[3].ElementCount > 0)
+        {
+            var sinks = ctx.Inputs[3];
+            reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
+                nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale,
+                sinks: sinks.Data, sinkCount: sinks.ElementCount);
+        }
+        else
+        {
+            reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
+                nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale);
+        }
     }
 }
