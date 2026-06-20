@@ -135,6 +135,17 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                     batchSize * K * N == ctx.Inputs[1].ElementCount &&
                     batchSize * M * N == ctx.Outputs[0].ElementCount)
                 {
+                    // A NATIVE low-precision operand (Half/bf16/FP8) has an EMPTY float .Data, so the batched
+                    // matmul below would read out of bounds (the same cryptic "Index/Extent X out of bounds" that
+                    // bit FusedLinear). Einsum has no low-p kernel path; a low-p WEIGHT should reach the graph as a
+                    // MatMul/Gemm (which DO consume native low-p via LowPWeightDispatch). Fail loud, not cryptic.
+                    if (LowPWeightDispatch.IsLowP(ctx.Inputs[0]) || LowPWeightDispatch.IsLowP(ctx.Inputs[1]))
+                        throw new NotSupportedException(
+                            "Einsum GPU matmul fast-path: a native low-precision operand (DType " +
+                            $"{(LowPWeightDispatch.IsLowP(ctx.Inputs[0]) ? ctx.Inputs[0].DType : ctx.Inputs[1].DType)}) " +
+                            "is not supported - its float Data is empty. Consume the low-p weight as MatMul/Gemm " +
+                            "(native low-p), or add a low-p einsum kernel.");
+
                     // Batched matmul: treat batch dims as outer, contract K
                     for (int b = 0; b < batchSize; b++)
                     {

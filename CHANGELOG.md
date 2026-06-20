@@ -23,6 +23,13 @@ now runs end-to-end with finite, non-degenerate logits (`finite=201088/201088`);
 `F16_FusedLinearOperator_RoutesBFloat16Weight` (bf16 None + GELU operator routing) + the fp32 FusedLinear
 regression green on all 6 backends (PMT `FusedLinear` 44/0).
 
+**Audited the low-p empty-`.Data` trap across every weight-consuming operator.** MatMul / Gemm / Conv already
+branch on `IsLowP` and route to the native path (`LowPWeightDispatch`); FusedLinear was the only real gap (fixed
+above). `EinsumOperator`'s GPU matmul fast-path now FAILS LOUD on a native low-p operand - a clear
+`NotSupportedException` (route the low-p linear as MatMul/Gemm) instead of the cryptic `Index/Extent X out of
+bounds` FailFast - since Einsum has no low-p kernel and its operands are normally both fp32 activations (no current
+model exercises it; the guard is defensive). PMT `Einsum` 20/0 unchanged.
+
 
 **BF16/F16 GGUF linear weights stay NATIVE on load (no f32 upcast).** The GGUF loader upcast every
 non-block-quantized weight to f32 at load (`ExtractWeight` → `GetTensorFloat32`), doubling the VRAM and
