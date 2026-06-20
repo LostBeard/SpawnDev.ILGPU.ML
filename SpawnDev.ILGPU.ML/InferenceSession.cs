@@ -1392,7 +1392,7 @@ public class InferenceSession : IDisposable
 
         // Build transformer graph from architecture metadata
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
+        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload, lowPWeightsTyped) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
         onProgress?.Invoke("build_graph", 100);
 
         // Extract small constant values
@@ -1430,6 +1430,8 @@ public class InferenceSession : IDisposable
         // Transpose-on-upload temps that must outlive this sync entry point on browser
         // backends (Synchronize() only flushes there) — owned by the session.
         var transposeTemps = new List<IDisposable>();
+        // Native BF16/F16 linear-weight transposed buffers (FromLowP-backed) — owned by the session.
+        var lowPBuffers = new List<IDisposable>();
         // Tied-embed aliases share one byte[]; dedupe by reference so the compressed
         // table is uploaded ONCE and serves both Gather and the LM-head MatMul.
         var uploadedQuant = new Dictionary<byte[], ArrayView1D<byte, Stride1D.Dense>>(
@@ -1459,6 +1461,22 @@ public class InferenceSession : IDisposable
                     // carries no buffer (a full F32 rent here would be ~4GB for a
                     // gemma-class embedding) and fails loudly if any op reads .Data.
                     gpuWeights[name] = Tensor.ShapeOnly(shape, name);
+                }
+                else if (lowPWeightsTyped.TryGetValue(name, out var lp))
+                {
+                    // Native BF16/F16 linear weight: upload packed bytes, transpose in the element dtype to
+                    // the declared [K, N], wrap as a FromLowP tensor (NO f32 upcast — half the VRAM). The
+                    // src [N,K] byte temp is freed after the transpose (browser: outlive the sync entry).
+                    int padded = (lp.Bytes.Length + 3) & ~3;
+                    var srcBuf = accelerator.Allocate1D<byte>(padded);
+                    srcBuf.View.SubView(0, lp.Bytes.Length).CopyFromCPU(lp.Bytes);
+                    gpuWeights[name] = WrapLowPWeight(accelerator, registry.Transpose, srcBuf, lp, shape, name, lowPBuffers);
+                    accelerator.Flush();
+                    if (accelerator.AcceleratorType is AcceleratorType.Wasm
+                        or AcceleratorType.WebGL or AcceleratorType.WebGPU)
+                        transposeTemps.Add(srcBuf);
+                    else
+                        srcBuf.Dispose();
                 }
                 else if (data.Length > 0)
                 {
@@ -1509,7 +1527,7 @@ public class InferenceSession : IDisposable
             quantizedWeights: gpuQuantizedWeights.Count > 0 ? gpuQuantizedWeights : null);
         onProgress?.Invoke("ready", 100);
 
-        var ownedDisposables = quantizedBuffers.Cast<IDisposable>().Concat(transposeTemps).ToList();
+        var ownedDisposables = quantizedBuffers.Cast<IDisposable>().Concat(transposeTemps).Concat(lowPBuffers).ToList();
         var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
             ModelName = graph.Name,
@@ -1558,7 +1576,7 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("parse", 100);
 
         onProgress?.Invoke("build_graph", 0);
-        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
+        var (graph, cpuWeightsAll, quantizedWeightsTyped, transposeOnUpload, lowPWeightsTyped) = GGUF.GGUFGraphBuilder.BuildGraph(ggufModel, acceptInputsEmbeds);
         onProgress?.Invoke("build_graph", 100);
 
         // Small constants (identical to CreateFromGGUF).
@@ -1593,6 +1611,8 @@ public class InferenceSession : IDisposable
         var gpuQuantizedWeights = new Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>();
         var quantizedTypes = new Dictionary<string, GGUF.GGMLType>();
         var quantizedBuffers = new List<MemoryBuffer1D<byte, Stride1D.Dense>>();
+        // Native BF16/F16 linear-weight transposed buffers (FromLowP-backed) — owned by the session.
+        var lowPBuffers = new List<IDisposable>();
         // Dedup tied-embed aliases: stream-offset key (boxed long compares by value) for streamed tensors,
         // byte[] reference for any in-memory ones — one Dictionary<object,...> handles both.
         var uploadedQuant = new Dictionary<object, ArrayView1D<byte, Stride1D.Dense>>();
@@ -1622,6 +1642,16 @@ public class InferenceSession : IDisposable
                 gpuQuantizedWeights[name] = qView;
                 quantizedTypes[name] = qw.Type;
                 gpuWeights[name] = Tensor.ShapeOnly(shape, name); // floats never exist (a Q6_K embed would be ~4 GB F32)
+            }
+            else if (lowPWeightsTyped.TryGetValue(name, out var lp))
+            {
+                // Native BF16/F16 linear weight: stream packed bytes straight to a GPU byte buffer, transpose
+                // in the element dtype to the declared [K, N], wrap as a FromLowP tensor (NO f32 upcast = half
+                // the VRAM + bandwidth). DRAIN before freeing the streamed byte temp (browser sync only flushes).
+                var srcBuf = await pool.AllocateQuantizedBytesFromStreamAsync(stream, lp.StreamOffset, lp.StreamByteSize, ct).ConfigureAwait(false);
+                gpuWeights[name] = WrapLowPWeight(accelerator, registry.Transpose, srcBuf, lp, shape, name, lowPBuffers);
+                await accelerator.SynchronizeAsync().ConfigureAwait(false);
+                srcBuf.Dispose();
             }
             else if (data.Length > 0)
             {
@@ -1658,13 +1688,49 @@ public class InferenceSession : IDisposable
         var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
         {
             ModelName = graph.Name,
-            _ownedBuffers = quantizedBuffers.Count > 0 ? quantizedBuffers.Cast<IDisposable>().ToList() : null
+            _ownedBuffers = (quantizedBuffers.Count > 0 || lowPBuffers.Count > 0)
+                ? quantizedBuffers.Cast<IDisposable>().Concat(lowPBuffers).ToList() : null
         };
         // Dynamic-shape recompilation: a Run at a growing decode length recompiles (CPU-only; GPU weights
         // are reused) rather than running the seq=1 compile shape and dropping all but the first token.
         session.EnableShapeRecompilation(graph, constSeed, floatSeed, enableOptimization: true);
         return session;
     }
+
+    // ═══════════════════════════════════════════════════════════
+    //  Native low-precision (BF16/F16) GGUF linear-weight upload
+    // ═══════════════════════════════════════════════════════════
+    // The GGUF loader keeps BF16/F16 linear weights NATIVE end-to-end: a packed-bytes GPU buffer is
+    // reinterpreted as ArrayView<T> (zero-copy Cast), transposed in the element dtype from the on-disk
+    // [N rows][K] storage to the declared MatMul-B [K, N], and wrapped as a FromLowP tensor (no f32
+    // buffer). The MatMul/Gemm operators read it via MatMulLowPWeight<T> and decode at the MAC — half the
+    // VRAM + upload bandwidth of the old GetTensorFloat32 upcast (no-needless-conversion).
+
+    /// <summary>Reinterpret a packed [N,K] byte buffer as <typeparamref name="T"/>, transpose to the
+    /// declared [K, N], and wrap as a FromLowP tensor. The permanent transposed output buffer is added to
+    /// <paramref name="owned"/>; the caller owns <paramref name="byteBuf"/> (free it AFTER the transpose
+    /// has drained).</summary>
+    private static Tensor WrapLowPTransposed<T>(Accelerator acc, Kernels.TransposeKernel transpose,
+        MemoryBuffer1D<byte, Stride1D.Dense> byteBuf, int[] shapeKN, Tensors.TensorDataType dtype,
+        string name, List<IDisposable> owned) where T : unmanaged
+    {
+        var srcNK = byteBuf.View.Cast<byte, T>();                       // zero-copy reinterpret, [N*K] elements
+        var outBuf = acc.Allocate1D<T>((long)shapeKN[0] * shapeKN[1]);  // declared [K, N]
+        // input declared as [N, K] = [shapeKN[1], shapeKN[0]]; perm [1,0] -> [K, N].
+        transpose.Transpose(srcNK, outBuf.View, new[] { shapeKN[1], shapeKN[0] }, new[] { 1, 0 });
+        owned.Add(outBuf);
+        return Tensors.Tensor.FromLowP(outBuf.View, dtype, shapeKN, name);
+    }
+
+    /// <summary>Dispatch <see cref="WrapLowPTransposed{T}"/> on the native element dtype.</summary>
+    private static Tensor WrapLowPWeight(Accelerator acc, Kernels.TransposeKernel transpose,
+        MemoryBuffer1D<byte, Stride1D.Dense> byteBuf, GGUF.GGUFLowPWeight lp, int[] shape, string name,
+        List<IDisposable> owned) => lp.DType switch
+        {
+            Tensors.TensorDataType.BFloat16 => WrapLowPTransposed<global::ILGPU.BFloat16>(acc, transpose, byteBuf, shape, lp.DType, name, owned),
+            Tensors.TensorDataType.Float16 => WrapLowPTransposed<global::ILGPU.Half>(acc, transpose, byteBuf, shape, lp.DType, name, owned),
+            _ => throw new NotSupportedException($"GGUF native low-p weight '{name}': dtype {lp.DType} has no native upload path."),
+        };
 
     // ═══════════════════════════════════════════════════════════
     //  SafeTensors

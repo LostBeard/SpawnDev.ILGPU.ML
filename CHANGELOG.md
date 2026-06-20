@@ -4,6 +4,21 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased — SpawnDev.ILGPU 4.14.0 (4-bit data-type tier) + MXFP4 single-source-of-truth decode
 
+**BF16/F16 GGUF linear weights stay NATIVE on load (no f32 upcast).** The GGUF loader upcast every
+non-block-quantized weight to f32 at load (`ExtractWeight` → `GetTensorFloat32`), doubling the VRAM and
+upload bandwidth of BF16/F16 weights (e.g. gpt-oss attention/output projections, any fp16/bf16 GGUF). Now
+a 2-D linear-B BF16/F16 weight is kept in its native 2-byte elements end-to-end: `GGUFGraphBuilder` records
+it on a new `GGUFLowPWeight` channel (mirroring the quantized channel — raw bytes or stream offset + dtype
++ a transpose flag, with a presence marker in the float `weights` dict) instead of expanding to `float[]`;
+both `InferenceSession` loaders upload the packed bytes, reinterpret (`Cast<byte,T>`), transpose in the
+element dtype from the GGUF `[N rows][K]` storage to the declared MatMul-B `[K, N]`, and wrap as a
+`Tensor.FromLowP<T>` (the MatMul/Gemm operators already decode it in-register via `MatMulLowPWeight<T>`).
+The streaming path is zero-copy (stream → GPU byte buffer → reinterpret → drain before freeing). Halves
+these weights' device memory (e.g. a `[vocab, n_embd]` bf16 lm-head stays ~1.16 GB instead of ~2.3 GB).
+Norms, biases and the embedding/Gather table stay f32 (tiny, or no native kernel yet). PMT green all 6
+backends (`F16_GgufLoad_BFloat16LinearWeight_TransposedNative_MatchesFp32` numerical + bf16 regression
+74/0; `GGUFGraphBuilder_BF16Linear_RoutesToNativeLowP` routing).
+
 **Migrated to SpawnDev.ILGPU 4.14.0 (nuget.org stable).** Off the `4.14.0-local.6` feed pin onto the
 published `4.14.0` (Fork / Algorithms.Fork `2.0.39` transitive) - the 4-bit / low-precision data-type tier
 (true packed `Float4E2M1`/`QInt4`/`QUInt4`, FP8/Half/bf16 parity, plus the kernel-safe raw-bits decode

@@ -4,6 +4,7 @@ using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Operators;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
+using System.Runtime.InteropServices;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -322,6 +323,79 @@ public abstract partial class MLTestBase
                 maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
             if (maxErr > 1e-3f)
                 throw new Exception($"MatMul operator bf16-weight routing maxErr={maxErr:E3} (expected < 1e-3)");
+        }
+        finally { pool.Dispose(); }
+    });
+
+    /// <summary>
+    /// bf16-native GGUF LOAD mechanic: a BF16 linear weight stored in GGUF [N rows][K] order is uploaded as
+    /// raw bytes, reinterpreted (Cast&lt;byte,BFloat16&gt;), transposed in the element dtype to the declared
+    /// [K, N] and wrapped as a FromLowP tensor — the exact chain InferenceSession.WrapLowPWeight runs at load,
+    /// NEVER upcasting to f32. Drives upload-&gt;Cast-&gt;Transpose&lt;BFloat16&gt;-&gt;FromLowP-&gt;MatMul and
+    /// matches a fp32 reference from the same bf16-rounded [K,N] weight. (no-needless-upcast GGUF loader, 2026-06-19.)
+    /// </summary>
+    [TestMethod]
+    public Task F16_GgufLoad_BFloat16LinearWeight_TransposedNative_MatchesFp32() => RunTest(async accelerator =>
+    {
+        int M = 3, K = 8, N = 6;
+        var rng = new Random(71);
+        var a = new float[M * K];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        // Declared MatMul-B weight [K, N], bf16-rounded — the reference.
+        var wKN = new global::ILGPU.BFloat16[K * N];
+        for (int i = 0; i < wKN.Length; i++) wKN[i] = (global::ILGPU.BFloat16)(rng.NextDouble() * 2 - 1);
+        // GGUF stores a linear weight as [N rows][K] = the transpose of the declared [K, N].
+        var storageNK = new global::ILGPU.BFloat16[N * K];
+        for (int k = 0; k < K; k++)
+            for (int n = 0; n < N; n++)
+                storageNK[n * K + k] = wKN[k * N + n];
+        var storageBytes = MemoryMarshal.AsBytes<global::ILGPU.BFloat16>(storageNK).ToArray();
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            var registry = new OperatorRegistry(accelerator);
+
+            // Mirror InferenceSession.WrapLowPWeight: packed bytes -> GPU byte buffer -> Cast<byte,BFloat16>
+            // -> Transpose<BFloat16> [N,K]->[K,N] -> FromLowP (no f32 upcast anywhere).
+            int padded = (storageBytes.Length + 3) & ~3;
+            using var srcBuf = accelerator.Allocate1D<byte>(padded);
+            srcBuf.View.SubView(0, storageBytes.Length).CopyFromCPU(storageBytes);
+            var srcNK = srcBuf.View.Cast<byte, global::ILGPU.BFloat16>();
+            using var outBuf = accelerator.Allocate1D<global::ILGPU.BFloat16>(K * N);
+            registry.Transpose.Transpose(srcNK, outBuf.View, new[] { N, K }, new[] { 1, 0 });
+            await accelerator.SynchronizeAsync();
+            var bLowP = Tensor.FromLowP(outBuf.View, TensorDataType.BFloat16, new[] { K, N }, "b");
+            if (bLowP.DType != TensorDataType.BFloat16) throw new Exception("loaded bf16 weight DType != BFloat16");
+
+            using var aBuf = accelerator.Allocate1D(a);
+            using var outMm = accelerator.Allocate1D<float>(M * N);
+            var aT = new Tensor(aBuf.View, new[] { M, K }, "a");
+            var outT = new Tensor(outMm.View, new[] { M, N }, "out");
+            var op = new MatMulOperator(registry);
+            op.Execute(new OnnxOpContext
+            {
+                Inputs = new[] { aT, bLowP },
+                Outputs = new[] { outT },
+                Attributes = new Dictionary<string, object>(),
+                Pool = pool,
+                InputNames = new[] { "a", "b" },
+                Registry = registry,
+            });
+            await accelerator.SynchronizeAsync();
+            var gpu = await outMm.CopyToHostAsync<float>(0, M * N);
+
+            float maxErr = 0f;
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++) s += a[m * K + k] * (float)wKN[k * N + n];
+                    maxErr = MathF.Max(maxErr, MathF.Abs(gpu[m * N + n] - s));
+                }
+            if (maxErr > 1e-3f)
+                throw new Exception($"bf16-native transposed-load matmul maxErr={maxErr:E3} (expected < 1e-3)");
+            Console.WriteLine($"[F16] bf16-native GGUF transposed-load matmul matches fp32 (maxErr={maxErr:E3})");
         }
         finally { pool.Dispose(); }
     });

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using SpawnDev.ILGPU.ML.Graph;
+using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.GGUF;
 
@@ -29,6 +30,18 @@ namespace SpawnDev.ILGPU.ML.GGUF;
 /// in-memory path.</param>
 public sealed record GGUFQuantizedWeight(byte[] Bytes, GGMLType Type, long StreamOffset = -1, int StreamByteSize = 0);
 
+/// <summary>Raw NATIVE low-precision (non-block-quantized) weight bytes + the element dtype that reads
+/// them. For a BF16/F16 linear weight we keep the on-disk 2-byte elements as-is and decode in-register at
+/// the MAC (via <c>MatMulLowPWeight&lt;T&gt;</c>) instead of upcasting to f32 at load - the same
+/// no-needless-conversion discipline as the quantized channel, but these decode through the typed
+/// <c>ArrayView&lt;BFloat16&gt;</c>/<c>&lt;Half&gt;</c> path, not a fused block-dequant kernel.</summary>
+/// <param name="Bytes">Raw element bytes (in-memory load); empty when streaming (see <paramref name="StreamOffset"/>).</param>
+/// <param name="DType">Native element dtype (<see cref="TensorDataType.BFloat16"/> or <see cref="TensorDataType.Float16"/>).</param>
+/// <param name="StreamOffset">Absolute byte offset in the streaming source, or -1 for the in-memory path.</param>
+/// <param name="Transpose">True if this is a linear-B weight stored [N rows][K] that must be transposed to
+/// [K, N] at upload (the declared MatMul B orientation), done natively in the element dtype.</param>
+public sealed record GGUFLowPWeight(byte[] Bytes, TensorDataType DType, long StreamOffset, int StreamByteSize, bool Transpose);
+
 public static class GGUFGraphBuilder
 {
     /// <param name="acceptInputsEmbeds">When true, the graph takes a pre-computed <c>inputs_embeds</c>
@@ -38,13 +51,17 @@ public static class GGUFGraphBuilder
     /// input_ids text path.</param>
     public static (ModelGraph Graph, Dictionary<string, float[]> Weights,
         Dictionary<string, GGUFQuantizedWeight> QuantizedWeights,
-        HashSet<string> TransposeOnUpload) BuildGraph(GGUFModel model, bool acceptInputsEmbeds = false)
+        HashSet<string> TransposeOnUpload,
+        Dictionary<string, GGUFLowPWeight> LowPWeights) BuildGraph(GGUFModel model, bool acceptInputsEmbeds = false)
     {
         var arch = model.Architecture.ToLowerInvariant();
         var graph = new ModelGraph { Name = $"{model.Name} ({arch})" };
         var weights = new Dictionary<string, float[]>();
         var quantizedBytes = new Dictionary<string, GGUFQuantizedWeight>();
         var transposeOnUpload = new HashSet<string>();
+        // Native low-precision (BF16/F16) linear weights — kept packed, decoded in-register at the MAC
+        // instead of upcast to f32 at load. Travels alongside transposeOnUpload through AddLinear.
+        var lowPBytes = new Dictionary<string, GGUFLowPWeight>();
 
         // Extract architecture hyperparameters
         int vocabSize = (int)model.VocabSize;
@@ -144,13 +161,13 @@ public static class GGUFGraphBuilder
 
             // ── Q, K, V projections (raw) ──
             string qOut = $"{pfx}_q", kOut = $"{pfx}_k", vOut = $"{pfx}_v";
-            AddLinear(graph, model, weights, $"{pfx}.attn_q", normOut, qOut, quantizedBytes, transposeOnUpload);
-            AddLinear(graph, model, weights, $"{pfx}.attn_k", normOut, kOut, quantizedBytes, transposeOnUpload);
+            AddLinear(graph, model, weights, $"{pfx}.attn_q", normOut, qOut, quantizedBytes, transposeOnUpload, lowPBytes);
+            AddLinear(graph, model, weights, $"{pfx}.attn_k", normOut, kOut, quantizedBytes, transposeOnUpload, lowPBytes);
             // gemma4 global layers carry no attn_v: V reuses the RAW K projection
             // (llama.cpp `Vcur = wv ? wv·x : Kcur`). All other archs always have attn_v.
             bool hasV = FindTensor(model, $"{pfx}.attn_v.weight") != null;
             if (hasV)
-                AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes, transposeOnUpload);
+                AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes, transposeOnUpload, lowPBytes);
             string vSrc = hasV ? vOut : kOut;
 
             // gemma4-style attention is signalled by the QK-norm tensors. When present we ALSO apply the
@@ -230,7 +247,7 @@ public static class GGUFGraphBuilder
             // ── Output projection ── (gpt-oss names it attn_out; llama/gemma/etc. use attn_output)
             string attnOut = $"{pfx}_attn_out";
             string attnOutPrefix = FindTensor(model, $"{pfx}.attn_output.weight") != null ? $"{pfx}.attn_output" : $"{pfx}.attn_out";
-            AddLinear(graph, model, weights, attnOutPrefix, attnMerged, attnOut, quantizedBytes, transposeOnUpload);
+            AddLinear(graph, model, weights, attnOutPrefix, attnMerged, attnOut, quantizedBytes, transposeOnUpload, lowPBytes);
 
             // ── Post-attention norm (gemma 2/3/4 norm-sandwich: normalize the sublayer OUTPUT before the
             //    residual add). Presence-based — llama/mistral/etc. have no such tensor and are unaffected. ──
@@ -261,8 +278,8 @@ public static class GGUFGraphBuilder
             {
                 // ── Dense FFN: gate + up → activation → down ──
                 string gateOut = $"{pfx}_gate", upOut = $"{pfx}_up";
-                AddLinear(graph, model, weights, $"{pfx}.ffn_gate", ffnNormOut, gateOut, quantizedBytes, transposeOnUpload);
-                AddLinear(graph, model, weights, $"{pfx}.ffn_up", ffnNormOut, upOut, quantizedBytes, transposeOnUpload);
+                AddLinear(graph, model, weights, $"{pfx}.ffn_gate", ffnNormOut, gateOut, quantizedBytes, transposeOnUpload, lowPBytes);
+                AddLinear(graph, model, weights, $"{pfx}.ffn_up", ffnNormOut, upOut, quantizedBytes, transposeOnUpload, lowPBytes);
 
                 string activated;
                 if (useSiLU)
@@ -284,7 +301,7 @@ public static class GGUFGraphBuilder
                     AddNode(graph, "Mul", new[] { geluOut, upOut }, new[] { activated });
                 }
 
-                AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes, transposeOnUpload);
+                AddLinear(graph, model, weights, $"{pfx}.ffn_down", activated, ffnOut, quantizedBytes, transposeOnUpload, lowPBytes);
             }
 
             // ── Post-FFN norm (gemma norm-sandwich), presence-based. ──
@@ -334,7 +351,7 @@ public static class GGUFGraphBuilder
         var outputWeight = FindTensor(model, "output.weight");
         if (outputWeight != null)
         {
-            ExtractWeight(model, outputWeight, weights, quantizedBytes, transposeOnUpload, isLinearB: true);
+            ExtractWeight(model, outputWeight, weights, quantizedBytes, transposeOnUpload, isLinearB: true, lowPBytes: lowPBytes);
             graph.Initializers[outputWeight.Name] = outputWeight.Shape;
             AddNode(graph, "MatMul", new[] { finalNormOut, outputWeight.Name }, new[] { lmHead });
         }
@@ -374,7 +391,7 @@ public static class GGUFGraphBuilder
             AddNode(graph, "Mul", new[] { "logits_tanh", capName }, new[] { "logits" });
         }
 
-        return (graph, weights, quantizedBytes, transposeOnUpload);
+        return (graph, weights, quantizedBytes, transposeOnUpload, lowPBytes);
     }
 
     // ── Helpers ──
@@ -447,7 +464,8 @@ public static class GGUFGraphBuilder
         Dictionary<string, float[]> weights,
         Dictionary<string, GGUFQuantizedWeight>? quantizedBytes = null,
         HashSet<string>? transposeOnUpload = null,
-        bool isLinearB = false)
+        bool isLinearB = false,
+        Dictionary<string, GGUFLowPWeight>? lowPBytes = null)
     {
         if (GGUFModel.IsQuantized(tensor.Type))
         {
@@ -485,6 +503,36 @@ public static class GGUFGraphBuilder
                 "unacceptable in the browser). Re-quantize the model or request a kernel for this type.");
         }
 
+        // Native low-precision LINEAR weight: keep BF16/F16 elements packed and decode in-register at the
+        // MAC (MatMulLowPWeight<T>) instead of upcasting to f32 at load - halves the weight's VRAM +
+        // upload bandwidth (no-needless-conversion, the same discipline as the quantized channel). Only
+        // 2-D linear-B weights take this path (the MatMul B path has a native low-p kernel); norms, biases
+        // and the embedding/Gather table stay f32 (tiny, or no native kernel). Transpose is done natively
+        // in the element dtype at upload (GGUF [N][K] storage -> declared MatMul B [K, N]).
+        if (lowPBytes != null && isLinearB && tensor.Dimensions.Length == 2
+            && NativeLowPDType(tensor.Type) is TensorDataType lowPType)
+        {
+            long elements = model.GetTensorElementCount(tensor);
+            if (model.SourceStream != null)
+            {
+                long absOffset = model.GetTensorDataOffset(tensor);
+                long byteSize = GGMLTypes.TypeSize(tensor.Type, elements);
+                if (byteSize > int.MaxValue)
+                    throw new NotSupportedException(
+                        $"GGUF tensor '{tensor.Name}' is {byteSize} bytes (> 2 GB) — single-tensor streaming upload not supported.");
+                lowPBytes[tensor.Name] = new GGUFLowPWeight(Array.Empty<byte>(), lowPType, absOffset, (int)byteSize, Transpose: true);
+            }
+            else
+            {
+                var rawBytes = model.GetTensorRawBytes(tensor)
+                    ?? throw new InvalidDataException(
+                        $"GGUF tensor '{tensor.Name}' ({tensor.Type}): raw data out of bounds.");
+                lowPBytes[tensor.Name] = new GGUFLowPWeight(rawBytes, lowPType, -1, 0, Transpose: true);
+            }
+            weights[tensor.Name] = Array.Empty<float>(); // presence marker; loader builds a FromLowP tensor (no f32 buffer)
+            return;
+        }
+
         var data = model.GetTensorFloat32(tensor)
             ?? throw new NotSupportedException(
                 $"GGUF tensor '{tensor.Name}' has unsupported type {tensor.Type}.");
@@ -492,6 +540,17 @@ public static class GGUFGraphBuilder
             transposeOnUpload?.Add(tensor.Name);
         weights[tensor.Name] = data;
     }
+
+    /// <summary>The non-block-quantized element types we can keep NATIVE (decode in-register at the MAC)
+    /// instead of upcasting to f32 at load — maps the GGML element type to the consumer
+    /// <see cref="TensorDataType"/>. Returns null for any type that should stay f32 (e.g. F32 itself) or
+    /// goes through the block-quant channel.</summary>
+    private static TensorDataType? NativeLowPDType(GGMLType t) => t switch
+    {
+        GGMLType.BF16 => TensorDataType.BFloat16,
+        GGMLType.F16 => TensorDataType.Float16,
+        _ => null,
+    };
 
     /// <summary>
     /// Emit one attention head-stream as gemma4/llama.cpp wires it (verbatim-matched to
@@ -611,15 +670,17 @@ public static class GGUFGraphBuilder
     private static void AddLinear(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
         string tensorPrefix, string input, string output,
         Dictionary<string, GGUFQuantizedWeight>? quantizedBytes = null,
-        HashSet<string>? transposeOnUpload = null)
+        HashSet<string>? transposeOnUpload = null,
+        Dictionary<string, GGUFLowPWeight>? lowPBytes = null)
     {
         var weightTensor = FindTensor(model, $"{tensorPrefix}.weight");
         if (weightTensor != null)
         {
             // MatMul-B role: declared [K, N] (= GGUF ne order). Quantized stays raw
             // (fused kernel reads the [N][K] storage = the transpose, by contract);
-            // F32/F16 gets a one-time GPU transpose at upload.
-            ExtractWeight(model, weightTensor, weights, quantizedBytes, transposeOnUpload, isLinearB: true);
+            // BF16/F16 stays NATIVE (decode in-register, transposed at upload in the element dtype);
+            // F32 gets a one-time GPU transpose at upload.
+            ExtractWeight(model, weightTensor, weights, quantizedBytes, transposeOnUpload, isLinearB: true, lowPBytes: lowPBytes);
             graph.Initializers[weightTensor.Name] = weightTensor.Shape;
         }
 

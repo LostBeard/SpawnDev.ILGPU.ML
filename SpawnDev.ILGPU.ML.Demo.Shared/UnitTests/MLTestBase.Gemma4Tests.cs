@@ -13,7 +13,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_GraphBuilder_UsesRMSNormAndGeGLU() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false));
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false));
 
         // The gemma family uses a GeGLU MLP (a Gelu node), NOT SiLU (no Sigmoid). The same isGemma flag
         // also selects RMSNorm, so the activation choice transitively confirms gemma4 was recognized
@@ -30,7 +30,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_GraphBuilder_PostNormSandwich() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
 
         // gemma 2/3/4 norm-sandwich: each sublayer's OUTPUT is normed BEFORE the residual add —
         //   residual = x + post_attention_norm(attn);   out = residual + post_ffw_norm(ffn).
@@ -49,7 +49,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_GraphBuilder_LogitSoftCap() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false, logitSoftCap: 30f));
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false, logitSoftCap: 30f));
 
         // gemma4 final logit soft-cap: logits = cap * tanh(logits / cap). The LM-head MatMul writes a
         // pre-cap tensor; a Tanh + Mul produce the final "logits".
@@ -61,7 +61,7 @@ public abstract partial class MLTestBase
             throw new Exception("final 'logits' must be produced by the soft-cap Mul (cap * tanh).");
 
         // Without a cap, "logits" comes straight from the MatMul (no Tanh).
-        var (plain, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false));
+        var (plain, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: false));
         if (plain.Nodes.Any(n => n.OpType == "Tanh"))
             throw new Exception("no soft-cap metadata -> no Tanh expected.");
         if (!plain.Nodes.Any(n => n.OpType == "MatMul" && n.Outputs.Contains("logits")))
@@ -74,7 +74,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_GraphBuilder_NormWeightsRaw_NoDoublePlusOne() => await RunTest(async accelerator =>
     {
-        var (graph, weights, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
+        var (graph, weights, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
 
         // gemma's `output = x_normed * (1 + weight)` is BAKED INTO THE GGUF at conversion time
         // (llama.cpp conversion/gemma.py Gemma3/Gemma4 modify_tensors: `data_torch = data_torch + 1`
@@ -105,7 +105,7 @@ public abstract partial class MLTestBase
         // `ggml_scale(inpL, sqrtf(n_embd))`). Without it the token-identity signal in the residual
         // stream is ~sqrt(n_embd)x too weak vs the RMS-normed sublayer outputs and every position
         // collapses to the same argmax. embd=8 → scale = sqrt(8).
-        var (graph, weights, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
+        var (graph, weights, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4Model(withPostNorms: true));
 
         var scaleMul = graph.Nodes.FirstOrDefault(n => n.OpType == "Mul"
             && n.Inputs.Contains("embed_out") && n.Outputs.Contains("embed_scaled"));
@@ -165,7 +165,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_Attn_EmitsRoPEAndFusedAttention_NotExplicitSoftmax() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
 
         // The fused path replaces the old explicit Q@Kᵀ / scale-Mul / Softmax / @V block.
         if (!graph.Nodes.Any(n => n.OpType == "FusedAttention"))
@@ -188,7 +188,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_Attn_QKNorm_BeforeRoPE() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
 
         // QK-norm: RMSNormalization on Q and K consuming attn_q_norm / attn_k_norm, feeding the RoPE node.
         var qNorm = graph.Nodes.FirstOrDefault(n => n.OpType == "RMSNormalization"
@@ -215,7 +215,7 @@ public abstract partial class MLTestBase
         // default to 1/sqrt(head_dim) made scores ~sqrt(head_dim)x too small -> softmax went near-uniform
         // -> attention averaged all positions -> residual collapsed (cross-position cosine -> 1) and
         // generation degenerated to whitespace. Every gemma4 FusedAttention node must carry scale = 1.0.
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
 
         var faNodes = graph.Nodes.Where(n => n.OpType == "FusedAttention").ToList();
         if (faNodes.Count == 0) throw new Exception("expected FusedAttention nodes.");
@@ -235,7 +235,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_Attn_GlobalLayer_VReuseAndFreqFactors() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
 
         // Layer 0 (sliding) HAS its own attn_v projection; layer 1 (global) does NOT — V reuses the raw K
         // projection (llama.cpp `Vcur = wv ? wv·x : Kcur`).
@@ -259,7 +259,7 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task Gemma4_Attn_LayerOutputScale_AfterResidual2() => await RunTest(async accelerator =>
     {
-        var (graph, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
+        var (graph, _, _, _, _) = GGUFGraphBuilder.BuildGraph(MakeGemma4AttnModel());
 
         // layer_output_scale: a per-layer scalar Mul on the WHOLE block output, after the FFN residual add.
         var scaleMul = graph.Nodes.FirstOrDefault(n => n.OpType == "Mul"

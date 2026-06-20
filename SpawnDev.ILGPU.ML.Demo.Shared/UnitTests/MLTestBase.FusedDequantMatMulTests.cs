@@ -294,7 +294,7 @@ public abstract partial class MLTestBase
             },
         };
 
-        var (graph, weights, quantized, transposeOnUpload) = GGUFGraphBuilder.BuildGraph(model);
+        var (graph, weights, quantized, transposeOnUpload, _) = GGUFGraphBuilder.BuildGraph(model);
 
         // Embedding declared in PHYSICAL order [vocab, embd] (reversed ne) for Gather.
         var embedDecl = graph.Initializers["token_embd.weight"];
@@ -329,6 +329,104 @@ public abstract partial class MLTestBase
             throw new Exception("Tied-head MatMul against the alias not found.");
 
         Console.WriteLine("[GGUFGraphBuilder] typing, orientation, and tied-head contracts hold");
+        await Task.CompletedTask;
+    });
+
+    /// <summary>
+    /// no-needless-upcast: a BF16 linear weight must route to the NATIVE low-p channel (BuildGraph's
+    /// LowPWeights, decoded in-register by MatMulLowPWeight&lt;BFloat16&gt;), NOT be upcast to f32 (the float
+    /// `weights` dict + the float TransposeOnUpload set). The transpose is carried natively (record flag);
+    /// norms stay f32. Guards the GGUF loader bf16-native fix (2026-06-19).
+    /// </summary>
+    [TestMethod]
+    public async Task GGUFGraphBuilder_BF16Linear_RoutesToNativeLowP() => await RunTest(async accelerator =>
+    {
+        const int embd = 32, ffn = 64, vocab = 16;
+        var rng = new Random(7);
+        var raw = new List<byte>();
+        var tensors = new List<GGUFTensorInfo>();
+        void Add(string name, long[] ne, GGMLType type, byte[] bytes)
+        {
+            tensors.Add(new GGUFTensorInfo { Name = name, Dimensions = ne, Type = type, DataOffset = (ulong)raw.Count });
+            raw.AddRange(bytes);
+        }
+        byte[] F32(int count)
+        {
+            var b = new byte[count * 4];
+            for (int i = 0; i < count; i++) BitConverter.GetBytes((float)(rng.NextDouble() - 0.5)).CopyTo(b, i * 4);
+            return b;
+        }
+        byte[] BF16(int count)
+        {
+            var arr = new global::ILGPU.BFloat16[count];
+            for (int i = 0; i < count; i++) arr[i] = (global::ILGPU.BFloat16)(float)(rng.NextDouble() - 0.5);
+            return System.Runtime.InteropServices.MemoryMarshal.AsBytes<global::ILGPU.BFloat16>(arr).ToArray();
+        }
+
+        // token_embd F32 (Gather/tied-head, stays f32); the per-layer linears are BF16 (the native path).
+        Add("token_embd.weight", new long[] { embd, vocab }, GGMLType.F32, F32(embd * vocab));
+        Add("blk.0.attn_norm.weight", new long[] { embd }, GGMLType.F32, F32(embd));
+        Add("blk.0.attn_q.weight", new long[] { embd, embd }, GGMLType.BF16, BF16(embd * embd));
+        Add("blk.0.attn_k.weight", new long[] { embd, embd }, GGMLType.BF16, BF16(embd * embd));
+        Add("blk.0.attn_v.weight", new long[] { embd, embd }, GGMLType.BF16, BF16(embd * embd));
+        Add("blk.0.attn_output.weight", new long[] { embd, embd }, GGMLType.BF16, BF16(embd * embd));
+        Add("blk.0.ffn_norm.weight", new long[] { embd }, GGMLType.F32, F32(embd));
+        Add("blk.0.ffn_gate.weight", new long[] { embd, ffn }, GGMLType.BF16, BF16(embd * ffn));
+        Add("blk.0.ffn_up.weight", new long[] { embd, ffn }, GGMLType.BF16, BF16(embd * ffn));
+        Add("blk.0.ffn_down.weight", new long[] { ffn, embd }, GGMLType.BF16, BF16(ffn * embd));
+        Add("output_norm.weight", new long[] { embd }, GGMLType.F32, F32(embd));
+
+        var model = new GGUFModel
+        {
+            RawData = raw.ToArray(),
+            DataStartOffset = 0,
+            Tensors = tensors.ToArray(),
+            Metadata = new Dictionary<string, object>
+            {
+                ["general.architecture"] = "llama",
+                ["general.name"] = "tiny-bf16",
+                ["llama.embedding_length"] = (long)embd,
+                ["llama.block_count"] = 1L,
+                ["llama.attention.head_count"] = 4L,
+                ["llama.attention.head_count_kv"] = 4L,
+                ["llama.vocab_size"] = (long)vocab,
+                ["llama.feed_forward_length"] = (long)ffn,
+                ["llama.context_length"] = 64L,
+            },
+        };
+
+        var (graph, weights, quantized, transposeOnUpload, lowP) = GGUFGraphBuilder.BuildGraph(model);
+
+        foreach (var lin in new[] { "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight",
+                                    "blk.0.attn_output.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight",
+                                    "blk.0.ffn_down.weight" })
+        {
+            if (!lowP.TryGetValue(lin, out var lp))
+                throw new Exception($"BF16 linear '{lin}' was NOT routed to the native LowPWeights channel (upcast to f32?).");
+            if (lp.DType != SpawnDev.ILGPU.ML.Tensors.TensorDataType.BFloat16)
+                throw new Exception($"'{lin}' native dtype {lp.DType}, expected BFloat16.");
+            if (!lp.Transpose)
+                throw new Exception($"'{lin}' linear-B weight must be marked for native transpose.");
+            if (lp.StreamOffset != -1)
+                throw new Exception($"'{lin}' in-memory load must carry raw Bytes, not a stream offset.");
+            if (weights[lin].Length != 0)
+                throw new Exception($"'{lin}' must be an empty float presence marker (no f32 upcast), got {weights[lin].Length} floats.");
+            if (transposeOnUpload.Contains(lin))
+                throw new Exception($"'{lin}' must NOT be in the float TransposeOnUpload set (it transposes natively).");
+            if (quantized.ContainsKey(lin))
+                throw new Exception($"'{lin}' must NOT be in the quantized channel.");
+        }
+
+        // attn_q stored [embd,embd] bf16 = embd*embd*2 bytes.
+        if (lowP["blk.0.attn_q.weight"].Bytes.Length != embd * embd * 2)
+            throw new Exception("attn_q bf16 byte count wrong.");
+        // Norms stay f32 (not native low-p).
+        if (lowP.ContainsKey("blk.0.attn_norm.weight"))
+            throw new Exception("F32 norm must NOT be in the native LowPWeights channel.");
+        if (weights["blk.0.attn_norm.weight"].Length != embd)
+            throw new Exception("F32 norm should be a real f32 weight array.");
+
+        Console.WriteLine("[GGUFGraphBuilder] BF16 linears route native (no f32 upcast); norms stay f32");
         await Task.CompletedTask;
     });
 
