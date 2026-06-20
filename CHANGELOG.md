@@ -2,7 +2,27 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased — SpawnDev.ILGPU 4.14.0 (4-bit data-type tier) + MXFP4 single-source-of-truth decode
+## Unreleased — SpawnDev.ILGPU 4.14.1 migration + FusedLinear native low-precision weight support
+
+**Migrated to SpawnDev.ILGPU 4.14.1 (nuget.org stable).** Off `4.14.0` onto `4.14.1` (Fork / Algorithms.Fork
+`2.0.40` transitive) - hardens the packed 4-bit tier (the per-backend `[NoInlining]` helper-function
+generators now decode `Float4E2M1`/`QInt4`/`QUInt4` correctly on all 6 backends) and adds the new
+`Float8E8M0` OCP MX-scale type.
+
+**FusedLinear now supports native low-precision (bf16 / fp16 / FP8) weights.** A linear weight kept NATIVE
+low-p by the GGUF loader (no f32 upcast - e.g. gpt-oss attention/output projections, after the 2026-06-19
+bf16-native loader) has an EMPTY float `Data` view (its data lives in the typed low-p view). `FusedLinearOperator`
+read `weights.Data` unconditionally, and its bounds check uses the SHAPE-derived `ElementCount` (still the real
+count for a low-p tensor), so the check passed and the fp32 kernel's `Data.SubView(0, K*N)` on the empty view threw
+`Index/Extent X out of bounds` - terminating a gpt-oss-20b forward at its first fused attention/output projection.
+The op now branches on `Tensor.DType` (via `LowPWeightDispatch.FusedLinear`) and routes a low-p weight to a new
+generic `FusedLinearKernel.ForwardLowP<T>` that reads the weight in its native type and converts to float
+in-register (`ILGPU.PrecisionConvert`, no f32 weight temp - Rule 4) with the bias + activation
+(None / ReLU / GELU / SiLU) fused, mirroring `MatMulKernel.MatMulLowPWeight<T>`. Verified: gpt-oss-20b CPU forward
+now runs end-to-end with finite, non-degenerate logits (`finite=201088/201088`); new
+`F16_FusedLinearOperator_RoutesBFloat16Weight` (bf16 None + GELU operator routing) + the fp32 FusedLinear
+regression green on all 6 backends (PMT `FusedLinear` 44/0).
+
 
 **BF16/F16 GGUF linear weights stay NATIVE on load (no f32 upcast).** The GGUF loader upcast every
 non-block-quantized weight to f32 at load (`ExtractWeight` → `GetTensorFloat32`), doubling the VRAM and

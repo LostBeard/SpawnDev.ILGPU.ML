@@ -46,7 +46,9 @@ public class FusedLinearOperator : IOnnxOperator
         // Flatten all leading dimensions into M — kernel does flat row/col indexing
         int M = input.ElementCount / K;
 
-        // Bounds validation with diagnostic info
+        // Bounds validation with diagnostic info. NOTE: weights.ElementCount is SHAPE-derived, so it is correct
+        // for both a fp32 weight (float Data, length == ElementCount) AND a native low-p weight (data in the
+        // typed low-p view; float Data EMPTY). The low-p case is routed below — it must NOT touch weights.Data.
         if (M < 1 || M * K != input.ElementCount || K * N > weights.ElementCount || N > bias.ElementCount || M * N > output.ElementCount)
         {
             throw new InvalidOperationException(
@@ -71,6 +73,22 @@ public class FusedLinearOperator : IOnnxOperator
         };
 
         _kernel ??= new FusedLinearKernel(_registry.Accelerator);
+
+        // Native low-precision weight (bf16/fp16/FP8 — e.g. gpt-oss attn/output projections kept native by the
+        // GGUF loader, no f32 upcast): its float Data view is EMPTY, so the fp32 kernel below would read out of
+        // bounds. Route to the generic low-p fused kernel, which reads the weight in its native type and converts
+        // to float in-register (Rule 4 no-upcast). Input/bias/output are always fp32 activations.
+        if (LowPWeightDispatch.IsLowP(weights))
+        {
+            LowPWeightDispatch.FusedLinear(_kernel,
+                input.Data.SubView(0, M * K),
+                weights,
+                bias.Data.SubView(0, N),
+                output.Data.SubView(0, M * N),
+                M, K, N, activation);
+            return;
+        }
+
         _kernel.Forward(
             input.Data.SubView(0, M * K),
             weights.Data.SubView(0, K * N),

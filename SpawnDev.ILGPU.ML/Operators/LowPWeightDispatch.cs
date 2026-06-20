@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Operators;
@@ -86,6 +87,24 @@ internal static class LowPWeightDispatch
             case TensorDataType.Float8E5M2:
                 conv.ForwardPaddedLowPWeight(input, weight.AsView<Float8E5M2>(), bias, output, inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW); break;
             default: throw Unexpected(weight);
+        }
+    }
+
+    /// <summary>Fused linear Output[M,N] = Activation(Input[M,K] (fp32) × W[K,N] (native low-p) + Bias[N]).
+    /// W stays native (no f32 upcast); converted to float in-register inside the generic kernel. Same [K,N]
+    /// weight layout as the fp32 FusedLinear (FuseLinearLayers excludes transB).</summary>
+    public static void FusedLinear(FusedLinearKernel fl,
+        ArrayView1D<float, Stride1D.Dense> input, Tensor w,
+        ArrayView1D<float, Stride1D.Dense> bias, ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, FusedActivation activation)
+    {
+        switch (w.DType)
+        {
+            case TensorDataType.Float16: fl.ForwardLowP(input, w.AsView<global::ILGPU.Half>(), bias, output, M, K, N, activation); break;
+            case TensorDataType.BFloat16: fl.ForwardLowP(input, w.AsView<BFloat16>(), bias, output, M, K, N, activation); break;
+            case TensorDataType.Float8E4M3: fl.ForwardLowP(input, w.AsView<Float8E4M3>(), bias, output, M, K, N, activation); break;
+            case TensorDataType.Float8E5M2: fl.ForwardLowP(input, w.AsView<Float8E5M2>(), bias, output, M, K, N, activation); break;
+            default: throw Unexpected(w);
         }
     }
 

@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Algorithms;
 using ILGPU.Runtime;
+using System.Numerics;
 
 namespace SpawnDev.ILGPU.ML.Kernels;
 
@@ -217,6 +218,86 @@ public class FusedLinearKernel
         float x = sum + bias[col];
         // SiLU = x * sigmoid(x)
         output[idx] = x / (1f + MathF.Exp(-x));
+    }
+
+    // ── Native low-precision weight path (bf16 / fp16 / FP8) ──
+    // A weight loaded NATIVE low-p (no f32 upcast — gpt-oss attn/output projections, any bf16/fp16 linear)
+    // carries its data in the typed low-p view; its float Data view is EMPTY. The float kernels above would
+    // read out of bounds, so this generic path reads the weight in its native type and converts to float
+    // in-register (PrecisionConvert) with fused bias + activation — no f32 weight temp (Rule 4 no-upcast).
+    // Mirrors MatMulKernel.MatMulLowPWeight<T>. Weight layout is [K,N] (FuseLinearLayers excludes transB),
+    // identical to the float per-element kernels. One thread per output element; fp32 accumulate.
+    private readonly Dictionary<Type, object> _fusedLinearLowPKernels = new();
+
+    /// <summary>Fused linear with a NATIVE low-precision weight (ILGPU.Half / BFloat16 / Float8E4M3 / Float8E5M2):
+    /// Output = Activation(Input·W + Bias), W read native and converted to float in-register (no f32 weight temp).
+    /// Supports None / ReLU / GELU / SiLU (the activations the per-element float kernels implement); Sigmoid and
+    /// Tanh fall to None, matching the float path's switch.</summary>
+    public void ForwardLowP<T>(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<T, Stride1D.Dense> weights,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, FusedActivation activation)
+        where T : unmanaged, INumber<T>
+    {
+        if (!_fusedLinearLowPKernels.TryGetValue(typeof(T), out var k))
+            _fusedLinearLowPKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                int, int, int, int>(FusedLinearLowPImpl<T>);
+        int actCode = activation switch
+        {
+            FusedActivation.ReLU => 1,
+            FusedActivation.GELU => 2,
+            FusedActivation.SiLU => 5,
+            _ => 0, // None (and Sigmoid/Tanh, which the float per-element switch also routes to None)
+        };
+        ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>)k)(M * N, input, weights, bias, output, M, K, N, actCode);
+    }
+
+    private static void FusedLinearLowPImpl<T>(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<T, Stride1D.Dense> weights,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N, int activation)
+        where T : unmanaged, INumber<T>
+    {
+        int row = idx / N;
+        int col = idx % N;
+        if (row >= M) return;
+
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += input[row * K + k] * PrecisionConvert.ConvertToSingle(weights[k * N + col]);
+
+        float x = sum + bias[col];
+        if (activation == 1) { output[idx] = x > 0f ? x : 0f; return; }          // ReLU
+        if (activation == 2) { output[idx] = GeluErf(x); return; }                // GELU (erf approx)
+        if (activation == 5) { output[idx] = x / (1f + MathF.Exp(-x)); return; }  // SiLU
+        output[idx] = x;                                                          // None
+    }
+
+    /// <summary>GELU erf approximation (A&amp;S 5-term), bit-faithful to <see cref="FusedLinearGeluImpl"/> /
+    /// ElementWiseKernels.GELUImpl (clamp tails: x&gt;10 → x, x&lt;-10 → 0). Shared by the native low-p fused path.</summary>
+    private static float GeluErf(float x)
+    {
+        if (x > 10f) return x;
+        if (x < -10f) return 0f;
+        const float INV_SQRT2 = 0.7071067811865475f;
+        float z = x * INV_SQRT2;
+        float az = z < 0f ? -z : z;
+        const float p = 0.3275911f;
+        const float a1 = 0.254829592f, a2 = -0.284496736f,
+                    a3 = 1.421413741f, a4 = -1.453152027f, a5 = 1.061405429f;
+        float t = 1f / (1f + p * az);
+        float t2 = t * t, t3 = t2 * t, t4 = t3 * t, t5 = t4 * t;
+        float erfAbs = 1f - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * MathF.Exp(-az * az);
+        float erf = z < 0f ? -erfAbs : erfAbs;
+        return 0.5f * x * (1f + erf);
     }
 
     // ── Register-blocked fused GEMM (the performant None/GELU path) ──

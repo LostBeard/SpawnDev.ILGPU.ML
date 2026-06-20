@@ -328,6 +328,81 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// FusedLinearOperator.Execute must route a bf16-backed weight (Tensor.FromLowP&lt;BFloat16&gt;) through the
+    /// native low-p fused kernel, NOT the fp32 FusedLinear kernel — whose <c>weights.Data.SubView(0, K*N)</c> on
+    /// the EMPTY float view of a low-p tensor threw "Index/Extent X out of bounds" (the gpt-oss attn/output
+    /// projection crash, 2026-06-20: the bf16-native loader keeps these weights native, then FuseLinearLayers
+    /// fuses MatMul+Add into a FusedLinear that read the empty float Data). Covers None + GELU. Matches a fp32
+    /// reference computed from the same bf16-rounded weights.
+    /// </summary>
+    [TestMethod]
+    public Task F16_FusedLinearOperator_RoutesBFloat16Weight() => RunTest(async accelerator =>
+    {
+        int M = 6, K = 16, N = 8; // M < 64 → per-element path (gpt-oss prefill regime)
+        var rng = new Random(73);
+        var inp = new float[M * K];
+        var w = new float[K * N];
+        var bias = new float[N];
+        for (int i = 0; i < inp.Length; i++) inp[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1) * 0.2f;
+        for (int i = 0; i < bias.Length; i++) bias[i] = (float)(rng.NextDouble() * 2 - 1) * 0.5f;
+
+        var wBf16 = new global::ILGPU.BFloat16[w.Length];
+        for (int i = 0; i < w.Length; i++) wBf16[i] = (global::ILGPU.BFloat16)w[i];
+
+        var pool = new BufferPool(accelerator);
+        try
+        {
+            foreach (var (act, name) in new[] { ("none", "None"), ("Gelu", "GELU") })
+            {
+                using var inBuf = accelerator.Allocate1D(inp);
+                using var wBuf = accelerator.Allocate1D(wBf16);
+                using var bBuf = accelerator.Allocate1D(bias);
+                using var outBuf = accelerator.Allocate1D<float>(M * N);
+
+                var inT = new Tensor(inBuf.View, new[] { M, K }, "in");
+                var wT = Tensor.FromLowP(wBuf.View, TensorDataType.BFloat16, new[] { K, N }, "w");
+                var bT = new Tensor(bBuf.View, new[] { N }, "bias");
+                var outT = new Tensor(outBuf.View, new[] { M, N }, "out");
+
+                var registry = new OperatorRegistry(accelerator);
+                var op = new FusedLinearOperator(registry);
+                var ctx = new OnnxOpContext
+                {
+                    Inputs = new[] { inT, wT, bT },
+                    Outputs = new[] { outT },
+                    Attributes = new Dictionary<string, object> { ["activation"] = act },
+                    Pool = pool,
+                    InputNames = new[] { "in", "w", "bias" },
+                    Registry = registry,
+                };
+                op.Execute(ctx); // before the fix: "Index/Extent X out of bounds" on the empty float weights.Data
+                await accelerator.SynchronizeAsync();
+                var gpu = await outBuf.CopyToHostAsync<float>(0, M * N);
+
+                var expected = new float[M * N];
+                for (int r = 0; r < M; r++)
+                    for (int c = 0; c < N; c++)
+                    {
+                        float s = 0f;
+                        for (int k = 0; k < K; k++)
+                            s += inp[r * K + k] * (float)wBf16[k * N + c];
+                        float x = s + bias[c];
+                        if (act == "Gelu")
+                            x = x > 10f ? x : x < -10f ? 0f : 0.5f * x * (1f + ErfApprox(x * 0.7071067811865475f));
+                        expected[r * N + c] = x;
+                    }
+                float maxErr = 0f;
+                for (int i = 0; i < expected.Length; i++)
+                    maxErr = MathF.Max(maxErr, MathF.Abs(gpu[i] - expected[i]));
+                if (maxErr > 1e-3f)
+                    throw new Exception($"FusedLinear bf16-weight routing ({name}) maxErr={maxErr:E3} (expected < 1e-3)");
+            }
+        }
+        finally { pool.Dispose(); }
+    });
+
+    /// <summary>
     /// bf16-native GGUF LOAD mechanic: a BF16 linear weight stored in GGUF [N rows][K] order is uploaded as
     /// raw bytes, reinterpreted (Cast&lt;byte,BFloat16&gt;), transposed in the element dtype to the declared
     /// [K, N] and wrapped as a FromLowP tensor — the exact chain InferenceSession.WrapLowPWeight runs at load,
