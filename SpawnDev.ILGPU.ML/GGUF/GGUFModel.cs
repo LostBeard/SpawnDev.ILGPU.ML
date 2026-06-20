@@ -1,3 +1,5 @@
+using ILGPU;
+
 namespace SpawnDev.ILGPU.ML.GGUF;
 
 /// <summary>
@@ -286,7 +288,8 @@ public class GGUFModel
     }
 
     /// <summary>MXFP4 window dequant — byte-window port of <see cref="DequantizeMXFP4"/> (17 B/block:
-    /// [e:E8M0][16 nibble bytes]; low nibble of byte i = element i, high nibble = element i+16).</summary>
+    /// [e:E8M0][16 nibble bytes]; low nibble of byte i = element i, high nibble = element i+16).
+    /// value = E2M1[nibble] · 2^(e-127) via the verified library decode (see DequantizeMXFP4).</summary>
     private static float[] RowMXFP4(byte[] buf, int b, int n)
     {
         var r = new float[n];
@@ -294,11 +297,11 @@ public class GGUFModel
         for (int blk = 0; blk < blocks; blk++)
         {
             int o = b + blk * 17;
-            float d = MathF.Pow(2f, buf[o] - 128f); // e8m0_half
+            float d = MathF.Pow(2f, buf[o] - 127f); // E8M0 scale 2^(e-127)
             for (int i = 0; i < 16; i++)
             {
-                r[blk * 32 + i] = MXFP4Kvalue(buf[o + 1 + i] & 0x0F) * d;
-                r[blk * 32 + i + 16] = MXFP4Kvalue(buf[o + 1 + i] >> 4) * d;
+                r[blk * 32 + i] = Float4E2M1Extensions.RawBitsToFloat(buf[o + 1 + i] & 0x0F) * d;
+                r[blk * 32 + i + 16] = Float4E2M1Extensions.RawBitsToFloat(buf[o + 1 + i] >> 4) * d;
             }
         }
         return r;
@@ -431,10 +434,13 @@ public class GGUFModel
 
     /// <summary>
     /// Dequantize MXFP4 (ggml GGML_TYPE_MXFP4): 32 elements per block, 17 bytes
-    /// ([e:E8M0 1 byte][16 packed FP4 nibbles]). Exact port of ggml dequantize_row_mxfp4:
-    /// value = kvalues_mxfp4[nibble] * ggml_e8m0_to_fp32_half(e). Low nibble of byte i is
-    /// element i, high nibble is element i+16 (ggml split order). This is the CPU oracle the
-    /// GPU FusedDequantMatMul MXFP4 kernel is asserted against.
+    /// ([e:E8M0 1 byte][16 packed FP4 nibbles]). Low nibble of byte i is element i, high nibble is
+    /// element i+16 (ggml split order). value = E2M1[nibble] · 2^(e-127) — the canonical MX form (OCP
+    /// E2M1 element × E8M0 scale, bias 127), identical to ggml's doubled-kvalues × 2^(e-128). The element
+    /// decode composes the VERIFIED library primitive <see cref="Float4E2M1Extensions.RawBitsToFloat"/>
+    /// (bit-exact ml_dtypes.float4_e2m1fn) — one source of truth shared with the GPU kernels. The
+    /// independent CPU oracle the GPU kernels are asserted against is the literal kvalues table in the
+    /// unit tests (RefMXFP4), not this production path.
     /// </summary>
     private float[] DequantizeMXFP4(long offset, long elements)
     {
@@ -443,27 +449,16 @@ public class GGUFModel
         for (int block = 0; block < numBlocks; block++)
         {
             int blockOffset = (int)offset + block * 17;
-            float d = MathF.Pow(2f, RawData[blockOffset] - 128f); // ggml_e8m0_to_fp32_half(e) = 2^(e-128)
+            float d = MathF.Pow(2f, RawData[blockOffset] - 127f); // E8M0 scale 2^(e-127)
             int resultBase = block * 32;
             for (int i = 0; i < 16; i++)
             {
                 byte packed = RawData[blockOffset + 1 + i];
-                result[resultBase + i] = MXFP4Kvalue(packed & 0x0F) * d;
-                result[resultBase + i + 16] = MXFP4Kvalue(packed >> 4) * d;
+                result[resultBase + i] = Float4E2M1Extensions.RawBitsToFloat(packed & 0x0F) * d;
+                result[resultBase + i + 16] = Float4E2M1Extensions.RawBitsToFloat(packed >> 4) * d;
             }
         }
         return result;
-    }
-
-    /// <summary>ggml kvalues_mxfp4[q] (= 2× the OCP E2M1 value) by bit math: {0,1,2,3,4,6,8,12} for
-    /// q=0..7, negated for q=8..15. Mirrors FusedDequantMatMul.DecodeMXFP4Kvalue (one definition of the
-    /// table, two call sites — CPU oracle + GPU kernel).</summary>
-    private static int MXFP4Kvalue(int q)
-    {
-        int exp = (q >> 1) & 3;
-        int mant = q & 1;
-        int mag = exp == 0 ? mant : ((1 << exp) + (mant << (exp - 1)));
-        return (q & 8) != 0 ? -mag : mag;
     }
 
     /// <summary>

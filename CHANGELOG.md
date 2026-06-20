@@ -2,6 +2,24 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — SpawnDev.ILGPU 4.14.0 (4-bit data-type tier) + MXFP4 single-source-of-truth decode
+
+**Migrated to SpawnDev.ILGPU 4.14.0 (nuget.org stable).** Off the `4.14.0-local.6` feed pin onto the
+published `4.14.0` (Fork / Algorithms.Fork `2.0.39` transitive) - the 4-bit / low-precision data-type tier
+(true packed `Float4E2M1`/`QInt4`/`QUInt4`, FP8/Half/bf16 parity, plus the kernel-safe raw-bits decode
+primitives this release exposes).
+
+**MXFP4 dequant now composes ONE verified FP4 decode.** The GGUF MXFP4 (ggml `GGML_TYPE_MXFP4`, gpt-oss
+MoE experts) fused-dequant paths - `FusedDequantMatMul` (GEMM + M=1 GEMV), `FusedDequantGather`, and the
+CPU full-dequant / per-row-embedding fallback in `GGUFModel` - now decode each FP4 nibble through the
+library primitive `ILGPU.Float4E2M1Extensions.RawBitsToFloat` (bit-exact `ml_dtypes.float4_e2m1fn`, pure
+bit-math so it transpiles on all 6 backends, buffer stays packed = Rule-4 no-unpack-on-load). The two
+hand-rolled `kvalues_mxfp4` tables (`DecodeMXFP4Kvalue`, `MXFP4Kvalue`) are deleted. The decode is value-
+identical: ggml's doubled kvalues `{0,1,2,3,4,6,8,12,..}` × halved scale `2^(e-128)` folds exactly into
+the canonical MX form (OCP E2M1 element × E8M0 scale `2^(e-127)`); `E8M0HalfToFloat` → `E8M0ToFloat`. The
+independent unit-test oracle remains the literal `RefMXFP4` kvalues table (no tautology). PMT `MXFP4`
+(MatMul + Gather + GEMV oracle tests) green on all 6 backends.
+
 ## Unreleased — Gemma 4 multimodal chat + selectable-precision decode KV cache + SpawnDev.ILGPU 4.13.0 migration
 
 **Browser model delivery: WebTorrent → OPFS → zero-copy GPU.** The browser gemma4 chat (and the WebTorrent

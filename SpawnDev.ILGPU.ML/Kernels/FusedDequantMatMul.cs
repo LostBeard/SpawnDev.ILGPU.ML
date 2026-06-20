@@ -249,11 +249,14 @@ public class FusedDequantMatMul : IDisposable
     //  MXFP4 (ggml GGML_TYPE_MXFP4 = 39, used by gpt-oss): 17 bytes per 32 values —
     //  [e:E8M0 (1 byte)][16 × packed FP4 nibbles]. Element j (0..15) = LOW nibble of
     //  byte j; element j+16 = HIGH nibble of byte j (ggml split order, like Q4_0).
-    //  Exact port of ggml dequantize_row_mxfp4: value = kvalues_mxfp4[nibble] · d,
-    //  d = ggml_e8m0_to_fp32_half(e). kvalues_mxfp4 = {0,1,2,3,4,6,8,12, 0,-1,-2,-3,
-    //  -4,-6,-8,-12} = 2× the OCP E2M1 values, paired with the HALVED E8M0 scale, so
-    //  the product equals E2M1[nibble]·2^(e-127). DecodeMXFP4Kvalue computes that table
-    //  by bit math (no LUT — keeps the WebGL GLSL small, same discipline as Q4_K).
+    //  value = E2M1[nibble] · 2^(e-127) — the canonical MX form (OCP E2M1 element ×
+    //  E8M0 shared scale). This is ggml dequantize_row_mxfp4 with its doubled
+    //  kvalues_mxfp4 table folded into the canonical scale: ggml uses {0,1,2,3,4,6,8,
+    //  12,...} (= 2× E2M1) paired with the HALVED scale 2^(e-128); 2×E2M1·2^(e-128) ≡
+    //  E2M1·2^(e-127). We compose the VERIFIED library E2M1 decode
+    //  Float4E2M1Extensions.RawBitsToFloat (bit-exact ml_dtypes.float4_e2m1fn, all 6
+    //  backends, pure bit-math = no struct ctor) instead of a hand-rolled table —
+    //  single source of truth (Rule 2). Scale = E8M0ToFloat (2^(e-127)).
     // ─────────────────────────────────────────────────────────────────────────
     private static void FusedDequantMXFP4Impl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -274,14 +277,14 @@ public class FusedDequantMatMul : IDisposable
         for (int block = 0; block < blocksPerRow; block++)
         {
             int bOff = n * bytesPerRow + block * 17;
-            float d = E8M0HalfToFloat(ReadByte(w, bOff));
+            float d = E8M0ToFloat(ReadByte(w, bOff));
             int kBase = block * 32;
 
             for (int j = 0; j < 16; j++)
             {
                 int packed = ReadByte(w, bOff + 1 + j);
-                sum += input[inBase + kBase + j] * (DecodeMXFP4Kvalue(packed & 0xF) * d);
-                sum += input[inBase + kBase + j + 16] * (DecodeMXFP4Kvalue(packed >> 4) * d);
+                sum += input[inBase + kBase + j] * (Float4E2M1Extensions.RawBitsToFloat(packed & 0xF) * d);
+                sum += input[inBase + kBase + j + 16] * (Float4E2M1Extensions.RawBitsToFloat(packed >> 4) * d);
             }
         }
         output[idx] = sum;
@@ -637,16 +640,16 @@ public class FusedDequantMatMul : IDisposable
     }
 
     /// <summary>Decode element <paramref name="col"/> of an MXFP4 row (17B/32: [e:E8M0][16 nibble bytes];
-    /// el j = low nibble of byte j, el j+16 = high nibble of byte j; value = kvalues_mxfp4[nibble]·e8m0_half(e)).
+    /// el j = low nibble of byte j, el j+16 = high nibble of byte j; value = E2M1[nibble]·2^(e-127)).
     /// Shared by the MXFP4 GEMV; same layout inverse as the GEMM kernel.</summary>
     internal static float DecodeMXFP4Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
     {
         int within = col & 31;
         int bOff = rowByteBase + (col >> 5) * 17;
-        float d = E8M0HalfToFloat(ReadByte(w, bOff));
+        float d = E8M0ToFloat(ReadByte(w, bOff));
         int packed = ReadByte(w, bOff + 1 + (within & 15));
         int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);  // within>=16 -> high nibble
-        return DecodeMXFP4Kvalue(nib) * d;
+        return Float4E2M1Extensions.RawBitsToFloat(nib) * d;
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q4_0 row (18B/32: [d:fp16][16 nibble bytes];
@@ -815,23 +818,14 @@ public class FusedDequantMatMul : IDisposable
         return (1 - 2 * sign) * (isNorm * magNorm + (1 - isNorm) * magSub);
     }
 
-    /// <summary>ggml E8M0 scale (HALF form) → float. Port of ggml_e8m0_to_fp32_half: for every e in
-    /// 0..255 the result is exactly 2^(e-128) (the e&lt;2 denormal patterns 0x00200000&lt;&lt;e equal
-    /// 2^-128 / 2^-127, which ARE 2^(e-128)). Arithmetic 2^(e-128) avoids an int→float bit reinterpret,
-    /// matching the HalfToFloat MathF.Pow style (WebGL-safe). NaN (e=255 in the full form) is not used by
+    /// <summary>E8M0 shared scale → float (canonical MX form): for every e in 0..255 the result is
+    /// 2^(e-127). This is the OCP MX scale (bias 127) and ggml's full ggml_e8m0_to_fp32; paired with the
+    /// canonical (un-doubled) E2M1 element from <see cref="Float4E2M1Extensions.RawBitsToFloat"/> it gives
+    /// the MXFP4 value E2M1[nibble]·2^(e-127). (ggml's _half variant 2^(e-128) exists only to absorb its
+    /// doubled kvalues table, which we don't use.) Arithmetic 2^(e-127) avoids an int→float bit reinterpret,
+    /// matching the HalfToFloat MathF.Pow style (WebGL-safe). NaN (e=255 in the IEEE form) is not used by
     /// MXFP4 weights, same as ggml.</summary>
-    internal static float E8M0HalfToFloat(int e) => MathF.Pow(2f, e - 128f);
-
-    /// <summary>ggml kvalues_mxfp4[q] (= 2× the OCP E2M1 value) by bit math, no LUT. q is a 4-bit nibble:
-    /// bit3 = sign, bits[2:1] = exp, bit0 = mantissa. Returns {0,1,2,3,4,6,8,12} for q=0..7 and their
-    /// negatives for q=8..15 — verified element-for-element against ggml's table.</summary>
-    internal static int DecodeMXFP4Kvalue(int q)
-    {
-        int exp = (q >> 1) & 3;
-        int mant = q & 1;
-        int mag = exp == 0 ? mant : ((1 << exp) + (mant << (exp - 1)));
-        return (q & 8) != 0 ? -mag : mag;
-    }
+    internal static float E8M0ToFloat(int e) => MathF.Pow(2f, e - 127f);
 
     /// <summary>Convert FP16 bits to float.</summary>
     internal static float HalfToFloat(int h)

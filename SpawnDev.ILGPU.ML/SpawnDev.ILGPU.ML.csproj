@@ -39,7 +39,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.BlazorJS" Version="3.5.12" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="4.14.0-local.6" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="4.14.0" />
 		<PackageReference Include="SpawnDev.WebTorrent" Version="3.2.10" />
 	</ItemGroup>
 
