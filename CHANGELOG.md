@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — KV-tiled grouped attention (unbounded SKV for long prompts)
+
+**`FusedAttentionKernel` now handles unbounded SKV via a KV-tiled grouped kernel.** The single-pass grouped
+kernel holds all scores in shared memory, so it was capped at SKV ≤ 4096 — beyond that (8k–16k agentic prompts)
+attention fell back to the per-element kernel, which recomputes the D-length Q·K dot per output dim (D-fold
+redundant) and is O(seq²): catastrophically slow at long context. The new tiled kernel processes KV one
+512-block at a time (scores for just one block resident), so SKV is unbounded; each thread keeps one online
+softmax shared across its ≤4 owned output dims and the per-kv recurrence runs in order — **bit-identical** to
+the single-pass kernel and the per-element reference. Dispatch is gated by SKV: ≤ 4096 keeps the faster
+single-pass kernel (fewer barriers, no per-kv owned-dim branch — verified no regression, ~1.22 s
+FusedAttention @1081 tok), above it uses the tiled kernel. A >4096-token prefill that previously fell back now
+runs the grouped path. New PMT config (SKV=5000, multi-block) in `FusedAttention_Grouped_MatchesPerElement`
+asserts the tiled kernel matches per-element on all 6 backends. Opt-in via the same
+`EnableGroupedAttention` / `GGUF_ATTN_GROUP` flag; non-browser-GPU (browser keeps per-element).
+
 ## Unreleased — Last-position-only logits (prefill LM-head as an M=1 GEMV)
 
 **`GGUFGraphBuilder.EnableLastPositionLogits`: at prefill the LM head computes logits for ONLY the last

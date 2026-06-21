@@ -275,21 +275,18 @@ public abstract partial class MLTestBase
             Check(e, "strided bf16 maxSeq-store GQA D=128");
         }
 
-        // (5) SKV-overflow fall-back: grouped flag ON but SKV beyond the shared-memory cap must transparently run
-        // the per-element kernel (and thus match it). Tiny D keeps the buffer small.
+        // (5) Large SKV ABOVE the single-pass cap (4096) → the KV-TILED kernel, spanning many 512-blocks (the
+        // multi-block online-softmax carry + a partial last block). Must equal the per-element kernel exactly.
         {
-            int nHeads = 1, kvHeads = 1, SQ = 1, SKV = AttnSharedSkvMaxProbe + 17, D = 8;
+            int nHeads = 2, kvHeads = 1, SQ = 2, SKV = 5000, D = 64, kvOffset = 100;
             var Q = Rand(nHeads * SQ * D); var K = Rand(kvHeads * SKV * D); var V = Rand(kvHeads * SKV * D);
             float e = await Compare(nHeads * SQ * D, async (f, o) =>
             {
                 using var qb = accelerator.Allocate1D(Q); using var kb = accelerator.Allocate1D(K); using var vb = accelerator.Allocate1D(V);
-                f.Forward(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: false, window: int.MaxValue, kvOffset: 0, scale: 0f);
+                f.Forward(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: true, window: 700, kvOffset: kvOffset, scale: 0f);
                 await accelerator.SynchronizeAsync();
             });
-            Check(e, "SKV-overflow fall-back to per-element");
+            Check(e, "large SKV=5000 (>cap) KV-tiled + causal + window");
         }
     });
-
-    // Mirror of FusedAttentionKernel.AttnSharedSkvMax (private) for the fall-back test's SKV-over-cap config.
-    private const int AttnSharedSkvMaxProbe = 4096;
 }
