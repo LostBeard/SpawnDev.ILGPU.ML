@@ -1,3 +1,4 @@
+using ILGPU;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
 
@@ -89,11 +90,43 @@ public class FusedLinearOperator : IOnnxOperator
             return;
         }
 
+        // Quantized weight (Q4_K/Q6_K/…) fused into FusedLinear: its float Data is EMPTY (ShapeOnly), so the
+        // FP32 kernel can't read it. Route through the fused dequant matmul, then bias + activation — the
+        // correct equivalent of the unfused MatMul→Add→Activation. This is what lets qwen2/qwen3 run: their
+        // attention q/k/v projections carry a bias, so GraphOptimizer fuses them into FusedLinear; gemma4's
+        // bias-less projections never fuse (they stay MatMul → dequant). Robust to shape-recompiles (runs at
+        // execute time off ctx.QuantizedWeights, independent of how the graph was compiled).
+        if (weights.Data.Length < (long)K * N && ctx.QuantizedWeights != null
+            && weights.Name != null && ctx.QuantizedWeights.TryGetValue(weights.Name, out var qWeightData))
+        {
+            if (_registry.QuantizedWeightTypes == null
+                || !_registry.QuantizedWeightTypes.TryGetValue(weights.Name, out var qType))
+                throw new InvalidOperationException(
+                    $"FusedLinear: quantized weight '{weights.Name}' has no GGML type registered " +
+                    "(OperatorRegistry.QuantizedWeightTypes) — the loader must record the type with the bytes.");
+            var outView = output.Data.SubView(0, M * N);
+            _registry.FusedDequant.Forward(input.Data.SubView(0, M * K), qWeightData, outView, M, K, N, qType);
+            _registry.ElementWise.AddBias(outView, bias.Data.SubView(0, N), M * N, N); // broadcast bias over rows
+            int nMN = M * N;
+            switch (activation) // mirror the activations the fused FP32 kernel supports
+            {
+                case FusedActivation.None: break;
+                case FusedActivation.ReLU: _registry.ElementWise.ReLUInPlace(outView, nMN); break;
+                case FusedActivation.GELU: _registry.ElementWise.GELUInPlace(outView, nMN); break;
+                case FusedActivation.Sigmoid: _registry.Activations.SigmoidInPlace(outView, nMN); break;
+                case FusedActivation.Tanh: _registry.Activations.TanhInPlace(outView, nMN); break;
+                case FusedActivation.SiLU: _registry.Activations.SiLUInPlace(outView, nMN); break;
+                default: throw new NotSupportedException($"FusedLinear quantized path: activation {activation} not yet supported.");
+            }
+            return;
+        }
+
         if (weights.Data.Length < (long)K * N)
             throw new InvalidOperationException(
                 $"FusedLinear weight '{weights.Name}' float path but its float Data is empty (len={weights.Data.Length}, " +
                 $"need K*N={(long)K * N}, DType={weights.DType}, shape=[{string.Join(",", weights.Shape)}]). A quantized/shape-only " +
-                $"weight reached the FP32 linear path — it must route through the dequant matmul (or low-p dispatch).");
+                $"weight reached the FP32 linear path but is not in ctx.QuantizedWeights — the quantized byte-view map " +
+                "was not wired into this executor.");
 
         _kernel.Forward(
             input.Data.SubView(0, M * K),
