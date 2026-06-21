@@ -59,16 +59,23 @@ public static class ServerEndpoints
             bool stream = GetBool(req, "stream") ?? false;
             var cfg = ReadOpenAiConfig(req);
             var stops = GetStringArray(req, "stop");
+            var tools = GetTools(req);
             string id = "chatcmpl-" + Guid.NewGuid().ToString("N")[..24];
             long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            if (!stream)
+            // Tools present → non-streaming path (the tool_call arrives at the end; we generate, then parse).
+            if (tools != null || !stream)
             {
-                var (text, res) = await GenerateOnce(registry, model, messages, cfg, stops, ctx.RequestAborted);
+                var (text, res) = await GenerateOnce(registry, model, messages, cfg, stops, ctx.RequestAborted, tools);
+                var toolCalls = tools != null ? ChatTemplates.ParseToolCalls(text) : new List<ChatTemplates.ParsedToolCall>();
+                object message = toolCalls.Count > 0
+                    ? new { role = "assistant", content = (string?)null, tool_calls = toolCalls.Select((tc, ix) => new { id = $"call_{ix}_{Guid.NewGuid().ToString("N")[..8]}", type = "function", function = new { name = tc.Name, arguments = tc.ArgumentsJson } }).ToArray() }
+                    : new { role = "assistant", content = (string?)text };
+                string finish = toolCalls.Count > 0 ? "tool_calls" : FinishReason(res);
                 return Results.Json(new
                 {
                     id, @object = "chat.completion", created, model,
-                    choices = new[] { new { index = 0, message = new { role = "assistant", content = text }, finish_reason = FinishReason(res) } },
+                    choices = new[] { new { index = 0, message, finish_reason = finish } },
                     usage = new { prompt_tokens = res?.PromptTokens ?? 0, completion_tokens = res?.GeneratedTokens ?? 0, total_tokens = (res?.PromptTokens ?? 0) + (res?.GeneratedTokens ?? 0) },
                 }, J);
             }
@@ -186,13 +193,22 @@ public static class ServerEndpoints
     // ── Generation bridge ────────────────────────────────────────────────────────────────────────
     private static async Task<(string Text, SpawnDev.ILGPU.ML.Pipelines.GenerationResult? Res)> GenerateOnce(
         ModelRegistry registry, string model, List<(string, string)> messages, GenerationConfig cfg,
-        string[]? stops, CancellationToken ct)
+        string[]? stops, CancellationToken ct, IReadOnlyList<string>? toolsJson = null)
     {
         using var lease = await registry.AcquireAsync(model, ct);
         var lm = lease.Model;
-        var (promptIds, stopIds) = ChatTemplates.BuildChatPrompt(lm.Gguf, lm.Tokenizer, messages);
+        var (promptIds, stopIds) = ChatTemplates.BuildChatPrompt(lm.Gguf, lm.Tokenizer, messages, toolsJson: toolsJson);
         var res = await lm.Generator.GenerateAsync(promptIds, cfg, stops, stopIds, onDelta: null, ct);
         return (res.Text, res);
+    }
+
+    // Extract tool definitions from a request as raw JSON strings (each is forwarded into the prompt verbatim).
+    private static List<string>? GetTools(JsonElement req)
+    {
+        if (!req.TryGetProperty("tools", out var t) || t.ValueKind != JsonValueKind.Array || t.GetArrayLength() == 0) return null;
+        var list = new List<string>();
+        foreach (var tool in t.EnumerateArray()) list.Add(tool.GetRawText());
+        return list;
     }
 
     private static async Task<SpawnDev.ILGPU.ML.Pipelines.GenerationResult?> GenerateStreaming(

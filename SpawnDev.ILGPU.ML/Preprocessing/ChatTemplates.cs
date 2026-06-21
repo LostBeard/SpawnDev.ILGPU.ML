@@ -252,8 +252,21 @@ public static class ChatTemplates
     /// generator's stop set alongside EOS.
     /// </summary>
     public static (int[] PromptIds, int[] StopTokenIds) BuildChatPrompt(GGUF.GGUFModel model,
-        SentencePieceTokenizer tok, IReadOnlyList<(string Role, string Content)> messages, bool thinking = true)
+        SentencePieceTokenizer tok, IReadOnlyList<(string Role, string Content)> messages, bool thinking = true,
+        IReadOnlyList<string>? toolsJson = null)
     {
+        // Tool-calling (v2): inject the tool signatures into the system message per format, so the model knows
+        // it may emit <tool_call>…</tool_call>. The generated text is later scanned by ParseToolCalls.
+        if (toolsJson != null && toolsJson.Count > 0)
+        {
+            var aug = new List<(string Role, string Content)>(messages);
+            string? sys = aug.Count > 0 && aug[0].Role == "system" ? aug[0].Content : null;
+            string toolSys = BuildToolSystem(DetectChatFormat(model), sys, toolsJson);
+            if (aug.Count > 0 && aug[0].Role == "system") aug[0] = ("system", toolSys);
+            else aug.Insert(0, ("system", toolSys));
+            messages = aug;
+        }
+
         switch (DetectChatFormat(model))
         {
             case ChatFormat.Gemma4:
@@ -274,5 +287,57 @@ public static class ChatTemplates
             foreach (var m in markers) if (tok.TryGetId(m, out var id)) list.Add(id);
             return list.ToArray();
         }
+    }
+
+    // ── Tool / function-calling (v2) ─────────────────────────────────────────────────────────────────
+    /// <summary>A tool call parsed from a model's generated text. <see cref="ArgumentsJson"/> is the raw JSON
+    /// of the arguments (an object), ready to forward as the OpenAI <c>arguments</c> string or the Anthropic
+    /// <c>input</c> object.</summary>
+    public readonly record struct ParsedToolCall(string Name, string ArgumentsJson);
+
+    /// <summary>Build the system-message content that advertises the available <paramref name="toolsJson"/>
+    /// (each already a serialized tool definition) in the model's tool-calling format. ChatML (qwen) uses the
+    /// <c>&lt;tools&gt;</c>/<c>&lt;tool_call&gt;</c> convention; other formats reuse it as a reasonable default
+    /// until their own tool format is wired.</summary>
+    public static string BuildToolSystem(ChatFormat format, string? systemContent, IReadOnlyList<string> toolsJson)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append(string.IsNullOrWhiteSpace(systemContent) ? "You are a helpful assistant." : systemContent);
+        sb.Append("\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n");
+        sb.Append("You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+        foreach (var t in toolsJson) { sb.Append('\n'); sb.Append(t); }
+        sb.Append("\n</tools>\n\nFor each function call, return a json object with function name and arguments ");
+        sb.Append("within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, ");
+        sb.Append("\"arguments\": <args-json-object>}\n</tool_call>");
+        return sb.ToString();
+    }
+
+    /// <summary>Extract tool calls from generated text. Handles the <c>&lt;tool_call&gt;{json}&lt;/tool_call&gt;</c>
+    /// convention (ChatML/qwen, and the default used by <see cref="BuildToolSystem"/>). Malformed blocks are
+    /// skipped. Returns an empty list when the model produced plain text.</summary>
+    public static List<ParsedToolCall> ParseToolCalls(string text)
+    {
+        var calls = new List<ParsedToolCall>();
+        const string open = "<tool_call>", close = "</tool_call>";
+        int i = 0;
+        while (true)
+        {
+            int s = text.IndexOf(open, i, StringComparison.Ordinal);
+            if (s < 0) break;
+            int e = text.IndexOf(close, s + open.Length, StringComparison.Ordinal);
+            if (e < 0) break;
+            string inner = text.Substring(s + open.Length, e - s - open.Length).Trim();
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(inner);
+                var root = doc.RootElement;
+                string name = root.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                string args = root.TryGetProperty("arguments", out var a) ? a.GetRawText() : "{}";
+                if (!string.IsNullOrEmpty(name)) calls.Add(new ParsedToolCall(name, args));
+            }
+            catch { /* skip a malformed block rather than fail the whole response */ }
+            i = e + close.Length;
+        }
+        return calls;
     }
 }
