@@ -29,6 +29,15 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>,
         int>? _rmsNormApplyNoWeightKernel;
 
+    // Single-pass (group-per-row) RMSNorm — loaded lazily on the first non-WebGL call. _dummyRmsWeight is the
+    // 1-element placeholder for the weightless path (hasWeight=0, the kernel never reads it); _rmsFusedGroup
+    // caches the chosen group size.
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, float, int>? _rmsNormFusedKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _dummyRmsWeight;
+    private int _rmsFusedGroup;
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int, float>? _instanceNormMeanVarKernel;
@@ -127,6 +136,39 @@ public class NormalizationKernels : IDisposable
     {
         int row = idx / C;
         output[idx] = input[idx] * invRms[row];
+    }
+
+    /// <summary>
+    /// Single-pass RMSNorm — one GROUP per row. Thread 0 computes the row's invRms with the EXACT same f64
+    /// sum-of-squares as the two-pass <see cref="RMSNormStatsImpl"/> (byte-identical, zero precision drift),
+    /// then the whole group applies the normalization in parallel. Fuses the two-pass stats + apply into ONE
+    /// dispatch — no second dispatch, no invRms global round-trip, no scratch buffer. Needs group shared memory
+    /// + a barrier, so it is gated to backends with a group (WebGL's TF path keeps the two-pass).
+    /// <paramref name="hasWeight"/> 0 = weightless unit gain (gemma4's V-norm); else multiply by weight[col].
+    /// </summary>
+    private static void RMSNormFusedImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        int C, float epsilon, int hasWeight)
+    {
+        int row = Grid.IdxX;     // one group per row
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int offset = row * C;
+
+        var sh = SharedMemory.Allocate<float>(1);
+        if (tid == 0)
+        {
+            double sumSq = 0.0;
+            for (int i = 0; i < C; i++) { double v = (double)input[offset + i]; sumSq += v * v; }
+            sh[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
+        }
+        Group.Barrier();
+
+        float invRms = sh[0];
+        for (int i = tid; i < C; i += T)
+            output[offset + i] = input[offset + i] * invRms * (hasWeight != 0 ? weight[i] : 1f);
     }
 
     /// <summary>
@@ -257,9 +299,29 @@ public class NormalizationKernels : IDisposable
         _batchNormKernel!(N * C * spatial, input, output, scale, bias, mean, variance, N, C, spatial, epsilon);
     }
 
+    // Single-pass fused RMSNorm on any backend with a group (everything but WebGL's TF path); fuses the
+    // two-pass stats + apply into one dispatch (no second dispatch, no invRms round-trip). Returns false to
+    // fall through to the two-pass path. hasWeight 0 = weightless. Byte-identical (thread 0 does the exact f64
+    // stats); the weight view is unused when hasWeight==0 (pass the dummy).
+    private bool TryFusedRMSNorm(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> weight,
+        int rows, int C, float epsilon, int hasWeight)
+    {
+        if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
+        int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
+            : (_rmsFusedGroup = Math.Min(256, (int)_accelerator.MaxNumThreadsPerGroup));
+        if (T < 32) return false; // group too small to be worth it — keep the two-pass
+        _rmsNormFusedKernel ??= _accelerator.LoadStreamKernel<
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, float, int>(RMSNormFusedImpl);
+        _rmsNormFusedKernel(new KernelConfig(new Index1D(rows), new Index1D(T)),
+            input, output, weight, C, epsilon, hasWeight);
+        return true;
+    }
+
     /// <summary>
-    /// RMSNorm: input [rows, C] → output [rows, C]. weight: [C].
-    /// Two-pass for WebGL TF compatibility.
+    /// RMSNorm: input [rows, C] → output [rows, C]. weight: [C]. Single-pass (one group/row) where a group is
+    /// available; two-pass on WebGL (TF).
     /// </summary>
     public void RMSNorm(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
@@ -267,15 +329,12 @@ public class NormalizationKernels : IDisposable
         int rows, int C, float epsilon = 1e-6f)
     {
         EnsureLoaded();
+        if (TryFusedRMSNorm(input, output, weight, rows, C, epsilon, hasWeight: 1)) return;
 
-        // invRms scratch from the reusable ring (no per-call alloc / no unbounded _allTempBufs growth). The ring
-        // depth keeps a slot out of reach of the still-pending Pass 2 of an earlier call (see RentInvRms).
+        // WebGL two-pass. invRms scratch from the reusable ring (no per-call alloc / no _allTempBufs growth);
+        // the ring depth keeps a slot out of reach of the still-pending Pass 2 of an earlier call (RentInvRms).
         var rmsInvRms = RentInvRms(rows);
-
-        // Pass 1: compute invRms per row
         _rmsNormStatsKernel!(rows, input, rmsInvRms, C, epsilon);
-
-        // Pass 2: apply normalization per element
         _rmsNormApplyKernel!(rows * C, input, output, weight, rmsInvRms, C);
     }
 
@@ -288,9 +347,10 @@ public class NormalizationKernels : IDisposable
         int rows, int C, float epsilon = 1e-6f)
     {
         EnsureLoaded();
+        _dummyRmsWeight ??= _accelerator.Allocate1D(new float[1]);
+        if (TryFusedRMSNorm(input, output, _dummyRmsWeight.View, rows, C, epsilon, hasWeight: 0)) return;
 
         var rmsInvRms = RentInvRms(rows);
-
         _rmsNormStatsKernel!(rows, input, rmsInvRms, C, epsilon);
         _rmsNormApplyNoWeightKernel!(rows * C, input, output, rmsInvRms, C);
     }
@@ -445,6 +505,8 @@ public class NormalizationKernels : IDisposable
         foreach (var b in _allTempBufs) try { b.Dispose(); } catch { }
         _allTempBufs.Clear();
         foreach (var b in _invRmsRing) try { b?.Dispose(); } catch { }
+        try { _dummyRmsWeight?.Dispose(); } catch { }
+        _dummyRmsWeight = null;
     }
 
     private void EnsureLoaded()

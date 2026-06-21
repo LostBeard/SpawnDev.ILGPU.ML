@@ -2,6 +2,22 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Single-pass fused RMSNorm + SpawnDev.ILGPU 4.15.0
+
+**RMSNorm is now single-pass (one group per row) on every backend with a group — fusing the two-pass stats +
+apply into ONE dispatch (no second dispatch, no invRms global round-trip, no scratch).** Thread 0 of each group
+computes the row's invRms with the EXACT same f64 sum-of-squares as the old stats pass (so the result is
+byte-identical — zero precision drift), then the whole group applies the normalization in parallel. WebGL (TF,
+no shared-mem group reduction) keeps the two-pass (with the reusable invRms ring below). This was previously
+blocked by the SpawnDev.ILGPU WGSL `_uf_group_iter` redeclaration bug (two `Grid.IdxX` `LoadStreamKernel`s
+colliding on WebGPU) — now confirmed FIXED: MatMul's tiled kernel + this RMSNorm group kernel both run on
+WebGPU (Norm 194/0). Verified byte-identical: PMT `Norm` + `GGUFDecodeKVCache` decode-equivalence + gemma4-12b
+identical tokens, all 6 backends.
+
+**Bumped SpawnDev.ILGPU 4.14.2-local.1 → 4.15.0** (Wasm SIMD128 auto-vectorization with a byte-identical scalar
+path; all in-register quant decoders single-exit/branchless — extends the WebGL/GLSL multi-exit-decode fix to
+FP8 E4M3/E5M2).
+
 ## Unreleased — RMSNorm invRms scratch from a reusable ring (no per-token alloc / leak)
 
 **RMSNorm's two-pass `invRms` scratch now comes from a fixed reusable ring instead of a fresh per-call
