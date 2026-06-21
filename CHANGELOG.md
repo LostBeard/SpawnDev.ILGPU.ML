@@ -2,6 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — RMSNorm invRms scratch from a reusable ring (no per-token alloc / leak)
+
+**RMSNorm's two-pass `invRms` scratch now comes from a fixed reusable ring instead of a fresh per-call
+`Allocate1D` that was never freed until `Dispose`.** Each RMSNorm call allocated a rows-sized invRms buffer and
+appended it to a list released only at `Dispose` — for a 48-layer gemma4 decode (~6 RMSNorm/layer) that is ~288
+tiny GPU buffers per token accumulating for the entire generation (a real, if small-per-item, leak the code
+comment acknowledged). The invRms ring (64 reusable buffers, each grown to the max rows it has seen) eliminates
+the per-call allocation AND the unbounded growth; a slot is reused only after 64 calls — far past the
+two-dispatch (Pass 1 → Pass 2) lifetime of any one call's invRms — so the race the per-call alloc avoided cannot
+return. The two-pass math is byte-identical (no precision change). Verified: PMT `Norm` + `GGUFDecodeKVCache`
+decode-equivalence + gemma4-12b byte-identical tokens, all 6 backends.
+
+NOTE: the deeper single-pass (fuse stats + apply into one dispatch, dropping the second dispatch + the invRms
+round-trip) needs a group/shared-mem kernel via `LoadStreamKernel`, currently blocked on the SpawnDev.ILGPU WGSL
+`_uf_group_iter` redeclaration bug for a second `Grid.IdxX` `LoadStreamKernel` (would break WebGPU). Tracked for
+the library fix; deferred here per the no-workarounds rule.
+
 ## Unreleased — FusedAttention params buffer ring pre-allocated (no per-call alloc)
 
 **`FusedAttentionKernel` reuses a pre-allocated params-buffer ring instead of `Allocate1D` per call.** Each

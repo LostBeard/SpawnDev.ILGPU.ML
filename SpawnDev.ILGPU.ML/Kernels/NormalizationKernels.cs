@@ -268,18 +268,15 @@ public class NormalizationKernels : IDisposable
     {
         EnsureLoaded();
 
-        // Per-call temp buffer — eliminates the same shared-state race documented on
-        // InstanceNorm. Stacked transformer blocks (LLaMA-style) issue many RMSNorm
-        // calls in flight; sharing the invRms buffer would let Pass 1 of call N+1
-        // clobber the data Pass 2 of call N is still reading.
-        var rmsInvRms = _accelerator.Allocate1D<float>(rows);
-        _allTempBufs.Add(rmsInvRms);
+        // invRms scratch from the reusable ring (no per-call alloc / no unbounded _allTempBufs growth). The ring
+        // depth keeps a slot out of reach of the still-pending Pass 2 of an earlier call (see RentInvRms).
+        var rmsInvRms = RentInvRms(rows);
 
         // Pass 1: compute invRms per row
-        _rmsNormStatsKernel!(rows, input, rmsInvRms.View, C, epsilon);
+        _rmsNormStatsKernel!(rows, input, rmsInvRms, C, epsilon);
 
         // Pass 2: apply normalization per element
-        _rmsNormApplyKernel!(rows * C, input, output, weight, rmsInvRms.View, C);
+        _rmsNormApplyKernel!(rows * C, input, output, weight, rmsInvRms, C);
     }
 
     /// <summary>
@@ -292,11 +289,10 @@ public class NormalizationKernels : IDisposable
     {
         EnsureLoaded();
 
-        var rmsInvRms = _accelerator.Allocate1D<float>(rows);
-        _allTempBufs.Add(rmsInvRms);
+        var rmsInvRms = RentInvRms(rows);
 
-        _rmsNormStatsKernel!(rows, input, rmsInvRms.View, C, epsilon);
-        _rmsNormApplyNoWeightKernel!(rows * C, input, output, rmsInvRms.View, C);
+        _rmsNormStatsKernel!(rows, input, rmsInvRms, C, epsilon);
+        _rmsNormApplyNoWeightKernel!(rows * C, input, output, rmsInvRms, C);
     }
 
     /// <summary>
@@ -418,12 +414,37 @@ public class NormalizationKernels : IDisposable
     // until Dispose() (typical InferenceSession lifetime).
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allTempBufs = new();
 
-    /// <summary>Free the per-call mean/invStd/invRms temp buffers (held alive across calls to avoid the two-pass
-    /// race). Previously these leaked until the accelerator was torn down; now released with the kernel owner.</summary>
+    // RMSNorm two-pass invRms ring: the invRms buffer (one float per row) is written by Pass 1 and read by the
+    // immediately-following Pass 2 (apply). A FIXED ring of reusable buffers (each grown to the max rows it has
+    // seen) replaces the per-call Allocate1D that was appended to _allTempBufs and never freed until Dispose —
+    // for a 48-layer decode that was ~288 tiny buffers/token accumulating for the WHOLE generation. A slot is
+    // reused only after InvRmsRingSize calls, far past the two-dispatch lifetime of any one call's invRms, so
+    // the Pass1/Pass2 race the per-call alloc avoided cannot reappear.
+    private const int InvRmsRingSize = 64;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense>?[] _invRmsRing = new MemoryBuffer1D<float, Stride1D.Dense>?[InvRmsRingSize];
+    private int _invRmsNext;
+
+    private ArrayView1D<float, Stride1D.Dense> RentInvRms(int rows)
+    {
+        var slot = _invRmsNext;
+        _invRmsNext = (_invRmsNext + 1) % InvRmsRingSize;
+        var buf = _invRmsRing[slot];
+        if (buf == null || buf.Length < rows)
+        {
+            buf?.Dispose();
+            _invRmsRing[slot] = buf = _accelerator.Allocate1D<float>(rows);
+        }
+        return buf.View.SubView(0, rows);
+    }
+
+    /// <summary>Free the per-call mean/invStd temp buffers (held alive across calls to avoid the two-pass race)
+    /// and the RMSNorm invRms ring. Previously these leaked until the accelerator was torn down; now released
+    /// with the kernel owner.</summary>
     public void Dispose()
     {
         foreach (var b in _allTempBufs) try { b.Dispose(); } catch { }
         _allTempBufs.Clear();
+        foreach (var b in _invRmsRing) try { b?.Dispose(); } catch { }
     }
 
     private void EnsureLoaded()
