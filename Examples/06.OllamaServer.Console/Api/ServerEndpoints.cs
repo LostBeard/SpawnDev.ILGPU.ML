@@ -390,7 +390,23 @@ public static class ServerEndpoints
         {
             var sb = new StringBuilder();
             foreach (var block in c.EnumerateArray())
-                if (block.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String) sb.Append(t.GetString());
+            {
+                string btype = block.TryGetProperty("type", out var bt) ? bt.GetString() ?? "" : "";
+                if (btype == "tool_use") // Anthropic: assistant's prior tool call → render as <tool_call>
+                {
+                    string nm = block.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                    string inp = block.TryGetProperty("input", out var ip) ? ip.GetRawText() : "{}";
+                    sb.Append($"\n<tool_call>\n{{\"name\": \"{nm}\", \"arguments\": {inp}}}\n</tool_call>");
+                }
+                else if (btype == "tool_result") // Anthropic: tool result (in a user turn) → <tool_response>
+                {
+                    string rc = block.TryGetProperty("content", out var cc)
+                        ? (cc.ValueKind == JsonValueKind.String ? cc.GetString() ?? "" : ExtractContent(cc)) : "";
+                    sb.Append($"<tool_response>\n{rc}\n</tool_response>");
+                }
+                else if (block.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String)
+                    sb.Append(t.GetString());
+            }
             return sb.ToString();
         }
         return "";
