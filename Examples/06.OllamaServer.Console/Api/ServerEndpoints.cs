@@ -285,6 +285,29 @@ public static class ServerEndpoints
             {
                 string role = m.TryGetProperty("role", out var r) ? r.GetString() ?? "user" : "user";
                 string content = m.TryGetProperty("content", out var c) ? ExtractContent(c) : "";
+
+                // Tool-calling round-trip (ChatML): an assistant turn may carry tool_calls instead of/with text —
+                // render them back as <tool_call> blocks so the model sees its own prior call. A role:"tool"
+                // result is delivered (qwen/ChatML) as a user turn wrapped in <tool_response>.
+                if (role == "assistant" && m.TryGetProperty("tool_calls", out var tcs) && tcs.ValueKind == JsonValueKind.Array)
+                {
+                    var sb = new StringBuilder(content);
+                    foreach (var tc in tcs.EnumerateArray())
+                    {
+                        if (!tc.TryGetProperty("function", out var fn)) continue;
+                        string fname = fn.TryGetProperty("name", out var nn) ? nn.GetString() ?? "" : "";
+                        string fargs = fn.TryGetProperty("arguments", out var aa)
+                            ? (aa.ValueKind == JsonValueKind.String ? aa.GetString() ?? "{}" : aa.GetRawText())
+                            : "{}";
+                        sb.Append($"\n<tool_call>\n{{\"name\": \"{fname}\", \"arguments\": {fargs}}}\n</tool_call>");
+                    }
+                    content = sb.ToString();
+                }
+                if (role == "tool")
+                {
+                    content = $"<tool_response>\n{content}\n</tool_response>";
+                    role = "user";
+                }
                 list.Add((role, content));
             }
         }
