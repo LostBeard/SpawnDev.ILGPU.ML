@@ -52,7 +52,7 @@ public class ConvTranspose2DKernel : IDisposable
         int oy = rem % outH;
         int oc = rem / outH;
 
-        double sum = (double)bias[oc]; // Always read — no branch (ANGLE optimizer workaround)
+        float sum = bias[oc]; // f32 accumulation (ML-standard; see Conv2DKernel). Always read — no branch (ANGLE workaround)
 
         for (int ic = 0; ic < inC; ic++)
         {
@@ -70,12 +70,12 @@ public class ConvTranspose2DKernel : IDisposable
                     int ix = diffX / stride;
                     if (ix >= inW) continue;
 
-                    sum += (double)input[ic * inH * inW + iy * inW + ix] * (double)weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
+                    sum += input[ic * inH * inW + iy * inW + ix] * weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
                 }
             }
         }
 
-        output[idx] = (float)sum;
+        output[idx] = sum;
     }
 
     public void Forward(

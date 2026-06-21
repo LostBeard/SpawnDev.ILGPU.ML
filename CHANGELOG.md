@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Conv2D / ConvTranspose2D accumulate in f32 (not f64)
+
+**Convolution now accumulates in f32, the ML standard, instead of f64.** Every `Conv2DKernel` variant (NCHW,
+NHWC, depthwise, native-low-p-weight) and `ConvTranspose2DKernel` previously accumulated each output element's
+`inC*kH*kW` MACs in `double` ("ultimate quality" caution). f64 is far slower on every GPU backend — consumer
+cards run f64 at ~1/64 of f32, and WebGPU/WebGL **emulate** it via Dekker (multiple f32 ops per MAC) — so the
+conv-heavy SD UNet/VAE paid it on every multiply-accumulate. f32 accumulation's rounding error over the MACs is
+~1e-5 relative, far below an 8-bit pixel and within the existing MAC-scaled conv-test tolerance. Verified: Conv2D
++ ConvTranspose2D CPU-reference tests **164/0 on all 6 backends**; SD-Turbo (seed 42) output is **perceptually
+identical** to the f64 baseline (`maxAbsDiff=1/255, meanAbsDiff=0.0007, 0.07% of bytes differ`) and the same run
+went **~2.4× faster on CUDA (29.4 s → 12.1 s)**. (The numerically-sensitive double *reductions* in
+Norm/Softmax/Stats kernels — variance, softmax-sum — are intentionally left in f64; only the conv MAC
+accumulation changed.)
+
 ## Unreleased — GPU argmax greedy decode (no per-token full-vocab readback)
 
 **Greedy next-token selection now runs on the GPU and reads back one int, not the ~1 MB vocab row.** Both decode

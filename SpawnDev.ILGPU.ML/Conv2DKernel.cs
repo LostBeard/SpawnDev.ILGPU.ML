@@ -89,9 +89,12 @@ public class Conv2DKernel : IDisposable
         int oy = rem % outH;
         int oc = rem / outH;
 
-        // Double accumulation: eliminates precision errors across all backends.
-        // Always read bias — no branch (ANGLE optimizer workaround).
-        double sum = (double)bias[oc];
+        // f32 accumulation (the ML-standard for conv): the rounding error over the inC*kH*kW MACs is ~1e-5
+        // relative — imperceptible in an 8-bit image and within the MAC-scaled conv-test tolerance. f64
+        // accumulation here was over-cautious "ultimate quality" and is far slower on every GPU backend
+        // (consumer cards run f64 at ~1/64 of f32; WebGPU/WebGL EMULATE f64 via Dekker — the conv-heavy UNet/VAE
+        // paid that on every MAC). Always read bias — no branch (ANGLE optimizer workaround).
+        float sum = bias[oc];
 
         for (int ic = 0; ic < inC; ic++)
         {
@@ -107,18 +110,18 @@ public class Conv2DKernel : IDisposable
                     int ix = ox * stride + kx * dilationW - padLeft;
                     if (ix < 0 || ix >= inW) continue;
 
-                    sum += (double)input[icBase + iy * inW + ix] * (double)weight[wcBase + ky * kW + kx];
+                    sum += input[icBase + iy * inW + ix] * weight[wcBase + ky * kW + kx];
                 }
             }
         }
 
-        output[idx] = (float)sum;
+        output[idx] = sum;
     }
 
     /// <summary>
     /// Conv2D NCHW with NATIVE low-precision WEIGHTS (<typeparamref name="T"/> = ILGPU.Half / BFloat16 /
     /// Float8E*) — identical math to Conv2DImpl, but each filter weight is read NATIVELY and converted to
-    /// float in-register (PrecisionConvert) for the double-precision accumulation. The weight stays native in
+    /// float in-register (PrecisionConvert) for the f32 accumulation. The weight stays native in
     /// GPU memory (no f32 temp buffer); input/bias/output stay fp32, no accuracy loss. The UNet is mostly
     /// Conv, so this is the bulk of the low-p memory win for SD-Turbo.
     /// </summary>
@@ -140,7 +143,7 @@ public class Conv2DKernel : IDisposable
         int oy = rem % outH;
         int oc = rem / outH;
 
-        double sum = (double)bias[oc];
+        float sum = bias[oc];
 
         for (int ic = 0; ic < inC; ic++)
         {
@@ -156,12 +159,12 @@ public class Conv2DKernel : IDisposable
                     int ix = ox * stride + kx * dilationW - padLeft;
                     if (ix < 0 || ix >= inW) continue;
 
-                    sum += (double)input[icBase + iy * inW + ix] * (double)PrecisionConvert.ConvertToSingle(weight[wcBase + ky * kW + kx]);
+                    sum += input[icBase + iy * inW + ix] * PrecisionConvert.ConvertToSingle(weight[wcBase + ky * kW + kx]);
                 }
             }
         }
 
-        output[idx] = (float)sum;
+        output[idx] = sum;
     }
 
     /// <summary>
@@ -326,7 +329,7 @@ public class Conv2DKernel : IDisposable
         int oy = rem % outH;
         int c = rem / outH;
 
-        double sum = (double)bias[c];
+        float sum = bias[c];
 
         int inBase = c * inH * inW;
         int wBase = c * kH * kW;
@@ -340,11 +343,11 @@ public class Conv2DKernel : IDisposable
                 int ix = ox * stride + kx * dilationW - padLeft;
                 if (ix < 0 || ix >= inW) continue;
 
-                sum += (double)input[inBase + iy * inW + ix] * (double)weight[wBase + ky * kW + kx];
+                sum += input[inBase + iy * inW + ix] * weight[wBase + ky * kW + kx];
             }
         }
 
-        output[idx] = (float)sum;
+        output[idx] = sum;
     }
 
     public void ForwardDepthwise(
@@ -411,7 +414,7 @@ public class Conv2DKernel : IDisposable
         int ox = rem % outW;
         int oy = rem / outW;
 
-        double sum = (double)bias[oc];
+        float sum = bias[oc];
 
         int kernelSize = inC * kH * kW;
         for (int k = 0; k < kernelSize; k++)
@@ -428,10 +431,10 @@ public class Conv2DKernel : IDisposable
 
             int inIdx = (iy * inW + ix) * inC + ic;
             int wIdx = ((oc * kH + ky) * kW + kx) * inC + ic;
-            sum += (double)input[inIdx] * (double)weight[wIdx];
+            sum += input[inIdx] * weight[wIdx];
         }
 
-        output[idx] = (float)sum;
+        output[idx] = sum;
     }
 
     public void ForwardNHWC(
@@ -491,7 +494,7 @@ public class Conv2DKernel : IDisposable
         int ox = rem % outW;
         int oy = rem / outW;
 
-        double sum = (double)bias[c];
+        float sum = bias[c];
 
         int kernelSize = kH * kW;
         for (int k = 0; k < kernelSize; k++)
@@ -505,10 +508,10 @@ public class Conv2DKernel : IDisposable
 
             int inIdx = (iy * inW + ix) * C + c;
             int wIdx = (ky * kW + kx) * C + c;
-            sum += (double)input[inIdx] * (double)weight[wIdx];
+            sum += input[inIdx] * weight[wIdx];
         }
 
-        output[idx] = (float)sum;
+        output[idx] = sum;
     }
 
     public void ForwardDepthwiseNHWC(
