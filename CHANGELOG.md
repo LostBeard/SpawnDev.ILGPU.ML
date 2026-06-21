@@ -2,6 +2,24 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — SpawnDev.ILGPU 4.14.2 + MXFP4 scale single-source-of-truth decode
+
+**Migrated to SpawnDev.ILGPU 4.14.2-local.1** (Fork / Algorithms.Fork `2.0.41`) — the WebGL fix for the
+multi-exit `RawBitsToFloat` GLSL explosion (this consumption surfaced it: a multi-exit decode inlined before a
+loop made the WebGL/GLSL structurizer duplicate the loop continuation per branch arm, blowing the MXFP4 kernel
+to 76,876 GLSL lines / depth-56 → shader compile-fail). Geordi made `Float8E8M0Extensions.RawBitsToFloat` and
+`Float4E2M1Extensions.RawBitsToFloat` single-exit / branchless (value-identical), so the MXFP4 kernel compiles.
+
+**MXFP4 scale decode now composes the verified library E8M0 primitive (element AND scale).** Completing the MXFP4
+single-source-of-truth story (the FP4 element was already composed; the scale was still inline): the shared
+power-of-two block scale — `FusedDequantMatMul` GEMM + M=1 GEMV `DecodeMXFP4Element`, `FusedDequantGather`, and the
+CPU `GGUFModel` full-dequant / per-row paths — now decodes through `ILGPU.Float8E8M0Extensions.RawBitsToFloat`
+(OCP `float8_e8m0fnu`: `2^(e-127)`, `e==0xFF→NaN`; pure bit-math, transpiles on all 6 backends, block stays
+packed). The inline `E8M0ToFloat` wrapper (`MathF.Pow(2f, e-127f)`) and the two CPU-path `MathF.Pow` sites are
+deleted. Value-identical on every real MX scale byte (`e` in `1..254`; differs only at the degenerate `e==0xFF`,
+where the library is spec-correct NaN). One verified decode for the MXFP4 element AND its scale. PMT `MXFP4` 20/0
+on all 6 backends (incl. WebGL, now that the library decode compiles there).
+
 ## Unreleased — Register-blocked GEMM for native low-precision weights
 
 **`MatMulLowPWeight` now uses the register-blocked tiled kernel for large matrices, not the per-element kernel.**

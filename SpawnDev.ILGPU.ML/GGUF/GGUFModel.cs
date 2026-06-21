@@ -297,7 +297,7 @@ public class GGUFModel
         for (int blk = 0; blk < blocks; blk++)
         {
             int o = b + blk * 17;
-            float d = MathF.Pow(2f, buf[o] - 127f); // E8M0 scale 2^(e-127)
+            float d = Float8E8M0Extensions.RawBitsToFloat(buf[o]); // E8M0 scale 2^(e-127) (verified library decode)
             for (int i = 0; i < 16; i++)
             {
                 r[blk * 32 + i] = Float4E2M1Extensions.RawBitsToFloat(buf[o + 1 + i] & 0x0F) * d;
@@ -449,7 +449,7 @@ public class GGUFModel
         for (int block = 0; block < numBlocks; block++)
         {
             int blockOffset = (int)offset + block * 17;
-            float d = MathF.Pow(2f, RawData[blockOffset] - 127f); // E8M0 scale 2^(e-127)
+            float d = Float8E8M0Extensions.RawBitsToFloat(RawData[blockOffset]); // E8M0 scale 2^(e-127) (verified library decode)
             int resultBase = block * 32;
             for (int i = 0; i < 16; i++)
             {

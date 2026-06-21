@@ -133,7 +133,7 @@ public class FusedDequantGather : IDisposable
 
     // MXFP4 (17 B/block: [e:E8M0][16 nibble bytes]). Same ggml split order as Q4_0 (element i<16 = low nibble
     // of byte i, i>=16 = high nibble of byte i-16); value = E2M1[nibble] * 2^(e-127). Mirrors
-    // FusedDequantMatMul's MXFP4 decode (E8M0ToFloat + Float4E2M1Extensions.RawBitsToFloat).
+    // FusedDequantMatMul's MXFP4 decode (Float8E8M0Extensions.RawBitsToFloat scale × Float4E2M1Extensions.RawBitsToFloat element).
     private static void GatherMXFP4Impl(Index1D idx,
         ArrayView1D<int, Stride1D.Dense> w,
         ArrayView1D<float, Stride1D.Dense> indices,
@@ -151,7 +151,7 @@ public class FusedDequantGather : IDisposable
         int bytesPerRow = rowLength / 32 * 17;
         int bOff = row * bytesPerRow + (col / 32) * 17;
         int i = col % 32;
-        float d = FusedDequantMatMul.E8M0ToFloat(FusedDequantMatMul.ReadByte(w, bOff));
+        float d = Float8E8M0Extensions.RawBitsToFloat(FusedDequantMatMul.ReadByte(w, bOff));
         int packed = FusedDequantMatMul.ReadByte(w, bOff + 1 + (i < 16 ? i : i - 16));
         int nibble = i < 16 ? (packed & 0xF) : (packed >> 4);
         output[idx] = Float4E2M1Extensions.RawBitsToFloat(nibble) * d;
