@@ -143,4 +143,136 @@ public static class ChatTemplates
     /// <summary>The gemma4 turn-close control token id (<c>&lt;turn|&gt;</c>) — the stop token for a
     /// gemma4 generation loop. -1 if absent.</summary>
     public static int Gemma4TurnCloseId(SentencePieceTokenizer tok) => tok.TryGetId("<turn|>", out var v) ? v : -1;
+
+    // ── General multi-turn chat-prompt building (token-level, control tokens as single ids) ──────────
+    // Maps an OpenAI/Ollama/Anthropic messages[] list to the model's prompt format. We DETECT the format
+    // from the model's own tokenizer.chat_template (ChatML / Llama3 / gemma4), and emit the structural
+    // markers (<|im_start|>, <|eot_id|>, …) as SINGLE vocab ids when present (else as encoded text), so
+    // greedy sub-word matching can't fracture them. (v1: text only — tool_call branches of the templates
+    // are phase 2. Full Jinja2-from-GGUF rendering is the tracked generalization beyond these families.)
+
+    /// <summary>The chat prompt format detected for a model.</summary>
+    public enum ChatFormat
+    {
+        /// <summary>Unknown / unsupported — caller should fall back (we use ChatML best-effort).</summary>
+        Unknown,
+        /// <summary>ChatML: <c>&lt;|im_start|&gt;role\ncontent&lt;|im_end|&gt;\n</c> (qwen, many others).</summary>
+        ChatML,
+        /// <summary>Llama 3: <c>&lt;|start_header_id|&gt;role&lt;|end_header_id|&gt;\n\ncontent&lt;|eot_id|&gt;</c>.</summary>
+        Llama3,
+        /// <summary>gemma4 turn format (control tokens <c>&lt;|turn&gt;</c> / <c>&lt;turn|&gt;</c>).</summary>
+        Gemma4,
+    }
+
+    /// <summary>Detect the chat format from the model's GGUF <c>tokenizer.chat_template</c> + architecture.</summary>
+    public static ChatFormat DetectChatFormat(GGUF.GGUFModel model)
+    {
+        var t = model.GetMetadataString("tokenizer.chat_template") ?? "";
+        if ((model.Architecture ?? "").StartsWith("gemma4") || t.Contains("<|turn>") || t.Contains("<turn|>"))
+            return ChatFormat.Gemma4;
+        if (t.Contains("<|im_start|>")) return ChatFormat.ChatML;
+        if (t.Contains("<|start_header_id|>")) return ChatFormat.Llama3;
+        return ChatFormat.Unknown;
+    }
+
+    private static void EmitMarker(List<int> ids, SentencePieceTokenizer tok, string marker)
+    {
+        if (tok.TryGetId(marker, out var id)) ids.Add(id);   // single special-token id (the correct path)
+        else ids.AddRange(tok.Encode(marker));               // fallback: encode the literal text
+    }
+
+    /// <summary>Build ChatML prompt token ids for a multi-turn conversation.</summary>
+    public static int[] BuildChatMLPromptTokens(SentencePieceTokenizer tok,
+        IReadOnlyList<(string Role, string Content)> messages, bool addGenerationPrompt = true)
+    {
+        var ids = new List<int>();
+        foreach (var (role, content) in messages)
+        {
+            EmitMarker(ids, tok, "<|im_start|>");
+            ids.AddRange(tok.Encode($"{role}\n{content}"));
+            EmitMarker(ids, tok, "<|im_end|>");
+            ids.AddRange(tok.Encode("\n"));
+        }
+        if (addGenerationPrompt) { EmitMarker(ids, tok, "<|im_start|>"); ids.AddRange(tok.Encode("assistant\n")); }
+        return ids.ToArray();
+    }
+
+    /// <summary>Build Llama 3 prompt token ids for a multi-turn conversation.</summary>
+    public static int[] BuildLlama3PromptTokens(SentencePieceTokenizer tok,
+        IReadOnlyList<(string Role, string Content)> messages, bool addGenerationPrompt = true)
+    {
+        var ids = new List<int>();
+        EmitMarker(ids, tok, "<|begin_of_text|>");
+        foreach (var (role, content) in messages)
+        {
+            EmitMarker(ids, tok, "<|start_header_id|>");
+            ids.AddRange(tok.Encode(role));
+            EmitMarker(ids, tok, "<|end_header_id|>");
+            ids.AddRange(tok.Encode("\n\n" + content));
+            EmitMarker(ids, tok, "<|eot_id|>");
+        }
+        if (addGenerationPrompt)
+        {
+            EmitMarker(ids, tok, "<|start_header_id|>");
+            ids.AddRange(tok.Encode("assistant"));
+            EmitMarker(ids, tok, "<|end_header_id|>");
+            ids.AddRange(tok.Encode("\n\n"));
+        }
+        return ids.ToArray();
+    }
+
+    /// <summary>Build gemma4 prompt token ids for a multi-turn conversation (per-turn
+    /// <c>&lt;|turn&gt;role\ncontent&lt;turn|&gt;\n</c>; the thinking toggle arms the first turn).</summary>
+    public static int[] BuildGemma4MultiTurnPromptTokens(SentencePieceTokenizer tok,
+        IReadOnlyList<(string Role, string Content)> messages, bool thinking = true, bool addGenerationPrompt = true)
+    {
+        int Id(string s) => tok.TryGetId(s, out var v) ? v : -1;
+        int bos = Id("<bos>"), turnO = Id("<|turn>"), turnC = Id("<turn|>"), think = Id("<|think|>");
+        var ids = new List<int>();
+        if (bos >= 0) ids.Add(bos);
+        bool armed = false;
+        foreach (var (role, content) in messages)
+        {
+            if (turnO >= 0) ids.Add(turnO);
+            ids.AddRange(tok.Encode($"{role}\n"));
+            if (!armed && thinking && think >= 0) { ids.Add(think); armed = true; }
+            ids.AddRange(tok.Encode(content));
+            ids.AddRange(tok.Encode("\n"));
+            if (turnC >= 0) ids.Add(turnC);
+            ids.AddRange(tok.Encode("\n"));
+        }
+        if (addGenerationPrompt) { if (turnO >= 0) ids.Add(turnO); ids.AddRange(tok.Encode("model\n")); }
+        return ids.ToArray();
+    }
+
+    /// <summary>
+    /// Build the prompt token ids for a multi-turn conversation in the model's own format, plus the stop
+    /// token id(s) that end an assistant turn for that format. Dispatches on <see cref="DetectChatFormat"/>;
+    /// unknown formats fall back to ChatML (the most common). The returned stop ids should be added to the
+    /// generator's stop set alongside EOS.
+    /// </summary>
+    public static (int[] PromptIds, int[] StopTokenIds) BuildChatPrompt(GGUF.GGUFModel model,
+        SentencePieceTokenizer tok, IReadOnlyList<(string Role, string Content)> messages, bool thinking = true)
+    {
+        switch (DetectChatFormat(model))
+        {
+            case ChatFormat.Gemma4:
+                return (BuildGemma4MultiTurnPromptTokens(tok, messages, thinking),
+                        Ids(tok, "<turn|>"));
+            case ChatFormat.Llama3:
+                return (BuildLlama3PromptTokens(tok, messages),
+                        Ids(tok, "<|eot_id|>", "<|eom_id|>"));
+            case ChatFormat.ChatML:
+            default:
+                return (BuildChatMLPromptTokens(tok, messages),
+                        Ids(tok, "<|im_end|>"));
+        }
+
+        static int[] Ids(SentencePieceTokenizer tok, params string[] markers)
+        {
+            var list = new List<int>();
+            foreach (var m in markers) if (tok.TryGetId(m, out var id)) list.Add(id);
+            return list.ToArray();
+        }
+    }
 }

@@ -162,6 +162,37 @@ public class SentencePieceTokenizer : ITokenizer
     }
 
     /// <summary>
+    /// The raw bytes a single token contributes to the decoded output stream \u2014 the building block for
+    /// incremental/streaming detokenization. Control tokens (type 2) and out-of-range ids contribute
+    /// nothing. Byte-fallback tokens (&lt;0xHH&gt;) contribute their single raw byte. Normal pieces
+    /// contribute the UTF-8 bytes of the piece with the SentencePiece word-start marker U+2581 (\u2581)
+    /// mapped to a space. Concatenating this over a token run and decoding the result as UTF-8 is the
+    /// correct, multi-byte-safe detokenization (unlike <see cref="Decode"/>'s per-byte char append).
+    /// </summary>
+    public byte[] TokenToBytes(int id)
+    {
+        if (id < 0 || id >= _vocab.Length) return Array.Empty<byte>();
+        int tokenType = id < _tokenTypes.Length ? _tokenTypes[id] : 0;
+        if (tokenType == 2) return Array.Empty<byte>(); // control token (BOS/EOS/turn markers)
+
+        string token = _vocab[id];
+        // Byte-fallback token <0xHH> \u2192 the single raw byte (same detection as Decode).
+        if (token.Length == 6 && token.StartsWith("<0x") && token.EndsWith(">")
+            && byte.TryParse(token.AsSpan(3, 2), System.Globalization.NumberStyles.HexNumber, null, out byte b))
+            return new[] { b };
+
+        // Normal piece: UTF-8 bytes with \u2581 \u2192 space.
+        return System.Text.Encoding.UTF8.GetBytes(token.Replace('\u2581', ' '));
+    }
+
+    /// <summary>
+    /// Create a stateful, UTF-8-safe streaming detokenizer. Feed generated token ids one at a time via
+    /// <see cref="SentencePieceStreamingDecoder.Push"/>; it returns the incremental text delta, holding
+    /// back an incomplete trailing multi-byte UTF-8 sequence until the bytes completing it arrive.
+    /// </summary>
+    public SentencePieceStreamingDecoder CreateStreamingDecoder() => new SentencePieceStreamingDecoder(this);
+
+    /// <summary>
     /// Create from GGUF model metadata.
     /// </summary>
     public static SentencePieceTokenizer? FromGGUF(GGUF.GGUFModel model)

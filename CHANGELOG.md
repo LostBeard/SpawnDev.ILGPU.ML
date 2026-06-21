@@ -2,6 +2,34 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Ollama-compatible inference server (Example 06) + general generation core
+
+**New library generation core, plus a drop-in Ollama-replacement Example so prebuilt agentic frontends
+(Claude CLI, Pi, Codex, OpenCode, …) can use native-GPU GGUF inference.**
+
+Library:
+- **`SentencePieceStreamingDecoder`** (+ `SentencePieceTokenizer.TokenToBytes`) — stateful UTF-8-safe
+  incremental detokenizer for streaming; holds incomplete multi-byte sequences until complete. Also fixes
+  a latent bug where `Decode` reinterpreted multi-byte byte-fallback glyphs as Latin-1 (mojibake). Verified
+  all 6 backends (PMT) incl. a `é = <0xC3><0xA9>` case.
+- **`GgufGenerator`** — architecture-agnostic generation on `InferenceSession`: incremental KV-cache decode +
+  sampling + the streaming detokenizer + stop handling (EOS / stop token ids / **arbitrary stop strings**,
+  with held-back tails so partial stop strings never leak). Reproduces the gemma4 pipeline byte-identical;
+  stop-string truncation verified.
+- **`ChatTemplates`** — multi-turn token-level chat-prompt builders (ChatML, Llama 3, gemma4) emitting
+  structural markers as single control-token ids, dispatched by `DetectChatFormat` from the model's own
+  `tokenizer.chat_template`. (Text only; tool_calls + full Jinja2-from-GGUF rendering are follow-ups.)
+
+Example `06.OllamaServer.Console`:
+- Reads **Ollama's model cache** (`~/.ollama/models`) zero-copy — serves the GGUF blobs Ollama already
+  pulled (verified 17/17 models). ASP.NET Core/Kestrel host on :11434.
+- Three client protocols, all verified end-to-end against gemma4 from the cache: OpenAI
+  (`/v1/chat/completions` SSE, `/v1/models`), Ollama-native (`/api/chat`, `/api/generate` NDJSON,
+  `/api/tags`), and **Anthropic Messages** (`/v1/messages` SSE + `/v1/messages/count_tokens`) for Claude CLI.
+
+Known (testbed surfaced these): qwen2 GGUF weight load FailFasts (`Index/Extent out of bounds`) — a loader
+bug to fix; general Jinja2-from-GGUF templating + tool-calling are the next increments.
+
 ## Unreleased — Single-pass fused RMSNorm + SpawnDev.ILGPU 4.15.0
 
 **RMSNorm is now single-pass (one group per row) on every backend with a group — fusing the two-pass stats +

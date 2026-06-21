@@ -440,6 +440,54 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task SentencePiece_StreamingDecoder_MatchesUtf8AndFixesByteFallback() => await RunTest(async accelerator =>
+    {
+        // Vocab: specials + the normal piece "▁caf" + byte-fallback tokens <0x00>..<0xFF>.
+        var tokens = new List<string> { "<unk>", "<s>", "</s>", "▁", "▁caf" };
+        var scores = new List<float> { 0, 0, 0, -1, -2 };
+        var types = new List<int> { 1, 2, 2, 0, 0 };
+        for (int b = 0; b < 256; b++) { tokens.Add($"<0x{b:X2}>"); scores.Add(-10); types.Add(5); }
+        var sp = new SentencePieceTokenizer(tokens.ToArray(), scores.ToArray(), types.ToArray());
+
+        int bos = sp.BosId;                         // control (id 1) → contributes no bytes
+        int caf = 4;                                 // "▁caf"
+        sp.TryGetId("<0xC3>", out int c3);           // "é" = UTF-8 0xC3 0xA9 via byte fallback
+        sp.TryGetId("<0xA9>", out int a9);
+        var ids = new[] { bos, caf, c3, a9 };        // → "café"
+
+        // Stream token-by-token. The multi-byte glyph must be HELD until both bytes arrive.
+        var dec = sp.CreateStreamingDecoder();
+        var d0 = dec.Push(bos);                       // control → ""
+        var d1 = dec.Push(caf);                       // " caf" → leading-space trimmed → "caf"
+        var dC3 = dec.Push(c3);                       // incomplete 2-byte seq → "" (held)
+        var dA9 = dec.Push(a9);                       // completes → "é"
+        var dF = dec.Finish();                        // nothing buffered → ""
+        string streamed = d0 + d1 + dC3 + dA9 + dF;
+
+        // CPU reference: accumulate every token's raw bytes, decode ONCE as UTF-8, trim one leading space.
+        var refBytes = new List<byte>();
+        foreach (var id in ids) refBytes.AddRange(sp.TokenToBytes(id));
+        string reference = System.Text.Encoding.UTF8.GetString(refBytes.ToArray());
+        if (reference.StartsWith(' ')) reference = reference[1..];
+
+        if (streamed != reference)
+            throw new Exception($"Streaming != UTF-8 reference: streamed='{streamed}' reference='{reference}'");
+        if (streamed != "café")
+            throw new Exception($"Expected 'café', got '{streamed}'");
+        if (dC3.Length != 0)
+            throw new Exception($"Incomplete multi-byte seq must be held, but Push(<0xC3>) emitted '{dC3}'");
+        if (dA9 != "é")
+            throw new Exception($"Completing byte must emit 'é', got '{dA9}'");
+        if (streamed.Contains('Ã') || streamed.Contains('©'))
+            throw new Exception($"Mojibake leaked (Latin-1 byte reinterpretation): '{streamed}'");
+
+        // Document the bug this fixes: the old per-byte Decode mangles the same glyph to "cafÃ©".
+        string oldDecode = sp.Decode(ids);
+        Console.WriteLine($"[SentencePiece] streaming='{streamed}' (correct) vs Decode='{oldDecode}' (per-byte) — PASS");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task SentencePiece_ToLoadedTokenizer_Works() => await RunTest(async accelerator =>
     {
         var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581hello" };

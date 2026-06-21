@@ -124,6 +124,30 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
     using var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, path);
     Console.WriteLine($"Loaded: {session}\n");
 
+    // GGUF_GEN_GEN2=1 → drive the general GgufGenerator (architecture-agnostic core: incremental
+    // streaming detokenizer + stop sequences). Same gemma4 prompt + turn-close stop → must reproduce the
+    // pipeline output. Also self-checks that the streamed deltas equal the returned full text.
+    if (Environment.GetEnvironmentVariable("GGUF_GEN_GEN2") == "1")
+    {
+        var tok2 = SpawnDev.ILGPU.ML.Preprocessing.SentencePieceTokenizer.FromGGUF(gm)!;
+        var promptIds = SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.BuildGemma4PromptTokens(tok2, null, prompt, thinking: true);
+        int turnClose = SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.Gemma4TurnCloseId(tok2);
+        using var gen2 = new SpawnDev.ILGPU.ML.Pipelines.GgufGenerator(session, accelerator, gm, maxSeqLen: promptIds.Length + maxNew + 8);
+        var streamed = new System.Text.StringBuilder();
+        var gSw = Stopwatch.StartNew();
+        var stopEnv = Environment.GetEnvironmentVariable("GGUF_GEN_STOP");
+        var stopStrings = string.IsNullOrEmpty(stopEnv) ? null : stopEnv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var res = await gen2.GenerateAsync(promptIds,
+            config: new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = maxNew },
+            stopStrings: stopStrings,
+            stopTokenIds: new[] { turnClose },
+            onDelta: d => { streamed.Append(d); return Task.CompletedTask; });
+        gSw.Stop();
+        bool streamMatches = streamed.ToString() == res.Text;
+        Console.WriteLine($"\n=== GENERATOR OUTPUT ({gSw.Elapsed.TotalSeconds:F1}s, stop={res.Stop}, gen={res.GeneratedTokens}, streamed==full:{streamMatches}) ===\n{res.Text}");
+        return 0;
+    }
+
     // GGUF_GEN_PIPE=1 → use the first-class GgufTextGenerationPipeline (chat template + KV-cache decode +
     // sampler in one call). Dogfoods the library API end-to-end.
     if (Environment.GetEnvironmentVariable("GGUF_GEN_PIPE") == "1")

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>OllamaServer.Console</AssemblyName>
+    <RootNamespace>OllamaServer.Console</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Minimal-API (Kestrel) host inside a console exe, without the Web SDK's wwwroot defaults. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+  </ItemGroup>
+
+</Project>
