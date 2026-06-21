@@ -2,6 +2,22 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Register-blocked GEMM for native low-precision weights
+
+**`MatMulLowPWeight` now uses the register-blocked tiled kernel for large matrices, not the per-element kernel.**
+A native low-p weight (fp16 / bf16 / FP8) kept the memory win but forfeited GEMM throughput — every
+`MatMulLowPWeight<T>` ran the simple one-result-per-thread kernel. New `RegisterBlockedMatMul.MatMulLowPWeight<T>`
+(`RegBlockedLowPImpl<T>`) is the same 64×64-tile / 4×4-register GEMM as the f32 path, with the weight decoded to
+float ONCE as it stages into the float shared-memory tile (`PrecisionConvert`) — so the decode is amortized over
+the 4× register reuse and the hot register-block math is byte-identical to the f32 kernel (16 results/thread vs 1).
+`MatMulKernel.MatMulLowPWeight` routes `M,N ≥ 64` here (the same gate as the f32 `MatMul`, so M==1 GEMV and
+CPU/WebGL fall back to the per-element kernel). Verified: `F16_MatMulLowPWeight_RegBlocked_LargeMatchesReference`
+(BFloat16 + Half, partial-tile dims, matches the low-p-weight fp32 reference) green on all 6 backends (PMT `F16`
+98/0). NOTE: this covers the **MatMul-operator** low-p path; SD's fused MatMul+bias+activation linears go through
+`FusedLinear` (per-element low-p), so extending the FusedLinear register-blocked path to low-p weights is the
+follow-on for the SD-fused-linear throughput. (SD-Turbo end-to-end timing was not measurable this session — the
+hub/WebTorrent model load was failing on a transient network condition.)
+
 ## Unreleased — Conv2D / ConvTranspose2D accumulate in f32 (not f64)
 
 **Convolution now accumulates in f32, the ML standard, instead of f64.** Every `Conv2DKernel` variant (NCHW,

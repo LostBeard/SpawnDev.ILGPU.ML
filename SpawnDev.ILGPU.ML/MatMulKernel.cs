@@ -390,6 +390,15 @@ public class MatMulKernel
         int M, int K, int N)
         where T : unmanaged, INumber<T>
     {
+        // Large matrices: register-blocked low-p path (16 results/thread, weight decoded once on the shared-mem
+        // load) — the tiled throughput the per-element kernel forfeited. M==1 (the LLM-decode GEMV) and small /
+        // CPU / WebGL (no 256-thread group) fall through to the simple per-element kernel below.
+        if (!_useSimpleKernels && M >= REG_TILE && N >= REG_TILE)
+        {
+            _regBlockedMatMul ??= new RegisterBlockedMatMul(_accelerator);
+            _regBlockedMatMul.MatMulLowPWeight(A, B, C, M, K, N);
+            return;
+        }
         if (!_simpleMatMulLowPWeightKernels.TryGetValue(typeof(T), out var k))
             _simpleMatMulLowPWeightKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,

@@ -142,6 +142,53 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// The REGISTER-BLOCKED low-p weight GEMM: at M,N ≥ 64 (the SD UNet/VAE MatMul regime) MatMulLowPWeight
+    /// routes a native fp16/bf16 weight to the 64×64-tile / 4×4-register kernel (weight decoded once on the
+    /// shared-mem load), instead of the slow per-element kernel. Dims are non-multiples of the 64 tile (partial
+    /// N-tile, 5 K-tiles) to exercise the boundary guards. Matches a fp32 reference computed with the same
+    /// low-p-rounded weights, on all 6 backends (CPU/WebGL take the simple fallback via the same gate as the
+    /// fp32 reg-blocked path; CUDA/OpenCL/WebGPU/Wasm take the tiled kernel).
+    /// </summary>
+    [TestMethod]
+    public Task F16_MatMulLowPWeight_RegBlocked_LargeMatchesReference() => RunTest(async accelerator =>
+    {
+        int M = 128, K = 80, N = 96;
+        var rng = new Random(7);
+        var a = new float[M * K];
+        var w = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < w.Length; i++) w[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        async Task Check<T>(Func<float, T> toLowP, Func<T, float> toF32, string name) where T : unmanaged, System.Numerics.INumber<T>
+        {
+            var wLowP = new T[w.Length];
+            for (int i = 0; i < w.Length; i++) wLowP[i] = toLowP(w[i]);
+            var cpu = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++) s += a[r * K + k] * toF32(wLowP[k * N + c]);
+                    cpu[r * N + c] = s;
+                }
+            using var aBuf = accelerator.Allocate1D(a);
+            using var bBuf = accelerator.Allocate1D(wLowP);
+            using var cBuf = accelerator.Allocate1D<float>(M * N);
+            var mm = new MatMulKernel(accelerator);
+            mm.MatMulLowPWeight(aBuf.View, bBuf.View, cBuf.View, M, K, N); // M,N≥64 → register-blocked low-p
+            await accelerator.SynchronizeAsync();
+            var gpu = await cBuf.CopyToHostAsync<float>(0, M * N);
+            float maxErr = 0f;
+            for (int i = 0; i < cpu.Length; i++) maxErr = MathF.Max(maxErr, MathF.Abs(gpu[i] - cpu[i]));
+            if (maxErr > 1e-2f)
+                throw new Exception($"RegBlocked MatMulLowPWeight<{name}> maxErr={maxErr:E3} vs {name}-weight fp32 reference (expected < 1e-2)");
+        }
+
+        await Check<global::ILGPU.BFloat16>(f => (global::ILGPU.BFloat16)f, b => (float)b, "BFloat16");
+        await Check<global::ILGPU.Half>(f => (global::ILGPU.Half)f, h => (float)h, "Half");
+    });
+
+    /// <summary>
     /// Slice 2+3: BufferPool.AllocateHalfWeightFromStreamAsync loads an fp16 weight from a stream (like an
     /// ONNX fp16 initializer) into a HalfTensor (half the GPU bytes), then MatMulHalfWeight consumes it.
     /// Verifies the LOAD+COMPUTE path matches a fp32 reference using the same fp16-rounded weights.
