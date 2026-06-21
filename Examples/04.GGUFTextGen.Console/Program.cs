@@ -60,20 +60,23 @@ if (Environment.GetEnvironmentVariable("GGUF_GEMM_BENCH") == "1")
             double ms = sw.Elapsed.TotalMilliseconds / iters;
             Console.WriteLine($"  f32 RegBlocked : {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS");
         }
-        int bytesPerRow = K / 256 * 144; int wBytes = ((N * bytesPerRow) + 3) / 4 * 4;
-        var wq = new byte[wBytes]; brng.NextBytes(wq);
-        using (var aBuf = bacc.Allocate1D(A))
-        using (var wBuf = bacc.Allocate1D(wq))
-        using (var cBuf = bacc.Allocate1D<float>(M * N))
+        void DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType type, int rowBytesPerBlock, string label)
         {
+            int bytesPerRow = K / 256 * rowBytesPerBlock; int wBytes = ((N * bytesPerRow) + 3) / 4 * 4;
+            var wq = new byte[wBytes]; brng.NextBytes(wq);
+            using var aBuf = bacc.Allocate1D(A);
+            using var wBuf = bacc.Allocate1D(wq);
+            using var cBuf = bacc.Allocate1D<float>(M * N);
             var fq = new SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul(bacc);
-            fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K); bacc.Synchronize();
+            fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, type); bacc.Synchronize();
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            for (int i = 0; i < iters; i++) fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K);
+            for (int i = 0; i < iters; i++) fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, type);
             bacc.Synchronize(); sw.Stop();
             double ms = sw.Elapsed.TotalMilliseconds / iters;
-            Console.WriteLine($"  Q4_K dequant RB: {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS");
+            Console.WriteLine($"  {label}: {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS");
         }
+        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K, 144, "Q4_K dequant RB");
+        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q6_K, 210, "Q6_K dequant RB");
     }
     Bench(1081, 3584, 18944); // MLP gate/up
     Bench(1081, 18944, 3584); // MLP down

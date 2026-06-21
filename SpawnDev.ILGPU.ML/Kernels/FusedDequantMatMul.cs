@@ -517,6 +517,25 @@ public class FusedDequantMatMul : IDisposable
         return dsc * nibble - dminmn;
     }
 
+    /// <summary>Decode Q6_K element <paramref name="r"/> (0..255) within a super-block at byte <paramref name="sbOff"/>,
+    /// given the per-column product <paramref name="dsc"/> = d·sc already folded (constant across a K-tile, which lies
+    /// within one Q6_K scale group of 16). Only the 6-bit quant is read here. Bit-identical to
+    /// <see cref="DecodeQ6KElement"/>: d·sc·q == (d·sc)·q, same float op order.</summary>
+    private static float DecodeQ6KNibble(ArrayView1D<int, Stride1D.Dense> w, int sbOff, int r, float dsc)
+    {
+        int half = r >> 7;
+        int rh = r & 127;
+        int variant = rh >> 5;
+        int l = rh & 31;
+        int qlByte = ReadByte(w, sbOff + 64 * half + l + (variant & 1) * 32);
+        int qh = ReadByte(w, sbOff + 128 + 32 * half + l);
+        int isHigh = variant >> 1;
+        int qlNib = isHigh == 1 ? (qlByte >> 4) : (qlByte & 0xF);
+        int qhBits = (qh >> (2 * variant)) & 3;
+        int q = (qlNib | (qhBits << 4)) - 32;
+        return dsc * q;
+    }
+
     // Number of output rows (M) a single multi-row-GEMM group handles. Each weight element is dequantized
     // ONCE and reused across these GemmMTile input rows — killing the O(M) redundant dequant of the general
     // per-element kernel (the prefill bottleneck). Small enough that the per-thread accumulators stay in regs.
@@ -790,6 +809,11 @@ public class FusedDequantMatMul : IDisposable
 
         var aTile = SharedMemory.Allocate<float>(RB_TILE * RB_BLOCK);
         var bTile = SharedMemory.Allocate<float>(RB_BLOCK * RB_TILE);
+        // Per-column folded product d·sc for the current K-tile (one float per column). A K-tile (16 deep,
+        // 16-aligned) lies within one Q6_K scale group of 16, so d (block-constant) and sc (group-constant)
+        // — and thus d·sc — are the same for all 16 k. Decode once per tile; per-element B load is then just
+        // the 6-bit quant fetch × dsc (DecodeQ6KNibble) — bit-identical to the per-element DecodeQ6KElement.
+        var bMeta = SharedMemory.Allocate<float>(RB_TILE);
 
         int tileIdx = Grid.IdxX;
         int tileRow = tileIdx / numTilesN;
@@ -809,12 +833,35 @@ public class FusedDequantMatMul : IDisposable
                 int aCol = t * RB_BLOCK + threadCol;
                 aTile[(threadRow * RB_REG + r) * RB_BLOCK + threadCol] = (aRow < M && aCol < K) ? A[aRow * K + aCol] : 0f;
             }
+            if (Group.IdxX < RB_TILE)
+            {
+                int metaCol = Group.IdxX;
+                int n = tileCol * RB_TILE + metaCol;
+                float dsc = 0f;
+                if (n < N)
+                {
+                    int k0 = t * RB_BLOCK;
+                    int sbOff = n * bytesPerRow + (k0 >> 8) * 210;
+                    int r = k0 & 255;
+                    int half = r >> 7;
+                    int rh = r & 127;
+                    int variant = rh >> 5;
+                    int l = rh & 31;
+                    float md = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+                    float msc = SignExtend8(ReadByte(w, sbOff + 192 + 8 * half + (l >> 4) + 2 * variant));
+                    dsc = md * msc; // d·sc folded once per column (was recomputed per element)
+                }
+                bMeta[metaCol] = dsc;
+            }
+            Group.Barrier();
             for (int r = 0; r < RB_REG; r++)
             {
                 int bRow = t * RB_BLOCK + threadRow;
-                int bCol = tileCol * RB_TILE + threadCol * RB_REG + r;
-                bTile[threadRow * RB_TILE + threadCol * RB_REG + r] =
-                    (bRow < K && bCol < N) ? DecodeQ6KElement(w, bCol * bytesPerRow, bRow) : 0f;
+                int metaCol = threadCol * RB_REG + r;
+                int bCol = tileCol * RB_TILE + metaCol;
+                int sbOff = bCol * bytesPerRow + (bRow >> 8) * 210;
+                bTile[threadRow * RB_TILE + metaCol] =
+                    (bRow < K && bCol < N) ? DecodeQ6KNibble(w, sbOff, bRow & 255, bMeta[metaCol]) : 0f;
             }
             Group.Barrier();
             for (int k = 0; k < RB_BLOCK; k++)
