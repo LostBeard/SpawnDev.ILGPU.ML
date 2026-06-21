@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — FusedAttention params buffer ring pre-allocated (no per-call alloc)
+
+**`FusedAttentionKernel` reuses a pre-allocated params-buffer ring instead of `Allocate1D` per call.** Each
+attention dispatch built its tiny (10-11 int) params buffer with a fresh `Allocate1D` (+ dispose-on-overwrite)
+— ~48 attention nodes/token → ~48 tiny GPU allocations per token. The ring slots (still RingSize=64, so a slot
+isn't reused until well past any unflushed batch) are now each allocated ONCE at a fixed size and refilled via
+`CopyFromCPU`; the kernel reads only the used prefix. Same upload, no per-call allocation. Attention results
+unchanged (PMT `Attention` 122/0 all 6 backends).
+
 ## Unreleased — Hoist the per-token executor refcount/constant rebuild out of RunAsync
 
 **`GraphExecutor.RunAsync` no longer re-walks the whole graph every token to rebuild the buffer-recycling

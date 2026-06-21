@@ -52,16 +52,27 @@ public class FusedAttentionKernel : IDisposable
     // reads it when sinkCount > 0). gpt-oss/OpenAI-MoE attention passes real per-head sink logits.
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummySinks;
 
-    // Params-buffer ring: each call gets its own buffer (per-layer window/kvOffset/seqKV
-    // differ within one batched command encoder, so a single mutated buffer would feed
-    // pending dispatches the WRONG params), but the ring bounds memory - a buffer is
-    // reused (disposed-by-overwrite) only after RingSize subsequent calls, far past any
-    // realistic unflushed batch depth. Replaces the old "dispose previous on next call"
-    // pattern, which freed a buffer a still-pending dispatch could be reading.
+    // Params-buffer ring: each call gets its own slot (per-layer window/kvOffset/seqKV differ within one batched
+    // command encoder, so a single mutated buffer would feed pending dispatches the WRONG params), but the ring
+    // bounds memory - a slot is reused only after RingSize subsequent calls, far past any realistic unflushed
+    // batch depth. Each slot is allocated ONCE (at ParamSize) and reused via CopyFromCPU; an earlier version did
+    // a fresh Allocate1D per call (~48 attention nodes/token => ~48 tiny GPU allocs/token).
     private const int RingSize = 64;
+    private const int ParamSize = 16; // >= the largest params array (ForwardStrided = 11 ints); kernel reads only the prefix
     private readonly MemoryBuffer1D<int, Stride1D.Dense>?[] _paramsRing
         = new MemoryBuffer1D<int, Stride1D.Dense>?[RingSize];
     private int _ringNext;
+
+    // Lazily allocate ring slot `_ringNext` and upload paramsData into it, returning the exact-length view.
+    private ArrayView1D<int, Stride1D.Dense> RentParamsSlot(int[] paramsData)
+    {
+        var slot = _ringNext;
+        _ringNext = (_ringNext + 1) % RingSize;
+        var buf = _paramsRing[slot] ??= _accelerator.Allocate1D<int>(ParamSize);
+        var view = buf.View.SubView(0, paramsData.Length);
+        view.CopyFromCPU(paramsData);
+        return view;
+    }
 
     public FusedAttentionKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -133,10 +144,7 @@ public class FusedAttentionKernel : IDisposable
             sinkCount,        // p[9]: >0 => fold per-head sink logit into the softmax denominator
         };
 
-        var slot = _ringNext;
-        _ringNext = (_ringNext + 1) % RingSize;
-        _paramsRing[slot]?.Dispose();
-        _paramsRing[slot] = _accelerator.Allocate1D(paramsData);
+        var paramsView = RentParamsSlot(paramsData);
 
         _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -147,7 +155,7 @@ public class FusedAttentionKernel : IDisposable
         var sinksView = sinks ?? _dummySinks.View;
 
         // One thread per output element: nHeads * seqQ * headDim
-        _kernel(nHeads * seqQ * headDim, Q, K, V, output, sinksView, _paramsRing[slot]!.View);
+        _kernel(nHeads * seqQ * headDim, Q, K, V, output, sinksView, paramsView);
     }
 
     /// <summary>
@@ -185,10 +193,7 @@ public class FusedAttentionKernel : IDisposable
             kvRowStride, // p[10]: per-head element stride of K/V (maxSeq*hd for the strided store; seqKV*hd contiguous)
         };
 
-        var slot = _ringNext;
-        _ringNext = (_ringNext + 1) % RingSize;
-        _paramsRing[slot]?.Dispose();
-        _paramsRing[slot] = _accelerator.Allocate1D(paramsData);
+        var paramsView = RentParamsSlot(paramsData);
 
         if (!_stridedKernels.TryGetValue(typeof(T), out var k))
             _stridedKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
@@ -201,7 +206,7 @@ public class FusedAttentionKernel : IDisposable
         ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
             ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)k)(
-            nHeads * seqQ * headDim, Q, K, V, output, sinksView, _paramsRing[slot]!.View);
+            nHeads * seqQ * headDim, Q, K, V, output, sinksView, paramsView);
     }
 
     /// <summary>
