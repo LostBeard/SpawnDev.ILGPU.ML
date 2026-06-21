@@ -144,6 +144,92 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// REGISTER-BLOCKED FusedLinear with a NATIVE low-precision weight (fp16/bf16) at M,N >= 64 — the SD
+    /// ResNet/FFN regime. ForwardLowP routes the large low-p linear to the 64×64-tile / 4×4-register kernel
+    /// (weight decoded once on the shared-mem load, bias+activation fused in the write-back) instead of the
+    /// per-element kernel. Covers None / ReLU / GELU / SiLU vs a fp32 reference using the same low-p-rounded
+    /// weights, on all 6 backends (CPU/WebGL fall back to per-element via the same gate as the fp32 path).
+    /// </summary>
+    [TestMethod]
+    public async Task FusedLinear_LowP_RegBlocked_LargeMatchesReference() => await RunTest(async accelerator =>
+    {
+        int M = 70, K = 130, N = 100; // >= 64, non-tile-multiple → register-blocked path + partial tiles
+        var input = RandomFloats(M * K, seed: 350, scale: 1.5f);
+        var w = RandomFloats(K * N, seed: 351, scale: 0.2f);
+        var bias = RandomFloats(N, seed: 352, scale: 0.5f);
+        var fused = new FusedLinearKernel(accelerator);
+
+        async Task Check<T>(Func<float, T> toLowP, Func<T, float> toF32, FusedActivation act, string name)
+            where T : unmanaged, System.Numerics.INumber<T>
+        {
+            var wLowP = new T[w.Length];
+            for (int i = 0; i < w.Length; i++) wLowP[i] = toLowP(w[i]);
+            var expected = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float s = 0f;
+                    for (int k = 0; k < K; k++) s += input[r * K + k] * toF32(wLowP[k * N + c]);
+                    float x = s + bias[c];
+                    expected[r * N + c] = act switch
+                    {
+                        FusedActivation.ReLU => x > 0f ? x : 0f,
+                        FusedActivation.GELU => x > 10f ? x : x < -10f ? 0f : 0.5f * x * (1f + ErfApprox(x * 0.7071067811865475f)),
+                        FusedActivation.SiLU => x / (1f + MathF.Exp(-x)),
+                        _ => x,
+                    };
+                }
+            using var inBuf = accelerator.Allocate1D(input);
+            using var wBuf = accelerator.Allocate1D(wLowP);
+            using var bBuf = accelerator.Allocate1D(bias);
+            using var outBuf = accelerator.Allocate1D<float>(M * N);
+            fused.ForwardLowP(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, act); // M,N>=64 → reg-blocked low-p
+            await accelerator.SynchronizeAsync();
+            await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 2e-2f,
+                $"FusedLinear+{act} low-p<{name}> (reg-blocked): ");
+        }
+
+        foreach (var act in new[] { FusedActivation.None, FusedActivation.ReLU, FusedActivation.GELU, FusedActivation.SiLU })
+        {
+            await Check<global::ILGPU.BFloat16>(f => (global::ILGPU.BFloat16)f, b => (float)b, act, "BFloat16");
+            await Check<global::ILGPU.Half>(f => (global::ILGPU.Half)f, h => (float)h, act, "Half");
+        }
+    });
+
+    /// <summary>
+    /// Fused linear with SiLU at register-blocked sizes (M,N >= 64) — the SD ResNet/FFN path now has a
+    /// register-blocked f32 variant (SiLU added to the RB gate + FusedActivate). Matches the per-element /
+    /// x·sigmoid(x) reference.
+    /// </summary>
+    [TestMethod]
+    public async Task FusedLinear_Silu_RegBlocked_LargeMatchesReference() => await RunTest(async accelerator =>
+    {
+        int M = 70, K = 130, N = 100; // >= 64, non-tile-multiple → register-blocked SiLU path
+        var input = RandomFloats(M * K, seed: 360, scale: 1.5f);
+        var weights = RandomFloats(K * N, seed: 361, scale: 0.2f);
+        var bias = RandomFloats(N, seed: 362, scale: 0.5f);
+
+        var expected = new float[M * N];
+        for (int r = 0; r < M; r++)
+        for (int c = 0; c < N; c++)
+        {
+            float sum = 0;
+            for (int k = 0; k < K; k++) sum += input[r * K + k] * weights[k * N + c];
+            float x = sum + bias[c];
+            expected[r * N + c] = x / (1f + MathF.Exp(-x)); // SiLU
+        }
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weights);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(M * N);
+        var fused = new FusedLinearKernel(accelerator);
+        fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.SiLU);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expected, 1e-2f, "FusedLinear+SiLU (reg-blocked): ");
+    });
+
+    /// <summary>
     /// Fused linear with erf-GELU at register-blocked sizes (M,N >= 64) — the GPT-2 decoder FFN path.
     /// Guards that the register-blocked erf-GELU is bit-faithful to the per-element / ORT-matched form.
     /// </summary>

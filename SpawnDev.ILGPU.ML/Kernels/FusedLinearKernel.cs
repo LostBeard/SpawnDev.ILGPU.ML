@@ -69,14 +69,21 @@ public class FusedLinearKernel
         FusedActivation activation = FusedActivation.None)
     {
         // ── Fast path: register-blocked shared-memory GEMM with fused bias + activation ──
-        // Only None and GELU have a register-blocked variant (the decoder-FFN lever). Routes exactly like
-        // RegisterBlockedMatMul: large enough to fill a 64×64 tile AND the backend can launch a 256-thread
-        // group (rules out WebGL / the CPU 64-thread cap → they fall through to the per-element path).
-        if ((activation == FusedActivation.None || activation == FusedActivation.GELU)
+        // None / ReLU / GELU / SiLU have a register-blocked variant (the decoder-FFN + SD-ResNet/FFN lever).
+        // Routes exactly like RegisterBlockedMatMul: large enough to fill a 64×64 tile AND the backend can launch
+        // a 256-thread group (rules out WebGL / the CPU 64-thread cap → they fall through to the per-element path).
+        if ((activation == FusedActivation.None || activation == FusedActivation.ReLU
+                || activation == FusedActivation.GELU || activation == FusedActivation.SiLU)
             && M >= RbTile && N >= RbTile
             && _accelerator.MaxNumThreadsPerGroup >= RbBlock * RbBlock)
         {
-            int activationCode = activation == FusedActivation.GELU ? 2 : 0; // 2 = erf-GELU (matches per-element path)
+            int activationCode = activation switch // matches the per-element path + FusedActivate
+            {
+                FusedActivation.ReLU => 1,
+                FusedActivation.GELU => 2,
+                FusedActivation.SiLU => 5,
+                _ => 0,
+            };
             _fusedRegBlockedKernel ??= _accelerator.LoadStreamKernel<
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -228,6 +235,8 @@ public class FusedLinearKernel
     // Mirrors MatMulKernel.MatMulLowPWeight<T>. Weight layout is [K,N] (FuseLinearLayers excludes transB),
     // identical to the float per-element kernels. One thread per output element; fp32 accumulate.
     private readonly Dictionary<Type, object> _fusedLinearLowPKernels = new();
+    // Register-blocked counterpart (large M,N on a 256-thread backend) — one compiled kernel per concrete T.
+    private readonly Dictionary<Type, object> _fusedRegBlockedLowPKernels = new();
 
     /// <summary>Fused linear with a NATIVE low-precision weight (ILGPU.Half / BFloat16 / Float8E4M3 / Float8E5M2):
     /// Output = Activation(Input·W + Bias), W read native and converted to float in-register (no f32 weight temp).
@@ -241,11 +250,6 @@ public class FusedLinearKernel
         int M, int K, int N, FusedActivation activation)
         where T : unmanaged, INumber<T>
     {
-        if (!_fusedLinearLowPKernels.TryGetValue(typeof(T), out var k))
-            _fusedLinearLowPKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                int, int, int, int>(FusedLinearLowPImpl<T>);
         int actCode = activation switch
         {
             FusedActivation.ReLU => 1,
@@ -253,6 +257,33 @@ public class FusedLinearKernel
             FusedActivation.SiLU => 5,
             _ => 0, // None (and Sigmoid/Tanh, which the float per-element switch also routes to None)
         };
+
+        // Large matrices on a 256-thread backend: register-blocked low-p path — the same 64×64-tile / 4×4-register
+        // GEMM as the fp32 reg-blocked FusedLinear, with the weight decoded to float ONCE on the shared-mem load
+        // (PrecisionConvert) and bias+activation fused into the write-back (16 results/thread vs 1). This is the
+        // tiled throughput SD's fused fp16 linears forfeited on the per-element kernel. Small / CPU / WebGL fall
+        // through to the per-element kernel (same gate as the fp32 reg-blocked path).
+        if (M >= RbTile && N >= RbTile && _accelerator.MaxNumThreadsPerGroup >= RbBlock * RbBlock)
+        {
+            if (!_fusedRegBlockedLowPKernels.TryGetValue(typeof(T), out var rk))
+                _fusedRegBlockedLowPKernels[typeof(T)] = rk = _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int, int, int, int, int>(FusedRegBlockedLowPActivation<T>);
+            int numTilesM = (M + RbTile - 1) / RbTile;
+            int numTilesN = (N + RbTile - 1) / RbTile;
+            var rbConfig = new KernelConfig(new Index1D(numTilesM * numTilesN), new Index1D(RbBlock * RbBlock));
+            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                int, int, int, int, int>)rk)(rbConfig, input, weights, bias, output, M, K, N, numTilesN, actCode);
+            return;
+        }
+
+        if (!_fusedLinearLowPKernels.TryGetValue(typeof(T), out var k))
+            _fusedLinearLowPKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                int, int, int, int>(FusedLinearLowPImpl<T>);
         ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int>)k)(M * N, input, weights, bias, output, M, K, N, actCode);
@@ -306,11 +337,13 @@ public class FusedLinearKernel
     // bit-equivalent to the per-element path against a CPU reference on WebGPU/Wasm/CUDA/OpenCL
     // (SpawnDev.ILGPU FusedFFN_RegBlocked* tests); CPU + WebGL are routed away from it in Forward.
 
-    // Fused bias-add + activation, shared by all 16 register write-backs.
-    // activation: 0 = linear (bias only), 2 = GELU erf-approx (A&S 5-term, GPT-2 / ORT default).
+    // Fused bias-add + activation, shared by all 16 register write-backs. Codes match the per-element kernels
+    // (FusedLinearLowPImpl): 0 = linear (bias only), 1 = ReLU, 2 = GELU (A&S 5-term erf), 5 = SiLU (x·sigmoid).
     private static float FusedActivate(float acc, float bias, int activation)
     {
         float v = acc + bias;
+        if (activation == 1) return v > 0f ? v : 0f;            // ReLU
+        if (activation == 5) return v / (1f + XMath.Exp(-v));   // SiLU = x·sigmoid(x)
         if (activation == 2)
         {
             // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))) — matches ElementWiseKernels.GELUImpl + the
@@ -400,6 +433,104 @@ public class FusedLinearKernel
         int baseCol = tileCol * TILE + threadCol * REG;
 
         // Fused bias-Add + activation in the write-back (bias indexed by output column).
+        if (baseRow + 0 < M)
+        {
+            if (baseCol + 0 < N) Y[(baseRow + 0) * N + baseCol + 0] = FusedActivate(c00, Bias[baseCol + 0], activation);
+            if (baseCol + 1 < N) Y[(baseRow + 0) * N + baseCol + 1] = FusedActivate(c01, Bias[baseCol + 1], activation);
+            if (baseCol + 2 < N) Y[(baseRow + 0) * N + baseCol + 2] = FusedActivate(c02, Bias[baseCol + 2], activation);
+            if (baseCol + 3 < N) Y[(baseRow + 0) * N + baseCol + 3] = FusedActivate(c03, Bias[baseCol + 3], activation);
+        }
+        if (baseRow + 1 < M)
+        {
+            if (baseCol + 0 < N) Y[(baseRow + 1) * N + baseCol + 0] = FusedActivate(c10, Bias[baseCol + 0], activation);
+            if (baseCol + 1 < N) Y[(baseRow + 1) * N + baseCol + 1] = FusedActivate(c11, Bias[baseCol + 1], activation);
+            if (baseCol + 2 < N) Y[(baseRow + 1) * N + baseCol + 2] = FusedActivate(c12, Bias[baseCol + 2], activation);
+            if (baseCol + 3 < N) Y[(baseRow + 1) * N + baseCol + 3] = FusedActivate(c13, Bias[baseCol + 3], activation);
+        }
+        if (baseRow + 2 < M)
+        {
+            if (baseCol + 0 < N) Y[(baseRow + 2) * N + baseCol + 0] = FusedActivate(c20, Bias[baseCol + 0], activation);
+            if (baseCol + 1 < N) Y[(baseRow + 2) * N + baseCol + 1] = FusedActivate(c21, Bias[baseCol + 1], activation);
+            if (baseCol + 2 < N) Y[(baseRow + 2) * N + baseCol + 2] = FusedActivate(c22, Bias[baseCol + 2], activation);
+            if (baseCol + 3 < N) Y[(baseRow + 2) * N + baseCol + 3] = FusedActivate(c23, Bias[baseCol + 3], activation);
+        }
+        if (baseRow + 3 < M)
+        {
+            if (baseCol + 0 < N) Y[(baseRow + 3) * N + baseCol + 0] = FusedActivate(c30, Bias[baseCol + 0], activation);
+            if (baseCol + 1 < N) Y[(baseRow + 3) * N + baseCol + 1] = FusedActivate(c31, Bias[baseCol + 1], activation);
+            if (baseCol + 2 < N) Y[(baseRow + 3) * N + baseCol + 2] = FusedActivate(c32, Bias[baseCol + 2], activation);
+            if (baseCol + 3 < N) Y[(baseRow + 3) * N + baseCol + 3] = FusedActivate(c33, Bias[baseCol + 3], activation);
+        }
+    }
+
+    // Register-blocked fused linear with a NATIVE low-p weight W. Identical to FusedRegBlockedLinearActivation
+    // except W is read as T and decoded to float ONCE as it enters the (float) shared tile — the one line that
+    // differs — so the decode is amortized over the 4× register reuse and the hot math is byte-identical.
+    private static void FusedRegBlockedLowPActivation<T>(
+        ArrayView1D<float, Stride1D.Dense> X,
+        ArrayView1D<T, Stride1D.Dense> W,
+        ArrayView1D<float, Stride1D.Dense> Bias,
+        ArrayView1D<float, Stride1D.Dense> Y,
+        int M, int K, int N, int numTilesN, int activation)
+        where T : unmanaged, INumber<T>
+    {
+        const int BLOCK = 16;
+        const int REG = 4;
+        const int TILE = BLOCK * REG; // 64
+        var aTile = SharedMemory.Allocate<float>(TILE * BLOCK);
+        var bTile = SharedMemory.Allocate<float>(BLOCK * TILE);
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;
+        int tileCol = tileIdx % numTilesN;
+        int localIdx = Group.IdxX;
+        int threadRow = localIdx / BLOCK;
+        int threadCol = localIdx % BLOCK;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
+        float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
+        float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + BLOCK - 1) / BLOCK;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            for (int r = 0; r < REG; r++)
+            {
+                int aRow = tileRow * TILE + threadRow * REG + r;
+                int aCol = t * BLOCK + threadCol;
+                int sIdx = (threadRow * REG + r) * BLOCK + threadCol;
+                aTile[sIdx] = (aRow < M && aCol < K) ? X[aRow * K + aCol] : 0f;
+            }
+            for (int r = 0; r < REG; r++)
+            {
+                int bRow = t * BLOCK + threadRow;
+                int bCol = tileCol * TILE + threadCol * REG + r;
+                int sIdx = threadRow * TILE + threadCol * REG + r;
+                bTile[sIdx] = (bRow < K && bCol < N) ? PrecisionConvert.ConvertToSingle(W[bRow * N + bCol]) : 0f;
+            }
+            Group.Barrier();
+
+            for (int k = 0; k < BLOCK; k++)
+            {
+                float a0 = aTile[(threadRow * REG + 0) * BLOCK + k];
+                float a1 = aTile[(threadRow * REG + 1) * BLOCK + k];
+                float a2 = aTile[(threadRow * REG + 2) * BLOCK + k];
+                float a3 = aTile[(threadRow * REG + 3) * BLOCK + k];
+                float b0 = bTile[k * TILE + threadCol * REG + 0];
+                float b1 = bTile[k * TILE + threadCol * REG + 1];
+                float b2 = bTile[k * TILE + threadCol * REG + 2];
+                float b3 = bTile[k * TILE + threadCol * REG + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+            Group.Barrier();
+        }
+
+        int baseRow = tileRow * TILE + threadRow * REG;
+        int baseCol = tileCol * TILE + threadCol * REG;
         if (baseRow + 0 < M)
         {
             if (baseCol + 0 < N) Y[(baseRow + 0) * N + baseCol + 0] = FusedActivate(c00, Bias[baseCol + 0], activation);

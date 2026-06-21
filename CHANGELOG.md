@@ -2,6 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — FusedLinear register-blocked path for native low-precision weights (+ SiLU/ReLU)
+
+**The fused MatMul+bias+activation path now register-blocks native low-p weights and supports SiLU/ReLU.**
+`FusedLinear` (the GraphOptimizer fuses MatMul+Add+activation into it — the SD ResNet/FFN + LLM decoder-FFN
+lever) had a register-blocked variant only for **f32** weights and only **None/GELU**; a fused fp16/bf16 linear
+(SD's UNet/VAE) fell to the per-element `ForwardLowP`, forfeiting tiled throughput (this is the SD-specific
+follow-on flagged when the MatMul-operator low-p reg-block shipped). New `FusedRegBlockedLowPActivation<T>` is the
+f32 register-blocked FusedLinear with the weight decoded to float ONCE on the shared-mem load (`PrecisionConvert`,
+amortized over the 4× register reuse) and bias+activation fused in the write-back; `ForwardLowP` routes `M,N ≥ 64`
+there (same gate as the f32 path → M small / CPU / WebGL fall back to per-element). `FusedActivate` extended to
+ReLU + SiLU, and the **f32** register-blocked gate extended to ReLU/SiLU too — so f32 SiLU FusedLinears (SD's
+ResNet/FFN) also get the tiled kernel, not just None/GELU. Verified: `FusedLinear_LowP_RegBlocked_LargeMatchesReference`
+(BFloat16 + Half × None/ReLU/GELU/SiLU, partial-tile dims) + `FusedLinear_Silu_RegBlocked_LargeMatchesReference`
+(f32) + the existing FusedLinear regression green on all 6 backends (PMT `FusedLinear` 56/0). SD-Turbo (seed 42)
+end-to-end went ~12.1 s → ~10.9 s on CUDA (the fused fp16 linears now tile; the rest is conv/attention-bound),
+image still a real PASS (lumStd 114.6).
+
 ## Unreleased — SpawnDev.ILGPU 4.14.2 + MXFP4 scale single-source-of-truth decode
 
 **Migrated to SpawnDev.ILGPU 4.14.2-local.1** (Fork / Algorithms.Fork `2.0.41`) — the WebGL fix for the
