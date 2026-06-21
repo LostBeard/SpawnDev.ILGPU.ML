@@ -60,6 +60,12 @@ public sealed class GgufTextGenerationPipeline : IDisposable
         }
         _cache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen);
         _session.EnableGGUFDecode(_cache);
+        // Fixed-shape decode loop: recycle the per-step output buffers (no OOM on long generations) and warm-cache
+        // the proven-stable shape-derived readbacks (skips their GPU round-trips — the browser-readback win). The
+        // cache auto-detects stability (probe→stable→finalize) and falls back to live readback for anything not
+        // proven stable, and this loop consumes each step's logits (argmax) before the next step, satisfying the
+        // output-recycling contract.
+        _session.CacheShapeReadbacks = true;
 
         _turnCloseId = ChatTemplates.Gemma4TurnCloseId(_tokenizer);
         _eosId = _tokenizer.EosId;

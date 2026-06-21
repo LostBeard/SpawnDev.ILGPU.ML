@@ -2,6 +2,18 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — GGUF decode pipelines enable CacheShapeReadbacks
+
+**`GgufTextGenerationPipeline` and `Gemma4MultimodalPipeline` now set `CacheShapeReadbacks = true`.** The flag
+(designed for exactly this fixed-shape decode loop) was never enabled on the gemma4 decode path, leaving two
+decode-loop wins off: (1) per-step output-buffer recycling (the prior step's logits buffer is returned to the
+pool before the next rent, so the same-shape output reuses it — without this, long generations accumulate ~13
+fresh buffers/step and OOM), and (2) the warm shape-readback cache (skips the GPU→host round-trips for
+shape-derived values once they're proven stable — the browser-readback latency win). The cache self-validates
+(probe→stable→finalize, falling back to live readback for anything not proven stable), and both loops consume
+each step's logits (greedy argmax) before the next step, satisfying the output-recycling contract. Verified
+decode-equivalent: gemma4-12b greedy generation is byte-identical with the flag on vs off (same tokens, CUDA).
+
 ## Unreleased — FusedLinear register-blocked path for native low-precision weights (+ SiLU/ReLU)
 
 **The fused MatMul+bias+activation path now register-blocks native low-p weights and supports SiLU/ReLU.**

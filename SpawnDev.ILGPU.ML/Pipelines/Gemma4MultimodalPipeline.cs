@@ -139,6 +139,10 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         // SpawnDev.ILGPU 4.13.0-local.4; bf16 store/load is now correct on CUDA/OpenCL/WebGPU/WebGL/Wasm.
         _cache = new GGUFDecodeKVCache(accelerator, kvHeads, hd, maxSeqLen);
         _session.EnableGGUFDecode(_cache);
+        // Fixed-shape decode loop: recycle per-step output buffers + warm-cache the proven-stable shape readbacks
+        // (the cache self-validates via probe→stable→finalize; this loop argmaxes each step's logits before the
+        // next step, satisfying the output-recycling contract). See GgufTextGenerationPipeline.
+        _session.CacheShapeReadbacks = true;
     }
 
     /// <summary>
