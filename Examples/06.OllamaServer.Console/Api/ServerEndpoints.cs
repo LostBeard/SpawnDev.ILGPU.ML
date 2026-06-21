@@ -162,7 +162,51 @@ public static class ServerEndpoints
             bool stream = GetBool(req, "stream") ?? false;
             var cfg = ReadAnthropicConfig(req);
             var stops = GetStringArray(req, "stop_sequences");
+            var tools = GetTools(req);
             string id = "msg_" + Guid.NewGuid().ToString("N")[..24];
+
+            // Tools → generate fully, then format as tool_use content blocks (the call's arguments stream as a
+            // single input_json_delta fragment — valid Anthropic; Claude CLI accumulates it). For Claude CLI.
+            if (tools != null)
+            {
+                var (genText, gres) = await GenerateOnce(registry, model, messages, cfg, stops, ctx.RequestAborted, tools);
+                var calls = ChatTemplates.ParseToolCalls(genText);
+                bool hasTool = calls.Count > 0;
+                string preamble = StripToolCalls(genText).Trim();
+                string stopReason = hasTool ? "tool_use" : AnthropicStop(gres);
+                var usage = new { input_tokens = gres?.PromptTokens ?? 0, output_tokens = gres?.GeneratedTokens ?? 0 };
+
+                if (!stream)
+                {
+                    var content = new List<object>();
+                    if (!hasTool) content.Add(new { type = "text", text = genText });
+                    else if (preamble.Length > 0) content.Add(new { type = "text", text = preamble });
+                    foreach (var tc in calls)
+                        content.Add(new { type = "tool_use", id = "toolu_" + Guid.NewGuid().ToString("N")[..20], name = tc.Name, input = ParseJsonOrEmpty(tc.ArgumentsJson) });
+                    return Results.Json(new { id, type = "message", role = "assistant", model, content, stop_reason = stopReason, stop_sequence = (string?)null, usage }, J);
+                }
+
+                await StartSse(ctx);
+                await WriteSseEvent(ctx, "message_start", new { type = "message_start", message = new { id, type = "message", role = "assistant", model, content = Array.Empty<object>(), stop_reason = (string?)null, stop_sequence = (string?)null, usage = new { input_tokens = usage.input_tokens, output_tokens = 1 } } });
+                int bi = 0;
+                if (!hasTool || preamble.Length > 0)
+                {
+                    await WriteSseEvent(ctx, "content_block_start", new { type = "content_block_start", index = bi, content_block = new { type = "text", text = "" } });
+                    await WriteSseEvent(ctx, "content_block_delta", new { type = "content_block_delta", index = bi, delta = new { type = "text_delta", text = hasTool ? preamble : genText } });
+                    await WriteSseEvent(ctx, "content_block_stop", new { type = "content_block_stop", index = bi });
+                    bi++;
+                }
+                foreach (var tc in calls)
+                {
+                    await WriteSseEvent(ctx, "content_block_start", new { type = "content_block_start", index = bi, content_block = new { type = "tool_use", id = "toolu_" + Guid.NewGuid().ToString("N")[..20], name = tc.Name, input = new { } } });
+                    await WriteSseEvent(ctx, "content_block_delta", new { type = "content_block_delta", index = bi, delta = new { type = "input_json_delta", partial_json = tc.ArgumentsJson } });
+                    await WriteSseEvent(ctx, "content_block_stop", new { type = "content_block_stop", index = bi });
+                    bi++;
+                }
+                await WriteSseEvent(ctx, "message_delta", new { type = "message_delta", delta = new { stop_reason = stopReason, stop_sequence = (string?)null }, usage = new { output_tokens = usage.output_tokens } });
+                await WriteSseEvent(ctx, "message_stop", new { type = "message_stop" });
+                return Results.Empty;
+            }
 
             if (!stream)
             {
@@ -209,6 +253,32 @@ public static class ServerEndpoints
         var list = new List<string>();
         foreach (var tool in t.EnumerateArray()) list.Add(tool.GetRawText());
         return list;
+    }
+
+    // Remove the <tool_call>…</tool_call> blocks from generated text, leaving any natural-language preamble.
+    private static string StripToolCalls(string text)
+    {
+        const string open = "<tool_call>", close = "</tool_call>";
+        var sb = new StringBuilder();
+        int i = 0;
+        while (true)
+        {
+            int s = text.IndexOf(open, i, StringComparison.Ordinal);
+            if (s < 0) { sb.Append(text, i, text.Length - i); break; }
+            sb.Append(text, i, s - i);
+            int e = text.IndexOf(close, s, StringComparison.Ordinal);
+            if (e < 0) break;
+            i = e + close.Length;
+        }
+        return sb.ToString();
+    }
+
+    // Parse a tool-arguments JSON string into a JsonElement (the Anthropic tool_use `input` is an object, not a
+    // string). Detached via Clone so it survives the JsonDocument dispose. Falls back to {} on malformed input.
+    private static JsonElement ParseJsonOrEmpty(string json)
+    {
+        try { using var d = JsonDocument.Parse(json); return d.RootElement.Clone(); }
+        catch { using var d = JsonDocument.Parse("{}"); return d.RootElement.Clone(); }
     }
 
     private static async Task<SpawnDev.ILGPU.ML.Pipelines.GenerationResult?> GenerateStreaming(
