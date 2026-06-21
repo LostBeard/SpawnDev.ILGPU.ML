@@ -31,9 +31,9 @@ return. The two-pass math is byte-identical (no precision change). Verified: PMT
 decode-equivalence + gemma4-12b byte-identical tokens, all 6 backends.
 
 NOTE: the deeper single-pass (fuse stats + apply into one dispatch, dropping the second dispatch + the invRms
-round-trip) needs a group/shared-mem kernel via `LoadStreamKernel`, currently blocked on the SpawnDev.ILGPU WGSL
-`_uf_group_iter` redeclaration bug for a second `Grid.IdxX` `LoadStreamKernel` (would break WebGPU). Tracked for
-the library fix; deferred here per the no-workarounds rule.
+round-trip) is now DONE — see the single-pass fused RMSNorm entry above. The `_uf_group_iter` WGSL redeclaration
+bug that previously blocked a second `Grid.IdxX` `LoadStreamKernel` on WebGPU is fixed/stale (MatMul's tiled
+kernel + the RMSNorm group kernel coexist on WebGPU, Norm 194/0).
 
 ## Unreleased — FusedAttention params buffer ring pre-allocated (no per-call alloc)
 
