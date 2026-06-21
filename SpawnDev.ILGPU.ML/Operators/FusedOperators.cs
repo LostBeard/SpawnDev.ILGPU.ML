@@ -89,6 +89,12 @@ public class FusedLinearOperator : IOnnxOperator
             return;
         }
 
+        if (weights.Data.Length < (long)K * N)
+            throw new InvalidOperationException(
+                $"FusedLinear weight '{weights.Name}' float path but its float Data is empty (len={weights.Data.Length}, " +
+                $"need K*N={(long)K * N}, DType={weights.DType}, shape=[{string.Join(",", weights.Shape)}]). A quantized/shape-only " +
+                $"weight reached the FP32 linear path — it must route through the dequant matmul (or low-p dispatch).");
+
         _kernel.Forward(
             input.Data.SubView(0, M * K),
             weights.Data.SubView(0, K * N),

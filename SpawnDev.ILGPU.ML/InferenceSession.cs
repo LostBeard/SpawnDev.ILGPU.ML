@@ -1628,7 +1628,8 @@ public class InferenceSession : IDisposable
                 {
                     MemoryBuffer1D<byte, Stride1D.Dense> qBuf;
                     if (qw.StreamOffset >= 0)
-                        qBuf = await pool.AllocateQuantizedBytesFromStreamAsync(stream, qw.StreamOffset, qw.StreamByteSize, ct).ConfigureAwait(false);
+                        try { qBuf = await pool.AllocateQuantizedBytesFromStreamAsync(stream, qw.StreamOffset, qw.StreamByteSize, ct).ConfigureAwait(false); }
+                        catch (InvalidDataException ex) { throw new InvalidDataException($"quantized tensor '{name}' (type={qw.Type}, shape=[{string.Join(",", shape)}]): {ex.Message}", ex); }
                     else
                     {
                         int padded = (qw.Bytes.Length + 3) & ~3;
@@ -1648,7 +1649,9 @@ public class InferenceSession : IDisposable
                 // Native BF16/F16 linear weight: stream packed bytes straight to a GPU byte buffer, transpose
                 // in the element dtype to the declared [K, N], wrap as a FromLowP tensor (NO f32 upcast = half
                 // the VRAM + bandwidth). DRAIN before freeing the streamed byte temp (browser sync only flushes).
-                var srcBuf = await pool.AllocateQuantizedBytesFromStreamAsync(stream, lp.StreamOffset, lp.StreamByteSize, ct).ConfigureAwait(false);
+                MemoryBuffer1D<byte, Stride1D.Dense> srcBuf;
+                try { srcBuf = await pool.AllocateQuantizedBytesFromStreamAsync(stream, lp.StreamOffset, lp.StreamByteSize, ct).ConfigureAwait(false); }
+                catch (InvalidDataException ex) { throw new InvalidDataException($"low-precision tensor '{name}' (shape=[{string.Join(",", shape)}]): {ex.Message}", ex); }
                 gpuWeights[name] = WrapLowPWeight(accelerator, registry.Transpose, srcBuf, lp, shape, name, lowPBuffers);
                 await accelerator.SynchronizeAsync().ConfigureAwait(false);
                 srcBuf.Dispose();

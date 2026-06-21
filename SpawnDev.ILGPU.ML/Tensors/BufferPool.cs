@@ -444,6 +444,15 @@ public class BufferPool : IDisposable
     public async Task<MemoryBuffer1D<byte, Stride1D.Dense>> AllocateQuantizedBytesFromStreamAsync(
         Stream stream, long byteOffset, int byteLength, CancellationToken ct = default)
     {
+        // Guard the range BEFORE allocating/copying: a bad byteOffset/byteLength (e.g. an upstream quant
+        // byte-size miscalc producing a negative or over-large length) otherwise hits an uncatchable ILGPU
+        // "Index/Extent out of bounds" FailFast inside CopyFromStreamRawAsync. Surface it as a clear,
+        // catchable error naming the actual values instead.
+        long streamLen = stream.CanSeek ? stream.Length : -1;
+        if (byteLength < 0 || byteOffset < 0 || (streamLen >= 0 && byteOffset + (long)byteLength > streamLen))
+            throw new InvalidDataException(
+                $"Quantized tensor byte range out of bounds: byteOffset={byteOffset}, byteLength={byteLength}, streamLength={streamLen}.");
+
         int padded = (byteLength + 3) & ~3;
         var buffer = _accelerator.Allocate1D<byte>(padded);
         if (byteLength == 0) return buffer;
