@@ -173,6 +173,40 @@ later = one session per model; true intra-model concurrency would need per-reque
 
 ---
 
+## v2 — Tool / function-calling (DESIGNED, ready to build)
+
+The feature that makes agentic frontends (Codex, OpenCode, Claude CLI) act, not just chat. Model-specific
+inject + parse; start with ChatML (qwen), then Llama3, then gemma4.
+
+**ChatML (qwen) — real format, extracted from `tokenizer.chat_template`:**
+- INJECT (when request has `tools`): the system turn gets, after the system text:
+  ```
+  \n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with
+  function signatures within <tools></tools> XML tags:\n<tools>\n{tool0 json}\n{tool1 json}\n</tools>\n\nFor
+  each function call, return a json object with function name and arguments within <tool_call></tool_call> XML
+  tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>
+  ```
+  (each `{tool json}` is the OpenAI/Anthropic tool definition serialized as-is.)
+- PARSE (model output): scan generated text for `<tool_call>\n{json}\n</tool_call>` blocks → `{name, arguments}`.
+- Llama3: emits `{"name":..,"parameters":..}` (note "parameters") + `<|python_tag|>` for builtin tools; stop on
+  `<|eom_id|>` when in tool mode. gemma4: its own format (extract its template's tools branch).
+
+**Protocol mapping:**
+- OpenAI: request `tools[]` (`{type:"function",function:{name,description,parameters}}`); response
+  `choices[].message.tool_calls=[{id,type:"function",function:{name,arguments:<STRING of json>}}]`,
+  `finish_reason="tool_calls"`. Incoming follow-up: `role:"tool"` messages with `tool_call_id` + content.
+- Anthropic: request `tools[]` (`{name,description,input_schema}`); response `content` `tool_use` block
+  `{type:"tool_use",id,name,input:<object>}`, `stop_reason="tool_use"`; STREAMING = `content_block_start`
+  type tool_use + `input_json_delta` partial_json fragments. Incoming: `tool_result` content blocks.
+- Ollama: request `tools[]`; response `message.tool_calls=[{function:{name,arguments:<object>}}]`.
+
+**Build order:** (1) extend `ChatTemplates.BuildChatPrompt` to take tools + tool/tool_result messages and inject
+per format; (2) a `ToolCallParser` that extracts calls from the generated text per format; (3) wire each
+endpoint's request `tools` → prompt and generated text → protocol tool-call response (non-stream first, then the
+Anthropic input_json_delta streaming); (4) verify E2E: give qwen2.5-coder a tool def, confirm it emits a parseable
+call, and that a tool_result round-trips. STILL also pending from v1: loader hardening (never FailFast → reject
+unsupported models cleanly), vision via the cached mmproj, full Jinja2-from-GGUF renderer, proper BPE-merge encode.
+
 ## Phase plan
 - **v1:** cache reader → registry/queue → template engine + incremental detok + stop sequences →
   OpenAI + Ollama chat/generate/tags/show endpoints → verify with a real coding CLI against the cache.
