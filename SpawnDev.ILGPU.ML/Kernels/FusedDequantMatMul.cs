@@ -192,7 +192,11 @@ public class FusedDequantMatMul : IDisposable
         if (M > 1 && EnableMultiRowGemm && !gpuBrowser && (type == GGMLType.Q4_K || type == GGMLType.Q6_K))
         {
             // M>=RB_TILE (large prefill): FLOP-efficient register-blocked tiled dequant GEMM. Smaller M: multi-row.
-            if (M >= RB_TILE)
+            // The register-blocked kernel launches RB_BLOCK*RB_BLOCK (256) threads per group; the ILGPU CPU
+            // accelerator caps a group dimension at 64 (same reason GemvGroupSize=64), so on any backend whose
+            // max group-X is below 256 (CPU) we fall through to the multi-row kernel (group 64) — which handles
+            // any M correctly, just less FLOP-efficiently. CUDA/OpenCL/Wasm allow >=256 and take the fast path.
+            if (M >= RB_TILE && _accelerator.MaxGroupSize.X >= RB_BLOCK * RB_BLOCK)
             {
                 var rbConfig = new KernelConfig(
                     ((M + RB_TILE - 1) / RB_TILE) * ((N + RB_TILE - 1) / RB_TILE), RB_BLOCK * RB_BLOCK);
@@ -498,6 +502,21 @@ public class FusedDequantMatMul : IDisposable
         return d * sc * nibble - dmin * mn;
     }
 
+    /// <summary>Decode Q4_K element <paramref name="r"/> (0..255) within a super-block at byte <paramref name="sbOff"/>,
+    /// given the per-column products already folded: <paramref name="dsc"/> = d·sc and <paramref name="dminmn"/> =
+    /// dmin·mn (both constant across a K-tile, which lies within one Q4_K sub-block). Only the per-element nibble is
+    /// read here, so the per-element dequant is a nibble fetch + one multiply + one subtract. Bit-identical to
+    /// <see cref="DecodeQ4KElement"/>: d·sc·nibble − dmin·mn == (d·sc)·nibble − (dmin·mn), same float op order.</summary>
+    private static float DecodeQ4KNibble(ArrayView1D<int, Stride1D.Dense> w, int sbOff, int r, float dsc, float dminmn)
+    {
+        int t = r >> 6;
+        int l = (r & 63) & 31;
+        int hi = (r >> 5) & 1;
+        int packed = ReadByte(w, sbOff + 16 + 32 * t + l);
+        int nibble = (packed >> (4 * hi)) & 0xF;
+        return dsc * nibble - dminmn;
+    }
+
     // Number of output rows (M) a single multi-row-GEMM group handles. Each weight element is dequantized
     // ONCE and reused across these GemmMTile input rows — killing the O(M) redundant dequant of the general
     // per-element kernel (the prefill bottleneck). Small enough that the per-thread accumulators stay in regs.
@@ -531,8 +550,10 @@ public class FusedDequantMatMul : IDisposable
         int tid = Group.IdxX;
 
         var sh = SharedMemory.Allocate<float>(GemvGroupSize);
-        var partial = new float[GemmMTile];
-        for (int mi = 0; mi < GemmMTile; mi++) partial[mi] = 0f;
+        // GemmMTile (8) row accumulators as SCALARS, not a device-local float[] — a local array miscompiles on
+        // the Wasm backend (wrong results; scalar register-blocked kernel is fine), so the M-tile is unrolled.
+        // GemmMTile is a compile-time constant 8; keep these in sync if it changes.
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f, p4 = 0f, p5 = 0f, p6 = 0f, p7 = 0f;
 
         if (n < N)
         {
@@ -551,29 +572,44 @@ public class FusedDequantMatMul : IDisposable
                     int r = tid + sub * GemvGroupSize;
                     float wval = DecodeQ4KScaled(w, sbOff, r, d, dmin); // dequant ONCE, reuse across rows
                     int kIdx = kBase + r;
-                    for (int mi = 0; mi < GemmMTile; mi++)
-                    {
-                        int m = mBase + mi;
-                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
-                    }
+                    if (mBase + 0 < M) p0 += input[(mBase + 0) * K + kIdx] * wval;
+                    if (mBase + 1 < M) p1 += input[(mBase + 1) * K + kIdx] * wval;
+                    if (mBase + 2 < M) p2 += input[(mBase + 2) * K + kIdx] * wval;
+                    if (mBase + 3 < M) p3 += input[(mBase + 3) * K + kIdx] * wval;
+                    if (mBase + 4 < M) p4 += input[(mBase + 4) * K + kIdx] * wval;
+                    if (mBase + 5 < M) p5 += input[(mBase + 5) * K + kIdx] * wval;
+                    if (mBase + 6 < M) p6 += input[(mBase + 6) * K + kIdx] * wval;
+                    if (mBase + 7 < M) p7 += input[(mBase + 7) * K + kIdx] * wval;
                 }
             }
         }
 
-        // Reduce each row's partials across the group → output[m, n]. sh is reused per row (barrier between).
-        for (int mi = 0; mi < GemmMTile; mi++)
+        // Reduce each row's partial across the group → output[m, n]. sh is reused per row (barrier between).
+        ReduceRow(sh, output, tid, mBase + 0, n, N, M, p0);
+        ReduceRow(sh, output, tid, mBase + 1, n, N, M, p1);
+        ReduceRow(sh, output, tid, mBase + 2, n, N, M, p2);
+        ReduceRow(sh, output, tid, mBase + 3, n, N, M, p3);
+        ReduceRow(sh, output, tid, mBase + 4, n, N, M, p4);
+        ReduceRow(sh, output, tid, mBase + 5, n, N, M, p5);
+        ReduceRow(sh, output, tid, mBase + 6, n, N, M, p6);
+        ReduceRow(sh, output, tid, mBase + 7, n, N, M, p7);
+    }
+
+    /// <summary>Group tree-reduction of one row's per-thread partial into output[m, n] (shared buffer reused per
+    /// row; the trailing barrier makes it safe for the next row). Factored out of the multi-row GEMM kernels so the
+    /// M-tile can be unrolled into scalars (a device-local float[] miscompiles on the Wasm backend).</summary>
+    private static void ReduceRow(ArrayView1D<float, Stride1D.Dense> sh,
+        ArrayView1D<float, Stride1D.Dense> output, int tid, int m, int n, int N, int M, float partial)
+    {
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
         {
-            sh[tid] = partial[mi];
-            Group.Barrier();
-            for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
-            {
-                if (tid < stride) sh[tid] += sh[tid + stride];
-                Group.Barrier();
-            }
-            int m = mBase + mi;
-            if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
+            if (tid < stride) sh[tid] += sh[tid + stride];
             Group.Barrier();
         }
+        if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
+        Group.Barrier();
     }
 
     /// <summary>Q6_K dequant GEMM for M&gt;1 — the Q6_K analogue of <see cref="GemmDequantQ4_K_MultiRowImpl"/>
@@ -592,8 +628,8 @@ public class FusedDequantMatMul : IDisposable
         int tid = Group.IdxX;
 
         var sh = SharedMemory.Allocate<float>(GemvGroupSize);
-        var partial = new float[GemmMTile];
-        for (int mi = 0; mi < GemmMTile; mi++) partial[mi] = 0f;
+        // Scalar M-tile accumulators (a device-local float[] miscompiles on Wasm — see GemmDequantQ4_K_MultiRowImpl).
+        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f, p4 = 0f, p5 = 0f, p6 = 0f, p7 = 0f;
 
         if (n < N)
         {
@@ -611,28 +647,26 @@ public class FusedDequantMatMul : IDisposable
                     int r = tid + sub * GemvGroupSize;
                     float wval = DecodeQ6KScaled(w, sbOff, r, d); // dequant ONCE, reuse across rows
                     int kIdx = kBase + r;
-                    for (int mi = 0; mi < GemmMTile; mi++)
-                    {
-                        int m = mBase + mi;
-                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
-                    }
+                    if (mBase + 0 < M) p0 += input[(mBase + 0) * K + kIdx] * wval;
+                    if (mBase + 1 < M) p1 += input[(mBase + 1) * K + kIdx] * wval;
+                    if (mBase + 2 < M) p2 += input[(mBase + 2) * K + kIdx] * wval;
+                    if (mBase + 3 < M) p3 += input[(mBase + 3) * K + kIdx] * wval;
+                    if (mBase + 4 < M) p4 += input[(mBase + 4) * K + kIdx] * wval;
+                    if (mBase + 5 < M) p5 += input[(mBase + 5) * K + kIdx] * wval;
+                    if (mBase + 6 < M) p6 += input[(mBase + 6) * K + kIdx] * wval;
+                    if (mBase + 7 < M) p7 += input[(mBase + 7) * K + kIdx] * wval;
                 }
             }
         }
 
-        for (int mi = 0; mi < GemmMTile; mi++)
-        {
-            sh[tid] = partial[mi];
-            Group.Barrier();
-            for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
-            {
-                if (tid < stride) sh[tid] += sh[tid + stride];
-                Group.Barrier();
-            }
-            int m = mBase + mi;
-            if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
-            Group.Barrier();
-        }
+        ReduceRow(sh, output, tid, mBase + 0, n, N, M, p0);
+        ReduceRow(sh, output, tid, mBase + 1, n, N, M, p1);
+        ReduceRow(sh, output, tid, mBase + 2, n, N, M, p2);
+        ReduceRow(sh, output, tid, mBase + 3, n, N, M, p3);
+        ReduceRow(sh, output, tid, mBase + 4, n, N, M, p4);
+        ReduceRow(sh, output, tid, mBase + 5, n, N, M, p5);
+        ReduceRow(sh, output, tid, mBase + 6, n, N, M, p6);
+        ReduceRow(sh, output, tid, mBase + 7, n, N, M, p7);
     }
 
     /// <summary>Register-blocked dequant GEMM for Q4_K, M&gt;=RB_TILE (prefill). The verified f32
@@ -651,6 +685,14 @@ public class FusedDequantMatMul : IDisposable
 
         var aTile = SharedMemory.Allocate<float>(RB_TILE * RB_BLOCK);
         var bTile = SharedMemory.Allocate<float>(RB_BLOCK * RB_TILE);
+        // Per-column Q4_K metadata for the current K-tile: the folded products {d·sc, dmin·mn} × RB_TILE columns.
+        // A K-tile is 16 k deep and 16-aligned, so it lies entirely within ONE Q4_K sub-block (32 elems) for every
+        // column — hence d/dmin (block-constant) AND the 6-bit sc/mn (sub-block-constant), and therefore d·sc and
+        // dmin·mn, are the SAME for all 16 k. Decode + fold them ONCE per tile (64 cooperating threads) instead of
+        // re-decoding per B-tile element (the old DecodeQ4KElement redid the fp16 d/dmin + 6-bit scale extraction
+        // + the d·sc/dmin·mn products 16× redundantly per column). The per-element B load is then a nibble fetch +
+        // one multiply + one subtract (DecodeQ4KNibble) — bit-identical.
+        var bMeta = SharedMemory.Allocate<float>(RB_TILE * 2);
 
         int tileIdx = Grid.IdxX;
         int tileRow = tileIdx / numTilesN;
@@ -670,12 +712,48 @@ public class FusedDequantMatMul : IDisposable
                 int aCol = t * RB_BLOCK + threadCol;
                 aTile[(threadRow * RB_REG + r) * RB_BLOCK + threadCol] = (aRow < M && aCol < K) ? A[aRow * K + aCol] : 0f;
             }
+            // Decode this K-tile's per-column metadata once (one thread per column; the rest wait at the barrier).
+            // r = k0 & 255 picks any element in the tile — the sub-block scale index j is constant across the tile.
+            if (Group.IdxX < RB_TILE)
+            {
+                int metaCol = Group.IdxX;
+                int n = tileCol * RB_TILE + metaCol;
+                float dsc = 0f, dminmn = 0f;
+                if (n < N)
+                {
+                    int k0 = t * RB_BLOCK;
+                    int sbOff = n * bytesPerRow + (k0 >> 8) * 144;
+                    int r = k0 & 255;
+                    int tt = r >> 6;
+                    int hi = (r >> 5) & 1;
+                    float md = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+                    float mdmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+                    int scOff = sbOff + 4;
+                    int j = 2 * tt + hi;
+                    int lowBit = ((j - 4) >> 31) & 1;
+                    int hiBit = 1 - lowBit;
+                    int bj = ReadByte(w, scOff + j);
+                    int bj4 = ReadByte(w, scOff + j + 4);
+                    int bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+                    float msc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+                    float mmn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+                    dsc = md * msc;       // d·sc folded once per column (was recomputed per element)
+                    dminmn = mdmin * mmn; // dmin·mn folded once per column
+                }
+                bMeta[metaCol * 2 + 0] = dsc;
+                bMeta[metaCol * 2 + 1] = dminmn;
+            }
+            Group.Barrier();
             for (int r = 0; r < RB_REG; r++)
             {
                 int bRow = t * RB_BLOCK + threadRow;                    // k
-                int bCol = tileCol * RB_TILE + threadCol * RB_REG + r;  // n
-                bTile[threadRow * RB_TILE + threadCol * RB_REG + r] =
-                    (bRow < K && bCol < N) ? DecodeQ4KElement(w, bCol * bytesPerRow, bRow) : 0f; // dequant ONCE
+                int metaCol = threadCol * RB_REG + r;                   // column within tile (0..RB_TILE-1)
+                int bCol = tileCol * RB_TILE + metaCol;                 // n
+                int sbOff = bCol * bytesPerRow + (bRow >> 8) * 144;
+                bTile[threadRow * RB_TILE + metaCol] =
+                    (bRow < K && bCol < N)
+                        ? DecodeQ4KNibble(w, sbOff, bRow & 255, bMeta[metaCol * 2 + 0], bMeta[metaCol * 2 + 1])
+                        : 0f;
             }
             Group.Barrier();
             for (int k = 0; k < RB_BLOCK; k++)

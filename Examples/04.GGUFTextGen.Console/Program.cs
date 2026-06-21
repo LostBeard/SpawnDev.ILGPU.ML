@@ -28,6 +28,59 @@ int[] tokenIds = args.FirstOrDefault(a => a.Contains(','))?.Split(',')
         .Select(s => int.Parse(s.Trim())).ToArray()
     ?? new[] { 2, 1000, 2000, 3000, 4000 };
 
+// GGUF_GEMM_BENCH=1 → localize the prefill MatMul GFLOPS ceiling: f32 register-blocked GEMM (no dequant)
+// vs the Q4_K dequant register-blocked GEMM at the SAME shapes. If f32 >> dequant the per-element B-tile
+// dequant is the overhead (ML fix); if ~equal, the GEMM codegen is the ceiling. Random weight bytes (timing
+// only). No model needed.
+if (Environment.GetEnvironmentVariable("GGUF_GEMM_BENCH") == "1")
+{
+    using var bctx = MLContext.Create().ToContext();
+    var bcuda = bctx.GetCudaDevices(); var bcl = bctx.GetCLDevices();
+    Device bdev = bcuda.Count > 0 ? (Device)bcuda[0] : bcl.Count > 0 ? (Device)bcl[0] : bctx.GetPreferredDevice(preferCPU: false);
+    using var bacc = bdev.CreateAccelerator(bctx);
+    Console.WriteLine($"Accelerator: {bacc.Name} ({bacc.AcceleratorType})");
+    SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableMultiRowGemm = true;
+    var brng = new Random(1);
+    double Gf(int M, int K, int N, double ms) => 2.0 * M * K * N / (ms / 1000.0) / 1e9;
+    void Bench(int M, int K, int N)
+    {
+        Console.WriteLine($"\n--- M={M} K={K} N={N} (2MKN={2.0 * M * K * N / 1e9:F2} GFLOP) ---");
+        int iters = 20;
+        var A = new float[M * K]; for (int i = 0; i < A.Length; i++) A[i] = (float)(brng.NextDouble() - 0.5);
+        var Bf = new float[K * N]; for (int i = 0; i < Bf.Length; i++) Bf[i] = (float)(brng.NextDouble() - 0.5);
+        using (var aBuf = bacc.Allocate1D(A))
+        using (var bBuf = bacc.Allocate1D(Bf))
+        using (var cBuf = bacc.Allocate1D<float>(M * N))
+        {
+            var rb = new SpawnDev.ILGPU.ML.Kernels.RegisterBlockedMatMul(bacc);
+            rb.MatMul(aBuf.View, bBuf.View, cBuf.View, M, K, N); bacc.Synchronize();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) rb.MatMul(aBuf.View, bBuf.View, cBuf.View, M, K, N);
+            bacc.Synchronize(); sw.Stop();
+            double ms = sw.Elapsed.TotalMilliseconds / iters;
+            Console.WriteLine($"  f32 RegBlocked : {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS");
+        }
+        int bytesPerRow = K / 256 * 144; int wBytes = ((N * bytesPerRow) + 3) / 4 * 4;
+        var wq = new byte[wBytes]; brng.NextBytes(wq);
+        using (var aBuf = bacc.Allocate1D(A))
+        using (var wBuf = bacc.Allocate1D(wq))
+        using (var cBuf = bacc.Allocate1D<float>(M * N))
+        {
+            var fq = new SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul(bacc);
+            fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K); bacc.Synchronize();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K);
+            bacc.Synchronize(); sw.Stop();
+            double ms = sw.Elapsed.TotalMilliseconds / iters;
+            Console.WriteLine($"  Q4_K dequant RB: {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS");
+        }
+    }
+    Bench(1081, 3584, 18944); // MLP gate/up
+    Bench(1081, 18944, 3584); // MLP down
+    Bench(1081, 3584, 3584);  // attn q-proj
+    return 0;
+}
+
 if (!File.Exists(modelPath))
 {
     Console.Error.WriteLine($"Model not found: {modelPath}");

@@ -2,6 +2,31 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Metadata-cached dequant GEMM + two cross-backend dequant-path fixes
+
+**`FusedDequantMatMul` register-blocked Q4_K GEMM now caches per-column block metadata once per K-tile.** An
+isolated GFLOPS benchmark (Example 04 `GGUF_GEMM_BENCH=1`, RTX 4070, qwen MLP shapes @M=1081) localized the
+prefill MatMul ceiling: the f32 register-blocked GEMM hits **~5700 GFLOPS** (≈20% of the card's f32 peak — the
+codegen is fine), while the Q4_K dequant version was **~2294 GFLOPS** — the dequant-on-load was 2.5× overhead.
+The B-tile load re-decoded each block's fp16 d/dmin + 6-bit sub-block scale **per element**. A K-tile (16 deep,
+16-aligned) is provably within one Q4_K sub-block, so each column's folded products `{d·sc, dmin·mn}` are now
+decoded **once per K-tile** into shared memory; the per-element load is a nibble fetch + one multiply + one
+subtract. **Result: ~2294 → ~4268 GFLOPS (~1.86×).** Bit-identical (A/B logits match the prior register-blocked
+exactly; tokens identical to the per-element oracle).
+
+Two pre-existing dequant-path defects surfaced by new register-blocked + multi-row oracle tests (the old oracle
+used M=2 with MultiRowGemm off, so neither opt-in prefill path was ever unit-tested) and fixed:
+- **CPU backend:** the register-blocked kernel launches 256-thread groups, but ILGPU's CPU accelerator caps a
+  group dimension at 64 → it threw `Invalid group dimensions`. Now gated on `MaxGroupSize.X >= 256`; CPU falls
+  back to the multi-row kernel (group 64).
+- **Wasm backend:** the multi-row Q4_K/Q6_K kernels used a device-local `float[]` accumulator, which **miscompiles
+  on the ILGPU Wasm backend** (correct on CPU/CUDA/OpenCL/WebGPU/WebGL; wrong only on Wasm). Unrolled to scalar
+  accumulators (matching the register-blocked kernel, which was always correct). The ROOT cause is an ILGPU Wasm
+  codegen bug for device-local arrays — flagged upstream; the scalar form is the durable kernel pattern regardless.
+
+New PMT tests `FusedDequantMatMul_{MultiRow,RegBlocked}_MatchesOracle_{Q4_K,Q6_K}` (M=40 multi-row + M=80
+register-blocked, non-tile-aligned dims) — green on all 6 backends.
+
 ## Unreleased — Grouped-per-query fused attention (prefill attention win)
 
 **`FusedAttentionKernel` grouped-per-query path: each Q·K score is computed ONCE instead of once per output

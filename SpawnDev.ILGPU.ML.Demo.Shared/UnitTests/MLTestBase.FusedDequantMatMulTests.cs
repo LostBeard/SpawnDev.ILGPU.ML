@@ -120,6 +120,67 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[FusedDequantMatMul] {type}: GPU matches the ggml-reference oracle");
     });
 
+    // EnableMultiRowGemm dequant GEMM oracle (the M>1 prefill paths). The plain FusedMatMulOracle above uses M=2
+    // with MultiRowGemm OFF (per-element kernel), so it never exercises EITHER opt-in prefill path. Here we force
+    // EnableMultiRowGemm and cover both: M=40 → the multi-row kernel (2..63, group 64); M=80 → the register-blocked
+    // tiled kernel (>=RB_TILE, group 256) with its metadata-cached B-tile load. Non-tile-aligned N=70/M force the
+    // bounds/padding handling. On a backend whose max group-X < 256 (CPU) the M=80 case falls back to multi-row.
+    // WebGL/WebGPU keep the per-element kernel. All must match the ggml-reference oracle.
+    [TestMethod]
+    public async Task FusedDequantMatMul_MultiRow_MatchesOracle_Q4_K() => await MultiRowMatMulOracle(GGMLType.Q4_K, 40);
+    [TestMethod]
+    public async Task FusedDequantMatMul_MultiRow_MatchesOracle_Q6_K() => await MultiRowMatMulOracle(GGMLType.Q6_K, 40);
+    [TestMethod]
+    public async Task FusedDequantMatMul_RegBlocked_MatchesOracle_Q4_K() => await MultiRowMatMulOracle(GGMLType.Q4_K, 80);
+    [TestMethod]
+    public async Task FusedDequantMatMul_RegBlocked_MatchesOracle_Q6_K() => await MultiRowMatMulOracle(GGMLType.Q6_K, 80);
+
+    private async Task MultiRowMatMulOracle(GGMLType type, int M) => await RunTest(async accelerator =>
+    {
+        const int K = 512, N = 70;  // N not a 64-multiple → padding path; M=40 multi-row, M=80 register-blocked
+        var rng = new Random(77 + (int)type + M);
+
+        var input = new float[M * K];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int bytesPerRow = RowBytes(type, K);
+        var weightBytes = new byte[N * bytesPerRow];
+        var wRows = new float[N][];
+        for (int n = 0; n < N; n++)
+        {
+            var rowBytes = MakeBlocks(type, K, rng);
+            Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+            wRows[n] = ReferenceDequant(type, rowBytes, K);
+        }
+
+        var expected = new float[M * N];
+        for (int m = 0; m < M; m++)
+            for (int n = 0; n < N; n++)
+            {
+                float sum = 0f;
+                for (int k = 0; k < K; k++) sum += input[m * K + k] * wRows[n][k];
+                expected[m * N + n] = sum;
+            }
+
+        using var inputBuf = accelerator.Allocate1D(input);
+        using var weightBuf = AllocatePadded(accelerator, weightBytes);
+        using var outputBuf = accelerator.Allocate1D<float>(M * N);
+
+        bool saved = FusedDequantMatMul.EnableMultiRowGemm;
+        try
+        {
+            FusedDequantMatMul.EnableMultiRowGemm = true;
+            using var fused = new FusedDequantMatMul(accelerator);
+            fused.Forward(inputBuf.View, weightBuf.View, outputBuf.View, M, K, N, type);
+            await accelerator.SynchronizeAsync();
+        }
+        finally { FusedDequantMatMul.EnableMultiRowGemm = saved; }
+
+        var gpuOut = await outputBuf.CopyToHostAsync<float>(0, M * N);
+        AssertCloseQuant(gpuOut, expected, 2e-3f, $"FusedDequantMatMul-RegBlocked[{type}]");
+        Console.WriteLine($"[FusedDequantMatMul-RegBlocked] {type}: M={M} K={K} N={N} matches the ggml-reference oracle");
+    });
+
     // ═════════════════════════════════════════════════════════════════════
     //  3. Fused dequant Gather GPU oracle (quantized embedding lookup)
     // ═════════════════════════════════════════════════════════════════════
