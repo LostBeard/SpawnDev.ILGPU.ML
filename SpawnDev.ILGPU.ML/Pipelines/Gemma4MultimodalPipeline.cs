@@ -36,6 +36,7 @@ public readonly record struct ImageInput(byte[] Rgb, int Width, int Height);
 public sealed class Gemma4MultimodalPipeline : IDisposable
 {
     private readonly Accelerator _accel;
+    private readonly Kernels.GpuArgMax _argmax;
     private readonly Stream _textStream;          // kept open for token_embd row gather
     private readonly GGUFModel _model;
     private readonly InferenceSession _session;
@@ -109,6 +110,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         InferenceSession session, Gemma4MultimodalProjectorGpu projector, int maxSeqLen, bool ownsSession)
     {
         _accel = accelerator;
+        _argmax = new Kernels.GpuArgMax(accelerator);
         _textStream = textStream;
         _model = model;
         _session = session;
@@ -267,21 +269,20 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     /// the next chat turn re-emits &lt;turn|&gt; to close the model turn in-context.</summary>
     private async Task<string> PrefillAndGenerateAsync(List<EmbRow> rows, int maxNewTokens, Func<int, string, Task>? onToken)
     {
-        float[] last = null!;
+        int next = -1;
         for (int i = 0; i < rows.Count; i++)
         {
             var outputs = await ForwardAsync(rows[i]);
-            if (i == rows.Count - 1) last = await ReadLastLogitsAsync(outputs);
+            if (i == rows.Count - 1) next = await ReadLastArgMaxAsync(outputs); // last prefill position predicts token 0
         }
 
         var generated = new List<int>();
         for (int step = 0; step < maxNewTokens; step++)
         {
-            int next = TextGenerationSampler.Greedy(last);
             generated.Add(next);
             if (onToken != null) await onToken(generated.Count, _tok.Decode(generated.ToArray()));
             if (next == _turnC || next == _eos || step == maxNewTokens - 1) break;
-            last = await ReadLastLogitsAsync(await ForwardAsync(new EmbRow(await ScaledRowAsync(next), null, 0)));
+            next = await ReadLastArgMaxAsync(await ForwardAsync(new EmbRow(await ScaledRowAsync(next), null, 0)));
         }
         // Strip the trailing stop token from the RETURNED text (it stays out of the cache either way).
         if (generated.Count > 0 && (generated[^1] == _turnC || generated[^1] == _eos)) generated.RemoveAt(generated.Count - 1);
@@ -303,16 +304,14 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
         { ["inputs_embeds"] = new Tensor(inBuf.View, new[] { 1, 1, _nEmbd }, "inputs_embeds") });
     }
 
-    /// <summary>Browser-portable readback of the last position's logits (async — no sync CopyToCPU).</summary>
-    private async Task<float[]> ReadLastLogitsAsync(Dictionary<string, Tensor> outputs)
+    /// <summary>Greedy next-token from the last position's logits via a GPU argmax — reads back one int, not
+    /// the ~1 MB vocab row (this path is greedy-only). Browser-portable (async, no sync CopyToCPU).</summary>
+    private async Task<int> ReadLastArgMaxAsync(Dictionary<string, Tensor> outputs)
     {
         var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
         int vocab = logitsT.Shape[^1];
         long lastOff = (long)(logitsT.ElementCount / vocab - 1) * vocab;
-        using var read = _accel.Allocate1D<float>(vocab);
-        await read.View.CopyFromAsync(logitsT.Data.SubView(lastOff, vocab));
-        await _accel.SynchronizeAsync();
-        return await read.CopyToHostAsync<float>(0, vocab);
+        return await _argmax.ArgMaxAsync(logitsT.Data.SubView(lastOff, vocab), vocab);
     }
 
     /// <summary>Gather token <paramref name="t"/>'s embedding row from token_embd and scale by sqrt(n_embd)
@@ -330,6 +329,7 @@ public sealed class Gemma4MultimodalPipeline : IDisposable
     {
         _projector.Dispose();
         _cache.Dispose();
+        _argmax.Dispose();
         if (_ownsSession) _session.Dispose();
         _textStream.Dispose();
     }

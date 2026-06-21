@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — GPU argmax greedy decode (no per-token full-vocab readback)
+
+**Greedy next-token selection now runs on the GPU and reads back one int, not the ~1 MB vocab row.** Both decode
+pipelines (`GgufTextGenerationPipeline`, `Gemma4MultimodalPipeline`) previously copied the entire last-position
+logits row (~262K floats) to the host every token and ran a CPU argmax (`TextGenerationSampler.Greedy`). The new
+`GpuArgMax` kernel does a parallel partial-argmax on the GPU — P threads each scan a strided slice and emit one
+interleaved (value, index) pair, combined on the host over P (~1024) entries — so the per-token transfer drops
+from `vocab*4` bytes to `~P*8` bytes in a single round-trip and the host scan from `vocab` to `P` (the latter
+matters most in WASM, where a 262K single-threaded argmax per token is real work). No shared memory / barriers, so
+it runs on all 6 backends including WebGL; tie-break is the LOWEST index, byte-identical to the CPU greedy path, so
+greedy tokens are unchanged. The full-vocab readback is kept only for sampling (top-k / top-p) and repetition
+penalty, which need the whole distribution on the host. Reused partial buffer (no per-token GPU alloc).
+`GpuArgMax_MatchesCpuGreedy_VariousSizes` + `GpuArgMax_LowestIndexOnTie` green on all 6 backends (PMT `GpuArgMax`
+14/0).
+
 ## Unreleased — SpawnDev.ILGPU 4.14.1 migration + FusedLinear native low-precision weight support
 
 **Migrated to SpawnDev.ILGPU 4.14.1 (nuget.org stable).** Off `4.14.0` onto `4.14.1` (Fork / Algorithms.Fork

@@ -29,6 +29,7 @@ public sealed class GgufTextGenerationPipeline : IDisposable
     private readonly Accelerator _accelerator;
     private readonly SentencePieceTokenizer _tokenizer;
     private readonly GGUFDecodeKVCache _cache;
+    private readonly GpuArgMax _argmax;
     private readonly int _turnCloseId;
     private readonly int _eosId;
 
@@ -62,6 +63,7 @@ public sealed class GgufTextGenerationPipeline : IDisposable
 
         _turnCloseId = ChatTemplates.Gemma4TurnCloseId(_tokenizer);
         _eosId = _tokenizer.EosId;
+        _argmax = new GpuArgMax(accelerator);
     }
 
     /// <summary>
@@ -92,20 +94,34 @@ public sealed class GgufTextGenerationPipeline : IDisposable
             int vocab = logitsT.Shape[^1];
             int seqOut = logitsT.ElementCount / vocab;
             long lastOff = (long)(seqOut - 1) * vocab;
-            // Browser-portable readback of the last position's logits (no sync CopyToCPU).
-            using var read = _accelerator.Allocate1D<float>(vocab);
-            await read.View.CopyFromAsync(logitsT.Data.SubView(lastOff, vocab));
-            await _accelerator.SynchronizeAsync();
-            var logits = await read.CopyToHostAsync<float>(0, vocab);
+            var lastLogits = logitsT.Data.SubView(lastOff, vocab);
 
-            if (config?.RepetitionPenalty is float rp && rp != 1.0f && generated.Count > 0)
-                TextGenerationSampler.ApplyRepetitionPenalty(logits, generated.ToArray(), rp);
-            int next = config?.Strategy switch
+            bool sampling = config?.Strategy is "top_k" or "top_p";
+            bool repPen = config?.RepetitionPenalty is float r && r != 1.0f && generated.Count > 0;
+            int next;
+            if (!sampling && !repPen)
             {
-                "top_k" => TextGenerationSampler.TopK(logits, config.TopK, config.Temperature, rng),
-                "top_p" => TextGenerationSampler.TopP(logits, config.TopP, config.Temperature, rng),
-                _ => TextGenerationSampler.Greedy(logits),
-            };
+                // Greedy with no host-side logit edit → argmax ON the GPU, read back one int (not ~1 MB).
+                next = await _argmax.ArgMaxAsync(lastLogits, vocab);
+            }
+            else
+            {
+                // Sampling / repetition-penalty need the full distribution on the host. Browser-portable
+                // readback of the last position's logits (no sync CopyToCPU).
+                using var read = _accelerator.Allocate1D<float>(vocab);
+                await read.View.CopyFromAsync(lastLogits);
+                await _accelerator.SynchronizeAsync();
+                var logits = await read.CopyToHostAsync<float>(0, vocab);
+
+                if (repPen)
+                    TextGenerationSampler.ApplyRepetitionPenalty(logits, generated.ToArray(), config!.RepetitionPenalty);
+                next = config?.Strategy switch
+                {
+                    "top_k" => TextGenerationSampler.TopK(logits, config.TopK, config.Temperature, rng),
+                    "top_p" => TextGenerationSampler.TopP(logits, config.TopP, config.Temperature, rng),
+                    _ => TextGenerationSampler.Greedy(logits),
+                };
+            }
 
             generated.Add(next);
             if (onToken != null) await onToken(generated.Count, _tokenizer.Decode(generated.ToArray()));
@@ -116,6 +132,6 @@ public sealed class GgufTextGenerationPipeline : IDisposable
         return _tokenizer.Decode(generated.ToArray());
     }
 
-    /// <summary>Releases the decode KV-cache. Does NOT dispose the session or accelerator (caller-owned).</summary>
-    public void Dispose() => _cache.Dispose();
+    /// <summary>Releases the decode KV-cache + argmax buffers. Does NOT dispose the session or accelerator (caller-owned).</summary>
+    public void Dispose() { _cache.Dispose(); _argmax.Dispose(); }
 }
