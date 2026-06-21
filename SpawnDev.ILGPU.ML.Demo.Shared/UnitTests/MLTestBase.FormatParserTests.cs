@@ -488,6 +488,29 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ByteLevelBpe_StreamingDecoder_MapsGptUnicodeBackToBytes() => await RunTest(async accelerator =>
+    {
+        // Byte-level BPE (GGUF tokenizer.ggml.model == "gpt2": qwen2/3, llama3) encodes raw bytes as printable
+        // unicode (space→Ġ U+0120, newline→Ċ U+010A, and 0xC3/0xA9 → Ã/© for a multi-byte glyph). Decode reverses it.
+        var tokens = new[] { "<unk>", "<s>", "</s>", "ĠHello", "Ġworld", "Ċ", "Ã©" };
+        var scores = new float[tokens.Length];
+        var types = new[] { 1, 2, 2, 0, 0, 0, 0 };
+        var sp = new SentencePieceTokenizer(tokens, scores, types, byteLevelBpe: true);
+        if (!sp.ByteLevelBpe) throw new Exception("ByteLevelBpe flag not set");
+
+        var dec = sp.CreateStreamingDecoder();
+        string outp = dec.Push(3) + dec.Push(4) + dec.Push(5) + dec.Push(6) + dec.Finish(); // ĠHello Ġworld Ċ Ã©
+        // Expected: " Hello world\n" + "é"  (no leading-space trim for byte-level BPE; é from 0xC3 0xA9 UTF-8)
+        string expected = " Hello world\n" + "é";
+        if (outp != expected)
+            throw new Exception($"Byte-level BPE decode wrong: got '{outp.Replace("\n", "\\n")}' want '{expected.Replace("\n", "\\n")}'");
+        if (outp.Contains('Ġ') || outp.Contains('Ċ') || outp.Contains('Ã'))
+            throw new Exception($"GPT-2 byte-level artifacts leaked: '{outp}'");
+        Console.WriteLine($"[ByteLevelBpe] '{outp.Replace("\n", "\\n")}' — PASS");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task SentencePiece_ToLoadedTokenizer_Works() => await RunTest(async accelerator =>
     {
         var tokens = new[] { "<unk>", "<s>", "</s>", "\u2581hello" };

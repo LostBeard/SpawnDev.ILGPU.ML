@@ -23,6 +23,29 @@ public class SentencePieceTokenizer : ITokenizer
     private readonly int _bosId;
     private readonly int _eosId;
     private readonly int _unkId;
+    private readonly bool _byteLevelBpe;
+
+    /// <summary>True for byte-level BPE vocabs (GGUF <c>tokenizer.ggml.model == "gpt2"</c>: qwen2/3, llama3,
+    /// most modern models). Such vocabs encode raw bytes as printable unicode via GPT-2's bytes↔unicode map
+    /// (space→Ġ, newline→Ċ, …) rather than SentencePiece's ▁ + &lt;0xHH&gt; scheme — decoding must reverse it.</summary>
+    public bool ByteLevelBpe => _byteLevelBpe;
+
+    // GPT-2 byte-level reverse map: vocab-string char → raw byte. Built once (the standard bytes_to_unicode).
+    private static readonly Dictionary<char, byte> Gpt2CharToByte = BuildGpt2CharToByte();
+    private static Dictionary<char, byte> BuildGpt2CharToByte()
+    {
+        var bs = new List<int>();
+        for (int b = '!'; b <= '~'; b++) bs.Add(b);        // 33..126
+        for (int b = 0xA1; b <= 0xAC; b++) bs.Add(b);      // 161..172
+        for (int b = 0xAE; b <= 0xFF; b++) bs.Add(b);      // 174..255
+        var cs = new List<int>(bs);
+        int n = 0;
+        for (int b = 0; b < 256; b++)
+            if (!bs.Contains(b)) { bs.Add(b); cs.Add(256 + n); n++; }
+        var map = new Dictionary<char, byte>(256);
+        for (int i = 0; i < bs.Count; i++) map[(char)cs[i]] = (byte)bs[i];
+        return map;
+    }
 
     /// <summary>Vocabulary size.</summary>
     public int VocabSize => _vocab.Length;
@@ -42,10 +65,11 @@ public class SentencePieceTokenizer : ITokenizer
     /// <summary>
     /// Create a SentencePiece tokenizer from GGUF metadata arrays.
     /// </summary>
-    public SentencePieceTokenizer(string[] tokens, float[] scores, int[]? tokenTypes = null)
+    public SentencePieceTokenizer(string[] tokens, float[] scores, int[]? tokenTypes = null, bool byteLevelBpe = false)
     {
         _vocab = tokens;
         _scores = scores;
+        _byteLevelBpe = byteLevelBpe;
         _tokenTypes = tokenTypes ?? new int[tokens.Length];
         _tokenToId = new Dictionary<string, int>(tokens.Length);
         for (int i = 0; i < tokens.Length; i++)
@@ -176,12 +200,25 @@ public class SentencePieceTokenizer : ITokenizer
         if (tokenType == 2) return Array.Empty<byte>(); // control token (BOS/EOS/turn markers)
 
         string token = _vocab[id];
+
+        if (_byteLevelBpe)
+        {
+            // Byte-level BPE: each char of the vocab string maps back to ONE raw byte via the GPT-2 table
+            // (\u0120\u21920x20, \u010a\u21920x0A, \u2026). Accumulating these and decoding as UTF-8 (the streaming decoder) yields
+            // the correct text, incl. multi-byte glyphs encoded as a run of mapped bytes.
+            var bytes = new byte[token.Length];
+            int k = 0;
+            foreach (char c in token)
+                if (Gpt2CharToByte.TryGetValue(c, out var bb)) bytes[k++] = bb;
+            return k == bytes.Length ? bytes : bytes[..k];
+        }
+
         // Byte-fallback token <0xHH> \u2192 the single raw byte (same detection as Decode).
         if (token.Length == 6 && token.StartsWith("<0x") && token.EndsWith(">")
             && byte.TryParse(token.AsSpan(3, 2), System.Globalization.NumberStyles.HexNumber, null, out byte b))
             return new[] { b };
 
-        // Normal piece: UTF-8 bytes with \u2581 \u2192 space.
+        // Normal SentencePiece piece: UTF-8 bytes with \u2581 \u2192 space.
         return System.Text.Encoding.UTF8.GetBytes(token.Replace('\u2581', ' '));
     }
 
@@ -210,7 +247,8 @@ public class SentencePieceTokenizer : ITokenizer
             else if (ttObj is object[] oarr) tokenTypes = oarr.Select(o => Convert.ToInt32(o)).ToArray();
         }
 
-        return new SentencePieceTokenizer(tokens, scores, tokenTypes);
+        bool byteLevelBpe = model.GetMetadataString("tokenizer.ggml.model") == "gpt2";
+        return new SentencePieceTokenizer(tokens, scores, tokenTypes, byteLevelBpe);
     }
 
     /// <summary>

@@ -17,7 +17,12 @@ public sealed class SentencePieceStreamingDecoder
     private readonly List<byte> _pending = new();
     private bool _trimmedLeadingSpace;
 
-    internal SentencePieceStreamingDecoder(SentencePieceTokenizer tokenizer) => _tok = tokenizer;
+    internal SentencePieceStreamingDecoder(SentencePieceTokenizer tokenizer)
+    {
+        _tok = tokenizer;
+        // Byte-level BPE encodes spaces explicitly (Ġ), so there is no SentencePiece leading-space marker to trim.
+        _trimmedLeadingSpace = tokenizer.ByteLevelBpe;
+    }
 
     /// <summary>
     /// Feed one generated token id; returns the newly-complete text delta (may be empty while waiting

@@ -72,7 +72,9 @@ if (args.Length >= 1 && args[0] == "--template")
     var tmpl = gm.GetMetadataString("tokenizer.chat_template");
     var bos = gm.GetMetadataString("tokenizer.ggml.bos_token_id");
     var eos = gm.GetMetadataString("tokenizer.ggml.eos_token_id");
-    Console.WriteLine($"bos_id={bos} eos_id={eos}");
+    var tkModel = gm.GetMetadataString("tokenizer.ggml.model");
+    var tkPre = gm.GetMetadataString("tokenizer.ggml.pre");
+    Console.WriteLine($"tokenizer.model={tkModel}  pre={tkPre}  bos_id={bos} eos_id={eos}");
     Console.WriteLine($"chat_template ({(tmpl?.Length ?? 0)} chars):\n----\n{tmpl ?? "(none in GGUF metadata)"}\n----");
     return;
 }
