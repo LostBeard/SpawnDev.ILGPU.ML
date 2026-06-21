@@ -30,9 +30,11 @@ public class SentencePieceTokenizer : ITokenizer
     /// (space→Ġ, newline→Ċ, …) rather than SentencePiece's ▁ + &lt;0xHH&gt; scheme — decoding must reverse it.</summary>
     public bool ByteLevelBpe => _byteLevelBpe;
 
-    // GPT-2 byte-level reverse map: vocab-string char → raw byte. Built once (the standard bytes_to_unicode).
-    private static readonly Dictionary<char, byte> Gpt2CharToByte = BuildGpt2CharToByte();
-    private static Dictionary<char, byte> BuildGpt2CharToByte()
+    // GPT-2 byte-level maps (the standard bytes_to_unicode), built once. Forward: raw byte → vocab-string char
+    // (for ENCODE); reverse: char → raw byte (for DECODE).
+    private static readonly char[] Gpt2ByteToChar = new char[256];
+    private static readonly Dictionary<char, byte> Gpt2CharToByte = BuildGpt2Tables();
+    private static Dictionary<char, byte> BuildGpt2Tables()
     {
         var bs = new List<int>();
         for (int b = '!'; b <= '~'; b++) bs.Add(b);        // 33..126
@@ -43,7 +45,7 @@ public class SentencePieceTokenizer : ITokenizer
         for (int b = 0; b < 256; b++)
             if (!bs.Contains(b)) { bs.Add(b); cs.Add(256 + n); n++; }
         var map = new Dictionary<char, byte>(256);
-        for (int i = 0; i < bs.Count; i++) map[(char)cs[i]] = (byte)bs[i];
+        for (int i = 0; i < bs.Count; i++) { map[(char)cs[i]] = (byte)bs[i]; Gpt2ByteToChar[bs[i]] = (char)cs[i]; }
         return map;
     }
 
@@ -104,7 +106,20 @@ public class SentencePieceTokenizer : ITokenizer
 
         // SentencePiece treats the input as a single string with ▁ replacing spaces
         // The leading space is significant: "Hello world" → "▁Hello▁world"
-        string normalized = "\u2581" + text.Replace(" ", "\u2581");
+        string normalized;
+        if (_byteLevelBpe)
+        {
+            // Byte-level BPE: map each UTF-8 byte of the input to its GPT-2 char, then greedy-match the vocab
+            // (stored in GPT-2-char form: space=\u0120, newline=\u010a, \u2026). No leading \u2581, no <0xHH> fallback.
+            var raw = System.Text.Encoding.UTF8.GetBytes(text);
+            var sb = new System.Text.StringBuilder(raw.Length);
+            foreach (var rb in raw) sb.Append(Gpt2ByteToChar[rb]);
+            normalized = sb.ToString();
+        }
+        else
+        {
+            normalized = "\u2581" + text.Replace(" ", "\u2581");
+        }
 
         // Greedy forward tokenization with longest match
         int pos = 0;
