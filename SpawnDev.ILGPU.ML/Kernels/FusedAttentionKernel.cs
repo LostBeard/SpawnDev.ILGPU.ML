@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using System.Numerics;
 
 namespace SpawnDev.ILGPU.ML.Kernels;
 
@@ -40,6 +41,12 @@ public class FusedAttentionKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _kernel;
+
+    // Strided + native-low-p K/V variant (the KV-cache decode path): K/V read in their native type
+    // (BFloat16 / float) and converted to float in-register, with a per-head element STRIDE (p[10]) that
+    // decouples the store's row pitch from the logical seqKV — so the cache reads its maxSeq-strided store
+    // DIRECTLY (no per-token repack/widen). One compiled kernel per concrete T, cached.
+    private readonly Dictionary<Type, object> _stridedKernels = new();
 
     // Dummy 1-element sinks buffer for the no-sinks case (the kernel always takes a sinks view but only
     // reads it when sinkCount > 0). gpt-oss/OpenAI-MoE attention passes real per-head sink logits.
@@ -144,6 +151,60 @@ public class FusedAttentionKernel : IDisposable
     }
 
     /// <summary>
+    /// Fused attention reading K/V in a NATIVE type <typeparamref name="T"/> (<c>BFloat16</c> or <c>float</c>),
+    /// converted to float in-register, with an explicit per-head element stride <paramref name="kvRowStride"/>
+    /// for K/V. This lets a KV-cache read its <c>[kvHeads, maxSeq, hd]</c> store DIRECTLY (pass
+    /// <c>kvRowStride = maxSeq*hd</c>) instead of repacking + bf16→f32-widening the whole history into a
+    /// contiguous f32 buffer every token. Q stays f32; output is f32. With <c>T=float</c> and
+    /// <c>kvRowStride = seqKV*headDim</c> this is byte-identical to <see cref="Forward(ArrayView1D{float,Stride1D.Dense},ArrayView1D{float,Stride1D.Dense},ArrayView1D{float,Stride1D.Dense},ArrayView1D{float,Stride1D.Dense},int,int,int,int,int,bool,int,int,float,ArrayView1D{float,Stride1D.Dense}?,int)"/>.
+    /// </summary>
+    public void ForwardStrided<T>(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<T, Stride1D.Dense> K,
+        ArrayView1D<T, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
+        bool causal, int window, int kvOffset, float scale, int kvRowStride,
+        ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0)
+        where T : unmanaged, INumber<T>
+    {
+        if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
+        if (kvHeads <= 0 || nHeads % kvHeads != 0)
+            throw new ArgumentOutOfRangeException(nameof(kvHeads),
+                $"kvHeads ({kvHeads}) must evenly divide nHeads ({nHeads}) for grouped-query attention.");
+        long noConstraint = (long)seqKV + seqQ + Math.Max(kvOffset, 0) + 1;
+        int effWindow = (int)Math.Min(window, noConstraint);
+        float effScale = scale > 0f ? scale : 1f / MathF.Sqrt(headDim);
+        var paramsData = new int[]
+        {
+            nHeads, seqQ, seqKV, headDim,
+            BitConverter.SingleToInt32Bits(effScale),
+            causal ? 1 : 0, effWindow, kvOffset,
+            nHeads / kvHeads,
+            sinkCount,
+            kvRowStride, // p[10]: per-head element stride of K/V (maxSeq*hd for the strided store; seqKV*hd contiguous)
+        };
+
+        var slot = _ringNext;
+        _ringNext = (_ringNext + 1) % RingSize;
+        _paramsRing[slot]?.Dispose();
+        _paramsRing[slot] = _accelerator.Allocate1D(paramsData);
+
+        if (!_stridedKernels.TryGetValue(typeof(T), out var k))
+            _stridedKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionStridedImpl<T>);
+
+        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
+        var sinksView = sinks ?? _dummySinks.View;
+        ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+            ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)k)(
+            nHeads * seqQ * headDim, Q, K, V, output, sinksView, _paramsRing[slot]!.View);
+    }
+
+    /// <summary>
     /// Per-element fused attention with Online Softmax (single pass) and arithmetic
     /// masking. Each thread computes one output value by iterating all KV positions.
     /// BRANCH-FREE BODY (see class doc): masked positions get score -1e10 via sign-bit
@@ -223,6 +284,78 @@ public class FusedAttentionKernel : IDisposable
             float correction = MathF.Exp(runningMax - newMax);
             runningSum = runningSum * correction + MathF.Exp(sink - newMax);
             weightedV = weightedV * correction; // sink contributes 0 to the value sum
+            runningMax = newMax;
+        }
+
+        output[idx] = weightedV / (runningSum + 1e-10f);
+    }
+
+    /// <summary>
+    /// Strided + native-low-p K/V variant of <see cref="FusedAttentionImpl"/>: identical online-softmax math
+    /// and branch-free masking, but K/V are read in type <typeparamref name="T"/> and converted to float
+    /// in-register (<c>PrecisionConvert.ConvertToSingle</c> — branchless; <c>T=float</c> lowers to nothing), and
+    /// the per-head base uses the explicit stride <c>p[10]</c> instead of <c>SKV</c>. With <c>T=float</c> and
+    /// <c>p[10]=SKV*D</c> it is byte-identical to <see cref="FusedAttentionImpl"/> (the correctness anchor).
+    /// </summary>
+    private static void FusedAttentionStridedImpl<T>(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<T, Stride1D.Dense> K,
+        ArrayView1D<T, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
+        ArrayView1D<int, Stride1D.Dense> p)
+        where T : unmanaged, INumber<T>
+    {
+        int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int sinkCount = p[9];
+        int kvStride = p[10]; // per-head element stride of K/V (decouples the store row pitch from SKV)
+
+        int d = idx % D;
+        int sq = (idx / D) % SQ;
+        int bh = idx / (SQ * D);
+        if (bh >= BH) return;
+
+        int kvHead = bh / gqaGroup;
+        int qBase = (bh * SQ + sq) * D;
+        int qPos = kvOffset + sq;
+
+        float runningMax = -1e10f;
+        float runningSum = 0f;
+        float weightedV = 0f;
+
+        for (int kv = 0; kv < SKV; kv++)
+        {
+            int kBase = kvHead * kvStride + kv * D;
+            float dot = 0f;
+            for (int dd = 0; dd < D; dd++)
+                dot += Q[qBase + dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+            float score = dot * scale;
+
+            int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
+            int windowOk = ((qPos - window - kv) >> 31) & 1;
+            int valid = causalOk & windowOk;
+            score = score * valid + -1e30f * (1 - valid);
+
+            float newMax = MathF.Max(runningMax, score);
+            float correction = MathF.Exp(runningMax - newMax);
+            float weight = MathF.Exp(score - newMax);
+            runningSum = runningSum * correction + weight;
+            weightedV = weightedV * correction + weight * PrecisionConvert.ConvertToSingle(V[kBase + d]);
+            runningMax = newMax;
+        }
+
+        if (sinkCount > 0)
+        {
+            float sink = sinks[bh % sinkCount];
+            float newMax = MathF.Max(runningMax, sink);
+            float correction = MathF.Exp(runningMax - newMax);
+            runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+            weightedV = weightedV * correction;
             runningMax = newMax;
         }
 

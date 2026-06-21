@@ -1524,13 +1524,34 @@ public class GraphExecutor : IDisposable
                     int dHd = DecodeKVCache.HeadDim(dLayer), dKvH = DecodeKVCache.KvHeads(dLayer);
                     int dSeqQ = nodeInputs[1]!.ElementCount / (dKvH * dHd);
                     int dTotal = DecodePastLen + dSeqQ;
-                    // ONE async path, all backends: WriteAsync/PackedKAsync use CopyFromAsync, which orders the
-                    // copy against the producing kernel on the Wasm worker pool (a sync CopyFrom of a node OUTPUT
-                    // silently races there). No backend-specific drain needed — the async copies self-order.
+                    // Write this step's K/V into the per-layer store (CopyFromAsync orders the copy against the
+                    // producing kernel on the Wasm worker pool — a sync CopyFrom of a node OUTPUT silently races
+                    // there; the await completes it before the attention kernel below reads the store).
                     await DecodeKVCache.WriteAsync(dLayer, nodeInputs[1]!.Data, nodeInputs[2]!.Data, DecodePastLen, dSeqQ).ConfigureAwait(false);
-                    nodeInputs[1] = new Tensor(await DecodeKVCache.PackedKAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[1]);
-                    nodeInputs[2] = new Tensor(await DecodeKVCache.PackedVAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[2]);
-                    decodeAttrs = new Dictionary<string, object>(node.Attributes) { ["kv_offset"] = (long)DecodePastLen };
+                    // Feed FusedAttention the [kvHeads, maxSeq, hd] store DIRECTLY in its native type (bf16/f32),
+                    // read maxSeq-strided — NO per-token repack + bf16→f32-widen of the whole history (that was
+                    // O(history) memory-bandwidth per token). kv_seq_len = the LIVE length (the store is padded).
+                    // EXCEPTION: WebGL's sub-word (bf16) kernel read of the large strided store mis-addresses
+                    // (an ILGPU WebGL backend limitation — f32-strided + all other backends are byte-exact;
+                    // surfaced to Geordi). WebGL+bf16 falls back to the repack (correct, just the old O(history)).
+                    bool stridedOk = _accelerator.AcceleratorType != AcceleratorType.WebGL
+                                     || DecodeKVCache.Precision == KVCachePrecision.F32;
+                    if (stridedOk)
+                    {
+                        nodeInputs[1] = DecodeKVCache.StoreK(dLayer, node.InputNames[1]);
+                        nodeInputs[2] = DecodeKVCache.StoreV(dLayer, node.InputNames[2]);
+                        decodeAttrs = new Dictionary<string, object>(node.Attributes)
+                        {
+                            ["kv_offset"] = (long)DecodePastLen,
+                            ["kv_seq_len"] = (long)dTotal,
+                        };
+                    }
+                    else
+                    {
+                        nodeInputs[1] = new Tensor(await DecodeKVCache.PackedKAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[1]);
+                        nodeInputs[2] = new Tensor(await DecodeKVCache.PackedVAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[2]);
+                        decodeAttrs = new Dictionary<string, object>(node.Attributes) { ["kv_offset"] = (long)DecodePastLen };
+                    }
                 }
             }
 

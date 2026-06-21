@@ -2,6 +2,27 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — FusedAttention reads the bf16 KV store directly (no per-token repack)
+
+**GGUF decode attention now reads the `[kvHeads, maxSeq, hd]` KV store DIRECTLY in its native bf16/f32 type,
+maxSeq-strided — eliminating the per-token O(history) repack + bf16→f32 widen.** Previously every decode token
+re-converted the ENTIRE K/V history (each layer, each token) from the bf16 store into a fresh contiguous f32 pack
+for FusedAttention — O(history) memory-bandwidth per token, growing with context (the contiguous
+`[kvHeads, totalLen, hd]` pack layout shifts every token, so it can't be appended incrementally). New
+`FusedAttention.ForwardStrided<T>` reads K/V in their native type (`BFloat16` / `float`) with in-register
+`PrecisionConvert` (branchless — the same read-native-convert-in-register philosophy as the low-p MatMul/FusedLinear
+work) and an explicit per-head stride, so the cache exposes its store directly (`GGUFDecodeKVCache.StoreK/StoreV`)
+and the per-token KV work drops to O(1) (just writing the new token). The existing f32-contiguous FusedAttention
+kernel/`Forward` (SD / ONNX attention) is UNTOUCHED. Per-token KV cost is now flat in context length, not linear.
+
+Verified: `FusedAttention_Strided_MatchesReference` (f32 anchor byte-identical to the existing kernel + bf16 +
+maxSeq-strided store, all with GQA + causal + sliding-window + kvOffset) + `GGUFDecodeKVCache_IncrementalMatchesFullRecompute`
+(incremental decode == full recompute, F32 + BF16) green on all 6 backends; gemma4-12b greedy generation
+byte-identical to the pre-change tokens (CUDA). NOTE: WebGL's sub-word (bf16) kernel read of the large strided
+store mis-addresses (an ILGPU WebGL backend limitation — f32-strided + all 5 other backends incl. WebGPU are
+byte-exact), so WebGL+bf16 falls back to the existing repack — correct, just the old O(history); surfaced to
+Geordi for the durable WebGL fix.
+
 ## Unreleased — GGUF decode pipelines enable CacheShapeReadbacks
 
 **`GgufTextGenerationPipeline` and `Gemma4MultimodalPipeline` now set `CacheShapeReadbacks = true`.** The flag

@@ -1,3 +1,5 @@
+using ILGPU;
+using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Operators;
@@ -113,17 +115,29 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
 
         // Optional 4th input = per-head attention sinks (gpt-oss attn_sinks, [n_head]): a learned logit
         // folded into the softmax denominator (0 value contribution). Absent => sinkCount 0 = plain attention.
-        if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null && ctx.Inputs[3].ElementCount > 0)
+        var sinksT = ctx.Inputs.Length > 3 && ctx.Inputs[3] != null && ctx.Inputs[3].ElementCount > 0 ? ctx.Inputs[3] : null;
+        ArrayView1D<float, Stride1D.Dense>? sinksView = sinksT != null ? sinksT.Data : (ArrayView1D<float, Stride1D.Dense>?)null;
+        int sinkCount = sinksT?.ElementCount ?? 0;
+
+        // DECODE KV-cache path: K/V are the cache's [kvHeads, maxSeq, hd] store, read DIRECTLY in their native
+        // type (bf16 / f32) with the store's per-head row pitch as the stride — NO per-token repack + bf16→f32
+        // widen. Signalled by kv_seq_len (the LIVE history length, since the store buffer is maxSeq-padded so
+        // seqKV-from-ElementCount would over-read into padding). Dispatch on the store's DType.
+        int kvSeqLen = ctx.GetInt("kv_seq_len", 0);
+        if (kvSeqLen > 0)
         {
-            var sinks = ctx.Inputs[3];
-            reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
-                nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale,
-                sinks: sinks.Data, sinkCount: sinks.ElementCount);
+            int kvRowStride = k.Shape[^2] * k.Shape[^1]; // maxSeq * hd — the store's per-head element pitch
+            if (LowPWeightDispatch.IsLowP(k))
+                reg.FusedAttention.ForwardStrided(q.Data, k.AsView<BFloat16>(), v.AsView<BFloat16>(), ctx.Outputs[0].Data,
+                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount);
+            else
+                reg.FusedAttention.ForwardStrided(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
+                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount);
+            return;
         }
-        else
-        {
-            reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
-                nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale);
-        }
+
+        reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
+            nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale,
+            sinks: sinksView, sinkCount: sinkCount);
     }
 }

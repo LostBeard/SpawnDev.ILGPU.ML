@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Kernels;
 
@@ -245,6 +246,23 @@ public sealed class GGUFDecodeKVCache : IDisposable
     public int KvHeads(int layer) => _layers[layer].KvHeads;
     /// <summary>Per-layer head_dim.</summary>
     public int HeadDim(int layer) => _layers[layer].HeadDim;
+
+    /// <summary>Wrap one layer's K (or V) store as a Tensor for the strided FusedAttention decode path: the FULL
+    /// <c>[1, kvHeads, maxSeq, hd]</c> store (bf16 via <see cref="Tensor.FromLowP{T}"/>, or f32), read DIRECTLY by
+    /// <c>FusedAttention.ForwardStrided</c> with a per-head element stride of <c>maxSeq*hd</c> (derived from this
+    /// shape) — NO per-token repack/bf16→f32-widen. The caller passes the LIVE history length via the node's
+    /// <c>kv_seq_len</c> attr (the store is maxSeq-padded; only the first <c>kv_seq_len</c> tokens are attended).</summary>
+    public Tensor StoreK(int layer, string name) => StoreTensor(_layers[layer], isKey: true, name);
+    /// <summary>V counterpart of <see cref="StoreK"/>.</summary>
+    public Tensor StoreV(int layer, string name) => StoreTensor(_layers[layer], isKey: false, name);
+
+    private Tensor StoreTensor(LayerCache lc, bool isKey, string name)
+    {
+        var shape = new[] { 1, lc.KvHeads, _maxSeqLen, lc.HeadDim };
+        return _precision == KVCachePrecision.BF16
+            ? Tensor.FromLowP((isKey ? lc.Kb : lc.Vb)!.View, TensorDataType.BFloat16, shape, name)
+            : new Tensor((isKey ? lc.Kf : lc.Vf)!.View, shape, name);
+    }
 
     /// <summary>Release all GPU buffers.</summary>
     public void Dispose()
