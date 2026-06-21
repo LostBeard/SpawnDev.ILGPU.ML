@@ -22,6 +22,11 @@ using SpawnDev.ILGPU.ML.Preprocessing;
 using OllamaServer.Console;
 using OllamaServer.Console.Api;
 
+// Enable the multi-row dequant-GEMM (M>1/prefill): A/B-verified bit-identical tokens with ~7.6x faster prefill
+// on Q4_K models (qwen/gemma). The library keeps it off by default pending the full 6-backend sweep; this
+// testbed opts in so long-prompt / tool-calling requests are fast.
+SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableMultiRowGemm = true;
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.
