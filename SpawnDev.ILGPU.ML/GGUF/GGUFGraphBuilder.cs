@@ -44,6 +44,19 @@ public sealed record GGUFLowPWeight(byte[] Bytes, TensorDataType DType, long Str
 
 public static class GGUFGraphBuilder
 {
+    /// <summary>
+    /// When true, the LM head computes logits for ONLY the last sequence position at prefill (a Slice on the
+    /// final hidden state before output_norm), turning the output projection from an M=seq GEMM into an M=1
+    /// GEMV. For autoregressive generation only the last token's logits are sampled, so this is a pure waste
+    /// elimination that SCALES with prompt length (the logits node is qwen's single biggest prefill node, and
+    /// grows linearly with context). Decode (seq=1) is unaffected (Slice of the last of 1 row is a no-op).
+    /// Opt-in (env <c>GGUF_LAST_POS=1</c>) until the full sweep promotes it; the generation consumers
+    /// (<c>GgufGenerator</c>, Example 04) already read only the last position, so output is token-identical.
+    /// Do NOT enable for a graph whose ALL-position logits are needed (e.g. perplexity/eval over the prompt).
+    /// </summary>
+    public static bool EnableLastPositionLogits =
+        Environment.GetEnvironmentVariable("GGUF_LAST_POS") == "1";
+
     /// <param name="acceptInputsEmbeds">When true, the graph takes a pre-computed <c>inputs_embeds</c>
     /// [1, seq, n_embd] tensor and SKIPS the token Gather + gemma sqrt(n_embd) scale. The caller supplies the
     /// full embedding sequence (text rows gathered+scaled host-side, multimodal rows = RAW projected
@@ -338,8 +351,28 @@ public static class GGUFGraphBuilder
         // ═══════════════════════════════════════════════════════════
         //  3. Final norm
         // ═══════════════════════════════════════════════════════════
+        // Last-position-only logits (opt-in): slice the final hidden state [1, seq, n_embd] to its LAST seq
+        // position [1, 1, n_embd] BEFORE output_norm, so output_norm + the LM head run at M=1 (a GEMV) instead
+        // of M=seq. Only the last token's logits are sampled in generation, so this is waste elimination that
+        // scales with prompt length. Slice on axis 1 (seq) with start=-1 → the last row, resolved against the
+        // concrete seq dim each shape-recompile (so it is [1,1,n_embd] at any prefill length and a no-op at
+        // seq=1 decode). RMSNorm is per-row, so slice-then-norm == norm-then-slice for the kept row.
+        string headInput = prevOutput;
+        if (EnableLastPositionLogits)
+        {
+            AddNode(graph, "Slice", new[] { prevOutput }, new[] { "last_token_hidden" },
+                new Dictionary<string, JsonElement>
+                {
+                    ["starts"] = JsonSerializer.SerializeToElement(new long[] { -1 }),
+                    ["ends"] = JsonSerializer.SerializeToElement(new long[] { int.MaxValue }),
+                    ["axes"] = JsonSerializer.SerializeToElement(new long[] { 1 }),
+                    ["steps"] = JsonSerializer.SerializeToElement(new long[] { 1 }),
+                });
+            headInput = "last_token_hidden";
+        }
+
         string finalNormOut = "final_norm_out";
-        AddNorm(graph, model, weights, "output_norm", prevOutput, finalNormOut, embedDim, useRMSNorm);
+        AddNorm(graph, model, weights, "output_norm", headInput, finalNormOut, embedDim, useRMSNorm);
 
         // ═══════════════════════════════════════════════════════════
         //  4. LM head (output projection)

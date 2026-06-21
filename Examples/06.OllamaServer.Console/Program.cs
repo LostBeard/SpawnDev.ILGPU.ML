@@ -35,6 +35,12 @@ SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableMultiRowGemm = true;
 // falls back; huge-context SKV needs flash attention) — this testbed opts in.
 SpawnDev.ILGPU.ML.Kernels.FusedAttentionKernel.EnableGroupedAttention = true;
 
+// Last-position-only logits: at prefill the LM head computes logits for only the last token (the one being
+// sampled) instead of all prompt positions — turning the vocab projection (qwen's single biggest prefill node)
+// from M=seq into an M=1 GEMV. Waste elimination that SCALES with prompt length (big for agentic 16k+ prompts).
+// Token-identical (the generator only reads the last position); library-default off. Correct for generation only.
+SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.EnableLastPositionLogits = true;
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.

@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Last-position-only logits (prefill LM-head as an M=1 GEMV)
+
+**`GGUFGraphBuilder.EnableLastPositionLogits`: at prefill the LM head computes logits for ONLY the last
+sequence position instead of all prompt positions.** For autoregressive generation only the last token's
+logits are sampled, so computing the rest is pure waste. A `Slice` node (axis=1, start=-1) on the final hidden
+state before output_norm turns the vocab projection — qwen's single biggest prefill node — from an M=seq GEMM
+into an M=1 GEMV (~0 ms). Resolved against the concrete seq length each shape-recompile, so it's correct at any
+prefill length and a no-op at seq=1 decode. The win **scales with prompt length** (at 16k context the logits
+node would be seconds → ~0). Token-identical: both generation consumers (`GgufGenerator`, Example 04) already
+read only the last position; verified bit-identical generated tokens + logits on qwen2.5-coder (KV-decode and
+large-prefill) and gemma4 (incl. the final-logit soft-cap on the sliced output). New PMT test
+`GGUFLastPositionLogits_MatchesFullLastPosition` (sliced last row == full-recompute last position, argmax-strict)
+green on all 6 backends. Opt-in (env `GGUF_LAST_POS=1`); library-default off (the GGUF graph's all-position
+logits are still available for eval/perplexity). Example 06 server opts in.
+
 ## Unreleased — Metadata-cached dequant GEMM + two cross-backend dequant-path fixes
 
 **`FusedDequantMatMul` register-blocked Q4_K AND Q6_K GEMMs now cache per-column block metadata once per K-tile.**

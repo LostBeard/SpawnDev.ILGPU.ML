@@ -106,4 +106,61 @@ public partial class MLTestBase
         await RunPrecision(KVCachePrecision.F32, relTol: 2e-3f, absFloor: 2e-3f);   // exact store: tight layout gate
         await RunPrecision(KVCachePrecision.BF16, relTol: 6e-2f, absFloor: 6e-2f);  // bf16 store: argmax-strict, bf16 tol
     });
+
+    /// <summary>
+    /// Last-position-only logits (<see cref="GGUFGraphBuilder.EnableLastPositionLogits"/>): the graph slices the
+    /// final hidden state to its LAST sequence position before output_norm + the LM head, so the head runs at M=1.
+    /// For generation only the last token's logits are sampled, so the sliced graph's single logit row MUST equal
+    /// the full-recompute graph's LAST position. argmax must match EXACTLY (the token actually sampled); the logit
+    /// values agree within a loose tol because the M=1 head is a coalesced GEMV (different K-reduction order than
+    /// the M=seq GEMM/per-element head — same numerics-order caveat as the tiled-GEMM A/B). All 6 backends; the
+    /// Slice node also exercises the GGUF graph's last-position path on every backend.
+    /// </summary>
+    [TestMethod]
+    public async Task GGUFLastPositionLogits_MatchesFullLastPosition() => await RunTest(async accelerator =>
+    {
+        const int embd = 256, vocab = 32, ffn = 320, ctx = 64;
+        var bytes = BuildTinyQuantizedLlamaGGUF(embd, vocab, ffn, ctx, new Random(7));
+        var seq = new float[] { 3, 9, 21, 5 };
+
+        async Task<float[]> LastLogits(bool lastPosOnly)
+        {
+            bool saved = GGUFGraphBuilder.EnableLastPositionLogits;
+            try
+            {
+                GGUFGraphBuilder.EnableLastPositionLogits = lastPosOnly;
+                using var session = InferenceSession.CreateFromGGUF(accelerator, bytes);
+                using var inBuf = accelerator.Allocate1D(seq);
+                var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+                { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, seq.Length }, "input_ids") });
+                var lt = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
+                int outSeq = lt.ElementCount / vocab;
+                if (lastPosOnly && outSeq != 1)
+                    throw new Exception($"last-position graph produced {outSeq} logit rows, expected 1 ([1,1,vocab])");
+                using var read = accelerator.Allocate1D<float>(vocab);
+                await read.View.CopyFromAsync(lt.Data.SubView((long)(outSeq - 1) * vocab, vocab));
+                await accelerator.SynchronizeAsync();
+                return await read.CopyToHostAsync<float>(0, vocab);
+            }
+            finally { GGUFGraphBuilder.EnableLastPositionLogits = saved; }
+        }
+
+        var full = await LastLogits(lastPosOnly: false); // all positions, take the last
+        var sliced = await LastLogits(lastPosOnly: true); // [1,1,vocab]
+
+        int argFull = 0, argSliced = 0;
+        for (int v = 1; v < vocab; v++)
+        {
+            if (full[v] > full[argFull]) argFull = v;
+            if (sliced[v] > sliced[argSliced]) argSliced = v;
+        }
+        if (argFull != argSliced)
+            throw new Exception($"GGUFLastPositionLogits argmax {argSliced} != full-recompute last-position argmax {argFull}");
+
+        float maxErr = 0;
+        for (int v = 0; v < vocab; v++) maxErr = MathF.Max(maxErr, MathF.Abs(sliced[v] - full[v]));
+        Console.WriteLine($"[GGUFLastPos] sliced last-position logits vs full[last]: argmax={argSliced}, maxErr={maxErr:E3}");
+        if (maxErr > 1e-2f)
+            throw new Exception($"GGUFLastPositionLogits maxErr={maxErr:E3} > 1e-2 — sliced last position differs from full-recompute last position");
+    });
 }
