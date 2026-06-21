@@ -13,6 +13,7 @@ using ILGPU.Runtime.Cuda;
 using ILGPU.Runtime.OpenCL;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SpawnDev.ILGPU.ML;
@@ -129,6 +130,40 @@ if (args.Contains("--list"))
     builder.Logging.ClearProviders();
     builder.WebHost.UseUrls($"http://localhost:{port}");
     var app = builder.Build();
+
+    // Diagnostic + hardening: log every request (method/path/body) and any unhandled exception to a file, and
+    // turn a crash into a clean error instead of a dropped connection. Captures real Claude CLI traffic so we can
+    // see exactly what it sends and where it breaks. Log: %TEMP%\claude-cli-requests.log.
+    var reqLog = Path.Combine(Path.GetTempPath(), "claude-cli-requests.log");
+    Console.WriteLine($"  request log: {reqLog}");
+    app.Use(async (ctx, next) =>
+    {
+        ctx.Request.EnableBuffering();
+        string body = "";
+        if ((ctx.Request.ContentLength ?? 0) > 0)
+        {
+            using var rd = new StreamReader(ctx.Request.Body, leaveOpen: true);
+            body = await rd.ReadToEndAsync();
+            ctx.Request.Body.Position = 0;
+        }
+        string bodyShort = body.Length > 4000 ? body[..4000] + "…" : body;
+        try
+        {
+            await next();
+            File.AppendAllText(reqLog, $"[{DateTime.Now:HH:mm:ss}] {ctx.Request.Method} {ctx.Request.Path} -> {ctx.Response.StatusCode}\n  body: {bodyShort}\n\n");
+        }
+        catch (Exception ex)
+        {
+            File.AppendAllText(reqLog, $"[{DateTime.Now:HH:mm:ss}] {ctx.Request.Method} {ctx.Request.Path} -> EXCEPTION\n  body: {bodyShort}\n  ex: {ex}\n\n");
+            if (!ctx.Response.HasStarted)
+            {
+                ctx.Response.StatusCode = 500;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync("{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":" + System.Text.Json.JsonSerializer.Serialize(ex.Message) + "}}");
+            }
+        }
+    });
+
     app.MapOllamaApi(registry);
 
     Console.WriteLine($"SpawnDev.ILGPU.ML — Ollama-compatible server");

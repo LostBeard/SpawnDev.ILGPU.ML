@@ -28,6 +28,7 @@ public static class ServerEndpoints
     {
         // ── Liveness / version ────────────────────────────────────────────────────────────────────
         app.MapGet("/", () => Results.Text("Ollama is running (SpawnDev.ILGPU.ML)"));
+        app.MapMethods("/", new[] { "HEAD" }, () => Results.Ok()); // Claude CLI / clients ping HEAD for liveness
         app.MapGet("/api/version", () => Results.Json(new { version = "0.1.0-spawndev" }, J));
 
         // ── Model listing ─────────────────────────────────────────────────────────────────────────
@@ -412,15 +413,19 @@ public static class ServerEndpoints
         return "";
     }
 
+    // Cap requested output tokens — agentic clients ask for huge values (Claude CLI: 32000) that a small local
+    // model would either ramble into or that wouldn't fit the context.
+    private const int MaxOutputTokens = 4096;
+
     private static GenerationConfig ReadOpenAiConfig(JsonElement req)
     {
-        var cfg = new GenerationConfig { MaxNewTokens = GetInt(req, "max_tokens") ?? GetInt(req, "max_completion_tokens") ?? 512 };
+        var cfg = new GenerationConfig { MaxNewTokens = Math.Min(GetInt(req, "max_tokens") ?? GetInt(req, "max_completion_tokens") ?? 512, MaxOutputTokens) };
         ApplySampling(cfg, GetFloat(req, "temperature"), GetFloat(req, "top_p"), null, GetInt(req, "seed"));
         return cfg;
     }
     private static GenerationConfig ReadAnthropicConfig(JsonElement req)
     {
-        var cfg = new GenerationConfig { MaxNewTokens = GetInt(req, "max_tokens") ?? 512 };
+        var cfg = new GenerationConfig { MaxNewTokens = Math.Min(GetInt(req, "max_tokens") ?? 512, MaxOutputTokens) };
         ApplySampling(cfg, GetFloat(req, "temperature"), GetFloat(req, "top_p"), GetInt(req, "top_k"), null);
         return cfg;
     }
@@ -429,7 +434,7 @@ public static class ServerEndpoints
         var cfg = new GenerationConfig { MaxNewTokens = 512 };
         if (req.TryGetProperty("options", out var o) && o.ValueKind == JsonValueKind.Object)
         {
-            cfg.MaxNewTokens = GetInt(o, "num_predict") ?? 512;
+            cfg.MaxNewTokens = Math.Min(GetInt(o, "num_predict") ?? 512, MaxOutputTokens);
             ApplySampling(cfg, GetFloat(o, "temperature"), GetFloat(o, "top_p"), GetInt(o, "top_k"), GetInt(o, "seed"));
         }
         return cfg;

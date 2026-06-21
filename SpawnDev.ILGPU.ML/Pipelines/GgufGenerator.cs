@@ -43,6 +43,7 @@ public sealed class GgufGenerator : IDisposable
     private readonly GGUFDecodeKVCache _cache;
     private readonly GpuArgMax _argmax;
     private readonly int _eosId;
+    private readonly int _maxSeqLen;
 
     /// <summary>The model's tokenizer (SentencePiece, from the GGUF vocab).</summary>
     public SentencePieceTokenizer Tokenizer => _tokenizer;
@@ -75,6 +76,7 @@ public sealed class GgufGenerator : IDisposable
         _session.EnableGGUFDecode(_cache);
         _session.CacheShapeReadbacks = true; // recycle fixed-shape decode buffers + warm-cache stable readbacks
         _eosId = _tokenizer.EosId;
+        _maxSeqLen = maxSeqLen;
         _argmax = new GpuArgMax(accelerator);
     }
 
@@ -95,6 +97,21 @@ public sealed class GgufGenerator : IDisposable
     {
         _session.ResetGGUFDecode();
         int maxNew = config?.MaxNewTokens is int mn && mn > 0 ? mn : 128;
+
+        // Fit prompt + generation into the KV cache. Agentic clients (Claude CLI) routinely send prompts far
+        // larger than a small local model's context (they assume a 200K-context Claude) and ask for huge
+        // max_tokens — so an over-long prompt is TAIL-truncated (keep the most recent tokens, which hold the
+        // actual question) and maxNew is capped, rather than overflowing the cache and crashing.
+        if (promptIds.Length + maxNew > _maxSeqLen - 1)
+        {
+            int reserve = Math.Clamp(maxNew, 64, Math.Max(64, _maxSeqLen / 8));
+            int keep = _maxSeqLen - 1 - reserve;
+            if (keep >= 1 && promptIds.Length > keep)
+                promptIds = promptIds[^keep..];
+            maxNew = Math.Min(maxNew, _maxSeqLen - 1 - promptIds.Length);
+            if (maxNew < 1) maxNew = 1;
+        }
+
         var rng = config?.Seed is int seed ? new Random(seed) : Random.Shared;
         var detok = _tokenizer.CreateStreamingDecoder();
         var generated = new List<int>();
