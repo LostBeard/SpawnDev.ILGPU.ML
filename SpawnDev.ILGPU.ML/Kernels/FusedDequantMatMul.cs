@@ -81,7 +81,7 @@ public class FusedDequantMatMul : IDisposable
         Environment.GetEnvironmentVariable("GGUF_GEMM_MR") == "1";
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemmMRQ4_K, _gemmMRQ6_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemmMRQ4_K, _gemmMRQ6_K, _rbQ4_K, _rbQ6_K;
 
     // Params buffers cached per (M,K,N). Never disposed mid-session: a WebGPU dispatch
     // that referenced the buffer may still be pending in the command encoder, and
@@ -191,6 +191,28 @@ public class FusedDequantMatMul : IDisposable
         // memory; WebGPU's workgroup reduction is slow on Tint/Dawn — both keep the per-element kernel below).
         if (M > 1 && EnableMultiRowGemm && !gpuBrowser && (type == GGMLType.Q4_K || type == GGMLType.Q6_K))
         {
+            // M>=RB_TILE (large prefill): FLOP-efficient register-blocked tiled dequant GEMM. Smaller M: multi-row.
+            if (M >= RB_TILE)
+            {
+                var rbConfig = new KernelConfig(
+                    ((M + RB_TILE - 1) / RB_TILE) * ((N + RB_TILE - 1) / RB_TILE), RB_BLOCK * RB_BLOCK);
+                if (type == GGMLType.Q4_K)
+                {
+                    _rbQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(RegBlockedDequantQ4_KImpl);
+                    _rbQ4_K(rbConfig, input, intView, output, paramsBuf.View);
+                }
+                else
+                {
+                    _rbQ6_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(RegBlockedDequantQ6_KImpl);
+                    _rbQ6_K(rbConfig, input, intView, output, paramsBuf.View);
+                }
+                return;
+            }
+
             var mrConfig = new KernelConfig(N * ((M + GemmMTile - 1) / GemmMTile), GemvGroupSize);
             if (type == GGMLType.Q4_K)
             {
@@ -481,6 +503,14 @@ public class FusedDequantMatMul : IDisposable
     // per-element kernel (the prefill bottleneck). Small enough that the per-thread accumulators stay in regs.
     private const int GemmMTile = 8;
 
+    // Register-blocked dequant GEMM (the FLOP-efficient prefill path for M>=RB_TILE). Mirrors the verified f32
+    // RegisterBlockedMatMul (16x16 block, each thread a 4x4 register tile, 64x64 output tile) — the ONLY change
+    // is the B (weight) tile is dequantized on load into shared memory, then reused REG×BLOCK times from
+    // registers. So a weight element is dequantized once per K-tile and amortized across the whole output tile.
+    private const int RB_BLOCK = 16;  // 16x16 = 256 threads
+    private const int RB_REG = 4;     // each thread computes REG x REG outputs
+    private const int RB_TILE = RB_BLOCK * RB_REG; // 64x64 output tile
+
     /// <summary>
     /// Q4_K dequant GEMM for M&gt;1 (prefill). Group-per-(output column n, M-tile): the group walks the column's
     /// Q4_K blocks coalesced (identical to the M=1 GEMV), dequantizes each element ONCE via
@@ -603,6 +633,153 @@ public class FusedDequantMatMul : IDisposable
             if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
             Group.Barrier();
         }
+    }
+
+    /// <summary>Register-blocked dequant GEMM for Q4_K, M&gt;=RB_TILE (prefill). The verified f32
+    /// RegisterBlockedMatMul with ONLY the B(weight) tile dequantized on load: W is stored [N,K], so the
+    /// GEMM's B[k][n] = W[n][k] = <see cref="DecodeQ4KElement"/>(w, n·bytesPerRow, k). Each weight element is
+    /// dequantized ONCE per K-tile and amortized across the 64×64 output tile (16 MACs/k from registers).</summary>
+    private static void RegBlockedDequantQ4_KImpl(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> C,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int numTilesN = (N + RB_TILE - 1) / RB_TILE;
+        int bytesPerRow = K / 256 * 144;
+
+        var aTile = SharedMemory.Allocate<float>(RB_TILE * RB_BLOCK);
+        var bTile = SharedMemory.Allocate<float>(RB_BLOCK * RB_TILE);
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;
+        int tileCol = tileIdx % numTilesN;
+        int threadRow = Group.IdxX / RB_BLOCK;
+        int threadCol = Group.IdxX % RB_BLOCK;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0, c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0, c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + RB_BLOCK - 1) / RB_BLOCK;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            for (int r = 0; r < RB_REG; r++)
+            {
+                int aRow = tileRow * RB_TILE + threadRow * RB_REG + r;
+                int aCol = t * RB_BLOCK + threadCol;
+                aTile[(threadRow * RB_REG + r) * RB_BLOCK + threadCol] = (aRow < M && aCol < K) ? A[aRow * K + aCol] : 0f;
+            }
+            for (int r = 0; r < RB_REG; r++)
+            {
+                int bRow = t * RB_BLOCK + threadRow;                    // k
+                int bCol = tileCol * RB_TILE + threadCol * RB_REG + r;  // n
+                bTile[threadRow * RB_TILE + threadCol * RB_REG + r] =
+                    (bRow < K && bCol < N) ? DecodeQ4KElement(w, bCol * bytesPerRow, bRow) : 0f; // dequant ONCE
+            }
+            Group.Barrier();
+            for (int k = 0; k < RB_BLOCK; k++)
+            {
+                float a0 = aTile[(threadRow * RB_REG + 0) * RB_BLOCK + k];
+                float a1 = aTile[(threadRow * RB_REG + 1) * RB_BLOCK + k];
+                float a2 = aTile[(threadRow * RB_REG + 2) * RB_BLOCK + k];
+                float a3 = aTile[(threadRow * RB_REG + 3) * RB_BLOCK + k];
+                float b0 = bTile[k * RB_TILE + threadCol * RB_REG + 0];
+                float b1 = bTile[k * RB_TILE + threadCol * RB_REG + 1];
+                float b2 = bTile[k * RB_TILE + threadCol * RB_REG + 2];
+                float b3 = bTile[k * RB_TILE + threadCol * RB_REG + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+            Group.Barrier();
+        }
+        WriteRegTile(C, M, N, tileRow * RB_TILE + threadRow * RB_REG, tileCol * RB_TILE + threadCol * RB_REG,
+            c00, c01, c02, c03, c10, c11, c12, c13, c20, c21, c22, c23, c30, c31, c32, c33);
+    }
+
+    /// <summary>Q6_K register-blocked dequant GEMM (Q6_K analogue: 210-byte blocks, <see cref="DecodeQ6KElement"/>).</summary>
+    private static void RegBlockedDequantQ6_KImpl(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> C,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int numTilesN = (N + RB_TILE - 1) / RB_TILE;
+        int bytesPerRow = K / 256 * 210;
+
+        var aTile = SharedMemory.Allocate<float>(RB_TILE * RB_BLOCK);
+        var bTile = SharedMemory.Allocate<float>(RB_BLOCK * RB_TILE);
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;
+        int tileCol = tileIdx % numTilesN;
+        int threadRow = Group.IdxX / RB_BLOCK;
+        int threadCol = Group.IdxX % RB_BLOCK;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0, c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0, c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + RB_BLOCK - 1) / RB_BLOCK;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            for (int r = 0; r < RB_REG; r++)
+            {
+                int aRow = tileRow * RB_TILE + threadRow * RB_REG + r;
+                int aCol = t * RB_BLOCK + threadCol;
+                aTile[(threadRow * RB_REG + r) * RB_BLOCK + threadCol] = (aRow < M && aCol < K) ? A[aRow * K + aCol] : 0f;
+            }
+            for (int r = 0; r < RB_REG; r++)
+            {
+                int bRow = t * RB_BLOCK + threadRow;
+                int bCol = tileCol * RB_TILE + threadCol * RB_REG + r;
+                bTile[threadRow * RB_TILE + threadCol * RB_REG + r] =
+                    (bRow < K && bCol < N) ? DecodeQ6KElement(w, bCol * bytesPerRow, bRow) : 0f;
+            }
+            Group.Barrier();
+            for (int k = 0; k < RB_BLOCK; k++)
+            {
+                float a0 = aTile[(threadRow * RB_REG + 0) * RB_BLOCK + k];
+                float a1 = aTile[(threadRow * RB_REG + 1) * RB_BLOCK + k];
+                float a2 = aTile[(threadRow * RB_REG + 2) * RB_BLOCK + k];
+                float a3 = aTile[(threadRow * RB_REG + 3) * RB_BLOCK + k];
+                float b0 = bTile[k * RB_TILE + threadCol * RB_REG + 0];
+                float b1 = bTile[k * RB_TILE + threadCol * RB_REG + 1];
+                float b2 = bTile[k * RB_TILE + threadCol * RB_REG + 2];
+                float b3 = bTile[k * RB_TILE + threadCol * RB_REG + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+            Group.Barrier();
+        }
+        WriteRegTile(C, M, N, tileRow * RB_TILE + threadRow * RB_REG, tileCol * RB_TILE + threadCol * RB_REG,
+            c00, c01, c02, c03, c10, c11, c12, c13, c20, c21, c22, c23, c30, c31, c32, c33);
+    }
+
+    private static void WriteRegTile(ArrayView1D<float, Stride1D.Dense> C, int M, int N, int baseRow, int baseCol,
+        float c00, float c01, float c02, float c03, float c10, float c11, float c12, float c13,
+        float c20, float c21, float c22, float c23, float c30, float c31, float c32, float c33)
+    {
+        if (baseRow + 0 < M && baseCol + 0 < N) C[(baseRow + 0) * N + baseCol + 0] = c00;
+        if (baseRow + 0 < M && baseCol + 1 < N) C[(baseRow + 0) * N + baseCol + 1] = c01;
+        if (baseRow + 0 < M && baseCol + 2 < N) C[(baseRow + 0) * N + baseCol + 2] = c02;
+        if (baseRow + 0 < M && baseCol + 3 < N) C[(baseRow + 0) * N + baseCol + 3] = c03;
+        if (baseRow + 1 < M && baseCol + 0 < N) C[(baseRow + 1) * N + baseCol + 0] = c10;
+        if (baseRow + 1 < M && baseCol + 1 < N) C[(baseRow + 1) * N + baseCol + 1] = c11;
+        if (baseRow + 1 < M && baseCol + 2 < N) C[(baseRow + 1) * N + baseCol + 2] = c12;
+        if (baseRow + 1 < M && baseCol + 3 < N) C[(baseRow + 1) * N + baseCol + 3] = c13;
+        if (baseRow + 2 < M && baseCol + 0 < N) C[(baseRow + 2) * N + baseCol + 0] = c20;
+        if (baseRow + 2 < M && baseCol + 1 < N) C[(baseRow + 2) * N + baseCol + 1] = c21;
+        if (baseRow + 2 < M && baseCol + 2 < N) C[(baseRow + 2) * N + baseCol + 2] = c22;
+        if (baseRow + 2 < M && baseCol + 3 < N) C[(baseRow + 2) * N + baseCol + 3] = c23;
+        if (baseRow + 3 < M && baseCol + 0 < N) C[(baseRow + 3) * N + baseCol + 0] = c30;
+        if (baseRow + 3 < M && baseCol + 1 < N) C[(baseRow + 3) * N + baseCol + 1] = c31;
+        if (baseRow + 3 < M && baseCol + 2 < N) C[(baseRow + 3) * N + baseCol + 2] = c32;
+        if (baseRow + 3 < M && baseCol + 3 < N) C[(baseRow + 3) * N + baseCol + 3] = c33;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
