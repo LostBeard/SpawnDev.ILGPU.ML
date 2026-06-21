@@ -119,7 +119,10 @@ if (args.Contains("--list"))
     var cudaDevs = serverCtx.GetCudaDevices();
     var dev = cudaDevs.Count > 0 ? (Device)cudaDevs[0] : serverCtx.GetPreferredDevice(preferCPU: false);
     using var serverAccel = dev.CreateAccelerator(serverCtx);
-    await using var registry = new ModelRegistry(store, serverAccel);
+    // 16K context — agentic frontends (Claude CLI) send a large system prompt + tool defs; 8K can overflow.
+    // Capped to the model's own context length in the registry. Override via OLLAMA_NUM_CTX.
+    int maxCtx = int.TryParse(Environment.GetEnvironmentVariable("OLLAMA_NUM_CTX"), out var nc) ? nc : 16384;
+    await using var registry = new ModelRegistry(store, serverAccel, maxSeqLen: maxCtx);
 
     int port = int.TryParse(Environment.GetEnvironmentVariable("OLLAMA_PORT"), out var p) ? p : 11434;
     var builder = WebApplication.CreateBuilder();
