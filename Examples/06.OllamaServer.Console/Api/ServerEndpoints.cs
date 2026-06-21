@@ -16,6 +16,14 @@ public static class ServerEndpoints
 {
     private static readonly JsonSerializerOptions J = new(JsonSerializerDefaults.Web);
 
+    // Protocol-shaped error responses (so a client probing an unknown model gets a clean 404 it understands,
+    // not an opaque 500). The server stays up either way.
+    private static IResult OpenAiError(string msg, int code) =>
+        Results.Json(new { error = new { message = msg, type = "invalid_request_error", code = "model_not_found" } }, J, statusCode: code);
+    private static IResult OllamaError(string msg, int code) => Results.Json(new { error = msg }, J, statusCode: code);
+    private static IResult AnthropicError(string msg, int code) =>
+        Results.Json(new { type = "error", error = new { type = "not_found_error", message = msg } }, J, statusCode: code);
+
     public static void MapOllamaApi(this IEndpointRouteBuilder app, ModelRegistry registry)
     {
         // ── Liveness / version ────────────────────────────────────────────────────────────────────
@@ -46,6 +54,7 @@ public static class ServerEndpoints
         {
             var req = await ReadJsonAsync(ctx);
             string model = GetString(req, "model") ?? "";
+            if (registry.Store.Resolve(model) == null) return OpenAiError($"model '{model}' not found in the Ollama cache", StatusCodes.Status404NotFound);
             var messages = ParseMessages(req, "messages");
             bool stream = GetBool(req, "stream") ?? false;
             var cfg = ReadOpenAiConfig(req);
@@ -84,6 +93,7 @@ public static class ServerEndpoints
         {
             var req = await ReadJsonAsync(ctx);
             string model = GetString(req, "model") ?? "";
+            if (registry.Store.Resolve(model) == null) return OllamaError($"model '{model}' not found", StatusCodes.Status404NotFound);
             var messages = ParseMessages(req, "messages");
             bool stream = GetBool(req, "stream") ?? true; // Ollama defaults to streaming
             var cfg = ReadOllamaOptions(req);
@@ -107,6 +117,7 @@ public static class ServerEndpoints
         {
             var req = await ReadJsonAsync(ctx);
             string model = GetString(req, "model") ?? "";
+            if (registry.Store.Resolve(model) == null) return OllamaError($"model '{model}' not found", StatusCodes.Status404NotFound);
             string prompt = GetString(req, "prompt") ?? "";
             bool stream = GetBool(req, "stream") ?? true;
             var cfg = ReadOllamaOptions(req);
@@ -139,6 +150,7 @@ public static class ServerEndpoints
         {
             var req = await ReadJsonAsync(ctx);
             string model = GetString(req, "model") ?? "";
+            if (registry.Store.Resolve(model) == null) return AnthropicError($"model '{model}' not found in the Ollama cache", StatusCodes.Status404NotFound);
             var messages = ParseMessages(req, "messages", anthropicSystem: GetString(req, "system"));
             bool stream = GetBool(req, "stream") ?? false;
             var cfg = ReadAnthropicConfig(req);
