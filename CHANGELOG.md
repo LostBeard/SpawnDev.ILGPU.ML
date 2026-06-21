@@ -2,6 +2,27 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Grouped-per-query fused attention (prefill attention win)
+
+**`FusedAttentionKernel` grouped-per-query path: each Q·K score is computed ONCE instead of once per output
+dim.** The per-element kernel launches one thread per `(head, query, dim)` output and recomputes the full
+D-length Q·K dot for every output dim — D-fold redundant (D=128 → 128×). After the dequant-GEMM landed this
+made FusedAttention ~70% of long-prompt prefill. The grouped kernel runs one thread GROUP per `(head, query)`:
+phase 1 computes each score once into shared `scores[]`, phase 2 has each thread own a slice of the D output
+dims and replay the IDENTICAL online-softmax recurrence per dim reading the shared score. Because the
+per-output-element math is reproduced operation-for-operation (same dd-order dot, same Max/Exp recurrence, same
+sink epilogue), the result is **BIT-IDENTICAL** to the per-element kernel.
+- **Measured (qwen2.5-coder Q4_K_M, RTX 4070, 1081-token prefill): FusedAttention 17.8s → 1.2s (~14.5×,
+  72.3% → 15.2% of prefill); total prefill 24.6s → 8.1s.** MatMul is again the dominant node.
+- **Verified:** A/B byte-identical generated tokens AND logits on qwen2.5-coder + gemma4 (head_dim 128 and 256,
+  GQA, causal + sliding-window, custom scale, bf16 strided KV-cache path). New PMT test
+  `FusedAttention_Grouped_MatchesPerElement` asserts grouped == per-element across all 6 backends (42/42 green);
+  grouped runs on CPU/CUDA/OpenCL/Wasm, falls back to per-element on WebGL (no workgroup shared memory) /
+  WebGPU (slow workgroup reduction) and for SKV beyond the shared cap.
+- **Opt-in** (`FusedAttentionKernel.EnableGroupedAttention` / env `GGUF_ATTN_GROUP=1`); library-default off
+  pending the full sweep (mirrors `EnableMultiRowGemm`). Example 06 server opts in. Huge-context prefill
+  (SKV > 4096) still uses the per-element kernel — kv-tiled flash attention is the follow-up.
+
 ## Unreleased — Ollama-compatible inference server (Example 06) + general generation core
 
 **New library generation core, plus a drop-in Ollama-replacement Example so prebuilt agentic frontends

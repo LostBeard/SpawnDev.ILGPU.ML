@@ -28,6 +28,13 @@ using OllamaServer.Console.Api;
 // testbed opts in so long-prompt / tool-calling requests are fast.
 SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableMultiRowGemm = true;
 
+// Enable the grouped-per-query fused attention (the prefill attention win): each Q·K score is computed ONCE
+// in shared memory instead of once per output dim, so FusedAttention drops ~14.5x at long prompts
+// (qwen2.5-coder @1081 tok: 17.8s -> 1.2s; prefill 24.6s -> 8.1s). A/B-verified bit-identical tokens on
+// qwen2.5-coder + gemma4 and grouped==per-element across all 6 backends (PMT). Library-default off (browser-GPU
+// falls back; huge-context SKV needs flash attention) — this testbed opts in.
+SpawnDev.ILGPU.ML.Kernels.FusedAttentionKernel.EnableGroupedAttention = true;
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.

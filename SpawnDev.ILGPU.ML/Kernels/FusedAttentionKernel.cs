@@ -74,6 +74,38 @@ public class FusedAttentionKernel : IDisposable
         return view;
     }
 
+    // ── Grouped-per-query attention (the prefill win) ──
+    // The per-element kernels above launch ONE thread per (bh, sq, d) output element, and each thread
+    // recomputes the FULL D-length Q·K dot once per output dim d — the score depends only on (bh, sq, kv),
+    // so the dot is computed D times redundantly (D=128 → 128×). At long prompts this made FusedAttention
+    // ~70% of prefill. The grouped kernel runs ONE thread GROUP per (bh, sq) query: phase 1 computes each
+    // Q·K score EXACTLY ONCE into shared scores[SKV] (cooperatively across the group), then phase 2 has each
+    // thread own a slice of the D output dims and replay the IDENTICAL online-softmax recurrence per dim
+    // reading the shared score instead of recomputing the dot. Because the per-output-element math is
+    // reproduced operation-for-operation (same dd-order dot, same Max/Exp recurrence, same sink epilogue),
+    // the output is BIT-IDENTICAL to the per-element kernel — only the redundant dot work is removed.
+    //
+    // Shape: one group per (bh, sq) = nHeads*seqQ groups, AttnGroupSize threads each. The dot loop and the
+    // V-accumulation are each O(SKV·D) per query (vs the per-element kernel's O(SKV·D²) dot), so ~D/2 less work.
+    //
+    // GATING (mirrors the GEMV / tiled-GEMM): shared scores[] is a fixed-size static allocation, so SKV must
+    // be ≤ AttnSharedSkvMax and headDim ≤ AttnHeadDimMax — anything larger falls back to the per-element
+    // kernel (huge-context prefill needs kv-tiled flash attention, the documented follow-up). Browser-GPU
+    // backends keep the per-element kernel too: WebGL has no workgroup shared memory, and WebGPU's
+    // workgroup reduction maps ~75× slow onto Tint/Dawn (same reason the cooperative GEMV is desktop-only).
+    // Opt-in (env GGUF_ATTN_GROUP=1 / EnableGroupedAttention) until the full 6-backend sweep promotes it.
+    private const int AttnGroupSize = 64;       // power of two; ≤ CPU's 64-thread group cap
+    private const int AttnSharedSkvMax = 4096;  // scores[] fits CUDA's 48KB shared (16KB) with occupancy headroom
+    private const int AttnHeadDimMax = 256;     // qShared[]; covers gemma4's 256-dim heads
+    public static bool EnableGroupedAttention =
+        Environment.GetEnvironmentVariable("GGUF_ATTN_GROUP") == "1";
+
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _groupedKernel;
+    private readonly Dictionary<Type, object> _groupedStridedKernels = new();
+
     public FusedAttentionKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -146,17 +178,40 @@ public class FusedAttentionKernel : IDisposable
 
         var paramsView = RentParamsSlot(paramsData);
 
+        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
+        var sinksView = sinks ?? _dummySinks.View;
+
+        // Grouped-per-query path (the dot computed ONCE; bit-identical, opt-in, non-browser-GPU, SKV-gated).
+        if (UseGrouped(seqKV, headDim))
+        {
+            _groupedKernel ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<int, Stride1D.Dense>>(FusedAttentionGroupedImpl);
+            _groupedKernel(new KernelConfig(nHeads * seqQ, AttnGroupSize), Q, K, V, output, sinksView, paramsView);
+            return;
+        }
+
         _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
 
-        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
-        var sinksView = sinks ?? _dummySinks.View;
-
         // One thread per output element: nHeads * seqQ * headDim
         _kernel(nHeads * seqQ * headDim, Q, K, V, output, sinksView, paramsView);
     }
+
+    /// <summary>
+    /// Whether the grouped-per-query kernel applies: opted in, a non-browser-GPU backend (WebGL has no
+    /// workgroup shared memory; WebGPU's workgroup reduction is ~75× slow on Tint/Dawn), and the per-query
+    /// scores[]+qShared[] fit the fixed shared allocations. Otherwise the per-element kernel runs.
+    /// </summary>
+    private bool UseGrouped(int seqKV, int headDim) =>
+        EnableGroupedAttention
+        && _accelerator.AcceleratorType != AcceleratorType.WebGL
+        && _accelerator.AcceleratorType != AcceleratorType.WebGPU
+        && seqKV <= AttnSharedSkvMax
+        && headDim <= AttnHeadDimMax;
 
     /// <summary>
     /// Fused attention reading K/V in a NATIVE type <typeparamref name="T"/> (<c>BFloat16</c> or <c>float</c>),
@@ -195,14 +250,32 @@ public class FusedAttentionKernel : IDisposable
 
         var paramsView = RentParamsSlot(paramsData);
 
+        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
+        var sinksView = sinks ?? _dummySinks.View;
+
+        // Grouped-per-query path (bit-identical, opt-in, non-browser-GPU, SKV-gated) — this is the prefill
+        // hotpath (the KV-cache strided bf16 read), so the win lands HERE as well as the contiguous Forward.
+        if (UseGrouped(seqKV, headDim))
+        {
+            if (!_groupedStridedKernels.TryGetValue(typeof(T), out var gk))
+                _groupedStridedKernels[typeof(T)] = gk = _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                    ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(
+                    FusedAttentionGroupedStridedImpl<T>);
+            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)gk)(
+                new KernelConfig(nHeads * seqQ, AttnGroupSize), Q, K, V, output, sinksView, paramsView);
+            return;
+        }
+
         if (!_stridedKernels.TryGetValue(typeof(T), out var k))
             _stridedKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
                 ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionStridedImpl<T>);
 
-        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
-        var sinksView = sinks ?? _dummySinks.View;
         ((Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
             ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)k)(
@@ -365,6 +438,181 @@ public class FusedAttentionKernel : IDisposable
         }
 
         output[idx] = weightedV / (runningSum + 1e-10f);
+    }
+
+    /// <summary>
+    /// Grouped-per-query fused attention (contiguous f32 K/V). One thread GROUP per (bh, sq):
+    /// phase 1 computes each Q·K score EXACTLY ONCE into shared <c>scores[]</c> (cooperatively, kills the
+    /// per-element kernel's D-fold redundant dot); phase 2 has each thread own a slice of the D output dims
+    /// and replay the IDENTICAL online-softmax recurrence of <see cref="FusedAttentionImpl"/> per dim,
+    /// reading the shared score instead of recomputing the dot — so the result is BIT-IDENTICAL.
+    /// </summary>
+    private static void FusedAttentionGroupedImpl(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<float, Stride1D.Dense> K,
+        ArrayView1D<float, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int sinkCount = p[9];
+
+        int g = Grid.IdxX;        // one group per (bh, sq)
+        int tid = Group.IdxX;     // 0..AttnGroupSize-1
+        int bh = g / SQ;
+        int sq = g % SQ;
+
+        int kvHead = bh / gqaGroup;
+        int qBase = (bh * SQ + sq) * D;
+        int qPos = kvOffset + sq;
+
+        var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
+        var scores = SharedMemory.Allocate<float>(AttnSharedSkvMax);
+
+        // Load this query's Q row into shared once (an exact copy → the dot stays bit-identical).
+        for (int dd = tid; dd < D; dd += AttnGroupSize)
+            qSh[dd] = Q[qBase + dd];
+        Group.Barrier();
+
+        // Phase 1: each kv score computed ONCE. Masking is the SAME branch-free sign-bit arithmetic as the
+        // per-element kernel, so the stored value (incl. the -1e30 sentinel for masked positions) matches.
+        for (int kv = tid; kv < SKV; kv += AttnGroupSize)
+        {
+            int kBase = (kvHead * SKV + kv) * D;
+            float dot = 0f;
+            for (int dd = 0; dd < D; dd++)
+                dot += qSh[dd] * K[kBase + dd];
+            float score = dot * scale;
+
+            int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
+            int windowOk = ((qPos - window - kv) >> 31) & 1;
+            int valid = causalOk & windowOk;
+            scores[kv] = score * valid + -1e30f * (1 - valid);
+        }
+        Group.Barrier();
+
+        // Phase 2: each thread owns output dims d = tid, tid+G, … < D and replays the per-element online
+        // softmax over the resident scores — operation-for-operation identical to FusedAttentionImpl.
+        for (int d = tid; d < D; d += AttnGroupSize)
+        {
+            float runningMax = -1e10f;
+            float runningSum = 0f;
+            float weightedV = 0f;
+            for (int kv = 0; kv < SKV; kv++)
+            {
+                float score = scores[kv];
+                float newMax = MathF.Max(runningMax, score);
+                float correction = MathF.Exp(runningMax - newMax);
+                float weight = MathF.Exp(score - newMax);
+                runningSum = runningSum * correction + weight;
+                weightedV = weightedV * correction + weight * V[(kvHead * SKV + kv) * D + d];
+                runningMax = newMax;
+            }
+
+            if (sinkCount > 0)
+            {
+                float sink = sinks[bh % sinkCount];
+                float newMax = MathF.Max(runningMax, sink);
+                float correction = MathF.Exp(runningMax - newMax);
+                runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+                weightedV = weightedV * correction;
+                runningMax = newMax;
+            }
+
+            output[qBase + d] = weightedV / (runningSum + 1e-10f);
+        }
+    }
+
+    /// <summary>
+    /// Strided + native-low-p <typeparamref name="T"/> K/V variant of <see cref="FusedAttentionGroupedImpl"/>
+    /// (the KV-cache prefill path). Identical grouped structure; K/V read in type T and converted in-register
+    /// (<c>PrecisionConvert.ConvertToSingle</c>) with the per-head element stride <c>p[10]</c>. With T=float and
+    /// <c>p[10]=SKV*D</c> it is byte-identical to <see cref="FusedAttentionGroupedImpl"/> and, in turn, to the
+    /// per-element <see cref="FusedAttentionStridedImpl{T}"/> (the correctness anchor).
+    /// </summary>
+    private static void FusedAttentionGroupedStridedImpl<T>(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<T, Stride1D.Dense> K,
+        ArrayView1D<T, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
+        ArrayView1D<int, Stride1D.Dense> p)
+        where T : unmanaged, INumber<T>
+    {
+        int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int sinkCount = p[9];
+        int kvStride = p[10];
+
+        int g = Grid.IdxX;
+        int tid = Group.IdxX;
+        int bh = g / SQ;
+        int sq = g % SQ;
+
+        int kvHead = bh / gqaGroup;
+        int qBase = (bh * SQ + sq) * D;
+        int qPos = kvOffset + sq;
+
+        var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
+        var scores = SharedMemory.Allocate<float>(AttnSharedSkvMax);
+
+        for (int dd = tid; dd < D; dd += AttnGroupSize)
+            qSh[dd] = Q[qBase + dd];
+        Group.Barrier();
+
+        for (int kv = tid; kv < SKV; kv += AttnGroupSize)
+        {
+            int kBase = kvHead * kvStride + kv * D;
+            float dot = 0f;
+            for (int dd = 0; dd < D; dd++)
+                dot += qSh[dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+            float score = dot * scale;
+
+            int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
+            int windowOk = ((qPos - window - kv) >> 31) & 1;
+            int valid = causalOk & windowOk;
+            scores[kv] = score * valid + -1e30f * (1 - valid);
+        }
+        Group.Barrier();
+
+        for (int d = tid; d < D; d += AttnGroupSize)
+        {
+            float runningMax = -1e10f;
+            float runningSum = 0f;
+            float weightedV = 0f;
+            for (int kv = 0; kv < SKV; kv++)
+            {
+                float score = scores[kv];
+                float newMax = MathF.Max(runningMax, score);
+                float correction = MathF.Exp(runningMax - newMax);
+                float weight = MathF.Exp(score - newMax);
+                runningSum = runningSum * correction + weight;
+                weightedV = weightedV * correction + weight * PrecisionConvert.ConvertToSingle(V[kvHead * kvStride + kv * D + d]);
+                runningMax = newMax;
+            }
+
+            if (sinkCount > 0)
+            {
+                float sink = sinks[bh % sinkCount];
+                float newMax = MathF.Max(runningMax, sink);
+                float correction = MathF.Exp(runningMax - newMax);
+                runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+                weightedV = weightedV * correction;
+                runningMax = newMax;
+            }
+
+            output[qBase + d] = weightedV / (runningSum + 1e-10f);
+        }
     }
 
     public void Dispose()

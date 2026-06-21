@@ -169,4 +169,127 @@ public abstract partial class MLTestBase
             await Assert(refF32, 1e-3f, "f32 maxSeq-strided store");
         }
     });
+
+    /// <summary>
+    /// The grouped-per-query kernel (env GGUF_ATTN_GROUP / <see cref="FusedAttentionKernel.EnableGroupedAttention"/>)
+    /// computes each Q·K score ONCE in shared memory then replays the EXACT per-element online-softmax recurrence
+    /// per output dim — so it must be BIT-IDENTICAL to the per-element kernel. This asserts grouped output ==
+    /// per-element output (the anchor), NOT a fresh CPU reference, across every attention feature: GQA, causal,
+    /// sliding-window, kvOffset, custom scale, attention sinks, D=256 (gemma4's head dim, &gt; the group size),
+    /// the bf16 strided KV path, a maxSeq-strided store, AND the SKV-overflow fall-back (grouped on but SKV beyond
+    /// the shared cap must transparently run the per-element kernel). On WebGL/WebGPU the dispatch falls back to
+    /// per-element (no workgroup shared memory / slow workgroup reduction), so the equality holds trivially there.
+    /// All 6 backends.
+    /// </summary>
+    [TestMethod]
+    public async Task FusedAttention_Grouped_MatchesPerElement() => await RunTest(async accelerator =>
+    {
+        var rng = new Random(13);
+        var fused = new FusedAttentionKernel(accelerator);
+        bool savedFlag = FusedAttentionKernel.EnableGroupedAttention;
+
+        // Run `body` once with the grouped path forced OFF (per-element anchor) and once forced ON, returning
+        // the max abs difference between the two output buffers. The grouped kernel only actually engages on a
+        // non-browser-GPU backend within the shared-memory gate; otherwise it falls back to per-element and the
+        // difference is exactly zero — either way the kernels must agree. NOTE: `body` MUST await
+        // SynchronizeAsync before its own input buffers leave scope — on WebGPU/Wasm disposing a buffer that a
+        // still-pending dispatch references corrupts the submit (CLAUDE.md "Never Dispose Buffers Before Flush").
+        async Task<float> Compare(int outLen, Func<FusedAttentionKernel, MemoryBuffer1D<float, Stride1D.Dense>, Task> body)
+        {
+            using var outA = accelerator.Allocate1D<float>(outLen);
+            using var outB = accelerator.Allocate1D<float>(outLen);
+            try
+            {
+                FusedAttentionKernel.EnableGroupedAttention = false;
+                await body(fused, outA);
+                FusedAttentionKernel.EnableGroupedAttention = true;
+                await body(fused, outB);
+            }
+            finally { FusedAttentionKernel.EnableGroupedAttention = savedFlag; }
+            var a = await outA.CopyToHostAsync<float>(0, outLen);
+            var b = await outB.CopyToHostAsync<float>(0, outLen);
+            float e = 0; for (int i = 0; i < outLen; i++) e = MathF.Max(e, MathF.Abs(a[i] - b[i]));
+            return e;
+        }
+
+        float[] Rand(int n) { var x = new float[n]; for (int i = 0; i < n; i++) x[i] = (float)(rng.NextDouble() * 2 - 1); return x; }
+        void Check(float e, string name) { Console.WriteLine($"[Grouped] {name}: maxDiff={e:E3}"); if (e > 1e-4f) throw new Exception($"FusedAttention grouped {name}: maxDiff={e:E3} > 1e-4 (must match per-element)"); }
+
+        // (1) Contiguous Forward, GQA + causal + sliding-window + custom scale. SKV (40) > group size (64? no) —
+        // pick SKV spanning multiple phase-1 strides and SQ > 1 so the kvOffset/causal interplay is exercised.
+        {
+            int nHeads = 6, kvHeads = 3, SQ = 5, SKV = 40, D = 128;
+            var Q = Rand(nHeads * SQ * D); var K = Rand(kvHeads * SKV * D); var V = Rand(kvHeads * SKV * D);
+            float scale = 0.123f;
+            float e = await Compare(nHeads * SQ * D, async (f, o) =>
+            {
+                using var qb = accelerator.Allocate1D(Q); using var kb = accelerator.Allocate1D(K); using var vb = accelerator.Allocate1D(V);
+                f.Forward(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: true, window: 24, kvOffset: 7, scale: scale);
+                await accelerator.SynchronizeAsync();
+            });
+            Check(e, "contiguous GQA+causal+window D=128");
+        }
+
+        // (2) Contiguous Forward with attention SINKS (gpt-oss): per-head sink logit folded into the denominator.
+        {
+            int nHeads = 4, kvHeads = 2, SQ = 3, SKV = 30, D = 64;
+            var Q = Rand(nHeads * SQ * D); var K = Rand(kvHeads * SKV * D); var V = Rand(kvHeads * SKV * D);
+            var sinks = Rand(nHeads);
+            float e = await Compare(nHeads * SQ * D, async (f, o) =>
+            {
+                using var qb = accelerator.Allocate1D(Q); using var kb = accelerator.Allocate1D(K); using var vb = accelerator.Allocate1D(V);
+                using var sb = accelerator.Allocate1D(sinks);
+                f.Forward(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: true, window: int.MaxValue, kvOffset: 0, scale: 0f, sinks: sb.View, sinkCount: nHeads);
+                await accelerator.SynchronizeAsync();
+            });
+            Check(e, "contiguous attention sinks D=64");
+        }
+
+        // (3) D=256 (gemma4 head dim) — exercises the phase-2 d-slice loop with D > the group size.
+        {
+            int nHeads = 2, kvHeads = 1, SQ = 4, SKV = 20, D = 256;
+            var Q = Rand(nHeads * SQ * D); var K = Rand(kvHeads * SKV * D); var V = Rand(kvHeads * SKV * D);
+            float e = await Compare(nHeads * SQ * D, async (f, o) =>
+            {
+                using var qb = accelerator.Allocate1D(Q); using var kb = accelerator.Allocate1D(K); using var vb = accelerator.Allocate1D(V);
+                f.Forward(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: true, window: int.MaxValue, kvOffset: 0, scale: 0f);
+                await accelerator.SynchronizeAsync();
+            });
+            Check(e, "contiguous D=256 (gemma head dim)");
+        }
+
+        // (4) Strided bf16 KV (the prefill hotpath) on a maxSeq-strided store + GQA + causal + window + kvOffset.
+        {
+            int nHeads = 4, kvHeads = 2, SQ = 3, SKV = 18, D = 128, kvOffset = 5, maxSeq = 32;
+            var Q = Rand(nHeads * SQ * D);
+            var Kf = Rand(kvHeads * SKV * D); var Vf = Rand(kvHeads * SKV * D);
+            var Ks = new global::ILGPU.BFloat16[kvHeads * maxSeq * D]; var Vs = new global::ILGPU.BFloat16[kvHeads * maxSeq * D];
+            for (int h = 0; h < kvHeads; h++) for (int kv = 0; kv < SKV; kv++) for (int d = 0; d < D; d++)
+            { Ks[(h * maxSeq + kv) * D + d] = (global::ILGPU.BFloat16)Kf[(h * SKV + kv) * D + d]; Vs[(h * maxSeq + kv) * D + d] = (global::ILGPU.BFloat16)Vf[(h * SKV + kv) * D + d]; }
+            float e = await Compare(nHeads * SQ * D, async (f, o) =>
+            {
+                using var qb = accelerator.Allocate1D(Q); using var kb = accelerator.Allocate1D(Ks); using var vb = accelerator.Allocate1D(Vs);
+                f.ForwardStrided<global::ILGPU.BFloat16>(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: true, window: 12, kvOffset: kvOffset, scale: 0f, kvRowStride: maxSeq * D);
+                await accelerator.SynchronizeAsync();
+            });
+            Check(e, "strided bf16 maxSeq-store GQA D=128");
+        }
+
+        // (5) SKV-overflow fall-back: grouped flag ON but SKV beyond the shared-memory cap must transparently run
+        // the per-element kernel (and thus match it). Tiny D keeps the buffer small.
+        {
+            int nHeads = 1, kvHeads = 1, SQ = 1, SKV = AttnSharedSkvMaxProbe + 17, D = 8;
+            var Q = Rand(nHeads * SQ * D); var K = Rand(kvHeads * SKV * D); var V = Rand(kvHeads * SKV * D);
+            float e = await Compare(nHeads * SQ * D, async (f, o) =>
+            {
+                using var qb = accelerator.Allocate1D(Q); using var kb = accelerator.Allocate1D(K); using var vb = accelerator.Allocate1D(V);
+                f.Forward(qb.View, kb.View, vb.View, o.View, nHeads, kvHeads, SQ, SKV, D, causal: false, window: int.MaxValue, kvOffset: 0, scale: 0f);
+                await accelerator.SynchronizeAsync();
+            });
+            Check(e, "SKV-overflow fall-back to per-element");
+        }
+    });
+
+    // Mirror of FusedAttentionKernel.AttnSharedSkvMax (private) for the fall-back test's SKV-over-cap config.
+    private const int AttnSharedSkvMaxProbe = 4096;
 }
