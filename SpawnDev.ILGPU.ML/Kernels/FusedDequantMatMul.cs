@@ -81,7 +81,7 @@ public class FusedDequantMatMul : IDisposable
         Environment.GetEnvironmentVariable("GGUF_GEMM_MR") == "1";
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemmMRQ4_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemmMRQ4_K, _gemmMRQ6_K;
 
     // Params buffers cached per (M,K,N). Never disposed mid-session: a WebGPU dispatch
     // that referenced the buffer may still be pending in the command encoder, and
@@ -189,13 +189,23 @@ public class FusedDequantMatMul : IDisposable
         // Multi-row dequant GEMM for M>1 (prefill) — opt-in (GGUF_GEMM_MR=1) until A/B-verified. Same shared-mem
         // /barrier shape as the GEMV, so it's gated to non-browser-GPU backends (WebGL has no workgroup shared
         // memory; WebGPU's workgroup reduction is slow on Tint/Dawn — both keep the per-element kernel below).
-        if (M > 1 && EnableMultiRowGemm && !gpuBrowser && type == GGMLType.Q4_K)
+        if (M > 1 && EnableMultiRowGemm && !gpuBrowser && (type == GGMLType.Q4_K || type == GGMLType.Q6_K))
         {
-            _gemmMRQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<int, Stride1D.Dense>>(GemmDequantQ4_K_MultiRowImpl);
-            int numMTiles = (M + GemmMTile - 1) / GemmMTile;
-            _gemmMRQ4_K(new KernelConfig(N * numMTiles, GemvGroupSize), input, intView, output, paramsBuf.View);
+            var mrConfig = new KernelConfig(N * ((M + GemmMTile - 1) / GemmMTile), GemvGroupSize);
+            if (type == GGMLType.Q4_K)
+            {
+                _gemmMRQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>>(GemmDequantQ4_K_MultiRowImpl);
+                _gemmMRQ4_K(mrConfig, input, intView, output, paramsBuf.View);
+            }
+            else
+            {
+                _gemmMRQ6_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>>(GemmDequantQ6_K_MultiRowImpl);
+                _gemmMRQ6_K(mrConfig, input, intView, output, paramsBuf.View);
+            }
             return;
         }
 
@@ -521,6 +531,65 @@ public class FusedDequantMatMul : IDisposable
         }
 
         // Reduce each row's partials across the group → output[m, n]. sh is reused per row (barrier between).
+        for (int mi = 0; mi < GemmMTile; mi++)
+        {
+            sh[tid] = partial[mi];
+            Group.Barrier();
+            for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+            {
+                if (tid < stride) sh[tid] += sh[tid + stride];
+                Group.Barrier();
+            }
+            int m = mBase + mi;
+            if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
+            Group.Barrier();
+        }
+    }
+
+    /// <summary>Q6_K dequant GEMM for M&gt;1 — the Q6_K analogue of <see cref="GemmDequantQ4_K_MultiRowImpl"/>
+    /// (210-byte super-blocks, scale at offset 208, no dmin, <see cref="DecodeQ6KScaled"/>). Frequently the
+    /// output/logits projection, so this is a large prefill win.</summary>
+    private static void GemmDequantQ6_K_MultiRowImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int gi = Grid.IdxX;
+        int n = gi % N;
+        int mBase = (gi / N) * GemmMTile;
+        int tid = Group.IdxX;
+
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        var partial = new float[GemmMTile];
+        for (int mi = 0; mi < GemmMTile; mi++) partial[mi] = 0f;
+
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 210;
+            int rowBase = n * bytesPerRow;
+            int numBlocks = K / 256;
+            int perThread = 256 / GemvGroupSize;
+            for (int blk = 0; blk < numBlocks; blk++)
+            {
+                int sbOff = rowBase + blk * 210;
+                float d = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+                int kBase = blk * 256;
+                for (int sub = 0; sub < perThread; sub++)
+                {
+                    int r = tid + sub * GemvGroupSize;
+                    float wval = DecodeQ6KScaled(w, sbOff, r, d); // dequant ONCE, reuse across rows
+                    int kIdx = kBase + r;
+                    for (int mi = 0; mi < GemmMTile; mi++)
+                    {
+                        int m = mBase + mi;
+                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
+                    }
+                }
+            }
+        }
+
         for (int mi = 0; mi < GemmMTile; mi++)
         {
             sh[tid] = partial[mi];
