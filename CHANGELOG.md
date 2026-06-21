@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Hoist the per-token executor refcount/constant rebuild out of RunAsync
+
+**`GraphExecutor.RunAsync` no longer re-walks the whole graph every token to rebuild the buffer-recycling
+refcounts + the runtime-constant map.** Each decode step rebuilt, over all ~1400 nodes: the refcount map (a full
+node-input walk), the graph-output HashSet, and the constant-output set (a LINQ `Constant` scan + a node walk to
+strip stale compile-time constants) — O(nodes) CPU per token, the super-linear per-node residual that forced
+multimodal prefill to go token-by-token. Since the executor's graph is fixed (`readonly`; recompile builds a NEW
+executor), these are now precomputed ONCE (`EnsureRunTemplates`): a base refcount template (node inputs + graph
+outputs + weights pinned to `int.MaxValue`) and a clean-constants map (compile-time constants with
+non-Constant-node outputs pre-stripped). Each run clones the templates and pins only that call's inputs —
+byte-identical result, without the per-token node walks / LINQ. Verified: `GGUFDecodeKVCache` decode-equivalence
+(incremental == full recompute) + gemma4-12b greedy generation byte-identical (CUDA) + the inference Pipeline
+sweep green on all 6 backends. The sync `Run()` path (non-decode) is unchanged.
+
 ## Unreleased — FusedAttention reads the bf16 KV store directly (no per-token repack)
 
 **GGUF decode attention now reads the `[kvHeads, maxSeq, hd]` KV store DIRECTLY in its native bf16/f32 type,

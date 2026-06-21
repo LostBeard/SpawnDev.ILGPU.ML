@@ -26,6 +26,41 @@ public class GraphExecutor : IDisposable
     private readonly Dictionary<string, Tensor> _weights;
     private readonly Dictionary<string, float[]>? _constantValues;
     private readonly ElementWiseKernels _ew;
+
+    // Per-RUN setup templates, precomputed ONCE from the fixed graph (_graph/_weights/_constantValues are all
+    // readonly; recompile builds a NEW executor). RunAsync clones these instead of re-walking all ~1400 nodes
+    // (refcount build) + a LINQ Constant scan + a node walk to strip stale constants on EVERY token — the
+    // super-linear per-node CPU residual that forced multimodal prefill token-by-token. Built lazily.
+    private Dictionary<string, int>? _baseRefCounts;       // node-input refcounts; graph OUTPUTS + WEIGHTS pinned to int.MaxValue
+    private Dictionary<string, float[]>? _cleanConstants;   // _constantValues with non-Constant-node outputs already stripped
+
+    private void EnsureRunTemplates()
+    {
+        if (_baseRefCounts != null) return;
+        var rc = new Dictionary<string, int>();
+        foreach (var node in _graph.Nodes)
+            foreach (var inputName in node.InputNames)
+                if (!string.IsNullOrEmpty(inputName))
+                    rc[inputName] = rc.GetValueOrDefault(inputName, 0) + 1;
+        foreach (var name in _graph.OutputNames) rc[name] = int.MaxValue;
+        foreach (var name in _weights.Keys) rc[name] = int.MaxValue;
+
+        var clean = _constantValues != null
+            ? new Dictionary<string, float[]>(_constantValues)
+            : new Dictionary<string, float[]>();
+        var constantNodeOutputs = new HashSet<string>(
+            _graph.Nodes.Where(n => n.OpType == "Constant").SelectMany(n => n.OutputNames));
+        foreach (var node in _graph.Nodes)
+        {
+            if (node.OpType == "Constant") continue;
+            foreach (var outName in node.OutputNames)
+                if (!constantNodeOutputs.Contains(outName))
+                    clean.Remove(outName);
+        }
+
+        _cleanConstants = clean;
+        _baseRefCounts = rc; // set LAST so the null-check above is the completion signal
+    }
     // Precision-aware (F16 pass-through) op kernels — owned here (not via the optional _registry, which is null
     // in registry-less executor uses like the controlled mixed-precision test). Stateless kernel caches.
     private readonly PrecisionAwareKernels _precisionAware;
@@ -849,33 +884,16 @@ public class GraphExecutor : IDisposable
         foreach (var (name, tensor) in inputs) tensors[name] = tensor;
         foreach (var (name, tensor) in _weights) tensors[name] = tensor;
 
-        // Reference counting for buffer recycling (same as Run)
-        var refCounts = new Dictionary<string, int>();
-        var outputNameSet = new HashSet<string>(_graph.OutputNames);
-        foreach (var node in _graph.Nodes)
-            foreach (var inputName in node.InputNames)
-                if (!string.IsNullOrEmpty(inputName))
-                    refCounts[inputName] = refCounts.GetValueOrDefault(inputName, 0) + 1;
-        foreach (var name in outputNameSet) refCounts[name] = int.MaxValue;
-        foreach (var name in _weights.Keys) refCounts[name] = int.MaxValue;
+        // Reference counting for buffer recycling + the runtime-constant map. Clone the graph-fixed templates
+        // (precomputed once by EnsureRunTemplates) and pin only this call's inputs — instead of re-walking all
+        // ~1400 nodes for the refcounts + a LINQ Constant scan + a node walk to strip stale constants on EVERY
+        // token. The templates already pin graph outputs + weights to int.MaxValue and pre-strip non-Constant
+        // node outputs from the constants, so the result is identical to the per-run rebuild.
+        EnsureRunTemplates();
+        var refCounts = new Dictionary<string, int>(_baseRefCounts!);
         foreach (var name in inputs.Keys) refCounts[name] = int.MaxValue;
 
-        // Runtime constant capture (same as Run — see comments there)
-        var runtimeConstants = _constantValues != null
-            ? new Dictionary<string, float[]>(_constantValues)
-            : new Dictionary<string, float[]>();
-
-        // Clear stale compile-time constants for non-Constant node outputs (same as Run).
-        // PRESERVE Constant node outputs — they're fixed model values (indices, axes, etc.).
-        var constantNodeOutputsAsync = new HashSet<string>(
-            _graph.Nodes.Where(n => n.OpType == "Constant").SelectMany(n => n.OutputNames));
-        foreach (var node in _graph.Nodes)
-        {
-            if (node.OpType == "Constant") continue;
-            foreach (var outName in node.OutputNames)
-                if (!constantNodeOutputsAsync.Contains(outName))
-                    runtimeConstants.Remove(outName);
-        }
+        var runtimeConstants = new Dictionary<string, float[]>(_cleanConstants!);
 
         // Decode-loop output recycling: this executor is reused every step (fixed-shape decode), but
         // the graph's OUTPUT buffers (logits + present.*) are never refcount-released — they're the
