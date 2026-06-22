@@ -45,6 +45,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
     private readonly Accelerator _accelerator;
     private readonly int _maxSeqLen;
     private readonly KVCachePrecision _precision;
+    private readonly bool _isCuda;
 
     private sealed class LayerCache
     {
@@ -94,6 +95,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
         _accelerator = accelerator;
         _maxSeqLen = maxSeqLen;
         _precision = precision;
+        _isCuda = accelerator.AcceleratorType == AcceleratorType.Cuda;
         _layers = new LayerCache[kvHeadsPerLayer.Length];
         for (int i = 0; i < _layers.Length; i++)
         {
@@ -112,6 +114,21 @@ public sealed class GGUFDecodeKVCache : IDisposable
             }
             _layers[i] = lc;
         }
+    }
+
+    // CUDA: a stream-ordered device-to-device enqueue (cuMemcpyAsync on DefaultStream, NO host
+    // SynchronizeStream). This is (a) CUDA-graph-CAPTURE-safe — a synchronize is illegal during
+    // cuStreamBeginCapture, and this records as a graph memcpy node instead — and (b) faster than
+    // CopyFromAsync in normal decode: on CUDA the whole forward runs on ONE stream, so stream ordering
+    // already guarantees the consumer kernel reads after this copy, making the per-copy sync that
+    // CopyFromAsync adds pure overhead. Browser/other backends KEEP CopyFromAsync — their worker/queue
+    // model needs its explicit ordering (a sync CopyFrom silently races on the Wasm worker pool; see the
+    // bf16 note above). DefaultStream is the capture stream during capture (via Accelerator.WithDefaultStream).
+    private Task CaptureSafeCopy<T>(ArrayView1D<T, Stride1D.Dense> dst, ArrayView1D<T, Stride1D.Dense> src)
+        where T : unmanaged
+    {
+        if (_isCuda) { dst.CopyFrom(_accelerator.DefaultStream, src); return Task.CompletedTask; }
+        return dst.CopyFromAsync(src);
     }
 
     /// <summary>
@@ -138,14 +155,16 @@ public sealed class GGUFDecodeKVCache : IDisposable
             _f32ToBf16(total, k, scratch);
             var tasks = new List<Task>(kvHeads);
             for (int h = 0; h < kvHeads; h++)
-                tasks.Add(lc.Kb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
-                    .CopyFromAsync(scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+                tasks.Add(CaptureSafeCopy(
+                    lc.Kb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
+                    scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
             await Task.WhenAll(tasks).ConfigureAwait(false);
             _f32ToBf16(total, v, scratch);
             tasks.Clear();
             for (int h = 0; h < kvHeads; h++)
-                tasks.Add(lc.Vb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
-                    .CopyFromAsync(scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+                tasks.Add(CaptureSafeCopy(
+                    lc.Vb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
+                    scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         else
@@ -155,10 +174,12 @@ public sealed class GGUFDecodeKVCache : IDisposable
             var tasks = new List<Task>(kvHeads * 2);
             for (int h = 0; h < kvHeads; h++)
             {
-                tasks.Add(lc.Kf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
-                    .CopyFromAsync(k.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
-                tasks.Add(lc.Vf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd)
-                    .CopyFromAsync(v.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+                tasks.Add(CaptureSafeCopy(
+                    lc.Kf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
+                    k.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
+                tasks.Add(CaptureSafeCopy(
+                    lc.Vf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
+                    v.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
             }
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
@@ -185,8 +206,9 @@ public sealed class GGUFDecodeKVCache : IDisposable
             var scratch = lc.Bf16Scratch!.View;
             var tasks = new List<Task>(kvHeads);
             for (int h = 0; h < kvHeads; h++)
-                tasks.Add(scratch.SubView((long)h * totalLen * hd, (long)totalLen * hd)
-                    .CopyFromAsync(store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
+                tasks.Add(CaptureSafeCopy(
+                    scratch.SubView((long)h * totalLen * hd, (long)totalLen * hd),
+                    store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
             await Task.WhenAll(tasks).ConfigureAwait(false);
             _bf16ToF32 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Bf16ToF32Impl);
@@ -198,8 +220,9 @@ public sealed class GGUFDecodeKVCache : IDisposable
             var store = (isKey ? lc.Kf : lc.Vf)!.View;
             var tasks = new List<Task>(kvHeads);
             for (int h = 0; h < kvHeads; h++)
-                tasks.Add(pack.SubView((long)h * totalLen * hd, (long)totalLen * hd)
-                    .CopyFromAsync(store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
+                tasks.Add(CaptureSafeCopy(
+                    pack.SubView((long)h * totalLen * hd, (long)totalLen * hd),
+                    store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         return pack.SubView(0, (long)kvHeads * totalLen * hd);

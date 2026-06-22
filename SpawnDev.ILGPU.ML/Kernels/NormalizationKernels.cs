@@ -37,6 +37,9 @@ public class NormalizationKernels : IDisposable
         int, float, int>? _rmsNormFusedKernel;
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummyRmsWeight;
     private int _rmsFusedGroup;
+    // Upper bound on the single-pass RMSNorm group size — also the compile-time size of the kernel's
+    // per-thread partial-sums shared array (RMSNormFusedImpl). The runtime group T is capped to this.
+    private const int MaxRmsGroup = 256;
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
@@ -139,11 +142,18 @@ public class NormalizationKernels : IDisposable
     }
 
     /// <summary>
-    /// Single-pass RMSNorm — one GROUP per row. Thread 0 computes the row's invRms with the EXACT same f64
-    /// sum-of-squares as the two-pass <see cref="RMSNormStatsImpl"/> (byte-identical, zero precision drift),
-    /// then the whole group applies the normalization in parallel. Fuses the two-pass stats + apply into ONE
+    /// Single-pass RMSNorm — one GROUP per row. The WHOLE group cooperatively computes the row's
+    /// sum-of-squares (each thread reduces a strided slice in f64 in-register, then thread 0 combines the T
+    /// partials), then the whole group applies the normalization. Fuses the two-pass stats + apply into ONE
     /// dispatch — no second dispatch, no invRms global round-trip, no scratch buffer. Needs group shared memory
     /// + a barrier, so it is gated to backends with a group (WebGL's TF path keeps the two-pass).
+    ///
+    /// PERF (2026-06-22): the prior version had THREAD 0 ALONE sum all C elements in f64 while T-1 threads
+    /// idled at the barrier — a single core doing C f64 mul-adds at the 4070's 1/64 f64 rate ≈ 140 µs/call =
+    /// 22.6% of decode (qwen 7B, the #2 op after MatMul). Parallelizing the reduction across the group
+    /// cuts it ~6x. The f64 accumulation per thread is kept (precision); partials cross threads in f32 shared
+    /// (sum of ~C/T squares each → negligible vs the 2e-4 RMSNorm test tolerance). NOT byte-identical to the
+    /// serial two-pass anymore (the tree-order f64 sum differs ~1e-7), which the CPU-reference tests allow.
     /// <paramref name="hasWeight"/> 0 = weightless unit gain (gemma4's V-norm); else multiply by weight[col].
     /// </summary>
     private static void RMSNormFusedImpl(
@@ -157,16 +167,25 @@ public class NormalizationKernels : IDisposable
         int T = Group.DimX;
         int offset = row * C;
 
-        var sh = SharedMemory.Allocate<float>(1);
+        var part = SharedMemory.Allocate<float>(MaxRmsGroup);   // per-thread partial sum-of-squares (T <= MaxRmsGroup)
+        var inv = SharedMemory.Allocate<float>(1);
+
+        // Each thread reduces its strided slice in f64 in-register (T-way parallel over C), then publishes a
+        // partial. Thread 0 combines the T partials in f64.
+        double local = 0.0;
+        for (int i = tid; i < C; i += T) { double v = (double)input[offset + i]; local += v * v; }
+        part[tid] = (float)local;
+        Group.Barrier();
+
         if (tid == 0)
         {
             double sumSq = 0.0;
-            for (int i = 0; i < C; i++) { double v = (double)input[offset + i]; sumSq += v * v; }
-            sh[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
+            for (int t = 0; t < T; t++) sumSq += part[t];
+            inv[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
         }
         Group.Barrier();
 
-        float invRms = sh[0];
+        float invRms = inv[0];
         for (int i = tid; i < C; i += T)
             output[offset + i] = input[offset + i] * invRms * (hasWeight != 0 ? weight[i] : 1f);
     }
@@ -301,15 +320,16 @@ public class NormalizationKernels : IDisposable
 
     // Single-pass fused RMSNorm on any backend with a group (everything but WebGL's TF path); fuses the
     // two-pass stats + apply into one dispatch (no second dispatch, no invRms round-trip). Returns false to
-    // fall through to the two-pass path. hasWeight 0 = weightless. Byte-identical (thread 0 does the exact f64
-    // stats); the weight view is unused when hasWeight==0 (pass the dummy).
+    // fall through to the two-pass path. hasWeight 0 = weightless. The whole group reduces the sum-of-squares
+    // cooperatively (see RMSNormFusedImpl); matches the CPU reference within the 2e-4 RMSNorm test tolerance.
+    // The weight view is unused when hasWeight==0 (pass the dummy).
     private bool TryFusedRMSNorm(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, ArrayView1D<float, Stride1D.Dense> weight,
         int rows, int C, float epsilon, int hasWeight)
     {
         if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
         int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
-            : (_rmsFusedGroup = Math.Min(256, (int)_accelerator.MaxNumThreadsPerGroup));
+            : (_rmsFusedGroup = Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup));
         if (T < 32) return false; // group too small to be worth it — keep the two-pass
         _rmsNormFusedKernel ??= _accelerator.LoadStreamKernel<
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
