@@ -17,10 +17,13 @@ REM ---- Port (11435 avoids a clash with a running real Ollama on 11434) ----
 set "PORT=11435"
 
 REM ---- Interactive bounds (our engine is ~90ms/tok, so unbounded huge prompts/outputs take minutes) ----
-REM   NUM_CTX: agentic clients send ~38K-token prompts; we cap (tail-truncate) the context. Smaller = faster
-REM            first token (prefill ~ ctx/176 tok/s). 8192 ~= 45s worst-case prefill; lower it for snappier.
-REM   MAX_OUTPUT: hard cap on generated tokens so a verbose answer can't run for minutes (1024 ~= 90s max).
-set "OLLAMA_NUM_CTX=8192"
+REM   NUM_CTX: THE dominant latency knob. Claude Code stuffs ~14.5K tokens (CLAUDE.md + its system prompt +
+REM            tools) into EVERY turn, and the whole delay is PREFILL of that — which is super-linear (O(seq^2)
+REM            attention). We tail-truncate to NUM_CTX (keeps the recent context + your question, drops the
+REM            static boilerplate head). MEASURED on this machine: ctx 8192 = ~104s/turn; ctx 2048 = ~11s/turn
+REM            (10x faster). Raise it if you need the model to see more project context, at a steep prefill cost.
+REM   MAX_OUTPUT: hard cap on generated tokens so a verbose answer can't run for minutes.
+set "OLLAMA_NUM_CTX=2048"
 set "OLLAMA_MAX_OUTPUT=1024"
 
 echo.

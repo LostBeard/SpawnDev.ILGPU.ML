@@ -266,10 +266,13 @@ public static class ServerEndpoints
         ModelRegistry registry, string model, List<(string, string)> messages, GenerationConfig cfg,
         string[]? stops, CancellationToken ct, IReadOnlyList<string>? toolsJson = null)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         using var lease = await registry.AcquireAsync(model, ct);
         var lm = lease.Model;
         var (promptIds, stopIds) = ChatTemplates.BuildChatPrompt(lm.Gguf, lm.Tokenizer, messages, toolsJson: toolsJson);
+        long buildMs = sw.ElapsedMilliseconds;
         var res = await lm.Generator.GenerateAsync(promptIds, cfg, stops, stopIds, onDelta: null, ct);
+        LogPerf("once", promptIds.Length, buildMs, -1, sw.ElapsedMilliseconds, res);
         return (res.Text, res);
     }
 
@@ -312,10 +315,35 @@ public static class ServerEndpoints
         ModelRegistry registry, string model, List<(string, string)> messages, GenerationConfig cfg,
         string[]? stops, CancellationToken ct, Func<string, Task> onDelta)
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         using var lease = await registry.AcquireAsync(model, ct);
         var lm = lease.Model;
         var (promptIds, stopIds) = ChatTemplates.BuildChatPrompt(lm.Gguf, lm.Tokenizer, messages);
-        return await lm.Generator.GenerateAsync(promptIds, cfg, stops, stopIds, onDelta, ct);
+        long buildMs = sw.ElapsedMilliseconds;
+        long firstMs = -1;
+        Func<string, Task> wrapped = async d => { if (firstMs < 0) firstMs = sw.ElapsedMilliseconds; await onDelta(d); };
+        var res = await lm.Generator.GenerateAsync(promptIds, cfg, stops, stopIds, wrapped, ct);
+        LogPerf("stream", promptIds.Length, buildMs, firstMs, sw.ElapsedMilliseconds, res);
+        return res;
+    }
+
+    // Records prompt size + prefill/decode split so the bottleneck is MEASURED, not guessed. firstMs = wall at
+    // the first streamed token (≈ lease + prompt-build + prefill); decode = the rest. Written to %TEMP%.
+    private static readonly string PerfLog = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "claude-cli-perf.log");
+    private static void LogPerf(string path, int promptTokens, long buildMs, long firstMs, long totalMs,
+        SpawnDev.ILGPU.ML.Pipelines.GenerationResult? res)
+    {
+        try
+        {
+            int gen = res?.GeneratedTokens ?? 0;
+            long prefillMs = firstMs >= 0 ? firstMs : totalMs;     // time to first token (build + prefill)
+            long decodeMs = firstMs >= 0 ? Math.Max(0, totalMs - firstMs) : 0;
+            double decTps = decodeMs > 0 && gen > 1 ? (gen - 1) * 1000.0 / decodeMs : 0;
+            System.IO.File.AppendAllText(PerfLog,
+                $"[{DateTime.Now:HH:mm:ss}] {path,-6} prompt={promptTokens,6}tok  build+prefill(TTFT)={prefillMs,7}ms  " +
+                $"decode={decodeMs,7}ms  gen={gen,5}tok  decode={decTps,6:F1}tok/s  total={totalMs,7}ms  stop={res?.Stop}\n");
+        }
+        catch { }
     }
 
     private static async Task<int> CountTokens(ModelRegistry registry, string model, List<(string, string)> messages, CancellationToken ct)
