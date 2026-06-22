@@ -100,7 +100,7 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<float, Stride1D.Dense>, int>? _quantActKernel;
     private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvDp4aQ4_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvDp4aQ4_K, _gemvDp4aQ6_K;
 
     // Multi-row dequant GEMM for M>1 (prefill): dequant each weight element ONCE, reuse across GemmMTile rows —
     // kills the O(M) redundant dequant of the general per-element kernel (the prefill bottleneck). Output is
@@ -198,6 +198,20 @@ public class FusedDequantMatMul : IDisposable
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvDp4aQ4_KImpl);
                 _gemvDp4aQ4_K(new KernelConfig(N, _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
+                return;
+            }
+            if (EnableDp4aGemv && type == GGMLType.Q6_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+            {
+                int nBlk = K / 32;
+                if (!_actQs.TryGetValue(K, out var qsBuf)) { qsBuf = _accelerator.Allocate1D<int>(nBlk * 8); _actQs[K] = qsBuf; }
+                if (!_actDs.TryGetValue(K, out var dsBuf)) { dsBuf = _accelerator.Allocate1D<float>(nBlk * 2); _actDs[K] = dsBuf; }
+                _quantActKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(QuantizeActQ8_1Impl);
+                _quantActKernel(nBlk, input, qsBuf.View, dsBuf.View, nBlk);
+                _gemvDp4aQ6_K ??= _accelerator.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvDp4aQ6_KImpl);
+                _gemvDp4aQ6_K(new KernelConfig(N, _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
                 return;
             }
             // Warp-cooperative Q4_K GEMV: one warp per output column, Warp.Shuffle scale-broadcast + reduction,
@@ -783,6 +797,85 @@ public class FusedDequantMatMul : IDisposable
                 }
                 partial += dsc0 * da0 * dot0 - dmm0 * sa0;
                 partial += dsc1 * da1 * dot1 - dmm1 * sa1;
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            partial += Warp.ShuffleDown(partial, off);
+        if (lane == 0 && n < N) output[n] = partial;
+    }
+
+    // Misaligned 4-byte load: the 4 bytes starting at arbitrary byteOff as an int (Q6_K's 210-byte super-blocks
+    // are not 4-aligned). At most 2 int loads.
+    private static int Load4Bytes(ArrayView1D<int, Stride1D.Dense> w, int byteOff)
+    {
+        int wi = byteOff >> 2;
+        int sh = (byteOff & 3) * 8;
+        int lo = w[wi];
+        if (sh == 0) return lo;
+        int hi = w[wi + 1];
+        return (int)(((uint)lo >> sh) | ((uint)hi << (32 - sh)));
+    }
+
+    // Pack 4 Q6_K values of one variant into an int32 of 4 int8: q = (qlNib | (qhBits<<4)) − 32, q∈[-32,31].
+    private static int PackQ6(int qlInt, int qhInt, int nibShift, int qhShift)
+    {
+        int packed = 0;
+        for (int e = 0; e < 4; e++)
+        {
+            int qlNib = ((qlInt >> (e * 8 + nibShift)) & 0xF);
+            int qhBits = ((qhInt >> (e * 8 + qhShift)) & 3);
+            int q = (qlNib | (qhBits << 4)) - 32;
+            packed |= (q & 0xFF) << (e * 8);
+        }
+        return packed;
+    }
+
+    // dp4a int8-activation Q6_K decode GEMV. Q6_K is SYMMETRIC (q∈[-32,31], value=d·sc·q, NO dmin), with 16-elem
+    // int8-scaled sub-blocks and 6-bit values split ql(4)+qh(2). Each lane owns whole "(half, l-group-of-4)"
+    // units: reads ql[l..l+3], ql[l+32..l+35], qh[l..l+3] ONCE (3 misaligned 4-byte loads), decodes all 4
+    // variants × 4 elements, packs each variant's 4 q's, dp4a's against the int8 activation quants (variant v →
+    // activation block super*8+half*4+v). partial += d·sc_v·d_a·dot_v. Same int8-act numerics as Q4_K dp4a; warp-
+    // reduce. CUDA only (dp4a).
+    private static void GemvDp4aQ6_KImpl(
+        ArrayView1D<int, Stride1D.Dense> qs,
+        ArrayView1D<float, Stride1D.Dense> ds,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int lane = Group.IdxX;
+        float partial = 0f;
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 210;
+            int rowBase = n * bytesPerRow;
+            int nUnits = K / 16;     // 16 units per 256-super-block
+            for (int u = lane; u < nUnits; u += 32)
+            {
+                int super = u >> 4;
+                int half = (u >> 3) & 1;
+                int lgroup = u & 7;
+                int l = lgroup * 4;
+                int sbOff = rowBase + super * 210;
+                float dw = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+                int qlBase = sbOff + 64 * half;
+                int qhBase = sbOff + 128 + 32 * half;
+                int scBase = sbOff + 192 + 8 * half;
+                int qlA = Load4Bytes(w, qlBase + l);
+                int qlB = Load4Bytes(w, qlBase + 32 + l);
+                int qhW = Load4Bytes(w, qhBase + l);
+                int scIdx = lgroup >> 2;                 // l>>4
+                int ablkBase = super * 8 + half * 4;
+                int d0 = Dp4a(PackQ6(qlA, qhW, 0, 0), qs[(ablkBase + 0) * 8 + lgroup], 0);
+                int d1 = Dp4a(PackQ6(qlB, qhW, 0, 2), qs[(ablkBase + 1) * 8 + lgroup], 0);
+                int d2 = Dp4a(PackQ6(qlA, qhW, 4, 4), qs[(ablkBase + 2) * 8 + lgroup], 0);
+                int d3 = Dp4a(PackQ6(qlB, qhW, 4, 6), qs[(ablkBase + 3) * 8 + lgroup], 0);
+                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 0)) * ds[(ablkBase + 0) * 2] * d0;
+                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 2)) * ds[(ablkBase + 1) * 2] * d1;
+                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 4)) * ds[(ablkBase + 2) * 2] * d2;
+                partial += dw * SignExtend8(ReadByte(w, scBase + scIdx + 6)) * ds[(ablkBase + 3) * 2] * d3;
             }
         }
         for (int off = 16; off > 0; off >>= 1)
