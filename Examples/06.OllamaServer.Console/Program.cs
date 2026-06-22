@@ -165,6 +165,15 @@ if (args.Contains("--list"))
             await next();
             File.AppendAllText(reqLog, $"[{DateTime.Now:HH:mm:ss}] {ctx.Request.Method} {ctx.Request.Path} -> {ctx.Response.StatusCode}\n  body: {bodyShort}\n\n");
         }
+        catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+        {
+            // The CLIENT closed the connection (e.g. an agentic frontend cancels a queued auxiliary request it
+            // no longer wants, or it timed out waiting for the single generation gate behind a longer request).
+            // That is normal, not a server fault: don't emit a 500 (the socket is gone anyway) and log it as a
+            // benign cancellation, not a scary EXCEPTION. The generation gate is already released by the `using`
+            // lease unwinding through this cancellation.
+            File.AppendAllText(reqLog, $"[{DateTime.Now:HH:mm:ss}] {ctx.Request.Method} {ctx.Request.Path} -> client-canceled (benign)\n\n");
+        }
         catch (Exception ex)
         {
             File.AppendAllText(reqLog, $"[{DateTime.Now:HH:mm:ss}] {ctx.Request.Method} {ctx.Request.Path} -> EXCEPTION\n  body: {bodyShort}\n  ex: {ex}\n\n");

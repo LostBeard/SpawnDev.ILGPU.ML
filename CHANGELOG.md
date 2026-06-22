@@ -15,6 +15,13 @@ tool markup never leaks, and emits `tool_use` blocks at the end. Streaming also 
 generation (the SSE write throws → generation stops → GPU frees). Non-stream tool requests still buffer + format
 tool blocks (unchanged). Verified: tools+stream returns a correct streamed answer with immediate TTFB.
 
+Also: a **client-canceled request is now handled gracefully** — when the client closes the connection (an
+agentic frontend dropping a queued auxiliary request, or timing out waiting for the single generation gate
+behind a longer request), the server logs a benign "client-canceled" instead of a scary `EXCEPTION`/500. The
+generation gate is released cleanly. (True *concurrent* serving of multiple requests on one GPU needs
+continuous batching — tracked as the v-next concurrency feature; until then requests serialize on the gate and
+the practical lever is generation speed.)
+
 ## Unreleased — Example 06 server: fix Claude CLI cold-start (pre-load the model)
 
 **Claude CLI failed to connect to the Ollama-replacement server** — the request log showed every startup
