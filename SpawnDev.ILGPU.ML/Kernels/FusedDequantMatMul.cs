@@ -71,7 +71,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K, _gemvWarpQ6_K;
 
     // Warp-cooperative GEMV (opt-in GGUF_GEMV_V2=1): the default GEMV pays two Group.Barrier() per super-block
     // (scale-decode + before-reuse) plus a shared-mem tree reduction — those syncs cap M=1 decode at ~10% of the
@@ -175,6 +175,15 @@ public class FusedDequantMatMul : IDisposable
                     ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                     ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_KWarpImpl);
                 _gemvWarpQ4_K(warpCfg, input, intView, output, paramsBuf.View);
+                return;
+            }
+            if (EnableWarpGemv && type == GGMLType.Q6_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+            {
+                var warpCfg = new KernelConfig(N, _accelerator.WarpSize);
+                _gemvWarpQ6_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ6_KWarpImpl);
+                _gemvWarpQ6_K(warpCfg, input, intView, output, paramsBuf.View);
                 return;
             }
             switch (type)
@@ -585,6 +594,62 @@ public class FusedDequantMatMul : IDisposable
         for (int off = 16; off > 0; off >>= 1)
             partial += Warp.ShuffleDown(partial, off);
         if (lane == 0 && n < N) output[n] = partial;
+    }
+
+    // Warp-cooperative Q6_K decode GEMV (M==1): one 32-lane warp per output column. The default GemvDequantQ6_KImpl
+    // calls DecodeQ6KScaled per element, which RE-reads the same qh / ql / scale bytes for each of the 4 elements
+    // they encode (~4x redundant loads). Here lane = l (0..31) reads each block's qh[l] + ql[l] + ql[l+32] ONCE and
+    // decodes all 4 variants (q1..q4) — the EXACT decode of the verified Q6_K multi-row GEMM (GemmDequantQ6_K_*), so
+    // bit-for-tolerance identical. 32 consecutive lanes read 32 consecutive bytes → coalesced. Final reduction via
+    // Warp.ShuffleDown (no Group.Barrier, no shared mem). CUDA only (Warp.Shuffle); others keep the portable kernel.
+    private static void GemvDequantQ6_KWarpImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int l = Group.IdxX;     // lane == element index l (0..31) within a half
+        float partial = 0f;
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 210;
+            int rowBase = n * bytesPerRow;
+            int numBlocks = K / 256;
+            for (int blk = 0; blk < numBlocks; blk++)
+            {
+                int sbOff = rowBase + blk * 210;
+                float d = HalfToFloatFinite(ReadByte(w, sbOff + 208) | (ReadByte(w, sbOff + 209) << 8));
+                int kBase = blk * 256;
+                for (int half = 0; half < 2; half++)
+                {
+                    int ql = sbOff + 64 * half;
+                    int qh = sbOff + 128 + 32 * half;
+                    int sc = sbOff + 192 + 8 * half;
+                    int y = kBase + half * 128;
+                    int isIdx = l >> 4;                 // l/16 -> 0 or 1 (scale sub-index)
+                    int hb = ReadByte(w, qh + l);
+                    int lo0 = ReadByte(w, ql + l);      // 4 elements per (l,half) from 1 qh + 2 ql bytes (no redundancy)
+                    int lo32 = ReadByte(w, ql + l + 32);
+                    int q1 = ((lo0 & 0xF) | ((hb & 3) << 4)) - 32;
+                    int q2 = ((lo32 & 0xF) | (((hb >> 2) & 3) << 4)) - 32;
+                    int q3 = ((lo0 >> 4) | (((hb >> 4) & 3) << 4)) - 32;
+                    int q4 = ((lo32 >> 4) | (((hb >> 6) & 3) << 4)) - 32;
+                    float s0 = SignExtend8(ReadByte(w, sc + isIdx));
+                    float s2 = SignExtend8(ReadByte(w, sc + isIdx + 2));
+                    float s4 = SignExtend8(ReadByte(w, sc + isIdx + 4));
+                    float s6 = SignExtend8(ReadByte(w, sc + isIdx + 6));
+                    partial += input[y + l] * (d * s0 * q1);
+                    partial += input[y + l + 32] * (d * s2 * q2);
+                    partial += input[y + l + 64] * (d * s4 * q3);
+                    partial += input[y + l + 96] * (d * s6 * q4);
+                }
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            partial += Warp.ShuffleDown(partial, off);
+        if (l == 0 && n < N) output[n] = partial;
     }
 
     /// <summary>Decode element <paramref name="r"/> (0..255) within a Q4_K super-block at byte
