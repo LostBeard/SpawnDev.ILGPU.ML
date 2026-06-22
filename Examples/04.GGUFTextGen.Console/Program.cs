@@ -374,6 +374,10 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         int maxSeq = int.TryParse(Environment.GetEnvironmentVariable("GGUF_GEN_MAXSEQ"), out var ms) && ms > defMaxSeq ? ms : defMaxSeq;
         kvCache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen: maxSeq);
         session.EnableGGUFDecode(kvCache);
+        // Match the production decode path (GgufGenerator): recycle fixed-shape decode output buffers across
+        // steps instead of renting a fresh one every token. Without this the bare harness leaks +1 pool buffer
+        // per step (unbounded growth + per-step alloc/GC) and reports a PESSIMISTIC decode time vs the server.
+        session.CacheShapeReadbacks = true;
         Console.WriteLine($"[KV-cache decode] {nLayers} layers, maxSeq={maxSeq}");
     }
 
