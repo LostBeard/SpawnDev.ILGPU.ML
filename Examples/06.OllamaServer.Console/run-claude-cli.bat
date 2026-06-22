@@ -9,11 +9,19 @@ REM ============================================================================
 setlocal
 
 REM ---- Which cached model to use. Any name from:  dotnet run -- --list ----
-REM     qwen2.5-coder is the coding model. For a bigger one try qwen2.5-coder:14b.
-set "MODEL=qwen2.5-coder:latest"
+REM     qwen2.5-coder 7B = the FAST interactive pick (~90ms/tok). gemma4:12b is slower (12B) and has a
+REM     large-context decode bug being fixed separately.
+set "MODEL=qwen2.5-coder:7b-instruct-q4_K_M"
 
 REM ---- Port (11435 avoids a clash with a running real Ollama on 11434) ----
 set "PORT=11435"
+
+REM ---- Interactive bounds (our engine is ~90ms/tok, so unbounded huge prompts/outputs take minutes) ----
+REM   NUM_CTX: agentic clients send ~38K-token prompts; we cap (tail-truncate) the context. Smaller = faster
+REM            first token (prefill ~ ctx/176 tok/s). 8192 ~= 45s worst-case prefill; lower it for snappier.
+REM   MAX_OUTPUT: hard cap on generated tokens so a verbose answer can't run for minutes (1024 ~= 90s max).
+set "OLLAMA_NUM_CTX=8192"
+set "OLLAMA_MAX_OUTPUT=1024"
 
 echo.
 echo   SpawnDev.ILGPU.ML  -  Claude CLI on your own GPU

@@ -440,8 +440,10 @@ public static class ServerEndpoints
     }
 
     // Cap requested output tokens — agentic clients ask for huge values (Claude CLI: 32000) that a small local
-    // model would either ramble into or that wouldn't fit the context.
-    private const int MaxOutputTokens = 4096;
+    // model would either ramble into or that wouldn't fit the context. At ~90ms/tok the cap bounds the worst-case
+    // response time (1024 tokens ≈ 90s). Override via OLLAMA_MAX_OUTPUT (set by run-claude-cli.bat).
+    private static readonly int MaxOutputTokens =
+        int.TryParse(Environment.GetEnvironmentVariable("OLLAMA_MAX_OUTPUT"), out var mo) && mo > 0 ? mo : 1024;
 
     private static GenerationConfig ReadOpenAiConfig(JsonElement req)
     {

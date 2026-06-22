@@ -2,6 +2,18 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Example 06 server: interactive bounds (fast model + capped context/output)
+
+**Made the Claude-CLI experience usable on a slow local engine.** `run-claude-cli.bat` now defaults to
+**qwen2.5-coder:7b** (~90ms/tok — the fast interactive pick; gemma4:12b is 12B/slower and has a separate
+large-context decode bug) and sets bounds so no request runs for minutes: `OLLAMA_NUM_CTX=8192` (agentic
+clients send ~38K-token prompts; we cap/tail-truncate — smaller = faster first token) and
+`OLLAMA_MAX_OUTPUT=1024` (hard output cap, env-configurable; at ~90ms/tok ≈ 90s worst case vs ~6 min at the old
+4096). Verified: qwen2.5-coder:7b on a moderate Claude-Code-shaped request (system-array + tools, non-stream)
+answers "The capital of France is Paris." in **2.4s with `stop_reason=end_turn`** (stops cleanly). The huge-
+prompt edge (38K truncated to ctx can break the chat structure → the model rambles to the cap) is now bounded
+by the output cap rather than open-ended; cleaner truncation + engine speed are the follow-ups.
+
 ## Unreleased — Example 06 server: stream the tools path (fix Claude CLI "API error")
 
 **Claude CLI got "API error" on the first real message and the GPU stayed pegged for minutes.** Claude CLI
