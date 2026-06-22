@@ -152,6 +152,16 @@ if (!string.IsNullOrEmpty(genPrompt))
     catch (Exception ex) { Console.Error.WriteLine($"GEN FAILED: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); return 1; }
 }
 
+// GGUF_PREFIX_CACHE_TEST=1 → prove KV-prefix-cache reuse is TOKEN-IDENTICAL to a fresh full prefill, and
+// measure the prefill-TTFT win. Builds prompt A (200 raw tokens) and B = A + 50 tokens; decodes 10 greedy
+// tokens from B with the cache OFF (fresh) and with the cache ON (after first decoding 1 token from A to
+// populate the prefix), then asserts the two 10-token id sequences match.
+if (Environment.GetEnvironmentVariable("GGUF_PREFIX_CACHE_TEST") == "1")
+{
+    try { return await PrefixCacheTestAsync(modelPath); }
+    catch (Exception ex) { Console.Error.WriteLine($"PREFIX-CACHE TEST FAILED: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); return 1; }
+}
+
 try
 {
     return await RunAsync(modelPath, tokenIds);
@@ -160,6 +170,114 @@ catch (Exception ex)
 {
     Console.Error.WriteLine($"FAILED: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
     return 1;
+}
+
+async Task<int> PrefixCacheTestAsync(string path)
+{
+    using var context = MLContext.Create().ToContext();
+    var cuda = context.GetCudaDevices();
+    Device device = cuda.Count > 0 ? (Device)cuda[0] : context.GetPreferredDevice(preferCPU: false);
+    using var accelerator = device.CreateAccelerator(context);
+    Console.WriteLine($"Accelerator: {accelerator.Name} ({accelerator.AcceleratorType})");
+
+    await using var hs = File.OpenRead(path);
+    var gm = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(hs);
+    gm.SourceStream = hs;
+    var tok = SpawnDev.ILGPU.ML.Preprocessing.SentencePieceTokenizer.FromGGUF(gm)!;
+
+    using var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, path);
+    Console.WriteLine($"Loaded: {session}\n");
+
+    // Build a deterministic 200-token raw prompt A, and B = A + 50 more tokens. BOS-prefixed so position 0
+    // is a real model start. We encode some natural text and pad/extend to the target lengths from the vocab.
+    int bosId = tok.BosId >= 0 ? tok.BosId : 1;
+    var baseText = "The quick brown fox jumps over the lazy dog. In a distant land, a curious scientist "
+        + "studied the patterns of the stars and the rhythms of the tides, recording every observation in a "
+        + "weathered leather journal that smelled faintly of ink and rain.";
+    var seed = tok.Encode(baseText).ToList();
+    if (seed.Count == 0) seed.Add(100);
+    var aList = new List<int> { bosId };
+    // Repeat the seed deterministically until we have >= 200 tokens, then trim to exactly 200.
+    int si = 0;
+    while (aList.Count < 200) { aList.Add(seed[si % seed.Count]); si++; }
+    var A = aList.Take(200).ToArray();
+    var bList = new List<int>(A);
+    while (bList.Count < 250) { bList.Add(seed[si % seed.Count]); si++; }
+    var B = bList.Take(250).ToArray();
+
+    Console.WriteLine($"Prompt A: {A.Length} tokens, Prompt B: {B.Length} tokens (B = A + {B.Length - A.Length} suffix)\n");
+
+    const int decodeN = 10;
+    var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = decodeN };
+    // maxSeqLen must hold B + decode with margin; keep it well above so no tail-truncation occurs (which
+    // would disable reuse by design).
+    int maxSeq = B.Length + decodeN + 64;
+
+    // NOTE on TTFT: kernels are JIT-cached on the shared `session` after the first prefill of each shape, so
+    // the fresh-vs-reuse TTFT gap below is real PREFILL COMPUTE, not one-time JIT. On qwen2 the M>1 prefill
+    // GEMM is the dominant cost (re-dequantizes the weight per output row), so prefilling 250 tokens (fresh)
+    // vs 49 tokens (reuse) is ~5x — exactly the prefix-cache win.
+
+    // ── Generator 1: prefix cache OFF, fresh full prefill of B, decode 10 ──
+    SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = false;
+    int[] freshIds;
+    double freshTtftMs;
+    using (var gen1 = new SpawnDev.ILGPU.ML.Pipelines.GgufGenerator(session, accelerator, gm, maxSeqLen: maxSeq))
+    {
+        var sw = Stopwatch.StartNew();
+        var r1 = await gen1.GenerateFirstTokenIdsAsync(B, cfg);
+        sw.Stop();
+        freshIds = r1.ids;
+        freshTtftMs = r1.ttftMs;
+        Console.WriteLine($"[fresh, cache OFF] reusedPrefix={gen1.LastReusedPrefix} TTFT(prefill+1st)={freshTtftMs:F1}ms  ids=[{string.Join(",", freshIds)}]");
+    }
+
+    // ── Generator 2: prefix cache ON. First decode 1 token from A (populates the cache with A's prefix),
+    //    THEN decode 10 from B (must reuse the ~200-token A prefix, prefill only the 50-token suffix). ──
+    SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = true;
+    int[] reuseIds;
+    double reuseTtftMs;
+    int reusedPrefix;
+    using (var gen2 = new SpawnDev.ILGPU.ML.Pipelines.GgufGenerator(session, accelerator, gm, maxSeqLen: maxSeq))
+    {
+        // Turn 1: decode 1 token from A → cache now holds A (200) + 1 generated token.
+        var warm = await gen2.GenerateFirstTokenIdsAsync(A, new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = 1 });
+        Console.WriteLine($"[warm from A] reusedPrefix={gen2.LastReusedPrefix} cachedAfter={A.Length + warm.ids.Length}");
+        // Turn 2: decode 10 from B → should reuse the 200-token A prefix (B[0..200) == A).
+        var sw = Stopwatch.StartNew();
+        var r2 = await gen2.GenerateFirstTokenIdsAsync(B, cfg);
+        sw.Stop();
+        reuseIds = r2.ids;
+        reuseTtftMs = r2.ttftMs;
+        reusedPrefix = gen2.LastReusedPrefix;
+        Console.WriteLine($"[reuse, cache ON] reusedPrefix={reusedPrefix} (expected ~{A.Length}) TTFT(prefill+1st)={reuseTtftMs:F1}ms  ids=[{string.Join(",", reuseIds)}]");
+    }
+
+    // ── Assert token-identity ──
+    int firstDiv = -1;
+    int n = Math.Min(freshIds.Length, reuseIds.Length);
+    for (int i = 0; i < n; i++) if (freshIds[i] != reuseIds[i]) { firstDiv = i; break; }
+    bool pass = firstDiv < 0 && freshIds.Length == reuseIds.Length && freshIds.Length == decodeN;
+
+    Console.WriteLine();
+    if (pass)
+    {
+        Console.WriteLine("PREFIX-CACHE TOKEN-IDENTICAL: PASS");
+        Console.WriteLine($"  reusedPrefix={reusedPrefix} tokens (of B's {B.Length}); prefilled only {B.Length - reusedPrefix} tokens on reuse.");
+        Console.WriteLine($"  TTFT fresh={freshTtftMs:F1}ms  reuse={reuseTtftMs:F1}ms  speedup={(reuseTtftMs > 0 ? freshTtftMs / reuseTtftMs : 0):F2}x");
+        return 0;
+    }
+    else
+    {
+        Console.WriteLine("PREFIX-CACHE TOKEN-IDENTICAL: FAIL");
+        if (firstDiv >= 0)
+            Console.WriteLine($"  first divergent index {firstDiv}: fresh={freshIds[firstDiv]} reuse={reuseIds[firstDiv]}");
+        else
+            Console.WriteLine($"  length mismatch: fresh={freshIds.Length} reuse={reuseIds.Length} (expected {decodeN})");
+        Console.WriteLine($"  fresh=[{string.Join(",", freshIds)}]");
+        Console.WriteLine($"  reuse=[{string.Join(",", reuseIds)}]");
+        return 3;
+    }
 }
 
 async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)

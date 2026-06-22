@@ -45,6 +45,25 @@ public sealed class GgufGenerator : IDisposable
     private readonly int _eosId;
     private readonly int _maxSeqLen;
 
+    /// <summary>The full token sequence (prompt + generated) currently resident in the KV cache from the
+    /// previous <see cref="GenerateAsync"/> call; null before the first call. Used to compute the reusable
+    /// common prefix on the next request.</summary>
+    private int[]? _cachedIds;
+
+    /// <summary>Enable KV-prefix caching: on each request, reuse the cached K/V for the longest common token
+    /// prefix shared with the previous request (same tokens at the same absolute positions → bit-identical
+    /// K/V), prefilling only the new suffix. The #1 win for agentic clients (Claude CLI) that re-send a near-
+    /// identical ~14.5K-token prompt every turn. Set false to force a full re-prefill every call (the original
+    /// behavior). Default true.</summary>
+    public static bool EnablePrefixCache { get; set; } = true;
+
+    /// <summary>Minimum reusable-prefix length to bother with prefix-cache reuse. Below this, a full prefill
+    /// is cheap enough that the reuse bookkeeping isn't worth it.</summary>
+    private const int MinReusePrefix = 16;
+
+    /// <summary>Last request's reused-prefix length P (0 = no reuse / full prefill). Diagnostic for tests.</summary>
+    public int LastReusedPrefix { get; private set; }
+
     /// <summary>The model's tokenizer (SentencePiece, from the GGUF vocab).</summary>
     public SentencePieceTokenizer Tokenizer => _tokenizer;
 
@@ -95,19 +114,22 @@ public sealed class GgufGenerator : IDisposable
         Func<string, Task>? onDelta = null,
         CancellationToken ct = default)
     {
-        _session.ResetGGUFDecode();
         int maxNew = config?.MaxNewTokens is int mn && mn > 0 ? mn : 128;
 
         // Fit prompt + generation into the KV cache. Agentic clients (Claude CLI) routinely send prompts far
         // larger than a small local model's context (they assume a 200K-context Claude) and ask for huge
         // max_tokens — so an over-long prompt is TAIL-truncated (keep the most recent tokens, which hold the
         // actual question) and maxNew is capped, rather than overflowing the cache and crashing.
+        bool truncated = false;
         if (promptIds.Length + maxNew > _maxSeqLen - 1)
         {
             int reserve = Math.Clamp(maxNew, 64, Math.Max(64, _maxSeqLen / 8));
             int keep = _maxSeqLen - 1 - reserve;
             if (keep >= 1 && promptIds.Length > keep)
+            {
                 promptIds = promptIds[^keep..];
+                truncated = true;
+            }
             maxNew = Math.Min(maxNew, _maxSeqLen - 1 - promptIds.Length);
             if (maxNew < 1) maxNew = 1;
         }
@@ -120,7 +142,37 @@ public sealed class GgufGenerator : IDisposable
         int maxStopLen = 0;
         if (stopStrings != null) foreach (var s in stopStrings) if (s.Length > maxStopLen) maxStopLen = s.Length;
 
-        int[] stepIds = promptIds; // prefill = whole prompt, then 1 token/step
+        // KV-prefix cache: reuse the bit-identical K/V of the longest common token prefix that this prompt
+        // shares with the sequence already resident in the cache (same tokens, same absolute positions, so
+        // RoPE positions match → token-identical to a full re-prefill). Prefill only the new suffix.
+        // P is capped at promptIds.Length-1 (must prefill ≥1 token so there are logits to decode from) and at
+        // _cachedIds.Length (can't reuse beyond what's cached). Below MinReusePrefix it's not worth it.
+        // CORRECTNESS: reuse is valid ONLY when the prompt was NOT tail-truncated this turn — truncation shifts
+        // every kept token to a lower absolute position, so the new prompt's position i no longer matches the
+        // cached token at absolute position i (RoPE uses absolute position). A coincidental value match would
+        // reuse K/V computed at the wrong position. On truncation, force a full prefill.
+        int P = 0;
+        if (EnablePrefixCache && !truncated && _cachedIds != null)
+        {
+            int maxP = Math.Min(_cachedIds.Length, promptIds.Length - 1);
+            while (P < maxP && _cachedIds[P] == promptIds[P]) P++;
+            if (P < MinReusePrefix) P = 0;
+        }
+
+        int[] stepIds; // prefill tokens for step 0 (whole prompt, or just the new suffix on reuse)
+        if (P > 0)
+        {
+            // Reuse path: leave the cached K/V for tokens 0..P-1 in place, set the cursor to P, prefill P..end.
+            _session.SetGGUFDecodePastLen(P);
+            stepIds = promptIds[P..];
+        }
+        else
+        {
+            // No reuse: full prefill from position 0 (original behavior).
+            _session.ResetGGUFDecode();
+            stepIds = promptIds;
+        }
+        LastReusedPrefix = P;
         StopReason stop = StopReason.Length;
 
         for (int step = 0; step < maxNew; step++)
@@ -199,7 +251,98 @@ public sealed class GgufGenerator : IDisposable
                 await onDelta(full.ToString(emitted, full.Length - emitted));
         }
 
+        // Record the full sequence now resident in the KV cache (prompt + generated) so the NEXT request can
+        // reuse this turn's prompt+response as its prefix. The generated tokens were written into the cache at
+        // their absolute positions during decode; only the tokens contributing to the cache count (a stop
+        // token ends the turn WITHOUT being written, so it is excluded — `generated` already excludes it).
+        // Cap to the cache's valid region (maxSeqLen-1, matching the prefill/decode bound used above).
+        if (EnablePrefixCache)
+        {
+            int total = promptIds.Length + generated.Count;
+            int cap = _maxSeqLen - 1;
+            var resident = new int[Math.Min(total, cap)];
+            int copyPrompt = Math.Min(promptIds.Length, resident.Length);
+            Array.Copy(promptIds, 0, resident, 0, copyPrompt);
+            for (int i = 0; copyPrompt + i < resident.Length && i < generated.Count; i++)
+                resident[copyPrompt + i] = generated[i];
+            _cachedIds = resident;
+        }
+        else _cachedIds = null;
+
         return new GenerationResult(full.ToString(), promptIds.Length, generated.Count, stop);
+    }
+
+    /// <summary>
+    /// TEST/DIAGNOSTIC: greedy-decode exactly <see cref="GenerationConfig.MaxNewTokens"/> token ids from
+    /// <paramref name="promptIds"/>, returning the RAW token ids (no EOS/stop suppression, no detokenization)
+    /// and the prefill TTFT (wall time of the first step = prefill + first-token argmax). Drives the exact same
+    /// KV-prefix-cache reuse path as <see cref="GenerateAsync"/> (so a reuse run is directly comparable to a
+    /// fresh run for the token-identity gate) and updates <see cref="_cachedIds"/> the same way. Greedy only.
+    /// </summary>
+    public async Task<(int[] ids, double ttftMs)> GenerateFirstTokenIdsAsync(int[] promptIds, GenerationConfig? config = null)
+    {
+        int maxNew = config?.MaxNewTokens is int mn && mn > 0 ? mn : 10;
+
+        bool truncated = false;
+        if (promptIds.Length + maxNew > _maxSeqLen - 1)
+        {
+            int reserve = Math.Clamp(maxNew, 64, Math.Max(64, _maxSeqLen / 8));
+            int keep = _maxSeqLen - 1 - reserve;
+            if (keep >= 1 && promptIds.Length > keep) { promptIds = promptIds[^keep..]; truncated = true; }
+            maxNew = Math.Min(maxNew, _maxSeqLen - 1 - promptIds.Length);
+            if (maxNew < 1) maxNew = 1;
+        }
+
+        // Same prefix-cache reuse decision as GenerateAsync (see that method for the correctness rationale).
+        int P = 0;
+        if (EnablePrefixCache && !truncated && _cachedIds != null)
+        {
+            int maxP = Math.Min(_cachedIds.Length, promptIds.Length - 1);
+            while (P < maxP && _cachedIds[P] == promptIds[P]) P++;
+            if (P < MinReusePrefix) P = 0;
+        }
+
+        int[] stepIds;
+        if (P > 0) { _session.SetGGUFDecodePastLen(P); stepIds = promptIds[P..]; }
+        else { _session.ResetGGUFDecode(); stepIds = promptIds; }
+        LastReusedPrefix = P;
+
+        var generated = new List<int>();
+        double ttftMs = 0;
+        for (int step = 0; step < maxNew; step++)
+        {
+            var idf = new float[stepIds.Length];
+            for (int i = 0; i < stepIds.Length; i++) idf[i] = stepIds[i];
+            var sw = step == 0 ? System.Diagnostics.Stopwatch.StartNew() : null;
+            using var inBuf = _accelerator.Allocate1D(idf);
+            var outputs = await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
+            { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
+
+            var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
+            int vocab = logitsT.Shape[^1];
+            int seqOut = logitsT.ElementCount / vocab;
+            long lastOff = (long)(seqOut - 1) * vocab;
+            int next = await _argmax.ArgMaxAsync(logitsT.Data.SubView(lastOff, vocab), vocab);
+            if (sw != null) { await _accelerator.SynchronizeAsync(); sw.Stop(); ttftMs = sw.Elapsed.TotalMilliseconds; }
+
+            generated.Add(next);
+            stepIds = new[] { next };
+        }
+
+        if (EnablePrefixCache)
+        {
+            int total = promptIds.Length + generated.Count;
+            int cap = _maxSeqLen - 1;
+            var resident = new int[Math.Min(total, cap)];
+            int copyPrompt = Math.Min(promptIds.Length, resident.Length);
+            Array.Copy(promptIds, 0, resident, 0, copyPrompt);
+            for (int i = 0; copyPrompt + i < resident.Length && i < generated.Count; i++)
+                resident[copyPrompt + i] = generated[i];
+            _cachedIds = resident;
+        }
+        else _cachedIds = null;
+
+        return (generated.ToArray(), ttftMs);
     }
 
     /// <summary>Index of the earliest stop-string match at or after <paramref name="from"/>, or -1.</summary>

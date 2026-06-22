@@ -2159,6 +2159,21 @@ public class InferenceSession : IDisposable
     /// <summary>Reset the decode cursor to begin a fresh sequence (reuses the cache allocation).</summary>
     public void ResetGGUFDecode() => DecodePastLen = 0;
 
+    /// <summary>Set the decode cursor to <paramref name="p"/> WITHOUT clearing the KV-cache contents — the
+    /// prefix-cache reuse path. When tokens 0..p-1 already hold the bit-identical K/V from a previous request
+    /// (same tokens at the same absolute positions), set the cursor to p and prefill only the new suffix
+    /// p..end: the suffix tokens are written at p and attend the cached 0..p-1 history + themselves, exactly
+    /// as a fresh full prefill would. RoPE uses the absolute position (kv_offset = DecodePastLen), so the
+    /// cached prefix's positions match and the result is token-identical to a full re-prefill. Leaves the
+    /// executor in the same valid mid-decode state as <see cref="ResetGGUFDecode"/>, just at position p.</summary>
+    public void SetGGUFDecodePastLen(int p)
+    {
+        if (_decodeCache == null)
+            throw new InvalidOperationException("Call EnableGGUFDecode(cache) before SetGGUFDecodePastLen.");
+        if (p < 0) throw new ArgumentOutOfRangeException(nameof(p));
+        DecodePastLen = p;
+    }
+
     /// <summary>Detach the KV-cache: clears the session's reference and resets the cursor. Call before
     /// disposing the cache so the session never holds a dangling reference to freed GPU buffers.</summary>
     public void DisableGGUFDecode() { _decodeCache = null; DecodePastLen = 0; }
