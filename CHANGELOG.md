@@ -2,6 +2,19 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Decode GEMV scale-cache (Q4_K M=1, the per-token path)
+
+**The M=1 dequant GEMV (run for every decoded token) cached its Q4_K sub-block scales.** A direct comparison
+against Ollama (same qwen2.5-coder-7B-Q4_K_M blob, RTX 4070) showed decode is the dominant gap (~120ms/tok vs
+Ollama's ~12ms); an isolated bench localized it to the M=1 GEMV running at only ~34 GB/s (~7% of the card's
+~504 GB/s). The Q8_0 GEMV (trivial dequant) ran at ~86 GB/s on the same path → the limiter was the per-element
+6-bit `get_scale_min_k4` extraction (ALU), not bandwidth. Fix: the 8 sub-block `{d·sc, dmin·mn}` of a Q4_K
+block are now decoded ONCE per block into shared (8 cooperating threads), and the per-element work is a nibble
+fetch + one multiply + one subtract (`DecodeQ4KNibble`). **Q4_K GEMV ~34 → ~51 GB/s (~1.5×); qwen decode steps
+~120 → ~90 ms.** Bit-identical (qwen decode tokens + logits unchanged; `GemvTests` oracle green on all 6
+backends). The remaining gap to Ollama is a deeper GEMV-structure / occupancy issue (even trivial-dequant Q8_0
+caps at ~17% bandwidth here) — tracked.
+
 ## Unreleased — KV-tiled grouped attention (unbounded SKV for long prompts)
 
 **`FusedAttentionKernel` now handles unbounded SKV via a KV-tiled grouped kernel.** The single-pass grouped

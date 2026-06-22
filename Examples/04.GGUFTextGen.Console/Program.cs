@@ -81,6 +81,10 @@ if (Environment.GetEnvironmentVariable("GGUF_GEMM_BENCH") == "1")
         }
         DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K, 144, "Q4_K dequant   ");
         DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q6_K, 210, "Q6_K dequant   ");
+        // Q8_0 (32-elem blocks, 34B = 272B/256-elem) has a TRIVIAL dequant (d × int8, no sub-block scale) — the
+        // ALU-vs-memory diagnostic for the M=1 GEMV: if Q8_0 GB/s >> Q4_K's, the Q4_K 6-bit scale extraction is
+        // the per-element ALU bottleneck (→ cache the sub-block scales), not memory bandwidth.
+        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q8_0, 272, "Q8_0 dequant   ");
     }
     Console.WriteLine("\n######## DECODE GEMV (M=1, bandwidth-bound — the Ollama decode gap) ########");
     Bench(1, 3584, 18944);    // MLP gate/up   (Q4_K)

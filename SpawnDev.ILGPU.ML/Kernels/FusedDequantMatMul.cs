@@ -441,29 +441,44 @@ public class FusedDequantMatMul : IDisposable
         int tid = Group.IdxX;    // 0..GemvGroupSize-1
 
         var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        // Per-block sub-block-scale cache: a Q4_K block has 8 sub-blocks (j=0..7), each with a 6-bit (sc,mn)
+        // shared by 32 elements. Extracting them per element (get_scale_min_k4 = ~15 ALU) was the GEMV's
+        // bottleneck (MEASURED: Q4_K GEMV 33 GB/s vs trivial-dequant Q8_0 86 GB/s on a 4070 — ALU-bound, not
+        // bandwidth). Decode the 8 folded {d·sc, dmin·mn} ONCE per block into shared, then the per-element work
+        // is a nibble fetch + 1 mul + 1 sub (DecodeQ4KNibble). Bit-identical to DecodeQ4KScaled.
+        var shDsc = SharedMemory.Allocate<float>(8);
+        var shDmm = SharedMemory.Allocate<float>(8);
         float partial = 0f;
         if (n < N)
         {
             int bytesPerRow = K / 256 * 144;
             int rowBase = n * bytesPerRow;
-            // BLOCK-STRUCTURED: with GemvGroupSize=64 each thread owns exactly 256/64=4 elements per 256-block
-            // (r = tid, tid+64, tid+128, tid+192 — same coalesced access as the strided-k loop). The block's
-            // fp16 d/dmin are IDENTICAL for all 256 elements, so decode them ONCE per block (was per element =
-            // 2 HalfToFloatFinite × ~20 ALU ops wasted 256x — Pathology #3). The per-element work is then just
-            // the 6-bit sub-block scale + the nibble.
             int numBlocks = K / 256;
             int perThread = 256 / GemvGroupSize;
             for (int blk = 0; blk < numBlocks; blk++)
             {
                 int sbOff = rowBase + blk * 144;
-                float d = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
-                float dmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+                // 8 threads decode the block's 8 sub-block scales once (d/dmin block-constant, folded into d·sc/dmin·mn).
+                if (tid < 8)
+                {
+                    float d = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+                    float dmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+                    int j = tid, scOff = sbOff + 4;
+                    int lowBit = ((j - 4) >> 31) & 1, hiBit = 1 - lowBit;
+                    int bj = ReadByte(w, scOff + j), bj4 = ReadByte(w, scOff + j + 4), bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+                    float sc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+                    float mn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+                    shDsc[j] = d * sc; shDmm[j] = dmin * mn;
+                }
+                Group.Barrier();
                 int kBase = blk * 256;
                 for (int sub = 0; sub < perThread; sub++)
                 {
                     int r = tid + sub * GemvGroupSize;
-                    partial += input[kBase + r] * DecodeQ4KScaled(w, sbOff, r, d, dmin);
+                    int j = 2 * (r >> 6) + ((r >> 5) & 1);
+                    partial += input[kBase + r] * DecodeQ4KNibble(w, sbOff, r, shDsc[j], shDmm[j]);
                 }
+                Group.Barrier(); // before the next block overwrites shDsc/shDmm
             }
         }
         sh[tid] = partial;
