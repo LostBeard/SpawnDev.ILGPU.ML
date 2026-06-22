@@ -179,6 +179,29 @@ if (args.Contains("--list"))
 
     app.MapOllamaApi(registry);
 
+    // Pre-load a model BEFORE the HTTP server starts listening (set OLLAMA_PRELOAD=<model>, e.g. by
+    // run-claude-cli.bat). Multi-GB models take seconds to load onto the GPU, and loading happens UNDER the
+    // single generation gate — so a lazy first-request load makes an agentic client's CONCURRENT startup burst
+    // (Claude CLI fires a title request + the main message + a warmup at once) pile up behind the load and get
+    // canceled (RequestAborted → OperationCanceledException, the failure seen in the request log). Pre-loading
+    // here means /api/version only comes up once the model is resident, so a client that waits for readiness
+    // never races the load. Lazy load still works for ad-hoc clients (just with that cold-start caveat).
+    var preloadModel = Environment.GetEnvironmentVariable("OLLAMA_PRELOAD");
+    if (!string.IsNullOrWhiteSpace(preloadModel))
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine($"  Pre-loading '{preloadModel}' onto the GPU (so the first client request doesn't wait for a load)...");
+        try
+        {
+            using var lease = await registry.AcquireAsync(preloadModel);
+            Console.WriteLine($"  Model resident in {sw.Elapsed.TotalSeconds:F1}s — ready for clients.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Pre-load of '{preloadModel}' failed ({ex.GetType().Name}: {ex.Message}); it will load on the first request instead.");
+        }
+    }
+
     Console.WriteLine($"SpawnDev.ILGPU.ML — Ollama-compatible server");
     Console.WriteLine($"  http://localhost:{port}   accelerator: {serverAccel.Name}");
     Console.WriteLine($"  {store.List().Count} models from {OllamaModelStore.DefaultRoot()}");

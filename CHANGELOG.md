@@ -2,6 +2,19 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Example 06 server: fix Claude CLI cold-start (pre-load the model)
+
+**Claude CLI failed to connect to the Ollama-replacement server** — the request log showed every startup
+`/v1/messages` throwing `OperationCanceledException` in `ModelRegistry.AcquireAsync`. Root cause (diagnosed
+from the captured traffic + reproduction, not guessed): the first request lazily loads the multi-GB model
+**while holding the single generation gate**, and Claude CLI fires several requests at once on startup (title +
+main + warmup) — they pile up behind the load and Claude cancels them (the client abort = `RequestAborted`).
+Once loaded, everything works (200s, coherent answers, concurrent requests serialize cleanly — all verified).
+Fix: the server **pre-loads a model at startup** (`OLLAMA_PRELOAD=<model>`) before it begins listening, so a
+client that waits for `/api/version` never races the load; `run-claude-cli.bat` sets `OLLAMA_PRELOAD` and now
+polls `/api/version` for readiness instead of a fixed 10s sleep. Verified: pre-load (~4s), readiness gating,
+title (`json_schema`/`output_config` shape), and a realistic main request (system-as-array, SSE) all work.
+
 ## Unreleased — Decode GEMV scale-cache (Q4_K M=1, the per-token path)
 
 **The M=1 dequant GEMV (run for every decoded token) cached its Q4_K sub-block scales.** A direct comparison

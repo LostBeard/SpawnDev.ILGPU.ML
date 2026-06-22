@@ -22,10 +22,19 @@ echo.
 echo   Opening the server in a new window (leave it running)...
 
 set "OLLAMA_PORT=%PORT%"
+REM Pre-load the model at server startup so it is GPU-resident BEFORE Claude CLI's concurrent startup burst
+REM hits it. A lazy first-request load held the single generation gate, and Claude's other startup requests
+REM (title + warmup) canceled while waiting (the OperationCanceledException in the request log). /api/version
+REM only answers once the model is loaded, so we poll it below instead of guessing a fixed wait.
+set "OLLAMA_PRELOAD=%MODEL%"
 start "SpawnDev.ILGPU.ML Server (%MODEL%)" cmd /k dotnet run --project "%~dp0OllamaServer.Console.csproj" -c Release
 
-echo   Waiting ~10s for the server to come up...
-timeout /t 10 /nobreak >nul
+echo   Waiting for the server to load %MODEL% onto the GPU (first load of a multi-GB model takes ~10-40s)...
+:waitready
+timeout /t 2 /nobreak >nul
+curl -s -o nul -m 2 http://localhost:%PORT%/api/version
+if errorlevel 1 goto waitready
+echo   Server ready (model resident on the GPU).
 
 REM ---- Point Claude CLI at our server (it speaks the Anthropic Messages API) ----
 set "ANTHROPIC_BASE_URL=http://localhost:%PORT%"
@@ -36,8 +45,7 @@ set "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=Local %MODEL%"
 set "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1"
 
 echo.
-echo   Launching Claude CLI...
-echo   (your FIRST message loads the model onto the GPU - give it ~15-20s)
+echo   Launching Claude CLI (model already resident - first message responds right away)...
 echo.
 claude
 
