@@ -64,6 +64,13 @@ public class FusedDequantMatMul : IDisposable
     // coalesced per warp and ample K-parallelism; must stay a power of two for the tree reduction.
     private const int GemvGroupSize = 64;
 
+    // dp4a GEMV: warps PER BLOCK. The original launch was 1 warp/block (KernelConfig(N, 32)); on the 4070 the
+    // hardware blocks-per-SM cap (~16-32) then limited occupancy to ~16-32 of the 48 max warps/SM ⇒ ~54% of
+    // peak bandwidth. Packing multiple warps/block (each warp still computes ONE output column with its 32
+    // lanes + warp-shuffle reduce; NO shared mem, so no extra pressure) fills the SM with warps ⇒ higher
+    // achieved bandwidth — the llama.cpp MMVQ structure. CUDA-only (warp==32). Power-of-two.
+    private const int Dp4aWarps = 4;
+
     // DIAGNOSTIC TOGGLE (env GGUF_GEMV_OFF=1): force M==1 onto the per-element M*N kernel instead of
     // the shared-memory/barrier GEMV. A/B switch for isolating the M=1 GEMV as a suspect in the CPU
     // KV-decode non-determinism investigation (2026-06-15). Read once; zero cost in production.
@@ -197,7 +204,7 @@ public class FusedDequantMatMul : IDisposable
                 _gemvDp4aQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvDp4aQ4_KImpl);
-                _gemvDp4aQ4_K(new KernelConfig(N, _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
+                _gemvDp4aQ4_K(new KernelConfig((N + Dp4aWarps - 1) / Dp4aWarps, Dp4aWarps * _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
                 return;
             }
             if (EnableDp4aGemv && type == GGMLType.Q6_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
@@ -211,7 +218,7 @@ public class FusedDequantMatMul : IDisposable
                 _gemvDp4aQ6_K ??= _accelerator.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvDp4aQ6_KImpl);
-                _gemvDp4aQ6_K(new KernelConfig(N, _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
+                _gemvDp4aQ6_K(new KernelConfig((N + Dp4aWarps - 1) / Dp4aWarps, Dp4aWarps * _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
                 return;
             }
             // Warp-cooperative Q4_K GEMV: one warp per output column, Warp.Shuffle scale-broadcast + reduction,
@@ -768,8 +775,8 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<int, Stride1D.Dense> p)
     {
         int K = p[1], N = p[2];
-        int n = Grid.IdxX;
-        int lane = Group.IdxX;
+        int n = Grid.IdxX * Dp4aWarps + (Group.IdxX >> 5);   // 4 warps/block, each owns one output column
+        int lane = Group.IdxX & 31;
         float partial = 0f;
         if (n < N)
         {
@@ -844,8 +851,8 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<int, Stride1D.Dense> p)
     {
         int K = p[1], N = p[2];
-        int n = Grid.IdxX;
-        int lane = Group.IdxX;
+        int n = Grid.IdxX * Dp4aWarps + (Group.IdxX >> 5);   // 4 warps/block, each owns one output column
+        int lane = Group.IdxX & 31;
         float partial = 0f;
         if (n < N)
         {
