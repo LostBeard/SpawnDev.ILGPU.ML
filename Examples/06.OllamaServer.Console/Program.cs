@@ -41,6 +41,13 @@ SpawnDev.ILGPU.ML.Kernels.FusedAttentionKernel.EnableGroupedAttention = true;
 // Token-identical (the generator only reads the last position); library-default off. Correct for generation only.
 SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.EnableLastPositionLogits = true;
 
+// Vectorized warp-cooperative Q4_K decode GEMV (the M=1 per-token hot path): each warp lane loads its nibble
+// word ONCE and decodes all 8 nibbles (vs the default kernel's ReadByte-per-nibble = 8x redundant loads),
+// sharing scales + reducing via Warp.Shuffle (no barrier/shared mem). MEASURED on qwen2.5-coder:7b/RTX 4070:
+// Q4_K GEMV ~2.5x (54->134 GB/s), decode step ~88->58 ms/tok, token-identical. Warp-size-32 GPUs (CUDA/NVIDIA
+// OpenCL); CPU/Wasm fall back to the portable GEMV. Library-default off pending the full sweep — this opts in.
+SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWarpGemv = true;
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.

@@ -71,7 +71,15 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K;
+
+    // Warp-cooperative GEMV (opt-in GGUF_GEMV_V2=1): the default GEMV pays two Group.Barrier() per super-block
+    // (scale-decode + before-reuse) plus a shared-mem tree reduction — those syncs cap M=1 decode at ~10% of the
+    // card's bandwidth. The warp kernel shares sub-block scales + reduces via Warp.Shuffle (warp-synchronous, NO
+    // barrier, NO shared mem). Q4_K first (the qwen decode weight). Gated to warp>=32 GPUs (CUDA/OpenCL); CPU/Wasm
+    // (small warp) keep the portable shared-mem kernel. Bit-identical math (same DecodeQ4KNibble + folded scales).
+    public static bool EnableWarpGemv =
+        Environment.GetEnvironmentVariable("GGUF_GEMV_V2") == "1";
 
     // Multi-row dequant GEMM for M>1 (prefill): dequant each weight element ONCE, reuse across GemmMTile rows —
     // kills the O(M) redundant dequant of the general per-element kernel (the prefill bottleneck). Output is
@@ -155,6 +163,20 @@ public class FusedDequantMatMul : IDisposable
         if (M == 1 && !gpuBrowser && !ForcePerElementGemv)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
+            // Warp-cooperative Q4_K GEMV: one warp per output column, Warp.Shuffle scale-broadcast + reduction,
+            // NO Group.Barrier / NO shared mem (the default kernel's per-super-block barriers cap its bandwidth).
+            // CUDA only: warp==32 + Warp.Shuffle always available. ILGPU's OpenCL backend needs the
+            // cl_khr_subgroup_shuffle / cl_intel_subgroups extension (absent on NVIDIA's OpenCL → "Invalid code
+            // generation"), so OpenCL keeps the portable GEMV until that capability path lands (ILGPU/Geordi).
+            if (EnableWarpGemv && type == GGMLType.Q4_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+            {
+                var warpCfg = new KernelConfig(N, _accelerator.WarpSize);
+                _gemvWarpQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_KWarpImpl);
+                _gemvWarpQ4_K(warpCfg, input, intView, output, paramsBuf.View);
+                return;
+            }
             switch (type)
             {
                 case GGMLType.Q4_K:
@@ -495,6 +517,74 @@ public class FusedDequantMatMul : IDisposable
             Group.Barrier();
         }
         if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    // Warp-cooperative VECTORIZED Q4_K GEMV (M==1 decode hot path): one 32-lane WARP per output column. The
+    // default GemvDequantQ4_KImpl reads each 4-bit weight via ReadByte — loading a full 32-bit word to use ONE
+    // nibble = 8× redundant loads (MEASURED the bottleneck: warp-shuffle reduction alone barely moved it, ~10%
+    // of card bandwidth). Here each lane loads its 32-bit word of nibbles EXACTLY ONCE and decodes all 8 nibbles
+    // in it (4 bytes × 2 nibbles = 8 elements). A super-block's 128 nibble-bytes = 32 words = one word per lane.
+    // The 8 sub-block folded {d·sc, dmin·mn} are decoded by lanes<8 and shared via Warp.Shuffle; the final
+    // reduction is Warp.ShuffleDown — ZERO Group.Barrier, ZERO shared memory. Same dequant math as DecodeQ4KNibble
+    // (dsc·nibble − dmm); accumulation order differs (per-lane), so results match the per-element kernel to GEMV
+    // float-reduction precision (the existing GEMV already differs from a serial sum at that level; argmax-identical,
+    // oracle-verified to 2e-3). Requires warp size == 32 (gated at dispatch); CPU/Wasm/other keep the portable kernel.
+    private static void GemvDequantQ4_KWarpImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;          // one warp per output column
+        int lane = Group.IdxX;      // 0..31
+        float partial = 0f;
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 144;
+            int rowBase = n * bytesPerRow;
+            int numBlocks = K / 256;
+            // Lane→data map (32 nibble-words/super-block, 1 per lane): the nibble region is 4 sub-block-pairs of
+            // 32 bytes; lane's 4 bytes lie within ONE pair t = lane>>3 at l = 4·(lane&7)+bi (bi=0..3). t selects
+            // sub-blocks 2t (nibble hi=0) and 2t+1 (nibble hi=1) — both shared in via Warp.Shuffle.
+            int t = lane >> 3;            // 0..3  → sub-block pair {2t, 2t+1}
+            int lBase = 4 * (lane & 7);   // 0,4,...,28  → first of this lane's 4 nibble columns
+            for (int blk = 0; blk < numBlocks; blk++)
+            {
+                int sbOff = rowBase + blk * 144;
+                // Lanes<8 decode their sub-block's folded {d·sc, dmin·mn} (mirrors the default kernel's shDsc/shDmm).
+                float myDsc = 0f, myDmm = 0f;
+                if (lane < 8)
+                {
+                    float d = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+                    float dmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+                    int j = lane, scOff = sbOff + 4;
+                    int lowBit = ((j - 4) >> 31) & 1, hiBit = 1 - lowBit;
+                    int bj = ReadByte(w, scOff + j), bj4 = ReadByte(w, scOff + j + 4), bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+                    float sc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+                    float mn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+                    myDsc = d * sc; myDmm = dmin * mn;
+                }
+                float dsc0 = Warp.Shuffle(myDsc, 2 * t), dmm0 = Warp.Shuffle(myDmm, 2 * t);
+                float dsc1 = Warp.Shuffle(myDsc, 2 * t + 1), dmm1 = Warp.Shuffle(myDmm, 2 * t + 1);
+
+                // Load this lane's 4 nibble-bytes as ONE 32-bit word (sbOff+16 is 4-aligned; +32t+lBase too).
+                int word = w[(sbOff + 16 + 32 * t + lBase) >> 2];
+                int kHi0 = blk * 256 + (t << 6) + lBase;   // global index of hi=0 element at l=lBase
+                for (int bi = 0; bi < 4; bi++)
+                {
+                    int b = (word >> (bi * 8)) & 0xFF;
+                    int nib0 = b & 0xF;          // hi=0 nibble → sub-block 2t
+                    int nib1 = (b >> 4) & 0xF;   // hi=1 nibble → sub-block 2t+1
+                    partial += input[kHi0 + bi] * (dsc0 * nib0 - dmm0);
+                    partial += input[kHi0 + 32 + bi] * (dsc1 * nib1 - dmm1);
+                }
+            }
+        }
+        // Warp-shuffle reduction (no shared mem / no barrier): lane 0 ends with the column's dot product.
+        for (int off = 16; off > 0; off >>= 1)
+            partial += Warp.ShuffleDown(partial, off);
+        if (lane == 0 && n < N) output[n] = partial;
     }
 
     /// <summary>Decode element <paramref name="r"/> (0..255) within a Q4_K super-block at byte

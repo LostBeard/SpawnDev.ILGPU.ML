@@ -161,6 +161,56 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Gemv_M1_QuantizedQ4K_Warp_MatchesOracle() => await RunTest(async accelerator =>
+    {
+        // Exercises the VECTORIZED warp-cooperative Q4_K GEMV (EnableWarpGemv / GGUF_GEMV_V2): one 32-lane warp
+        // per output column, each lane loading its nibble word ONCE and decoding all 8 nibbles, scales + reduction
+        // via Warp.Shuffle (no Group.Barrier / no shared mem). ~2.5x the default GEMV's bandwidth on a 4070,
+        // argmax-identical on qwen2.5-coder. On a backend whose warp size != 32 (CPU/Wasm) it falls back to the
+        // default GEMV (still correct). Must match the CPU dequant·GEMV reference to GEMV-reduction tolerance.
+        const int M = 1, K = 4096, N = 256;
+        var type = GGMLType.Q4_K;
+        var rng = new Random(43);
+        var input = new float[K];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int bytesPerRow = RowBytes(type, K);
+        var weightBytes = new byte[N * bytesPerRow];
+        var wRows = new float[N][];
+        for (int n = 0; n < N; n++)
+        {
+            var rowBytes = MakeBlocks(type, K, rng);
+            Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+            wRows[n] = ReferenceDequant(type, rowBytes, K);
+        }
+
+        var expected = new float[N];
+        for (int n = 0; n < N; n++)
+        {
+            float sum = 0f;
+            for (int k = 0; k < K; k++) sum += input[k] * wRows[n][k];
+            expected[n] = sum;
+        }
+
+        using var inputBuf = accelerator.Allocate1D(input);
+        using var weightBuf = AllocatePadded(accelerator, weightBytes);
+        using var outBuf = accelerator.Allocate1D<float>(N);
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        bool saved = Kernels.FusedDequantMatMul.EnableWarpGemv;
+        try
+        {
+            Kernels.FusedDequantMatMul.EnableWarpGemv = true;
+            fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+            await accelerator.SynchronizeAsync();
+        }
+        finally { Kernels.FusedDequantMatMul.EnableWarpGemv = saved; }
+        var got = await outBuf.CopyToHostAsync<float>(0, N);
+
+        AssertCloseQuant(got, expected, 2e-3f, "Gemv warp Q4_K M=1");
+        Console.WriteLine($"[Gemv] WARP Q4_K M=1 K={K} N={N} (warpSize={accelerator.WarpSize}): matches oracle");
+    });
+
+    [TestMethod]
     public async Task Gemv_M1_QuantizedQ8_0_MatchesOracle() => await RunTest(async accelerator =>
     {
         // Exercises the M==1 coalesced GEMV path for Q8_0 (34B/32: [d][32 int8]).
