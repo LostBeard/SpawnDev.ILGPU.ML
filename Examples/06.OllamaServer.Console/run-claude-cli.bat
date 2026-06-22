@@ -16,14 +16,17 @@ set "MODEL=qwen2.5-coder:7b-instruct-q4_K_M"
 REM ---- Port (11435 avoids a clash with a running real Ollama on 11434) ----
 set "PORT=11435"
 
-REM ---- Interactive bounds (our engine is ~90ms/tok, so unbounded huge prompts/outputs take minutes) ----
-REM   NUM_CTX: THE dominant latency knob. Claude Code stuffs ~14.5K tokens (CLAUDE.md + its system prompt +
-REM            tools) into EVERY turn, and the whole delay is PREFILL of that — which is super-linear (O(seq^2)
-REM            attention). We tail-truncate to NUM_CTX (keeps the recent context + your question, drops the
-REM            static boilerplate head). MEASURED on this machine: ctx 8192 = ~104s/turn; ctx 2048 = ~11s/turn
-REM            (10x faster). Raise it if you need the model to see more project context, at a steep prefill cost.
+REM ---- Interactive bounds ----
+REM   NUM_CTX: FULL context — no truncation. Claude Code re-sends ~14.5K tokens (CLAUDE.md + its system prompt
+REM            + tools) every turn, where the STATIC head is identical turn-over-turn. KV-PREFIX CACHING reuses
+REM            that head: turn 1 prefills the whole prompt, turns 2+ reuse the bit-identical cached prefix and
+REM            prefill ONLY the new suffix → fast AND full-context (true Ollama parity — Ollama does not
+REM            truncate either). We set the model's full context so the prompt is NEVER tail-truncated (which
+REM            would drop the reusable static head AND shift RoPE positions, disabling reuse). Turn-1 prefill
+REM            cost is the next perf frontier (faster dequant-GEMM/attention + a persistent prefix), NOT a
+REM            reason to drop context. See claude-cli-perf.log for per-turn reused/prefilled token counts.
 REM   MAX_OUTPUT: hard cap on generated tokens so a verbose answer can't run for minutes.
-set "OLLAMA_NUM_CTX=2048"
+set "OLLAMA_NUM_CTX=32768"
 set "OLLAMA_MAX_OUTPUT=1024"
 
 echo.
