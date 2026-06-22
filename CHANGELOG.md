@@ -2,6 +2,19 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Example 06 server: stream the tools path (fix Claude CLI "API error")
+
+**Claude CLI got "API error" on the first real message and the GPU stayed pegged for minutes.** Claude CLI
+ALWAYS sends its toolset, and the `/v1/messages` handler routed any request with `tools` to **buffered (fully
+non-streaming) generation** — so even with `stream:true`, nothing was sent until the entire response finished
+(a large agentic prompt's prefill + up to MaxOutputTokens is minutes). Claude got zero data → time-to-first-
+token timeout → "API error" → retries piled up; and the buffered generation ran to completion after Claude
+disconnected (pegged VRAM). Fix: the tools+stream path now **streams text deltas live** (SSE opened immediately,
+`message_start` first → time-to-first-byte ~14ms verified), holding back only a partial `<tool_call>` suffix so
+tool markup never leaks, and emits `tool_use` blocks at the end. Streaming also makes a client disconnect ABORT
+generation (the SSE write throws → generation stops → GPU frees). Non-stream tool requests still buffer + format
+tool blocks (unchanged). Verified: tools+stream returns a correct streamed answer with immediate TTFB.
+
 ## Unreleased — Example 06 server: fix Claude CLI cold-start (pre-load the model)
 
 **Claude CLI failed to connect to the Ollama-replacement server** — the request log showed every startup
