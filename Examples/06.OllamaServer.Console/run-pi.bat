@@ -53,7 +53,13 @@ echo.
 echo   Launching Pi (ollama provider -^> our server). If Pi shows a stale model list, run /ollama-refresh.
 echo.
 REM Model id uses Pi's "ollama/" provider prefix (matches its enabledModels). Verified: returns "Paris".
-pi --model "ollama/%MODEL%"
+REM
+REM -nc (--no-context-files): SKIP auto-loading AGENTS.md + CLAUDE.md. Those are ~20K tokens of AI-agent
+REM   META-RULES (not codebase docs), and a ~20K-token prompt means a multi-MINUTE turn-1 prefill on the
+REM   current engine (large-context prefill is the open perf frontier) - i.e. "Pi never answers". Skipping
+REM   them keeps the prompt small so Pi responds fast. Drop -nc once large-context prefill is fast, or add a
+REM   small codebase-specific AGENTS.md. Pass a prompt/context explicitly with @file when you need it.
+pi -nc --model "ollama/%MODEL%"
 
 echo.
 echo   Pi exited. The server is still running in its own window - close it to stop.
