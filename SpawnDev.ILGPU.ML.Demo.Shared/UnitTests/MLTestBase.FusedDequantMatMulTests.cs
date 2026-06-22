@@ -112,8 +112,17 @@ public abstract partial class MLTestBase
         using var outputBuf = accelerator.Allocate1D<float>(M * N);
 
         using var fused = new FusedDequantMatMul(accelerator);
-        fused.Forward(inputBuf.View, weightBuf.View, outputBuf.View, M, K, N, type);
-        await accelerator.SynchronizeAsync();
+        // This test's purpose is the PER-ELEMENT M>1 kernel. Since EnableMultiRowGemm now defaults ON,
+        // force it OFF here so M=2 Q4_K/Q6_K still exercise per-element (the multi-row/register-blocked paths
+        // have their own oracle tests below). Other types (Q4_0/Q8_0/MXFP4) are per-element at M>1 regardless.
+        bool saved = FusedDequantMatMul.EnableMultiRowGemm;
+        try
+        {
+            FusedDequantMatMul.EnableMultiRowGemm = false;
+            fused.Forward(inputBuf.View, weightBuf.View, outputBuf.View, M, K, N, type);
+            await accelerator.SynchronizeAsync();
+        }
+        finally { FusedDequantMatMul.EnableMultiRowGemm = saved; }
         var gpuOut = await outputBuf.CopyToHostAsync<float>(0, M * N);
 
         AssertCloseQuant(gpuOut, expected, 2e-3f, $"FusedDequantMatMul[{type}]");

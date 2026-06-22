@@ -74,11 +74,15 @@ public class FusedDequantMatMul : IDisposable
         ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4;
 
     // Multi-row dequant GEMM for M>1 (prefill): dequant each weight element ONCE, reuse across GemmMTile rows —
-    // kills the O(M) redundant dequant of the general per-element kernel (the prefill bottleneck). A/B-VERIFIED
-    // bit-identical tokens (qwen2.5-coder + gemma4) with ~7.6x faster prefill. Default OFF pending the full
-    // 6-backend sweep (decode-equiv + Wasm); set true (or env GGUF_GEMM_MR=1) to enable. Q4_K first.
+    // kills the O(M) redundant dequant of the general per-element kernel (the prefill bottleneck). Output is
+    // BIT-IDENTICAL to the per-element kernel (a faster MatMul, not a semantic change); A/B-VERIFIED on
+    // qwen2.5-coder:7b Q4_K_M (CUDA, 50-tok prompt) — token+logit identical, prefill 34.0s→2.0s (~16.6x).
+    // DEFAULT ON (2026-06-22): the full 6-backend sweep is GREEN — PMT FusedDequantMatMul_{MultiRow,RegBlocked}
+    // _MatchesOracle_{Q4_K,Q6_K} 56/56 across CPU/CUDA/OpenCL/WebGPU/WebGL/Wasm vs the ggml CPU reference.
+    // Env GGUF_GEMM_MR=0 forces it OFF (per-element fallback — the A/B diagnostic). Q4_K/Q6_K only; other
+    // types' M>1 still use the per-element kernel; browser GPU keeps per-element by design (see dispatch).
     public static bool EnableMultiRowGemm =
-        Environment.GetEnvironmentVariable("GGUF_GEMM_MR") == "1";
+        Environment.GetEnvironmentVariable("GGUF_GEMM_MR") != "0";
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>>? _gemmMRQ4_K, _gemmMRQ6_K, _rbQ4_K, _rbQ6_K;
