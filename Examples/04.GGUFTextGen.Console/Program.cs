@@ -242,9 +242,13 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         var kvHeadsArr = new int[nLayers]; var hdArr = new int[nLayers];
         for (int L = 0; L < nLayers; L++)
         { var cfg = GGUFGraphBuilder.GetLayerAttnConfig(gm, L, nH, defNKV, defHd); kvHeadsArr[L] = cfg.NKVHeads; hdArr[L] = cfg.HeadDim; }
-        kvCache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen: ids.Count + maxNew + 8);
+        // GGUF_GEN_MAXSEQ overrides the cache size — the SERVER runs at 16384 (for agentic clients' big
+        // prompts), which exposes a gemma4 large-context decode slowdown that the tight default hides.
+        int defMaxSeq = ids.Count + maxNew + 8;
+        int maxSeq = int.TryParse(Environment.GetEnvironmentVariable("GGUF_GEN_MAXSEQ"), out var ms) && ms > defMaxSeq ? ms : defMaxSeq;
+        kvCache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen: maxSeq);
         session.EnableGGUFDecode(kvCache);
-        Console.WriteLine($"[KV-cache decode] {nLayers} layers, maxSeq={ids.Count + maxNew + 8}");
+        Console.WriteLine($"[KV-cache decode] {nLayers} layers, maxSeq={maxSeq}");
     }
 
     // GGUF_NODE_TIMING=1 → per-node Execute timing (decomposes the residual: which ops eat the CPU
