@@ -51,10 +51,12 @@ used M=2 with MultiRowGemm off, so neither opt-in prefill path was ever unit-tes
 - **CPU backend:** the register-blocked kernel launches 256-thread groups, but ILGPU's CPU accelerator caps a
   group dimension at 64 → it threw `Invalid group dimensions`. Now gated on `MaxGroupSize.X >= 256`; CPU falls
   back to the multi-row kernel (group 64).
-- **Wasm backend:** the multi-row Q4_K/Q6_K kernels used a device-local `float[]` accumulator, which **miscompiles
-  on the ILGPU Wasm backend** (correct on CPU/CUDA/OpenCL/WebGPU/WebGL; wrong only on Wasm). Unrolled to scalar
-  accumulators (matching the register-blocked kernel, which was always correct). The ROOT cause is an ILGPU Wasm
-  codegen bug for device-local arrays — flagged upstream; the scalar form is the durable kernel pattern regardless.
+- **Wasm backend:** the multi-row Q4_K/Q6_K kernels' device-local `float[]` accumulator **miscompiled on the
+  ILGPU Wasm backend** (correct on the other 5; wrong only on Wasm). Root-caused by Geordi to two ILGPU Wasm
+  codegen bugs (no `LowerArrays` pass + a Local-alloca aliasing onto shared memory), both **fixed in
+  SpawnDev.ILGPU 4.15.1**. This project now references 4.15.1 and the kernels use the clean parametric
+  `new float[GemmMTile]` array again (the temporary scalar-unroll workaround is removed) — verified green on all
+  6 backends (PMT 54/54).
 
 New PMT tests `FusedDequantMatMul_{MultiRow,RegBlocked}_MatchesOracle_{Q4_K,Q6_K}` (M=40 multi-row + M=80
 register-blocked, non-tile-aligned dims) — green on all 6 backends.

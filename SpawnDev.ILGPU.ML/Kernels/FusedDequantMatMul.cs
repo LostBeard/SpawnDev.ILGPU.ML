@@ -569,10 +569,8 @@ public class FusedDequantMatMul : IDisposable
         int tid = Group.IdxX;
 
         var sh = SharedMemory.Allocate<float>(GemvGroupSize);
-        // GemmMTile (8) row accumulators as SCALARS, not a device-local float[] — a local array miscompiles on
-        // the Wasm backend (wrong results; scalar register-blocked kernel is fine), so the M-tile is unrolled.
-        // GemmMTile is a compile-time constant 8; keep these in sync if it changes.
-        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f, p4 = 0f, p5 = 0f, p6 = 0f, p7 = 0f;
+        var partial = new float[GemmMTile]; // per-thread M-tile accumulators (device-local array; correct on all
+        for (int mi = 0; mi < GemmMTile; mi++) partial[mi] = 0f; // 6 backends since SpawnDev.ILGPU 4.15.1)
 
         if (n < N)
         {
@@ -591,44 +589,29 @@ public class FusedDequantMatMul : IDisposable
                     int r = tid + sub * GemvGroupSize;
                     float wval = DecodeQ4KScaled(w, sbOff, r, d, dmin); // dequant ONCE, reuse across rows
                     int kIdx = kBase + r;
-                    if (mBase + 0 < M) p0 += input[(mBase + 0) * K + kIdx] * wval;
-                    if (mBase + 1 < M) p1 += input[(mBase + 1) * K + kIdx] * wval;
-                    if (mBase + 2 < M) p2 += input[(mBase + 2) * K + kIdx] * wval;
-                    if (mBase + 3 < M) p3 += input[(mBase + 3) * K + kIdx] * wval;
-                    if (mBase + 4 < M) p4 += input[(mBase + 4) * K + kIdx] * wval;
-                    if (mBase + 5 < M) p5 += input[(mBase + 5) * K + kIdx] * wval;
-                    if (mBase + 6 < M) p6 += input[(mBase + 6) * K + kIdx] * wval;
-                    if (mBase + 7 < M) p7 += input[(mBase + 7) * K + kIdx] * wval;
+                    for (int mi = 0; mi < GemmMTile; mi++)
+                    {
+                        int m = mBase + mi;
+                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
+                    }
                 }
             }
         }
 
-        // Reduce each row's partial across the group → output[m, n]. sh is reused per row (barrier between).
-        ReduceRow(sh, output, tid, mBase + 0, n, N, M, p0);
-        ReduceRow(sh, output, tid, mBase + 1, n, N, M, p1);
-        ReduceRow(sh, output, tid, mBase + 2, n, N, M, p2);
-        ReduceRow(sh, output, tid, mBase + 3, n, N, M, p3);
-        ReduceRow(sh, output, tid, mBase + 4, n, N, M, p4);
-        ReduceRow(sh, output, tid, mBase + 5, n, N, M, p5);
-        ReduceRow(sh, output, tid, mBase + 6, n, N, M, p6);
-        ReduceRow(sh, output, tid, mBase + 7, n, N, M, p7);
-    }
-
-    /// <summary>Group tree-reduction of one row's per-thread partial into output[m, n] (shared buffer reused per
-    /// row; the trailing barrier makes it safe for the next row). Factored out of the multi-row GEMM kernels so the
-    /// M-tile can be unrolled into scalars (a device-local float[] miscompiles on the Wasm backend).</summary>
-    private static void ReduceRow(ArrayView1D<float, Stride1D.Dense> sh,
-        ArrayView1D<float, Stride1D.Dense> output, int tid, int m, int n, int N, int M, float partial)
-    {
-        sh[tid] = partial;
-        Group.Barrier();
-        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        // Reduce each row's partials across the group → output[m, n]. sh is reused per row (barrier between).
+        for (int mi = 0; mi < GemmMTile; mi++)
         {
-            if (tid < stride) sh[tid] += sh[tid + stride];
+            sh[tid] = partial[mi];
+            Group.Barrier();
+            for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+            {
+                if (tid < stride) sh[tid] += sh[tid + stride];
+                Group.Barrier();
+            }
+            int m = mBase + mi;
+            if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
             Group.Barrier();
         }
-        if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
-        Group.Barrier();
     }
 
     /// <summary>Q6_K dequant GEMM for M&gt;1 — the Q6_K analogue of <see cref="GemmDequantQ4_K_MultiRowImpl"/>
@@ -647,8 +630,8 @@ public class FusedDequantMatMul : IDisposable
         int tid = Group.IdxX;
 
         var sh = SharedMemory.Allocate<float>(GemvGroupSize);
-        // Scalar M-tile accumulators (a device-local float[] miscompiles on Wasm — see GemmDequantQ4_K_MultiRowImpl).
-        float p0 = 0f, p1 = 0f, p2 = 0f, p3 = 0f, p4 = 0f, p5 = 0f, p6 = 0f, p7 = 0f;
+        var partial = new float[GemmMTile];
+        for (int mi = 0; mi < GemmMTile; mi++) partial[mi] = 0f;
 
         if (n < N)
         {
@@ -666,26 +649,28 @@ public class FusedDequantMatMul : IDisposable
                     int r = tid + sub * GemvGroupSize;
                     float wval = DecodeQ6KScaled(w, sbOff, r, d); // dequant ONCE, reuse across rows
                     int kIdx = kBase + r;
-                    if (mBase + 0 < M) p0 += input[(mBase + 0) * K + kIdx] * wval;
-                    if (mBase + 1 < M) p1 += input[(mBase + 1) * K + kIdx] * wval;
-                    if (mBase + 2 < M) p2 += input[(mBase + 2) * K + kIdx] * wval;
-                    if (mBase + 3 < M) p3 += input[(mBase + 3) * K + kIdx] * wval;
-                    if (mBase + 4 < M) p4 += input[(mBase + 4) * K + kIdx] * wval;
-                    if (mBase + 5 < M) p5 += input[(mBase + 5) * K + kIdx] * wval;
-                    if (mBase + 6 < M) p6 += input[(mBase + 6) * K + kIdx] * wval;
-                    if (mBase + 7 < M) p7 += input[(mBase + 7) * K + kIdx] * wval;
+                    for (int mi = 0; mi < GemmMTile; mi++)
+                    {
+                        int m = mBase + mi;
+                        if (m < M) partial[mi] += input[m * K + kIdx] * wval;
+                    }
                 }
             }
         }
 
-        ReduceRow(sh, output, tid, mBase + 0, n, N, M, p0);
-        ReduceRow(sh, output, tid, mBase + 1, n, N, M, p1);
-        ReduceRow(sh, output, tid, mBase + 2, n, N, M, p2);
-        ReduceRow(sh, output, tid, mBase + 3, n, N, M, p3);
-        ReduceRow(sh, output, tid, mBase + 4, n, N, M, p4);
-        ReduceRow(sh, output, tid, mBase + 5, n, N, M, p5);
-        ReduceRow(sh, output, tid, mBase + 6, n, N, M, p6);
-        ReduceRow(sh, output, tid, mBase + 7, n, N, M, p7);
+        for (int mi = 0; mi < GemmMTile; mi++)
+        {
+            sh[tid] = partial[mi];
+            Group.Barrier();
+            for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+            {
+                if (tid < stride) sh[tid] += sh[tid + stride];
+                Group.Barrier();
+            }
+            int m = mBase + mi;
+            if (tid == 0 && n < N && m < M) output[m * N + n] = sh[0];
+            Group.Barrier();
+        }
     }
 
     /// <summary>Register-blocked dequant GEMM for Q4_K, M&gt;=RB_TILE (prefill). The verified f32

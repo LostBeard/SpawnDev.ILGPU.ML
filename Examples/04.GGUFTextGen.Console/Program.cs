@@ -48,6 +48,7 @@ if (Environment.GetEnvironmentVariable("GGUF_GEMM_BENCH") == "1")
         int iters = 20;
         var A = new float[M * K]; for (int i = 0; i < A.Length; i++) A[i] = (float)(brng.NextDouble() - 0.5);
         var Bf = new float[K * N]; for (int i = 0; i < Bf.Length; i++) Bf[i] = (float)(brng.NextDouble() - 0.5);
+        if (M > 1)
         using (var aBuf = bacc.Allocate1D(A))
         using (var bBuf = bacc.Allocate1D(Bf))
         using (var cBuf = bacc.Allocate1D<float>(M * N))
@@ -73,11 +74,19 @@ if (Environment.GetEnvironmentVariable("GGUF_GEMM_BENCH") == "1")
             for (int i = 0; i < iters; i++) fq.Forward(aBuf.View, wBuf.View, cBuf.View, M, K, N, type);
             bacc.Synchronize(); sw.Stop();
             double ms = sw.Elapsed.TotalMilliseconds / iters;
-            Console.WriteLine($"  {label}: {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS");
+            // At M=1 (decode GEMV) the kernel is BANDWIDTH-bound: it reads the whole quant weight (wBytes) once.
+            // GB/s vs the card's peak (RTX 4070 ~504 GB/s) is the right metric; GFLOPS is for the M>1 GEMM.
+            double gbs = wBytes / (ms / 1000.0) / 1e9;
+            Console.WriteLine($"  {label}: {ms,8:F3} ms  {Gf(M, K, N, ms),7:F1} GFLOPS  {gbs,7:F1} GB/s  (weight {wBytes / 1e6:F1} MB)");
         }
-        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K, 144, "Q4_K dequant RB");
-        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q6_K, 210, "Q6_K dequant RB");
+        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q4_K, 144, "Q4_K dequant   ");
+        DequantBench(SpawnDev.ILGPU.ML.GGUF.GGMLType.Q6_K, 210, "Q6_K dequant   ");
     }
+    Console.WriteLine("\n######## DECODE GEMV (M=1, bandwidth-bound — the Ollama decode gap) ########");
+    Bench(1, 3584, 18944);    // MLP gate/up   (Q4_K)
+    Bench(1, 18944, 3584);    // MLP down      (Q6_K in qwen)
+    Bench(1, 3584, 3584);     // attn q-proj   (Q4_K)
+    Console.WriteLine("\n######## PREFILL GEMM (M=1081) ########");
     Bench(1081, 3584, 18944); // MLP gate/up
     Bench(1081, 18944, 3584); // MLP down
     Bench(1081, 3584, 3584);  // attn q-proj
