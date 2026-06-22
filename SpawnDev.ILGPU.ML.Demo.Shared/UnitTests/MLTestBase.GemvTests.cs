@@ -260,6 +260,35 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task CudaAsm_Dp4a_InlinePtx_Works() => await RunTest(async accelerator =>
+    {
+        // Validates ILGPU inline-PTX (CudaAsm.Emit) + the dp4a (4x int8 dot-product) instruction in THIS build —
+        // the enabler for an int8-dot-product decode GEMV (the llama.cpp MMVQ technique: keep weights int, dot
+        // via dp4a, no float upconvert). CUDA-only intrinsic; other backends skip (the kernel is only loaded on
+        // CUDA, so they never compile the PTX). a=int8[1,2,3,4], b=int8[5,6,7,8] → 1*5+2*6+3*7+4*8 = 70.
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda)
+        {
+            Console.WriteLine($"[CudaAsm] dp4a skipped on {accelerator.AcceleratorType} (CUDA-only intrinsic)");
+            return;
+        }
+        int a = (1 & 0xFF) | (2 << 8) | (3 << 16) | (4 << 24);
+        int b = (5 & 0xFF) | (6 << 8) | (7 << 16) | (8 << 24);
+        using var outBuf = accelerator.Allocate1D<int>(1);
+        var k = accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView<int>, int, int>(Dp4aKernel);
+        k(1, outBuf.View, a, b);
+        await accelerator.SynchronizeAsync();
+        var got = (await outBuf.CopyToHostAsync<int>(0, 1))[0];
+        if (got != 70) throw new Exception($"dp4a expected 70, got {got} — inline-PTX dp4a path is NOT usable in this build");
+        Console.WriteLine("[CudaAsm] dp4a.s32.s32 = 70 ✓ — inline-PTX path validated (int8-dot decode GEMV is buildable in ILGPU today)");
+    });
+
+    private static void Dp4aKernel(Index1D i, ArrayView<int> outp, int a, int b)
+    {
+        global::ILGPU.Runtime.Cuda.CudaAsm.Emit("dp4a.s32.s32 %0, %1, %2, %3;", out int r, a, b, 0);
+        outp[0] = r;
+    }
+
+    [TestMethod]
     public async Task Gemv_M1_QuantizedQ8_0_MatchesOracle() => await RunTest(async accelerator =>
     {
         // Exercises the M==1 coalesced GEMV path for Q8_0 (34B/32: [d][32 int8]).
