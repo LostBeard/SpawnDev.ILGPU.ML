@@ -50,6 +50,60 @@ public static class ServerEndpoints
             return Results.Json(new { @object = "list", data }, J);
         });
 
+        // ── Ollama: POST /api/show (model metadata) ─────────────────────────────────────────────────
+        // Ollama clients (e.g. the Pi agentic CLI's ollama provider) call /api/show to resolve a model's
+        // capabilities + context length BEFORE generating. Without it (was 404) those clients never start
+        // inference. We parse the GGUF header (metadata only — cheap, no weights) for arch/ctx/vocab.
+        app.MapPost("/api/show", async (HttpContext ctx) =>
+        {
+            var req = await ReadJsonAsync(ctx);
+            string name = GetString(req, "model") ?? GetString(req, "name") ?? "";
+            var m = registry.Store.Resolve(name);
+            if (m == null) return OllamaError($"model '{name}' not found", StatusCodes.Status404NotFound);
+
+            string arch = "gguf"; long ctxLen = 0; long vocab = 0;
+            try
+            {
+                await using var hs = File.OpenRead(m.GgufPath);
+                var gm = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(hs);
+                if (!string.IsNullOrEmpty(gm.Architecture)) arch = gm.Architecture;
+                ctxLen = gm.ContextLength;
+                vocab = gm.VocabSize;
+            }
+            catch { /* fall back to generic metadata if the header can't be read */ }
+
+            // quantization_level best-effort from the display name (e.g. "...-q4_K_M" → "Q4_K_M").
+            string quant = "";
+            var qm = System.Text.RegularExpressions.Regex.Match(m.Name, @"[Qq]\d(?:_[A-Za-z0-9]+)*");
+            if (qm.Success) quant = qm.Value.ToUpperInvariant();
+
+            var modelInfo = new Dictionary<string, object> { ["general.architecture"] = arch };
+            if (ctxLen > 0) modelInfo[$"{arch}.context_length"] = ctxLen;
+            if (vocab > 0) modelInfo[$"{arch}.vocab_size"] = vocab;
+
+            var caps = new List<string> { "completion", "tools" };
+            if (m.MmprojPath != null) caps.Add("vision");
+
+            return Results.Json(new
+            {
+                license = "",
+                modelfile = $"# Modelfile for {m.Name}\nFROM {m.GgufPath}",
+                parameters = "",
+                template = "",
+                details = new
+                {
+                    parent_model = "",
+                    format = "gguf",
+                    family = arch,
+                    families = new[] { arch },
+                    parameter_size = "",
+                    quantization_level = quant,
+                },
+                model_info = modelInfo,
+                capabilities = caps,
+            }, J);
+        });
+
         // ── OpenAI: POST /v1/chat/completions ───────────────────────────────────────────────────────
         app.MapPost("/v1/chat/completions", async (HttpContext ctx) =>
         {
