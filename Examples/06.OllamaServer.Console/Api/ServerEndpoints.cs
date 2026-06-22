@@ -272,7 +272,7 @@ public static class ServerEndpoints
         var (promptIds, stopIds) = ChatTemplates.BuildChatPrompt(lm.Gguf, lm.Tokenizer, messages, toolsJson: toolsJson);
         long buildMs = sw.ElapsedMilliseconds;
         var res = await lm.Generator.GenerateAsync(promptIds, cfg, stops, stopIds, onDelta: null, ct);
-        LogPerf("once", promptIds.Length, buildMs, -1, sw.ElapsedMilliseconds, res);
+        LogPerf("once", promptIds.Length, buildMs, -1, sw.ElapsedMilliseconds, res, lm.Generator.LastReusedPrefix);
         return (res.Text, res);
     }
 
@@ -323,7 +323,7 @@ public static class ServerEndpoints
         long firstMs = -1;
         Func<string, Task> wrapped = async d => { if (firstMs < 0) firstMs = sw.ElapsedMilliseconds; await onDelta(d); };
         var res = await lm.Generator.GenerateAsync(promptIds, cfg, stops, stopIds, wrapped, ct);
-        LogPerf("stream", promptIds.Length, buildMs, firstMs, sw.ElapsedMilliseconds, res);
+        LogPerf("stream", promptIds.Length, buildMs, firstMs, sw.ElapsedMilliseconds, res, lm.Generator.LastReusedPrefix);
         return res;
     }
 
@@ -331,7 +331,7 @@ public static class ServerEndpoints
     // the first streamed token (≈ lease + prompt-build + prefill); decode = the rest. Written to %TEMP%.
     private static readonly string PerfLog = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "claude-cli-perf.log");
     private static void LogPerf(string path, int promptTokens, long buildMs, long firstMs, long totalMs,
-        SpawnDev.ILGPU.ML.Pipelines.GenerationResult? res)
+        SpawnDev.ILGPU.ML.Pipelines.GenerationResult? res, int reusedPrefix = 0)
     {
         try
         {
@@ -339,9 +339,13 @@ public static class ServerEndpoints
             long prefillMs = firstMs >= 0 ? firstMs : totalMs;     // time to first token (build + prefill)
             long decodeMs = firstMs >= 0 ? Math.Max(0, totalMs - firstMs) : 0;
             double decTps = decodeMs > 0 && gen > 1 ? (gen - 1) * 1000.0 / decodeMs : 0;
+            // reused = KV-prefix-cache hit (tokens reused from the previous turn); prefilled = the new suffix
+            // actually run through the forward pass this turn. On an agentic client re-sending a near-identical
+            // prompt, reused should be most of promptTokens turn-over-turn → TTFT collapses to the suffix cost.
+            int prefilled = Math.Max(0, promptTokens - reusedPrefix);
             System.IO.File.AppendAllText(PerfLog,
-                $"[{DateTime.Now:HH:mm:ss}] {path,-6} prompt={promptTokens,6}tok  build+prefill(TTFT)={prefillMs,7}ms  " +
-                $"decode={decodeMs,7}ms  gen={gen,5}tok  decode={decTps,6:F1}tok/s  total={totalMs,7}ms  stop={res?.Stop}\n");
+                $"[{DateTime.Now:HH:mm:ss}] {path,-6} prompt={promptTokens,6}tok  reused={reusedPrefix,6}tok  prefilled={prefilled,6}tok  " +
+                $"build+prefill(TTFT)={prefillMs,7}ms  decode={decodeMs,7}ms  gen={gen,5}tok  decode={decTps,6:F1}tok/s  total={totalMs,7}ms  stop={res?.Stop}\n");
         }
         catch { }
     }
