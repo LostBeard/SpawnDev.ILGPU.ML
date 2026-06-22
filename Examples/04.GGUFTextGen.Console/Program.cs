@@ -213,12 +213,20 @@ async Task<int> PrefixCacheTestAsync(string path)
     // would disable reuse by design).
     int maxSeq = B.Length + decodeN + 64;
 
-    // NOTE on TTFT: kernels are JIT-cached on the shared `session` after the first prefill of each shape, so
-    // the fresh-vs-reuse TTFT gap below is real PREFILL COMPUTE, not one-time JIT. On qwen2 the M>1 prefill
-    // GEMM is the dominant cost (re-dequantizes the weight per output row), so prefilling 250 tokens (fresh)
-    // vs 49 tokens (reuse) is ~5x — exactly the prefix-cache win.
+    // WARMUP — make the TTFT numbers TRUSTWORTHY. ILGPU JIT-caches kernels per-kernel-method on the shared
+    // `session` (sizes are runtime args, so the FIRST prefill pays ALL the JIT, not per-M). Without a warmup,
+    // the first timed leg would be JIT+compute and the second pure compute — not comparable. Prime the whole
+    // prefill+decode graph once here (throwaway generator, result discarded) so BOTH timed legs below measure
+    // pure PREFILL COMPUTE. On qwen2 the M>1 prefill GEMM dominates (re-dequantizes the weight per output
+    // row), so warm prefill scales ~linearly with token count: 250 (fresh) vs 49 (reuse) ≈ the prefix-cache win.
+    SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = false;
+    using (var warmGen = new SpawnDev.ILGPU.ML.Pipelines.GgufGenerator(session, accelerator, gm, maxSeqLen: maxSeq))
+    {
+        var w = await warmGen.GenerateFirstTokenIdsAsync(B, cfg); // primes M=250 prefill + decode kernels
+        Console.WriteLine($"[warmup] JIT primed (discarded {w.ids.Length} ids, {w.ttftMs:F1}ms incl. one-time JIT)\n");
+    }
 
-    // ── Generator 1: prefix cache OFF, fresh full prefill of B, decode 10 ──
+    // ── Generator 1: prefix cache OFF, fresh full prefill of B, decode 10 (now WARM → pure compute) ──
     SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = false;
     int[] freshIds;
     double freshTtftMs;
