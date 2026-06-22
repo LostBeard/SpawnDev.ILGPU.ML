@@ -48,6 +48,13 @@ SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.EnableLastPositionLogits = true;
 // OpenCL); CPU/Wasm fall back to the portable GEMV. Library-default off pending the full sweep — this opts in.
 SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWarpGemv = true;
 
+// dp4a int8-activation Q4_K decode GEMV — the llama.cpp/Ollama MMVQ path: int8-quantize the activation and dot
+// in the integer domain via dp4a (4x int8 MAC/instr). MEASURED qwen2.5-coder:7b/RTX 4070: Q4_K GEMV 134->271
+// GB/s (54% of peak, 2.15x over the warp GEMV), decode ~51->~40 ms/tok; output coherent (byte-identical to the
+// float path on test prompts). This is int8-APPROXIMATE — the SAME approximation Ollama uses — so it's parity,
+// not a compromise; Q6_K still uses the exact warp GEMV above. CUDA only (dp4a inline-PTX). Library-default off.
+SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableDp4aGemv = true;
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.

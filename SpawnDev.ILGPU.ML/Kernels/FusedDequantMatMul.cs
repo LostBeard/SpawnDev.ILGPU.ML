@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Runtime.Cuda;
 using SpawnDev.ILGPU.ML.GGUF;
 
 namespace SpawnDev.ILGPU.ML.Kernels;
@@ -80,6 +81,26 @@ public class FusedDequantMatMul : IDisposable
     // (small warp) keep the portable shared-mem kernel. Bit-identical math (same DecodeQ4KNibble + folded scales).
     public static bool EnableWarpGemv =
         Environment.GetEnvironmentVariable("GGUF_GEMV_V2") == "1";
+
+    // dp4a int8-activation decode GEMV (opt-in GGUF_GEMV_DP4A=1): the llama.cpp/Ollama MMVQ technique. The
+    // activation vector is quantized to int8 per 32-block (block_q8_1: int8 quants + scale d + s=d·Σq) once per
+    // matmul, then the dot runs in the INTEGER domain via dp4a (4x int8 MAC/instr) — 8 float FMAs/word become
+    // 2 dp4a, freeing the issue slots so the 32-bit weight loads saturate bandwidth (the path past our warp
+    // GEMV's ~26%). NUMERICS: int8-approximate (the activation quant), NOT float-exact — same approximation
+    // Ollama uses; validate vs the int8-activation reference / Ollama oracle, not the float GEMV. CUDA only
+    // (dp4a is a CUDA inline-PTX intrinsic). Q4_K first (qwen's main decode weight).
+    public static bool EnableDp4aGemv =
+        Environment.GetEnvironmentVariable("GGUF_GEMV_DP4A") == "1";
+
+    // Cached int8-quantized-activation temp buffers, per K (a model uses a few distinct K). Member-owned (never
+    // method-local) so a pending dispatch never references a freed buffer (CLAUDE.md "Never Dispose Before Flush").
+    private readonly Dictionary<int, MemoryBuffer1D<int, Stride1D.Dense>> _actQs = new();
+    private readonly Dictionary<int, MemoryBuffer1D<float, Stride1D.Dense>> _actDs = new();
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _quantActKernel;
+    private Action<KernelConfig, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<int, Stride1D.Dense>>? _gemvDp4aQ4_K;
 
     // Multi-row dequant GEMM for M>1 (prefill): dequant each weight element ONCE, reuse across GemmMTile rows —
     // kills the O(M) redundant dequant of the general per-element kernel (the prefill bottleneck). Output is
@@ -163,6 +184,22 @@ public class FusedDequantMatMul : IDisposable
         if (M == 1 && !gpuBrowser && !ForcePerElementGemv)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);
+            // dp4a int8-activation Q4_K GEMV: quantize the activation to int8 (block_q8_1) once, then dot in the
+            // integer domain via dp4a (the llama.cpp MMVQ path). CUDA only (dp4a inline-PTX intrinsic).
+            if (EnableDp4aGemv && type == GGMLType.Q4_K && _accelerator.AcceleratorType == AcceleratorType.Cuda)
+            {
+                int nBlk = K / 32;
+                if (!_actQs.TryGetValue(K, out var qsBuf)) { qsBuf = _accelerator.Allocate1D<int>(nBlk * 8); _actQs[K] = qsBuf; }
+                if (!_actDs.TryGetValue(K, out var dsBuf)) { dsBuf = _accelerator.Allocate1D<float>(nBlk * 2); _actDs[K] = dsBuf; }
+                _quantActKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(QuantizeActQ8_1Impl);
+                _quantActKernel(nBlk, input, qsBuf.View, dsBuf.View, nBlk);
+                _gemvDp4aQ4_K ??= _accelerator.LoadStreamKernel<ArrayView1D<int, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GemvDp4aQ4_KImpl);
+                _gemvDp4aQ4_K(new KernelConfig(N, _accelerator.WarpSize), qsBuf.View, dsBuf.View, intView, output, paramsBuf.View);
+                return;
+            }
             // Warp-cooperative Q4_K GEMV: one warp per output column, Warp.Shuffle scale-broadcast + reduction,
             // NO Group.Barrier / NO shared mem (the default kernel's per-super-block barriers cap its bandwidth).
             // CUDA only: warp==32 + Warp.Shuffle always available. ILGPU's OpenCL backend needs the
@@ -650,6 +687,107 @@ public class FusedDequantMatMul : IDisposable
         for (int off = 16; off > 0; off >>= 1)
             partial += Warp.ShuffleDown(partial, off);
         if (l == 0 && n < N) output[n] = partial;
+    }
+
+    // Wrapper for the dp4a (4x int8 dot-accumulate) PTX intrinsic: d = c + Σ a.s8[i]·b.s8[i]. CUDA-only.
+    private static int Dp4a(int a, int b, int c)
+    {
+        CudaAsm.Emit("dp4a.s32.s32 %0, %1, %2, %3;", out int r, a, b, c);
+        return r;
+    }
+
+    // Quantize the activation vector to block_q8_1 (32-element blocks): per block, int8 quants packed 4/word
+    // (8 words/block) + d (= amax/127) + s (= d·Σq, the term for the Q4_K dmin·mn offset). One thread per block.
+    private static void QuantizeActQ8_1Impl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> qs, ArrayView1D<float, Stride1D.Dense> ds, int nBlk)
+    {
+        int blk = idx.X;
+        if (blk >= nBlk) return;
+        int b = blk * 32;
+        float amax = 0f;
+        for (int j = 0; j < 32; j++) { float a = input[b + j]; a = a < 0f ? -a : a; if (a > amax) amax = a; }
+        float d = amax * (1f / 127f);
+        float invd = amax > 0f ? 127f / amax : 0f;
+        int sum = 0;
+        for (int wi = 0; wi < 8; wi++)
+        {
+            int packed = 0;
+            for (int e = 0; e < 4; e++)
+            {
+                float v = input[b + wi * 4 + e] * invd;
+                int q = (int)(v + (v >= 0f ? 0.5f : -0.5f));
+                q = q < -127 ? -127 : (q > 127 ? 127 : q);
+                sum += q;
+                packed |= (q & 0xFF) << (e * 8);
+            }
+            qs[blk * 8 + wi] = packed;
+        }
+        ds[blk * 2 + 0] = d;
+        ds[blk * 2 + 1] = d * sum;
+    }
+
+    // Folded Q4_K sub-block scale {d·sc, dmin·mn} for sub-block j (0..7) at super-block byte sbOff — same 6-bit
+    // extraction as DecodeQ4KScaled / the warp kernel. Returns d·sc; dmin·mn via out.
+    private static float DecodeQ4KDsc(ArrayView1D<int, Stride1D.Dense> w, int sbOff, int j, out float dmm)
+    {
+        float d = HalfToFloatFinite(ReadByte(w, sbOff) | (ReadByte(w, sbOff + 1) << 8));
+        float dmin = HalfToFloatFinite(ReadByte(w, sbOff + 2) | (ReadByte(w, sbOff + 3) << 8));
+        int scOff = sbOff + 4;
+        int lowBit = ((j - 4) >> 31) & 1, hiBit = 1 - lowBit;
+        int bj = ReadByte(w, scOff + j), bj4 = ReadByte(w, scOff + j + 4), bjAlt = ReadByte(w, scOff + j - 4 * hiBit);
+        float sc = lowBit * (bj & 63) + hiBit * ((bj4 & 0xF) | ((bjAlt >> 6) << 4));
+        float mn = lowBit * (bj4 & 63) + hiBit * ((bj4 >> 4) | ((bj >> 6) << 4));
+        dmm = dmin * mn;
+        return d * sc;
+    }
+
+    // dp4a int8-activation Q4_K decode GEMV (the llama.cpp MMVQ path): one 32-lane warp per output column; each
+    // lane owns whole "t-units" (one t = sub-blocks 2t,2t+1 = 64 elements), reading its 8 weight nibble-words
+    // ONCE, nibble-masking to two int4-packed words, and dp4a-ing against the int8 activation quants. Dot in
+    // int32, then folded to float by the weight scale × activation scale:
+    //   partial += (d·sc)·d_a·dot − (dmin·mn)·s_a   per sub-block.   Warp-reduce. CUDA only (dp4a).
+    private static void GemvDp4aQ4_KImpl(
+        ArrayView1D<int, Stride1D.Dense> qs,
+        ArrayView1D<float, Stride1D.Dense> ds,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int lane = Group.IdxX;
+        float partial = 0f;
+        if (n < N)
+        {
+            int bytesPerRow = K / 256 * 144;
+            int rowBase = n * bytesPerRow;
+            int nTU = K / 64;
+            for (int tu = lane; tu < nTU; tu += 32)
+            {
+                int super = tu >> 2;
+                int t = tu & 3;
+                int sbOff = rowBase + super * 144;
+                float dmm0, dmm1;
+                float dsc0 = DecodeQ4KDsc(w, sbOff, 2 * t, out dmm0);
+                float dsc1 = DecodeQ4KDsc(w, sbOff, 2 * t + 1, out dmm1);
+                int ablk0 = super * 8 + 2 * t, ablk1 = ablk0 + 1;
+                float da0 = ds[ablk0 * 2], sa0 = ds[ablk0 * 2 + 1];
+                float da1 = ds[ablk1 * 2], sa1 = ds[ablk1 * 2 + 1];
+                int wWordBase = (sbOff + 16 + 32 * t) >> 2;
+                int dot0 = 0, dot1 = 0;
+                for (int wi = 0; wi < 8; wi++)
+                {
+                    int wword = w[wWordBase + wi];
+                    dot0 = Dp4a((wword >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + wi], dot0);
+                    dot1 = Dp4a((wword >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + wi], dot1);
+                }
+                partial += dsc0 * da0 * dot0 - dmm0 * sa0;
+                partial += dsc1 * da1 * dot1 - dmm1 * sa1;
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1)
+            partial += Warp.ShuffleDown(partial, off);
+        if (lane == 0 && n < N) output[n] = partial;
     }
 
     /// <summary>Decode element <paramref name="r"/> (0..255) within a Q4_K super-block at byte
@@ -1472,5 +1610,9 @@ public class FusedDequantMatMul : IDisposable
     {
         foreach (var buf in _paramsBufs.Values) buf.Dispose();
         _paramsBufs.Clear();
+        foreach (var buf in _actQs.Values) buf.Dispose();
+        _actQs.Clear();
+        foreach (var buf in _actDs.Values) buf.Dispose();
+        _actDs.Clear();
     }
 }

@@ -289,6 +289,81 @@ public abstract partial class MLTestBase
     }
 
     [TestMethod]
+    public async Task Gemv_M1_Dp4a_Q4K_MatchesInt8ActReference() => await RunTest(async accelerator =>
+    {
+        // The dp4a int8-activation Q4_K decode GEMV (the llama.cpp/Ollama MMVQ path, EnableDp4aGemv). It int8-
+        // quantizes the activation (block_q8_1) and dots in the integer domain via dp4a. The output is int8-
+        // APPROXIMATE (not float-exact) — exactly Ollama's approximation — so the oracle is an int8-activation
+        // CPU reference (quantize the activation the SAME way, requantize, dot with the float weights), which the
+        // kernel must match to float-reduction tolerance. We also report the loss vs the float-exact dot.
+        // CUDA-only (dp4a inline-PTX); other backends skip (the path is gated to CUDA, they never load the kernel).
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda)
+        {
+            Console.WriteLine($"[Gemv] dp4a Q4_K: CUDA-only, skipped on {accelerator.AcceleratorType}");
+            return;
+        }
+        const int M = 1, K = 4096, N = 256;
+        var type = GGMLType.Q4_K;
+        var rng = new Random(91);
+        var input = new float[K];
+        for (int i = 0; i < K; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int bytesPerRow = RowBytes(type, K);
+        var weightBytes = new byte[N * bytesPerRow];
+        var wRows = new float[N][];
+        for (int n = 0; n < N; n++)
+        {
+            var rb = MakeBlocks(type, K, rng);
+            Buffer.BlockCopy(rb, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+            wRows[n] = ReferenceDequant(type, rb, K);
+        }
+
+        // int8-activation reference: quantize the activation per 32-block EXACTLY as QuantizeActQ8_1Impl does
+        // (amax/127 scale, round-half-up, clamp [-127,127]), requantize (q·d), dot with the float weights.
+        var aq = new float[K];
+        for (int blk = 0; blk < K / 32; blk++)
+        {
+            float amax = 0f;
+            for (int j = 0; j < 32; j++) { float a = MathF.Abs(input[blk * 32 + j]); if (a > amax) amax = a; }
+            float d = amax / 127f, invd = amax > 0f ? 127f / amax : 0f;
+            for (int j = 0; j < 32; j++)
+            {
+                float v = input[blk * 32 + j] * invd;
+                int q = (int)(v + (v >= 0f ? 0.5f : -0.5f));
+                q = Math.Clamp(q, -127, 127);
+                aq[blk * 32 + j] = q * d;
+            }
+        }
+        var expected = new float[N];
+        var exact = new float[N];
+        for (int n = 0; n < N; n++)
+        {
+            float s = 0f, e = 0f;
+            for (int k = 0; k < K; k++) { s += aq[k] * wRows[n][k]; e += input[k] * wRows[n][k]; }
+            expected[n] = s; exact[n] = e;
+        }
+
+        using var inputBuf = accelerator.Allocate1D(input);
+        using var weightBuf = AllocatePadded(accelerator, weightBytes);
+        using var outBuf = accelerator.Allocate1D<float>(N);
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        bool saved = Kernels.FusedDequantMatMul.EnableDp4aGemv;
+        try
+        {
+            Kernels.FusedDequantMatMul.EnableDp4aGemv = true;
+            fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+            await accelerator.SynchronizeAsync();
+        }
+        finally { Kernels.FusedDequantMatMul.EnableDp4aGemv = saved; }
+        var got = await outBuf.CopyToHostAsync<float>(0, N);
+
+        AssertCloseQuant(got, expected, 1e-2f, "dp4a Q4_K vs int8-activation reference");
+        float maxRel = 0f;
+        for (int n = 0; n < N; n++) { float r = MathF.Abs(got[n] - exact[n]) / (MathF.Abs(exact[n]) + 1e-3f); if (r > maxRel) maxRel = r; }
+        Console.WriteLine($"[Gemv] dp4a Q4_K M=1 K={K} N={N}: matches int8-act reference; max rel err vs FLOAT-exact = {maxRel:P2} (Ollama-style activation-quant loss)");
+    });
+
+    [TestMethod]
     public async Task Gemv_M1_QuantizedQ8_0_MatchesOracle() => await RunTest(async accelerator =>
     {
         // Exercises the M==1 coalesced GEMV path for Q8_0 (34B/32: [d][32 int8]).
