@@ -56,6 +56,44 @@ if (Environment.GetEnvironmentVariable("GGUF_PTX_PROBE") == "1")
     return 0;
 }
 
+// GGUF_ATTN_BENCH=1 → register vs shared-slice per-query attention A/B on the desktop accelerator (same
+// 8h×256×256×128 shape as the PMT WebGPU benchmark, for a CUDA-vs-WebGPU side-by-side). No model needed.
+if (Environment.GetEnvironmentVariable("GGUF_ATTN_BENCH") == "1")
+{
+    using var actx = MLContext.Create().ToContext();
+    var acuda = actx.GetCudaDevices();
+    Device adev = acuda.Count > 0 ? (Device)acuda[0] : actx.GetPreferredDevice(preferCPU: false);
+    using var aacc = adev.CreateAccelerator(actx);
+    Console.WriteLine($"[attn-bench] {aacc.Name} ({aacc.AcceleratorType}, warp={aacc.WarpSize})");
+    int nHeads = 8, SQ = 256, SKV = 256, D = 128;
+    var arng = new Random(42);
+    var aq = new float[nHeads * SQ * D]; var ak = new float[nHeads * SKV * D]; var av = new float[nHeads * SKV * D];
+    for (int i = 0; i < aq.Length; i++) aq[i] = (float)(arng.NextDouble() * 2 - 1);
+    for (int i = 0; i < ak.Length; i++) ak[i] = (float)(arng.NextDouble() * 2 - 1);
+    for (int i = 0; i < av.Length; i++) av[i] = (float)(arng.NextDouble() * 2 - 1);
+    using var aqB = aacc.Allocate1D(aq); using var akB = aacc.Allocate1D(ak); using var avB = aacc.Allocate1D(av);
+    using var aoB = aacc.Allocate1D<float>(nHeads * SQ * D);
+    var fa = new FusedAttentionKernel(aacc);
+    double TimeAttn(bool register)
+    {
+        FusedAttentionKernel.EnableRegisterAttention = register;
+        fa.ForwardStrided<float>(aqB.View, akB.View, avB.View, aoB.View, nHeads, nHeads, SQ, SKV, D, true, int.MaxValue, 0, 0f, SKV * D);
+        aacc.Synchronize();
+        double best = double.MaxValue;
+        for (int it = 0; it < 8; it++)
+        {
+            var sw = Stopwatch.StartNew();
+            fa.ForwardStrided<float>(aqB.View, akB.View, avB.View, aoB.View, nHeads, nHeads, SQ, SKV, D, true, int.MaxValue, 0, 0f, SKV * D);
+            aacc.Synchronize(); sw.Stop();
+            best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+        }
+        return best;
+    }
+    double aShared = TimeAttn(false), aReg = TimeAttn(true);
+    Console.WriteLine($"[attn-bench] Register attention {nHeads}h×{SQ}×{SKV}×{D} [{aacc.AcceleratorType}]: shared-slice {aShared:F3}ms → register {aReg:F3}ms = {aShared / aReg:F2}× faster");
+    return 0;
+}
+
 // GGUF_GEMM_BENCH=1 → localize the prefill MatMul GFLOPS ceiling: f32 register-blocked GEMM (no dequant)
 // vs the Q4_K dequant register-blocked GEMM at the SAME shapes. If f32 >> dequant the per-element B-tile
 // dequant is the overhead (ML fix); if ~equal, the GEMM codegen is the ceiling. Random weight bytes (timing
