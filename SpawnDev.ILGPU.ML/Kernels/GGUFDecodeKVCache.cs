@@ -46,6 +46,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
     private readonly int _maxSeqLen;
     private readonly KVCachePrecision _precision;
     private readonly bool _isCuda;
+    private readonly bool _isWebGPU;
 
     private sealed class LayerCache
     {
@@ -96,6 +97,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
         _maxSeqLen = maxSeqLen;
         _precision = precision;
         _isCuda = accelerator.AcceleratorType == AcceleratorType.Cuda;
+        _isWebGPU = accelerator.AcceleratorType == AcceleratorType.WebGPU;
         _layers = new LayerCache[kvHeadsPerLayer.Length];
         for (int i = 0; i < _layers.Length; i++)
         {
@@ -128,7 +130,12 @@ public sealed class GGUFDecodeKVCache : IDisposable
         where T : unmanaged
     {
         if (_isCuda) { dst.CopyFrom(_accelerator.DefaultStream, src); return Task.CompletedTask; }
-        return dst.CopyFromAsync(src);
+        // WebGPU is a SINGLE QUEUE (like CUDA's single stream): a sync CopyFrom enqueues a queue-ordered
+        // CopyBufferToBuffer that the consumer kernel reads after — NO race (unlike the Wasm worker pool), so we
+        // skip the per-copy CopyFromAsync await (a GPU round-trip the browser pays dearly for: 2×nLayers/decode-step).
+        // Sync CopyFrom of a kernel output is ordered+correct on WebGPU (the ReshapeOperator relies on the same).
+        if (_isWebGPU) { dst.CopyFrom(src); return Task.CompletedTask; }
+        return dst.CopyFromAsync(src); // Wasm worker pool / WebGL TF: keep the explicit async ordering
     }
 
     /// <summary>
