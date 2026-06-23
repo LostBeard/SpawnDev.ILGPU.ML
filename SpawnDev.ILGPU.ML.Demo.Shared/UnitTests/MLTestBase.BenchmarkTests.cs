@@ -74,6 +74,67 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Benchmark the barrier-free per-query attention vs the legacy per-element kernel ON EACH BACKEND — the
+    /// point is the WebGPU number (per-element is its only prior path; per-query is the universal fix). Reports
+    /// ms/call for both + the speedup. Modest prefill shape so WebGL/WebGPU stay under the timeout. WebGL only
+    /// runs per-element (no workgroup shared memory) so it reports one number.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Benchmark_FusedAttention_PerQuery_vs_PerElement() => await RunTest(async accelerator =>
+    {
+        int nHeads = 8, SQ = 256, SKV = 256, D = 128;
+        var rng = new Random(42);
+        var q = new float[nHeads * SQ * D];
+        var k = new float[nHeads * SKV * D];
+        var v = new float[nHeads * SKV * D];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < k.Length; i++) k[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < v.Length; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        using var qBuf = accelerator.Allocate1D(q);
+        using var kBuf = accelerator.Allocate1D(k);
+        using var vBuf = accelerator.Allocate1D(v);
+        using var oBuf = accelerator.Allocate1D<float>(nHeads * SQ * D);
+        var fused = new FusedAttentionKernel(accelerator);
+        bool isWebGL = accelerator.AcceleratorType == AcceleratorType.WebGL;
+
+        async Task<double> TimeIt(bool perElement)
+        {
+            FusedAttentionKernel.DisablePerQuery = perElement;
+            fused.Forward(qBuf.View, kBuf.View, vBuf.View, oBuf.View, nHeads, SQ, SKV, D); // warmup
+            await accelerator.SynchronizeAsync();
+            double best = double.MaxValue;
+            int iters = perElement ? 2 : 4;
+            for (int it = 0; it < iters; it++)
+            {
+                var sw = Stopwatch.StartNew();
+                fused.Forward(qBuf.View, kBuf.View, vBuf.View, oBuf.View, nHeads, SQ, SKV, D);
+                await accelerator.SynchronizeAsync();
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+            }
+            return best;
+        }
+
+        try
+        {
+            double perElem = await TimeIt(perElement: true);
+            if (isWebGL)
+            {
+                Console.WriteLine($"[Benchmark] Attention {nHeads}h×{SQ}×{SKV}×{D} [{accelerator.AcceleratorType}]: per-element {perElem:F2}ms (per-query N/A — no shared mem on WebGL)");
+            }
+            else
+            {
+                double perQuery = await TimeIt(perElement: false);
+                Console.WriteLine($"[Benchmark] Attention {nHeads}h×{SQ}×{SKV}×{D} [{accelerator.AcceleratorType}]: per-element {perElem:F2}ms → per-query {perQuery:F2}ms = {perElem / perQuery:F2}× faster");
+            }
+        }
+        finally { FusedAttentionKernel.DisablePerQuery = false; }
+
+        Console.WriteLine($"[Benchmark] PASS — attention per-query/per-element reported");
+    });
+
+    /// <summary>
     /// Benchmark MatMulKernel auto-selection: verifies that the auto-select path
     /// correctly chooses register-blocked for large matrices and tiled for small ones.
     /// </summary>

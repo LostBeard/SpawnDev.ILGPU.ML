@@ -133,6 +133,10 @@ public class FusedAttentionKernel : IDisposable
     public static bool EnableGroupedAttention =
         Environment.GetEnvironmentVariable("GGUF_ATTN_GROUP") == "1";
 
+    // BENCHMARK/diagnostic only: force the legacy per-element attention (skip the barrier-free per-query path) so
+    // a benchmark can A/B the two on the same backend. Leave false in production.
+    public static bool DisablePerQuery;
+
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -243,7 +247,7 @@ public class FusedAttentionKernel : IDisposable
         // Barrier-free per-query path (same as ForwardStrided): the universal non-grouped attention. T=float here
         // (contiguous K/V); with kvRowStride=seqKV*headDim (p[10] above) it's byte-identical to the per-element
         // kernel. Excludes WebGL (no workgroup shared memory) and headDim > MaxAttnHeadDimPQ → per-element below.
-        if (headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
+        if (!DisablePerQuery && headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
         {
             if (!_perQueryStridedKernels.TryGetValue(typeof(float), out var pq))
                 _perQueryStridedKernels[typeof(float)] = pq = _accelerator.LoadStreamKernel<
@@ -343,7 +347,7 @@ public class FusedAttentionKernel : IDisposable
         // EXCLUDES WebGL: it has NO workgroup shared memory (Transform-Feedback model), so the shared slice is
         // invalid there — WebGL keeps the shared-mem-free per-element kernel. headDim ≤ MaxAttnHeadDimPQ (the
         // per-thread slice width); larger heads fall back to per-element.
-        if (headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
+        if (!DisablePerQuery && headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
         {
             if (!_perQueryStridedKernels.TryGetValue(typeof(T), out var pq))
                 _perQueryStridedKernels[typeof(T)] = pq = _accelerator.LoadStreamKernel<
