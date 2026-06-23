@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Register attention DEFAULT-ON for CUDA (2.7× prefill attention, ~20% decode)
+
+Promoted the warp-cooperative register per-query attention from opt-in to **default-on** (the dispatch still gates
+it to CUDA: warp==32 + Warp.Shuffle, D%16==0; all other backends keep the shared-slice; `GGUF_ATTN_REG=0` forces
+OFF for A/B). **RTX 4070: 2.7× prefill attention (shared-slice 1226.8 → register 452.9 ms on a 324-token prompt)**
++ ~20% decode — the prefill win directly attacks the Ollama prefill-throughput gap (prefill is ~94% attention).
+Argmax-identical. Oracle `Attn_RegisterPerQuery_MatchesCpu_Cuda` now covers hd 64/128/256 (4/8/16 lanes/query);
+GGUFDecodeKVCache green with register as the CUDA default.
+
 ## Unreleased — Warp-cooperative REGISTER per-query attention (opt-in, CUDA-first) — ~20% faster decode
 
 **The flash-class register accumulator (Geordi's D-tiling recipe).** The barrier-free per-query attention holds its

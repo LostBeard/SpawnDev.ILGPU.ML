@@ -138,12 +138,13 @@ public class FusedAttentionKernel : IDisposable
     // a benchmark can A/B the two on the same backend. Leave false in production.
     public static bool DisablePerQuery;
 
-    // Opt-in (GGUF_ATTN_REG=1) warp-cooperative REGISTER per-query attention: T=D/16 lanes cooperate per query,
-    // each holding a const-16 REGISTER accumulator tile (Geordi's scalar-replace recipe) — no shared-mem slice,
-    // no barrier; the Q·K dot is split across the T lanes + butterfly-reduced via Warp.ShuffleXor. CUDA-first
-    // (warp==32 + Warp.Shuffle); other backends keep the shared-slice per-query. Requires D % 16 == 0.
+    // Warp-cooperative REGISTER per-query attention: T=D/16 lanes cooperate per query, each holding a const-16
+    // REGISTER accumulator tile (Geordi's scalar-replace recipe) — no shared-mem slice, no barrier; the Q·K dot is
+    // split across the T lanes + butterfly-reduced via Warp.ShuffleXor. MEASURED ~20% faster decode + 2.7× prefill
+    // attention (RTX 4070, argmax-identical). DEFAULT ON; the dispatch still gates it to CUDA (warp==32 +
+    // Warp.Shuffle, D%16==0) — other backends keep the shared-slice per-query. GGUF_ATTN_REG=0 forces OFF (A/B).
     public static bool EnableRegisterAttention =
-        Environment.GetEnvironmentVariable("GGUF_ATTN_REG") == "1";
+        Environment.GetEnvironmentVariable("GGUF_ATTN_REG") != "0";
     private const int RegTileD = 16; // per-lane register tile width (≤16 scalar-replaces; divides 64/128/256)
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,

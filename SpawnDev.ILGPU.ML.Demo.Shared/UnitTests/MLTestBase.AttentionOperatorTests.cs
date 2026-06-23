@@ -241,9 +241,11 @@ public abstract partial class MLTestBase
         if (accelerator.AcceleratorType != AcceleratorType.Cuda)
         { Console.WriteLine($"[Attn] register per-query: CUDA-only, skipped on {accelerator.AcceleratorType}"); return; }
 
-        const int nHeads = 4, kvHeads = 2, seqQ = 3, seqKV = 20, headDim = 64, kvOffset = 5;
+        const int nHeads = 4, kvHeads = 2, seqQ = 3, seqKV = 20, kvOffset = 5;
         const bool causal = true; const int window = 0; const float scale = 0f;
-        var rng = new Random(417);
+        foreach (int headDim in new[] { 64, 128, 256 })  // nLanes = hd/16 = 4, 8, 16 lanes/query
+        {
+        var rng = new Random(417 + headDim);
         var q = new float[nHeads * seqQ * headDim];
         var k = new float[kvHeads * seqKV * headDim];
         var v = new float[kvHeads * seqKV * headDim];
@@ -301,7 +303,8 @@ public abstract partial class MLTestBase
         finally { Kernels.FusedAttentionKernel.EnableRegisterAttention = saved; }
         var got = await outBuf.CopyToHostAsync<float>(0, expected.Length);
 
-        AssertCloseQuant(got, expected, 2e-3f, "register per-query attention vs CPU oracle");
-        Console.WriteLine($"[Attn] register per-query nH={nHeads} kvH={kvHeads} hd={headDim} (4 lanes/query): matches CPU oracle");
+        AssertCloseQuant(got, expected, 2e-3f, $"register per-query attention hd={headDim} vs CPU oracle");
+        Console.WriteLine($"[Attn] register per-query nH={nHeads} kvH={kvHeads} hd={headDim} ({headDim / 16} lanes/query): matches CPU oracle");
+        }
     });
 }
