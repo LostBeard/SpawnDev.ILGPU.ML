@@ -135,6 +135,65 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// Benchmark the warp-cooperative REGISTER per-query attention vs the shared-slice per-query — the point is the
+    /// WebGPU number (the register accumulator avoids workgroup memory entirely via subgroupShuffleXor). Both via
+    /// ForwardStrided (where register is gated); A/B by EnableRegisterAttention. CUDA + WebGPU-subgroups only
+    /// (warp==32); CPU/Wasm/WebGL/OpenCL keep the shared-slice and report N/A. Prefill-ish shape (register's win).
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task Benchmark_RegisterAttention_vs_SharedSlice() => await RunTest(async accelerator =>
+    {
+        bool canRegister = accelerator.WarpSize == 32
+            && (accelerator.AcceleratorType == AcceleratorType.Cuda || accelerator.AcceleratorType == AcceleratorType.WebGPU);
+        if (!canRegister)
+        { Console.WriteLine($"[Benchmark] Register attention [{accelerator.AcceleratorType}]: N/A (no warp-32 subgroups — keeps shared-slice)"); return; }
+
+        int nHeads = 8, SQ = 256, SKV = 256, D = 128;
+        var rng = new Random(42);
+        var q = new float[nHeads * SQ * D];
+        var k = new float[nHeads * SKV * D];
+        var v = new float[nHeads * SKV * D];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < k.Length; i++) k[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < v.Length; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        using var qB = accelerator.Allocate1D(q);
+        using var kB = accelerator.Allocate1D(k);
+        using var vB = accelerator.Allocate1D(v);
+        using var oB = accelerator.Allocate1D<float>(nHeads * SQ * D);
+        var fused = new FusedAttentionKernel(accelerator);
+
+        async Task<double> TimeIt(bool register)
+        {
+            FusedAttentionKernel.EnableRegisterAttention = register;
+            // Contiguous K/V ([nHeads, SKV, D]): kvRowStride = SKV*D, seq-major flags default off.
+            fused.ForwardStrided<float>(qB.View, kB.View, vB.View, oB.View, nHeads, nHeads, SQ, SKV, D, true, int.MaxValue, 0, 0f, SKV * D); // warmup
+            await accelerator.SynchronizeAsync();
+            double best = double.MaxValue;
+            for (int it = 0; it < 4; it++)
+            {
+                var sw = Stopwatch.StartNew();
+                fused.ForwardStrided<float>(qB.View, kB.View, vB.View, oB.View, nHeads, nHeads, SQ, SKV, D, true, int.MaxValue, 0, 0f, SKV * D);
+                await accelerator.SynchronizeAsync();
+                sw.Stop();
+                best = Math.Min(best, sw.Elapsed.TotalMilliseconds);
+            }
+            return best;
+        }
+
+        bool saved = FusedAttentionKernel.EnableRegisterAttention;
+        try
+        {
+            double shared = await TimeIt(register: false);
+            double reg = await TimeIt(register: true);
+            Console.WriteLine($"[Benchmark] Register attention {nHeads}h×{SQ}×{SKV}×{D} [{accelerator.AcceleratorType}]: shared-slice {shared:F2}ms → register {reg:F2}ms = {shared / reg:F2}× faster");
+        }
+        finally { FusedAttentionKernel.EnableRegisterAttention = saved; }
+
+        Console.WriteLine($"[Benchmark] PASS — register/shared-slice attention reported");
+    });
+
+    /// <summary>
     /// Benchmark MatMulKernel auto-selection: verifies that the auto-select path
     /// correctly chooses register-blocked for large matrices and tiled for small ones.
     /// </summary>
