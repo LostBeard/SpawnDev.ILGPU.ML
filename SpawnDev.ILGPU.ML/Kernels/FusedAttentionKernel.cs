@@ -49,6 +49,7 @@ public class FusedAttentionKernel : IDisposable
     private readonly Dictionary<Type, object> _stridedKernels = new();
     // Barrier-free per-query kernel cache (the universal non-grouped path; replaces the per-element strided kernel).
     private readonly Dictionary<Type, object> _perQueryStridedKernels = new();
+    private readonly Dictionary<Type, object> _perQueryRegisterKernels = new();
 
     // Dummy 1-element sinks buffer for the no-sinks case (the kernel always takes a sinks view but only
     // reads it when sinkCount > 0). gpt-oss/OpenAI-MoE attention passes real per-head sink logits.
@@ -136,6 +137,14 @@ public class FusedAttentionKernel : IDisposable
     // BENCHMARK/diagnostic only: force the legacy per-element attention (skip the barrier-free per-query path) so
     // a benchmark can A/B the two on the same backend. Leave false in production.
     public static bool DisablePerQuery;
+
+    // Opt-in (GGUF_ATTN_REG=1) warp-cooperative REGISTER per-query attention: T=D/16 lanes cooperate per query,
+    // each holding a const-16 REGISTER accumulator tile (Geordi's scalar-replace recipe) — no shared-mem slice,
+    // no barrier; the Q·K dot is split across the T lanes + butterfly-reduced via Warp.ShuffleXor. CUDA-first
+    // (warp==32 + Warp.Shuffle); other backends keep the shared-slice per-query. Requires D % 16 == 0.
+    public static bool EnableRegisterAttention =
+        Environment.GetEnvironmentVariable("GGUF_ATTN_REG") == "1";
+    private const int RegTileD = 16; // per-lane register tile width (≤16 scalar-replaces; divides 64/128/256)
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -361,6 +370,25 @@ public class FusedAttentionKernel : IDisposable
         // EXCLUDES WebGL: it has NO workgroup shared memory (Transform-Feedback model), so the shared slice is
         // invalid there — WebGL keeps the shared-mem-free per-element kernel. headDim ≤ MaxAttnHeadDimPQ (the
         // per-thread slice width); larger heads fall back to per-element.
+        // Opt-in warp-cooperative REGISTER per-query (CUDA-first: warp==32 + Warp.Shuffle; D%16==0). T=D/16 lanes
+        // share a query, each holding a 16-wide register acc tile; block = one warp holding 32/T queries.
+        if (EnableRegisterAttention && _accelerator.AcceleratorType == AcceleratorType.Cuda
+            && headDim % RegTileD == 0 && _accelerator.WarpSize == 32)
+        {
+            if (!_perQueryRegisterKernels.TryGetValue(typeof(T), out var rg))
+                _perQueryRegisterKernels[typeof(T)] = rg = _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                    ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionPerQueryRegisterImpl<T>);
+            int regT = headDim / RegTileD, regQPerWarp = 32 / regT;
+            int regWarps = (nHeads * seqQ + regQPerWarp - 1) / regQPerWarp;
+            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)rg)(
+                new KernelConfig(regWarps, 32), Q, K, V, output, sinksView, paramsView);
+            return;
+        }
+
         if (!DisablePerQuery && headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
         {
             if (!_perQueryStridedKernels.TryGetValue(typeof(T), out var pq))
@@ -661,6 +689,94 @@ public class FusedAttentionKernel : IDisposable
         float inv = 1f / (runningSum + 1e-10f);
         for (int dd = 0; dd < D; dd++)
             output[oBase + dd] = sh[accBase + dd] * inv;
+    }
+
+    /// <summary>Warp-cooperative REGISTER per-query attention (opt-in GGUF_ATTN_REG, CUDA-first). T = D/RegTileD
+    /// lanes cooperate on ONE query; each lane owns dims [t·16,(t+1)·16) for BOTH the Q·K dot-partial AND the output,
+    /// holding its 16 online-softmax accumulators in REGISTERS (the const-16 array scalar-replaces — Geordi's recipe;
+    /// NO shared-mem slice, NO barrier). Per kv: each lane computes its partial dot; the T lanes butterfly-reduce it
+    /// via Warp.ShuffleXor (aligned power-of-2 group → every lane gets the full dot); then each lane runs the SAME
+    /// scalar online-softmax recurrence and updates its 16 register accs. Same masking/recurrence as
+    /// FusedAttentionPerQueryStridedImpl; the dot is summed per-tile+shuffle (vs sequential) so it matches to GEMV
+    /// float-reduction tolerance (argmax-identical). Requires warp==32 + D%16==0; block = one warp holding 32/T queries.</summary>
+    private static void FusedAttentionPerQueryRegisterImpl<T>(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<T, Stride1D.Dense> K,
+        ArrayView1D<T, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
+        ArrayView1D<int, Stride1D.Dense> p)
+        where T : unmanaged, INumber<T>
+    {
+        int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int sinkCount = p[9];
+        int kvStride = p[10];
+
+        int lane = Group.IdxX;          // 0..31 (block = one 32-lane warp)
+        int nLanes = D / RegTileD;      // lanes cooperating per query (4/8/16)
+        int qPerWarp = 32 / nLanes;     // queries per warp
+        int query = Grid.IdxX * qPerWarp + lane / nLanes;
+        int t = lane % nLanes;          // this lane's dim tile
+        if (query >= BH * SQ) return;
+
+        int sq = query % SQ;
+        int bh = query / SQ;
+        int kvHead = bh / gqaGroup;
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
+        int qPos = kvOffset + sq;
+        int kvHeadStride = p[13] == 1 ? D : kvStride;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
+        int myDim = t * RegTileD;       // first head-dim this lane owns
+
+        var acc = new float[RegTileD];  // REGISTERS (const 16 → scalar-replaced; no shared mem)
+        for (int d = 0; d < RegTileD; d++) acc[d] = 0f;
+        float runningMax = -1e10f;
+        float runningSum = 0f;
+
+        for (int kv = 0; kv < SKV; kv++)
+        {
+            int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
+            float pd = 0f;
+            for (int d = 0; d < RegTileD; d++)
+                pd += Q[qBase + myDim + d] * PrecisionConvert.ConvertToSingle(K[kBase + myDim + d]);
+            // butterfly-reduce the partial dot across this query's nLanes (aligned power-of-2 → all lanes get it).
+            for (int off = nLanes >> 1; off > 0; off >>= 1)
+                pd += Warp.ShuffleXor(pd, off);
+            float score = pd * scale;
+            int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
+            int windowOk = ((qPos - window - kv) >> 31) & 1;
+            int valid = causalOk & windowOk;
+            score = score * valid + -1e30f * (1 - valid);
+
+            float newMax = MathF.Max(runningMax, score);
+            float correction = MathF.Exp(runningMax - newMax);
+            float weight = MathF.Exp(score - newMax);
+            runningSum = runningSum * correction + weight;
+            for (int d = 0; d < RegTileD; d++)
+                acc[d] = acc[d] * correction + weight * PrecisionConvert.ConvertToSingle(V[kBase + myDim + d]);
+            runningMax = newMax;
+        }
+
+        if (sinkCount > 0)
+        {
+            float sink = sinks[bh % sinkCount];
+            float newMax = MathF.Max(runningMax, sink);
+            float correction = MathF.Exp(runningMax - newMax);
+            runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+            for (int d = 0; d < RegTileD; d++) acc[d] = acc[d] * correction;
+            runningMax = newMax;
+        }
+
+        float inv = 1f / (runningSum + 1e-10f);
+        for (int d = 0; d < RegTileD; d++)
+            output[oBase + myDim + d] = acc[d] * inv;
     }
 
     /// <summary>

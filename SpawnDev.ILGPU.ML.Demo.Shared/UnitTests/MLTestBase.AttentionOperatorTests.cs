@@ -231,4 +231,77 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[AttnOp] FusedAttention nH={nHeads} kvH={kvHeads} window={window} " +
             $"scale={(scale > 0 ? scale.ToString("F4") : "default")} kvOffset={kvOffset}: matches CPU oracle");
     }
+
+    /// <summary>Warp-cooperative REGISTER per-query attention (FusedAttentionKernel.EnableRegisterAttention) matches
+    /// the CPU oracle. CUDA-only (warp==32 + Warp.Shuffle, the gate); other backends keep the shared-slice. hd=64 is
+    /// a multiple of RegTileD(16) → 4 lanes/query. GQA + a multi-query + kvOffset shape exercises the bases.</summary>
+    [TestMethod]
+    public async Task Attn_RegisterPerQuery_MatchesCpu_Cuda() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda)
+        { Console.WriteLine($"[Attn] register per-query: CUDA-only, skipped on {accelerator.AcceleratorType}"); return; }
+
+        const int nHeads = 4, kvHeads = 2, seqQ = 3, seqKV = 20, headDim = 64, kvOffset = 5;
+        const bool causal = true; const int window = 0; const float scale = 0f;
+        var rng = new Random(417);
+        var q = new float[nHeads * seqQ * headDim];
+        var k = new float[kvHeads * seqKV * headDim];
+        var v = new float[kvHeads * seqKV * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < k.Length; i++) k[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < v.Length; i++) v[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        float effScale = scale > 0f ? scale : 1f / MathF.Sqrt(headDim);
+        long effWindow = window <= 0 ? long.MaxValue : window;
+        int group = nHeads / kvHeads;
+        var expected = new float[nHeads * seqQ * headDim];
+        for (int h = 0; h < nHeads; h++)
+        {
+            int kvh = h / group;
+            for (int sq = 0; sq < seqQ; sq++)
+            {
+                long qPos = kvOffset + sq;
+                var scores = new double[seqKV]; var valid = new bool[seqKV]; double max = double.NegativeInfinity;
+                for (int kv = 0; kv < seqKV; kv++)
+                {
+                    valid[kv] = (!causal || kv <= qPos) && kv > qPos - effWindow;
+                    if (!valid[kv]) continue;
+                    double dot = 0;
+                    for (int dd = 0; dd < headDim; dd++)
+                        dot += q[(h * seqQ + sq) * headDim + dd] * k[(kvh * seqKV + kv) * headDim + dd];
+                    scores[kv] = dot * effScale; if (scores[kv] > max) max = scores[kv];
+                }
+                double sum = 0;
+                for (int kv = 0; kv < seqKV; kv++) if (valid[kv]) sum += Math.Exp(scores[kv] - max);
+                for (int dd = 0; dd < headDim; dd++)
+                {
+                    double acc = 0;
+                    for (int kv = 0; kv < seqKV; kv++)
+                        if (valid[kv]) acc += Math.Exp(scores[kv] - max) / sum * v[(kvh * seqKV + kv) * headDim + dd];
+                    expected[(h * seqQ + sq) * headDim + dd] = (float)acc;
+                }
+            }
+        }
+
+        using var qBuf = accelerator.Allocate1D(q);
+        using var kBuf = accelerator.Allocate1D(k);
+        using var vBuf = accelerator.Allocate1D(v);
+        using var outBuf = accelerator.Allocate1D<float>(expected.Length);
+        using var fa = new Kernels.FusedAttentionKernel(accelerator);
+        bool saved = Kernels.FusedAttentionKernel.EnableRegisterAttention;
+        try
+        {
+            Kernels.FusedAttentionKernel.EnableRegisterAttention = true;
+            // Contiguous K/V store ([kvHeads, seqKV, hd]): kvRowStride = seqKV*hd, seq-major flags default off.
+            fa.ForwardStrided<float>(qBuf.View, kBuf.View, vBuf.View, outBuf.View,
+                nHeads, kvHeads, seqQ, seqKV, headDim, causal, window <= 0 ? int.MaxValue : window,
+                kvOffset, scale, seqKV * headDim);
+            await accelerator.SynchronizeAsync();
+        }
+        finally { Kernels.FusedAttentionKernel.EnableRegisterAttention = saved; }
+        var got = await outBuf.CopyToHostAsync<float>(0, expected.Length);
+
+        AssertCloseQuant(got, expected, 2e-3f, "register per-query attention vs CPU oracle");
+        Console.WriteLine($"[Attn] register per-query nH={nHeads} kvH={kvHeads} hd={headDim} (4 lanes/query): matches CPU oracle");
+    });
 }

@@ -43,6 +43,29 @@ wrapper. BLOCKED on a clean specialize-on-D / unroll pattern — asked Geordi
 (`tuvok-to-geordi-localarray-works-but-dynamicD-localmem-ties-sharedslice`). His LowerArrays fix is the
 prerequisite (done); the unroll/specialize pattern is pending. Registers >> shared >> local for this pattern.
 
+### UNBLOCKED 2026-06-23 — Geordi's D-tiling recipe + the concrete warp-cooperative design
+Geordi (`_DevComms/SpawnDev.ILGPU/geordi-to-tuvok-register-attention-const-D-recipe-2026-06-23.md`,
+[[reference-ilgpu-const-d-register-scalar-replace-attention]]): a `new float[T_d]` with **compile-time-const
+`T_d ≤ 16`** scalar-replaces to REGISTERS (the `LoopUnrolling.MaxTotalUnrolledBodyCost=320` cap → full-unroll only
+to D≈16). Full-D-per-thread (128/256) spills to `.local` ≈ shared-slice (the measured no-win). So **tile D across
+threads**.
+
+**Concrete design (CUDA/OpenCL-first; const `Td=16` — divides 64/128/256):**
+- `T = D/Td` threads cooperate per query (T∈{4,8,16}); a 32-lane warp holds `32/T` queries (all powers of 2, aligned).
+- lane → `qInWarp=lane/T`, `t=lane%T`; this lane owns dims `[t*Td,(t+1)*Td)` for BOTH the dot-partial AND the output.
+- per kv: `pd = Σ_{d<Td} Q[t*Td+d]·K[t*Td+d]`; **butterfly sub-group reduce** `for off=T/2..1: pd += Warp.ShuffleXor(pd,off)`
+  (aligned power-of-2 T-group → all T lanes get the full dot, NO barrier); online-softmax (each lane same scalar);
+  `acc[0..Td-1] = acc*correction + weight·V[t*Td+d]` (REGISTERS, const Td=16 scalar-replaces).
+- write `output[oBase + t*Td + d] = acc[d]/sum`. Reuses the p[11]/p[12]/p[13] seq-major bases + kvHeadStride/kvTokenStride.
+
+**HONEST tradeoffs (why it's NOT the slam-dunk next lever):** (1) needs **warp-shuffle** → CUDA/OpenCL + WebGPU-IF-
+subgroups only; CPU/Wasm (warp 8) + WebGL keep the shared-slice → **not fully universal** (the mandate's soft spot).
+(2) On CUDA the shared slice is on-chip/fast, so the register win is **modest** there; the bigger win is WebGPU-with-
+subgroups (avoids workgroup mem) — but subgroups are adapter/browser-gated. (3) Most complex kernel in the family
+(sub-warp cooperation + online softmax + register tiling + gating). RECOMMEND: implement GATED opt-in (env flag +
+CUDA-gate first), A/B on a long-prompt PREFILL (where attention is ~94% and O(n²·D) — the real win, the 20× Ollama
+gap), then extend to WebGPU-subgroups. Master-safe via the gate the whole way.
+
 ## Not these (Geordi's lane, in flight): GEMV 128-bit vectorized load (decode), Wasm large-local-array
 sequencing. Cache = task #6 (deferred). WebGL attention stays per-element (multi-store vs Transform-Feedback
 one-store-per-thread — architectural).

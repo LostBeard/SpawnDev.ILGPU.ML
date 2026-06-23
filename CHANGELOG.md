@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Warp-cooperative REGISTER per-query attention (opt-in, CUDA-first) — ~20% faster decode
+
+**The flash-class register accumulator (Geordi's D-tiling recipe).** The barrier-free per-query attention holds its
+D outputs in a per-thread workgroup-shared slice (the shared-RMW is its ~5.3× ceiling). New opt-in
+(`GGUF_ATTN_REG=1`) `FusedAttentionPerQueryRegisterImpl`: **T = D/16 lanes cooperate on one query**, each owning
+dims `[t·16,(t+1)·16)` and holding its 16 online-softmax accumulators in **REGISTERS** (the const-16 array
+scalar-replaces — no shared slice, no barrier). Per kv: each lane computes its partial Q·K dot, the T lanes
+butterfly-reduce it via `Warp.ShuffleXor` (aligned power-of-2 group, every lane gets the full dot), then each lane
+runs the same scalar online-softmax and updates its 16 register accs. **RTX 4070 clean A/B (qwen2.5-coder:7b
+decode): shared-slice 23.9 → register 19.2 ms/tok (~20%)**, argmax-identical (the per-tile+shuffle dot sum reorders
+vs sequential, within GEMV float-reduction tolerance). CUDA-first (warp==32 + `Warp.Shuffle`, D%16==0); other
+backends keep the shared-slice per-query (default OFF → opt-in, master behavior unchanged). PMT GGUFDecodeKVCache
+green (CUDA register-incremental == full-recompute) + default sweep unaffected. WebGPU-subgroup extension is the
+next step (the bigger win there — avoids workgroup memory).
+
 ## Unreleased — Fused SwiGLU (SiLU-gated MLP activation, dispatch reduction)
 
 **Fused the SiLU MLP activation into ONE kernel.** The SwiGLU path emitted three elementwise nodes per layer —
