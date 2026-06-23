@@ -292,10 +292,14 @@ public static class GGUFGraphBuilder
             // ── Residual 1 + FFN norm ──
             // Fuse the residual Add into the following RMSNorm (AddRMSNorm: 2 nodes → 1, residualOut + normedOut)
             // when it's a plain weighted RMSNorm (qwen/llama; gemma's (1+w) fold is baked into the GGUF weights so
-            // RMSNorm is uniform). LayerNorm / no-weight archs keep the separate Add + AddNorm.
+            // RMSNorm is uniform). LayerNorm / no-weight archs keep the separate Add + AddNorm. EXCLUDE the gemma
+            // 2/3/4 NORM-SANDWICH (post_attention_norm present): there the residual Add consumes the post-attn-norm
+            // output, and fusing it would hide that sandwich wiring (the residual-add must stay a visible Add node
+            // fed by post_attention_norm) — keep it unfused so the sandwich semantics are explicit + verified.
             string residual1 = $"{pfx}_res1";
             string ffnNormOut = $"{pfx}_ffn_norm";
-            var ffnNormW = useRMSNorm ? FindTensor(model, $"{pfx}.ffn_norm.weight") : null;
+            bool hasNormSandwich = FindTensor(model, $"{pfx}.post_attention_norm.weight") != null;
+            var ffnNormW = (useRMSNorm && !hasNormSandwich) ? FindTensor(model, $"{pfx}.ffn_norm.weight") : null;
             if (ffnNormW != null)
             {
                 ExtractWeight(model, ffnNormW, weights);

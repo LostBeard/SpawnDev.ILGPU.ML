@@ -38,9 +38,12 @@ normalized output (`rmsnorm(a+b)·weight`) — replacing a separate Add kernel +
 single-pass f64-partial reduction shape as the existing fused RMSNorm, so it matches the Add→RMSNorm chain to the
 RMSNorm tolerance; byte-identical decode. Wired for the within-layer ffn-norm on plain weighted RMSNorm archs
 (qwen/llama; gemma's (1+w) fold is baked into the GGUF weights so RMSNorm is uniform) — LayerNorm / no-weight archs
-keep the separate Add+norm. WebGL (no workgroup shared mem) falls back to `ElementWise.Add` + the two-pass norm
-(same op, two kernels). Decode node count 535→507 (−28/step; Add 56→28, RMSNorm 57→29). PMT GGUFDecodeKVCache green
-all 6 backends. (The 28 residual-stream "boundary" Adds before each attn-norm are a pattern-2 follow-up.)
+keep the separate Add+norm. **EXCLUDES the gemma 2/3/4 norm-sandwich** (a layer with `post_attention_norm`): there
+the residual Add consumes the post-attn-norm output, so fusing it would hide the sandwich wiring (the residual add
+must stay a visible `Add` fed by `post_attention_norm`) — those layers stay unfused. WebGL (no workgroup shared mem)
+falls back to `ElementWise.Add` + the two-pass norm (same op, two kernels). Decode node count 535→507 (−28/step; Add
+56→28, RMSNorm 57→29). PMT full sweep green all 6 backends incl `Gemma4_GraphBuilder_PostNormSandwich`. (The 28
+residual-stream "boundary" Adds before each attn-norm are a pattern-2 follow-up.)
 
 ## Unreleased — Zero-copy Reshape views at decode (drop 112 CopyFrom dispatches/step, universal)
 
