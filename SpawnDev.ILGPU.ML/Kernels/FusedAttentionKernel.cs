@@ -47,6 +47,8 @@ public class FusedAttentionKernel : IDisposable
     // decouples the store's row pitch from the logical seqKV — so the cache reads its maxSeq-strided store
     // DIRECTLY (no per-token repack/widen). One compiled kernel per concrete T, cached.
     private readonly Dictionary<Type, object> _stridedKernels = new();
+    // Barrier-free per-query kernel cache (the universal non-grouped path; replaces the per-element strided kernel).
+    private readonly Dictionary<Type, object> _perQueryStridedKernels = new();
 
     // Dummy 1-element sinks buffer for the no-sinks case (the kernel always takes a sinks view but only
     // reads it when sinkCount > 0). gpt-oss/OpenAI-MoE attention passes real per-head sink logits.
@@ -63,12 +65,38 @@ public class FusedAttentionKernel : IDisposable
         = new MemoryBuffer1D<int, Stride1D.Dense>?[RingSize];
     private int _ringNext;
 
+    // CUDA-GRAPH CAPTURE: stable per-forward params slots. The ring (below) hands out a DIFFERENT device
+    // pointer each call, so a captured kernel node would bake the capture-step's slot and replay (no host
+    // code runs) would never see refreshed params. With stable slots, the k-th attention call of every
+    // forward gets the SAME device buffer (counter auto-resets when GraphExecutor.ForwardGeneration ticks),
+    // so the captured node reads a stable buffer the host can refresh between replays. During the actual
+    // capture pass (GraphExecutor.SuppressDrains) the H2D is SKIPPED — a CopyFromCPU synchronizes, which is
+    // illegal mid-capture; the slot already holds the immediately-preceding warm pass's params (same state).
+    public static bool UseStableCaptureSlots;
+    private const int CaptureSlotMax = 512;   // >= attention nodes per forward (28-layer qwen = 28)
+    private readonly MemoryBuffer1D<int, Stride1D.Dense>?[] _captureSlots
+        = new MemoryBuffer1D<int, Stride1D.Dense>?[CaptureSlotMax];
+    private int _captureSlotNext;
+    private long _captureSlotGen = -1;
+
     // Lazily allocate ring slot `_ringNext` and upload paramsData into it, returning the exact-length view.
     private ArrayView1D<int, Stride1D.Dense> RentParamsSlot(int[] paramsData)
     {
-        var slot = _ringNext;
+        if (UseStableCaptureSlots)
+        {
+            long gen = SpawnDev.ILGPU.ML.Graph.GraphExecutor.ForwardGeneration;
+            if (gen != _captureSlotGen) { _captureSlotGen = gen; _captureSlotNext = 0; }
+            int slot = _captureSlotNext++;
+            var sbuf = _captureSlots[slot] ??= _accelerator.Allocate1D<int>(ParamSize);
+            var sview = sbuf.View.SubView(0, paramsData.Length);
+            // Skip the synchronizing H2D during capture; the warm pass already populated this stable slot.
+            if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+                sview.CopyFromCPU(paramsData);
+            return sview;
+        }
+        var slotIdx = _ringNext;
         _ringNext = (_ringNext + 1) % RingSize;
-        var buf = _paramsRing[slot] ??= _accelerator.Allocate1D<int>(ParamSize);
+        var buf = _paramsRing[slotIdx] ??= _accelerator.Allocate1D<int>(ParamSize);
         var view = buf.View.SubView(0, paramsData.Length);
         view.CopyFromCPU(paramsData);
         return view;
@@ -290,6 +318,28 @@ public class FusedAttentionKernel : IDisposable
             return;
         }
 
+        // Non-grouped path (WebGPU always; desktop when grouped not opted in): the BARRIER-FREE per-query kernel
+        // — one thread per (bh, sq), each accumulating all D outputs in its OWN shared-memory slice (no barrier,
+        // no reduction), O(SKV·D) (kills the per-element kernel's D× redundant dot). Byte-identical output.
+        // EXCLUDES WebGL: it has NO workgroup shared memory (Transform-Feedback model), so the shared slice is
+        // invalid there — WebGL keeps the shared-mem-free per-element kernel. headDim ≤ MaxAttnHeadDimPQ (the
+        // per-thread slice width); larger heads fall back to per-element.
+        if (headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
+        {
+            if (!_perQueryStridedKernels.TryGetValue(typeof(T), out var pq))
+                _perQueryStridedKernels[typeof(T)] = pq = _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                    ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionPerQueryStridedImpl<T>);
+            int pqQueries = nHeads * seqQ;
+            int pqBlocks = (pqQueries + PQGroup - 1) / PQGroup;
+            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
+                ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)pq)(
+                new KernelConfig(pqBlocks, PQGroup), Q, K, V, output, sinksView, paramsView);
+            return;
+        }
+
         if (!_stridedKernels.TryGetValue(typeof(T), out var k))
             _stridedKernels[typeof(T)] = k = _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
@@ -458,6 +508,96 @@ public class FusedAttentionKernel : IDisposable
         }
 
         output[idx] = weightedV / (runningSum + 1e-10f);
+    }
+
+    // Per-query kernel: threads/block and the max headDim each thread's shared-memory accumulator slice covers
+    // (gemma4 = 256, qwen = 128). Shared size = PQGroup * MaxAttnHeadDimPQ floats = 8*256*4 = 8 KB (within
+    // WebGPU's 16 KB workgroup-storage limit). PQGroup is small because each thread owns a FULL D-wide slice.
+    private const int MaxAttnHeadDimPQ = 256;
+    private const int PQGroup = 8;
+
+    /// <summary>
+    /// BARRIER-FREE per-query attention — ONE thread per (bh, sq). Identical online-softmax + branch-free masking
+    /// to <see cref="FusedAttentionStridedImpl{T}"/>, but each thread computes the Q·K dot ONCE per kv and
+    /// accumulates ALL D outputs — so the per-element kernel's D× redundant dot is gone (O(SKV·D) per query vs
+    /// O(SKV·D²)). The D accumulators live in the thread's OWN slice of workgroup shared memory (no cross-thread
+    /// access → NO <c>Group.Barrier</c>, NO workgroup reduction). Because the running max/sum/correction sequence
+    /// is independent of the output dim, the per-dim result is BYTE-IDENTICAL to the per-element kernel (the
+    /// correctness anchor). The point: no barrier/reduction means it runs FAST on WebGPU/WebGL (where the grouped
+    /// kernel's reduction is ~75× slow on Tint/Dawn and is therefore disabled) AND on every other backend — the
+    /// universal non-grouped attention path. (Shared mem is used as per-thread scratch only because ILGPU cannot
+    /// yet lower a dynamically-indexed device-LOCAL array in this kernel — flagged to Geordi for the cleaner form.)
+    /// </summary>
+    private static void FusedAttentionPerQueryStridedImpl<T>(
+        ArrayView1D<float, Stride1D.Dense> Q,
+        ArrayView1D<T, Stride1D.Dense> K,
+        ArrayView1D<T, Stride1D.Dense> V,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
+        ArrayView1D<int, Stride1D.Dense> p)
+        where T : unmanaged, INumber<T>
+    {
+        int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int sinkCount = p[9];
+        int kvStride = p[10];
+
+        int query = Grid.IdxX * PQGroup + Group.IdxX;   // global query index = (bh, sq)
+        if (query >= BH * SQ) return;
+        int sq = query % SQ;
+        int bh = query / SQ;
+
+        int kvHead = bh / gqaGroup;
+        int qBase = (bh * SQ + sq) * D;
+        int qPos = kvOffset + sq;
+
+        // This thread's private D-wide accumulator slice in shared memory (no other thread touches it).
+        var sh = SharedMemory.Allocate<float>(PQGroup * MaxAttnHeadDimPQ);
+        int accBase = Group.IdxX * MaxAttnHeadDimPQ;
+        for (int dd = 0; dd < D; dd++) sh[accBase + dd] = 0f;
+
+        float runningMax = -1e10f;
+        float runningSum = 0f;
+
+        for (int kv = 0; kv < SKV; kv++)
+        {
+            int kBase = kvHead * kvStride + kv * D;
+            float dot = 0f;
+            for (int dd = 0; dd < D; dd++)
+                dot += Q[qBase + dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
+            float score = dot * scale;
+
+            int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
+            int windowOk = ((qPos - window - kv) >> 31) & 1;
+            int valid = causalOk & windowOk;
+            score = score * valid + -1e30f * (1 - valid);
+
+            float newMax = MathF.Max(runningMax, score);
+            float correction = MathF.Exp(runningMax - newMax);
+            float weight = MathF.Exp(score - newMax);
+            runningSum = runningSum * correction + weight;
+            for (int dd = 0; dd < D; dd++)
+                sh[accBase + dd] = sh[accBase + dd] * correction + weight * PrecisionConvert.ConvertToSingle(V[kBase + dd]);
+            runningMax = newMax;
+        }
+
+        if (sinkCount > 0)
+        {
+            float sink = sinks[bh % sinkCount];
+            float newMax = MathF.Max(runningMax, sink);
+            float correction = MathF.Exp(runningMax - newMax);
+            runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+            for (int dd = 0; dd < D; dd++) sh[accBase + dd] = sh[accBase + dd] * correction;
+            runningMax = newMax;
+        }
+
+        float inv = 1f / (runningSum + 1e-10f);
+        for (int dd = 0; dd < D; dd++)
+            output[qBase + dd] = sh[accBase + dd] * inv;
     }
 
     /// <summary>
