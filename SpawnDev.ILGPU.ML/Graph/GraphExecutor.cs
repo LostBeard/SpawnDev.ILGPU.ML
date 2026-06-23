@@ -220,6 +220,25 @@ public class GraphExecutor : IDisposable
     public static bool PerOpSync { get; set; }
 
     /// <summary>
+    /// CUDA-GRAPH CAPTURE: when true, <see cref="RunAsync"/> skips ALL periodic + final
+    /// <c>SynchronizeAsync</c> drains. A synchronize is illegal during
+    /// <c>cuStreamBeginCapture</c> (it aborts the capture), so the decode-graph capture path
+    /// sets this for the single forward it records into a <see cref="ILGPU.Runtime.Cuda.CudaGraph"/>.
+    /// The forward must already be WARM (pools + readback cache primed) so the drain-free pass
+    /// allocates nothing and reads nothing back. Always reset to false immediately after EndCapture.
+    /// </summary>
+    public static bool SuppressDrains;
+
+    /// <summary>
+    /// CUDA-GRAPH CAPTURE: bumped once at the start of every <see cref="RunAsync"/>. Per-node operators
+    /// that hand out stable device "slots" for capture (e.g. <c>FusedAttentionKernel</c>'s params buffer)
+    /// reset their per-forward slot counter when this value changes, so the k-th call of a given op gets
+    /// the SAME device pointer every forward — the requirement for a captured node to read a stable buffer
+    /// the host refreshes between replays. Harmless (a monotonic counter) when capture is not in use.
+    /// </summary>
+    public static long ForwardGeneration;
+
+    /// <summary>
     /// DIAGNOSTIC: incremented each time the Pad readback fallback fires at execute time.
     /// After session-init Pad pre-extraction (InferenceSession 2026-05-05), this should
     /// remain 0 for every well-formed ONNX model. Tests assert == 0 after a Run/RunAsync
@@ -871,6 +890,7 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
+        ForwardGeneration++;   // signals per-forward "stable capture slot" counters to reset (CUDA-graph capture)
         LastRunOpLog.Clear();
         LastRunIntegerDivCount = 0;
         LastRunReadbackCount = 0;
@@ -939,17 +959,22 @@ public class GraphExecutor : IDisposable
                     refCounts[inputName] = rc - 1;
                     if (rc - 1 <= 0)
                     {
-                        // Release low-p OR fp32 storage, whichever holds this tensor (deferred to the drain).
+                        // CUDA-graph capture: drains are suppressed, so the deferred-release path would never
+                        // return buffers mid-forward → the whole working set stays live → pool miss → cuMemAlloc
+                        // (ILLEGAL during capture, crashes). Instead return IMMEDIATELY: on the single capture
+                        // stream, a later node's kernel that re-Rents this buffer is recorded after this input's
+                        // last consumer, so stream ordering makes the reuse safe with no host drain. Keeps the
+                        // captured forward's pool footprint bounded with ZERO allocation.
                         if (halfTensors.TryGetValue(inputName, out var hrel))
                         {
                             halfTensors.Remove(inputName);
-                            pendingHalfReleases.Add(hrel);
-                            pendingReleaseBytes += (long)hrel.ElementCount * 2;
+                            if (SuppressDrains) _pool.ReturnHalf(hrel);
+                            else { pendingHalfReleases.Add(hrel); pendingReleaseBytes += (long)hrel.ElementCount * 2; }
                         }
                         else if (tensors.TryGetValue(inputName, out var releaseTensor))
                         {
-                            pendingReleases.Add(releaseTensor);
-                            pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float);
+                            if (SuppressDrains) _pool.Return(releaseTensor);
+                            else { pendingReleases.Add(releaseTensor); pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float); }
                         }
                     }
                 }
@@ -961,6 +986,9 @@ public class GraphExecutor : IDisposable
         // both execution paths so peak GPU memory is bounded to ~(live set + cap) regardless of which path ran.
         async Task DrainPointAsync()
         {
+            // CUDA-graph capture records this forward; a synchronize would abort the capture. The
+            // captured forward is warm, so skipping the drain leaks no buffers within the single pass.
+            if (SuppressDrains) return;
             if (nodeIdx % SyncIntervalNodes == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
             {
                 _drainSw.Restart();
@@ -1816,26 +1844,35 @@ public class GraphExecutor : IDisposable
                 break;
         }
 
-        // Final yield + sync
-        await Task.Yield();
-        _drainSw.Restart();
-        try { await _accelerator.SynchronizeAsync(); }
-        catch (Exception syncEx)
+        // Final yield + sync. Skip the yield during capture: Task.Yield ALWAYS reschedules onto another
+        // thread-pool thread, and cuStreamEndCapture must run on the thread that began the capture. With the
+        // yield (and the drains) suppressed, the whole captured forward runs synchronously on one thread.
+        if (!SuppressDrains)
+            await Task.Yield();
+        // CUDA-graph capture: skip the final synchronize (illegal during capture) AND the buffer
+        // returns. The captured forward is warm + single-pass, so leaving these pending is safe; the
+        // caller resets SuppressDrains right after EndCapture and the normal drain path resumes.
+        if (!SuppressDrains)
         {
-            var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
-            var tailLen = LastRunOpLog.Count - tailStart;
-            var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
-            throw new Exception(
-                $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || last {tailLen} ops: {tail}");
+            _drainSw.Restart();
+            try { await _accelerator.SynchronizeAsync(); }
+            catch (Exception syncEx)
+            {
+                var tailStart = Math.Max(0, LastRunOpLog.Count - 40);
+                var tailLen = LastRunOpLog.Count - tailStart;
+                var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
+                throw new Exception(
+                    $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || last {tailLen} ops: {tail}");
+            }
+            _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
+            // Release any remaining deferred buffers
+            foreach (var t in pendingReleases)
+                _pool.Return(t);
+            foreach (var h in pendingHalfReleases)
+                _pool.ReturnHalf(h);
+            pendingReleases.Clear();
+            pendingHalfReleases.Clear();
         }
-        _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
-        // Release any remaining deferred buffers
-        foreach (var t in pendingReleases)
-            _pool.Return(t);
-        foreach (var h in pendingHalfReleases)
-            _pool.ReturnHalf(h);
-        pendingReleases.Clear();
-        pendingHalfReleases.Clear();
 
         var results = new Dictionary<string, Tensor>();
         foreach (var name in _graph.OutputNames)
