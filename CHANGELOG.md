@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Register attention on WebGPU (subgroups) + consume ILGPU 4.16.2
+
+**Register per-query attention now runs on WebGPU**, extending the flash-class register accumulator (CUDA default-on,
+2.7× prefill / ~20% decode) to the browser — where it wins most (no workgroup memory at all; the per-thread 16-wide
+register tile + `Warp.ShuffleXor` butterfly map to WGSL `subgroupShuffleXor`). Two things made it valid on Dawn:
+(1) ILGPU **4.16.2** (consumed; was 4.16.0) — `Warp.Shuffle{Xor,Up,Down}` now lower to the matching WGSL builtin
+(the ShuffleKind was being dropped → plain `subgroupShuffle`), plus a module-level `diagnostic(off,
+subgroup_uniformity)` directive so a subgroup op inside a storage-buffer-bound loop compiles. (2) A **uniform-shuffle
+correctness fix** in `FusedAttentionPerQueryRegisterImpl`: dropped the divergent `if (query >= BH*SQ) return;` before
+the shuffle — now ALL lanes run `Warp.ShuffleXor` uniformly (out-of-range lanes read a clamped in-bounds query and
+skip only the final store), so the shuffle is genuinely uniform (correct on WebGPU AND CUDA, not just
+whole-group-active-by-luck). Dispatch gate extended to WebGPU when `WarpSize==32` (adapter exposes subgroups);
+CPU/Wasm/WebGL/OpenCL keep the shared-slice. PMT GGUFDecodeKVCache **8/8 all 6 backends incl WebGPU** (register ==
+full-recompute, byte-identical on real Dawn); CUDA still byte-identical.
+
 ## Unreleased — Fused AddRMSNorm (residual add + RMSNorm in one cooperative pass, universal)
 
 Fused the per-layer residual `Add` into the following `RMSNorm`. New `AddRMSNorm` op/kernel: one cooperative pass

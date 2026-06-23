@@ -371,10 +371,14 @@ public class FusedAttentionKernel : IDisposable
         // EXCLUDES WebGL: it has NO workgroup shared memory (Transform-Feedback model), so the shared slice is
         // invalid there — WebGL keeps the shared-mem-free per-element kernel. headDim ≤ MaxAttnHeadDimPQ (the
         // per-thread slice width); larger heads fall back to per-element.
-        // Opt-in warp-cooperative REGISTER per-query (CUDA-first: warp==32 + Warp.Shuffle; D%16==0). T=D/16 lanes
-        // share a query, each holding a 16-wide register acc tile; block = one warp holding 32/T queries.
-        if (EnableRegisterAttention && _accelerator.AcceleratorType == AcceleratorType.Cuda
-            && headDim % RegTileD == 0 && _accelerator.WarpSize == 32)
+        // Warp-cooperative REGISTER per-query (warp==32 + Warp.ShuffleXor; D%16==0). T=D/16 lanes share a query,
+        // each holding a 16-wide register acc tile; block = one warp holding 32/T queries. CUDA always; WebGPU when
+        // the adapter exposes subgroups (WarpSize reports 32 → ShuffleXor lowers to subgroupShuffleXor; needs ILGPU
+        // 4.16.2+ which emits the subgroup_uniformity diagnostic so the storage-bound kv-loop shuffle compiles).
+        // OpenCL EXCLUDED (NVIDIA OpenCL lacks cl_khr_subgroup_shuffle); CPU/Wasm/WebGL keep the shared-slice.
+        if (EnableRegisterAttention && headDim % RegTileD == 0 && _accelerator.WarpSize == 32
+            && (_accelerator.AcceleratorType == AcceleratorType.Cuda
+                || _accelerator.AcceleratorType == AcceleratorType.WebGPU))
         {
             if (!_perQueryRegisterKernels.TryGetValue(typeof(T), out var rg))
                 _perQueryRegisterKernels[typeof(T)] = rg = _accelerator.LoadStreamKernel<
@@ -721,9 +725,15 @@ public class FusedAttentionKernel : IDisposable
         int lane = Group.IdxX;          // 0..31 (block = one 32-lane warp)
         int nLanes = D / RegTileD;      // lanes cooperating per query (4/8/16)
         int qPerWarp = 32 / nLanes;     // queries per warp
-        int query = Grid.IdxX * qPerWarp + lane / nLanes;
+        int rawQuery = Grid.IdxX * qPerWarp + lane / nLanes;
         int t = lane % nLanes;          // this lane's dim tile
-        if (query >= BH * SQ) return;
+        // NO early return: a partial last warp would make the Warp.ShuffleXor below DIVERGENT (subgroup ops with
+        // inactive lanes are UB on WebGPU + CUDA). Instead ALL lanes run the shuffle uniformly — out-of-range lanes
+        // read a CLAMPED in-bounds query (query=0, safe) and just skip the final output store. (lane/nLanes is
+        // constant within a query's nLanes-group, so a group is wholly active or inactive — but we keep every lane
+        // live so the subgroup op is genuinely uniform, per Geordi's WGSL-uniformity guidance, 4.16.2.)
+        bool active = rawQuery < BH * SQ;
+        int query = active ? rawQuery : 0;
 
         int sq = query % SQ;
         int bh = query / SQ;
@@ -776,8 +786,9 @@ public class FusedAttentionKernel : IDisposable
         }
 
         float inv = 1f / (runningSum + 1e-10f);
-        for (int d = 0; d < RegTileD; d++)
-            output[oBase + myDim + d] = acc[d] * inv;
+        if (active)
+            for (int d = 0; d < RegTileD; d++)
+                output[oBase + myDim + d] = acc[d] * inv;
     }
 
     /// <summary>
