@@ -2,16 +2,18 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased — WebGPU KV-cache write: queue-ordered sync CopyFrom (drop the per-copy await round-trip)
+## Unreleased — KV-cache write: queue-ordered sync CopyFrom on ALL backends (drop the per-copy await round-trip)
 
 The decode KV-cache write (`CaptureSafeCopy`) used a stream-ordered sync `CopyFrom` on CUDA (no host sync — "the
-whole forward is one stream, so ordering is free") but fell back to an awaited `CopyFromAsync` on every other
-backend, including WebGPU. WebGPU is a SINGLE QUEUE, exactly like CUDA's single stream: a sync `CopyFrom` enqueues a
-queue-ordered `CopyBufferToBuffer` that the consumer kernel reads after — no race (the async was really there for the
-Wasm worker pool, where a sync copy *does* race). So WebGPU was paying for an awaited GPU round-trip per K/V per layer
-= 2×nLayers per decode token (56/token on a 28-layer 7B) that it never needed. WebGPU now takes the CUDA-style
-sync-enqueue path; Wasm/WebGL keep `CopyFromAsync` (worker-pool / TF ordering). Correctness gate: PMT GGUFDecodeKVCache
-(incremental == full-recompute, byte-identical) green on WebGPU. Pure round-trip removal — the KV math is unchanged.
+whole forward is one stream, so ordering is free") but fell back to an awaited `CopyFromAsync` on every other backend
+(WebGPU, Wasm, WebGL). That fallback existed for a Wasm worker-pool ordering race — **which has since been fixed in
+SpawnDev.ILGPU**: `CopyFrom` is now reliably ordered on all 6 backends (native `CopyBufferToBuffer` on WebGPU, TF on
+WebGL, serialized work-stream on Wasm), so the consumer kernel always reads after the copy with no race. The awaited
+`CopyFromAsync` was therefore a pure GPU round-trip per K/V per layer = 2×nLayers per decode token (56/token on a
+28-layer 7B) on WebGPU AND Wasm — the two backends where a round-trip hurts most. All non-CUDA backends now take the
+sync-enqueue path; CUDA keeps the explicit `DefaultStream` form for graph-capture safety. Correctness gate: PMT
+GGUFDecodeKVCache (incremental == full-recompute, byte-identical) green all 6 backends. Pure round-trip removal — the
+KV math is unchanged.
 
 ## Unreleased — Register attention on WebGPU (subgroups) + consume ILGPU 4.16.2
 
