@@ -710,6 +710,13 @@ public class FusedDequantMatMul : IDisposable
         if (l == 0 && n < N) output[n] = partial;
     }
 
+    // 16-byte struct-of-4-ints: bind a weight chunk as ArrayView<W16> + AsAligned16() so ILGPU's PTX backend
+    // emits a single 128-bit ld.v4.b32 (= SASS LDG.E.128) instead of 4 scalar ld.b32 — the decode-GEMV
+    // weight-bandwidth lever (PROVEN by Geordi, VectorizedLoadPtxDump). Sequential layout: a,b,c,d = the 4
+    // consecutive int words. See GemvDp4aQ4_KImpl.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct W16 { public int a, b, c, d; }
+
     // Wrapper for the dp4a (4x int8 dot-accumulate) PTX intrinsic: d = c + Σ a.s8[i]·b.s8[i]. CUDA-only.
     private static int Dp4a(int a, int b, int c)
     {
@@ -794,14 +801,32 @@ public class FusedDequantMatMul : IDisposable
                 int ablk0 = super * 8 + 2 * t, ablk1 = ablk0 + 1;
                 float da0 = ds[ablk0 * 2], sa0 = ds[ablk0 * 2 + 1];
                 float da1 = ds[ablk1 * 2], sa1 = ds[ablk1 * 2 + 1];
-                int wWordBase = (sbOff + 16 + 32 * t) >> 2;
+                // 128-bit vectorized weight load: this t-unit's 8 nibble-words are two 16-byte chunks. Reading
+                // each as a W16 (struct of 4 ints) via AsAligned16() makes ILGPU emit ld.v4.b32 (=LDG.E.128) —
+                // ONE 128-bit load per 4 words instead of 4 scalar ld.b32, cutting weight load-issue 4× (the
+                // 52%→~73% bandwidth lever, llama.cpp MMVQ level; [[reference-ilgpu-128bit-vectorized-load-via-asaligned16]]).
+                // Base is provably 16-aligned: sbOff = rowBase + super·144, with rowBase = n·(K/256·144) and
+                // 144 both multiples of 16; +16 +32·t stays a multiple of 16. Bit-identical to the scalar loop.
+                var w16 = w.BaseView.Cast<W16>().AsAligned16();
+                int w16Base = (sbOff + 16 + 32 * t) >> 4;   // byte offset / 16 → W16 index
+                W16 c0 = w16[w16Base], c1 = w16[w16Base + 1];
                 int dot0 = 0, dot1 = 0;
-                for (int wi = 0; wi < 8; wi++)
-                {
-                    int wword = w[wWordBase + wi];
-                    dot0 = Dp4a((wword >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + wi], dot0);
-                    dot1 = Dp4a((wword >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + wi], dot1);
-                }
+                dot0 = Dp4a((c0.a >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 0], dot0);
+                dot1 = Dp4a((c0.a >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 0], dot1);
+                dot0 = Dp4a((c0.b >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 1], dot0);
+                dot1 = Dp4a((c0.b >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 1], dot1);
+                dot0 = Dp4a((c0.c >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 2], dot0);
+                dot1 = Dp4a((c0.c >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 2], dot1);
+                dot0 = Dp4a((c0.d >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 3], dot0);
+                dot1 = Dp4a((c0.d >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 3], dot1);
+                dot0 = Dp4a((c1.a >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 4], dot0);
+                dot1 = Dp4a((c1.a >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 4], dot1);
+                dot0 = Dp4a((c1.b >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 5], dot0);
+                dot1 = Dp4a((c1.b >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 5], dot1);
+                dot0 = Dp4a((c1.c >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 6], dot0);
+                dot1 = Dp4a((c1.c >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 6], dot1);
+                dot0 = Dp4a((c1.d >> 0) & 0x0F0F0F0F, qs[ablk0 * 8 + 7], dot0);
+                dot1 = Dp4a((c1.d >> 4) & 0x0F0F0F0F, qs[ablk1 * 8 + 7], dot1);
                 partial += dsc0 * da0 * dot0 - dmm0 * sa0;
                 partial += dsc1 * da1 * dot1 - dmm1 * sa1;
             }
