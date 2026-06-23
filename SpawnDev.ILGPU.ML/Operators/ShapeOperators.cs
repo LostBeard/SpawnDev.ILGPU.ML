@@ -29,11 +29,14 @@ public class ReshapeOperator(OperatorRegistry reg) : IOnnxOperator
     }
     public void Execute(OnnxOpContext ctx)
     {
-        // Copy input to output
+        // Reshape only relabels dimensions — the element order is identical — so move the data with a native
+        // device-to-device CopyFrom (WebGPU CopyBufferToBuffer / queue-ordered on every backend) instead of a
+        // Scale(×1) KERNEL dispatch (shader compile + bind group + dispatch). Reshape runs ~4×/layer (~112×/decode
+        // step on qwen); this drops that many shader dispatches to native copies. Sync CopyFrom of a kernel output
+        // is correct + ordered on all 6 backends (SpawnDev.ILGPU local.7+; the device→device throw was removed).
         int count = Math.Min(ctx.Inputs[0].ElementCount, ctx.Outputs[0].ElementCount);
         if (count > 0)
-            reg.ElementWise.Scale(ctx.Inputs[0].Data.SubView(0, count),
-                ctx.Outputs[0].Data.SubView(0, count), count, 1f);
+            ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
 
         // Target shape: the opset-5 shape INPUT (from a Concat of Shape values) takes precedence; otherwise
         // the opset-1 "shape" ATTRIBUTE (the GGUF builder's form — e.g. attention reshapes to [1,seq,heads,dim]).
