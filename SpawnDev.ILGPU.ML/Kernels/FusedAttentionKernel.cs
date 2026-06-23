@@ -208,6 +208,7 @@ public class FusedAttentionKernel : IDisposable
             causal ? 1 : 0, effWindow, kvOffset,
             nHeads / kvHeads, // GQA group size: query head h reads kv head h / group
             sinkCount,        // p[9]: >0 => fold per-head sink logit into the softmax denominator
+            seqKV * headDim,  // p[10]: kvRowStride (contiguous K/V = seqKV*headDim; read only by the per-query kernel)
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -236,6 +237,24 @@ public class FusedAttentionKernel : IDisposable
                     ArrayView1D<int, Stride1D.Dense>>(FusedAttentionTiledImpl);
                 _tiledKernel(cfg, Q, K, V, output, sinksView, paramsView);
             }
+            return;
+        }
+
+        // Barrier-free per-query path (same as ForwardStrided): the universal non-grouped attention. T=float here
+        // (contiguous K/V); with kvRowStride=seqKV*headDim (p[10] above) it's byte-identical to the per-element
+        // kernel. Excludes WebGL (no workgroup shared memory) and headDim > MaxAttnHeadDimPQ → per-element below.
+        if (headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
+        {
+            if (!_perQueryStridedKernels.TryGetValue(typeof(float), out var pq))
+                _perQueryStridedKernels[typeof(float)] = pq = _accelerator.LoadStreamKernel<
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionPerQueryStridedImpl<float>);
+            int pqBlocks = (nHeads * seqQ + PQGroup - 1) / PQGroup;
+            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)pq)(
+                new KernelConfig(pqBlocks, PQGroup), Q, K, V, output, sinksView, paramsView);
             return;
         }
 
