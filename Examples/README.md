@@ -18,9 +18,9 @@ dotnet run --project Examples/<name>/<name>.csproj -- <args>
 | 01 | `HelloPipeline.Console` | minimal: load a model, one forward pass, print output | planned |
 | 02 | **`ModelInspector.Console`** | stream a model's **header only** (no full download) → architecture, operators, tensors, quantization, GGUF metadata + tensor templates, engine compatibility | ✅ shipped |
 | 03 | **`ImageGen.Console`** | SD-Turbo text→image on native GPU kernels; prompt → `.bmp` | ⏳ written, verify pending |
-| 04 | `TextGen.Console` | GPT-2 autoregressive decode + KV cache | planned |
-| 05 | `AIChat.Console` | full chat loop + history (Gemma) | planned |
-| 06 | `Precompiled.Console` | same workload via precompiled shaders — startup/perf delta | planned |
+| 04 | **`GGUFTextGen.Console`** | GGUF autoregressive decode + KV cache (qwen2.5-coder, gemma4); decode/prefill perf probes | ✅ shipped |
+| 05 | **`Gemma4Multimodal.Console`** | gemma4:12b vision+text (mmproj image tokens) | ⏳ written, verify pending |
+| 06 | **`OllamaServer.Console`** | **drop-in Ollama replacement** — native-GPU GGUF server (OpenAI + Ollama + Anthropic APIs) for Claude CLI / Pi / Codex / etc., zero-copy from your `~/.ollama` cache | 🚧 WIP (works; perf + huge-context decode are the active work) |
 | 07–09 | `*.BlazorWasm` | browser mirrors (zero-copy canvas for image-gen) | planned |
 
 ## 02 · ModelInspector.Console
@@ -46,6 +46,29 @@ dotnet run --project Examples/03.ImageGen.Console/ImageGen.Console.csproj -- a p
 dotnet run --project Examples/03.ImageGen.Console/ImageGen.Console.csproj -- "a watercolor fox" --seed 7 --out fox.bmp
 dotnet run --project Examples/03.ImageGen.Console/ImageGen.Console.csproj -- --ci
 ```
+
+## 06 · OllamaServer.Console 🚧 WIP
+
+A **drop-in Ollama replacement**: a native-GPU GGUF inference server that prebuilt agentic frontends
+(Claude CLI, Pi, Codex, OpenCode, Continue, …) talk to with zero reconfiguration. It serves the GGUF models
+**already in your `~/.ollama` cache, zero-copy** — no re-download, no duplicate files — and speaks three wire
+protocols at once: **OpenAI** (`/v1/chat/completions`), **Ollama-native** (`/api/chat`, `/api/tags`,
+`/api/show`), and **Anthropic Messages** (`/v1/messages`, for Claude CLI).
+
+```bash
+dotnet run --project Examples/06.OllamaServer.Console -c Release            # serve on :11434
+dotnet run --project Examples/06.OllamaServer.Console -- --list             # list servable cached models
+dotnet run --project Examples/06.OllamaServer.Console -- --chat qwen2.5-coder:7b "Hi"
+```
+
+Point a client at it (see the example's own [README](06.OllamaServer.Console/README.md) for the full table):
+`ANTHROPIC_BASE_URL=http://localhost:11434 claude`, or any OpenAI-compatible client at `…/v1`.
+
+**Status (WIP):** functional end-to-end on qwen2.5-coder:7b and gemma4:12b (greedy + KV-cache decode, streaming
+detokenize, tool-calling, ChatML/Llama3/gemma templates). The active work is **performance** (decode is
+GPU-compute-bound; beating Ollama needs vectorized-load + fused GEMV — in progress) and a large-context decode
+path for 12B models. Validate against real Ollama as an oracle (same GGUF blob → first-divergence token +
+tokens/sec), not byte-identity.
 
 ## Conventions
 

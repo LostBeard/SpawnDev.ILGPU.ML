@@ -2,6 +2,29 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Universal barrier-free per-query attention (WebGPU prefill win) + Reshape native-copy
+
+**Barrier-free per-query fused attention — the universal (esp. WebGPU) prefill win.** Prefill is ~94% attention
+at long context, and WebGPU/WebGL were stuck on the per-element kernel (O(n²·D²), D× redundant Q·K dot) because
+the grouped kernel's workgroup reduction is ~75× slow on Tint/Dawn. New `FusedAttentionPerQueryStridedImpl`: one
+thread per (bh, sq), computes the dot ONCE and accumulates all D outputs in its own slice of workgroup shared
+memory — no `Group.Barrier`, no reduction — byte-identical to the per-element kernel. It's the non-grouped path on
+every backend **except WebGL** (no workgroup shared memory → keeps per-element; also a multi-store-per-thread that
+WebGL's Transform-Feedback can't do). Wired for both the GGUF-strided (`ForwardStrided`) and contiguous (`Forward`)
+paths. **Measured (8h×256×256×128): WebGPU per-element 18258ms → per-query 265ms = ~69×; Wasm 16×; CUDA prefill
+~5×.** PMT GREEN all 6 backends (GGUFDecodeKVCache 8/8, attention oracle 92/92); decode byte-identical. (A
+dynamic-D *local-memory* accumulator was tried on Geordi's LowerArrays fix and measured ≈ tie / CUDA-slower vs the
+shared slice — reverted; true registers need D-specialized unrolling, a follow-up.)
+
+**Reshape → native `CopyFrom` instead of a `Scale(×1)` kernel dispatch.** `ReshapeOperator` only relabels
+dimensions (identical element order) but was copying via a `Scale(×1)` shader dispatch (~112×/decode step on
+qwen). Now a native device→device `CopyFrom` (WebGPU `CopyBufferToBuffer`; queue-ordered on every backend) — drops
+~112 shader dispatches/step to native copies, biggest on WebGPU's dispatch overhead. Verified CUDA byte-identical
++ GGUFDecodeKVCache 8/8 + Attn 92/92.
+
+(Also this cycle, shipped earlier: RMSNorm cooperative parallel reduction; dp4a int8-activation GEMV 4-warps/block
+(CUDA); Example 06 `/api/show` + `run-pi.bat`.)
+
 ## Unreleased — Example 06 server: interactive bounds (fast model + capped context/output)
 
 **Made the Claude-CLI experience usable on a slow local engine.** `run-claude-cli.bat` now defaults to

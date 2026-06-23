@@ -209,6 +209,18 @@ await accelerator.SynchronizeAsync();
 var result = await c.CopyToHostAsync<float>();
 ```
 
+## Examples
+
+A progressive ladder of self-contained example projects under [`Examples/`](Examples/README.md) — from a minimal
+model inspect to a full inference server. Highlight:
+
+- **`06.OllamaServer.Console` — a drop-in Ollama replacement 🚧 (WIP).** Turns this engine into a native-GPU GGUF
+  inference server that prebuilt agentic frontends (**Claude CLI**, Pi, Codex, OpenCode, Continue, …) talk to with
+  zero reconfiguration. Speaks **OpenAI**, **Ollama-native**, and **Anthropic Messages** APIs at once, and serves
+  the GGUF models **already in your `~/.ollama` cache, zero-copy**. Functional end-to-end today (qwen2.5-coder,
+  gemma4 — KV-cache decode, streaming, tool-calling); the active work is matching Ollama's speed (vectorized-load +
+  fused GEMV) and large-context decode for 12B models. See [`Examples/06.OllamaServer.Console`](Examples/06.OllamaServer.Console/README.md).
+
 ## Supported Backends
 
 | | WebGPU | WebGL | Wasm | CUDA | OpenCL | CPU |
