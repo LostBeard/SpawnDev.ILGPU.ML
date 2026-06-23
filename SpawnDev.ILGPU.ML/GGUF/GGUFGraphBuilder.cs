@@ -314,13 +314,10 @@ public static class GGUFGraphBuilder
                 string activated;
                 if (useSiLU)
                 {
-                    // SiLU(x) = x * sigmoid(x)
-                    string sigOut = $"{pfx}_gate_sig";
-                    AddNode(graph, "Sigmoid", new[] { gateOut }, new[] { sigOut });
-                    string siluOut = $"{pfx}_gate_silu";
-                    AddNode(graph, "Mul", new[] { gateOut, sigOut }, new[] { siluOut });
+                    // Fused SwiGLU: (gate · sigmoid(gate)) · up in ONE kernel — was Sigmoid + Mul + Mul (3
+                    // dispatches/layer → 1; 56 fewer dispatches/decode-step, biggest on WebGPU). Bit-identical.
                     activated = $"{pfx}_ffn_act";
-                    AddNode(graph, "Mul", new[] { siluOut, upOut }, new[] { activated });
+                    AddNode(graph, "SwiGLU", new[] { gateOut, upOut }, new[] { activated });
                 }
                 else
                 {

@@ -191,6 +191,19 @@ public class SiLUOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+/// <summary>Fused SwiGLU (gate, up) → (gate·sigmoid(gate))·up in ONE kernel — replaces the SiLU MLP's
+/// Sigmoid + Mul + Mul (3 dispatches → 1; biggest on WebGPU dispatch overhead). Bit-identical to that chain.</summary>
+public class SwiGLUOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "SwiGLU";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+    {
+        reg.Activations.SwiGLU(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+    }
+}
+
 public class LeakyReluOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "LeakyRelu";

@@ -2,6 +2,17 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Fused SwiGLU (SiLU-gated MLP activation, dispatch reduction)
+
+**Fused the SiLU MLP activation into ONE kernel.** The SwiGLU path emitted three elementwise nodes per layer —
+`Sigmoid(gate)` → `Mul(gate, sig)` → `Mul(silu, up)`. New `SwiGLU` op/kernel computes `(gate · sigmoid(gate)) · up`
+in a single pass (3 dispatches/layer → 1 = **56 fewer dispatches/decode-step**; biggest on WebGPU dispatch overhead,
+continuing the transpose-fusion theme). **Bit-identical**: the sigmoid clamps (>80→1, <-80→0) match `SigmoidInPlaceImpl`
+and the multiply order `(gate·sig)·up` matches the two-Mul chain. Elementwise gather (no scatter) → WebGL-safe.
+Decode node count 591→535 (qwen2.5-coder:7b; Sigmoid + 56 Mul folded out). PMT GREEN all 6 backends:
+GGUFDecodeKVCache 8/8 (the tiny-llama test model uses SiLU → exercises SwiGLU, incremental == full-recompute
+byte-identical) + Attn 92/92; qwen 16-tok decode byte-identical. (gemma's GeGLU `Gelu+Mul` left as a follow-up.)
+
 ## Unreleased — Consume ILGPU 4.16.0 (CUDA graph API + Wasm large-local-array fix)
 
 Bumped `SpawnDev.ILGPU` 4.15.1 → **4.16.0** (Geordi's stable, forks 2.1.0): rolls up the CUDA graph capture API

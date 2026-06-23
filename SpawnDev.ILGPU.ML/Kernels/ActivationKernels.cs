@@ -19,6 +19,8 @@ public class ActivationKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _hardSigmoidInPlace;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float>? _hardSigmoidParamsInPlace;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _hardSwishInPlace;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>>? _swiGLU;
 
     public ActivationKernels(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -49,6 +51,18 @@ public class ActivationKernels
         if (x < -80f) { data[idx] = 0f; return; }
         float sig = 1f / (1f + MathF.Exp(-x));
         data[idx] = x * sig;
+    }
+
+    /// <summary>Fused SwiGLU: out = (gate · sigmoid(gate)) · up — the SiLU-gated MLP activation in ONE pass,
+    /// replacing the graph's Sigmoid + Mul + Mul (3 dispatches → 1; biggest on WebGPU dispatch overhead).
+    /// BIT-IDENTICAL: the sigmoid clamps (&gt;80→1, &lt;-80→0) match <see cref="SigmoidInPlaceImpl"/> and the
+    /// multiply order (gate·sig)·up matches the two-Mul graph. gate/up/out are distinct buffers (no aliasing).</summary>
+    private static void SwiGLUImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> gate,
+        ArrayView1D<float, Stride1D.Dense> up, ArrayView1D<float, Stride1D.Dense> outp)
+    {
+        float g = gate[idx];
+        float sig = g > 80f ? 1f : (g < -80f ? 0f : 1f / (1f + MathF.Exp(-g)));
+        outp[idx] = (g * sig) * up[idx];
     }
 
     /// <summary>LeakyReLU: max(alpha*x, x). Alpha passed via int buffer (as float bits).</summary>
@@ -114,6 +128,11 @@ public class ActivationKernels
     public void SiLUInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     { EnsureLoaded(); _siluInPlace!(count, data); }
 
+    /// <summary>Fused SwiGLU: out = (gate · sigmoid(gate)) · up. Replaces Sigmoid + Mul + Mul (3 dispatches → 1).</summary>
+    public void SwiGLU(ArrayView1D<float, Stride1D.Dense> gate, ArrayView1D<float, Stride1D.Dense> up,
+        ArrayView1D<float, Stride1D.Dense> outp, int count)
+    { EnsureLoaded(); _swiGLU!(count, gate, up, outp); }
+
     public void HardSigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     { EnsureLoaded(); _hardSigmoidInPlace!(count, data); }
 
@@ -133,5 +152,7 @@ public class ActivationKernels
         _hardSigmoidInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidInPlaceImpl);
         _hardSigmoidParamsInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsInPlaceImpl);
         _hardSwishInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSwishInPlaceImpl);
+        _swiGLU ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SwiGLUImpl);
     }
 }

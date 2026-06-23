@@ -53,7 +53,7 @@ public class OperatorRegistry : IDisposable
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
         "SequenceAt", "SequenceConstruct", "SequenceEmpty", "SequenceErase", "SequenceInsert", "SequenceLength", "SequenceMap", "Shape",
         "Shrink", "SiLU", "Sigmoid", "Sign", "Sin", "Sinh", "Size", "Slice",
-        "Softmax", "SoftmaxCrossEntropyLoss", "Softplus", "Softsign", "SpaceToDepth", "Split", "SplitToSequence", "Sqrt",
+        "Softmax", "SoftmaxCrossEntropyLoss", "Softplus", "Softsign", "SpaceToDepth", "Split", "SplitToSequence", "Sqrt", "SwiGLU",
         "Squeeze", "StringConcat", "StringNormalizer", "StringSplit", "Sub", "Sum", "Tan", "Tanh",
         "ThresholdedRelu", "Tile", "TopK", "Transpose", "Trilu", "Unique", "Unsqueeze", "Upsample",
         "Where", "Xor",
@@ -225,6 +225,7 @@ public class OperatorRegistry : IDisposable
         Register(new UpsampleOperator(this));
         Register(new ShapeOperator(this));
         Register(new SiLUOperator(this));
+        Register(new SwiGLUOperator(this));
         Register(new LeakyReluOperator(this));
         Register(new ExpandOperator(this));
         Register(new TileOperator(this));
