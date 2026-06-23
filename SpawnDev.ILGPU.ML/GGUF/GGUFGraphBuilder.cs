@@ -202,8 +202,11 @@ public static class GGUFGraphBuilder
             }
 
             // Q/K: reshape → QK-norm → RoPE → transpose. V: reshape → weightless-norm → transpose (no RoPE).
+            // Q drops its PRE-attention transpose (step 2): FusedAttention reads Q seq-major (seq_major_q below).
+            // K/V keep theirs until the KV-cache store goes seq-major (step 3).
             string qReshaped = EmitAttnHead(graph, model, weights, pfx, "q", qOut, nHeads, hd, cfg,
-                gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, doRope: true, weightlessNorm: false);
+                gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, doRope: true, weightlessNorm: false,
+                skipTranspose: true);
             string kReshaped = EmitAttnHead(graph, model, weights, pfx, "k", kOut, cfg.NKVHeads, hd, cfg,
                 gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, doRope: true, weightlessNorm: false);
             string vReshaped = EmitAttnHead(graph, model, weights, pfx, "v", vSrc, cfg.NKVHeads, hd, cfg,
@@ -238,6 +241,9 @@ public static class GGUFGraphBuilder
                 // seq-major base, the per-element kernels (WebGL) enumerate idx in seq-major order (own-slot
                 // write, no scatter). Eliminates ~28 transpose dispatches+copies/decode-step. (Tuvok 2026-06-23.)
                 ["seq_major_out"] = JsonSerializer.SerializeToElement(1L),
+                // seq_major_q: Q is fed seq-major (its pre-attention transpose was dropped, step 2) so
+                // FusedAttention reads Q with the seq-major base (p[12]). K/V stay heads-major (step 3 pending).
+                ["seq_major_q"] = JsonSerializer.SerializeToElement(1L),
             };
             if (gemmaAttn)
                 faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);
@@ -601,7 +607,7 @@ public static class GGUFGraphBuilder
     /// </summary>
     private static string EmitAttnHead(ModelGraph graph, GGUFModel model, Dictionary<string, float[]> weights,
         string pfx, string tag, string projOut, int heads, int hd, LayerAttnConfig cfg,
-        string? qkNormTensor, string? freqFactors, bool doRope, bool weightlessNorm)
+        string? qkNormTensor, string? freqFactors, bool doRope, bool weightlessNorm, bool skipTranspose = false)
     {
         string r4d = $"{pfx}_{tag}_4d";
         AddNode(graph, "Reshape", new[] { projOut }, new[] { r4d },
@@ -641,6 +647,11 @@ public static class GGUFGraphBuilder
             AddNode(graph, "RoPE", ins, new[] { roped }, ropeAttrs);
             cur = roped;
         }
+
+        // skipTranspose: the FusedAttention consumer reads this input SEQ-major (p[12] for Q), so the
+        // [1,seq,heads,hd]→[1,heads,seq,hd] Transpose is dropped — return the pre-transpose (seq-major) tensor.
+        if (skipTranspose)
+            return cur;
 
         string t = $"{pfx}_{tag}_t";
         AddNode(graph, "Transpose", new[] { cur }, new[] { t }, Attrs("perm", new long[] { 0, 2, 1, 3 }));

@@ -192,7 +192,7 @@ public class FusedAttentionKernel : IDisposable
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale,
         ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
-        bool seqMajorOut = false)
+        bool seqMajorOut = false, bool seqMajorQ = false)
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
         if (kvHeads <= 0 || nHeads % kvHeads != 0)
@@ -216,6 +216,8 @@ public class FusedAttentionKernel : IDisposable
             seqKV * headDim,  // p[10]: kvRowStride (contiguous K/V = seqKV*headDim; read only by the per-query kernel)
             seqMajorOut ? 1 : 0, // p[11]: write output SEQ-major [1,seq,heads,hd] (oBase=(sq*BH+bh)*D) instead of
                                  // heads-major — lets the graph drop the post-attention Transpose[0,2,1,3] (universal).
+            seqMajorQ ? 1 : 0,   // p[12]: read Q SEQ-major (qBase=(sq*BH+bh)*D) — lets the graph drop the Q
+                                 // PRE-attention Transpose[0,2,1,3] (step 2; K/V keep theirs until the KV-cache goes seq-major).
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -302,7 +304,7 @@ public class FusedAttentionKernel : IDisposable
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale, int kvRowStride,
         ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
-        bool seqMajorOut = false)
+        bool seqMajorOut = false, bool seqMajorQ = false)
         where T : unmanaged, INumber<T>
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
@@ -322,6 +324,8 @@ public class FusedAttentionKernel : IDisposable
             kvRowStride, // p[10]: per-head element stride of K/V (maxSeq*hd for the strided store; seqKV*hd contiguous)
             seqMajorOut ? 1 : 0, // p[11]: write output SEQ-major (oBase=(sq*BH+bh)*D) — lets the graph drop the
                                  // post-attention Transpose[0,2,1,3] (universal data-movement elimination).
+            seqMajorQ ? 1 : 0,   // p[12]: read Q SEQ-major (qBase=(sq*BH+bh)*D) — lets the graph drop the Q
+                                 // PRE-attention Transpose[0,2,1,3] (step 2).
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -417,7 +421,8 @@ public class FusedAttentionKernel : IDisposable
         if (bh >= BH) return;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
+        // Q read base: seq-major (sq*BH+bh)*D when p[12]=1 (graph dropped the Q pre-transpose), else heads-major.
+        int qBase = p[12] == 1 ? (sq * BH + bh) * D : (bh * SQ + sq) * D;
         int qPos = kvOffset + sq;
 
         float runningMax = -1e10f;
@@ -505,7 +510,8 @@ public class FusedAttentionKernel : IDisposable
         if (bh >= BH) return;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
+        // Q read base: seq-major (sq*BH+bh)*D when p[12]=1 (graph dropped the Q pre-transpose), else heads-major.
+        int qBase = p[12] == 1 ? (sq * BH + bh) * D : (bh * SQ + sq) * D;
         int qPos = kvOffset + sq;
 
         float runningMax = -1e10f;
@@ -588,10 +594,12 @@ public class FusedAttentionKernel : IDisposable
         int bh = query / SQ;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
-        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
-        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
-        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
+        // Per-thread bases: heads-major [1,heads,seq,hd] vs seq-major [1,seq,heads,hd]. p[12]=1 → READ Q seq-major
+        // (graph dropped the Q pre-transpose, step 2); p[11]=1 → WRITE output seq-major (dropped the post-attention
+        // transpose, step 1). Independent flags (step 1 shipped with Q still heads-major / p[12]=0).
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
 
         // This thread's private D-wide accumulator slice in shared memory (no other thread touches it).
@@ -668,10 +676,12 @@ public class FusedAttentionKernel : IDisposable
         int sq = g % SQ;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
-        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
-        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
-        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
+        // Per-thread bases: heads-major [1,heads,seq,hd] vs seq-major [1,seq,heads,hd]. p[12]=1 → READ Q seq-major
+        // (graph dropped the Q pre-transpose, step 2); p[11]=1 → WRITE output seq-major (dropped the post-attention
+        // transpose, step 1). Independent flags (step 1 shipped with Q still heads-major / p[12]=0).
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -749,10 +759,12 @@ public class FusedAttentionKernel : IDisposable
         int sq = g % SQ;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
-        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
-        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
-        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
+        // Per-thread bases: heads-major [1,heads,seq,hd] vs seq-major [1,seq,heads,hd]. p[12]=1 → READ Q seq-major
+        // (graph dropped the Q pre-transpose, step 2); p[11]=1 → WRITE output seq-major (dropped the post-attention
+        // transpose, step 1). Independent flags (step 1 shipped with Q still heads-major / p[12]=0).
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -833,10 +845,12 @@ public class FusedAttentionKernel : IDisposable
         int sq = g % SQ;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
-        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
-        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
-        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
+        // Per-thread bases: heads-major [1,heads,seq,hd] vs seq-major [1,seq,heads,hd]. p[12]=1 → READ Q seq-major
+        // (graph dropped the Q pre-transpose, step 2); p[11]=1 → WRITE output seq-major (dropped the post-attention
+        // transpose, step 1). Independent flags (step 1 shipped with Q still heads-major / p[12]=0).
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -938,10 +952,12 @@ public class FusedAttentionKernel : IDisposable
         int sq = g % SQ;
 
         int kvHead = bh / gqaGroup;
-        int qBase = (bh * SQ + sq) * D;
-        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
-        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
-        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
+        // Per-thread bases: heads-major [1,heads,seq,hd] vs seq-major [1,seq,heads,hd]. p[12]=1 → READ Q seq-major
+        // (graph dropped the Q pre-transpose, step 2); p[11]=1 → WRITE output seq-major (dropped the post-attention
+        // transpose, step 1). Independent flags (step 1 shipped with Q still heads-major / p[12]=0).
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);

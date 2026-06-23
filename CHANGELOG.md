@@ -2,6 +2,16 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Transpose-fusion step 2: drop the Q pre-attention transpose (universal)
+
+**Eliminated the per-layer Q PRE-attention `Transpose[0,2,1,3]` (another 28 dispatches+copies/decode-step).**
+Symmetric to step 1 but on the READ side: new `seqMajorQ` mode (kernel param `p[12]`) makes FusedAttention read Q
+with the seq-major base `(sq*BH+bh)*D`, so `EmitAttnHead(..., skipTranspose: true)` for Q drops its transpose and
+feeds the post-RoPE `[1,seq,heads,hd]` tensor straight in. Independent of `seqMajorOut` (step 1, the output side) —
+both set together by the GGUF builder now (`seq_major_q` attr). K/V keep their transposes until step 3 (the
+KV-cache store must go seq-major). **Decode Transpose nodes 84→56 (56 = the remaining K+V pre-transposes).** PMT
+GREEN all 6 backends (GGUFDecodeKVCache 8/8 + Attn 92/92); qwen2.5-coder:7b 16-tok decode byte-identical.
+
 ## Unreleased — Transpose-fusion step 1: drop the post-attention transpose (universal)
 
 **Eliminated the per-layer post-attention `Transpose[0,2,1,3]` (28 dispatches+copies/decode-step, universal).**
