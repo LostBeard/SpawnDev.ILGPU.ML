@@ -62,3 +62,64 @@ executor blind.
 - `Pipelines/GgufGenerator.cs` — production decode driver (`CacheShapeReadbacks=true`).
 - `Kernels/FusedDequantMatMul.cs` — dp4a GEMVs (`GemvDp4aQ4_KImpl`/`GemvDp4aQ6_KImpl`/`QuantizeActQ8_1Impl`/`Dp4a`).
 - `Examples/06.OllamaServer.Console/Program.cs` — server opt-ins (all speed flags).
+
+---
+
+## 2026-06-22 — MEASURED findings + refined design (Tuvok session)
+
+### Profiling result (Rule 4b — done; dotnet-trace, SampleProfiler @1ms, real qwen decode, 160 tok)
+Inside `GraphExecutor.RunAsync`, time classified by stack:
+- **Unmanaged non-sync (`cuLaunchKernel` + arg marshalling): 72.5%** ← dominant
+- Managed node-walk (Rent / dict / LINQ `.Select().ToArray()` / Execute): **18.0%**
+- Sync-wait (SynchronizeAsync drains): 9.5%
+
+**This REFINES the original assumption.** The residual is dominated by per-launch DRIVER cost, NOT the managed
+graph-walker (Rent/dict/LINQ is only 18%). So CUDA graphs (collapse ~703 `cuLaunchKernel` → 1 `cuGraphLaunch`)
+is the correct primary lever; the managed walker is the secondary one. Caveat: SampleProfiler collapses all
+CUDA-driver time into one unmanaged bucket — it cleanly excludes the sync drains (measured 9.5% separately) and
+the managed walker (18%), which is enough to confirm the lever. Steady-state wall ~33ms = ~7ms GPU + ~26ms CPU.
+
+### The ILGPU graph API is SHIPPED (Geordi, master `71438a4`) and 4070-verified (6.6× dispatch win)
+`CudaStream.BeginCapture/EndCapture/CaptureStatus/SupportsGraphCapture`, `CudaGraph.Instantiate()`,
+`CudaGraphExec.Launch/Upload`. Geordi's Part-3 proof validates the EXACT per-token mechanism: a captured kernel
+reads its per-step value from a **stable-pointer device buffer**, host mutates the buffer's CONTENTS between
+**synced** replays → bit-exact. The decode loop syncs per token anyway (to sample), so per-token updates are free.
+**Footgun (Geordi):** un-synced `CopyFromCPU(stream, managedArray)` between launches races (staged pinned host
+buffer reused) → wrong. Safe = synced-per-step (natural) OR a dedicated pinned staging buffer.
+
+### Routing decision (ASK to Geordi, pending)
+`*StreamKernel` launchers resolve `accelerator.DefaultStream` **at launch time** (`KernelLoaders.cs:401,425,…`),
+which wraps the NULL stream (uncapturable). Two routes: (a) Geordi's explicit-stream launchers = change ~295
+call sites (miss-one = capture abort); (b) **swap `DefaultStream` to a created non-blocking `CudaStream`** =
+reroutes all sites with zero churn, can't-miss, covers prefill. Asked Geordi for a scoped `acc.WithDefaultStream`
+(needs ILGPU — `DefaultStream` is `protected set`). With (b), `cuGraphExecKernelNodeSetParams` is NOT needed for
+the primary path (device-resident params instead). DevComms `tuvok-to-geordi-graph-profile-routing-package-2026-06-22`.
+
+### Per-step varying state (mapped from the code)
+1. **`input_ids` device buffer** — `GgufGenerator` reallocs `inBuf` via `Allocate1D(idf)` EVERY step → pointer
+   differs each token. The captured embedding-Gather bakes step-0's pointer → replay reads wrong/freed memory.
+   **FIX: a STABLE reused single-token decode input buffer** (write the new token id in per step). Prereq + tiny
+   perf win (drops a per-step alloc/free). Decode stepIds is always length 1; prefill (step 0, longer) is not captured.
+2. **`DecodePastLen`** (grows +1/token) feeds: RoPE `kv_offset`, KV-write offset, attention `seqKV`/`kvOffset`.
+   - **Attention grid is FIXED** (`Index1D` = nHeads×seqQ, seqQ=1); `seqKV` is a kernel **loop bound**, not a grid
+     dim. So NO grid update needed across steps. ✅
+   - FusedAttention **already passes seqKV/kvOffset/window via a DEVICE buffer** (`RentParamsSlot`→`CopyFromCPU`,
+     `FusedAttentionKernel.cs:67`). BUT it **cycles a 64-slot RING** (new device pointer each call) → a captured
+     node bakes the capture-step slot, and replay (no host code) never refreshes it. **FIX: a STABLE params slot
+     per decode attention node** (keyed by layer/node identity, allocated once), host writes only the 2 dynamic
+     ints (`seqKV`=pastLen+1, `kvOffset`=pastLen) per token before `exec.Launch`. The ring's anti-race purpose is
+     preserved because each node gets its OWN stable slot (no cross-layer sharing within a forward).
+   - **RoPE `kv_offset`** and **KV-write offset**: confirm whether host-baked (kernel scalar) or device-resident;
+     if host-baked, make device-resident the same way (stable slot, refresh per token).
+
+### Build order (Stage gating)
+- **Stage 0 — mechanics: DONE** (Geordi's 4070 proof, 6.6×, bit-exact).
+- **Stage 1 — same-state replay de-risk on the REAL model:** consume the ILGPU local pkg; stable input buffer;
+  warm one decode step; `WithDefaultStream(capStream)` + BeginCapture → run one forward (drains disabled,
+  readbacks warm, pool warm = no alloc/sync/readback in capture) → EndCapture → Instantiate; replay once, sync,
+  compare logits to the non-graph forward at the SAME state (must be identical); measure residual collapse.
+  Does NOT need per-step updates — proves capture+replay works on the real decode forward + the win is real.
+- **Stage 2 — per-step inputs:** stable input buffer refresh + stable params slots (seqKV/kvOffset/RoPE/KV-write
+  device-resident) so successive DIFFERENT tokens are correct; verify token-identical vs non-graph decode over a
+  full generation; measure decode ms/tok. Gate opt-in (`GGUF_DECODE_GRAPH`/`EnableDecodeGraph`), Example 06 opts in.
+- **Blocker:** ML consumes ILGPU as NuGet `4.15.1` (no graph API) — need Geordi's `-local.N` pkg first.
