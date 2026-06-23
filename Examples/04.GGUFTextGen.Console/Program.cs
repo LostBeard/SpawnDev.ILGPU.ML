@@ -28,6 +28,34 @@ int[] tokenIds = args.FirstOrDefault(a => a.Contains(','))?.Split(',')
         .Select(s => int.Parse(s.Trim())).ToArray()
     ?? new[] { 2, 1000, 2000, 3000, 4000 };
 
+// GGUF_PTX_PROBE=1 → compile the dp4a Q4_K decode GEMV via the CUDA backend and dump its PTX, then count
+// 128-bit vectorized weight loads (ld.v4.b32 = LDG.E.128) vs scalar (ld.b32). PROVES the AsAligned16/W16
+// weight load lit up — must NOT guess (CLAUDE.md 4b). No model needed. (Tuvok 2026-06-23 GEMV bandwidth lever.)
+if (Environment.GetEnvironmentVariable("GGUF_PTX_PROBE") == "1")
+{
+    using var pctx = MLContext.Create().ToContext();
+    var pcuda = pctx.GetCudaDevices();
+    if (pcuda.Count == 0) { Console.WriteLine("[ptx-probe] no CUDA device"); return 1; }
+    using var pacc = (CudaAccelerator)pcuda[0].CreateAccelerator(pctx);
+    Console.WriteLine($"[ptx-probe] {pacc.Name}");
+    foreach (var name in new[] { "GemvDp4aQ4_KImpl", "GemvDp4aQ6_KImpl" })
+    {
+        var m = typeof(FusedDequantMatMul).GetMethod(name,
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        if (m == null) { Console.WriteLine($"[ptx-probe] {name}: NOT FOUND"); continue; }
+        var compiled = pacc.Backend.Compile(
+            ILGPU.Backends.EntryPoints.EntryPointDescription.FromExplicitlyGroupedKernel(m),
+            new ILGPU.Runtime.KernelSpecialization(128, null));
+        var ptx = (compiled as ILGPU.Backends.PTX.PTXCompiledKernel)?.PTXAssembly ?? "(not PTX)";
+        int Count(string s) { int n = 0, i = 0; while ((i = ptx.IndexOf(s, i, StringComparison.Ordinal)) >= 0) { n++; i += s.Length; } return n; }
+        int v4 = Count("ld.v4.b32"), v2 = Count("ld.v2.b32");
+        int scalar = Count("ld.b32") - Count("ld.param.b32");
+        Console.WriteLine($"[ptx-probe] {name}: ld.v4.b32={v4}  ld.v2.b32={v2}  scalar ld.b32={scalar}");
+        File.WriteAllText(Path.Combine(Path.GetTempPath(), name + ".ptx"), ptx);
+    }
+    return 0;
+}
+
 // GGUF_GEMM_BENCH=1 → localize the prefill MatMul GFLOPS ceiling: f32 register-blocked GEMM (no dequant)
 // vs the Q4_K dequant register-blocked GEMM at the SAME shapes. If f32 >> dequant the per-element B-tile
 // dequant is the overhead (ML fix); if ~equal, the GEMM codegen is the ceiling. Random weight bytes (timing
@@ -432,6 +460,131 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         stepIds = new[] { arg };  // decode: feed only the new token (KV path)
     }
     sw.Stop();
+
+    // ── Stage-1 CUDA-graph decode capture/replay PROBE (GGUF_DECODE_GRAPH_PROBE=1) ──
+    // De-risks the dispatch-collapse arc on the REAL model: the decode loop above left the executor
+    // WARM (pools + readback cache primed, CacheShapeReadbacks finalized). We capture ONE more decode
+    // forward at the current state into a CUDA graph and replay it. SAME-STATE replay (we do NOT advance
+    // the KV cursor), so every replay reproduces the SAME logits — the correctness gate is
+    // replay-argmax == a fresh non-graph forward at this exact state. Then we time direct forwards vs
+    // graph replays to MEASURE the ~26ms CPU-dispatch residual collapse (the lever to beat Ollama).
+    if (useKV && Environment.GetEnvironmentVariable("GGUF_DECODE_GRAPH_PROBE") == "1")
+    {
+        if (accelerator is not CudaAccelerator)
+            Console.WriteLine("\n[graph-probe] SKIP: not a CUDA accelerator (graph capture is CUDA-only).");
+        else if (!CudaStream.SupportsGraphCapture)
+            Console.WriteLine("\n[graph-probe] SKIP: driver does not expose the CUDA graph API.");
+        else if (gen.Count < 3)
+            Console.WriteLine("\n[graph-probe] SKIP: need >=3 warm decode steps first (run with GGUF_GEN_N>=8).");
+        else
+        {
+            Console.WriteLine("\n=== Stage-1 CUDA-graph decode capture/replay probe ===");
+            int nextTok = stepIds[0];                         // the next single-token decode input
+            int statePast = session.DecodePastLen;            // freeze this decode state
+            const int R = 50;                                 // replays / direct steps to time
+
+            // Stable single-token input buffer — a captured embedding-gather bakes THIS device pointer,
+            // so it must not move between replays (a fresh Allocate1D per step would break replay).
+            using var capIn = accelerator.Allocate1D(new[] { (float)nextTok });
+            var capInput = new Tensor(capIn.View, new[] { 1, 1 }, "input_ids");
+
+            float[] ReadLogits(Tensor lg)
+            {
+                int vc = lg.Shape[^1]; int so = lg.ElementCount / vc;
+                var h = new float[lg.ElementCount]; lg.Data.CopyToCPU(h);
+                var last = new float[vc]; Array.Copy(h, (so - 1) * vc, last, 0, vc);
+                return last;
+            }
+            int ArgMax(float[] v) { int a = 0; float b = v[0]; for (int i = 1; i < v.Length; i++) if (v[i] > b) { b = v[i]; a = i; } return a; }
+
+            // (1) BASELINE: a fresh non-graph forward at this exact state → reference token.
+            session.SetGGUFDecodePastLen(statePast);
+            var refOut = await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = capInput });
+            await accelerator.SynchronizeAsync();
+            var refLogits = ReadLogits(refOut.TryGetValue("logits", out var rl) ? rl : refOut.Values.First());
+            int refArg = ArgMax(refLogits);
+
+            var capStream = (CudaStream)accelerator.CreateStream();
+            int replayArg; double directMs, graphMs; float maxAbsDiff;
+            try
+            {
+                // Stable per-forward attention params slots (vs the ring) so captured nodes read a fixed
+                // device pointer the warm pass populated — and the capture pass skips the H2D (sync-illegal).
+                FusedAttentionKernel.UseStableCaptureSlots = true;
+                using (accelerator.WithDefaultStream(capStream))   // reroute all *StreamKernel launches → capStream
+                {
+                    // Warm pass A (drains ON): populate the stable attention params slots + prime JIT/modules.
+                    session.SetGGUFDecodePastLen(statePast);
+                    await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = capInput });
+                    await accelerator.SynchronizeAsync();
+
+                    // Warm pass B (drains SUPPRESSED, immediate buffer-return = same footprint as capture): grows
+                    // the pool to the no-drain working set so the capture pass allocates NOTHING (a cuMemAlloc
+                    // mid-capture is illegal and crashes). Not captured.
+                    session.SetGGUFDecodePastLen(statePast);
+                    SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains = true;
+                    await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = capInput });
+                    SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains = false;
+                    await accelerator.SynchronizeAsync();
+
+                    // CAPTURE one forward at the same state (drains suppressed = capture-clean).
+                    session.SetGGUFDecodePastLen(statePast);
+                    SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains = true;
+                    // Global (not ThreadLocal): RunDecodeStepAsync's awaits (Task.Yield etc.) resume on other
+                    // thread-pool threads, and ThreadLocal capture forbids ending from a different thread.
+                    capStream.BeginCapture(CudaStreamCaptureMode.Global);
+                    var capOut = await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = capInput });
+                    using var graph = capStream.EndCapture();
+                    SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains = false;
+                    var capLogitsT = capOut.TryGetValue("logits", out var cl) ? cl : capOut.Values.First();
+
+                    using var gexec = graph.Instantiate();
+                    gexec.Upload(capStream);
+
+                    // REPLAY once → compare logits to the non-graph baseline (must match: same kernels, same buffers).
+                    gexec.Launch(capStream);
+                    await capStream.SynchronizeAsync();
+                    var replayLogits = ReadLogits(capLogitsT);
+                    replayArg = ArgMax(replayLogits);
+                    maxAbsDiff = 0f;
+                    for (int i = 0; i < refLogits.Length; i++) { float d = MathF.Abs(replayLogits[i] - refLogits[i]); if (d > maxAbsDiff) maxAbsDiff = d; }
+
+                    // TIME graph replays (fixed state — pure 1×cuGraphLaunch + GPU compute, ~zero host dispatch).
+                    var gsw = Stopwatch.StartNew();
+                    for (int r = 0; r < R; r++) { gexec.Launch(capStream); await capStream.SynchronizeAsync(); }
+                    gsw.Stop(); graphMs = gsw.Elapsed.TotalMilliseconds / R;
+
+                    // BATCHED: R launches back-to-back, ONE sync → isolates pure GPU compute/step from any
+                    // per-step sync overhead. If this ≈ per-step graphMs, decode is GPU-bound (graphs can't help
+                    // more); if much smaller, the per-step sync was the cost.
+                    var bsw = Stopwatch.StartNew();
+                    for (int r = 0; r < R; r++) gexec.Launch(capStream);
+                    await capStream.SynchronizeAsync();
+                    bsw.Stop();
+                    Console.WriteLine($"  graph batched   : {bsw.Elapsed.TotalMilliseconds / R,7:F2} ms/step (R launches, 1 sync = pure GPU)");
+                }
+
+                // Direct timing uses the production ring path (apples-to-apples with today's decode).
+                FusedAttentionKernel.UseStableCaptureSlots = false;
+                // TIME direct non-graph forwards at the same state (full ~703-launch host dispatch each).
+                var dsw = Stopwatch.StartNew();
+                for (int r = 0; r < R; r++)
+                {
+                    session.SetGGUFDecodePastLen(statePast);
+                    await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = capInput });
+                    await accelerator.SynchronizeAsync();
+                }
+                dsw.Stop(); directMs = dsw.Elapsed.TotalMilliseconds / R;
+            }
+            finally { SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains = false; FusedAttentionKernel.UseStableCaptureSlots = false; capStream.Dispose(); }
+
+            Console.WriteLine($"  state: pastLen={statePast}, input token={nextTok} '{tok.Decode(new[] { nextTok })}'");
+            Console.WriteLine($"  correctness: replay token={replayArg} '{tok.Decode(new[] { replayArg })}' vs baseline={refArg} '{tok.Decode(new[] { refArg })}'  -> {(replayArg == refArg ? "MATCH" : "MISMATCH")} (max|Δlogit|={maxAbsDiff:E3})");
+            Console.WriteLine($"  direct  forward : {directMs,7:F2} ms/step");
+            Console.WriteLine($"  graph   replay  : {graphMs,7:F2} ms/step");
+            Console.WriteLine($"  decode speedup  : {directMs / graphMs,7:F2}x   (Ollama decode ~12 ms/tok reference)");
+        }
+    }
 
     if (nodeTiming && SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs is { } nt && nt.Count > 0)
     {

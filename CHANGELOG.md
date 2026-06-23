@@ -2,6 +2,14 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Consume ILGPU 4.16.0 (CUDA graph API + Wasm large-local-array fix)
+
+Bumped `SpawnDev.ILGPU` 4.15.1 → **4.16.0** (Geordi's stable, forks 2.1.0): rolls up the CUDA graph capture API
+(`CudaStream.BeginCapture/EndCapture`, `CudaGraph`/`CudaGraphExec`, `Accelerator.WithDefaultStream`) + the device-
+local dynamically-indexed `new T[N>32]` codegen fix now correct on **all 6 backends incl Wasm**. Verified on the ML
+lane: GGUFDecodeKVCache 8/8 + qwen decode byte-identical, no regression. Unblocks Example 04's `GGUF_DECODE_GRAPH_PROBE`
+(decode CUDA-graph capture/replay probe) + the new `GGUF_PTX_PROBE` (dumps the dp4a GEMV PTX to verify `ld.v4.b32`).
+
 ## Unreleased — Transpose-fusion step 3: seq-major KV-cache — ZERO transpose nodes (universal)
 
 **Eliminated the last 56 K/V PRE-attention transposes — the decode graph now has ZERO `Transpose` nodes (703→591,
