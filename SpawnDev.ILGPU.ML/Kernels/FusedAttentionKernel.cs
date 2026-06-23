@@ -191,7 +191,8 @@ public class FusedAttentionKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale,
-        ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0)
+        ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
+        bool seqMajorOut = false)
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
         if (kvHeads <= 0 || nHeads % kvHeads != 0)
@@ -213,6 +214,8 @@ public class FusedAttentionKernel : IDisposable
             nHeads / kvHeads, // GQA group size: query head h reads kv head h / group
             sinkCount,        // p[9]: >0 => fold per-head sink logit into the softmax denominator
             seqKV * headDim,  // p[10]: kvRowStride (contiguous K/V = seqKV*headDim; read only by the per-query kernel)
+            seqMajorOut ? 1 : 0, // p[11]: write output SEQ-major [1,seq,heads,hd] (oBase=(sq*BH+bh)*D) instead of
+                                 // heads-major — lets the graph drop the post-attention Transpose[0,2,1,3] (universal).
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -298,7 +301,8 @@ public class FusedAttentionKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale, int kvRowStride,
-        ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0)
+        ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
+        bool seqMajorOut = false)
         where T : unmanaged, INumber<T>
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
@@ -316,6 +320,8 @@ public class FusedAttentionKernel : IDisposable
             nHeads / kvHeads,
             sinkCount,
             kvRowStride, // p[10]: per-head element stride of K/V (maxSeq*hd for the strided store; seqKV*hd contiguous)
+            seqMajorOut ? 1 : 0, // p[11]: write output SEQ-major (oBase=(sq*BH+bh)*D) — lets the graph drop the
+                                 // post-attention Transpose[0,2,1,3] (universal data-movement elimination).
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -399,10 +405,14 @@ public class FusedAttentionKernel : IDisposable
         int gqaGroup = p[8]; // nHeads / kvHeads; query head bh reads kv head bh / gqaGroup
         int sinkCount = p[9]; // 0 => no sinks; else per-head sink logit count (gpt-oss attention sinks)
 
-        // Decompose index: [bh, sq, d]
+        // Decompose index. p[11]=1 → idx enumerates the SEQ-MAJOR output [1,seq,heads,hd] (head varies faster
+        // than seq), so each thread's OWN slot output[idx] already IS its seq-major position — one store per
+        // thread, NO scatter, so it's WebGL-safe (and lets the graph drop the post-attention transpose). The Q
+        // read still uses the heads-major qBase. p[11]=0 → heads-major [1,heads,seq,hd] (the original layout).
         int d = idx % D;
-        int sq = (idx / D) % SQ;
-        int bh = idx / (SQ * D);
+        int sq, bh;
+        if (p[11] == 1) { bh = (idx / D) % BH; sq = idx / (BH * D); }
+        else { sq = (idx / D) % SQ; bh = idx / (SQ * D); }
 
         if (bh >= BH) return;
 
@@ -486,9 +496,12 @@ public class FusedAttentionKernel : IDisposable
         int sinkCount = p[9];
         int kvStride = p[10]; // per-head element stride of K/V (decouples the store row pitch from SKV)
 
+        // p[11]=1 → idx enumerates the SEQ-MAJOR output (head faster than seq) so output[idx] is the thread's own
+        // seq-major slot (no scatter, WebGL-safe; graph drops the post-attn transpose). Q read stays heads-major.
         int d = idx % D;
-        int sq = (idx / D) % SQ;
-        int bh = idx / (SQ * D);
+        int sq, bh;
+        if (p[11] == 1) { bh = (idx / D) % BH; sq = idx / (BH * D); }
+        else { sq = (idx / D) % SQ; bh = idx / (SQ * D); }
         if (bh >= BH) return;
 
         int kvHead = bh / gqaGroup;
@@ -576,6 +589,9 @@ public class FusedAttentionKernel : IDisposable
 
         int kvHead = bh / gqaGroup;
         int qBase = (bh * SQ + sq) * D;
+        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
+        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
+        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
         int qPos = kvOffset + sq;
 
         // This thread's private D-wide accumulator slice in shared memory (no other thread touches it).
@@ -620,7 +636,7 @@ public class FusedAttentionKernel : IDisposable
 
         float inv = 1f / (runningSum + 1e-10f);
         for (int dd = 0; dd < D; dd++)
-            output[qBase + dd] = sh[accBase + dd] * inv;
+            output[oBase + dd] = sh[accBase + dd] * inv;
     }
 
     /// <summary>
@@ -653,6 +669,9 @@ public class FusedAttentionKernel : IDisposable
 
         int kvHead = bh / gqaGroup;
         int qBase = (bh * SQ + sq) * D;
+        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
+        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
+        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -700,7 +719,7 @@ public class FusedAttentionKernel : IDisposable
                 weightedV = weightedV * correction;
                 runningMax = newMax;
             }
-            output[qBase + d] = weightedV / (runningSum + 1e-10f);
+            output[oBase + d] = weightedV / (runningSum + 1e-10f);
         }
     }
 
@@ -731,6 +750,9 @@ public class FusedAttentionKernel : IDisposable
 
         int kvHead = bh / gqaGroup;
         int qBase = (bh * SQ + sq) * D;
+        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
+        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
+        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -778,7 +800,7 @@ public class FusedAttentionKernel : IDisposable
                 weightedV = weightedV * correction;
                 runningMax = newMax;
             }
-            output[qBase + d] = weightedV / (runningSum + 1e-10f);
+            output[oBase + d] = weightedV / (runningSum + 1e-10f);
         }
     }
 
@@ -812,6 +834,9 @@ public class FusedAttentionKernel : IDisposable
 
         int kvHead = bh / gqaGroup;
         int qBase = (bh * SQ + sq) * D;
+        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
+        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
+        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -876,10 +901,10 @@ public class FusedAttentionKernel : IDisposable
         }
 
         // Division (not reciprocal-multiply) to match FusedAttentionImpl bit-for-bit.
-        if (d0 < D) output[qBase + d0] = wV0 / (runningSum + 1e-10f);
-        if (d1 < D) output[qBase + d1] = wV1 / (runningSum + 1e-10f);
-        if (d2 < D) output[qBase + d2] = wV2 / (runningSum + 1e-10f);
-        if (d3 < D) output[qBase + d3] = wV3 / (runningSum + 1e-10f);
+        if (d0 < D) output[oBase + d0] = wV0 / (runningSum + 1e-10f);
+        if (d1 < D) output[oBase + d1] = wV1 / (runningSum + 1e-10f);
+        if (d2 < D) output[oBase + d2] = wV2 / (runningSum + 1e-10f);
+        if (d3 < D) output[oBase + d3] = wV3 / (runningSum + 1e-10f);
     }
 
     /// <summary>
@@ -914,6 +939,9 @@ public class FusedAttentionKernel : IDisposable
 
         int kvHead = bh / gqaGroup;
         int qBase = (bh * SQ + sq) * D;
+        // Output base: seq-major [1,seq,heads,hd] when p[11]=1 (graph drops the post-attn transpose), else
+        // heads-major (== qBase; for the per-element kernels idx == qBase + d so output[oBase+d] is identical).
+        int oBase = p[11] == 1 ? (sq * BH + bh) * D : qBase;
         int qPos = kvOffset + sq;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
@@ -974,10 +1002,10 @@ public class FusedAttentionKernel : IDisposable
             runningMax = newMax;
         }
 
-        if (d0 < D) output[qBase + d0] = wV0 / (runningSum + 1e-10f);
-        if (d1 < D) output[qBase + d1] = wV1 / (runningSum + 1e-10f);
-        if (d2 < D) output[qBase + d2] = wV2 / (runningSum + 1e-10f);
-        if (d3 < D) output[qBase + d3] = wV3 / (runningSum + 1e-10f);
+        if (d0 < D) output[oBase + d0] = wV0 / (runningSum + 1e-10f);
+        if (d1 < D) output[oBase + d1] = wV1 / (runningSum + 1e-10f);
+        if (d2 < D) output[oBase + d2] = wV2 / (runningSum + 1e-10f);
+        if (d3 < D) output[oBase + d3] = wV3 / (runningSum + 1e-10f);
     }
 
     public void Dispose()

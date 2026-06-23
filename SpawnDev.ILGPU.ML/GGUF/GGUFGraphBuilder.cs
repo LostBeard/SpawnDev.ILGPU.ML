@@ -232,6 +232,12 @@ public static class GGUFGraphBuilder
                 // FusedAttention node with its per-layer K/V buffer. Unused in the default full-recompute
                 // forward; read only in decode mode. See Plans/gemma4-kvcache-decode-plan-2026-06-12.md.
                 ["layer"] = JsonSerializer.SerializeToElement((long)layer),
+                // seq_major_out: FusedAttention writes its output directly in seq-major [1,seq,heads,hd] layout
+                // (kernel p[11]) so we can DROP the post-attention Transpose[0,2,1,3] below — the merged Reshape
+                // then consumes the attention output directly. Universal: the group kernels scatter to the
+                // seq-major base, the per-element kernels (WebGL) enumerate idx in seq-major order (own-slot
+                // write, no scatter). Eliminates ~28 transpose dispatches+copies/decode-step. (Tuvok 2026-06-23.)
+                ["seq_major_out"] = JsonSerializer.SerializeToElement(1L),
             };
             if (gemmaAttn)
                 faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);
@@ -248,13 +254,13 @@ public static class GGUFGraphBuilder
             else faInputs = new[] { qReshaped, kReshaped, vReshaped };
             AddNode(graph, "FusedAttention", faInputs, new[] { attnValues }, faAttrs);
 
-            // ── Merge heads: [1, nHeads, seq, hd] → [1, seq, nHeads*hd] ──
-            // (nHeads*hd, NOT embedDim: gemma4 attn_output input is 16*256=4096 sliding / 16*512=8192 global.)
-            string attnTransposed = $"{pfx}_attn_t";
-            AddNode(graph, "Transpose", new[] { attnValues }, new[] { attnTransposed },
-                Attrs("perm", new long[] { 0, 2, 1, 3 }));
+            // ── Merge heads: [1, seq, nHeads, hd] → [1, seq, nHeads*hd] ──
+            // FusedAttention already wrote seq-major (seq_major_out above), so the old Transpose[0,2,1,3]
+            // ([1,heads,seq,hd]→[1,seq,heads,hd]) is GONE — the Reshape (pure relabel, native CopyFrom) consumes
+            // the attention output directly. (nHeads*hd, NOT embedDim: gemma4 attn_output input is 16*256=4096
+            // sliding / 16*512=8192 global.)
             string attnMerged = $"{pfx}_attn_merged";
-            AddNode(graph, "Reshape", new[] { attnTransposed }, new[] { attnMerged },
+            AddNode(graph, "Reshape", new[] { attnValues }, new[] { attnMerged },
                 Attrs("shape", new long[] { 1, -1, (long)(nHeads * hd) }));
 
             // ── Output projection ── (gpt-oss names it attn_out; llama/gemma/etc. use attn_output)

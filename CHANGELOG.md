@@ -2,6 +2,21 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Transpose-fusion step 1: drop the post-attention transpose (universal)
+
+**Eliminated the per-layer post-attention `Transpose[0,2,1,3]` (28 dispatches+copies/decode-step, universal).**
+FusedAttention output was heads-major `[1,heads,seq,hd]`, then a real Transpose kernel → `[1,seq,heads,hd]`, then
+the head-merge Reshape. New `seqMajorOut` mode (kernel param `p[11]`) makes FusedAttention write its output
+**directly seq-major**, so the graph drops the transpose and the Reshape (native CopyFrom) consumes the attention
+output as-is. Universal + WebGL-safe: the 5 group-cooperative variants scatter to the seq-major base; the 2
+per-element variants (the WebGL path) instead enumerate `idx` in seq-major order so each thread writes its OWN
+slot (one store per thread — no scatter, which WebGL's Transform-Feedback forbids). Set unconditionally by the
+GGUF graph builder (`seq_major_out` attr); the SafeTensors builder + the softmax→matmul fusion keep the default
+heads-major path. **Decode node count 703→675 (−28/step); biggest on WebGPU (each transpose = a dispatch + a full
+copy).** PMT GREEN all 6 backends: GGUFDecodeKVCache 8/8 (incremental == full-recompute, byte-identical incl
+WebGL) + Attn oracle 92/92 (default path intact); real qwen2.5-coder:7b 16-tok decode byte-identical. Next
+(steps 2-3): the 84 remaining PRE-attention Q/K/V transposes (needs the KV-cache store to go seq-major too).
+
 ## Unreleased — Universal barrier-free per-query attention (WebGPU prefill win) + Reshape native-copy
 
 **Barrier-free per-query fused attention — the universal (esp. WebGPU) prefill win.** Prefill is ~94% attention

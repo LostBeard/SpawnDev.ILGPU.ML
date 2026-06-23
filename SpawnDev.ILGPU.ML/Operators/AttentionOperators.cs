@@ -119,6 +119,10 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
         ArrayView1D<float, Stride1D.Dense>? sinksView = sinksT != null ? sinksT.Data : (ArrayView1D<float, Stride1D.Dense>?)null;
         int sinkCount = sinksT?.ElementCount ?? 0;
 
+        // seq_major_out: the graph builder sets this when it has DROPPED the post-attention Transpose[0,2,1,3],
+        // so FusedAttention must write its output directly in seq-major [1,seq,heads,hd] layout (p[11]).
+        bool seqMajor = ctx.GetInt("seq_major_out", 0) == 1;
+
         // DECODE KV-cache path: K/V are the cache's [kvHeads, maxSeq, hd] store, read DIRECTLY in their native
         // type (bf16 / f32) with the store's per-head row pitch as the stride — NO per-token repack + bf16→f32
         // widen. Signalled by kv_seq_len (the LIVE history length, since the store buffer is maxSeq-padded so
@@ -129,15 +133,15 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
             int kvRowStride = k.Shape[^2] * k.Shape[^1]; // maxSeq * hd — the store's per-head element pitch
             if (LowPWeightDispatch.IsLowP(k))
                 reg.FusedAttention.ForwardStrided(q.Data, k.AsView<BFloat16>(), v.AsView<BFloat16>(), ctx.Outputs[0].Data,
-                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount);
+                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount, seqMajor);
             else
                 reg.FusedAttention.ForwardStrided(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
-                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount);
+                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount, seqMajor);
             return;
         }
 
         reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
             nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale,
-            sinks: sinksView, sinkCount: sinkCount);
+            sinks: sinksView, sinkCount: sinkCount, seqMajorOut: seqMajor);
     }
 }
