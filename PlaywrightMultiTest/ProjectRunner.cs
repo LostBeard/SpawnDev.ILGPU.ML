@@ -13,6 +13,9 @@ namespace PlaywrightMultiTest
 
         public static ProjectRunner Instance => GetRunner().GetAwaiter().GetResult()!;
         private static Task<ProjectRunner>? _projectRunner;
+        // Cleared once per run so the browser console log ACCUMULATES across lanes/page-recreations (otherwise a
+        // later lane wipes an earlier lane's lines, e.g. WebGPU [Benchmark] numbers lost when the Wasm lane starts).
+        private static bool _browserConsoleLogCleared;
         public List<TestableProject> TestableProjects { get; } = new List<TestableProject>();
 
         /// <summary>
@@ -209,7 +212,10 @@ namespace PlaywrightMultiTest
                         var wgslDumpDir = Path.Combine(project.Directory, "..", "PlaywrightMultiTest", "WGSLDumps");
                         Directory.CreateDirectory(wgslDumpDir);
                         var consoleLogPath = Path.Combine(wgslDumpDir, "browser_console.log");
-                        File.WriteAllText(consoleLogPath, ""); // clear previous log
+                        // Clear ONCE per run (first browser setup) so subsequent lanes/page-recreations APPEND —
+                        // otherwise a later lane (e.g. Wasm) wipes an earlier lane's lines (e.g. WebGPU benchmark
+                        // numbers). Accumulating across lanes is what lets us read per-backend perf programmatically.
+                        if (!_browserConsoleLogCleared) { File.WriteAllText(consoleLogPath, ""); _browserConsoleLogCleared = true; }
                         var wasmDumpChunks = new System.Collections.Generic.List<string>();
 
                         void HookPageConsole(Microsoft.Playwright.IPage page, string label)
@@ -242,7 +248,7 @@ namespace PlaywrightMultiTest
                                 // Log WGSL/Wasm traces, errors, and P2P-layer diagnostic lines so
                                 // multi-popup WebRTC flows (P2P two-tab test) leave a trail for
                                 // offline diagnosis.
-                                if (text.Contains("WGSL") || text.Contains("@compute") || text.Contains("@workgroup_size") || text.Contains("WGSL_DUMP") || text.Contains("GLSL_DUMP") || text.Contains("[WasmWorker]") || text.Contains("[Wasm") || text.Contains("CONV2D_TRACE") || text.Contains("TEX_UNIT") || text.Contains("PREPROCESS_TRACE") || text.Contains("LAYER_TRACE") || text.Contains("LOGITS_TRACE") || text.Contains("CPU_LOGITS") || text.Contains("DISP_TRACE") || text.Contains("TF_OFFSET") || text.Contains("[Peer]") || text.Contains("[RtcPeer]") || text.Contains("[sd_compute]") || text.Contains("[P2PCompute") || text.Contains("[P2P ") || text.Contains("[Torrent") || msg.Type == "error")
+                                if (text.Contains("WGSL") || text.Contains("@compute") || text.Contains("@workgroup_size") || text.Contains("WGSL_DUMP") || text.Contains("GLSL_DUMP") || text.Contains("[WasmWorker]") || text.Contains("[Wasm") || text.Contains("[Benchmark]") || text.Contains("CONV2D_TRACE") || text.Contains("TEX_UNIT") || text.Contains("PREPROCESS_TRACE") || text.Contains("LAYER_TRACE") || text.Contains("LOGITS_TRACE") || text.Contains("CPU_LOGITS") || text.Contains("DISP_TRACE") || text.Contains("TF_OFFSET") || text.Contains("[Peer]") || text.Contains("[RtcPeer]") || text.Contains("[sd_compute]") || text.Contains("[P2PCompute") || text.Contains("[P2P ") || text.Contains("[Torrent") || msg.Type == "error")
                                 {
                                     try
                                     {
