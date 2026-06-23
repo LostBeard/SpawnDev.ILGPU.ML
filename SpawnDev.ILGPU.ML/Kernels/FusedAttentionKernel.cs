@@ -192,7 +192,7 @@ public class FusedAttentionKernel : IDisposable
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale,
         ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
-        bool seqMajorOut = false, bool seqMajorQ = false)
+        bool seqMajorOut = false, bool seqMajorQ = false, bool seqMajorKV = false)
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
         if (kvHeads <= 0 || nHeads % kvHeads != 0)
@@ -218,6 +218,8 @@ public class FusedAttentionKernel : IDisposable
                                  // heads-major — lets the graph drop the post-attention Transpose[0,2,1,3] (universal).
             seqMajorQ ? 1 : 0,   // p[12]: read Q SEQ-major (qBase=(sq*BH+bh)*D) — lets the graph drop the Q
                                  // PRE-attention Transpose[0,2,1,3] (step 2; K/V keep theirs until the KV-cache goes seq-major).
+            seqMajorKV ? 1 : 0,  // p[13]: read K/V SEQ-major ([kv,kvHeads,hd] → kBase=(kv*kvHeads+kvHead)*D, headStride=D,
+                                 // tokenStride=kvHeads*D) — drops the K/V PRE-attention transposes (step 3, KV-cache seq-major).
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -304,7 +306,7 @@ public class FusedAttentionKernel : IDisposable
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale, int kvRowStride,
         ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
-        bool seqMajorOut = false, bool seqMajorQ = false)
+        bool seqMajorOut = false, bool seqMajorQ = false, bool seqMajorKV = false)
         where T : unmanaged, INumber<T>
     {
         if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
@@ -326,6 +328,8 @@ public class FusedAttentionKernel : IDisposable
                                  // post-attention Transpose[0,2,1,3] (universal data-movement elimination).
             seqMajorQ ? 1 : 0,   // p[12]: read Q SEQ-major (qBase=(sq*BH+bh)*D) — lets the graph drop the Q
                                  // PRE-attention Transpose[0,2,1,3] (step 2).
+            seqMajorKV ? 1 : 0,  // p[13]: read K/V SEQ-major (kBase=(kv*kvHeads+kvHead)*D) — drops the K/V PRE-attention
+                                 // transposes (step 3). For the strided decode store, the store itself is seq-major.
         };
 
         var paramsView = RentParamsSlot(paramsData);
@@ -424,6 +428,10 @@ public class FusedAttentionKernel : IDisposable
         // Q read base: seq-major (sq*BH+bh)*D when p[12]=1 (graph dropped the Q pre-transpose), else heads-major.
         int qBase = p[12] == 1 ? (sq * BH + bh) * D : (bh * SQ + sq) * D;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else head-major
+        // contiguous [kvHeads,SKV,hd]: head offset SKV*D, token D). Drops the K/V pre-attention transposes.
+        int kvHeadStride = p[13] == 1 ? D : SKV * D;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         float runningMax = -1e10f;
         float runningSum = 0f;
@@ -431,7 +439,7 @@ public class FusedAttentionKernel : IDisposable
 
         for (int kv = 0; kv < SKV; kv++)
         {
-            int kBase = (kvHead * SKV + kv) * D;
+            int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += Q[qBase + dd] * K[kBase + dd];
@@ -513,6 +521,10 @@ public class FusedAttentionKernel : IDisposable
         // Q read base: seq-major (sq*BH+bh)*D when p[12]=1 (graph dropped the Q pre-transpose), else heads-major.
         int qBase = p[12] == 1 ? (sq * BH + bh) * D : (bh * SQ + sq) * D;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major store [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else
+        // head-major strided: head offset kvStride, token D). Drops the K/V pre-attention transposes (step 3).
+        int kvHeadStride = p[13] == 1 ? D : kvStride;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         float runningMax = -1e10f;
         float runningSum = 0f;
@@ -520,7 +532,7 @@ public class FusedAttentionKernel : IDisposable
 
         for (int kv = 0; kv < SKV; kv++)
         {
-            int kBase = kvHead * kvStride + kv * D;
+            int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += Q[qBase + dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
@@ -601,6 +613,10 @@ public class FusedAttentionKernel : IDisposable
         int qBase = p[12] == 1 ? sBase : hBase;
         int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major store [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else head-major
+        // strided: head offset kvStride, token D). Drops the K/V pre-attention transposes (step 3).
+        int kvHeadStride = p[13] == 1 ? D : kvStride;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         // This thread's private D-wide accumulator slice in shared memory (no other thread touches it).
         var sh = SharedMemory.Allocate<float>(PQGroup * MaxAttnHeadDimPQ);
@@ -612,7 +628,7 @@ public class FusedAttentionKernel : IDisposable
 
         for (int kv = 0; kv < SKV; kv++)
         {
-            int kBase = kvHead * kvStride + kv * D;
+            int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += Q[qBase + dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
@@ -683,6 +699,10 @@ public class FusedAttentionKernel : IDisposable
         int qBase = p[12] == 1 ? sBase : hBase;
         int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else head-major
+        // contiguous: head offset SKV*D, token D). Drops the K/V pre-attention transposes (step 3).
+        int kvHeadStride = p[13] == 1 ? D : SKV * D;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
         var scores = SharedMemory.Allocate<float>(AttnSharedSkvMax);
@@ -693,7 +713,7 @@ public class FusedAttentionKernel : IDisposable
 
         for (int kv = tid; kv < SKV; kv += AttnGroupSize)
         {
-            int kBase = (kvHead * SKV + kv) * D;
+            int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += qSh[dd] * K[kBase + dd];
@@ -717,7 +737,7 @@ public class FusedAttentionKernel : IDisposable
                 float correction = MathF.Exp(runningMax - newMax);
                 float weight = MathF.Exp(score - newMax);
                 runningSum = runningSum * correction + weight;
-                weightedV = weightedV * correction + weight * V[(kvHead * SKV + kv) * D + d];
+                weightedV = weightedV * correction + weight * V[kvHead * kvHeadStride + kv * kvTokenStride + d];
                 runningMax = newMax;
             }
             if (sinkCount > 0)
@@ -766,6 +786,10 @@ public class FusedAttentionKernel : IDisposable
         int qBase = p[12] == 1 ? sBase : hBase;
         int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major store [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else head-major
+        // strided: head offset kvStride, token D). Drops the K/V pre-attention transposes (step 3).
+        int kvHeadStride = p[13] == 1 ? D : kvStride;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
         var scores = SharedMemory.Allocate<float>(AttnSharedSkvMax);
@@ -776,7 +800,7 @@ public class FusedAttentionKernel : IDisposable
 
         for (int kv = tid; kv < SKV; kv += AttnGroupSize)
         {
-            int kBase = kvHead * kvStride + kv * D;
+            int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float dot = 0f;
             for (int dd = 0; dd < D; dd++)
                 dot += qSh[dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
@@ -800,7 +824,7 @@ public class FusedAttentionKernel : IDisposable
                 float correction = MathF.Exp(runningMax - newMax);
                 float weight = MathF.Exp(score - newMax);
                 runningSum = runningSum * correction + weight;
-                weightedV = weightedV * correction + weight * PrecisionConvert.ConvertToSingle(V[kvHead * kvStride + kv * D + d]);
+                weightedV = weightedV * correction + weight * PrecisionConvert.ConvertToSingle(V[kvHead * kvHeadStride + kv * kvTokenStride + d]);
                 runningMax = newMax;
             }
             if (sinkCount > 0)
@@ -852,6 +876,10 @@ public class FusedAttentionKernel : IDisposable
         int qBase = p[12] == 1 ? sBase : hBase;
         int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else head-major
+        // contiguous: head offset SKV*D, token D). Drops the K/V pre-attention transposes (step 3).
+        int kvHeadStride = p[13] == 1 ? D : SKV * D;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
         var scoresBlk = SharedMemory.Allocate<float>(AttnKvBlock);
@@ -876,7 +904,7 @@ public class FusedAttentionKernel : IDisposable
             for (int j = tid; j < curBK; j += AttnGroupSize)
             {
                 int kv = blockStart + j;
-                int kBase = (kvHead * SKV + kv) * D;
+                int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
                 float dot = 0f;
                 for (int dd = 0; dd < D; dd++)
                     dot += qSh[dd] * K[kBase + dd];
@@ -889,7 +917,7 @@ public class FusedAttentionKernel : IDisposable
             Group.Barrier();
             for (int j = 0; j < curBK; j++)
             {
-                int vBase = (kvHead * SKV + blockStart + j) * D;
+                int vBase = kvHead * kvHeadStride + (blockStart + j) * kvTokenStride;
                 float score = scoresBlk[j];
                 float newMax = MathF.Max(runningMax, score);
                 float correction = MathF.Exp(runningMax - newMax);
@@ -959,6 +987,10 @@ public class FusedAttentionKernel : IDisposable
         int qBase = p[12] == 1 ? sBase : hBase;
         int oBase = p[11] == 1 ? sBase : hBase;
         int qPos = kvOffset + sq;
+        // K/V layout (p[13]=1 seq-major store [kv,kvHeads,hd]: head offset D, token stride kvHeads*D; else head-major
+        // strided: head offset kvStride, token D). Drops the K/V pre-attention transposes (step 3).
+        int kvHeadStride = p[13] == 1 ? D : kvStride;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
 
         var qSh = SharedMemory.Allocate<float>(AttnHeadDimMax);
         var scoresBlk = SharedMemory.Allocate<float>(AttnKvBlock);
@@ -980,7 +1012,7 @@ public class FusedAttentionKernel : IDisposable
             for (int j = tid; j < curBK; j += AttnGroupSize)
             {
                 int kv = blockStart + j;
-                int kBase = kvHead * kvStride + kv * D;
+                int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
                 float dot = 0f;
                 for (int dd = 0; dd < D; dd++)
                     dot += qSh[dd] * PrecisionConvert.ConvertToSingle(K[kBase + dd]);
@@ -993,7 +1025,7 @@ public class FusedAttentionKernel : IDisposable
             Group.Barrier();
             for (int j = 0; j < curBK; j++)
             {
-                int vBase = kvHead * kvStride + (blockStart + j) * D;
+                int vBase = kvHead * kvHeadStride + (blockStart + j) * kvTokenStride;
                 float score = scoresBlk[j];
                 float newMax = MathF.Max(runningMax, score);
                 float correction = MathF.Exp(runningMax - newMax);

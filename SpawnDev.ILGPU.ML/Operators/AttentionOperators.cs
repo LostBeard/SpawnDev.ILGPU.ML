@@ -125,6 +125,9 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
         // seq_major_q: the graph dropped the Q PRE-attention transpose, so Q is fed seq-major [1,seq,heads,hd]
         // and FusedAttention reads it seq-major (p[12]). Independent of seq_major_out (the output side, step 1).
         bool seqMajorQ = ctx.GetInt("seq_major_q", 0) == 1;
+        // seq_major_kv: the graph dropped the K/V PRE-attention transposes — K/V are seq-major [.,seq,kvHeads,hd]
+        // (and for decode the KV-cache store is seq-major), so FusedAttention reads K/V seq-major (p[13]).
+        bool seqMajorKV = ctx.GetInt("seq_major_kv", 0) == 1;
 
         // DECODE KV-cache path: K/V are the cache's [kvHeads, maxSeq, hd] store, read DIRECTLY in their native
         // type (bf16 / f32) with the store's per-head row pitch as the stride — NO per-token repack + bf16→f32
@@ -136,15 +139,15 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
             int kvRowStride = k.Shape[^2] * k.Shape[^1]; // maxSeq * hd — the store's per-head element pitch
             if (LowPWeightDispatch.IsLowP(k))
                 reg.FusedAttention.ForwardStrided(q.Data, k.AsView<BFloat16>(), v.AsView<BFloat16>(), ctx.Outputs[0].Data,
-                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount, seqMajor, seqMajorQ);
+                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount, seqMajor, seqMajorQ, seqMajorKV);
             else
                 reg.FusedAttention.ForwardStrided(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
-                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount, seqMajor, seqMajorQ);
+                    nHeads, kvHeads, seqQ, kvSeqLen, headDim, causal, effWindow, kvOffset, scale, kvRowStride, sinksView, sinkCount, seqMajor, seqMajorQ, seqMajorKV);
             return;
         }
 
         reg.FusedAttention.Forward(q.Data, k.Data, v.Data, ctx.Outputs[0].Data,
             nHeads, kvHeads, seqQ, seqKV, headDim, causal, effWindow, kvOffset, scale,
-            sinks: sinksView, sinkCount: sinkCount, seqMajorOut: seqMajor, seqMajorQ: seqMajorQ);
+            sinks: sinksView, sinkCount: sinkCount, seqMajorOut: seqMajor, seqMajorQ: seqMajorQ, seqMajorKV: seqMajorKV);
     }
 }

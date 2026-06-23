@@ -142,46 +142,32 @@ public sealed class GGUFDecodeKVCache : IDisposable
         if (atToken + nTokens > _maxSeqLen)
             throw new InvalidOperationException($"GGUFDecodeKVCache overflow: {atToken}+{nTokens} > {_maxSeqLen}. Increase maxSeqLen or add a sliding window.");
         int hd = lc.HeadDim, kvHeads = lc.KvHeads;
+        // SEQ-MAJOR store [maxSeq, kvHeads, hd]: the per-step K/V arrive seq-major [nTokens, kvHeads, hd] (the graph
+        // dropped the K/V pre-attention transpose, step 3), so each writes as ONE CONTIGUOUS run at row atToken — no
+        // per-head strided copy. (CaptureSafeCopy = CopyFromAsync orders the copy against the producing kernel on the
+        // Wasm worker pool — a sync CopyFrom of a node output silently races there.)
+        long dstOff = (long)atToken * kvHeads * hd;
+        long count = (long)nTokens * kvHeads * hd;
         if (_precision == KVCachePrecision.BF16)
         {
-            // Convert f32→bf16 into a CONTIGUOUS scratch (kernel writes its OWN index — WebGL-safe, no scatter),
-            // then CopyFromAsync scratch → the maxSeq-strided store. CopyFromAsync orders the copy against the
-            // convert kernel on the Wasm worker pool (sync CopyFrom silently races there). Batched per K/V.
-            int total = kvHeads * nTokens * hd;
+            // Convert f32→bf16 into a CONTIGUOUS scratch (kernel writes its OWN index — WebGL-safe), then one
+            // CopyFromAsync scratch → store per K/V. K and V share the scratch, so V waits for K's copy.
             EnsureBf16Scratch(lc, nTokens);
             var scratch = lc.Bf16Scratch!.View;
             _f32ToBf16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>(F32ToBf16Impl);
-            _f32ToBf16(total, k, scratch);
-            var tasks = new List<Task>(kvHeads);
-            for (int h = 0; h < kvHeads; h++)
-                tasks.Add(CaptureSafeCopy(
-                    lc.Kb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
-                    scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-            _f32ToBf16(total, v, scratch);
-            tasks.Clear();
-            for (int h = 0; h < kvHeads; h++)
-                tasks.Add(CaptureSafeCopy(
-                    lc.Vb!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
-                    scratch.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            _f32ToBf16((int)count, k, scratch);
+            await CaptureSafeCopy(lc.Kb!.View.SubView(dstOff, count), scratch.SubView(0, count)).ConfigureAwait(false);
+            _f32ToBf16((int)count, v, scratch);
+            await CaptureSafeCopy(lc.Vb!.View.SubView(dstOff, count), scratch.SubView(0, count)).ConfigureAwait(false);
         }
         else
         {
-            // F32: per-head CopyFromAsync (k/v are graph node OUTPUTS; the async copy orders against their
-            // producing kernel on Wasm — a sync CopyFrom of a node output silently races there).
-            var tasks = new List<Task>(kvHeads * 2);
-            for (int h = 0; h < kvHeads; h++)
-            {
-                tasks.Add(CaptureSafeCopy(
-                    lc.Kf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
-                    k.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
-                tasks.Add(CaptureSafeCopy(
-                    lc.Vf!.View.SubView((long)h * _maxSeqLen * hd + (long)atToken * hd, (long)nTokens * hd),
-                    v.SubView((long)h * nTokens * hd, (long)nTokens * hd)));
-            }
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            // F32: one contiguous CopyFromAsync each (k/v are graph node OUTPUTS; the async copy orders against
+            // their producing kernel on Wasm — a sync CopyFrom of a node output silently races there).
+            await Task.WhenAll(
+                CaptureSafeCopy(lc.Kf!.View.SubView(dstOff, count), k.SubView(0, count)),
+                CaptureSafeCopy(lc.Vf!.View.SubView(dstOff, count), v.SubView(0, count))).ConfigureAwait(false);
         }
     }
 
@@ -197,35 +183,32 @@ public sealed class GGUFDecodeKVCache : IDisposable
         int hd = lc.HeadDim, kvHeads = lc.KvHeads;
         EnsurePackCapacity(lc, totalLen);
         var pack = (isKey ? lc.PackK : lc.PackV)!.View;
+        // SEQ-MAJOR store [maxSeq, kvHeads, hd]: the live first-totalLen region is CONTIGUOUS [totalLen, kvHeads, hd]
+        // at offset 0 — no per-head strided gather. The pack/Tensor the caller wraps is therefore seq-major too
+        // (the WebGL+bf16 fallback passes seq_major_kv so FusedAttention reads it seq-major).
+        long live = (long)kvHeads * totalLen * hd;
         if (_precision == KVCachePrecision.BF16)
         {
-            // CopyFromAsync the strided bf16 store → a CONTIGUOUS scratch (ordered on Wasm), then convert scratch
-            // → f32 pack (the convert KERNEL reads scratch — a kernel-input read IS ordered after the copy).
+            // CopyFromAsync the live bf16 store region → a CONTIGUOUS scratch (a BUFFER copy — WebGL-safe), then
+            // convert scratch → f32 pack. The convert KERNEL must NOT read the bf16 store directly: WebGL's bf16
+            // sub-word kernel read of the store mis-addresses (the ILGPU limitation this whole fallback exists for).
+            // Seq-major makes the live region contiguous, so it's ONE copy (was a per-head strided gather).
             var store = (isKey ? lc.Kb : lc.Vb)!.View;
             EnsureBf16Scratch(lc, totalLen);
             var scratch = lc.Bf16Scratch!.View;
-            var tasks = new List<Task>(kvHeads);
-            for (int h = 0; h < kvHeads; h++)
-                tasks.Add(CaptureSafeCopy(
-                    scratch.SubView((long)h * totalLen * hd, (long)totalLen * hd),
-                    store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            await CaptureSafeCopy(scratch.SubView(0, live), store.SubView(0, live)).ConfigureAwait(false);
             _bf16ToF32 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Bf16ToF32Impl);
-            _bf16ToF32(kvHeads * totalLen * hd, scratch.SubView(0, (long)kvHeads * totalLen * hd), pack);
+            _bf16ToF32(kvHeads * totalLen * hd, scratch.SubView(0, live), pack);
         }
         else
         {
-            // F32: per-head CopyFromAsync (store maxSeq-stride → contiguous pack).
+            // F32: one contiguous CopyFromAsync of the live region (this branch only fires if a non-WebGL caller
+            // asks for a packed copy; WebGL+f32 reads the seq-major store strided directly).
             var store = (isKey ? lc.Kf : lc.Vf)!.View;
-            var tasks = new List<Task>(kvHeads);
-            for (int h = 0; h < kvHeads; h++)
-                tasks.Add(CaptureSafeCopy(
-                    pack.SubView((long)h * totalLen * hd, (long)totalLen * hd),
-                    store.SubView((long)h * _maxSeqLen * hd, (long)totalLen * hd)));
-            await Task.WhenAll(tasks).ConfigureAwait(false);
+            await CaptureSafeCopy(pack.SubView(0, live), store.SubView(0, live)).ConfigureAwait(false);
         }
-        return pack.SubView(0, (long)kvHeads * totalLen * hd);
+        return pack.SubView(0, live);
     }
 
     private void EnsurePackCapacity(LayerCache lc, int tokens)
@@ -281,7 +264,9 @@ public sealed class GGUFDecodeKVCache : IDisposable
 
     private Tensor StoreTensor(LayerCache lc, bool isKey, string name)
     {
-        var shape = new[] { 1, lc.KvHeads, _maxSeqLen, lc.HeadDim };
+        // SEQ-MAJOR store [1, maxSeq, kvHeads, hd] (step 3): FusedAttention reads it with seqMajorKV (kvHead offset
+        // hd, per-token stride kvHeads*hd) and IGNORES the p[10] kvRowStride. Shape kept truthful for the operator.
+        var shape = new[] { 1, _maxSeqLen, lc.KvHeads, lc.HeadDim };
         return _precision == KVCachePrecision.BF16
             ? Tensor.FromLowP((isKey ? lc.Kb : lc.Vb)!.View, TensorDataType.BFloat16, shape, name)
             : new Tensor((isKey ? lc.Kf : lc.Vf)!.View, shape, name);

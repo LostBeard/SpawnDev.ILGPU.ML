@@ -1594,8 +1594,10 @@ public class GraphExecutor : IDisposable
                     }
                     else
                     {
-                        nodeInputs[1] = new Tensor(await DecodeKVCache.PackedKAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[1]);
-                        nodeInputs[2] = new Tensor(await DecodeKVCache.PackedVAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dKvH, dTotal, dHd }, node.InputNames[2]);
+                        // SEQ-MAJOR packed tensors [1, dTotal, dKvH, dHd] (step 3): the pack is contiguous seq-major;
+                        // the contiguous Forward path reads it with seq_major_kv (carried in node.Attributes below).
+                        nodeInputs[1] = new Tensor(await DecodeKVCache.PackedKAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dTotal, dKvH, dHd }, node.InputNames[1]);
+                        nodeInputs[2] = new Tensor(await DecodeKVCache.PackedVAsync(dLayer, dTotal).ConfigureAwait(false), new[] { 1, dTotal, dKvH, dHd }, node.InputNames[2]);
                         decodeAttrs = new Dictionary<string, object>(node.Attributes) { ["kv_offset"] = (long)DecodePastLen };
                     }
                 }

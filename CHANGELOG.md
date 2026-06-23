@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Transpose-fusion step 3: seq-major KV-cache — ZERO transpose nodes (universal)
+
+**Eliminated the last 56 K/V PRE-attention transposes — the decode graph now has ZERO `Transpose` nodes (703→591,
+all 112 gone across steps 1-3).** The KV-cache store flips from head-major `[kvHeads, maxSeq, hd]` to **seq-major
+`[maxSeq, kvHeads, hd]`**, so the per-step K/V (already seq-major from the dropped transpose) write as ONE
+contiguous copy (`WriteAsync`, was a per-head strided loop) and the live region is contiguous for the repack
+(`PackedAsync`). New `seqMajorKV` mode (kernel param `p[13]`): all 7 attention variants read K/V with
+`kBase = kvHead·kvHeadStride + kv·kvTokenStride` — seq-major (headStride=hd, tokenStride=kvHeads·hd) or the
+existing head-major (contiguous `SKV·hd` / strided `p[10]`). K/V read is a GATHER (no WebGL scatter issue). The
+WebGL+bf16 fallback packs seq-major + reads via the contiguous kernel with `seq_major_kv`. Set by the GGUF builder
+(`EmitAttnHead(skipTranspose)` for K+V + `seq_major_kv` attr); decode preserves the attr (GraphExecutor copies
+node.Attributes). PMT GREEN all 6 backends (GGUFDecodeKVCache 8/8 incl WebGL+bf16 fallback + Attn 92/92);
+qwen2.5-coder:7b 16-tok decode byte-identical. Transpose-fusion lever COMPLETE.
+
 ## Unreleased — Transpose-fusion step 2: drop the Q pre-attention transpose (universal)
 
 **Eliminated the per-layer Q PRE-attention `Transpose[0,2,1,3]` (another 28 dispatches+copies/decode-step).**

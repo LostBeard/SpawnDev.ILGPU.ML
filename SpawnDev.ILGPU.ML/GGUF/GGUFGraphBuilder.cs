@@ -201,16 +201,18 @@ public static class GGUFGraphBuilder
                 }
             }
 
-            // Q/K: reshape → QK-norm → RoPE → transpose. V: reshape → weightless-norm → transpose (no RoPE).
-            // Q drops its PRE-attention transpose (step 2): FusedAttention reads Q seq-major (seq_major_q below).
-            // K/V keep theirs until the KV-cache store goes seq-major (step 3).
+            // Q/K/V: reshape → (QK-norm/weightless-norm) → (RoPE) — ALL drop their PRE-attention transpose now
+            // (steps 2+3): FusedAttention reads Q/K/V seq-major (seq_major_q/seq_major_kv below), and the decode
+            // KV-cache store is seq-major. RoPE still runs on the pre-transpose [1,seq,heads,hd] layout.
             string qReshaped = EmitAttnHead(graph, model, weights, pfx, "q", qOut, nHeads, hd, cfg,
                 gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, doRope: true, weightlessNorm: false,
                 skipTranspose: true);
             string kReshaped = EmitAttnHead(graph, model, weights, pfx, "k", kOut, cfg.NKVHeads, hd, cfg,
-                gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, doRope: true, weightlessNorm: false);
+                gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, doRope: true, weightlessNorm: false,
+                skipTranspose: true);
             string vReshaped = EmitAttnHead(graph, model, weights, pfx, "v", vSrc, cfg.NKVHeads, hd, cfg,
-                qkNormTensor: null, freqFactors: null, doRope: false, weightlessNorm: gemmaAttn);
+                qkNormTensor: null, freqFactors: null, doRope: false, weightlessNorm: gemmaAttn,
+                skipTranspose: true);
 
             // ── Fused masked attention: softmax(QKᵀ·scale [+ causal/SWA mask]) · V in one dispatch ──
             // (GQA: n_kv_heads < n_heads; window 0 = global, else sliding.)
@@ -244,6 +246,9 @@ public static class GGUFGraphBuilder
                 // seq_major_q: Q is fed seq-major (its pre-attention transpose was dropped, step 2) so
                 // FusedAttention reads Q with the seq-major base (p[12]). K/V stay heads-major (step 3 pending).
                 ["seq_major_q"] = JsonSerializer.SerializeToElement(1L),
+                // seq_major_kv: K/V pre-attention transposes dropped (step 3); the decode KV-cache store is seq-major.
+                // FusedAttention reads K/V seq-major (p[13]: kvHead offset hd, per-token stride kvHeads*hd).
+                ["seq_major_kv"] = JsonSerializer.SerializeToElement(1L),
             };
             if (gemmaAttn)
                 faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);
