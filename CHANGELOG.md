@@ -22,6 +22,14 @@ qwen). Now a native device→device `CopyFrom` (WebGPU `CopyBufferToBuffer`; que
 ~112 shader dispatches/step to native copies, biggest on WebGPU's dispatch overhead. Verified CUDA byte-identical
 + GGUFDecodeKVCache 8/8 + Attn 92/92.
 
+**128-bit vectorized weight load in the dp4a Q4_K decode GEMV.** `GemvDp4aQ4_KImpl` read its 8 nibble-words per
+t-unit as 8 scalar `ld.b32`. Each t-unit's 8 words are two 16-byte-aligned chunks, so reading each as a `W16`
+struct-of-4-ints via `BaseView.Cast<W16>().AsAligned16()` makes ILGPU's PTX backend emit a single 128-bit
+`ld.v4.b32` (= SASS `LDG.E.128`) per 4 words — weight load-issue cut 4× (the llama.cpp MMVQ bandwidth level).
+PTX-verified (2× `ld.v4.b32`, was 8 scalar); bit-identical (PMT `Gemv_M1_Dp4a` 14/14, qwen 12-tok byte-identical).
+RTX 4070 kernel A/B: Q4_K dp4a GEMV 266→292 GB/s (+10-16% MLP shapes), 148→238 (+61% attn-proj), ~53→58% of peak.
+(E2E decode unchanged within noise — the GEMV is a fraction of the 703-node step; next GEMV lever = 4-warps-per-row.)
+
 (Also this cycle, shipped earlier: RMSNorm cooperative parallel reduction; dp4a int8-activation GEMV 4-warps/block
 (CUDA); Example 06 `/api/show` + `run-pi.bat`.)
 
