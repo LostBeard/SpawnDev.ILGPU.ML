@@ -234,6 +234,39 @@ public class RMSNormOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 
+// ── AddRMSNorm (fused residual-add + RMSNorm) ──
+
+/// <summary>Fused residual `Add` + `RMSNormalization`: inputs (a, b, [weight]); outputs (residual = a+b, normed =
+/// rmsnorm(a+b)·weight). Replaces the Add→RMSNorm pair (2 graph nodes → 1; biggest on WebGPU dispatch overhead).
+/// One cooperative pass on non-WebGL (reads a+b, writes both); WebGL falls back to ElementWise.Add + two-pass norm.</summary>
+public class AddRMSNormOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "AddRMSNorm";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0], inputs[0] };   // residual + normed, both the input shape
+    public void Execute(OnnxOpContext ctx)
+    {
+        float eps = ctx.GetFloat("epsilon", 1e-6f);
+        int axis = ctx.GetInt("axis", -1);
+        var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+        var shape = a.Shape;
+        if (axis < 0) axis += shape.Length;
+        int rows = 1; for (int i = 0; i < axis; i++) rows *= shape[i];
+        int C = 1; for (int i = axis; i < shape.Length; i++) C *= shape[i];
+        bool hasWeight = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null;
+        var residual = ctx.Outputs[0].Data; var normed = ctx.Outputs[1].Data;
+        var wView = hasWeight ? ctx.Inputs[2].Data : a.Data; // ignored by the fused path when hasWeight==0
+
+        if (reg.Normalization.AddRMSNormFused(a.Data, b.Data, residual, normed, wView, rows, C, eps, hasWeight ? 1 : 0))
+            return;
+
+        // WebGL / tiny-group fallback: residual = a+b, then the two-pass RMSNorm on residual.
+        reg.ElementWise.Add(a.Data, b.Data, residual, a.ElementCount);
+        if (hasWeight) reg.Normalization.RMSNorm(residual, normed, ctx.Inputs[2].Data, rows, C, eps);
+        else reg.Normalization.RMSNorm(residual, normed, rows, C, eps);
+    }
+}
+
 // ── BatchNormalization ──
 
 public class BatchNormOperator(OperatorRegistry reg) : IOnnxOperator

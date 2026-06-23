@@ -289,13 +289,26 @@ public static class GGUFGraphBuilder
                 attnResInput = postAttnOut;
             }
 
-            // ── Residual 1 ──
+            // ── Residual 1 + FFN norm ──
+            // Fuse the residual Add into the following RMSNorm (AddRMSNorm: 2 nodes → 1, residualOut + normedOut)
+            // when it's a plain weighted RMSNorm (qwen/llama; gemma's (1+w) fold is baked into the GGUF weights so
+            // RMSNorm is uniform). LayerNorm / no-weight archs keep the separate Add + AddNorm.
             string residual1 = $"{pfx}_res1";
-            AddNode(graph, "Add", new[] { layerIn, attnResInput }, new[] { residual1 });
-
-            // ── FFN norm ──
             string ffnNormOut = $"{pfx}_ffn_norm";
-            AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
+            var ffnNormW = useRMSNorm ? FindTensor(model, $"{pfx}.ffn_norm.weight") : null;
+            if (ffnNormW != null)
+            {
+                ExtractWeight(model, ffnNormW, weights);
+                graph.Initializers[ffnNormW.Name] = ffnNormW.Shape;
+                float rmsEps = model.GetMetadataFloat($"{model.Architecture}.attention.layer_norm_rms_epsilon", 1e-6f);
+                AddNode(graph, "AddRMSNorm", new[] { layerIn, attnResInput, ffnNormW.Name },
+                    new[] { residual1, ffnNormOut }, Attrs("epsilon", rmsEps));
+            }
+            else
+            {
+                AddNode(graph, "Add", new[] { layerIn, attnResInput }, new[] { residual1 });
+                AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
+            }
 
             // ── FFN: dense gate/up → activation → down, OR a Mixture-of-Experts block when the model carries
             //    a router (ffn_gate_inp, e.g. gpt-oss). ──

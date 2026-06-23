@@ -30,7 +30,7 @@ public class OperatorRegistry : IDisposable
     /// </summary>
     public static readonly IReadOnlySet<string> BuiltinOpTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "Abs", "Acos", "Acosh", "Add", "AffineGrid", "And", "ArgMax", "ArgMin",
+        "Abs", "Acos", "Acosh", "Add", "AddRMSNorm", "AffineGrid", "And", "ArgMax", "ArgMin",
         "Asin", "Asinh", "Atan", "Atanh", "AveragePool", "BatchNormalization", "Bernoulli", "BitShift",
         "BitwiseAnd", "BitwiseNot", "BitwiseOr", "BitwiseXor", "BlackmanWindow", "Cast", "CastLike", "Ceil",
         "Celu", "CenterCropPad", "Clip", "Col2Im", "Compress", "Concat", "ConcatFromSequence", "Constant",
@@ -378,6 +378,7 @@ public class OperatorRegistry : IDisposable
         // True RMSNorm (every RMS decoder: llama/mistral/qwen/gemma). Distinct from the
         // mean-centered LayerNormalization — see RMSNormOperator.
         Register(new RMSNormOperator(this));
+        Register(new AddRMSNormOperator(this));
     }
 
     public void Dispose()

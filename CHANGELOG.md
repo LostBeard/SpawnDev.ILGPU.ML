@@ -2,6 +2,18 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Fused AddRMSNorm (residual add + RMSNorm in one cooperative pass, universal)
+
+Fused the per-layer residual `Add` into the following `RMSNorm`. New `AddRMSNorm` op/kernel: one cooperative pass
+reads `x = a + b` per element, writes BOTH the residual stream (`a+b`, for the next residual add) AND the
+normalized output (`rmsnorm(a+b)·weight`) — replacing a separate Add kernel + RMSNorm (2 graph nodes → 1). Same
+single-pass f64-partial reduction shape as the existing fused RMSNorm, so it matches the Add→RMSNorm chain to the
+RMSNorm tolerance; byte-identical decode. Wired for the within-layer ffn-norm on plain weighted RMSNorm archs
+(qwen/llama; gemma's (1+w) fold is baked into the GGUF weights so RMSNorm is uniform) — LayerNorm / no-weight archs
+keep the separate Add+norm. WebGL (no workgroup shared mem) falls back to `ElementWise.Add` + the two-pass norm
+(same op, two kernels). Decode node count 535→507 (−28/step; Add 56→28, RMSNorm 57→29). PMT GGUFDecodeKVCache green
+all 6 backends. (The 28 residual-stream "boundary" Adds before each attn-norm are a pattern-2 follow-up.)
+
 ## Unreleased — Zero-copy Reshape views at decode (drop 112 CopyFrom dispatches/step, universal)
 
 The executor's zero-copy metadata-only-op path (Reshape/Squeeze/Unsqueeze/Flatten hand off a single-consumer

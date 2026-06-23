@@ -35,6 +35,9 @@ public class NormalizationKernels : IDisposable
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>,
         int, float, int>? _rmsNormFusedKernel;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, float, int>? _addRmsNormFusedKernel;
     private MemoryBuffer1D<float, Stride1D.Dense>? _dummyRmsWeight;
     private int _rmsFusedGroup;
     // Upper bound on the single-pass RMSNorm group size — also the compile-time size of the kernel's
@@ -190,6 +193,51 @@ public class NormalizationKernels : IDisposable
             output[offset + i] = input[offset + i] * invRms * (hasWeight != 0 ? weight[i] : 1f);
     }
 
+    /// <summary>Fused (residual-Add + RMSNorm) in ONE cooperative pass: reads x = a + b per element, writes the
+    /// residual sum to <paramref name="residualOut"/> (the residual stream the NEXT add consumes) AND the normalized
+    /// result to <paramref name="normedOut"/> — replacing a separate Add kernel + RMSNorm. Same single-pass
+    /// reduction shape as <see cref="RMSNormFusedImpl"/> (sum of squares of x, f64 partials → tree combine), so it
+    /// matches the Add→RMSNorm chain to the RMSNorm test tolerance. Non-WebGL (shared mem + barrier); WebGL falls
+    /// back to ElementWise.Add + the two-pass norm (same op, two kernels).</summary>
+    private static void AddRMSNormFusedImpl(
+        ArrayView1D<float, Stride1D.Dense> a,
+        ArrayView1D<float, Stride1D.Dense> b,
+        ArrayView1D<float, Stride1D.Dense> residualOut,
+        ArrayView1D<float, Stride1D.Dense> normedOut,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        int C, float epsilon, int hasWeight)
+    {
+        int row = Grid.IdxX;
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int offset = row * C;
+
+        var part = SharedMemory.Allocate<float>(MaxRmsGroup);
+        var inv = SharedMemory.Allocate<float>(1);
+
+        double local = 0.0;
+        for (int i = tid; i < C; i += T)
+        {
+            float x = a[offset + i] + b[offset + i];
+            residualOut[offset + i] = x;        // the residual stream (read by the next residual Add)
+            double v = (double)x; local += v * v;
+        }
+        part[tid] = (float)local;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            double sumSq = 0.0;
+            for (int t = 0; t < T; t++) sumSq += part[t];
+            inv[0] = 1f / MathF.Sqrt((float)(sumSq / C) + epsilon);
+        }
+        Group.Barrier();
+
+        float invRms = inv[0];
+        for (int i = tid; i < C; i += T)
+            normedOut[offset + i] = residualOut[offset + i] * invRms * (hasWeight != 0 ? weight[i] : 1f);
+    }
+
     /// <summary>
     /// InstanceNorm Pass 1: compute mean and invStd per (N,C) slice.
     /// One thread per slice. Each thread loops over spatial once for mean, once for variance.
@@ -336,6 +384,27 @@ public class NormalizationKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>, int, float, int>(RMSNormFusedImpl);
         _rmsNormFusedKernel(new KernelConfig(new Index1D(rows), new Index1D(T)),
             input, output, weight, C, epsilon, hasWeight);
+        return true;
+    }
+
+    /// <summary>Fused residual-Add + RMSNorm in one cooperative pass: residualOut = a+b, normedOut = rmsnorm(a+b)·w.
+    /// Returns false on WebGL / tiny groups (the caller does the Add + two-pass norm fallback). hasWeight 0 = unit gain.</summary>
+    public bool AddRMSNormFused(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b,
+        ArrayView1D<float, Stride1D.Dense> residualOut, ArrayView1D<float, Stride1D.Dense> normedOut,
+        ArrayView1D<float, Stride1D.Dense> weight, int rows, int C, float epsilon, int hasWeight)
+    {
+        EnsureLoaded();
+        if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
+        int T = _rmsFusedGroup != 0 ? _rmsFusedGroup
+            : (_rmsFusedGroup = Math.Min(MaxRmsGroup, (int)_accelerator.MaxNumThreadsPerGroup));
+        if (T < 32) return false;
+        if (hasWeight == 0) { _dummyRmsWeight ??= _accelerator.Allocate1D(new float[1]); weight = _dummyRmsWeight.View; }
+        _addRmsNormFusedKernel ??= _accelerator.LoadStreamKernel<
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, float, int>(AddRMSNormFusedImpl);
+        _addRmsNormFusedKernel(new KernelConfig(new Index1D(rows), new Index1D(T)),
+            a, b, residualOut, normedOut, weight, C, epsilon, hasWeight);
         return true;
     }
 
