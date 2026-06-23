@@ -1451,7 +1451,13 @@ public class GraphExecutor : IDisposable
                 var srcName = node.InputNames[0];
                 var outName = node.OutputNames[0];
                 if (!string.IsNullOrEmpty(srcName) && !string.IsNullOrEmpty(outName) && !src.IsHalf
-                    && src.ElementCount >= 4096                                  // only LARGE reshapes (the memory win);
+                    && src.ElementCount >= 256                                   // skip only trivial/shape-ish reshapes;
+                                                                                // 256 (was 4096) captures the GGUF DECODE
+                                                                                // q/k/v + head-merge reshapes (seq=1 →
+                                                                                // ~512-3584 elems, 112/step) → zero-copy
+                                                                                // view, dropping 112 CopyFrom dispatches/
+                                                                                // step (biggest on WebGPU). Single-consumer
+                                                                                // gate below keeps it safe (the memory win);
                     && !runtimeConstants.ContainsKey(outName)                    // not a value a downstream reads on CPU
                     && tensors.TryGetValue(srcName, out var srcT) && ReferenceEquals(srcT, src)
                     && refCounts.TryGetValue(srcName, out var srcRc) && srcRc == 1

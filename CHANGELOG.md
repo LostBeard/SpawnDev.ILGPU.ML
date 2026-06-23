@@ -2,6 +2,16 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased — Zero-copy Reshape views at decode (drop 112 CopyFrom dispatches/step, universal)
+
+The executor's zero-copy metadata-only-op path (Reshape/Squeeze/Unsqueeze/Flatten hand off a single-consumer
+pooled buffer as a view instead of `CopyFrom`-ing it) was gated to `ElementCount >= 4096` ("large reshapes, the
+memory win"). At **decode** (seq=1) the per-layer q/k/v + head-merge reshapes are only ~512-3584 elems → below the
+gate → they fell through to a real device→device copy (**112 CopyFrom/step on qwen, 8.1% of decode**). Lowered the
+threshold to **256**: those reshapes now become zero-copy views (no copy, no dispatch) — the single-consumer
+ref-count gate keeps it safe. `Reshape` disappears entirely from the decode op profile; byte-identical. Universal,
+biggest on WebGPU (each was a CopyBufferToBuffer dispatch). PMT GGUFDecodeKVCache green all 6 backends.
+
 ## Unreleased — Register attention DEFAULT-ON for CUDA (2.7× prefill attention, ~20% decode)
 
 Promoted the warp-cooperative register per-query attention from opt-in to **default-on** (the dispatch still gates
