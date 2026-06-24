@@ -56,7 +56,7 @@
 | Whisper | ✅ | 🟡 decoder only | full speech E2E pending |
 | SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; not wired into a verified demo page |
 | SD-Turbo | ✅ | 🚧 | no end-to-end image test |
-| GGUF LLMs (Phi/Mistral) | ✅ parse/metadata | 🚧 | parser/metadata only; **no autoregressive conversational E2E test** — treat as "loads/inspects", not "runs" |
+| GGUF LLMs (Qwen/Gemma/Llama) | ✅ **runs** (desktop) | 🟡 kernels verified | **Autoregressive KV-cache decode VERIFIED** — Example 06 Ollama-compatible server (OpenAI/Ollama/Anthropic APIs, Claude CLI) E2E on CUDA/OpenCL; Ollama-oracle byte-identical; ~51 tok/s on qwen2.5-coder:7b Q4_K_M (4070). Browser: decode kernels pass PMT on WebGPU (`GGUFDecodeKVCache` incremental==full-recompute), full in-browser LLM demo is WIP |
 
 ## Keeping this honest
 - **Operator count** is rendered live from `OperatorRegistry.BuiltinOpTypes` (the documented single source of truth) — never hardcode it again.

@@ -2,7 +2,19 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased — KV-cache write: queue-ordered sync CopyFrom on ALL backends (drop the per-copy await round-trip)
+## 4.0.0-preview.5 (2026-06-23) - GGUF LLM inference + register attention (CUDA + WebGPU) + ~4.6x decode
+
+Headline: native GPU **GGUF LLM inference** (Qwen / Gemma / Llama, KV-cache decode) with an **Ollama-compatible
+server example** (Example 06: OpenAI, Ollama, and Anthropic-Messages APIs; works with the Claude CLI). Decode on
+qwen2.5-coder:7b Q4_K_M (RTX 4070) went ~11 -> ~51 tok/s this cycle - **1.75x of Ollama, down from a 7x gap** - via
+dp4a int8 GEMV, warp-cooperative **register / flash-class per-query attention** (now on CUDA *and* WebGPU subgroups,
+plus a universal barrier-free per-query path for the other backends), kernel fusions (SwiGLU, AddRMSNorm), transpose
+elimination (zero transpose nodes), zero-copy reshape views, and a queue-ordered sync-CopyFrom KV-write that drops
+per-token browser GPU round-trips. Consumes **ILGPU 4.16.2** (CUDA graph capture API, WGSL subgroup shuffle +
+`subgroup_uniformity` directive, Wasm large-local-array fix). The remaining Ollama gap is prefill (tensor-core / WMMA,
+not yet emitted). Itemized below.
+
+### KV-cache write: queue-ordered sync CopyFrom on ALL backends (drop the per-copy await round-trip)
 
 The decode KV-cache write (`CaptureSafeCopy`) used a stream-ordered sync `CopyFrom` on CUDA (no host sync — "the
 whole forward is one stream, so ordering is free") but fell back to an awaited `CopyFromAsync` on every other backend
@@ -15,7 +27,7 @@ sync-enqueue path; CUDA keeps the explicit `DefaultStream` form for graph-captur
 GGUFDecodeKVCache (incremental == full-recompute, byte-identical) green all 6 backends. Pure round-trip removal — the
 KV math is unchanged.
 
-## Unreleased — Register attention on WebGPU (subgroups) + consume ILGPU 4.16.2
+### Register attention on WebGPU (subgroups) + consume ILGPU 4.16.2
 
 **Register per-query attention now runs on WebGPU**, extending the flash-class register accumulator (CUDA default-on,
 2.7× prefill / ~20% decode) to the browser — where it wins most (no workgroup memory at all; the per-thread 16-wide
@@ -30,7 +42,7 @@ whole-group-active-by-luck). Dispatch gate extended to WebGPU when `WarpSize==32
 CPU/Wasm/WebGL/OpenCL keep the shared-slice. PMT GGUFDecodeKVCache **8/8 all 6 backends incl WebGPU** (register ==
 full-recompute, byte-identical on real Dawn); CUDA still byte-identical.
 
-## Unreleased — Fused AddRMSNorm (residual add + RMSNorm in one cooperative pass, universal)
+### Fused AddRMSNorm (residual add + RMSNorm in one cooperative pass, universal)
 
 Fused the per-layer residual `Add` into the following `RMSNorm`. New `AddRMSNorm` op/kernel: one cooperative pass
 reads `x = a + b` per element, writes BOTH the residual stream (`a+b`, for the next residual add) AND the
@@ -45,7 +57,7 @@ falls back to `ElementWise.Add` + the two-pass norm (same op, two kernels). Deco
 56→28, RMSNorm 57→29). PMT full sweep green all 6 backends incl `Gemma4_GraphBuilder_PostNormSandwich`. (The 28
 residual-stream "boundary" Adds before each attn-norm are a pattern-2 follow-up.)
 
-## Unreleased — Zero-copy Reshape views at decode (drop 112 CopyFrom dispatches/step, universal)
+### Zero-copy Reshape views at decode (drop 112 CopyFrom dispatches/step, universal)
 
 The executor's zero-copy metadata-only-op path (Reshape/Squeeze/Unsqueeze/Flatten hand off a single-consumer
 pooled buffer as a view instead of `CopyFrom`-ing it) was gated to `ElementCount >= 4096` ("large reshapes, the
@@ -55,7 +67,7 @@ threshold to **256**: those reshapes now become zero-copy views (no copy, no dis
 ref-count gate keeps it safe. `Reshape` disappears entirely from the decode op profile; byte-identical. Universal,
 biggest on WebGPU (each was a CopyBufferToBuffer dispatch). PMT GGUFDecodeKVCache green all 6 backends.
 
-## Unreleased — Register attention DEFAULT-ON for CUDA (2.7× prefill attention, ~20% decode)
+### Register attention DEFAULT-ON for CUDA (2.7× prefill attention, ~20% decode)
 
 Promoted the warp-cooperative register per-query attention from opt-in to **default-on** (the dispatch still gates
 it to CUDA: warp==32 + Warp.Shuffle, D%16==0; all other backends keep the shared-slice; `GGUF_ATTN_REG=0` forces
@@ -64,7 +76,7 @@ OFF for A/B). **RTX 4070: 2.7× prefill attention (shared-slice 1226.8 → regis
 Argmax-identical. Oracle `Attn_RegisterPerQuery_MatchesCpu_Cuda` now covers hd 64/128/256 (4/8/16 lanes/query);
 GGUFDecodeKVCache green with register as the CUDA default.
 
-## Unreleased — Warp-cooperative REGISTER per-query attention (opt-in, CUDA-first) — ~20% faster decode
+### Warp-cooperative REGISTER per-query attention (opt-in, CUDA-first) — ~20% faster decode
 
 **The flash-class register accumulator (Geordi's D-tiling recipe).** The barrier-free per-query attention holds its
 D outputs in a per-thread workgroup-shared slice (the shared-RMW is its ~5.3× ceiling). New opt-in
@@ -79,7 +91,7 @@ backends keep the shared-slice per-query (default OFF → opt-in, master behavio
 green (CUDA register-incremental == full-recompute) + default sweep unaffected. WebGPU-subgroup extension is the
 next step (the bigger win there — avoids workgroup memory).
 
-## Unreleased — Fused SwiGLU (SiLU-gated MLP activation, dispatch reduction)
+### Fused SwiGLU (SiLU-gated MLP activation, dispatch reduction)
 
 **Fused the SiLU MLP activation into ONE kernel.** The SwiGLU path emitted three elementwise nodes per layer —
 `Sigmoid(gate)` → `Mul(gate, sig)` → `Mul(silu, up)`. New `SwiGLU` op/kernel computes `(gate · sigmoid(gate)) · up`
@@ -90,7 +102,7 @@ Decode node count 591→535 (qwen2.5-coder:7b; Sigmoid + 56 Mul folded out). PMT
 GGUFDecodeKVCache 8/8 (the tiny-llama test model uses SiLU → exercises SwiGLU, incremental == full-recompute
 byte-identical) + Attn 92/92; qwen 16-tok decode byte-identical. (gemma's GeGLU `Gelu+Mul` left as a follow-up.)
 
-## Unreleased — Consume ILGPU 4.16.0 (CUDA graph API + Wasm large-local-array fix)
+### Consume ILGPU 4.16.0 (CUDA graph API + Wasm large-local-array fix)
 
 Bumped `SpawnDev.ILGPU` 4.15.1 → **4.16.0** (Geordi's stable, forks 2.1.0): rolls up the CUDA graph capture API
 (`CudaStream.BeginCapture/EndCapture`, `CudaGraph`/`CudaGraphExec`, `Accelerator.WithDefaultStream`) + the device-
@@ -98,7 +110,7 @@ local dynamically-indexed `new T[N>32]` codegen fix now correct on **all 6 backe
 lane: GGUFDecodeKVCache 8/8 + qwen decode byte-identical, no regression. Unblocks Example 04's `GGUF_DECODE_GRAPH_PROBE`
 (decode CUDA-graph capture/replay probe) + the new `GGUF_PTX_PROBE` (dumps the dp4a GEMV PTX to verify `ld.v4.b32`).
 
-## Unreleased — Transpose-fusion step 3: seq-major KV-cache — ZERO transpose nodes (universal)
+### Transpose-fusion step 3: seq-major KV-cache — ZERO transpose nodes (universal)
 
 **Eliminated the last 56 K/V PRE-attention transposes — the decode graph now has ZERO `Transpose` nodes (703→591,
 all 112 gone across steps 1-3).** The KV-cache store flips from head-major `[kvHeads, maxSeq, hd]` to **seq-major
@@ -112,7 +124,7 @@ WebGL+bf16 fallback packs seq-major + reads via the contiguous kernel with `seq_
 node.Attributes). PMT GREEN all 6 backends (GGUFDecodeKVCache 8/8 incl WebGL+bf16 fallback + Attn 92/92);
 qwen2.5-coder:7b 16-tok decode byte-identical. Transpose-fusion lever COMPLETE.
 
-## Unreleased — Transpose-fusion step 2: drop the Q pre-attention transpose (universal)
+### Transpose-fusion step 2: drop the Q pre-attention transpose (universal)
 
 **Eliminated the per-layer Q PRE-attention `Transpose[0,2,1,3]` (another 28 dispatches+copies/decode-step).**
 Symmetric to step 1 but on the READ side: new `seqMajorQ` mode (kernel param `p[12]`) makes FusedAttention read Q
@@ -122,7 +134,7 @@ both set together by the GGUF builder now (`seq_major_q` attr). K/V keep their t
 KV-cache store must go seq-major). **Decode Transpose nodes 84→56 (56 = the remaining K+V pre-transposes).** PMT
 GREEN all 6 backends (GGUFDecodeKVCache 8/8 + Attn 92/92); qwen2.5-coder:7b 16-tok decode byte-identical.
 
-## Unreleased — Transpose-fusion step 1: drop the post-attention transpose (universal)
+### Transpose-fusion step 1: drop the post-attention transpose (universal)
 
 **Eliminated the per-layer post-attention `Transpose[0,2,1,3]` (28 dispatches+copies/decode-step, universal).**
 FusedAttention output was heads-major `[1,heads,seq,hd]`, then a real Transpose kernel → `[1,seq,heads,hd]`, then
@@ -137,7 +149,7 @@ copy).** PMT GREEN all 6 backends: GGUFDecodeKVCache 8/8 (incremental == full-re
 WebGL) + Attn oracle 92/92 (default path intact); real qwen2.5-coder:7b 16-tok decode byte-identical. Next
 (steps 2-3): the 84 remaining PRE-attention Q/K/V transposes (needs the KV-cache store to go seq-major too).
 
-## Unreleased — Universal barrier-free per-query attention (WebGPU prefill win) + Reshape native-copy
+### Universal barrier-free per-query attention (WebGPU prefill win) + Reshape native-copy
 
 **Barrier-free per-query fused attention — the universal (esp. WebGPU) prefill win.** Prefill is ~94% attention
 at long context, and WebGPU/WebGL were stuck on the per-element kernel (O(n²·D²), D× redundant Q·K dot) because
@@ -168,7 +180,7 @@ RTX 4070 kernel A/B: Q4_K dp4a GEMV 266→292 GB/s (+10-16% MLP shapes), 148→2
 (Also this cycle, shipped earlier: RMSNorm cooperative parallel reduction; dp4a int8-activation GEMV 4-warps/block
 (CUDA); Example 06 `/api/show` + `run-pi.bat`.)
 
-## Unreleased — Example 06 server: interactive bounds (fast model + capped context/output)
+### Example 06 server: interactive bounds (fast model + capped context/output)
 
 **Made the Claude-CLI experience usable on a slow local engine.** `run-claude-cli.bat` now defaults to
 **qwen2.5-coder:7b** (~90ms/tok — the fast interactive pick; gemma4:12b is 12B/slower and has a separate
@@ -180,7 +192,7 @@ answers "The capital of France is Paris." in **2.4s with `stop_reason=end_turn`*
 prompt edge (38K truncated to ctx can break the chat structure → the model rambles to the cap) is now bounded
 by the output cap rather than open-ended; cleaner truncation + engine speed are the follow-ups.
 
-## Unreleased — Example 06 server: stream the tools path (fix Claude CLI "API error")
+### Example 06 server: stream the tools path (fix Claude CLI "API error")
 
 **Claude CLI got "API error" on the first real message and the GPU stayed pegged for minutes.** Claude CLI
 ALWAYS sends its toolset, and the `/v1/messages` handler routed any request with `tools` to **buffered (fully
@@ -200,7 +212,7 @@ generation gate is released cleanly. (True *concurrent* serving of multiple requ
 continuous batching — tracked as the v-next concurrency feature; until then requests serialize on the gate and
 the practical lever is generation speed.)
 
-## Unreleased — Example 06 server: fix Claude CLI cold-start (pre-load the model)
+### Example 06 server: fix Claude CLI cold-start (pre-load the model)
 
 **Claude CLI failed to connect to the Ollama-replacement server** — the request log showed every startup
 `/v1/messages` throwing `OperationCanceledException` in `ModelRegistry.AcquireAsync`. Root cause (diagnosed
@@ -213,7 +225,7 @@ client that waits for `/api/version` never races the load; `run-claude-cli.bat` 
 polls `/api/version` for readiness instead of a fixed 10s sleep. Verified: pre-load (~4s), readiness gating,
 title (`json_schema`/`output_config` shape), and a realistic main request (system-as-array, SSE) all work.
 
-## Unreleased — Decode GEMV scale-cache (Q4_K M=1, the per-token path)
+### Decode GEMV scale-cache (Q4_K M=1, the per-token path)
 
 **The M=1 dequant GEMV (run for every decoded token) cached its Q4_K sub-block scales.** A direct comparison
 against Ollama (same qwen2.5-coder-7B-Q4_K_M blob, RTX 4070) showed decode is the dominant gap (~120ms/tok vs
@@ -226,7 +238,7 @@ fetch + one multiply + one subtract (`DecodeQ4KNibble`). **Q4_K GEMV ~34 → ~51
 backends). The remaining gap to Ollama is a deeper GEMV-structure / occupancy issue (even trivial-dequant Q8_0
 caps at ~17% bandwidth here) — tracked.
 
-## Unreleased — KV-tiled grouped attention (unbounded SKV for long prompts)
+### KV-tiled grouped attention (unbounded SKV for long prompts)
 
 **`FusedAttentionKernel` now handles unbounded SKV via a KV-tiled grouped kernel.** The single-pass grouped
 kernel holds all scores in shared memory, so it was capped at SKV ≤ 4096 — beyond that (8k–16k agentic prompts)
@@ -241,7 +253,7 @@ runs the grouped path. New PMT config (SKV=5000, multi-block) in `FusedAttention
 asserts the tiled kernel matches per-element on all 6 backends. Opt-in via the same
 `EnableGroupedAttention` / `GGUF_ATTN_GROUP` flag; non-browser-GPU (browser keeps per-element).
 
-## Unreleased — Last-position-only logits (prefill LM-head as an M=1 GEMV)
+### Last-position-only logits (prefill LM-head as an M=1 GEMV)
 
 **`GGUFGraphBuilder.EnableLastPositionLogits`: at prefill the LM head computes logits for ONLY the last
 sequence position instead of all prompt positions.** For autoregressive generation only the last token's
@@ -256,7 +268,7 @@ large-prefill) and gemma4 (incl. the final-logit soft-cap on the sliced output).
 green on all 6 backends. Opt-in (env `GGUF_LAST_POS=1`); library-default off (the GGUF graph's all-position
 logits are still available for eval/perplexity). Example 06 server opts in.
 
-## Unreleased — Metadata-cached dequant GEMM + two cross-backend dequant-path fixes
+### Metadata-cached dequant GEMM + two cross-backend dequant-path fixes
 
 **`FusedDequantMatMul` register-blocked Q4_K AND Q6_K GEMMs now cache per-column block metadata once per K-tile.**
 An isolated GFLOPS benchmark (Example 04 `GGUF_GEMM_BENCH=1`, RTX 4070, qwen MLP shapes @M=1081) localized the
@@ -285,7 +297,7 @@ used M=2 with MultiRowGemm off, so neither opt-in prefill path was ever unit-tes
 New PMT tests `FusedDequantMatMul_{MultiRow,RegBlocked}_MatchesOracle_{Q4_K,Q6_K}` (M=40 multi-row + M=80
 register-blocked, non-tile-aligned dims) — green on all 6 backends.
 
-## Unreleased — Grouped-per-query fused attention (prefill attention win)
+### Grouped-per-query fused attention (prefill attention win)
 
 **`FusedAttentionKernel` grouped-per-query path: each Q·K score is computed ONCE instead of once per output
 dim.** The per-element kernel launches one thread per `(head, query, dim)` output and recomputes the full
@@ -306,7 +318,7 @@ sink epilogue), the result is **BIT-IDENTICAL** to the per-element kernel.
   pending the full sweep (mirrors `EnableMultiRowGemm`). Example 06 server opts in. Huge-context prefill
   (SKV > 4096) still uses the per-element kernel — kv-tiled flash attention is the follow-up.
 
-## Unreleased — Ollama-compatible inference server (Example 06) + general generation core
+### Ollama-compatible inference server (Example 06) + general generation core
 
 **New library generation core, plus a drop-in Ollama-replacement Example so prebuilt agentic frontends
 (Claude CLI, Pi, Codex, OpenCode, …) can use native-GPU GGUF inference.**
@@ -334,7 +346,7 @@ Example `06.OllamaServer.Console`:
 Known (testbed surfaced these): qwen2 GGUF weight load FailFasts (`Index/Extent out of bounds`) — a loader
 bug to fix; general Jinja2-from-GGUF templating + tool-calling are the next increments.
 
-## Unreleased — Single-pass fused RMSNorm + SpawnDev.ILGPU 4.15.0
+### Single-pass fused RMSNorm + SpawnDev.ILGPU 4.15.0
 
 **RMSNorm is now single-pass (one group per row) on every backend with a group — fusing the two-pass stats +
 apply into ONE dispatch (no second dispatch, no invRms global round-trip, no scratch).** Thread 0 of each group
@@ -350,7 +362,7 @@ identical tokens, all 6 backends.
 path; all in-register quant decoders single-exit/branchless — extends the WebGL/GLSL multi-exit-decode fix to
 FP8 E4M3/E5M2).
 
-## Unreleased — RMSNorm invRms scratch from a reusable ring (no per-token alloc / leak)
+### RMSNorm invRms scratch from a reusable ring (no per-token alloc / leak)
 
 **RMSNorm's two-pass `invRms` scratch now comes from a fixed reusable ring instead of a fresh per-call
 `Allocate1D` that was never freed until `Dispose`.** Each RMSNorm call allocated a rows-sized invRms buffer and
@@ -367,7 +379,7 @@ round-trip) is now DONE — see the single-pass fused RMSNorm entry above. The `
 bug that previously blocked a second `Grid.IdxX` `LoadStreamKernel` on WebGPU is fixed/stale (MatMul's tiled
 kernel + the RMSNorm group kernel coexist on WebGPU, Norm 194/0).
 
-## Unreleased — FusedAttention params buffer ring pre-allocated (no per-call alloc)
+### FusedAttention params buffer ring pre-allocated (no per-call alloc)
 
 **`FusedAttentionKernel` reuses a pre-allocated params-buffer ring instead of `Allocate1D` per call.** Each
 attention dispatch built its tiny (10-11 int) params buffer with a fresh `Allocate1D` (+ dispose-on-overwrite)
@@ -376,7 +388,7 @@ isn't reused until well past any unflushed batch) are now each allocated ONCE at
 `CopyFromCPU`; the kernel reads only the used prefix. Same upload, no per-call allocation. Attention results
 unchanged (PMT `Attention` 122/0 all 6 backends).
 
-## Unreleased — Hoist the per-token executor refcount/constant rebuild out of RunAsync
+### Hoist the per-token executor refcount/constant rebuild out of RunAsync
 
 **`GraphExecutor.RunAsync` no longer re-walks the whole graph every token to rebuild the buffer-recycling
 refcounts + the runtime-constant map.** Each decode step rebuilt, over all ~1400 nodes: the refcount map (a full
@@ -390,7 +402,7 @@ byte-identical result, without the per-token node walks / LINQ. Verified: `GGUFD
 (incremental == full recompute) + gemma4-12b greedy generation byte-identical (CUDA) + the inference Pipeline
 sweep green on all 6 backends. The sync `Run()` path (non-decode) is unchanged.
 
-## Unreleased — FusedAttention reads the bf16 KV store directly (no per-token repack)
+### FusedAttention reads the bf16 KV store directly (no per-token repack)
 
 **GGUF decode attention now reads the `[kvHeads, maxSeq, hd]` KV store DIRECTLY in its native bf16/f32 type,
 maxSeq-strided — eliminating the per-token O(history) repack + bf16→f32 widen.** Previously every decode token
@@ -411,7 +423,7 @@ store mis-addresses (an ILGPU WebGL backend limitation — f32-strided + all 5 o
 byte-exact), so WebGL+bf16 falls back to the existing repack — correct, just the old O(history); surfaced to
 Geordi for the durable WebGL fix.
 
-## Unreleased — GGUF decode pipelines enable CacheShapeReadbacks
+### GGUF decode pipelines enable CacheShapeReadbacks
 
 **`GgufTextGenerationPipeline` and `Gemma4MultimodalPipeline` now set `CacheShapeReadbacks = true`.** The flag
 (designed for exactly this fixed-shape decode loop) was never enabled on the gemma4 decode path, leaving two
@@ -423,7 +435,7 @@ shape-derived values once they're proven stable — the browser-readback latency
 each step's logits (greedy argmax) before the next step, satisfying the output-recycling contract. Verified
 decode-equivalent: gemma4-12b greedy generation is byte-identical with the flag on vs off (same tokens, CUDA).
 
-## Unreleased — FusedLinear register-blocked path for native low-precision weights (+ SiLU/ReLU)
+### FusedLinear register-blocked path for native low-precision weights (+ SiLU/ReLU)
 
 **The fused MatMul+bias+activation path now register-blocks native low-p weights and supports SiLU/ReLU.**
 `FusedLinear` (the GraphOptimizer fuses MatMul+Add+activation into it — the SD ResNet/FFN + LLM decoder-FFN
@@ -440,7 +452,7 @@ ResNet/FFN) also get the tiled kernel, not just None/GELU. Verified: `FusedLinea
 end-to-end went ~12.1 s → ~10.9 s on CUDA (the fused fp16 linears now tile; the rest is conv/attention-bound),
 image still a real PASS (lumStd 114.6).
 
-## Unreleased — SpawnDev.ILGPU 4.14.2 + MXFP4 scale single-source-of-truth decode
+### SpawnDev.ILGPU 4.14.2 + MXFP4 scale single-source-of-truth decode
 
 **Migrated to SpawnDev.ILGPU 4.14.2-local.1** (Fork / Algorithms.Fork `2.0.41`) — the WebGL fix for the
 multi-exit `RawBitsToFloat` GLSL explosion (this consumption surfaced it: a multi-exit decode inlined before a
@@ -458,7 +470,7 @@ deleted. Value-identical on every real MX scale byte (`e` in `1..254`; differs o
 where the library is spec-correct NaN). One verified decode for the MXFP4 element AND its scale. PMT `MXFP4` 20/0
 on all 6 backends (incl. WebGL, now that the library decode compiles there).
 
-## Unreleased — Register-blocked GEMM for native low-precision weights
+### Register-blocked GEMM for native low-precision weights
 
 **`MatMulLowPWeight` now uses the register-blocked tiled kernel for large matrices, not the per-element kernel.**
 A native low-p weight (fp16 / bf16 / FP8) kept the memory win but forfeited GEMM throughput — every
@@ -474,7 +486,7 @@ CPU/WebGL fall back to the per-element kernel). Verified: `F16_MatMulLowPWeight_
 follow-on for the SD-fused-linear throughput. (SD-Turbo end-to-end timing was not measurable this session — the
 hub/WebTorrent model load was failing on a transient network condition.)
 
-## Unreleased — Conv2D / ConvTranspose2D accumulate in f32 (not f64)
+### Conv2D / ConvTranspose2D accumulate in f32 (not f64)
 
 **Convolution now accumulates in f32, the ML standard, instead of f64.** Every `Conv2DKernel` variant (NCHW,
 NHWC, depthwise, native-low-p-weight) and `ConvTranspose2DKernel` previously accumulated each output element's
@@ -488,7 +500,7 @@ went **~2.4× faster on CUDA (29.4 s → 12.1 s)**. (The numerically-sensitive d
 Norm/Softmax/Stats kernels — variance, softmax-sum — are intentionally left in f64; only the conv MAC
 accumulation changed.)
 
-## Unreleased — GPU argmax greedy decode (no per-token full-vocab readback)
+### GPU argmax greedy decode (no per-token full-vocab readback)
 
 **Greedy next-token selection now runs on the GPU and reads back one int, not the ~1 MB vocab row.** Both decode
 pipelines (`GgufTextGenerationPipeline`, `Gemma4MultimodalPipeline`) previously copied the entire last-position
@@ -503,7 +515,7 @@ penalty, which need the whole distribution on the host. Reused partial buffer (n
 `GpuArgMax_MatchesCpuGreedy_VariousSizes` + `GpuArgMax_LowestIndexOnTie` green on all 6 backends (PMT `GpuArgMax`
 14/0).
 
-## Unreleased — SpawnDev.ILGPU 4.14.1 migration + FusedLinear native low-precision weight support
+### SpawnDev.ILGPU 4.14.1 migration + FusedLinear native low-precision weight support
 
 **Migrated to SpawnDev.ILGPU 4.14.1 (nuget.org stable).** Off `4.14.0` onto `4.14.1` (Fork / Algorithms.Fork
 `2.0.40` transitive) - hardens the packed 4-bit tier (the per-backend `[NoInlining]` helper-function
@@ -563,7 +575,7 @@ the canonical MX form (OCP E2M1 element × E8M0 scale `2^(e-127)`); `E8M0HalfToF
 independent unit-test oracle remains the literal `RefMXFP4` kvalues table (no tautology). PMT `MXFP4`
 (MatMul + Gather + GEMV oracle tests) green on all 6 backends.
 
-## Unreleased — Gemma 4 multimodal chat + selectable-precision decode KV cache + SpawnDev.ILGPU 4.13.0 migration
+### Gemma 4 multimodal chat + selectable-precision decode KV cache + SpawnDev.ILGPU 4.13.0 migration
 
 **Browser model delivery: WebTorrent → OPFS → zero-copy GPU.** The browser gemma4 chat (and the WebTorrent
 load path generally) now: (1) streams weights **zero-copy** — `AllocateQuantizedBytesFromStreamAsync` uses
@@ -640,7 +652,7 @@ static kept accumulating every later test's per-node tensors — turning a long 
 DistilGPT2 OutOfMemory + a cascade of follow-on timeouts. `RunTest` now evicts the static capture
 state at each test's start (deterministic, like the existing zombie-accelerator eviction).
 
-## Unreleased — gemma4:12b GGUF forward is CORRECT end-to-end (CUDA)
+### gemma4:12b GGUF forward is CORRECT end-to-end (CUDA)
 
 gemma4:12b greedy-decodes coherent thinking-model text through the pure-ILGPU engine
 ("What is the capital of France?" -> a `<|channel>thought` reasoning block then "The capital
@@ -667,7 +679,7 @@ chat template, a teacher-forcing per-position comparison vs a reference, and GGU
 cross-position-cosine diagnostics. Decode is currently full-recompute (~7s/token); KV-cache is
 planned (`Plans/gemma4-kvcache-decode-plan-2026-06-12.md`).
 
-## Unreleased — gemma4 decode-path kernels (GEMV routing, masked flash attention, RoPE generalization)
+### gemma4 decode-path kernels (GEMV routing, masked flash attention, RoPE generalization)
 
 The three kernel prerequisites for the gemma4 bring-up (the graph wiring selects and
 passes the per-layer values; the kernels honor call parameters):
@@ -690,7 +702,7 @@ passes the per-layer values; the kernels honor call parameters):
 All three: CPU-oracle test suites, scoped PMT green on all 6 backends, offline GLSL
 size probes (the WebGL emitter constraint) before gating.
 
-## Unreleased — GGUF quantization correctness overhaul (the K-quant landmine)
+### GGUF quantization correctness overhaul (the K-quant landmine)
 
 ### The bug class (gemma4 gap #0)
 

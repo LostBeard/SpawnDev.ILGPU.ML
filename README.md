@@ -20,6 +20,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
+- **Local GGUF LLM inference + Ollama-compatible server** *(new in preview.5)* — run quantized LLMs (Qwen, Gemma, Llama) fully on your GPU with KV-cache decode; the Example 06 server is a drop-in Ollama replacement (OpenAI, Ollama, and Anthropic-Messages APIs) that works with the Claude CLI. ~51 tok/s decode on qwen2.5-coder:7b Q4_K_M (RTX 4070) via dp4a int8 GEMV + warp-cooperative register/flash attention (CUDA + WebGPU).
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
 - **30 GPU kernel files** — MatMul, Conv2D, FWHT, TurboQuant, RoPE, QKNorm, GroupNorm, SelectiveScan (Mamba-3), MarchingCubes, SpatialMemoryUnit, and more
 - **~194 ONNX operators registered** (exact count is `OperatorRegistry.BuiltinOpTypes.Count`, rendered live on the Home page — not all are full-spec-complete; some are registered pass-throughs) — classification, style transfer, super resolution, depth estimation, pose estimation, object detection, NLP, diffusion, and more
@@ -33,7 +34,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 - **P2P Model Delivery + Shared Compute** — [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) integration for decentralized model delivery via BitTorrent. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
 
-## What's verified in `4.0.0-preview.4`
+## What's verified in `4.0.0-preview.5`
 
 Six demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + OpenCL — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries:
 
