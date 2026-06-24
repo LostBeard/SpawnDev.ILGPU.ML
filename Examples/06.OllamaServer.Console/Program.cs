@@ -83,11 +83,29 @@ if (args.Length >= 1 && args[0] == "--chat")
     Console.WriteLine($"Prompt: {promptIds.Length} tokens, stop ids=[{string.Join(",", stopIds)}]\n\nResponse: ");
 
     using var gen = new GgufGenerator(session, accelerator, gm, maxSeqLen: promptIds.Length + 256 + 8);
+    // Warm the kernels (first dispatch JIT-compiles ~hundreds of kernels) so the timed prefill is COMPUTE, not
+    // compilation — matching Ollama's precompiled-kernel prompt-eval. Use a REVERSED prompt (same shapes, warms the
+    // M>1 prefill GEMM, but a different token sequence so it won't hit the prefix-KV cache and skip the real prefill).
+    if (Environment.GetEnvironmentVariable("CHAT_NO_WARMUP") != "1")
+    {
+        var warmIds = (int[])promptIds.Clone(); Array.Reverse(warmIds);
+        await gen.GenerateAsync(warmIds, config: new GenerationConfig { MaxNewTokens = 2 }, stopTokenIds: stopIds);
+    }
+    // Timing for an Ollama --verbose-style A/B: TTFT ≈ prefill (prompt eval), then steady decode rate (eval).
+    var genSw = System.Diagnostics.Stopwatch.StartNew();
+    double ttftMs = -1;
     var res = await gen.GenerateAsync(promptIds,
         config: new GenerationConfig { MaxNewTokens = 256 },
         stopTokenIds: stopIds,
-        onDelta: d => { Console.Write(d); return Task.CompletedTask; });
-    Console.WriteLine($"\n\n[stop={res.Stop}, gen={res.GeneratedTokens} tokens]");
+        onDelta: d => { if (ttftMs < 0) ttftMs = genSw.Elapsed.TotalMilliseconds; Console.Write(d); return Task.CompletedTask; });
+    genSw.Stop();
+    double totalMs = genSw.Elapsed.TotalMilliseconds;
+    int genTok = res.GeneratedTokens;
+    double decodeMs = totalMs - (ttftMs < 0 ? totalMs : ttftMs);
+    double decodeTokS = (genTok > 1 && decodeMs > 0) ? (genTok - 1) * 1000.0 / decodeMs : 0;
+    double prefillTokS = ttftMs > 0 ? promptIds.Length * 1000.0 / ttftMs : 0;
+    Console.WriteLine($"\n\n[stop={res.Stop}, gen={genTok} tokens]");
+    Console.WriteLine($"[timing] prompt={promptIds.Length} tok | prefill(TTFT)={ttftMs:F0}ms (~{prefillTokS:F0} tok/s) | decode={decodeTokS:F1} tok/s ({(genTok > 1 ? decodeMs / (genTok - 1) : 0):F1} ms/tok) | total={totalMs:F0}ms");
     return;
 }
 
