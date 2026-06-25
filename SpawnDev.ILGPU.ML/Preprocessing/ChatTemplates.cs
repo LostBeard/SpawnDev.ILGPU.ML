@@ -355,9 +355,11 @@ public static class ChatTemplates
 
         // gemma4 injects tools at the TOKEN level in its own declaration DSL (see
         // BuildGemma4MultiTurnPromptTokens) — NOT the ChatML system-message convention — so route it before
-        // the BuildToolSystem injection below.
+        // the BuildToolSystem injection below. Disable thinking when tools are present: gemma4's verbose
+        // <|channel>thought reasoning bloats the output and can truncate a long tool call before its closing
+        // args (dropping required params), so a tool turn must emit the call directly and compactly.
         if (format == ChatFormat.Gemma4)
-            return (BuildGemma4MultiTurnPromptTokens(tok, messages, thinking, toolsJson: hasTools ? toolsJson : null),
+            return (BuildGemma4MultiTurnPromptTokens(tok, messages, thinking && !hasTools, toolsJson: hasTools ? toolsJson : null),
                     Ids(tok, "<turn|>"));
 
         // ChatML / Llama3: advertise the tools in the system message (qwen <tools>/<tool_call> convention).
