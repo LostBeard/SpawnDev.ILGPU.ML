@@ -161,6 +161,30 @@ public static class ServerEndpoints
             var cfg = ReadOllamaOptions(req);
             string created = DateTimeOffset.UtcNow.ToString("o");
 
+            // Tool-calling (Ollama-native): when the client sends tools, generate fully, parse the model's
+            // <tool_call> blocks (or the bare-JSON fallback) into structured message.tool_calls. Mirrors the
+            // /v1/chat/completions tool path; arguments are emitted as a JSON OBJECT (Ollama's native shape,
+            // unlike OpenAI's stringified arguments). Generation is non-streaming because the call only resolves
+            // at the end; the result is still delivered over NDJSON when the client asked to stream.
+            var chatTools = GetTools(req);
+            if (chatTools != null)
+            {
+                var (genText, gres) = await GenerateOnce(registry, model, messages, cfg, null, ctx.RequestAborted, chatTools);
+                var calls = ChatTemplates.ParseToolCalls(genText);
+                // When a tool call is present, content is emptied (matches Ollama + the /v1 path): the model was
+                // instructed to emit ONLY the call, and the raw markup/JSON must not leak as visible assistant text.
+                object toolMsg = calls.Count > 0
+                    ? new { role = "assistant", content = "", tool_calls = calls.Select(tc => new { function = new { name = tc.Name, arguments = ParseJsonOrEmpty(tc.ArgumentsJson) } }).ToArray() }
+                    : new { role = "assistant", content = genText };
+                string doneReason = calls.Count > 0 ? "stop" : OllamaDone(gres);
+                if (!stream)
+                    return Results.Json(new { model, created_at = created, message = toolMsg, done = true, done_reason = doneReason }, J);
+                ctx.Response.ContentType = "application/x-ndjson";
+                await WriteNdjson(ctx, new { model, created_at = created, message = toolMsg, done = false });
+                await WriteNdjson(ctx, new { model, created_at = created, message = new { role = "assistant", content = "" }, done = true, done_reason = doneReason });
+                return Results.Empty;
+            }
+
             if (!stream)
             {
                 var (text, res) = await GenerateOnce(registry, model, messages, cfg, null, ctx.RequestAborted);

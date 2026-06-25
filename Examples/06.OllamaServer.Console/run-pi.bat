@@ -21,9 +21,12 @@ REM      http://127.0.0.1:11434/v1, so we run ON 11434. (Don't run real Ollama a
 set "PORT=11434"
 
 REM ---- Interactive bounds ----
-REM   NUM_CTX: model's full context (no truncation). KV-prefix caching reuses the identical static head
-REM            across turns. MAX_OUTPUT caps generated tokens so a verbose answer can't run for minutes.
+REM   NUM_CTX: KV-cache size. A large (12B+) model plus a big context OOMs a 12GB card — e.g. gemma4:12b
+REM            (7.6GB) + a 16k+ cache approaches 12GB, pegging the GPU with ZERO token throughput. Keep
+REM            7B/8B models at 32768; cap big models to 4096 (verified to fit gemma4:12b on a 4070 with
+REM            headroom). Raise the 4096 only if you have the VRAM. MAX_OUTPUT caps a verbose answer.
 set "OLLAMA_NUM_CTX=32768"
+echo %MODEL%| findstr /I "12b 13b 14b 24b 27b 30b 32b 70b gemma4" >nul && set "OLLAMA_NUM_CTX=4096"
 set "OLLAMA_MAX_OUTPUT=1024"
 
 echo.
