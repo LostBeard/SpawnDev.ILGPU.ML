@@ -1,0 +1,279 @@
+@page "/ai-chat"
+@using global::ILGPU.Runtime
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.ML.Preprocessing
+@using SpawnDev.BlazorJS
+@using SpawnDev.BlazorJS.JSObjects
+@using SpawnDev.BlazorJS.Toolbox
+@using JsFile = SpawnDev.BlazorJS.JSObjects.File
+@implements IAsyncDisposable
+@inject BlazorJSRuntime JS
+
+<PageTitle>AI Chat — on-device LLM</PageTitle>
+
+<div class="ai-chat">
+    <header class="hdr">
+        <h1>AI Chat <span class="badge">100% on-device</span></h1>
+        <p class="sub">Chat with a quantized GGUF language model running entirely in your browser on WebGPU — your
+            text never leaves your device. Load a model below to begin.</p>
+    </header>
+
+    @if (_state == LoadState.Idle)
+    {
+        <div class="optin">
+            <h2>Load a model</h2>
+            <p>
+                Pick a <code>.gguf</code> model file from your device. The weights stream straight to the GPU as the
+                file is read — nothing is uploaded to any server. Small instruct models (a few hundred MB) work well;
+                you can grab them from Hugging Face or your local Ollama cache.
+            </p>
+
+            <div class="picker">
+                <button class="primary" @onclick="OpenPicker">Choose a .gguf model file…</button>
+                <input @ref="_fileInputRef" type="file" accept=".gguf" class="hidden-file" />
+            </div>
+
+            <h3>Tested models</h3>
+            <ul class="models">
+                @foreach (var m in _tested)
+                {
+                    <li class="@(m.Status == "ok" ? "ok" : m.Status == "warn" ? "warn" : "bad")">
+                        <span class="dot"></span>
+                        <span class="name">@m.Name</span>
+                        <span class="meta">@m.Arch · @m.Size</span>
+                        <span class="note">@m.Note</span>
+                    </li>
+                }
+            </ul>
+            <p class="fineprint">
+                Status reflects what we've verified end-to-end. ✅ generates correctly; ⚠️ loads but output is being
+                worked on. Loading any other GGUF text model is fair game — it doubles as a compatibility test.
+            </p>
+        </div>
+    }
+    else if (_state == LoadState.Loading)
+    {
+        <div class="loading">
+            <div class="spinner"></div>
+            <p>@_status</p>
+        </div>
+    }
+    else if (_state == LoadState.Error)
+    {
+        <div class="error">
+            <h2>Could not load the model</h2>
+            <pre>@_status</pre>
+            <button @onclick="BackToIdle">Back</button>
+        </div>
+    }
+    else // Ready
+    {
+        <div class="chat">
+            <div class="bar">
+                <span class="model-tag">@_modelName <span class="fmt">@_arch · @_chatFormat</span></span>
+                <span class="accel">@_acceleratorName</span>
+                <button class="link" @onclick="ResetChat" disabled="@_busy">New conversation</button>
+                <button class="link" @onclick="BackToIdle" disabled="@_busy">Switch model</button>
+            </div>
+
+            <div class="transcript" @ref="_transcriptRef">
+                @foreach (var msg in _messages)
+                {
+                    <div class="msg @msg.Role">
+                        <div class="who">@(msg.Role == "user" ? "You" : "Assistant")</div>
+                        <div class="text">@msg.Content</div>
+                    </div>
+                }
+                @if (_busy)
+                {
+                    <div class="msg assistant"><div class="who">Assistant</div><div class="text typing">@_streaming<span class="caret">▋</span></div></div>
+                }
+            </div>
+
+            <div class="composer">
+                <textarea @bind="_input" @bind:event="oninput" @onkeydown="OnKeyDown"
+                          placeholder="Send a message…" disabled="@_busy" rows="1"></textarea>
+                <button class="primary" @onclick="SendAsync" disabled="@(_busy || string.IsNullOrWhiteSpace(_input))">Send</button>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    enum LoadState { Idle, Loading, Ready, Error }
+    LoadState _state = LoadState.Idle;
+    string _status = "";
+
+    // Curated, HONEST status of the small models we've actually run (see DEMO_AND_MODEL_STATUS.md).
+    record TestedModel(string Name, string Arch, string Size, string Status, string Note);
+    readonly List<TestedModel> _tested = new()
+    {
+        new("qwen2.5:0.5b-instruct (q8_0)", "qwen2", "~0.5 GB", "ok",   "✅ verified — coherent on WebGPU"),
+        new("qwen2.5:0.5b-instruct (q4_K_M)", "qwen2", "~0.4 GB", "ok", "✅ verified (Q5_0 weights supported)"),
+        new("gemma3:270m", "gemma3", "~0.3 GB", "warn", "⚠️ loads; arch tuning in progress"),
+        new("smollm2:360m", "llama", "~0.4 GB", "warn", "⚠️ loads; chat template in progress"),
+    };
+
+    ElementReference _fileInputRef;
+    ElementReference _transcriptRef;
+    HTMLInputElement? _fileInput;
+    bool _pickerWired;
+
+    global::ILGPU.Context? _context;
+    Accelerator? _accelerator;
+    GgufTextGenerationPipeline? _pipeline;
+    string _acceleratorName = "";
+    string _modelName = "";
+    string _arch = "";
+    string _chatFormat = "";
+
+    sealed class ChatMessage { public string Role = "user"; public string Content = ""; }
+    readonly List<ChatMessage> _messages = new();
+
+    string _input = "";
+    bool _busy;
+    string _streaming = "";
+
+    protected override void OnAfterRender(bool firstRender)
+    {
+        // The file input only exists while we're on the Idle panel; (re)wire it whenever it appears.
+        if (_state == LoadState.Idle && !_pickerWired)
+        {
+            _pickerWired = true;
+            _fileInput = new HTMLInputElement(_fileInputRef);
+            _fileInput.OnChange += OnFilePicked;
+        }
+    }
+
+    void OpenPicker() => _fileInput?.Click();
+
+    async void OnFilePicked(Event ev)
+    {
+        JsFile? file = null;
+        using (var files = _fileInput!.Files) file = files != null && files.Length > 0 ? files[0] : null;
+        if (file == null) return;
+        if (!file.Name.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
+        {
+            Fail("Please choose a .gguf model file.");
+            await InvokeAsync(StateHasChanged);
+            return;
+        }
+        await LoadModelAsync(file);
+    }
+
+    async Task LoadModelAsync(JsFile file)
+    {
+        _state = LoadState.Loading;
+        _pickerWired = false; // input element is leaving the DOM
+        _modelName = file.Name;
+        _status = "Initializing WebGPU…";
+        await InvokeAsync(StateHasChanged);
+        try
+        {
+            if (_accelerator == null)
+            {
+                var builder = MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
+                _accelerator = await _context.CreatePreferredAcceleratorAsync();
+                if (_accelerator == null) { Fail("No WebGPU accelerator is available in this browser."); await InvokeAsync(StateHasChanged); return; }
+                _acceleratorName = $"{_accelerator.Name} ({_accelerator.AcceleratorType})";
+                JS.Log($"[AiChat] accelerator: {_acceleratorName}");
+            }
+
+            // A browser File is a Blob → BlobStream is a SEEKABLE async stream (Blob.slice random access), so the
+            // weights stream straight to the GPU; the whole file is never held in .NET memory.
+            var blob = new BlobStream(file);
+            _status = $"Loading {file.Name} ({file.Size / (1024 * 1024)} MB) — streaming weights to the GPU…";
+            await InvokeAsync(StateHasChanged);
+
+            _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, blob, maxSeqLen: 4096,
+                onProgress: (stage, pct) => { _status = $"{stage} {pct}%"; InvokeAsync(StateHasChanged); });
+            _arch = _pipeline.Architecture;
+            _chatFormat = _pipeline.ChatFormat.ToString();
+            _messages.Clear();
+            _state = LoadState.Ready;
+            _status = "";
+            JS.Log($"[AiChat] ready: arch={_arch} format={_chatFormat}");
+        }
+        catch (Exception ex)
+        {
+            JS.LogError($"[AiChat] load failed: {ex.GetType().Name}: {ex.Message}");
+            Fail($"{ex.GetType().Name}: {ex.Message}");
+        }
+        await InvokeAsync(StateHasChanged);
+    }
+
+    void Fail(string msg) { _status = msg; _state = LoadState.Error; }
+
+    void BackToIdle()
+    {
+        _pipeline?.Dispose();
+        _pipeline = null;
+        _messages.Clear();
+        _state = LoadState.Idle;
+        _pickerWired = false; // re-wire the picker on next render
+        _status = "";
+    }
+
+    async Task OnKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey) await SendAsync();
+    }
+
+    async Task SendAsync()
+    {
+        if (_busy || _pipeline == null || string.IsNullOrWhiteSpace(_input)) return;
+        var text = _input.Trim();
+        _input = "";
+        _messages.Add(new ChatMessage { Role = "user", Content = text });
+        _busy = true; _streaming = "";
+        StateHasChanged();
+        await ScrollToBottom();
+
+        // Build the multi-turn conversation; the pipeline applies the model's chat template + reuses the KV
+        // prefix across turns.
+        var convo = _messages.Select(m => (m.Role, m.Content)).ToList();
+        try
+        {
+            string answer = await _pipeline.GenerateAsync(convo,
+                config: new GenerationConfig { MaxNewTokens = 512, Strategy = "greedy" },
+                onToken: (_, soFar) => { _streaming = soFar; InvokeAsync(async () => { StateHasChanged(); await ScrollToBottom(); }); return Task.CompletedTask; });
+            _messages.Add(new ChatMessage { Role = "assistant", Content = answer.Trim() });
+        }
+        catch (Exception ex)
+        {
+            JS.LogError($"[AiChat] generate failed: {ex.Message}");
+            _messages.Add(new ChatMessage { Role = "assistant", Content = $"[error: {ex.Message}]" });
+        }
+        _busy = false; _streaming = "";
+        StateHasChanged();
+        await ScrollToBottom();
+    }
+
+    void ResetChat()
+    {
+        _messages.Clear();
+        _streaming = "";
+    }
+
+    async Task ScrollToBottom()
+    {
+        try { using var el = new HTMLElement(_transcriptRef); el.ScrollTop = el.ScrollHeight; }
+        catch { /* transcript not mounted yet */ }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            if (_fileInput != null) { _fileInput.OnChange -= OnFilePicked; _fileInput.Dispose(); }
+            _pipeline?.Dispose();
+            _accelerator?.Dispose();
+            _context?.Dispose();
+        }
+        catch (Exception ex) { JS.LogError($"[AiChat] dispose: {ex.Message}"); }
+        await Task.CompletedTask;
+    }
+}
