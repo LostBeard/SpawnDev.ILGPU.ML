@@ -415,6 +415,37 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task SentencePiece_ByteLevelBpe_UsesMergeRanks_NotGreedy() => await RunTest(async accelerator =>
+    {
+        // Byte-level BPE (gpt2 vocabs: qwen/llama3/smollm) MUST tokenize by rank-ordered merges, NOT greedy
+        // longest-match. The two diverge on multi-token words (real bug: smollm2 "assistant" → "assis"+"tan"+"t"
+        // under greedy malformed the prompt → garbage output; proper BPE → "ass"+"istant" → coherent).
+        // Construct a case where greedy and BPE DISAGREE and assert we follow BPE.
+        //   vocab: a=1 b=2 c=3 ab=4 bc=5   merges: ["b c"] (only b+c may merge, rank 0)
+        //   input "abc":  greedy longest → ["ab","c"]=[4,3];  BPE (merge b+c first) → ["a","bc"]=[1,5]
+        var tokens = new[] { "<unk>", "a", "b", "c", "ab", "bc" };
+        var scores = new float[tokens.Length];
+        var types = new[] { 1, 0, 0, 0, 0, 0 };
+        var merges = new[] { "b c" };
+
+        var bpe = new SentencePieceTokenizer(tokens, scores, types, byteLevelBpe: true, merges: merges);
+        var got = bpe.Encode("abc");
+        var want = new[] { 1, 5 }; // [a, bc] — the BPE-merge result
+        if (got.Length != want.Length || got[0] != want[0] || got[1] != want[1])
+            throw new Exception($"Byte-level BPE used greedy not merge-rank: Encode('abc')=[{string.Join(",", got)}], " +
+                $"expected [{string.Join(",", want)}] ([a,bc]). Greedy would give [4,3] ([ab,c]).");
+
+        // No merges → falls back to greedy longest-match (legacy/safe path): "abc" → ["ab","c"]=[4,3].
+        var greedy = new SentencePieceTokenizer(tokens, scores, types, byteLevelBpe: true, merges: null);
+        var g = greedy.Encode("abc");
+        if (g.Length != 2 || g[0] != 4 || g[1] != 3)
+            throw new Exception($"No-merge byte-level fallback should be greedy [4,3], got [{string.Join(",", g)}]");
+
+        Console.WriteLine($"[BPE] merge-rank Encode('abc')=[{string.Join(",", got)}] (BPE), greedy-fallback=[{string.Join(",", g)}] — PASS");
+        await Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task SentencePiece_ByteFallback_HandlesUnknownChars() => await RunTest(async accelerator =>
     {
         // Vocab with byte fallback tokens

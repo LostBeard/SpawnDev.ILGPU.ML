@@ -111,8 +111,8 @@
     {
         new("qwen2.5:0.5b-instruct (q8_0)", "qwen2", "~0.5 GB", "ok",   "✅ verified — coherent on WebGPU"),
         new("qwen2.5:0.5b-instruct (q4_K_M)", "qwen2", "~0.4 GB", "ok", "✅ verified (Q5_0 weights supported)"),
+        new("smollm2:360m", "llama", "~0.4 GB", "ok",   "✅ verified — coherent (BPE tokenizer fix)"),
         new("gemma3:270m", "gemma3", "~0.3 GB", "warn", "⚠️ loads; arch tuning in progress"),
-        new("smollm2:360m", "llama", "~0.4 GB", "warn", "⚠️ loads; chat template in progress"),
     };
 
     ElementReference _fileInputRef;

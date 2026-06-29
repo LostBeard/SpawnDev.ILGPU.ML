@@ -81,6 +81,36 @@ if (args.Length >= 1 && args[0] == "--chat-pipe")
     return;
 }
 
+// --toks <model-file.gguf | ollama-name> "<prompt>" : DIAGNOSTIC — dump the exact chat-prompt token ids +
+// per-token decoded text + the resolved bos/eos + stop ids. No GPU. Used to debug tokenization/template
+// mismatches (e.g. a model that emits an immediate end-of-turn = a malformed prompt).
+if (args.Length >= 1 && args[0] == "--toks")
+{
+    var arg = args.Length >= 2 ? args[1] : "";
+    var userPrompt = args.Length >= 3 ? args[2] : "What is the capital of France?";
+    string? path = File.Exists(arg) ? arg : new OllamaModelStore().Resolve(arg)?.GgufPath;
+    if (path == null || !File.Exists(path)) { Console.WriteLine($"Not a .gguf file or cached model: {arg}"); return; }
+
+    await using var ths = File.OpenRead(path);
+    var tgm = await GGUFParser.ParseHeaderAsync(ths);
+    var ttok = SentencePieceTokenizer.FromGGUF(tgm)!;
+    var tfmt = ChatTemplates.DetectChatFormat(tgm);
+    var tmessages = new List<(string Role, string Content)> { ("user", userPrompt) };
+    var (tPromptIds, tStopIds) = ChatTemplates.BuildChatPrompt(tgm, ttok, tmessages);
+    Console.WriteLine($"model={Path.GetFileName(path)}  arch={tgm.Architecture}  format={tfmt}");
+    Console.WriteLine($"tokenizer.model={tgm.GetMetadataString("tokenizer.ggml.model")}  pre={tgm.GetMetadataString("tokenizer.ggml.pre")}");
+    Console.WriteLine($"BosId={ttok.BosId}  EosId={ttok.EosId}  stopIds=[{string.Join(",", tStopIds)}]");
+    Console.WriteLine($"metadata bos_token_id={tgm.GetMetadataInt("tokenizer.ggml.bos_token_id", -1)}  eos_token_id={tgm.GetMetadataInt("tokenizer.ggml.eos_token_id", -1)}");
+    Console.WriteLine($"\nprompt = {tPromptIds.Length} tokens:");
+    foreach (var id in tPromptIds)
+    {
+        var s = ttok.Decode(new[] { id }).Replace("\n", "\\n");
+        Console.WriteLine($"  [{id,6}] '{s}'");
+    }
+    Console.WriteLine($"\nfull decode:\n{ttok.Decode(tPromptIds)}");
+    return;
+}
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.

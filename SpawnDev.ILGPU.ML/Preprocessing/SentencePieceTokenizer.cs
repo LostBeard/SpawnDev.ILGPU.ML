@@ -24,6 +24,11 @@ public class SentencePieceTokenizer : ITokenizer
     private readonly int _eosId;
     private readonly int _unkId;
     private readonly bool _byteLevelBpe;
+    // Byte-level BPE merge ranks ("A B" → rank). Lower rank = higher priority. Null when the GGUF carries no
+    // merges (then the byte-level path falls back to score-greedy longest-match). Real GPT-2/qwen/llama3/smollm
+    // tokenization is rank-ordered BPE, NOT greedy — greedy diverges on multi-token words (e.g. "assistant"),
+    // which malforms the prompt for sensitive small models. See the byte-level Encode path.
+    private readonly Dictionary<(string, string), int>? _bpeRanks;
 
     /// <summary>True for byte-level BPE vocabs (GGUF <c>tokenizer.ggml.model == "gpt2"</c>: qwen2/3, llama3,
     /// most modern models). Such vocabs encode raw bytes as printable unicode via GPT-2's bytes↔unicode map
@@ -67,11 +72,25 @@ public class SentencePieceTokenizer : ITokenizer
     /// <summary>
     /// Create a SentencePiece tokenizer from GGUF metadata arrays.
     /// </summary>
-    public SentencePieceTokenizer(string[] tokens, float[] scores, int[]? tokenTypes = null, bool byteLevelBpe = false)
+    public SentencePieceTokenizer(string[] tokens, float[] scores, int[]? tokenTypes = null, bool byteLevelBpe = false,
+        string[]? merges = null)
     {
         _vocab = tokens;
         _scores = scores;
         _byteLevelBpe = byteLevelBpe;
+        // Build the BPE merge-rank table for the byte-level path. Each merge is "A B" (the two symbol strings to
+        // join), listed in priority order — index = rank.
+        if (byteLevelBpe && merges is { Length: > 0 })
+        {
+            _bpeRanks = new Dictionary<(string, string), int>(merges.Length);
+            for (int i = 0; i < merges.Length; i++)
+            {
+                int sp = merges[i].IndexOf(' ');
+                if (sp <= 0 || sp >= merges[i].Length - 1) continue;
+                var pair = (merges[i].Substring(0, sp), merges[i].Substring(sp + 1));
+                _bpeRanks.TryAdd(pair, i);
+            }
+        }
         _tokenTypes = tokenTypes ?? new int[tokens.Length];
         _tokenToId = new Dictionary<string, int>(tokens.Length);
         for (int i = 0; i < tokens.Length; i++)
@@ -115,6 +134,10 @@ public class SentencePieceTokenizer : ITokenizer
             var sb = new System.Text.StringBuilder(raw.Length);
             foreach (var rb in raw) sb.Append(Gpt2ByteToChar[rb]);
             normalized = sb.ToString();
+            // Proper rank-ordered BPE (what GPT-2/qwen/llama3/smollm actually use) when merges are present.
+            // Greedy longest-match (below) only coincides with BPE for some vocabs and diverges on multi-token
+            // words \u2014 fixing that is the whole point of loading the merges.
+            if (_bpeRanks != null) return EncodeByteLevelBpe(normalized);
         }
         else
         {
@@ -167,6 +190,54 @@ public class SentencePieceTokenizer : ITokenizer
             }
         }
 
+        return result.ToArray();
+    }
+
+    /// <summary>
+    /// Byte-level BPE encode (GPT-2 / qwen / llama3 / smollm). Operates on the already byte-mapped string:
+    /// start from single-character symbols, then repeatedly merge the adjacent pair with the LOWEST merge rank
+    /// (highest training priority) until no ranked pair remains — the canonical GPT-2 <c>bpe()</c> algorithm.
+    /// This matches how the model was trained, unlike score-greedy longest-match which diverges on multi-token
+    /// words (e.g. "assistant" → "assis"+"tan"+"t") and malforms the prompt for sensitive models. Special/control
+    /// tokens are emitted by the chat-template layer as ids (not through here), so they need no special handling.
+    /// </summary>
+    private int[] EncodeByteLevelBpe(string normalized)
+    {
+        if (normalized.Length == 0) return Array.Empty<int>();
+        var word = new List<string>(normalized.Length);
+        foreach (var ch in normalized) word.Add(ch.ToString());
+
+        while (word.Count > 1)
+        {
+            // Lowest-rank adjacent pair across the current symbol list.
+            int bestRank = int.MaxValue;
+            string? bf = null, bs = null;
+            for (int i = 0; i < word.Count - 1; i++)
+                if (_bpeRanks!.TryGetValue((word[i], word[i + 1]), out int r) && r < bestRank)
+                { bestRank = r; bf = word[i]; bs = word[i + 1]; }
+            if (bf == null) break;
+
+            // Merge every non-overlapping occurrence of that pair, then re-scan (canonical GPT-2 bpe).
+            var merged = new List<string>(word.Count);
+            int k = 0;
+            while (k < word.Count)
+            {
+                if (k < word.Count - 1 && word[k] == bf && word[k + 1] == bs) { merged.Add(bf + bs); k += 2; }
+                else { merged.Add(word[k]); k++; }
+            }
+            word = merged;
+        }
+
+        var result = new List<int>(word.Count);
+        foreach (var sym in word)
+        {
+            if (_tokenToId.TryGetValue(sym, out int id)) result.Add(id);
+            else foreach (var ch in sym) // unmergeable leftover → emit its single byte-char token(s)
+                {
+                    if (_tokenToId.TryGetValue(ch.ToString(), out int cid)) result.Add(cid);
+                    else if (_unkId >= 0) result.Add(_unkId);
+                }
+        }
         return result.ToArray();
     }
 
@@ -263,7 +334,10 @@ public class SentencePieceTokenizer : ITokenizer
         }
 
         bool byteLevelBpe = model.GetMetadataString("tokenizer.ggml.model") == "gpt2";
-        return new SentencePieceTokenizer(tokens, scores, tokenTypes, byteLevelBpe);
+        // Byte-level BPE vocabs carry the rank-ordered merge list — required to tokenize the way the model was
+        // trained (greedy longest-match diverges on multi-token words and breaks sensitive models).
+        var merges = byteLevelBpe ? model.GetMetadataStringArray("tokenizer.ggml.merges") : null;
+        return new SentencePieceTokenizer(tokens, scores, tokenTypes, byteLevelBpe, merges);
     }
 
     /// <summary>
