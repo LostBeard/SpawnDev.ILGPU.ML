@@ -68,6 +68,11 @@
 .models .meta { grid-area: meta; font-size: .78rem; color: #8893a0; font-variant: tabular-nums; }
 .models .note { grid-area: note; font-size: .8rem; color: #5b6470; }
 
+.models li.selectable { cursor: pointer; transition: border-color .12s, box-shadow .12s, transform .04s; }
+.models li.selectable:hover { border-color: #1768f0; box-shadow: 0 1px 6px rgba(23,104,240,.12); }
+.models li.selectable:active { transform: translateY(1px); }
+.picker-list { margin-top: .25rem; }
+
 .fineprint { font-size: .8rem; color: #8893a0; margin-top: .9rem; }
 
 /* ── Buttons ── */

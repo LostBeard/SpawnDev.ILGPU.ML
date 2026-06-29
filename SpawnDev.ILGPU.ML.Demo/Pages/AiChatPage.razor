@@ -3,12 +3,13 @@
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Pipelines
 @using SpawnDev.ILGPU.ML.Preprocessing
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.WebTorrent
 @using SpawnDev.BlazorJS
-@using SpawnDev.BlazorJS.JSObjects
-@using SpawnDev.BlazorJS.Toolbox
-@using JsFile = SpawnDev.BlazorJS.JSObjects.File
 @implements IAsyncDisposable
 @inject BlazorJSRuntime JS
+@inject WebTorrentClient WebTorrent
+@inject HttpClient Http
 
 <PageTitle>AI Chat — on-device LLM</PageTitle>
 
@@ -16,39 +17,33 @@
     <header class="hdr">
         <h1>AI Chat <span class="badge">100% on-device</span></h1>
         <p class="sub">Chat with a quantized GGUF language model running entirely in your browser on WebGPU — your
-            text never leaves your device. Load a model below to begin.</p>
+            text never leaves your device. The weights stream peer-to-peer from the SpawnDev hub and are cached
+            in your browser; pick a model to begin.</p>
     </header>
 
     @if (_state == LoadState.Idle)
     {
         <div class="optin">
-            <h2>Load a model</h2>
+            <h2>Choose a model</h2>
             <p>
-                Pick a <code>.gguf</code> model file from your device. The weights stream straight to the GPU as the
-                file is read — nothing is uploaded to any server. Small instruct models (a few hundred MB) work well;
-                you can grab them from Hugging Face or your local Ollama cache.
+                The model downloads from the SpawnDev hub (pulled from Hugging Face, seeded over WebTorrent) and is
+                cached in your browser — manage or evict it on the <a href="/cache">Model Cache</a> page. Loading
+                starts streaming straight to the GPU as soon as the download begins; you don't wait for the full file.
             </p>
-
-            <div class="picker">
-                <button class="primary" @onclick="OpenPicker">Choose a .gguf model file…</button>
-                <input @ref="_fileInputRef" type="file" accept=".gguf" class="hidden-file" />
-            </div>
-
-            <h3>Tested models</h3>
-            <ul class="models">
-                @foreach (var m in _tested)
+            <ul class="models picker-list">
+                @foreach (var m in _models)
                 {
-                    <li class="@(m.Status == "ok" ? "ok" : m.Status == "warn" ? "warn" : "bad")">
+                    <li class="@(m.Status == "ok" ? "ok" : m.Status == "warn" ? "warn" : "bad") selectable" @onclick="() => LoadModelAsync(m)">
                         <span class="dot"></span>
-                        <span class="name">@m.Name</span>
+                        <span class="name">@m.Label</span>
                         <span class="meta">@m.Arch · @m.Size</span>
                         <span class="note">@m.Note</span>
                     </li>
                 }
             </ul>
             <p class="fineprint">
-                Status reflects what we've verified end-to-end. ✅ generates correctly; ⚠️ loads but output is being
-                worked on. Loading any other GGUF text model is fair game — it doubles as a compatibility test.
+                ✅ verified end-to-end (generates correctly on WebGPU); ⚠️ loads &amp; runs but output is being
+                refined. First load of a model downloads it (hundreds of MB) — later loads use the browser cache.
             </p>
         </div>
     }
@@ -57,6 +52,7 @@
         <div class="loading">
             <div class="spinner"></div>
             <p>@_status</p>
+            <button class="link" @onclick="CancelLoad">Cancel</button>
         </div>
     }
     else if (_state == LoadState.Error)
@@ -71,7 +67,7 @@
     {
         <div class="chat">
             <div class="bar">
-                <span class="model-tag">@_modelName <span class="fmt">@_arch · @_chatFormat</span></span>
+                <span class="model-tag">@_modelLabel <span class="fmt">@_arch · @_chatFormat</span></span>
                 <span class="accel">@_acceleratorName</span>
                 <button class="link" @onclick="ResetChat" disabled="@_busy">New conversation</button>
                 <button class="link" @onclick="BackToIdle" disabled="@_busy">Switch model</button>
@@ -105,26 +101,28 @@
     LoadState _state = LoadState.Idle;
     string _status = "";
 
-    // Curated, HONEST status of the small models we've actually run (see DEMO_AND_MODEL_STATUS.md).
-    record TestedModel(string Name, string Arch, string Size, string Status, string Note);
-    readonly List<TestedModel> _tested = new()
+    // The models served via the hub (Hugging Face GGUF repos, streamed over WebTorrent). HONEST status — see
+    // DEMO_AND_MODEL_STATUS.md. Repo/File are the Hugging Face coordinates HubModelStream.OpenAsync streams.
+    sealed record ModelOption(string Label, string Repo, string File, string Size, string Arch, string Status, string Note);
+    readonly List<ModelOption> _models = new()
     {
-        new("qwen2.5:0.5b-instruct (q8_0)", "qwen2", "~0.5 GB", "ok",   "✅ verified — coherent on WebGPU"),
-        new("qwen2.5:0.5b-instruct (q4_K_M)", "qwen2", "~0.4 GB", "ok", "✅ verified (Q5_0 weights supported)"),
-        new("smollm2:360m", "llama", "~0.4 GB", "ok",   "✅ verified — coherent (BPE tokenizer fix)"),
-        new("gemma3:270m", "gemma3", "~0.3 GB", "warn", "⚠️ coherent (chat-format + scale fix); refining vs ollama"),
+        new("Qwen2.5 0.5B Instruct (Q8_0)", "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf",
+            "~0.5 GB", "qwen2", "ok", "✅ verified — coherent on WebGPU"),
+        new("SmolLM2 360M Instruct (Q8_0)", "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF", "smollm2-360m-instruct-q8_0.gguf",
+            "~0.4 GB", "llama", "ok", "✅ verified — coherent (BPE tokenizer fix)"),
+        new("Gemma 3 270M (Q8_0)", "ggml-org/gemma-3-270m-GGUF", "gemma-3-270m-Q8_0.gguf",
+            "~0.3 GB", "gemma3", "warn", "⚠️ coherent; arch tuning in progress"),
     };
 
-    ElementReference _fileInputRef;
     ElementReference _transcriptRef;
-    HTMLInputElement? _fileInput;
-    bool _pickerWired;
 
     global::ILGPU.Context? _context;
     Accelerator? _accelerator;
     GgufTextGenerationPipeline? _pipeline;
+    HubModelStream.HubModel? _openModel; // keep the hub stream alive for the session
+    System.Threading.CancellationTokenSource? _loadCts;
     string _acceleratorName = "";
-    string _modelName = "";
+    string _modelLabel = "";
     string _arch = "";
     string _chatFormat = "";
 
@@ -135,39 +133,12 @@
     bool _busy;
     string _streaming = "";
 
-    protected override void OnAfterRender(bool firstRender)
-    {
-        // The file input only exists while we're on the Idle panel; (re)wire it whenever it appears.
-        if (_state == LoadState.Idle && !_pickerWired)
-        {
-            _pickerWired = true;
-            _fileInput = new HTMLInputElement(_fileInputRef);
-            _fileInput.OnChange += OnFilePicked;
-        }
-    }
-
-    void OpenPicker() => _fileInput?.Click();
-
-    async void OnFilePicked(Event ev)
-    {
-        JsFile? file = null;
-        using (var files = _fileInput!.Files) file = files != null && files.Length > 0 ? files[0] : null;
-        if (file == null) return;
-        if (!file.Name.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
-        {
-            Fail("Please choose a .gguf model file.");
-            await InvokeAsync(StateHasChanged);
-            return;
-        }
-        await LoadModelAsync(file);
-    }
-
-    async Task LoadModelAsync(JsFile file)
+    async Task LoadModelAsync(ModelOption model)
     {
         _state = LoadState.Loading;
-        _pickerWired = false; // input element is leaving the DOM
-        _modelName = file.Name;
+        _modelLabel = model.Label;
         _status = "Initializing WebGPU…";
+        _loadCts = new System.Threading.CancellationTokenSource();
         await InvokeAsync(StateHasChanged);
         try
         {
@@ -182,21 +153,28 @@
                 JS.Log($"[AiChat] accelerator: {_acceleratorName}");
             }
 
-            // A browser File is a Blob → BlobStream is a SEEKABLE async stream (Blob.slice random access), so the
-            // weights stream straight to the GPU; the whole file is never held in .NET memory.
-            var blob = new BlobStream(file);
-            _status = $"Loading {file.Name} ({file.Size / (1024 * 1024)} MB) — streaming weights to the GPU…";
+            // Stream the GGUF from the hub. The returned stream is SEEKABLE and downloads on demand — the weights
+            // stream to the GPU AS the file downloads (no waiting for the whole file or for the hub to finish
+            // caching). The torrent stays in the WebTorrent client's OPFS store for fast later loads (managed on
+            // the /cache page).
+            var hub = new HubModelStream(WebTorrent, Http) { PrepareTimeout = TimeSpan.FromMinutes(15) };
+            _status = $"Streaming {model.Label} ({model.Size}) from the hub to the GPU…";
             await InvokeAsync(StateHasChanged);
+            _openModel?.Stream.Dispose();
+            _openModel = await hub.OpenAsync(model.Repo, model.File, deselect: false, _loadCts.Token);
 
-            _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, blob, maxSeqLen: 4096,
-                onProgress: (stage, pct) => { _status = $"{stage} {pct}%"; InvokeAsync(StateHasChanged); });
+            _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, _openModel.Stream,
+                maxSeqLen: 4096,
+                onProgress: (stage, pct) => { _status = $"{Humanize(stage)} {pct}%"; InvokeAsync(StateHasChanged); },
+                ct: _loadCts.Token);
             _arch = _pipeline.Architecture;
             _chatFormat = _pipeline.ChatFormat.ToString();
             _messages.Clear();
             _state = LoadState.Ready;
             _status = "";
-            JS.Log($"[AiChat] ready: arch={_arch} format={_chatFormat}");
+            JS.Log($"[AiChat] ready: {model.Label} arch={_arch} format={_chatFormat}");
         }
+        catch (OperationCanceledException) { BackToIdle(); }
         catch (Exception ex)
         {
             JS.LogError($"[AiChat] load failed: {ex.GetType().Name}: {ex.Message}");
@@ -205,15 +183,26 @@
         await InvokeAsync(StateHasChanged);
     }
 
+    static string Humanize(string stage) => stage switch
+    {
+        "parse" => "Reading model header",
+        "build_graph" => "Building compute graph",
+        "upload" or "weights" => "Streaming weights to GPU",
+        _ => stage,
+    };
+
     void Fail(string msg) { _status = msg; _state = LoadState.Error; }
+
+    void CancelLoad() { _loadCts?.Cancel(); }
 
     void BackToIdle()
     {
         _pipeline?.Dispose();
         _pipeline = null;
+        _openModel?.Stream.Dispose();
+        _openModel = null;
         _messages.Clear();
         _state = LoadState.Idle;
-        _pickerWired = false; // re-wire the picker on next render
         _status = "";
     }
 
@@ -232,8 +221,6 @@
         StateHasChanged();
         await ScrollToBottom();
 
-        // Build the multi-turn conversation; the pipeline applies the model's chat template + reuses the KV
-        // prefix across turns.
         var convo = _messages.Select(m => (m.Role, m.Content)).ToList();
         try
         {
@@ -252,15 +239,11 @@
         await ScrollToBottom();
     }
 
-    void ResetChat()
-    {
-        _messages.Clear();
-        _streaming = "";
-    }
+    void ResetChat() { _messages.Clear(); _streaming = ""; }
 
     async Task ScrollToBottom()
     {
-        try { using var el = new HTMLElement(_transcriptRef); el.ScrollTop = el.ScrollHeight; }
+        try { using var el = new SpawnDev.BlazorJS.JSObjects.HTMLElement(_transcriptRef); el.ScrollTop = el.ScrollHeight; }
         catch { /* transcript not mounted yet */ }
     }
 
@@ -268,8 +251,10 @@
     {
         try
         {
-            if (_fileInput != null) { _fileInput.OnChange -= OnFilePicked; _fileInput.Dispose(); }
+            _loadCts?.Cancel();
             _pipeline?.Dispose();
+            // Keep the torrent in the WebTorrent client's OPFS store (fast later loads); just dispose our reader.
+            _openModel?.Stream.Dispose();
             _accelerator?.Dispose();
             _context?.Dispose();
         }
