@@ -34,6 +34,31 @@ namespace PlaywrightMultiTest
         /// </summary>
         private ProjectRunner() { }
 
+        /// <summary>Kill any leftover process whose executable lives under <paramref name="dir"/> — an orphaned
+        /// console test subprocess from a prior run (e.g. one whose parent testhost was killed mid-run) keeps
+        /// running and holds a file lock on the publish output, so the next <c>dotnet publish</c> fails instantly
+        /// with a confusing "Build {project} failed" (a phantom failure that masks the real test results). Matched
+        /// by the project's OWN full directory path, so it never touches another editor's processes.</summary>
+        private static void KillLeftoverProcessesUnder(string dir, string label)
+        {
+            try
+            {
+                var full = System.IO.Path.GetFullPath(dir).TrimEnd('\\', '/');
+                foreach (var p in Process.GetProcesses())
+                {
+                    string? path = null;
+                    try { path = p.MainModule?.FileName; } catch { /* access denied / already exited */ }
+                    if (path != null && path.StartsWith(full, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { LogStatus($"Killing leftover process under {label}: PID {p.Id} ({path})"); p.Kill(true); p.WaitForExit(3000); }
+                        catch { /* best effort */ }
+                    }
+                    p.Dispose();
+                }
+            }
+            catch { /* best-effort cleanup; never block the build on it */ }
+        }
+
         private static async Task<int> RunDotnetAsync(string args, string workingDir, int timeoutMs = 300000)
         {
             LogStatus($"RunDotnetAsync: dotnet {args.Split(' ')[0]} (timeout={timeoutMs/1000}s)");
@@ -356,6 +381,9 @@ namespace PlaywrightMultiTest
 
                     // build a publish version of the app for testing.
                     // Same MSBuild-worker resilience as the Blazor branch above.
+                    // First kill any orphaned subprocess from a prior run still running out of this project's
+                    // output dir — it locks the publish binary and would make this publish fail instantly.
+                    KillLeftoverProcessesUnder(project.Directory, project.Name);
                     LogStatus($"Publishing {project.Name}...");
                     var pubResult = await RunDotnetAsync($"publish \"{project.CsprojPath}\" -c Release -p:BuildInParallel=false -maxcpucount:1", project.Directory).ConfigureAwait(false);
                     LogStatus($"Publish {project.Name}: exit={pubResult}");
