@@ -22,7 +22,8 @@
 | `/clip` | Zero-shot classification (CLIP) | ✅ **VERIFIED** | `Pipeline_CLIP_Reference_CatIsTopMatch`, `Reference_CLIPVision_MatchesOnnxRuntime` |
 | `/remove-bg` | Background removal (RMBG) | ✅ **VERIFIED** | `Pipeline_BackgroundRemoval_RealImage_ProducesVaryingMask` (perf caveats on WebGPU compile) |
 | `/super-res` | Super-resolution (ESPCN) | ✅ **VERIFIED** | `CreateFromFile_SuperResolution_ESPCN`, `HF_DownloadAndLoadSession_SuperResolution` |
-| `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP) |
+| `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | Transformers.js-style `GgufTextGenerationPipeline`: pick a `.gguf` → `BlobStream`→`CreateFromStreamAsync`→streaming chat on WebGPU. Engine verified on CUDA (qwen2.5:0.5b q8_0/q4_K_M ✅ coherent; smollm2:360m ✅ coherent after BPE-merge fix; gemma3:270m coherent, residual loop). Page mounts clean (Playwright, 0 console errors). In-browser file-pick→generate E2E = manual confirm (no model delivery in PMT yet) |
+| `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP). NOTE: superseded by `/ai-chat` for real LLM chat — candidate to retire |
 | `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Pipeline_SemanticSearch_SimilarSentencesCloser` (DistilBERT) |
 | `/inspector` | Model Inspector (structure + compat) | ✅ **VERIFIED** | Streams ONNX structure-only; GPT-2 100% compat after registry fix; inspect-by-URL live-hub test |
 | `/benchmark` | GPU benchmark | ✅ **VERIFIED** | MatMul / perf kernels (92-101 GFLOPS validated) |
@@ -56,7 +57,7 @@
 | Whisper | ✅ | 🟡 decoder only | full speech E2E pending |
 | SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; not wired into a verified demo page |
 | SD-Turbo | ✅ | 🚧 | no end-to-end image test |
-| GGUF LLMs (Qwen/Gemma/Llama) | ✅ **runs** (desktop) | 🟡 kernels verified | **Autoregressive KV-cache decode VERIFIED** — Example 06 Ollama-compatible server (OpenAI/Ollama/Anthropic APIs, Claude CLI) E2E on CUDA/OpenCL; Ollama-oracle byte-identical; ~51 tok/s on qwen2.5-coder:7b Q4_K_M (4070). Browser: decode kernels pass PMT on WebGPU (`GGUFDecodeKVCache` incremental==full-recompute), full in-browser LLM demo is WIP |
+| GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | **Autoregressive KV-cache decode VERIFIED** — Example 06 Ollama-compatible server (OpenAI/Ollama/Anthropic APIs, Claude CLI) E2E on CUDA/OpenCL; Ollama-oracle byte-identical; ~51 tok/s on qwen2.5-coder:7b Q4_K_M (4070). Quants: Q4_0/Q5_0/Q8_0/Q4_K/Q6_K/MXFP4 (Q5_0 added 2026-06-29, PMT 20/0 all backends). Tokenizer: proper byte-level BPE merges (qwen byte-identical; smollm2 fixed). Archs: qwen2/llama coherent + oracle-matched; gemma3 coherent (residual loop). Browser: `/ai-chat` page streams a GGUF to WebGPU via the pipeline (engine PMT-verified; full in-browser file-pick→generate is manual confirm pending model delivery) |
 
 ## Keeping this honest
 - **Operator count** is rendered live from `OperatorRegistry.BuiltinOpTypes` (the documented single source of truth) — never hardcode it again.
