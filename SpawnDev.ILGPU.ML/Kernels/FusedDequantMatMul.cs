@@ -46,7 +46,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4;
+        ArrayView1D<int, Stride1D.Dense>>? _kernelQ4_0, _kernelQ8_0, _kernelQ4_K, _kernelQ6_K, _kernelMXFP4, _kernelQ5_0;
 
     // ── M=1 (GEMV) coalesced path ──
     // At seq=1 decode, M=1, so the general one-thread-per-output-element kernel above launches only N
@@ -79,7 +79,7 @@ public class FusedDequantMatMul : IDisposable
 
     private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K, _gemvWarpQ6_K;
+        ArrayView1D<int, Stride1D.Dense>>? _gemvQ4_K, _gemvQ6_K, _gemvQ8_0, _gemvQ4_0, _gemvMXFP4, _gemvWarpQ4_K, _gemvWarpQ6_K, _gemvQ5_0;
 
     // Warp-cooperative GEMV (opt-in GGUF_GEMV_V2=1): the default GEMV pays two Group.Barrier() per super-block
     // (scale-decode + before-reuse) plus a shared-mem tree reduction — those syncs cap M=1 decode at ~10% of the
@@ -135,7 +135,7 @@ public class FusedDequantMatMul : IDisposable
     /// loader routes only these to the fused path; everything else dequantizes to F32
     /// on the CPU at load time.</summary>
     public static bool Supports(GGMLType type) =>
-        type is GGMLType.Q4_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K or GGMLType.MXFP4;
+        type is GGMLType.Q4_0 or GGMLType.Q5_0 or GGMLType.Q8_0 or GGMLType.Q4_K or GGMLType.Q6_K or GGMLType.MXFP4;
 
     /// <summary>Elements per quantization block for a supported type.</summary>
     private static int BlockElements(GGMLType type) =>
@@ -270,6 +270,12 @@ public class FusedDequantMatMul : IDisposable
                         ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ4_0Impl);
                     _gemvQ4_0(gemvConfig, input, intView, output, paramsBuf.View);
                     return;
+                case GGMLType.Q5_0:
+                    _gemvQ5_0 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                        ArrayView1D<int, Stride1D.Dense>>(GemvDequantQ5_0Impl);
+                    _gemvQ5_0(gemvConfig, input, intView, output, paramsBuf.View);
+                    return;
                 case GGMLType.MXFP4:
                     _gemvMXFP4 ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
                         ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -334,6 +340,10 @@ public class FusedDequantMatMul : IDisposable
                 _kernelQ4_0 ??= LoadKernel(FusedDequantQ4_0Impl);
                 _kernelQ4_0(M * N, input, intView, output, paramsBuf.View);
                 break;
+            case GGMLType.Q5_0:
+                _kernelQ5_0 ??= LoadKernel(FusedDequantQ5_0Impl);
+                _kernelQ5_0(M * N, input, intView, output, paramsBuf.View);
+                break;
             case GGMLType.Q8_0:
                 _kernelQ8_0 ??= LoadKernel(FusedDequantQ8_0Impl);
                 _kernelQ8_0(M * N, input, intView, output, paramsBuf.View);
@@ -392,6 +402,50 @@ public class FusedDequantMatMul : IDisposable
                 int packed = ReadByte(w, bOff + 2 + j);
                 sum += input[inBase + kBase + j] * (((packed & 0xF) - 8) * d);
                 sum += input[inBase + kBase + j + 16] * (((packed >> 4) - 8) * d);
+            }
+        }
+        output[idx] = sum;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Q5_0: 22 bytes per 32 values — [d:fp16][qh:uint32 LE][16 × packed nibbles].
+    //  Like Q4_0 (element j = low nibble of byte j, j+16 = HIGH nibble of byte j;
+    //  ggml split order), but each value gets a 5th (high) bit from the qh bitmask:
+    //  the bit for element `within` (0..31) is bit `within` of qh, placed at bit 4.
+    //  value = ((nibble | (qhBit << 4)) - 16) * d  (ggml dequantize_row_q5_0).
+    // ─────────────────────────────────────────────────────────────────────────
+    private static void FusedDequantQ5_0Impl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int M = p[0], K = p[1], N = p[2];
+        int m = idx / N;
+        int n = idx % N;
+        if (m >= M) return;
+
+        int blocksPerRow = K / 32;
+        int bytesPerRow = blocksPerRow * 22;
+        int inBase = m * K;
+
+        float sum = 0f;
+        for (int block = 0; block < blocksPerRow; block++)
+        {
+            int bOff = n * bytesPerRow + block * 22;
+            float d = HalfToFloat(ReadByte(w, bOff) | (ReadByte(w, bOff + 1) << 8));
+            // qh: 4 little-endian bytes at bOff+2 → one 32-bit mask of per-element high bits.
+            int qh = ReadByte(w, bOff + 2) | (ReadByte(w, bOff + 3) << 8)
+                   | (ReadByte(w, bOff + 4) << 16) | (ReadByte(w, bOff + 5) << 24);
+            int kBase = block * 32;
+
+            for (int j = 0; j < 16; j++)
+            {
+                int packed = ReadByte(w, bOff + 6 + j);
+                int xhLo = ((qh >> j) & 1) << 4;          // high bit for element j
+                int xhHi = ((qh >> (j + 16)) & 1) << 4;   // high bit for element j+16
+                sum += input[inBase + kBase + j] * ((((packed & 0xF) | xhLo) - 16) * d);
+                sum += input[inBase + kBase + j + 16] * ((((packed >> 4) | xhHi) - 16) * d);
             }
         }
         output[idx] = sum;
@@ -1550,6 +1604,50 @@ public class FusedDequantMatMul : IDisposable
         int packed = ReadByte(w, bOff + 2 + (within & 15));
         int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);  // within>=16 -> high nibble
         return (nib - 8) * d;
+    }
+
+    // ── Q5_0 GEMV (M==1): 22B/32 = [d:fp16][qh:u32][16 nibbles]; el j=low nibble + qh bit j, el j+16=high nibble + qh bit j+16; value=((nib|xh)-16)·d ──
+    private static void GemvDequantQ5_0Impl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<int, Stride1D.Dense> w,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int K = p[1], N = p[2];
+        int n = Grid.IdxX;
+        int tid = Group.IdxX;
+        var sh = SharedMemory.Allocate<float>(GemvGroupSize);
+        float partial = 0f;
+        if (n < N)
+        {
+            int rowBase = n * (K / 32 * 22);
+            for (int k = tid; k < K; k += GemvGroupSize)
+                partial += input[k] * DecodeQ5_0Element(w, rowBase, k);
+        }
+        sh[tid] = partial;
+        Group.Barrier();
+        for (int stride = GemvGroupSize / 2; stride > 0; stride >>= 1)
+        {
+            if (tid < stride) sh[tid] += sh[tid + stride];
+            Group.Barrier();
+        }
+        if (tid == 0 && n < N) output[n] = sh[0];
+    }
+
+    /// <summary>Decode element <paramref name="col"/> of a Q5_0 row (22B/32: [d:fp16][qh:u32][16 nibble bytes];
+    /// el j = low nibble of byte j, el j+16 = high nibble of byte j, each OR'd with its qh high bit at bit 4;
+    /// value = ((nibble | qhBit&lt;&lt;4) - 16)·d).</summary>
+    internal static float DecodeQ5_0Element(ArrayView1D<int, Stride1D.Dense> w, int rowByteBase, int col)
+    {
+        int within = col & 31;                       // 0..31 within the 32-value block
+        int bOff = rowByteBase + (col >> 5) * 22;
+        float d = HalfToFloatFinite(ReadByte(w, bOff) | (ReadByte(w, bOff + 1) << 8));
+        int qh = ReadByte(w, bOff + 2) | (ReadByte(w, bOff + 3) << 8)
+               | (ReadByte(w, bOff + 4) << 16) | (ReadByte(w, bOff + 5) << 24);
+        int packed = ReadByte(w, bOff + 6 + (within & 15));
+        int nib = (within >> 4) == 1 ? (packed >> 4) : (packed & 0xF);  // within>=16 -> high nibble
+        int xh = ((qh >> within) & 1) << 4;          // 5th bit for this element, at bit 4
+        return ((nib | xh) - 16) * d;
     }
 
     /// <summary>Decode element <paramref name="col"/> of a Q4_K-quantized row whose

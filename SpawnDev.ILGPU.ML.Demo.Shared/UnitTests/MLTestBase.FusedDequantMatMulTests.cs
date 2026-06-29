@@ -69,6 +69,8 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task FusedDequantMatMul_MatchesOracle_Q4_0() => await FusedMatMulOracle(GGMLType.Q4_0);
     [TestMethod]
+    public async Task FusedDequantMatMul_MatchesOracle_Q5_0() => await FusedMatMulOracle(GGMLType.Q5_0);
+    [TestMethod]
     public async Task FusedDequantMatMul_MatchesOracle_Q8_0() => await FusedMatMulOracle(GGMLType.Q8_0);
     [TestMethod]
     public async Task FusedDequantMatMul_MatchesOracle_Q4_K() => await FusedMatMulOracle(GGMLType.Q4_K);
@@ -196,6 +198,8 @@ public abstract partial class MLTestBase
 
     [TestMethod]
     public async Task FusedDequantGather_MatchesOracle_Q4_K() => await FusedGatherOracle(GGMLType.Q4_K);
+    [TestMethod]
+    public async Task FusedDequantGather_MatchesOracle_Q5_0() => await FusedGatherOracle(GGMLType.Q5_0);
     [TestMethod]
     public async Task FusedDequantGather_MatchesOracle_Q6_K() => await FusedGatherOracle(GGMLType.Q6_K);
     [TestMethod]

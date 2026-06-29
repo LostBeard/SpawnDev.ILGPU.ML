@@ -1,143 +1,166 @@
-using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.GGUF;
-using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
-using SpawnDev.ILGPU.ML.Tensors;
+using System.Text;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
 /// <summary>
-/// First-class text generation for GGUF chat models (gemma4) on top of <see cref="InferenceSession"/>.
-/// Assembles the proven pieces into one call: the gemma4 chat template
-/// (<see cref="ChatTemplates.BuildGemma4PromptTokens"/>), the O(n) incremental KV-cache decode
-/// (<see cref="InferenceSession.RunDecodeStepAsync"/> + <see cref="GGUFDecodeKVCache"/>), and the
-/// shared <see cref="TextGenerationSampler"/> (greedy / top-k / top-p / repetition penalty via
-/// <see cref="GenerationConfig"/>). Browser-portable (async readback, no sync GPU waits).
+/// First-class, ARCHITECTURE-AGNOSTIC text generation for GGUF chat models on top of
+/// <see cref="InferenceSession"/> + <see cref="GgufGenerator"/>. One call turns a user prompt (or a
+/// multi-turn conversation) into the model's answer: the chat template is auto-detected from the GGUF's
+/// own <c>tokenizer.chat_template</c> + architecture (<see cref="ChatTemplates.DetectChatFormat"/> →
+/// ChatML / Llama3 / gemma4) and applied for you (<see cref="ChatTemplates.BuildChatPrompt"/>), then the
+/// O(n) incremental KV-cache decode + sampler run via the shared <see cref="GgufGenerator"/> (greedy /
+/// top-k / top-p / repetition penalty, KV-prefix reuse, UTF-8-safe streaming, stop tokens + strings).
 ///
-/// Usage:
+/// Modeled on the Transformers.js <c>pipeline('text-generation', model)</c> ergonomics: a single object you
+/// create once and then call with EITHER a raw string OR a list of <c>(role, content)</c> chat messages;
+/// the caller never tokenizes or hand-builds a template. Browser-portable (async readback, no sync GPU
+/// waits). Works for qwen (ChatML), llama/smollm (ChatML/Llama3), gemma4, and any GGUF whose template the
+/// detector recognizes (unknown → ChatML best-effort).
+///
+/// Usage (one-call factory — recommended):
 /// <code>
-/// var model = await GGUFParser.ParseHeaderAsync(stream);          // for tokenizer + attn geometry
-/// using var session = await InferenceSession.CreateFromGGUFFileAsync(acc, path);
-/// using var gen = new GgufTextGenerationPipeline(session, acc, model);
-/// string answer = await gen.GenerateAsync("What is the capital of France?");
+/// using var pipe = await GgufTextGenerationPipeline.CreateFromFileAsync(accelerator, "model.gguf");
+/// string answer = await pipe.GenerateAsync("What is the capital of France?");
+/// // or multi-turn, with streaming:
+/// var msgs = new (string, string)[] { ("system", "You are helpful."), ("user", "Hi!") };
+/// await pipe.GenerateAsync(msgs, onToken: (n, soFar) => { Console.Write(soFar); return Task.CompletedTask; });
 /// </code>
+/// Or wrap an already-loaded session: <c>new GgufTextGenerationPipeline(session, acc, parsedModel)</c>.
 /// </summary>
 public sealed class GgufTextGenerationPipeline : IDisposable
 {
-    private readonly InferenceSession _session;
-    private readonly Accelerator _accelerator;
+    private readonly GgufGenerator _gen;
+    private readonly GGUFModel _model;
     private readonly SentencePieceTokenizer _tokenizer;
-    private readonly GGUFDecodeKVCache _cache;
-    private readonly GpuArgMax _argmax;
-    private readonly int _turnCloseId;
-    private readonly int _eosId;
+    private readonly ChatTemplates.ChatFormat _format;
+    private readonly InferenceSession? _ownedSession; // non-null only when WE created the session (factory path)
 
     /// <summary>The model's tokenizer (SentencePiece, from the GGUF vocab).</summary>
     public SentencePieceTokenizer Tokenizer => _tokenizer;
 
+    /// <summary>The chat format auto-detected from the GGUF (ChatML / Llama3 / gemma4 / Unknown→ChatML).</summary>
+    public ChatTemplates.ChatFormat ChatFormat => _format;
+
+    /// <summary>The model architecture string from the GGUF metadata (e.g. "qwen2", "llama", "gemma3").</summary>
+    public string Architecture => _model.Architecture;
+
+    /// <summary>Default cap on generated tokens when neither the call nor the <see cref="GenerationConfig"/> sets one.</summary>
+    public int MaxNewTokens { get; set; } = 256;
+
     /// <summary>
-    /// Build the pipeline. <paramref name="model"/> is a parsed GGUF header (tokenizer + per-layer
-    /// attention geometry come from it); <paramref name="session"/> is the loaded inference session for
-    /// the same model. Allocates the decode KV-cache (sized to <paramref name="maxSeqLen"/>) and enables
-    /// incremental decode on the session.
+    /// Wrap an already-loaded <paramref name="session"/> for <paramref name="model"/>. The caller OWNS the
+    /// session (this pipeline does NOT dispose it). Allocates the decode KV-cache (sized to
+    /// <paramref name="maxSeqLen"/>) and enables incremental decode via <see cref="GgufGenerator"/>.
     /// </summary>
-    public GgufTextGenerationPipeline(InferenceSession session, Accelerator accelerator, GGUF.GGUFModel model, int maxSeqLen = 4096)
+    public GgufTextGenerationPipeline(InferenceSession session, Accelerator accelerator, GGUFModel model, int maxSeqLen = 4096)
+        : this(session, accelerator, model, maxSeqLen, ownedSession: null) { }
+
+    private GgufTextGenerationPipeline(InferenceSession session, Accelerator accelerator, GGUFModel model,
+        int maxSeqLen, InferenceSession? ownedSession)
     {
-        _session = session ?? throw new ArgumentNullException(nameof(session));
-        _accelerator = accelerator ?? throw new ArgumentNullException(nameof(accelerator));
+        _model = model ?? throw new ArgumentNullException(nameof(model));
         _tokenizer = SentencePieceTokenizer.FromGGUF(model)
             ?? throw new InvalidOperationException("GGUF model has no SentencePiece tokenizer metadata.");
-
-        int nLayers = (int)model.BlockCount, nHeads = (int)model.AttentionHeadCount;
-        int defNKV = (int)model.AttentionHeadCountKV; if (defNKV == 0) defNKV = nHeads;
-        int defHd = nHeads > 0 ? (int)model.EmbeddingLength / nHeads : 0;
-        var kvHeadsArr = new int[nLayers]; var hdArr = new int[nLayers];
-        for (int L = 0; L < nLayers; L++)
-        {
-            var cfg = GGUFGraphBuilder.GetLayerAttnConfig(model, L, nHeads, defNKV, defHd);
-            kvHeadsArr[L] = cfg.NKVHeads; hdArr[L] = cfg.HeadDim;
-        }
-        _cache = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen);
-        _session.EnableGGUFDecode(_cache);
-        // Fixed-shape decode loop: recycle the per-step output buffers (no OOM on long generations) and warm-cache
-        // the proven-stable shape-derived readbacks (skips their GPU round-trips — the browser-readback win). The
-        // cache auto-detects stability (probe→stable→finalize) and falls back to live readback for anything not
-        // proven stable, and this loop consumes each step's logits (argmax) before the next step, satisfying the
-        // output-recycling contract.
-        _session.CacheShapeReadbacks = true;
-
-        _turnCloseId = ChatTemplates.Gemma4TurnCloseId(_tokenizer);
-        _eosId = _tokenizer.EosId;
-        _argmax = new GpuArgMax(accelerator);
+        _format = ChatTemplates.DetectChatFormat(model);
+        _gen = new GgufGenerator(session, accelerator, model, maxSeqLen);
+        _ownedSession = ownedSession;
     }
 
     /// <summary>
-    /// Generate a response to <paramref name="userPrompt"/> using the gemma4 chat template + incremental
-    /// KV-cache decode. Returns the decoded assistant text (includes the model's &lt;|channel&gt;thought
-    /// block, since gemma4 is a thinking model — split on the channel markers if you want only the final
-    /// answer). <paramref name="config"/> selects greedy (default) / top-k / top-p sampling;
-    /// <paramref name="onToken"/> streams (tokenCount, textSoFar) after each token.
+    /// One-call factory: load a GGUF model from a file and build a ready-to-use text-generation pipeline
+    /// (parses the header for the tokenizer + chat format, streams the weights to the GPU, allocates the
+    /// decode cache). The returned pipeline OWNS the underlying session and disposes it on
+    /// <see cref="Dispose"/>. Mirrors Transformers.js <c>pipeline('text-generation', path)</c>.
     /// </summary>
-    public async Task<string> GenerateAsync(string userPrompt, string? systemPrompt = null,
-        int maxNewTokens = 128, GenerationConfig? config = null, Func<int, string, Task>? onToken = null)
+    public static async Task<GgufTextGenerationPipeline> CreateFromFileAsync(Accelerator accelerator, string ggufPath,
+        int maxSeqLen = 4096, Action<string, int>? onProgress = null, CancellationToken ct = default)
     {
-        _session.ResetGGUFDecode();
-        var promptIds = ChatTemplates.BuildGemma4PromptTokens(_tokenizer, systemPrompt, userPrompt, thinking: true);
-        var rng = config?.Seed is int seed ? new Random(seed) : Random.Shared;
-        var generated = new List<int>();
-        int[] stepIds = promptIds;  // prefill = whole prompt, then 1 token/step
-
-        for (int step = 0; step < maxNewTokens; step++)
-        {
-            var idf = new float[stepIds.Length];
-            for (int i = 0; i < stepIds.Length; i++) idf[i] = stepIds[i];
-            using var inBuf = _accelerator.Allocate1D(idf);
-            var outputs = await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
-            { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
-
-            var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
-            int vocab = logitsT.Shape[^1];
-            int seqOut = logitsT.ElementCount / vocab;
-            long lastOff = (long)(seqOut - 1) * vocab;
-            var lastLogits = logitsT.Data.SubView(lastOff, vocab);
-
-            bool sampling = config?.Strategy is "top_k" or "top_p";
-            bool repPen = config?.RepetitionPenalty is float r && r != 1.0f && generated.Count > 0;
-            int next;
-            if (!sampling && !repPen)
-            {
-                // Greedy with no host-side logit edit → argmax ON the GPU, read back one int (not ~1 MB).
-                next = await _argmax.ArgMaxAsync(lastLogits, vocab);
-            }
-            else
-            {
-                // Sampling / repetition-penalty need the full distribution on the host. Browser-portable
-                // readback of the last position's logits (no sync CopyToCPU).
-                using var read = _accelerator.Allocate1D<float>(vocab);
-                await read.View.CopyFromAsync(lastLogits);
-                await _accelerator.SynchronizeAsync();
-                var logits = await read.CopyToHostAsync<float>(0, vocab);
-
-                if (repPen)
-                    TextGenerationSampler.ApplyRepetitionPenalty(logits, generated.ToArray(), config!.RepetitionPenalty);
-                next = config?.Strategy switch
-                {
-                    "top_k" => TextGenerationSampler.TopK(logits, config.TopK, config.Temperature, rng),
-                    "top_p" => TextGenerationSampler.TopP(logits, config.TopP, config.Temperature, rng),
-                    _ => TextGenerationSampler.Greedy(logits),
-                };
-            }
-
-            generated.Add(next);
-            if (onToken != null) await onToken(generated.Count, _tokenizer.Decode(generated.ToArray()));
-            if (next == _turnCloseId || next == _eosId) break;
-            stepIds = new[] { next };
-        }
-
-        return _tokenizer.Decode(generated.ToArray());
+        var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, ggufPath, onProgress, ct).ConfigureAwait(false);
+        GGUFModel model;
+        await using (var fs = new FileStream(ggufPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, useAsync: true))
+            model = await GGUFParser.ParseHeaderAsync(fs, ct).ConfigureAwait(false);
+        return new GgufTextGenerationPipeline(session, accelerator, model, maxSeqLen, ownedSession: session);
     }
 
-    /// <summary>Releases the decode KV-cache + argmax buffers. Does NOT dispose the session or accelerator (caller-owned).</summary>
-    public void Dispose() { _cache.Dispose(); _argmax.Dispose(); }
+    /// <summary>
+    /// One-call factory from a SEEKABLE .gguf stream (browser / hub torrent / OPFS delivery): streams the
+    /// weights to the GPU without ever materializing the whole model as a byte[]. The stream must outlive
+    /// this call and be seekable. The returned pipeline OWNS the session. (The session keeps the stream for
+    /// on-demand small-tensor reads; we parse the header once up front for the tokenizer + chat format.)
+    /// </summary>
+    public static async Task<GgufTextGenerationPipeline> CreateFromStreamAsync(Accelerator accelerator, Stream seekableGguf,
+        int maxSeqLen = 4096, Action<string, int>? onProgress = null, CancellationToken ct = default)
+    {
+        if (!seekableGguf.CanSeek)
+            throw new ArgumentException("CreateFromStreamAsync requires a seekable stream.", nameof(seekableGguf));
+        seekableGguf.Seek(0, SeekOrigin.Begin);
+        var model = await GGUFParser.ParseHeaderAsync(seekableGguf, ct).ConfigureAwait(false);
+        seekableGguf.Seek(0, SeekOrigin.Begin);
+        var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, seekableGguf, onProgress, ct).ConfigureAwait(false);
+        return new GgufTextGenerationPipeline(session, accelerator, model, maxSeqLen, ownedSession: session);
+    }
+
+    /// <summary>
+    /// Generate a response to a multi-turn <paramref name="messages"/> conversation (each entry is a
+    /// <c>(Role, Content)</c> pair; Role is conventionally "system" / "user" / "assistant"). The model's own
+    /// chat template is applied automatically and the assistant turn is generated. <paramref name="onToken"/>
+    /// streams <c>(tokenCount, textSoFar)</c> after each emitted token. Returns the decoded assistant text.
+    /// </summary>
+    public async Task<string> GenerateAsync(IReadOnlyList<(string Role, string Content)> messages,
+        GenerationConfig? config = null, bool thinking = true, Func<int, string, Task>? onToken = null,
+        CancellationToken ct = default)
+    {
+        var (promptIds, stopIds) = ChatTemplates.BuildChatPrompt(_model, _tokenizer, messages, thinking);
+        return await GenerateFromIdsAsync(promptIds, stopIds, config, onToken, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Generate a response to a single <paramref name="userPrompt"/> (optionally with a
+    /// <paramref name="systemPrompt"/>). Convenience over the messages overload for the common one-shot case.
+    /// </summary>
+    public Task<string> GenerateAsync(string userPrompt, string? systemPrompt = null, int maxNewTokens = 0,
+        GenerationConfig? config = null, Func<int, string, Task>? onToken = null, CancellationToken ct = default)
+    {
+        var messages = string.IsNullOrEmpty(systemPrompt)
+            ? new List<(string, string)> { ("user", userPrompt) }
+            : new List<(string, string)> { ("system", systemPrompt!), ("user", userPrompt) };
+        if (maxNewTokens > 0)
+        {
+            config ??= new GenerationConfig();
+            config.MaxNewTokens = maxNewTokens;
+        }
+        return GenerateAsync(messages, config, onToken: onToken, ct: ct);
+    }
+
+    private async Task<string> GenerateFromIdsAsync(int[] promptIds, int[] stopIds, GenerationConfig? config,
+        Func<int, string, Task>? onToken, CancellationToken ct)
+    {
+        // Default the token budget from the pipeline if the caller left it open, so a bare GenerateAsync("...")
+        // doesn't run to the cache limit.
+        if (config == null) config = new GenerationConfig { MaxNewTokens = MaxNewTokens };
+        else if (config.MaxNewTokens is null or <= 0) config.MaxNewTokens = MaxNewTokens;
+
+        var sb = onToken != null ? new StringBuilder() : null;
+        int count = 0;
+        var res = await _gen.GenerateAsync(promptIds, config, stopTokenIds: stopIds,
+            onDelta: onToken == null ? null : async delta =>
+            {
+                sb!.Append(delta);
+                count++;
+                await onToken(count, sb.ToString()).ConfigureAwait(false);
+            },
+            ct: ct).ConfigureAwait(false);
+        return res.Text;
+    }
+
+    /// <summary>Releases the decode KV-cache + argmax buffers, and the session ONLY if this pipeline created
+    /// it (factory path). Never disposes a session/accelerator passed into the constructor (caller-owned).</summary>
+    public void Dispose()
+    {
+        _gen.Dispose();
+        _ownedSession?.Dispose();
+    }
 }

@@ -55,6 +55,32 @@ SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWarpGemv = true;
 // not a compromise; Q6_K still uses the exact warp GEMV above. CUDA only (dp4a inline-PTX). Library-default off.
 SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableDp4aGemv = true;
 
+// --chat-pipe <model-file.gguf | ollama-name> "<prompt>" : dogfood the ONE-CALL, architecture-agnostic
+// GgufTextGenerationPipeline (Transformers.js-style: create once, call with a string or messages; chat
+// template auto-detected + applied for you). Accepts a LOCAL FILE PATH (D:\…\_Models\foo.gguf) or, if that
+// isn't a file, resolves an ollama-cached model name. This is the API the Blazor demo uses.
+if (args.Length >= 1 && args[0] == "--chat-pipe")
+{
+    var arg = args.Length >= 2 ? args[1] : "";
+    var userPrompt = args.Length >= 3 ? args[2] : "What is the capital of France? Answer in one short sentence.";
+    string? ggufPath = File.Exists(arg) ? arg : new OllamaModelStore().Resolve(arg)?.GgufPath;
+    if (ggufPath == null || !File.Exists(ggufPath)) { Console.WriteLine($"Not a .gguf file or cached model: {arg}"); return; }
+
+    using var pctx = MLContext.Create().ToContext();
+    var pcuda = pctx.GetCudaDevices();
+    var pdevice = pcuda.Count > 0 ? (Device)pcuda[0] : pctx.GetPreferredDevice(preferCPU: false);
+    using var pacc = pdevice.CreateAccelerator(pctx);
+    Console.WriteLine($"Accelerator: {pacc.Name}\nLoading: {ggufPath}");
+
+    using var pipe = await GgufTextGenerationPipeline.CreateFromFileAsync(pacc, ggufPath, maxSeqLen: 2048);
+    Console.WriteLine($"arch={pipe.Architecture}  chat-format={pipe.ChatFormat}\n\nResponse: ");
+    var answer = await pipe.GenerateAsync(userPrompt,
+        config: new GenerationConfig { MaxNewTokens = 256, Strategy = "greedy" },
+        onToken: (_, soFar) => { Console.Write($"\r{soFar}"); return Task.CompletedTask; });
+    Console.WriteLine($"\n\n[done] {answer.Trim()}");
+    return;
+}
+
 // --chat <model> "<prompt>" : the server's core generation flow as a CLI — resolve a cached model,
 // build its chat prompt (format auto-detected), generate with stop tokens, stream the answer. Proves
 // the whole chain (Ollama cache → load → chat template → generator) before the HTTP host goes on top.

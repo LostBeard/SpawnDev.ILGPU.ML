@@ -514,6 +514,48 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Gemv_M1_QuantizedQ5_0_MatchesOracle() => await RunTest(async accelerator =>
+    {
+        // Exercises the M==1 coalesced GEMV path for Q5_0 (22B/32: [d][qh:u32][16 nibble bytes]) — the legacy
+        // 5-bit quant used by common q4_K_M GGUFs (e.g. qwen2.5:0.5b's attn/ffn weights). Each value gets a
+        // 5th high bit from the qh bitmask. ggml dequantize_row_q5_0 is the oracle (RefQ5_0).
+        const int M = 1, K = 4096, N = 256;
+        var type = GGMLType.Q5_0;
+        var rng = new Random(50);
+        var input = new float[K];
+        for (int i = 0; i < input.Length; i++) input[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        int bytesPerRow = RowBytes(type, K);
+        var weightBytes = new byte[N * bytesPerRow];
+        var wRows = new float[N][];
+        for (int n = 0; n < N; n++)
+        {
+            var rowBytes = MakeBlocks(type, K, rng);
+            Buffer.BlockCopy(rowBytes, 0, weightBytes, n * bytesPerRow, bytesPerRow);
+            wRows[n] = ReferenceDequant(type, rowBytes, K);
+        }
+
+        var expected = new float[N];
+        for (int n = 0; n < N; n++)
+        {
+            float sum = 0f;
+            for (int k = 0; k < K; k++) sum += input[k] * wRows[n][k];
+            expected[n] = sum;
+        }
+
+        using var inputBuf = accelerator.Allocate1D(input);
+        using var weightBuf = AllocatePadded(accelerator, weightBytes);
+        using var outBuf = accelerator.Allocate1D<float>(N);
+        using var fused = new Kernels.FusedDequantMatMul(accelerator);
+        fused.Forward(inputBuf.View, weightBuf.View, outBuf.View, M, K, N, type);
+        await accelerator.SynchronizeAsync();
+        var got = await outBuf.CopyToHostAsync<float>(0, N);
+
+        AssertCloseQuant(got, expected, 2e-3f, "Gemv quantized Q5_0 M=1");
+        Console.WriteLine($"[Gemv] quantized Q5_0 M=1 K={K} N={N}: matches oracle");
+    });
+
+    [TestMethod]
     public async Task Gemv_M1_QuantizedMXFP4_MatchesOracle() => await RunTest(async accelerator =>
     {
         // Exercises the M==1 coalesced GEMV path for MXFP4 (17B/32: [e:E8M0][16 nibble bytes]).
