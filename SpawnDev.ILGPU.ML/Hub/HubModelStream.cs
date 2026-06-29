@@ -168,8 +168,18 @@ public class HubModelStream
         req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
         using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
-        long size = resp.Content.Headers.ContentRange?.Length ?? resp.Content.Headers.ContentLength ?? -1;
-        if (size <= 0) throw new InvalidOperationException($"Hub web seed did not report a size for {url}.");
+        // Trust ONLY the Content-Range TOTAL (`bytes 0-0/TOTAL`) or, when the server ignored the range and
+        // returned a full 200, the Content-Length. A 206's Content-Length is the PARTIAL size (1 byte for a 0-0
+        // range), so it must NEVER be taken as the file size. NOTE: in the BROWSER, Content-Range is only
+        // readable if the web-seed server exposes it via CORS (Access-Control-Expose-Headers) — otherwise this
+        // probe sees no total and (correctly) fails loudly here instead of silently treating the file as 1 byte.
+        long size = resp.Content.Headers.ContentRange?.Length
+                    ?? (resp.StatusCode == System.Net.HttpStatusCode.OK ? resp.Content.Headers.ContentLength ?? -1 : -1);
+        if (size <= 1)
+            throw new InvalidOperationException(
+                $"Hub web seed did not report a usable file size for {url} (status {(int)resp.StatusCode}, " +
+                $"content-range '{resp.Content.Headers.ContentRange}', content-length {resp.Content.Headers.ContentLength}). " +
+                "In a browser this usually means the /hf endpoint does not expose Content-Range via CORS.");
         return size;
     }
 

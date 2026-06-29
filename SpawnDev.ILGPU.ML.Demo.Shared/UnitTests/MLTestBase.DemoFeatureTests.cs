@@ -402,6 +402,56 @@ public abstract partial class MLTestBase
         }
     });
 
+    // EXACT /ai-chat page path: stream a real GGUF LLM (qwen2.5:0.5b-instruct q8_0) from OUR live hub
+    // (hub.spawndev.com → HF repo, seekable torrent / web-seed) and load it via the architecture-agnostic
+    // GgufTextGenerationPipeline.CreateFromStreamAsync — weights stream straight to the GPU, never held whole in
+    // memory. Then run a real chat turn and assert the answer. This is the in-browser PROOF (runs on WebGPU in the
+    // PMT browser lane) that the demo's hub-delivery + load + generate path works BEFORE TJ touches the demo — the
+    // qwen path is oracle-matched (ollama greedy → "Paris"), so we assert the answer mentions Paris.
+    // HeavyModel: ~0.5 GB fetched via the hub + GPU compile + decode — gated out of the fast loop.
+    [TestMethod(Timeout = 600000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task Pipeline_GgufLLM_ViaHubStream_AnswersParis() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+        const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
+
+            var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
+            if (model.Length < 100_000_000)
+                throw new Exception($"hub GGUF length={model.Length}, expected ~500MB");
+
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token))
+            {
+                Console.WriteLine($"[GgufLLM/hub] loaded arch={pipe.Architecture} format={pipe.ChatFormat}");
+                var messages = new[] { ("user", "What is the capital of France? Answer in one short sentence.") };
+                var answer = await pipe.GenerateAsync(messages,
+                    config: new GenerationConfig { MaxNewTokens = 24, Strategy = "greedy" }, ct: cts.Token);
+                Console.WriteLine($"[GgufLLM/hub] answer='{answer.Trim()}'");
+
+                if (string.IsNullOrWhiteSpace(answer))
+                    throw new Exception("GGUF LLM via hub produced empty output");
+                if (!answer.Contains("Paris", StringComparison.OrdinalIgnoreCase))
+                    throw new Exception($"GGUF LLM via hub answer did not mention Paris (oracle): '{answer.Trim()}'");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
+
     // ═══════════════════════════════════════════════════════════
     //  Diffusion scheduler math (SD-Turbo) — CPU-only regression guard
     // ═══════════════════════════════════════════════════════════
