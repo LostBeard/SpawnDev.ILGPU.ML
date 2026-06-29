@@ -164,23 +164,48 @@ public class HubModelStream
     /// <summary>Total size of a hub web-seed resource via a 0-0 range probe (Content-Range '…/TOTAL').</summary>
     private async Task<long> ProbeSizeAsync(string url, CancellationToken ct)
     {
-        using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
-        using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
-        // Trust ONLY the Content-Range TOTAL (`bytes 0-0/TOTAL`) or, when the server ignored the range and
-        // returned a full 200, the Content-Length. A 206's Content-Length is the PARTIAL size (1 byte for a 0-0
-        // range), so it must NEVER be taken as the file size. NOTE: in the BROWSER, Content-Range is only
-        // readable if the web-seed server exposes it via CORS (Access-Control-Expose-Headers) — otherwise this
-        // probe sees no total and (correctly) fails loudly here instead of silently treating the file as 1 byte.
-        long size = resp.Content.Headers.ContentRange?.Length
-                    ?? (resp.StatusCode == System.Net.HttpStatusCode.OK ? resp.Content.Headers.ContentLength ?? -1 : -1);
-        if (size <= 1)
-            throw new InvalidOperationException(
-                $"Hub web seed did not report a usable file size for {url} (status {(int)resp.StatusCode}, " +
-                $"content-range '{resp.Content.Headers.ContentRange}', content-length {resp.Content.Headers.ContentLength}). " +
-                "In a browser this usually means the /hf endpoint does not expose Content-Range via CORS.");
-        return size;
+        // The web seed streams WHILE the hub is still caching the model (the "preparing" state) — proven: a range
+        // request returns the real Content-Range total + serves bytes during preparing. But in the FIRST instants
+        // of a cold model the hub hasn't resolved the total yet, so a 0-0 probe can transiently come back with
+        // status 502/503 or a 206 whose Content-Range total isn't set (leaving only the 1-byte partial
+        // Content-Length). That window closes within seconds (one origin HEAD), so RETRY through it rather than
+        // failing — preserving the download-while-caching design (no waiting for the hub to finish acquiring).
+        var deadline = TimeSpan.FromSeconds(45);
+        var delay = TimeSpan.FromMilliseconds(500);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(deadline);
+        long lastSize = -1; int lastStatus = 0; object? lastCr = null, lastCl = null;
+        try
+        {
+            while (true)
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
+                lastStatus = (int)resp.StatusCode;
+                lastCr = resp.Content.Headers.ContentRange; lastCl = resp.Content.Headers.ContentLength;
+                if (resp.IsSuccessStatusCode)
+                {
+                    // Trust ONLY the Content-Range TOTAL (`bytes 0-0/TOTAL`), or a full-200 Content-Length. A 206's
+                    // Content-Length is the partial (1 byte) — never the file size.
+                    long size = resp.Content.Headers.ContentRange?.Length
+                                ?? (resp.StatusCode == System.Net.HttpStatusCode.OK ? resp.Content.Headers.ContentLength ?? -1 : -1);
+                    if (size > 1) return size;
+                    lastSize = size;
+                }
+                else if (lastStatus is not (502 or 503 or 504))
+                    resp.EnsureSuccessStatusCode(); // a real error (404/403/…) — throw now, don't spin
+                await Task.Delay(delay, cts.Token).ConfigureAwait(false);
+                if (delay < TimeSpan.FromSeconds(3)) delay += TimeSpan.FromMilliseconds(500);
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Hub web seed did not report a usable file size for {url} within {deadline.TotalSeconds:F0}s " +
+                $"(last status {lastStatus}, content-range '{lastCr}', content-length {lastCl}, size {lastSize}). " +
+                "In a browser, also confirm the /hf endpoint exposes Content-Range via CORS.");
+        }
     }
 
     /// <summary>JSON shape of the hub's non-blocking /model | /ollama-model status response.</summary>
