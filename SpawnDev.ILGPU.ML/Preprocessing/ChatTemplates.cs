@@ -162,14 +162,22 @@ public static class ChatTemplates
         Llama3,
         /// <summary>gemma4 turn format (control tokens <c>&lt;|turn&gt;</c> / <c>&lt;turn|&gt;</c>).</summary>
         Gemma4,
+        /// <summary>gemma / gemma2 / gemma3 turn format: <c>&lt;start_of_turn&gt;role\ncontent&lt;end_of_turn&gt;\n</c>
+        /// (role "model" for the assistant; no system role — a system message folds into the first user turn).</summary>
+        Gemma,
     }
 
     /// <summary>Detect the chat format from the model's GGUF <c>tokenizer.chat_template</c> + architecture.</summary>
     public static ChatFormat DetectChatFormat(GGUF.GGUFModel model)
     {
         var t = model.GetMetadataString("tokenizer.chat_template") ?? "";
-        if ((model.Architecture ?? "").StartsWith("gemma4") || t.Contains("<|turn>") || t.Contains("<turn|>"))
+        var arch = model.Architecture ?? "";
+        if (arch.StartsWith("gemma4") || t.Contains("<|turn>") || t.Contains("<turn|>"))
             return ChatFormat.Gemma4;
+        // gemma / gemma2 / gemma3 use the <start_of_turn> template (NOT ChatML — they have no <|im_start|>, so a
+        // ChatML prompt byte-splits into garbage). Detect by the template or the (non-gemma4) gemma architecture.
+        if (t.Contains("<start_of_turn>") || arch.StartsWith("gemma"))
+            return ChatFormat.Gemma;
         if (t.Contains("<|im_start|>")) return ChatFormat.ChatML;
         if (t.Contains("<|start_header_id|>")) return ChatFormat.Llama3;
         return ChatFormat.Unknown;
@@ -194,6 +202,30 @@ public static class ChatTemplates
             ids.AddRange(tok.Encode("\n"));
         }
         if (addGenerationPrompt) { EmitMarker(ids, tok, "<|im_start|>"); ids.AddRange(tok.Encode("assistant\n")); }
+        return ids.ToArray();
+    }
+
+    /// <summary>Build gemma / gemma2 / gemma3 prompt token ids: <c>&lt;bos&gt;</c> then per turn
+    /// <c>&lt;start_of_turn&gt;role\ncontent&lt;end_of_turn&gt;\n</c> (assistant → "model"). Gemma has no system
+    /// role, so a leading system message is folded into the first user turn (the standard gemma convention).</summary>
+    public static int[] BuildGemmaPromptTokens(SentencePieceTokenizer tok,
+        IReadOnlyList<(string Role, string Content)> messages, bool addGenerationPrompt = true)
+    {
+        var ids = new List<int>();
+        EmitMarker(ids, tok, "<bos>");
+        string? pendingSystem = null;
+        foreach (var (role, content) in messages)
+        {
+            if (role == "system") { pendingSystem = pendingSystem == null ? content : pendingSystem + "\n\n" + content; continue; }
+            string gemmaRole = role == "assistant" ? "model" : "user";
+            string text = content;
+            if (gemmaRole == "user" && pendingSystem != null) { text = pendingSystem + "\n\n" + content; pendingSystem = null; }
+            EmitMarker(ids, tok, "<start_of_turn>");
+            ids.AddRange(tok.Encode($"{gemmaRole}\n{text}"));
+            EmitMarker(ids, tok, "<end_of_turn>");
+            ids.AddRange(tok.Encode("\n"));
+        }
+        if (addGenerationPrompt) { EmitMarker(ids, tok, "<start_of_turn>"); ids.AddRange(tok.Encode("model\n")); }
         return ids.ToArray();
     }
 
@@ -376,6 +408,9 @@ public static class ChatTemplates
 
         switch (format)
         {
+            case ChatFormat.Gemma:
+                return (BuildGemmaPromptTokens(tok, messages),
+                        Ids(tok, "<end_of_turn>"));
             case ChatFormat.Llama3:
                 return (BuildLlama3PromptTokens(tok, messages),
                         Ids(tok, "<|eot_id|>", "<|eom_id|>"));

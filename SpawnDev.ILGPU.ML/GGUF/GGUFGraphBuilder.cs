@@ -251,7 +251,16 @@ public static class GGUFGraphBuilder
                 ["seq_major_kv"] = JsonSerializer.SerializeToElement(1L),
             };
             if (gemmaAttn)
-                faAttrs["scale"] = JsonSerializer.SerializeToElement(1.0f);
+            {
+                // gemma4 folds the 1/sqrt(head_dim) into its QK-norm → attention scale 1.0. gemma2/3 instead
+                // scale the query by 1/sqrt(query_pre_attn_scalar) (HF default = head_dim) AFTER the QK-norm, so
+                // their softmax scale is 1/sqrt(query_pre_attn_scalar), NOT 1.0. Forcing 1.0 on gemma3 makes the
+                // scores ~16x too large (head_dim 256 → sqrt 16) → softmax saturates → garbage generation.
+                float gemmaScale = arch.StartsWith("gemma4", StringComparison.Ordinal)
+                    ? 1.0f
+                    : 1f / MathF.Sqrt(model.GetMetadataFloat($"{model.Architecture}.attention.query_pre_attn_scalar", hd));
+                faAttrs["scale"] = JsonSerializer.SerializeToElement(gemmaScale);
+            }
             // Attention sinks (gpt-oss): a per-head learned logit ([n_head]) added to the softmax
             // denominator (0 value contribution). Presence-based 4th input; absent elsewhere.
             var sinksTensor = FindTensor(model, $"{pfx}.attn_sinks");
