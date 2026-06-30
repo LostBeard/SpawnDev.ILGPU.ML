@@ -804,6 +804,29 @@ public class GlobalAvgPoolOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── Reductions ──
 
+// Shared reduce-axis resolution. ONNX semantics: opset-18 takes `axes` as input[1]; opset<=17 as the
+// `axes` attribute; when axes are ABSENT the default is to reduce ALL axes (NOT the last dim — that was a
+// latent bug that bit axes-as-input models like DAv3's RoPE ReduceMax), unless noop_with_empty_axes=1
+// (then it's an identity, returned as an empty axis set).
+internal static class ReduceOps
+{
+    public static int[] ResolveAxes(OnnxOpContext ctx, int rank)
+    {
+        long[] axes = System.Array.Empty<long>();
+        if (ctx.InputNames.Length > 1 && !string.IsNullOrEmpty(ctx.InputNames[1]))
+        {
+            var v = ctx.TryGetInputValues(1);
+            if (v != null && v.Length > 0) axes = v.Select(x => (long)MathF.Round(x)).ToArray();
+        }
+        if (axes.Length == 0) axes = ctx.GetLongs("axes");
+        if (axes.Length == 0)
+            return ctx.GetInt("noop_with_empty_axes", 0) != 0
+                ? System.Array.Empty<int>()
+                : Enumerable.Range(0, rank).ToArray();
+        return axes.Select(a => (int)(a < 0 ? a + rank : a)).OrderBy(a => a).ToArray();
+    }
+}
+
 public class ReduceMeanOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "ReduceMean";
@@ -851,10 +874,9 @@ public class ReduceSumOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
+        var normalizedAxes = ReduceOps.ResolveAxes(ctx, shape.Length);
+        if (normalizedAxes.Length == 0) // noop_with_empty_axes=1 → identity
+        { reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f); return; }
 
         int firstAxis = normalizedAxes[0];
         int lastAxis = normalizedAxes[^1];
@@ -875,10 +897,9 @@ public class ReduceMaxOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
+        var normalizedAxes = ReduceOps.ResolveAxes(ctx, shape.Length);
+        if (normalizedAxes.Length == 0) // noop_with_empty_axes=1 → identity
+        { reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f); return; }
 
         int firstAxis = normalizedAxes[0];
         int lastAxis = normalizedAxes[^1];
@@ -897,10 +918,9 @@ public class ReduceMinOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var shape = ctx.Inputs[0].Shape;
-        var axes = ctx.GetLongs("axes");
-        var normalizedAxes = axes.Length > 0
-            ? axes.Select(a => (int)(a < 0 ? a + shape.Length : a)).OrderBy(a => a).ToArray()
-            : new[] { shape.Length - 1 };
+        var normalizedAxes = ReduceOps.ResolveAxes(ctx, shape.Length);
+        if (normalizedAxes.Length == 0) // noop_with_empty_axes=1 → identity
+        { reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f); return; }
 
         int firstAxis = normalizedAxes[0];
         int lastAxis = normalizedAxes[^1];

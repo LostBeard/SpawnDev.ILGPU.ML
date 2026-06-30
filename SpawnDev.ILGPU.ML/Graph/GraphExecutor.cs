@@ -813,6 +813,38 @@ public class GraphExecutor : IDisposable
                 or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"))
                 runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
 
+            // Runtime Reduce (ReduceMax/Min/Mean/Sum/...): output = input shape with the reduced axes removed
+            // (keepdims=0) or set to 1 (keepdims=1). opset-18 passes axes as input[1]; when axes are absent
+            // the ONNX default is REDUCE ALL (unless noop_with_empty_axes=1) — NOT last-dim. Compile-time
+            // inference can't read the runtime axes input, so resolve here. DAv3 RoPE: ReduceMax over a
+            // 3-D dynamic tensor must collapse to a scalar; the attr-only default left [3,257].
+            if ((node.OpType is "ReduceMax" or "ReduceMin" or "ReduceMean" or "ReduceSum" or "ReduceProd"
+                 or "ReduceL1" or "ReduceL2" or "ReduceSumSquare" or "ReduceLogSum" or "ReduceLogSumExp")
+                && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var rIn = nodeInputs[0]!.Shape; int rRank = rIn.Length;
+                int[] rAx;
+                float[]? rAxV = node.InputNames.Length > 1 && !string.IsNullOrEmpty(node.InputNames[1])
+                    ? runtimeConstants.GetValueOrDefault(node.InputNames[1]) : null;
+                if (rAxV != null && rAxV.Length > 0)
+                    rAx = rAxV.Select(a => (int)MathF.Round(a)).Select(a => a < 0 ? a + rRank : a).ToArray();
+                else if (node.Attributes.TryGetValue("axes", out var rAxObj) && rAxObj is long[] rAl && rAl.Length > 0)
+                    rAx = rAl.Select(a => (int)(a < 0 ? a + rRank : a)).ToArray();
+                else
+                {
+                    bool rNoop = node.Attributes.TryGetValue("noop_with_empty_axes", out var rNop) && Convert.ToInt32(rNop) != 0;
+                    rAx = rNoop ? Array.Empty<int>() : Enumerable.Range(0, rRank).ToArray(); // ONNX default: reduce ALL
+                }
+                bool rKeep = !node.Attributes.TryGetValue("keepdims", out var rKd) || Convert.ToInt32(rKd) != 0;
+                var rOut = new List<int>();
+                for (int i = 0; i < rRank; i++)
+                {
+                    if (Array.IndexOf(rAx, i) >= 0) { if (rKeep) rOut.Add(1); }
+                    else rOut.Add(rIn[i]);
+                }
+                runtimeOutputShapes = new[] { rOut.Count > 0 ? rOut.ToArray() : new[] { 1 } }; // empty => scalar (1 elem)
+            }
+
             // Runtime broadcast re-inference for elementwise/select ops poisoned by an upstream
             // value-dependent placeholder — re-infer the output from the ACTUAL runtime input shapes.
             if ((node.OpType == "Where" || node.OpType == "Cast" || node.OpType == "Add" || node.OpType == "Sub"
@@ -1509,6 +1541,38 @@ public class GraphExecutor : IDisposable
                 or "Erf" or "Exp" or "Sqrt" or "Neg" or "Reciprocal" or "Softplus" or "Elu" or "LeakyRelu"
                 or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"))
                 runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
+
+            // Runtime Reduce (ReduceMax/Min/Mean/Sum/...): output = input shape with the reduced axes removed
+            // (keepdims=0) or set to 1 (keepdims=1). opset-18 passes axes as input[1]; when axes are absent
+            // the ONNX default is REDUCE ALL (unless noop_with_empty_axes=1) — NOT last-dim. Compile-time
+            // inference can't read the runtime axes input, so resolve here. DAv3 RoPE: ReduceMax over a
+            // 3-D dynamic tensor must collapse to a scalar; the attr-only default left [3,257].
+            if ((node.OpType is "ReduceMax" or "ReduceMin" or "ReduceMean" or "ReduceSum" or "ReduceProd"
+                 or "ReduceL1" or "ReduceL2" or "ReduceSumSquare" or "ReduceLogSum" or "ReduceLogSumExp")
+                && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var rIn = nodeInputs[0]!.Shape; int rRank = rIn.Length;
+                int[] rAx;
+                float[]? rAxV = node.InputNames.Length > 1 && !string.IsNullOrEmpty(node.InputNames[1])
+                    ? runtimeConstants.GetValueOrDefault(node.InputNames[1]) : null;
+                if (rAxV != null && rAxV.Length > 0)
+                    rAx = rAxV.Select(a => (int)MathF.Round(a)).Select(a => a < 0 ? a + rRank : a).ToArray();
+                else if (node.Attributes.TryGetValue("axes", out var rAxObj) && rAxObj is long[] rAl && rAl.Length > 0)
+                    rAx = rAl.Select(a => (int)(a < 0 ? a + rRank : a)).ToArray();
+                else
+                {
+                    bool rNoop = node.Attributes.TryGetValue("noop_with_empty_axes", out var rNop) && Convert.ToInt32(rNop) != 0;
+                    rAx = rNoop ? Array.Empty<int>() : Enumerable.Range(0, rRank).ToArray(); // ONNX default: reduce ALL
+                }
+                bool rKeep = !node.Attributes.TryGetValue("keepdims", out var rKd) || Convert.ToInt32(rKd) != 0;
+                var rOut = new List<int>();
+                for (int i = 0; i < rRank; i++)
+                {
+                    if (Array.IndexOf(rAx, i) >= 0) { if (rKeep) rOut.Add(1); }
+                    else rOut.Add(rIn[i]);
+                }
+                runtimeOutputShapes = new[] { rOut.Count > 0 ? rOut.ToArray() : new[] { 1 } }; // empty => scalar (1 elem)
+            }
 
             // Runtime broadcast re-inference for elementwise/select ops poisoned by an upstream
             // value-dependent placeholder — re-infer the output from the ACTUAL runtime input shapes.
