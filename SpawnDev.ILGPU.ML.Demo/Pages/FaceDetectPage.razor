@@ -75,6 +75,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Not a Transformers.js task — faces + landmarks on your GPU." />
+
 </DemoLayout>
 
 <style>
@@ -92,6 +95,19 @@
 </style>
 
 @code {
+    // "Show how" — the actual BlazeFace path this page runs (no Transformers.js equivalent exists).
+    private const string _howToCs = """
+// Load BlazeFace (~0.5MB) from the hub and build the face pipeline on YOUR GPU — no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.BlazeFace, "model.tflite");
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+var pipe = new FaceDetectionPipeline(session, accelerator);
+
+// Detect — boxes + landmarks + confidence per frame, on-device
+var result = await pipe.DetectAsync(rgbaPixels, width: 640, height: 480);
+foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks);
+""";
+
     private string _selectedBackend = "WebGPU";
     private bool _showBoxes = true, _showLandmarks = true, _showConfidence = true;
     private int _faceCount;

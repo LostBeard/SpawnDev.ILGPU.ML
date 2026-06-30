@@ -128,6 +128,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Not a Transformers.js task — 17-keypoint pose on your GPU." />
+
 </DemoLayout>
 
 <style>
@@ -234,6 +237,19 @@
 </style>
 
 @code {
+    // "Show how" — the actual MoveNet pose path this page runs (no Transformers.js equivalent exists).
+    private const string _howToCs = """
+// Load MoveNet from the hub and build the pose pipeline on YOUR GPU — no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.MoveNetLightning, ModelHub.KnownFiles.OnnxModel);
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+var pipe = new PoseEstimationPipeline(session, accelerator);
+
+// Estimate — 17 keypoints (x, y, confidence) per frame, on-device
+var result = await pipe.EstimateAsync(rgbaPixels, width: 640, height: 480);
+foreach (var kp in result.Keypoints) Draw(kp.X, kp.Y, kp.Confidence);
+""";
+
     private string _selectedBackend = "WebGPU";
     private string _modelVariant = "lightning";
     private string _inputMode = "webcam"; // "webcam" or "image"

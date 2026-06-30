@@ -94,11 +94,29 @@
             </div>
         </div>
     }
+
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Transformers.js has no GGUF / local-LLM pipeline — this is on-device, KV-cache LLM chat (Qwen / Gemma / Llama / SmolLM), llama.cpp-class, entirely in the browser." />
 </div>
 
 @code {
     enum LoadState { Idle, Loading, Ready, Error }
     LoadState _state = LoadState.Idle;
+
+    // "Show how" — the actual GGUF chat path this page runs (no Transformers.js equivalent exists).
+    private const string _howToCs = """
+// Stream a GGUF LLM from the hub (WebTorrent / HuggingFace) onto YOUR GPU — weights stream AS they
+// download, KV-cache decode, no server, no ONNX Runtime
+var hub = new HubModelStream(WebTorrent, Http);
+var model = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
+var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, model.Stream, maxSeqLen: 4096);
+
+// Chat — architecture + chat template auto-detected; tokens stream as they decode
+var convo = new[] { ("user", "What is the capital of France?") };
+string answer = await pipe.GenerateAsync(convo,
+    config: new GenerationConfig { MaxNewTokens = 512, Strategy = "greedy" },
+    onToken: (_, soFar) => { Show(soFar); return Task.CompletedTask; });
+""";
     string _status = "";
 
     // The models served via the hub (Hugging Face GGUF repos, streamed over WebTorrent). HONEST status — see

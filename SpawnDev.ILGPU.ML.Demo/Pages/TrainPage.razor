@@ -106,6 +106,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Transformers.js is inference-only — this trains on your GPU in the browser." />
+
 </DemoLayout>
 
 <style>
@@ -159,6 +162,20 @@
 </style>
 
 @code {
+    // "Show how" — the actual GPU training path this page runs (no Transformers.js equivalent — it's inference-only).
+    private const string _howToCs = """
+// Build a small classifier and TRAIN it on YOUR GPU — 784 → 64 → ReLU → numClasses
+var model = new TrainableModel(accelerator);
+model.AddLinear(28 * 28, 64);
+model.AddReLU();
+model.AddLinear(64, numClasses);
+model.Build(maxBatchSize: totalSamples);
+
+// Backpropagation runs on the GPU, in the browser — one step per epoch
+for (int epoch = 0; epoch < 50; epoch++)
+    float loss = await model.TrainStepAsync(inputData, labels, totalSamples, learningRate: 0.01f);
+""";
+
     private string _selectedBackend = "WebGPU";
     private string _selectedClass = "";
     private string _newClassName = "";

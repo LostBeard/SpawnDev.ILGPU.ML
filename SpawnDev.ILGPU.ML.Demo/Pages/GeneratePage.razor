@@ -104,6 +104,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Not a Transformers.js task — Stable Diffusion text→image on your GPU. (Demo coming soon.)" />
+
 </DemoLayout>
 
 <style>
@@ -190,6 +193,20 @@
 </style>
 
 @code {
+    // "Show how" — the actual SD-Turbo text→image path this page runs (no Transformers.js equivalent exists).
+    private const string _howToCs = """
+// Stream the SD-Turbo sub-models (text encoder, U-Net, VAE) from the hub over WebTorrent to YOUR GPU
+var hubStream = new HubModelStream(WebTorrent, Http);
+var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hubStream,
+    onProgress: (stage, pct) => Show($"{stage} {pct}%"));
+
+// Diffusion text→image — runs entirely on-device, no server, no ONNX Runtime
+pipe.NumInferenceSteps = 1;   // SD-Turbo: single step
+pipe.Width = pipe.Height = 512;
+var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a mountain lake at sunset" });
+ShowImage(result.ImageRGBA, result.Width, result.Height);
+""";
+
     private string _selectedBackend = "WebGPU";
     private string _prompt = "";
     private string _negativePrompt = "";

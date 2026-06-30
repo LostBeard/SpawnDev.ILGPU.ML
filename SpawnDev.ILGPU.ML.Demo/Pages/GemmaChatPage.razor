@@ -110,12 +110,32 @@
             </div>
         </div>
     }
+
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Transformers.js has no image-text-to-text pipeline — ours does image AND audio + text, on-device." />
 </div>
 
 @code {
     enum LoadState { Idle, Loading, Ready, Error }
     LoadState _state = LoadState.Idle;
     string _status = "";
+
+    // "Show how" — the actual Gemma 4 multimodal path this page runs (no Transformers.js equivalent exists).
+    private const string _howToCs = """
+// Stream the text + vision/audio (mmproj) GGUF layers from the hub (ollama registry / WebTorrent) to YOUR GPU
+var hub = new HubModelStream(WebTorrent, Http);
+var proj = await hub.OpenOllamaAsync("gemma4", "12b", "projector");
+var text = await hub.OpenOllamaAsync("gemma4", "12b", "model");
+var pipe = await Gemma4MultimodalPipeline.CreateFromStreamsAsync(
+    accelerator, () => Task.FromResult(text.File.CreateReadStream()), proj.Stream);
+
+// Chat over text + image + audio — tokens stream as they decode, all on-device
+var chat = pipe.StartChat(thinking: true);
+string answer = await chat.SendAsync("What's in this picture?",
+    images: new List<ImageInput> { new ImageInput(rgbBytes, width, height) },
+    audio: new List<float[]> { samples16kHzMono }, maxNewTokens: 512,
+    onToken: (n, soFar) => { Show(soFar); return Task.CompletedTask; });
+""";
 
     // Ollama model coordinates (editable in the opt-in panel). The hub's OllamaProxy pulls these layers
     // from registry.ollama.ai, seeds them as torrents, and the WebTorrent client streams them here.

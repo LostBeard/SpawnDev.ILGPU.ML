@@ -72,6 +72,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="Beyond Transformers.js — webcam depth streamed into a live 3D voxel scene." />
+
 </DemoLayout>
 
 <style>
@@ -135,6 +138,22 @@
 @implements IDisposable
 
 @code {
+    // "Show how" — the actual depth + zero-copy GPU render path this page runs (no Transformers.js equivalent exists).
+    private const string _howToCs = """
+// Load Depth Anything V2 Small from the hub and build the depth pipeline on YOUR GPU — no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DepthAnythingV2Small, ModelHub.KnownFiles.OnnxModel);
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
+    inputShapes: new() { ["pixel_values"] = new[] { 1, 3, 518, 518 } });
+var pipe = new DepthEstimationPipeline(session, accelerator, inputSize: 518);
+
+// Estimate depth — the colormapped result STAYS on the GPU and is presented straight to a canvas (zero readback)
+var renderer = CanvasRendererFactory.Create(accelerator);
+renderer.AttachCanvas(canvasEl);
+var (depthBuffer, w, h) = await pipe.EstimateGpuAsync(rgbaPixels, 320, 240);
+await renderer.PresentAsync(depthBuffer);
+""";
+
     private string _selectedBackend = "WebGPU";
     private string _viewMode = "side-by-side";
     private float _depthScale = 3.0f;
