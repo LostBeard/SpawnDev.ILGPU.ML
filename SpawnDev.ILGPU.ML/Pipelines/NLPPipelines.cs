@@ -99,8 +99,26 @@ public class TextClassificationPipeline : IDisposable
     }
 
     /// <summary>
+    /// Classify raw text using a real tokenizer (e.g. WordPiece for BERT/DistilBERT): wraps
+    /// <c>[CLS] + tokenize(text) + [SEP]</c> and runs the GPU classifier. This is the honest
+    /// production path — prefer it over <see cref="ClassifySimpleAsync"/> (a whitespace fallback that
+    /// drops out-of-vocab words). The CLS/SEP ids come from the loaded tokenizer's resolved special
+    /// tokens, falling back to BERT's defaults (101/102) when the tokenizer didn't resolve them.
+    /// </summary>
+    public async Task<TextClassificationResult> ClassifyAsync(string text, LoadedTokenizer tokenizer)
+    {
+        int cls = tokenizer.BosTokenId >= 0 ? tokenizer.BosTokenId : CLS_TOKEN;
+        int sep = tokenizer.EosTokenId >= 0 ? tokenizer.EosTokenId : SEP_TOKEN;
+        var ids = new List<int>(_maxLength) { cls };
+        ids.AddRange(tokenizer.Encode(text));
+        if (ids.Count > _maxLength - 1) ids = ids.Take(_maxLength - 1).ToList(); // leave room for [SEP]
+        ids.Add(sep);
+        return await ClassifyAsync(ids.ToArray());
+    }
+
+    /// <summary>
     /// Classify with raw text using simple whitespace tokenization + BERT special tokens.
-    /// For proper tokenization, use ClassifyAsync(int[] tokenIds) with a WordPiece tokenizer.
+    /// For proper tokenization, use <see cref="ClassifyAsync(string, LoadedTokenizer)"/> (WordPiece).
     /// </summary>
     public async Task<TextClassificationResult> ClassifySimpleAsync(string text, Dictionary<string, int>? vocab = null)
     {
@@ -232,11 +250,35 @@ public class FeatureExtractionPipeline : IDisposable
         };
     }
 
+    /// <summary>
+    /// Embed raw text using a real tokenizer (e.g. WordPiece for BERT): <c>[CLS] + tokenize(text) +
+    /// [SEP]</c> then mean-pool + L2-normalize. The honest path — prefer it over a hash/whitespace
+    /// tokenizer. CLS/SEP come from the loaded tokenizer's resolved special tokens (BERT 101/102 fallback).
+    /// </summary>
+    public async Task<EmbeddingResult> EmbedAsync(string text, LoadedTokenizer tokenizer)
+    {
+        int cls = tokenizer.BosTokenId >= 0 ? tokenizer.BosTokenId : 101;
+        int sep = tokenizer.EosTokenId >= 0 ? tokenizer.EosTokenId : 102;
+        var ids = new List<int>(_maxLength) { cls };
+        ids.AddRange(tokenizer.Encode(text));
+        if (ids.Count > _maxLength - 1) ids = ids.Take(_maxLength - 1).ToList(); // leave room for [SEP]
+        ids.Add(sep);
+        return await EmbedAsync(ids.ToArray());
+    }
+
     /// <summary>Compute cosine similarity between two pre-tokenized texts.</summary>
     public async Task<float> SimilarityAsync(int[] tokenIdsA, int[] tokenIdsB)
     {
         var embA = await EmbedAsync(tokenIdsA);
         var embB = await EmbedAsync(tokenIdsB);
+        return embA.SimilarityTo(embB);
+    }
+
+    /// <summary>Cosine similarity between two raw texts using a real tokenizer (WordPiece).</summary>
+    public async Task<float> SimilarityAsync(string textA, string textB, LoadedTokenizer tokenizer)
+    {
+        var embA = await EmbedAsync(textA, tokenizer);
+        var embB = await EmbedAsync(textB, tokenizer);
         return embA.SimilarityTo(embB);
     }
 

@@ -1,0 +1,223 @@
+@page "/sentiment"
+
+<PageTitle>Sentiment Analysis — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Sentiment Analysis"
+            Description="Classify text sentiment with DistilBERT-SST2 — real WordPiece tokenization, native GPU inference, no server."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="DistilBERT-SST2"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@_isModelLoaded"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="257">
+
+    <div class="sentiment-layout">
+        <div class="sentiment-input">
+            <textarea class="sentiment-textarea" @bind="_text" @bind:event="oninput"
+                      placeholder="Type or paste text to analyze its sentiment..." rows="4"></textarea>
+
+            <div class="sentiment-samples">
+                @foreach (var s in _samples)
+                {
+                    <button class="sample-chip" @onclick="@(() => UseSample(s))">@s</button>
+                }
+            </div>
+
+            <button class="run-btn"
+                    disabled="@(_isModelLoading || _isRunning || string.IsNullOrWhiteSpace(_text))"
+                    @onclick="Analyze">
+                @(_isModelLoading ? "Loading model…" : _isRunning ? "Analyzing…" : "Analyze Sentiment")
+            </button>
+        </div>
+
+        <div class="sentiment-output">
+            @if (_hasResult)
+            {
+                <div class="sentiment-result @(_resultPositive ? "pos" : "neg")">
+                    <div class="sentiment-verdict">@(_resultPositive ? "POSITIVE" : "NEGATIVE")</div>
+                    <div class="sentiment-confidence">@_resultConfidence.ToString("P1") confident</div>
+                    <div class="sentiment-bar">
+                        <div class="sentiment-bar-fill" style="width:@((_resultConfidence * 100).ToString("F0", System.Globalization.CultureInfo.InvariantCulture))%"></div>
+                    </div>
+                </div>
+            }
+            else if (!_isModelLoaded && !_isModelLoading)
+            {
+                <div class="sentiment-hint">Enter text and press <strong>Analyze</strong>. The model (~257&nbsp;MB) downloads on first use.</div>
+            }
+        </div>
+    </div>
+
+    @if (_error != null)
+    {
+        <div class="error-banner">@_error</div>
+    }
+
+    <PrivacyBadge />
+
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — the SAME DistilBERT-SST2 model as Transformers.js, with a real WordPiece tokenizer, native GPU inference, no ONNX Runtime, no server." />
+
+</DemoLayout>
+
+<style>
+    .sentiment-layout {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+        align-items: start;
+    }
+
+    .sentiment-textarea {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.75rem;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.03);
+        color: #e2e8f0;
+        font-size: 0.95rem;
+        font-family: inherit;
+        resize: vertical;
+    }
+
+    .sentiment-samples {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        margin-top: 0.6rem;
+    }
+
+    .sample-chip {
+        padding: 0.3rem 0.65rem;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+        color: #94a3b8;
+        font-size: 0.78rem;
+        cursor: pointer;
+        transition: all 0.15s ease;
+    }
+
+    .sample-chip:hover {
+        background: rgba(139, 92, 246, 0.15);
+        border-color: rgba(139, 92, 246, 0.3);
+        color: #e2e8f0;
+    }
+
+    .run-btn {
+        margin-top: 1rem;
+        padding: 0.6rem 1.5rem;
+        border-radius: 8px;
+        border: none;
+        background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+        color: white;
+        font-weight: 600;
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .run-btn:disabled { opacity: 0.5; cursor: default; }
+    .run-btn:not(:disabled):hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(59, 130, 246, 0.3); }
+
+    .sentiment-result {
+        padding: 1.5rem;
+        border-radius: 12px;
+        text-align: center;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .sentiment-result.pos { background: rgba(34, 197, 94, 0.10); border-color: rgba(34, 197, 94, 0.35); }
+    .sentiment-result.neg { background: rgba(239, 68, 68, 0.10); border-color: rgba(239, 68, 68, 0.35); }
+
+    .sentiment-verdict { font-size: 1.6rem; font-weight: 800; letter-spacing: 0.05em; }
+    .sentiment-result.pos .sentiment-verdict { color: #4ade80; }
+    .sentiment-result.neg .sentiment-verdict { color: #f87171; }
+
+    .sentiment-confidence { color: #cbd5e1; font-size: 0.9rem; margin-top: 0.25rem; }
+
+    .sentiment-bar { margin-top: 0.9rem; height: 10px; border-radius: 5px; background: rgba(255, 255, 255, 0.06); overflow: hidden; }
+    .sentiment-bar-fill { height: 100%; border-radius: 5px; transition: width 0.5s ease; }
+    .sentiment-result.pos .sentiment-bar-fill { background: linear-gradient(90deg, #22c55e, #4ade80); }
+    .sentiment-result.neg .sentiment-bar-fill { background: linear-gradient(90deg, #ef4444, #f87171); }
+
+    .sentiment-hint { color: #94a3b8; font-size: 0.88rem; line-height: 1.5; padding: 1rem; }
+
+    .error-banner {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        border-radius: 8px;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        background: rgba(239, 68, 68, 0.08);
+        color: #fca5a5;
+        font-size: 0.85rem;
+    }
+
+    @@media (max-width: 640px) {
+        .sentiment-layout { grid-template-columns: 1fr; }
+    }
+</style>
+
+@code {
+    // UI state — used by the markup. Infrastructure/logic is in SentimentPage.razor.cs (code-behind).
+    private string _selectedBackend = "WebGPU";
+    private string _text = "";
+    private bool _isRunning;
+    private bool _isModelLoading;
+    private bool _isModelLoaded;
+    private double _modelProgress;
+    private double _inferenceMs;
+    private string? _error;
+
+    private bool _hasResult;
+    private bool _resultPositive;
+    private float _resultConfidence;
+
+    private readonly string[] _samples =
+    {
+        "I love this movie, it was absolutely fantastic!",
+        "This film was terrible, boring, and a waste of time.",
+        "The food was okay, nothing special.",
+        "Best purchase I've made all year — highly recommend!",
+    };
+
+    private void UseSample(string s) { _text = s; _hasResult = false; }
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent (same model).
+    private const string _howToCs = """
+// Load DistilBERT-SST2 + its real WordPiece tokenizer onto YOUR GPU — no server, no ONNX Runtime
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "onnx/model.onnx");
+var tokJson    = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
+var tokenizer  = TokenizerLoader.FromTokenizerJson(Encoding.UTF8.GetString(tokJson)); // builds WordPiece
+using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+var pipe = new TextClassificationPipeline(session, accelerator);
+
+// Classify — [CLS] + WordPiece(text) + [SEP], runs entirely on the GPU
+var r = await pipe.ClassifyAsync("I love this movie!", tokenizer);
+// r.TopLabel == "POSITIVE", r.TopConfidence ≈ 0.9998
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('sentiment-analysis',
+    'Xenova/distilbert-base-uncased-finetuned-sst-2-english',
+    { device: 'webgpu' });
+const out = await pipe('I love this movie!');
+// out: [{ label: 'POSITIVE', score: 0.9998 }]
+""";
+
+    private List<Components.BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "WebGL", DisplayName = "WebGL" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+}
