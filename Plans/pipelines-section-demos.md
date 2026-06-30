@@ -127,18 +127,26 @@ Priority order (cheapest + highest "show how" value first), all reuse `NLPPipeli
 Lower priority / needs a model: text2text-generation, image-feature-extraction, audio-classification,
 zero-shot-object-detection (OWL-ViT), document-QA, zero-shot-audio (CLAP).
 
-### ⚠ PREREQUISITE found 2026-06-30 — WordPiece tokenizer (blocks the BERT NLP demos)
-We have **BPETokenizer + SentencePieceTokenizer** but **NO WordPiece** tokenizer. `TokenizerLoader` parses
-`tokenizer.json` / `vocab.json+merges.txt` but always builds a **BPE** tokenizer (`NLPPipelines.cs`
-`TextClassificationPipeline.ClassifySimpleAsync` literally comments "For real use, a WordPiece tokenizer should
-be used"; `/embeddings` ships a hash-based `SimpleTokenize` = approximate results, a standing honesty caveat).
-So the BERT-family gap demos — **sentiment/text-classification, fill-mask, question-answering, NER** — CANNOT be
-demoed honestly yet (they'd produce meaningless tokens → garbage labels). **Do not ship them with fake
-tokenization.** Prerequisite (Rule 2, fix the library): add a real **WordPiece** tokenizer + wire
-`TokenizerLoader` to build it when `tokenizer.json` `model.type == "WordPiece"`; then these demos (and honest
-`/embeddings`) become feasible. Demos that DON'T need WordPiece can go first: translation (NLLB → SentencePiece),
-summarization (DistilBART → BPE), TTS (SpeechT5), image-segmentation. The text-generation / GGUF demos are
-already honest (BPE/SentencePiece via GGUF).
+### ✅ PREREQUISITE DONE 2026-06-30 — WordPiece tokenizer (unblocks the BERT NLP demos)
+We had **BPETokenizer + SentencePieceTokenizer** but **NO WordPiece** — `TokenizerLoader` always built a **BPE**
+tokenizer, so BERT-family models produced meaningless tokens (`NLPPipelines.cs` literally commented "a WordPiece
+tokenizer should be used"). **FIXED (Rule 2, at the library source):**
+- `Preprocessing/WordPieceTokenizer.cs` — faithful HuggingFace port: BasicTokenizer pass (clean text → CJK
+  spacing → optional lowercase + accent strip → whitespace + punctuation split) then greedy longest-match-first
+  WordPiece with `##` continuation + `[UNK]` fallback + `max_input_chars_per_word`. `Encode()` returns raw ids
+  (no `[CLS]`/`[SEP]`); `LoadedTokenizer.EncodeForModel` adds them via Bos/Eos, same as BPE/SP.
+- `TokenizerLoader.ParseTokenizerJson` now detects `model.type == "WordPiece"`, reads the `BertNormalizer`
+  settings (lowercase / strip_accents / handle_chinese_chars, incl. inside a `Sequence`) + model options
+  (unk_token / continuing_subword_prefix / max_input_chars_per_word), and builds a `WordPieceTokenizer`.
+- Regression test `MLTestBase.WordPieceTokenizerTests.cs` — the canonical HF reference vectors from
+  `test_tokenization_bert.py` (greedy split, lowercase, accent strip, cased→UNK, decode) + a `TokenizerLoader`
+  path test proving the model.type/normalizer wiring builds WordPiece, not BPE. All pass (sanity script + PMT).
+
+**Now feasible to demo honestly:** sentiment/text-classification, fill-mask, question-answering, NER (the BERT
+family). Still also-fine without WordPiece: translation (NLLB → SentencePiece), summarization (DistilBART → BPE),
+TTS (SpeechT5), image-segmentation. NEXT: still owe a real WordPiece-backed `/embeddings` path (it currently
+ships a hash-based `SimpleTokenize` — wire it to `LoadedTokenizer` now that WordPiece exists) and the gap demo
+pages themselves.
 
 ## 5. Sequencing
 1. Build the `/pipelines` landing grid + the reusable **How-to panel component** (renders our C# + the TJS

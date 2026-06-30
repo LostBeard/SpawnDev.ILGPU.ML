@@ -148,17 +148,87 @@ public static class TokenizerLoader
             if (lower.Contains("bos") || lower.Contains("<s>") || lower == "[cls]") bosTokenId ??= id;
         }
 
-        var bpe = new BPETokenizer(vocab, merges.ToArray());
+        // Pick the tokenizer model. BERT-family models (BERT/DistilBERT/ELECTRA/...) declare
+        // model.type == "WordPiece"; everything else here is BPE (GPT-2/CLIP/RoBERTa-style).
+        ITokenizer tokenizer;
+        var modelType = root.TryGetProperty("model", out var modelEl) &&
+                        modelEl.TryGetProperty("type", out var typeEl) &&
+                        typeEl.ValueKind == JsonValueKind.String
+            ? typeEl.GetString() : null;
+
+        if (string.Equals(modelType, "WordPiece", StringComparison.OrdinalIgnoreCase))
+        {
+            var (lower, strip, cjk) = ReadBertNormalizer(root);
+            string unk = "[UNK]", contPrefix = "##";
+            int maxChars = 100;
+            if (root.TryGetProperty("model", out var m))
+            {
+                if (m.TryGetProperty("unk_token", out var u) && u.ValueKind == JsonValueKind.String) unk = u.GetString()!;
+                if (m.TryGetProperty("continuing_subword_prefix", out var p) && p.ValueKind == JsonValueKind.String) contPrefix = p.GetString()!;
+                if (m.TryGetProperty("max_input_chars_per_word", out var mc) && mc.ValueKind == JsonValueKind.Number) maxChars = mc.GetInt32();
+            }
+            tokenizer = new WordPieceTokenizer(vocab, lower, strip, cjk, unk, contPrefix, maxChars);
+        }
+        else
+        {
+            tokenizer = new BPETokenizer(vocab, merges.ToArray());
+        }
 
         return new LoadedTokenizer
         {
-            Tokenizer = bpe,
+            Tokenizer = tokenizer,
             VocabSize = vocab.Count,
             PadTokenId = padTokenId ?? 0,
             EosTokenId = eosTokenId ?? -1,
             BosTokenId = bosTokenId ?? -1,
             SpecialTokens = specialTokens,
         };
+    }
+
+    /// <summary>
+    /// Read BertNormalizer settings from a tokenizer.json root (lowercase / strip_accents /
+    /// handle_chinese_chars). The normalizer may be a BertNormalizer directly or wrapped in a
+    /// Sequence. Defaults match a BERT-uncased model (lowercase + CJK spacing on, accents follow
+    /// lowercase) when the normalizer is absent or a different type.
+    /// </summary>
+    private static (bool lowercase, bool? stripAccents, bool tokenizeChineseChars) ReadBertNormalizer(JsonElement root)
+    {
+        bool lowercase = true;
+        bool? stripAccents = null; // null → WordPieceTokenizer follows lowercase
+        bool cjk = true;
+
+        if (root.TryGetProperty("normalizer", out var norm) && norm.ValueKind == JsonValueKind.Object)
+        {
+            var bert = FindBertNormalizer(norm);
+            if (bert.HasValue)
+            {
+                var b = bert.Value;
+                if (b.TryGetProperty("lowercase", out var lc) && (lc.ValueKind == JsonValueKind.True || lc.ValueKind == JsonValueKind.False))
+                    lowercase = lc.GetBoolean();
+                if (b.TryGetProperty("strip_accents", out var sa) && (sa.ValueKind == JsonValueKind.True || sa.ValueKind == JsonValueKind.False))
+                    stripAccents = sa.GetBoolean();
+                if (b.TryGetProperty("handle_chinese_chars", out var hc) && (hc.ValueKind == JsonValueKind.True || hc.ValueKind == JsonValueKind.False))
+                    cjk = hc.GetBoolean();
+            }
+        }
+        return (lowercase, stripAccents, cjk);
+    }
+
+    private static JsonElement? FindBertNormalizer(JsonElement norm)
+    {
+        if (norm.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String)
+        {
+            if (t.GetString() == "BertNormalizer") return norm;
+            if (t.GetString() == "Sequence" && norm.TryGetProperty("normalizers", out var seq) && seq.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var n in seq.EnumerateArray())
+                {
+                    var found = FindBertNormalizer(n);
+                    if (found.HasValue) return found;
+                }
+            }
+        }
+        return null;
     }
 
     /// <summary>
