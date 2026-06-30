@@ -2,6 +2,22 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+### Fix: GGUF RoPE pairing style is per-architecture (NORM vs NeoX) - fixes llama-arch degenerate output
+
+GGUF inference applied **NeoX / split-half** RoPE to every architecture. That is correct for qwen2/gemma
+(true NeoX), but the **LLaMA lineage** (llama, mistral, minicpm, granite, ...) uses **NORM /
+consecutive-pair** RoPE and ships q/k weights *permuted at conversion* to match it (mirrors llama.cpp
+`llama_model_rope_type`). Applying NeoX to a NORM-permuted model scrambles every q/k channel, producing
+degenerate logits - smollm2:360m looped (`"TheThe answerThe answer the following question:"`) from correct
+tokens while Ollama's identical blob was coherent. Fix: `GGUFGraphBuilder.UsesNormRope(arch)` selects the
+NORM lineage and stamps `interleaved` on the RoPE node (the kernel and operator already supported both
+styles; the builder simply never set it). One place covers prefill, decode, and the KV-cache on all
+backends. Verified on CUDA (smollm2 → "The capital of France is Paris."; qwen2 unregressed); regression
+guard `RopeStyleWiringTests` builds the real graph per arch and asserts each RoPE node's pairing flag. PMT
+GGUF + Rope suites green on all 6 backends.
+
 ## 4.0.0-preview.5 (2026-06-23) - GGUF LLM inference + register attention (CUDA + WebGPU) + ~4.6x decode
 
 Headline: native GPU **GGUF LLM inference** (Qwen / Gemma / Llama, KV-cache decode) with an **Ollama-compatible

@@ -96,7 +96,8 @@ public abstract partial class MLTestBase
     /// graph-builder contract test uses, serialized to real GGUF v3 bytes. K=embd=256 = one
     /// K-quant super-block per row keeps every backend fast while still exercising the full
     /// fused-dequant path end-to-end.</summary>
-    private static byte[] BuildTinyQuantizedLlamaGGUF(int embd, int vocab, int ffn, int ctx, Random rng)
+    private static byte[] BuildTinyQuantizedLlamaGGUF(int embd, int vocab, int ffn, int ctx, Random rng,
+        string arch = "llama")
     {
         // ── Tensor payloads (GGUF storage order: [N rows][K contiguous], ne fastest-first) ──
         byte[] F32Bytes(int count, float center = 0f, float spread = 0.5f)
@@ -133,15 +134,15 @@ public abstract partial class MLTestBase
 
         var metadata = new (string Key, object Value)[]
         {
-            ("general.architecture", "llama"),
+            ("general.architecture", arch),
             ("general.name", "tiny-recompile-test"),
-            ("llama.embedding_length", (uint)embd),
-            ("llama.block_count", 1u),
-            ("llama.attention.head_count", 4u),
-            ("llama.attention.head_count_kv", 4u),
-            ("llama.vocab_size", (uint)vocab),
-            ("llama.feed_forward_length", (uint)ffn),
-            ("llama.context_length", (uint)ctx),
+            ($"{arch}.embedding_length", (uint)embd),
+            ($"{arch}.block_count", 1u),
+            ($"{arch}.attention.head_count", 4u),
+            ($"{arch}.attention.head_count_kv", 4u),
+            ($"{arch}.vocab_size", (uint)vocab),
+            ($"{arch}.feed_forward_length", (uint)ffn),
+            ($"{arch}.context_length", (uint)ctx),
         };
 
         // ── Serialize: GGUF v3, default 32-byte data alignment ──

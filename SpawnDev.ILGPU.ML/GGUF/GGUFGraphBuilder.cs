@@ -520,6 +520,30 @@ public static class GGUFGraphBuilder
     }
 
     /// <summary>
+    /// RoPE pairing convention per architecture, mirroring llama.cpp's
+    /// <c>llama_model_rope_type</c> (src/llama-model.cpp). Two styles exist and are NOT
+    /// interchangeable - the GGUF conversion bakes the matching layout into the q/k weights:
+    /// <list type="bullet">
+    /// <item>NORM ("normal" RoPE, GPT-J style): rotates CONSECUTIVE head-dim pairs (2i, 2i+1).
+    ///   The LLaMA lineage. <c>convert_hf_to_gguf.py</c> PERMUTES wq/wk at conversion so this
+    ///   consecutive-pair rotation reproduces HF's split-half result. → <c>interleaved = 1</c>.</item>
+    /// <item>NeoX style: rotates SPLIT-HALF pairs (i, i + rot/2). qwen/qwen2/gemma/falcon/phi/
+    ///   gpt-oss. Weights are NOT permuted. → <c>interleaved = 0</c> (the kernel default).</item>
+    /// </list>
+    /// Applying NeoX to a NORM (permuted) model scrambles every q/k channel → degenerate logits
+    /// (the smollm2:360m / llama-arch repetition-loop bug). Returns true for the NORM family.
+    /// </summary>
+    public static bool UsesNormRope(string arch) => arch switch
+    {
+        // llama.cpp LLAMA_ROPE_TYPE_NORM group ("operating on pairs of consecutive head values")
+        "llama" or "llama4" or "mistral" or "deci" or "baichuan" or "internlm2" or "minicpm"
+            or "minicpm3" or "xverse" or "olmo" or "olmo2" or "olmoe" or "cohere" or "command-r"
+            or "arctic" or "granite" or "granitemoe" or "exaone" or "refact" or "plamo" => true,
+        // Everything else we build (qwen, qwen2, gemma*, gptoss, ...) is NeoX / split-half.
+        _ => false,
+    };
+
+    /// <summary>
     /// Extract one tensor for GPU loading. ROLE-AWARE routing - the consumer determines
     /// what a correct representation is:
     /// - Quantized + fused-supported (Q4_0/Q8_0/Q4_K/Q6_K) + a consumer with a fused
@@ -670,6 +694,10 @@ public static class GGUFGraphBuilder
                 ["rotary_dim"] = JsonSerializer.SerializeToElement((long)cfg.RotaryDim),
                 ["rows_per_position"] = JsonSerializer.SerializeToElement((long)heads),
                 ["kv_offset"] = JsonSerializer.SerializeToElement(0L),
+                // Pairing style: NORM/consecutive (interleaved=1) for the LLaMA lineage, else
+                // NeoX/split-half (0). MUST match how the GGUF weights were permuted - see UsesNormRope.
+                ["interleaved"] = JsonSerializer.SerializeToElement(
+                    UsesNormRope(model.Architecture.ToLowerInvariant()) ? 1L : 0L),
             };
             var ins = freqFactors != null ? new[] { cur, freqFactors } : new[] { cur };
             AddNode(graph, "RoPE", ins, new[] { roped }, ropeAttrs);
