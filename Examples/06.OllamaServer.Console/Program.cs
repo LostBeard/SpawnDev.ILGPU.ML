@@ -97,11 +97,63 @@ if (args.Length >= 1 && args[0] == "--hparams")
     foreach (var k in new[] { "rope.freq_base", "rope.scaling.factor", "attention.layer_norm_rms_epsilon",
         "attention.layer_norm_epsilon", "logit_scale", "attention.scale", "final_logit_softcapping" })
         Console.WriteLine($"  {a}.{k} = {m.GetMetadataFloat($"{a}.{k}", float.NaN)}");
+    // Per-layer attention config (SWA pattern / rope base / window) — verifies gemma2/3 SWA wiring.
+    int nL = (int)m.GetMetadataInt($"{a}.block_count", 0);
+    int nH = (int)m.GetMetadataInt($"{a}.attention.head_count", 1);
+    int nKV = (int)m.GetMetadataInt($"{a}.attention.head_count_kv", nH);
+    int hd0 = (int)m.GetMetadataInt($"{a}.attention.key_length", nH > 0 ? (int)m.GetMetadataInt($"{a}.embedding_length", 0) / nH : 0);
+    for (int L = 0; L < nL; L++)
+    {
+        var cfg = SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.GetLayerAttnConfig(m, L, nH, nKV, hd0);
+        Console.WriteLine($"  layer[{L,2}] isGlobal={cfg.IsGlobal,-5} ropeBase={cfg.RopeBase,-9} window={cfg.Window,-5} nkv={cfg.NKVHeads} headDim={cfg.HeadDim}");
+    }
     var names = m.Tensors.Select(t => t.Name).ToHashSet();
     Console.WriteLine($"  tie_word_embeddings (NO separate output.weight) = {!names.Contains("output.weight")}");
     foreach (var tn in new[] { "output.weight", "token_embd.weight", "output_norm.weight",
-        "blk.0.attn_q.bias", "blk.0.attn_k.bias", "blk.0.attn_v.bias", "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight" })
+        "blk.0.attn_q.bias", "blk.0.attn_k.bias", "blk.0.attn_v.bias", "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight",
+        "blk.0.post_attention_norm.weight", "blk.0.post_ffw_norm.weight", "blk.0.attn_norm.weight", "blk.0.ffn_norm.weight" })
         Console.WriteLine($"  has {tn} = {names.Contains(tn)}");
+    Console.WriteLine("  blk.0 tensors: " + string.Join(", ", m.Tensors.Where(t => t.Name.StartsWith("blk.0.")).Select(t => t.Name.Substring(6))));
+    // Norm-weight stats: gemma bakes (1+weight) at conversion → stored gains center near 1 (NOT 0).
+    // If a *norm.weight here centers near 0, the +1 fold was NOT baked → we must add it. Full parse for data.
+    var mFull = GGUFParser.Parse(await File.ReadAllBytesAsync(path));
+    foreach (var tn in new[] { "blk.0.attn_norm.weight", "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight",
+        "blk.0.post_attention_norm.weight", "blk.0.ffn_norm.weight", "blk.0.post_ffw_norm.weight", "output_norm.weight" })
+    {
+        var t = mFull.Tensors.FirstOrDefault(x => x.Name == tn);
+        if (t == null) { Console.WriteLine($"  [stats] {tn}: ABSENT"); continue; }
+        var d = mFull.GetTensorFloat32(t);
+        if (d == null || d.Length == 0) { Console.WriteLine($"  [stats] {tn}: (no f32, type={t.Type})"); continue; }
+        double mean = d.Average(); float mn = d.Min(), mx = d.Max();
+        Console.WriteLine($"  [stats] {tn}: type={t.Type} n={d.Length} mean={mean:F4} min={mn:F4} max={mx:F4}");
+    }
+    return;
+}
+
+// --meta <model> : DIAGNOSTIC — dump EVERY GGUF metadata key + CLR type + value (arrays summarized).
+// Used to verify how an arch declares e.g. sliding_window_pattern (int period vs bool array), freq_base_swa.
+if (args.Length >= 1 && args[0] == "--meta")
+{
+    var arg = args.Length >= 2 ? args[1] : "";
+    string? path = File.Exists(arg) ? arg : new OllamaModelStore().Resolve(arg)?.GgufPath;
+    if (path == null || !File.Exists(path)) { Console.WriteLine($"Not found: {arg}"); return; }
+    await using var hs = File.OpenRead(path);
+    var m = await GGUFParser.ParseHeaderAsync(hs);
+    var filter = args.Length >= 3 ? args[2] : null; // optional substring filter
+    Console.WriteLine($"model={Path.GetFileName(path)}  arch={m.Architecture}  ({m.Metadata.Count} keys)");
+    foreach (var (k, v) in m.Metadata.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+    {
+        if (filter != null && !k.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
+        string desc;
+        if (v is Array arr)
+        {
+            var elemType = v.GetType().GetElementType()?.Name ?? "?";
+            var head = arr.Cast<object>().Take(12).Select(o => o?.ToString() ?? "null");
+            desc = $"{elemType}[{arr.Length}] = [{string.Join(", ", head)}{(arr.Length > 12 ? ", …" : "")}]";
+        }
+        else desc = $"{v?.GetType().Name ?? "null"} = {v}";
+        Console.WriteLine($"  {k}: {desc}");
+    }
     return;
 }
 

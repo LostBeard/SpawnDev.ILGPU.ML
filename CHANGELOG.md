@@ -4,6 +4,24 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Fix: gemma3 forward pass - weightless V-norm + sliding-window rope base (fixes factually-wrong output)
+
+gemma3:270m produced fluent but factually WRONG output ("The capital of France is a place where you can
+experience the thrill"; "Paris" ranked 143rd) while Ollama's identical blob answered "Paris". Two distinct
+bugs, both in `GGUFGraphBuilder`:
+- **Weightless V-norm wrongly applied to gemma3 (dominant).** The weightless RMS-norm of V before attention
+  is a gemma4 / gemma3n behavior only; standard Gemma 3 leaves V raw (llama.cpp `src/models/gemma3.cpp` norms
+  Q and K, never V). It was gated on "has QK-norm", which is true for gemma3 too, so we normed V and corrupted
+  the attended values - factual retrieval collapsed while the FFN kept fluency. New `UsesWeightlessVNorm(arch)`
+  gates it to gemma4*/gemma3n. Result: "Paris" rank 143 -> rank 0.
+- **Sliding-window rope base.** gemma3 interleaves a 5:1 local:global layer pattern (period 6); local layers
+  use rope base 10000, globals 1e6. gemma3:270m's GGUF carries neither `sliding_window_pattern` nor
+  `rope.freq_base_swa`, so llama.cpp's hardcoded gemma3 defaults apply. `GetLayerAttnConfig` now defaults
+  gemma2/gemma3 to period 6 + local base 10000 when the GGUF omits them.
+
+Verified on CUDA (gemma3 -> "Paris", matches Ollama greedy; "2+2" -> "2 + 2 = 4"); qwen2/smollm2/gemma4
+unregressed. Guard: `GemmaArchWiringTests`. PMT Gemma 98/0 + GGUF green, all 6 backends.
+
 ### Fix: GGUF RoPE pairing style is per-architecture (NORM vs NeoX) - fixes llama-arch degenerate output
 
 GGUF inference applied **NeoX / split-half** RoPE to every architecture. That is correct for qwen2/gemma

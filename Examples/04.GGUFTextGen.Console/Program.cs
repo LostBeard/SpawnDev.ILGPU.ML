@@ -480,6 +480,28 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
         int last = (seqOut - 1) * vocab, arg = 0; float best = host[last];
         for (int v = 1; v < vocab; v++) if (host[last + v] > best) { best = host[last + v]; arg = v; }
         gen.Add(arg);
+        // DIAGNOSTIC: GGUF_GEN_TOPK=N dumps the top-N next tokens at THIS step; GGUF_FIND=<substr>
+        // reports the logit + rank of every token whose decode contains <substr> (e.g. "Paris").
+        if (step == 0)
+        {
+            var topkEnv = Environment.GetEnvironmentVariable("GGUF_GEN_TOPK");
+            var findEnv = Environment.GetEnvironmentVariable("GGUF_FIND");
+            if (topkEnv != null && int.TryParse(topkEnv, out var topk))
+            {
+                var idx = Enumerable.Range(0, vocab).OrderByDescending(v => host[last + v]).Take(topk).ToArray();
+                Console.WriteLine($"  TOP-{topk}: " + string.Join("  ", idx.Select(v => $"[{v}]'{tok.Decode(new[] { v })}'={host[last + v]:F2}")));
+            }
+            if (findEnv != null)
+            {
+                var ranked = Enumerable.Range(0, vocab).OrderByDescending(v => host[last + v]).ToArray();
+                for (int r = 0; r < ranked.Length; r++)
+                {
+                    var s = tok.Decode(new[] { ranked[r] });
+                    if (s.Contains(findEnv, StringComparison.OrdinalIgnoreCase))
+                    { Console.WriteLine($"  FIND '{findEnv}': token [{ranked[r]}]'{s}' logit={host[last + ranked[r]]:F2} RANK={r}"); if (r > 0) break; }
+                }
+            }
+        }
         // PERF BREAKDOWN (Rule 4 measurement): partition the step into executor-total / readback round-trips /
         // GPU sync-drains / recompile, so we KNOW where decode time goes instead of guessing. The residual
         // (execMs - readbackMs - drainMs) is pure per-node dispatch + CPU + buffer-alloc cost.

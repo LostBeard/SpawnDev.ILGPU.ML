@@ -187,6 +187,8 @@ public static class GGUFGraphBuilder
             // weightless V RMS-norm and (global layers) the rope_freqs NTK factors — all gemma4 behaviors.
             // Absent (llama/mistral/gemma2/...) = standard attention: no QK-norm, no V-norm.
             bool gemmaAttn = FindTensor(model, $"{pfx}.attn_q_norm.weight") != null;
+            // Weightless V RMS-norm is a gemma4 (and gemma3n) behavior ONLY — see UsesWeightlessVNorm.
+            bool gemmaVNorm = gemmaAttn && UsesWeightlessVNorm(arch);
 
             // rope_freqs (NTK / proportional rope) — global (full-attention) gemma4 layers only. Shared
             // model-level tensor; extract once, reference per global layer.
@@ -211,7 +213,7 @@ public static class GGUFGraphBuilder
                 gemmaAttn ? $"{pfx}.attn_k_norm" : null, freqFactors, doRope: true, weightlessNorm: false,
                 skipTranspose: true);
             string vReshaped = EmitAttnHead(graph, model, weights, pfx, "v", vSrc, cfg.NKVHeads, hd, cfg,
-                qkNormTensor: null, freqFactors: null, doRope: false, weightlessNorm: gemmaAttn,
+                qkNormTensor: null, freqFactors: null, doRope: false, weightlessNorm: gemmaVNorm,
                 skipTranspose: true);
 
             // ── Fused masked attention: softmax(QKᵀ·scale [+ causal/SWA mask]) · V in one dispatch ──
@@ -491,18 +493,39 @@ public static class GGUFGraphBuilder
         int[]? IntArr(string k) => model.Metadata.TryGetValue(k, out var v)
             ? (v as int[]) ?? (v is Array arr ? arr.Cast<object>().Select(Convert.ToInt32).ToArray() : null) : null;
 
+        int slidingWindow = (int)model.GetMetadataInt($"{a}.attention.sliding_window", 0);
+
+        // SWA layer selection, in priority order:
+        //  1. explicit per-layer bool array (gemma4 writes sliding_window_pattern as a bool[]),
+        //  2. explicit integer pattern PERIOD (newer convs write it as a u32),
+        //  3. arch default: gemma2/gemma3 interleave a 5:1 local:global pattern (period 6, every
+        //     6th layer global) that llama.cpp HARDCODES (set_swa_pattern(6)) and that the GGUF does
+        //     NOT serialize — so when a model declares a sliding_window but no pattern, default to 6.
+        // (gemma3:270m's GGUF carries neither the pattern nor rope.freq_base_swa — verified via --meta.)
         var pattern = BoolArr($"{a}.attention.sliding_window_pattern");
-        bool isGlobal = pattern == null || layer >= pattern.Length || !pattern[layer];
+        int swaPeriod = (int)model.GetMetadataInt($"{a}.attention.sliding_window_pattern", 0);
+        bool isGemmaSwa = a is "gemma2" or "gemma3";
+        if (swaPeriod <= 0 && slidingWindow > 0 && isGemmaSwa) swaPeriod = 6;
+
+        bool isGlobal;
+        if (pattern != null && layer < pattern.Length) isGlobal = !pattern[layer];
+        else if (swaPeriod > 0) isGlobal = (layer % swaPeriod) == (swaPeriod - 1); // every Nth layer global
+        else isGlobal = true;
 
         var kv = IntArr($"{a}.attention.head_count_kv");
         int nkv = kv != null && layer < kv.Length ? kv[layer]
                 : (int)model.GetMetadataInt($"{a}.attention.head_count_kv", defaultNKV);
         if (nkv <= 0) nkv = defaultNKV;
 
-        int window = isGlobal ? 0 : (int)model.GetMetadataInt($"{a}.attention.sliding_window", 0);
+        int window = isGlobal ? 0 : slidingWindow;
 
         float baseFull = model.GetMetadataFloat($"{a}.rope.freq_base", 10000f);
-        float ropeBase = isGlobal ? baseFull : model.GetMetadataFloat($"{a}.rope.freq_base_swa", baseFull);
+        // SWA (local) layers use a SEPARATE, smaller rope base. gemma2/gemma3 default it to 10000
+        // (llama.cpp rope_freq_base_train_swa) when the GGUF omits rope.freq_base_swa — which gemma3:270m
+        // does. Without this, local layers wrongly rotate at the 1e6 GLOBAL base = corrupted attention
+        // on 5/6 of the layers (the gemma3 repetition-loop residual). NeoX style (set elsewhere per arch).
+        float swaBaseDefault = isGemmaSwa ? 10000f : baseFull;
+        float ropeBase = isGlobal ? baseFull : model.GetMetadataFloat($"{a}.rope.freq_base_swa", swaBaseDefault);
 
         // Resolve the REAL head_dim first (key_length), then default the rope dimension to IT — not to
         // embedDim/nHeads. gpt-oss heads don't tile the embedding (64 heads x 64 != 2880), so the caller's
@@ -542,6 +565,17 @@ public static class GGUFGraphBuilder
         // Everything else we build (qwen, qwen2, gemma*, gptoss, ...) is NeoX / split-half.
         _ => false,
     };
+
+    /// <summary>
+    /// Whether the architecture applies a WEIGHTLESS RMS-norm to V (Vcur) before attention. This is a
+    /// gemma4 / gemma3n behavior ONLY (llama.cpp src/models/gemma4.cpp `Vcur = ggml_rms_norm(Vcur, eps)`).
+    /// Standard Gemma 3 (gemma3.cpp) normalizes Q and K but leaves V RAW ("Vcur proceeds directly to
+    /// attention"). Applying it to gemma3 corrupted the attended values → factual retrieval collapsed
+    /// (rank-143 "Paris", fluent-but-wrong) while the FFN kept fluency. Gemma2 also has no V-norm.
+    /// MUST be gated on arch, NOT on "has QK-norm" (gemma3 AND gemma4 both carry attn_q_norm/attn_k_norm).
+    /// </summary>
+    public static bool UsesWeightlessVNorm(string arch) =>
+        arch.StartsWith("gemma4", StringComparison.Ordinal) || arch == "gemma3n";
 
     /// <summary>
     /// Extract one tensor for GPU loading. ROLE-AWARE routing - the consumer determines
