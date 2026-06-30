@@ -8,6 +8,11 @@
         <p class="vc-description">Talk to your AI dev team. Speech-to-text transcribes your voice, agents respond with distinct voices via text-to-speech. All audio processing runs in your browser.</p>
     </div>
 
+    <div class="demo-status-banner demo-status-soon">
+        <span class="demo-status-tag">Coming soon</span>
+        <span class="demo-status-msg">This is a Phase-1 preview using the browser's built-in Web Speech API — the on-device GPU Whisper voice stack the name implies isn't wired up yet.</span>
+    </div>
+
     <div class="vc-transcript" @ref="_transcriptEl">
         @if (_transcript.Count == 0)
         {

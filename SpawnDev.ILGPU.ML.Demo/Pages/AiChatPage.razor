@@ -109,9 +109,9 @@
         new("Qwen2.5 0.5B Instruct (Q8_0)", "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf",
             "~0.5 GB", "qwen2", "ok", "✅ verified — coherent on WebGPU"),
         new("SmolLM2 360M Instruct (Q8_0)", "HuggingFaceTB/SmolLM2-360M-Instruct-GGUF", "smollm2-360m-instruct-q8_0.gguf",
-            "~0.4 GB", "llama", "ok", "✅ verified — coherent (BPE tokenizer fix)"),
+            "~0.4 GB", "llama", "ok", "✅ verified — coherent (BPE tokenizer + RoPE NORM-style fix)"),
         new("Gemma 3 270M (Q8_0)", "ggml-org/gemma-3-270m-GGUF", "gemma-3-270m-Q8_0.gguf",
-            "~0.3 GB", "gemma3", "warn", "⚠️ coherent; arch tuning in progress"),
+            "~0.3 GB", "gemma3", "ok", "✅ coherent — forward-pass fixed (CUDA-verified vs Ollama; WebGPU graph PMT-green)"),
     };
 
     ElementReference _transcriptRef;

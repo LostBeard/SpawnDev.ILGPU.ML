@@ -7,6 +7,20 @@
         }
     </div>
 
+    @if (Status == DemoStatus.ComingSoon || Status == DemoStatus.Beta)
+    {
+        <div class="demo-status-banner @(Status == DemoStatus.ComingSoon ? "demo-status-soon" : "demo-status-beta")">
+            <span class="demo-status-tag">@(Status == DemoStatus.ComingSoon ? "Coming soon" : "Beta")</span>
+            <span class="demo-status-msg">
+                @(string.IsNullOrEmpty(StatusMessage)
+                    ? (Status == DemoStatus.ComingSoon
+                        ? "This demo is a work in progress — the pipeline isn't wired up end to end yet, so it may not produce a result."
+                        : "This demo runs a real pipeline but isn't fully verified yet — expect rough edges.")
+                    : StatusMessage)
+            </span>
+        </div>
+    }
+
     <div class="demo-toolbar">
         <BackendSelector AvailableBackends="@AvailableBackends"
                          SelectedBackend="@SelectedBackend"
@@ -40,9 +54,17 @@
 </div>
 
 @code {
+    /// <summary>Honest demo-readiness state. Verified = end-to-end tested/working; Beta = real pipeline
+    /// runs but incomplete; ComingSoon = core action is a stub/no-op. Drives the banner + sets expectations.</summary>
+    public enum DemoStatus { Verified, Beta, ComingSoon }
+
     [Parameter] public string Title { get; set; } = "Demo";
     [Parameter] public string? Description { get; set; }
     [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    // Honesty banner (defaults to Verified = no banner; pages opt into Beta/ComingSoon).
+    [Parameter] public DemoStatus Status { get; set; } = DemoStatus.Verified;
+    [Parameter] public string? StatusMessage { get; set; }
 
     // Backend
     [Parameter] public List<BackendSelector.BackendInfo> AvailableBackends { get; set; } = new();

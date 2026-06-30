@@ -42,6 +42,31 @@
     padding-bottom: 0.25rem;
 }
 
+/* Honest demo-status badges: 'soon' = core action is a stub/no-op (don't expect it to work yet);
+   'beta' = the real pipeline runs but is incomplete (placeholder fallback, partial path, or no E2E test). */
+.nav-badge {
+    margin-left: auto;
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.05rem 0.35rem;
+    border-radius: 0.6rem;
+    line-height: 1.2;
+}
+
+.nav-badge-soon {
+    color: #fcd34d;
+    background: rgba(180, 130, 10, 0.25);
+    border: 1px solid rgba(252, 211, 77, 0.4);
+}
+
+.nav-badge-beta {
+    color: #93c5fd;
+    background: rgba(40, 90, 160, 0.22);
+    border: 1px solid rgba(147, 197, 253, 0.35);
+}
+
     .nav-item ::deep a {
         color: #d7d7d7;
         border-radius: 4px;
