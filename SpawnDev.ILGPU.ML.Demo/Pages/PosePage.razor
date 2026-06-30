@@ -44,7 +44,7 @@
         <div class="pose-viewport">
             <WebcamCapture OnFrameCaptured="@HandleFrame"
                            OnFrameDataUrl="@HandleFrameDataUrl"
-                           AutoCapture="true"
+                           AutoCapture="@_isModelLoaded"
                            CaptureIntervalMs="50"
                            ShowCaptureButton="true" />
 
@@ -279,11 +279,9 @@
     private global::ILGPU.Context? _context;
     private Pipelines.PoseEstimationPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: MoveNet is NOT downloaded/loaded on page entry. It loads on the first real
+    // interaction (clicking the webcam capture button, or picking a still image). AutoCapture is
+    // bound to _isModelLoaded so the live webcam only auto-runs once the model is loaded.
 
     private async Task LoadModelAsync()
     {
@@ -351,6 +349,7 @@
     private async Task HandleBackendChange(string backend)
     {
         if (backend == _selectedBackend && _isModelLoaded) return;
+        bool wasLoaded = _isModelLoaded;
         _selectedBackend = backend;
         _keypoints = null;
         _stillImageDataUrl = null;
@@ -358,12 +357,21 @@
         _accelerator?.Dispose();
         _pipeline = null;
         _accelerator = null;
-        await LoadModelAsync();
+        _isModelLoaded = false;
+        // Opt-in: only re-load if the model was already loaded; switching backend before
+        // first use must not trigger a download.
+        if (wasLoaded)
+            await LoadModelAsync();
+        else
+            StateHasChanged();
     }
 
     private async Task HandleFrame(byte[] frameBytes)
     {
-        if (_pipeline == null || _processingFrame) return;
+        if (_processingFrame) return;
+        // Opt-in load: the first captured frame (user clicked Capture) is the first engagement.
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
+        if (_pipeline == null) return;
         _processingFrame = true;
         try
         {
@@ -401,6 +409,8 @@
 
     private async Task HandleStillImageLoaded(byte[] imageBytes)
     {
+        // Opt-in load: pull the model on first use (user picked an image), not on page entry.
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
         if (_pipeline == null) return;
         try
         {

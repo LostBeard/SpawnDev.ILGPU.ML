@@ -113,11 +113,9 @@
     private global::ILGPU.Context? _context;
     private Pipelines.FaceDetectionPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: BlazeFace is NOT downloaded/loaded on page entry. It loads on the first real
+    // interaction (the user clicking the webcam capture button) — see HandleFrame. Once loaded,
+    // AutoCapture (bound to _isModelLoaded) starts the live feed.
 
     private async Task LoadModelAsync()
     {
@@ -154,11 +152,28 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        bool wasLoaded = _isModelLoaded;
+        _pipeline?.Dispose();
+        _pipeline = null;
+        _accelerator?.Dispose();
+        _accelerator = null;
+        _isModelLoaded = false;
+        // Opt-in: only re-load if the model was already loaded; switching backend before
+        // first use must not trigger a download.
+        if (wasLoaded)
+            await LoadModelAsync();
+        else
+            StateHasChanged();
+    }
 
     private async Task HandleFrame(byte[] frameBytes)
     {
-        if (_pipeline == null || _processingFrame) return;
+        if (_processingFrame) return;
+        // Opt-in load: the first captured frame (user clicked Capture) is the first engagement.
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
+        if (_pipeline == null) return;
         _processingFrame = true;
         try
         {

@@ -31,11 +31,8 @@ public partial class StylePage : IDisposable
     private bool _processingFrame;
     private MemoryBuffer2D<int, Stride2D.DenseX>? _lastFrameBuffer;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadStyle("mosaic");
-    }
+    // OPT-IN: no style model is downloaded/loaded on page entry. It loads on the first real
+    // interaction (picking an image, selecting a style, or starting the webcam).
 
     private async Task LoadStyle(string styleName)
     {
@@ -138,6 +135,9 @@ public partial class StylePage : IDisposable
             _rgbaPixels = data.Read<int>();
             _imageWidth = w; _imageHeight = h;
 
+            // Opt-in load: pull the style model on first use (user picked an image), not on page entry.
+            if (!_isModelLoaded && !_isModelLoading)
+                await LoadStyle(_selectedStyle);
             if (_isModelLoaded) await RunStyleTransfer();
         }
         catch (Exception ex)
@@ -175,6 +175,7 @@ public partial class StylePage : IDisposable
     private async Task HandleBackendChange(string backend)
     {
         if (backend == _selectedBackend && _isModelLoaded) return;
+        bool wasLoaded = _isModelLoaded;
         _selectedBackend = backend;
         _styledImageUrl = null;
 
@@ -184,9 +185,14 @@ public partial class StylePage : IDisposable
         _pipeline = null;
         _session = null;
         _accelerator = null;
+        _isModelLoaded = false;
 
-        // Reload current style on new backend
-        await LoadStyle(_selectedStyle);
+        // Opt-in: only reload the current style on the new backend if it was already loaded;
+        // switching backend before first use must not trigger a download.
+        if (wasLoaded)
+            await LoadStyle(_selectedStyle);
+        else
+            StateHasChanged();
     }
 
     private void DownloadResult()

@@ -226,6 +226,7 @@
     private bool _autoChat;
     private bool _isGenerating;
     private bool _isModelLoaded;
+    private bool _isModelLoading;
     private int _nextCharId = 3;
 
     [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
@@ -233,33 +234,40 @@
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
+    // OPT-IN: the LLM loads on the first sent message (or auto-chat), NOT on page entry — see SendMessage.
+    // Visiting the page downloads nothing.
+
+    private async Task LoadModelAsync()
     {
-        if (firstRender)
+        try
         {
-            try
+            _isModelLoading = true;
+            StateHasChanged();
+
+            if (_context == null)
             {
-                if (_context == null)
-                {
-                    var builder = SpawnDev.ILGPU.ML.MLContext.Create();
-                    await builder.AllAcceleratorsAsync();
-                    _context = builder.ToContext();
-                }
-                _accelerator = await _context.CreatePreferredAcceleratorAsync();
-                if (_accelerator == null) return;
-                using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
-                var modelBytes = await hub.LoadAsync(
-                    SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
-                    "onnx/decoder_model.onnx");
-                var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
-                var tokenizerBytes = await hub.LoadAsync(
-                    SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
-                _textGenPipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
-                _textGenPipeline.LoadTokenizer(System.Text.Encoding.UTF8.GetString(tokenizerBytes));
-                _isModelLoaded = true;
-                StateHasChanged();
+                var builder = SpawnDev.ILGPU.ML.MLContext.Create();
+                await builder.AllAcceleratorsAsync();
+                _context = builder.ToContext();
             }
-            catch (Exception ex) { Console.WriteLine($"[ComicChat] LLM error: {ex.Message}"); }
+            _accelerator = await _context.CreatePreferredAcceleratorAsync();
+            if (_accelerator == null) return;
+            using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
+            var modelBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
+                "onnx/decoder_model.onnx");
+            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            var tokenizerBytes = await hub.LoadAsync(
+                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
+            _textGenPipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
+            _textGenPipeline.LoadTokenizer(System.Text.Encoding.UTF8.GetString(tokenizerBytes));
+            _isModelLoaded = true;
+        }
+        catch (Exception ex) { Console.WriteLine($"[ComicChat] LLM error: {ex.Message}"); }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
         }
     }
 
@@ -289,6 +297,9 @@
         _userMessage = "";
         _isGenerating = true;
         StateHasChanged();
+
+        // opt-in: load the LLM on the first sent message
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
 
         if (_isModelLoaded && _textGenPipeline != null)
         {
@@ -377,6 +388,9 @@
         var lastMessage = _panels.LastOrDefault(p => !p.IsUser)?.Text ?? _panels.Last().Text;
         _isGenerating = true;
         StateHasChanged();
+
+        // opt-in: load the LLM on the first auto-chat turn
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
 
         if (_isModelLoaded && _textGenPipeline != null)
         {

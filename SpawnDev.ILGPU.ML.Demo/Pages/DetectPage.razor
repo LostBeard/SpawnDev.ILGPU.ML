@@ -186,11 +186,8 @@
     private global::ILGPU.Context? _context;
     private Pipelines.ObjectDetectionPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: YOLOv8-Nano is NOT downloaded/loaded on page entry. It loads on the first real
+    // interaction (picking an image or switching to the webcam) — see HandleImageLoaded / HandleFrame.
 
     private async Task LoadModelAsync()
     {
@@ -229,11 +226,28 @@
 
     private bool _processingFrame;
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        bool wasLoaded = _isModelLoaded;
+        _pipeline?.Dispose();
+        _pipeline = null;
+        _accelerator?.Dispose();
+        _accelerator = null;
+        _isModelLoaded = false;
+        // Opt-in: only re-load if the model was already loaded; switching backend before
+        // first use must not trigger a download.
+        if (wasLoaded)
+            await LoadModelAsync();
+        else
+            StateHasChanged();
+    }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
-        if (_pipeline == null || _isModelLoading) return;
+        if (_isModelLoading) return;
+        // Opt-in load: pull the model on first use (user picked an image), not on page entry.
+        if (!_isModelLoaded) await LoadModelAsync();
+        if (_pipeline == null) return;
         try
         {
             // Decode image file bytes to RGBA via browser createImageBitmap
@@ -262,7 +276,10 @@
 
     private async Task HandleFrame(byte[] frameBytes)
     {
-        if (_pipeline == null || _processingFrame) return;
+        if (_processingFrame) return;
+        // Opt-in load: switching to the webcam is the first engagement — load the model now.
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
+        if (_pipeline == null) return;
         _processingFrame = true;
         try
         {

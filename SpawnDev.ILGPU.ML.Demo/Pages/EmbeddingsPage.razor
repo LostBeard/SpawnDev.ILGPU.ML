@@ -35,7 +35,7 @@
                     <input type="text" class="sim-input" @bind="_sentenceB" placeholder="A kitten was sitting on a rug" />
                 </div>
             </div>
-            <button class="run-btn" @onclick="ComputeSimilarity" disabled="@(!_isModelLoaded || _isRunning)">
+            <button class="run-btn" @onclick="ComputeSimilarity" disabled="@(_isModelLoading || _isRunning)">
                 Compare
             </button>
             @if (_similarityScore.HasValue)
@@ -60,7 +60,7 @@
             </div>
             <div class="search-query-row">
                 <input type="text" class="search-query" @bind="_searchQuery" placeholder="How do computers learn?" />
-                <button class="run-btn" @onclick="SearchCorpus" disabled="@(!_isModelLoaded || _isRunning)">
+                <button class="run-btn" @onclick="SearchCorpus" disabled="@(_isModelLoading || _isRunning)">
                     Search
                 </button>
             </div>
@@ -155,11 +155,8 @@
     private global::ILGPU.Context? _context;
     private FeatureExtractionPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: the ~257 MB DistilBERT model loads on the first run (Compute Similarity / Search), NOT on page
+    // entry — see ComputeSimilarity / SearchCorpus. Visiting the page downloads nothing.
 
     private async Task LoadModelAsync()
     {
@@ -202,7 +199,11 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        // Opt-in: only reload if the model is already in use — don't download on a pre-load backend switch.
+        if (_isModelLoaded || _isModelLoading) await LoadModelAsync();
+    }
 
     /// <summary>Simple whitespace tokenizer with BERT special tokens.</summary>
     private int[] SimpleTokenize(string text)
@@ -221,7 +222,9 @@
 
     private async Task ComputeSimilarity()
     {
-        if (_pipeline == null || string.IsNullOrWhiteSpace(_sentenceA) || string.IsNullOrWhiteSpace(_sentenceB)) return;
+        if (string.IsNullOrWhiteSpace(_sentenceA) || string.IsNullOrWhiteSpace(_sentenceB)) return;
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
+        if (_pipeline == null) return;
         _isRunning = true;
         _similarityScore = null;
         StateHasChanged();
@@ -247,7 +250,9 @@
 
     private async Task SearchCorpus()
     {
-        if (_pipeline == null || string.IsNullOrWhiteSpace(_corpus) || string.IsNullOrWhiteSpace(_searchQuery)) return;
+        if (string.IsNullOrWhiteSpace(_corpus) || string.IsNullOrWhiteSpace(_searchQuery)) return;
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
+        if (_pipeline == null) return;
         _isRunning = true;
         _searchResults = null;
         StateHasChanged();

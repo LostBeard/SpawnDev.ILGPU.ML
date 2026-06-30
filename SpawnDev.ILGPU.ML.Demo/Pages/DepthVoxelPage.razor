@@ -48,7 +48,7 @@
                 <WebcamCapture OnFrameCaptured="@HandleFrame"
                                AutoCapture="@_isModelLoaded"
                                CaptureIntervalMs="100"
-                               ShowCaptureButton="false"
+                               ShowCaptureButton="true"
                                Width="320" Height="240" />
             </div>
         }
@@ -157,11 +157,9 @@
     private SpawnDev.ILGPU.Rendering.ICanvasRenderer? _canvasRenderer;
     private global::ILGPU.Runtime.MemoryBuffer2D<int, global::ILGPU.Stride2D.DenseX>? _lastDepthBuffer;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: Depth Anything V2 Small (95MB) is NOT downloaded/loaded on page entry. It loads on
+    // the first real interaction (clicking the webcam capture button) — see HandleFrame. AutoCapture
+    // is bound to _isModelLoaded so the live feed only auto-runs once the model is loaded.
 
     private async Task LoadModelAsync()
     {
@@ -202,11 +200,32 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        bool wasLoaded = _isModelLoaded;
+        _lastDepthBuffer?.Dispose();
+        _lastDepthBuffer = null;
+        _canvasRenderer?.Dispose();
+        _canvasRenderer = null;
+        _pipeline?.Dispose();
+        _pipeline = null;
+        _accelerator?.Dispose();
+        _accelerator = null;
+        _isModelLoaded = false;
+        // Opt-in: only re-load if the model was already loaded; switching backend before
+        // first use must not trigger a download.
+        if (wasLoaded)
+            await LoadModelAsync();
+        else
+            StateHasChanged();
+    }
 
     private async Task HandleFrame(byte[] frameBytes)
     {
-        if (_pipeline == null || _processingFrame || _accelerator == null) return;
+        if (_processingFrame) return;
+        // Opt-in load: the first captured frame (user clicked Capture) is the first engagement.
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
+        if (_pipeline == null || _accelerator == null) return;
         _processingFrame = true;
         try
         {

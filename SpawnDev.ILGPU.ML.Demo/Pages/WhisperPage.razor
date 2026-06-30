@@ -156,11 +156,8 @@
     private global::ILGPU.Context? _context;
     private SpeechRecognitionPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: the Whisper encoder + decoder load on the first run (transcribing an audio file),
+    // NOT on page entry — see HandleAudioFile. Visiting the page downloads nothing.
 
     private async Task LoadModelAsync()
     {
@@ -217,11 +214,17 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        // Opt-in: only reload if the model is already in use — don't download on a pre-load backend switch.
+        if (_isModelLoaded || _isModelLoading) await LoadModelAsync();
+    }
 
     private async Task HandleAudioFile(InputFileChangeEventArgs e)
     {
-        if (_pipeline == null || e.File == null) return;
+        if (e.File == null) return;
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
+        if (_pipeline == null) return;
         _isRunning = true;
         _transcription = null;
         StateHasChanged();

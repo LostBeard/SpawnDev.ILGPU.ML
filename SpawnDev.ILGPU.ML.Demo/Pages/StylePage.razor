@@ -215,7 +215,11 @@
     }
     private async Task HandleFrame(byte[] frameBytes)
     {
-        if (_pipeline == null || _processingFrame || _accelerator == null) return;
+        if (_processingFrame) return;
+        // Opt-in load: starting the live webcam is the first engagement — load the style model now.
+        if (!_isModelLoaded && !_isModelLoading)
+            await LoadStyle(_selectedStyle);
+        if (_pipeline == null || _accelerator == null) return;
         _processingFrame = true;
         try
         {

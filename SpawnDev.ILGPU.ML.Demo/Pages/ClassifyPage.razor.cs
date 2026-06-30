@@ -23,13 +23,9 @@ public partial class ClassifyPage : IDisposable
     private int _imageWidth;
     private int _imageHeight;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-        {
-            await LoadBackendAndModelAsync();
-        }
-    }
+    // OPT-IN: the model is NOT downloaded/loaded on page entry (a demo can pull hundreds of MB — the user
+    // shouldn't pay that just for looking). It loads on the first real interaction (picking an image) — see
+    // HandleImageLoaded. The reference opt-in pattern is AiChatPage/GemmaChatPage.
 
     private async Task LoadBackendAndModelAsync()
     {
@@ -125,7 +121,8 @@ public partial class ClassifyPage : IDisposable
 
     private async Task HandleBackendChange(string backend)
     {
-        if (backend == _selectedBackend && _isModelLoaded) return;
+        if (backend == _selectedBackend) return;
+        bool wasLoaded = _isModelLoaded;
         _selectedBackend = backend;
         _predictions = null;
 
@@ -134,8 +131,14 @@ public partial class ClassifyPage : IDisposable
         _classService = null;
         _accelerator?.Dispose();
         _accelerator = null;
+        _isModelLoaded = false;
 
-        await LoadBackendAndModelAsync();
+        // Only re-load if the model was ALREADY loaded — switching backend before first use must not
+        // trigger a download (opt-in). The next interaction will load on the newly selected backend.
+        if (wasLoaded)
+            await LoadBackendAndModelAsync();
+        else
+            StateHasChanged();
     }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
@@ -168,6 +171,9 @@ public partial class ClassifyPage : IDisposable
 
             Console.WriteLine($"[Classify] Decoded: {w}x{h}, {_rgbaPixels.Length} pixels");
 
+            // Opt-in load: pull the model on first use (user picked an image), not on page entry.
+            if (!_isModelLoaded && !_isModelLoading)
+                await LoadBackendAndModelAsync();
             if (_isModelLoaded)
                 await RunInference();
         }

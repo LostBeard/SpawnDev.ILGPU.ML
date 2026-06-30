@@ -262,6 +262,7 @@
     private string? _currentAnimation;
     private string? _transcribedText;
     private bool _isThinking, _isListening;
+    private bool _isModelLoading;
     private bool _hasTextGen, _hasSpeechToText, _hasTextToSpeech, _hasEmotionDetect;
     private int _totalTokens;
     private double _totalInferenceMs;
@@ -272,16 +273,16 @@
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadLLMAsync();
-    }
+    // OPT-IN: the LLM loads on the first sent message, NOT on page entry — see SendMessage.
+    // Visiting the page downloads nothing.
 
     private async Task LoadLLMAsync()
     {
         try
         {
+            _isModelLoading = true;
+            StateHasChanged();
+
             if (_context == null)
             {
                 var builder = SpawnDev.ILGPU.ML.MLContext.Create();
@@ -308,6 +309,11 @@
         {
             Console.WriteLine($"[Assistant] LLM load error: {ex.Message}");
         }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
     }
 
     private void SelectAssistant(string id) { _selectedAssistant = id; _messages.Clear(); _currentResponse = null; }
@@ -322,6 +328,9 @@
         _currentAnimation = "thinking...";
         StateHasChanged();
         await Task.Yield();
+
+        // opt-in: load the LLM on the first sent message
+        if (!_hasTextGen && !_isModelLoading) await LoadLLMAsync();
 
         if (_hasTextGen && _textGenPipeline != null)
         {

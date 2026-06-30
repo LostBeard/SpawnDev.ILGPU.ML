@@ -187,11 +187,8 @@
     private Dictionary<string, float[]>? _capturedLayers;
     private List<string> _layerNames = new();
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: SqueezeNet is NOT downloaded/loaded on page entry. It loads on the first real
+    // interaction (picking an image) — see HandleImageLoaded.
 
     private async Task LoadModelAsync()
     {
@@ -223,6 +220,8 @@
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
+        // Opt-in load: pull the model on first use (user picked an image), not on page entry.
+        if (!_isModelLoaded) await LoadModelAsync();
         if (_session == null || _accelerator == null) return;
         _featureMaps = null;
         _attentionMapUrl = null;

@@ -59,7 +59,7 @@
         }
     </div>
 
-    <button class="run-btn" @onclick="Generate" disabled="@(!_isModelLoaded || _isRunning || string.IsNullOrWhiteSpace(_prompt))">
+    <button class="run-btn" @onclick="Generate" disabled="@(_isModelLoading || _isRunning || string.IsNullOrWhiteSpace(_prompt))">
         @(_isRunning ? $"Generating ({_tokensGenerated} tokens)..." : "Generate")
     </button>
 
@@ -148,11 +148,8 @@
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: the model loads on the first run (Generate), NOT on page entry — see Generate.
+    // Visiting the page downloads nothing.
 
     private async Task LoadModelAsync()
     {
@@ -233,11 +230,17 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        // Opt-in: only reload if the model is already in use — don't download on a pre-load backend switch.
+        if (_isModelLoaded || _isModelLoading) await LoadModelAsync();
+    }
 
     private async Task Generate()
     {
-        if (_pipeline == null || string.IsNullOrWhiteSpace(_prompt)) return;
+        if (string.IsNullOrWhiteSpace(_prompt)) return;
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
+        if (_pipeline == null) return;
         _isRunning = true;
         _generatedText = "";
         StateHasChanged();

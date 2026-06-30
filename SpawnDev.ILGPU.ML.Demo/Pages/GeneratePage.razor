@@ -217,11 +217,9 @@
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN / Coming Soon: this stub must NOT download anything on page entry. SD-Turbo is ~2.5 GB
+    // across 3 models and is streamed by LoadModelAsync — that is intentionally no longer called on
+    // render. The Generate button stays disabled until a model is loaded, which the stub never does.
 
     private async Task LoadModelAsync()
     {

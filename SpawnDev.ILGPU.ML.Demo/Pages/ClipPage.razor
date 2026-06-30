@@ -111,11 +111,8 @@
     private global::ILGPU.Context? _context;
     private ZeroShotClassificationPipeline? _pipeline;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: the ~170 MB CLIP model loads on the first run (dropping/picking an image to classify),
+    // NOT on page entry — see RunClassification. Visiting the page downloads nothing.
 
     private async Task LoadModelAsync()
     {
@@ -160,10 +157,6 @@
 
             _isModelLoaded = true;
             _modelProgress = 100;
-
-            // Auto-run if image already loaded
-            if (_rgbaPixels != null)
-                await RunClassification();
         }
         catch (Exception ex)
         {
@@ -176,7 +169,11 @@
         }
     }
 
-    private Task HandleBackendChange(string backend) => LoadModelAsync();
+    private async Task HandleBackendChange(string backend)
+    {
+        // Opt-in: only reload if the model is already in use — don't download on a pre-load backend switch.
+        if (_isModelLoaded || _isModelLoading) await LoadModelAsync();
+    }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
@@ -197,8 +194,8 @@
             _rgbaPixels = data.Read<int>();
             _imageWidth = w; _imageHeight = h;
 
-            if (_isModelLoaded)
-                await RunClassification();
+            // Opt-in: dropping/picking an image IS the run action — load the model now if needed.
+            await RunClassification();
         }
         catch (Exception ex)
         {
@@ -208,7 +205,9 @@
 
     private async Task RunClassification()
     {
-        if (_pipeline == null || _rgbaPixels == null) return;
+        if (_rgbaPixels == null) return;
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
+        if (_pipeline == null) return;
         _isRunning = true;
         StateHasChanged();
         await Task.Yield();

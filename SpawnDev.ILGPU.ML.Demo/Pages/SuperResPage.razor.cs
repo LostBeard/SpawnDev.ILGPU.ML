@@ -24,11 +24,8 @@ public partial class SuperResPage : IDisposable
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadBackendAndModelAsync();
-    }
+    // OPT-IN: the model is NOT downloaded/loaded on page entry. It loads on the first real
+    // interaction (picking an image) — see HandleImageLoaded.
 
     private async Task LoadBackendAndModelAsync()
     {
@@ -116,6 +113,9 @@ public partial class SuperResPage : IDisposable
             _rgbaPixels = data.Read<int>();
             _imageWidth = w; _imageHeight = h;
 
+            // Opt-in load: pull the model on first use (user picked an image), not on page entry.
+            if (!_isModelLoaded && !_isModelLoading)
+                await LoadBackendAndModelAsync();
             if (_isModelLoaded) await RunSuperRes();
         }
         catch (Exception ex)
@@ -152,6 +152,7 @@ public partial class SuperResPage : IDisposable
     private async Task HandleBackendChange(string backend)
     {
         if (backend == _selectedBackend && _isModelLoaded) return;
+        bool wasLoaded = _isModelLoaded;
         _selectedBackend = backend;
         _enhancedImageUrl = null;
 
@@ -161,8 +162,14 @@ public partial class SuperResPage : IDisposable
         _pipeline = null;
         _session = null;
         _accelerator = null;
+        _isModelLoaded = false;
 
-        await LoadBackendAndModelAsync();
+        // Opt-in: only re-load if the model was already loaded; switching backend before
+        // first use must not trigger a download.
+        if (wasLoaded)
+            await LoadBackendAndModelAsync();
+        else
+            StateHasChanged();
     }
 
     private void DownloadResult()

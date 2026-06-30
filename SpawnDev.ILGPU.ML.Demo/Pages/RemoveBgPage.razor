@@ -187,11 +187,8 @@
     private float[]? _lastMask;
     private int _lastMaskWidth, _lastMaskHeight;
 
-    protected override async Task OnAfterRenderAsync(bool firstRender)
-    {
-        if (firstRender)
-            await LoadModelAsync();
-    }
+    // OPT-IN: RMBG-1.4 is NOT downloaded/loaded on page entry. It loads on the first real
+    // interaction (picking an image) — see HandleImageLoaded.
 
     private async Task LoadModelAsync()
     {
@@ -259,6 +256,7 @@
     private async Task HandleBackendChange(string backend)
     {
         if (backend == _selectedBackend && _isModelLoaded) return;
+        bool wasLoaded = _isModelLoaded;
         _selectedBackend = backend;
         _resultImageUrl = null;
         _lastMask = null;
@@ -266,7 +264,13 @@
         _accelerator?.Dispose();
         _pipeline = null;
         _accelerator = null;
-        await LoadModelAsync();
+        _isModelLoaded = false;
+        // Opt-in: only re-load if the model was already loaded; switching backend before
+        // first use must not trigger a download.
+        if (wasLoaded)
+            await LoadModelAsync();
+        else
+            StateHasChanged();
     }
 
     private void SetBgMode(string mode)
@@ -388,6 +392,9 @@
             _rgbaPixels = data.Read<int>();
             _imageWidth = w; _imageHeight = h;
 
+            // Opt-in load: pull the model on first use (user picked an image), not on page entry.
+            if (!_isModelLoaded && !_isModelLoading)
+                await LoadModelAsync();
             if (_isModelLoaded)
                 await RunRemoval();
         }
