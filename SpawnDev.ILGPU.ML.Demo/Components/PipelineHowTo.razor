@@ -1,0 +1,70 @@
+@* Reusable "show how" panel for a pipeline demo: the minimal code to run the pipeline on our engine,
+   side-by-side with the Transformers.js equivalent so the parity/lead is explicit. Pages pass the snippets
+   (ideally copied verbatim from the page's own code so the how-to can't drift from reality). *@
+
+<div class="howto">
+    <button class="howto-toggle @(_open ? "open" : "")" @onclick="() => _open = !_open">
+        <span class="howto-caret">@(_open ? "▾" : "▸")</span>
+        How it works — minimal code
+        @if (!_open) { <span class="howto-hint">show how, not just show off</span> }
+    </button>
+
+    @if (_open)
+    {
+        <div class="howto-body">
+            <div class="howto-col">
+                <div class="howto-head">
+                    <span class="howto-name">SpawnDev.ILGPU.ML</span>
+                    <span class="howto-badge ours">your GPU · no server · no ONNX Runtime</span>
+                </div>
+                <pre class="howto-code"><code>@OurCode.Trim()</code></pre>
+            </div>
+
+            @if (!string.IsNullOrWhiteSpace(TransformersJsCode))
+            {
+                <div class="howto-col">
+                    <div class="howto-head">
+                        <span class="howto-name">Transformers.js</span>
+                        <span class="howto-badge">equivalent</span>
+                    </div>
+                    <pre class="howto-code"><code>@TransformersJsCode!.Trim()</code></pre>
+                </div>
+            }
+        </div>
+
+        @if (!string.IsNullOrWhiteSpace(DocsNote))
+        {
+            <div class="howto-note">@DocsNote</div>
+        }
+    }
+</div>
+
+<style>
+    .howto { margin-top: 1.5rem; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; overflow: hidden; background: rgba(255,255,255,0.02); }
+    .howto-toggle { width: 100%; text-align: left; background: rgba(255,255,255,0.03); border: none; color: #cbd5e1; font-size: 0.9rem; font-weight: 600; padding: 0.7rem 1rem; cursor: pointer; display: flex; align-items: center; gap: 0.5rem; transition: background 0.15s; }
+    .howto-toggle:hover { background: rgba(255,255,255,0.06); }
+    .howto-toggle.open { border-bottom: 1px solid rgba(255,255,255,0.08); }
+    .howto-caret { color: #8b5cf6; font-size: 0.8rem; }
+    .howto-hint { margin-left: auto; color: #64748b; font-size: 0.78rem; font-weight: 400; font-style: italic; }
+    .howto-body { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: rgba(255,255,255,0.06); }
+    .howto-col { background: #0b1120; display: flex; flex-direction: column; min-width: 0; }
+    .howto-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .howto-name { color: #e2e8f0; font-size: 0.82rem; font-weight: 700; }
+    .howto-badge { font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; padding: 0.08rem 0.4rem; border-radius: 0.5rem; color: #94a3b8; background: rgba(255,255,255,0.06); }
+    .howto-badge.ours { color: #6ee7b7; background: rgba(52,211,153,0.12); border: 1px solid rgba(52,211,153,0.25); }
+    .howto-code { margin: 0; padding: 0.85rem; overflow-x: auto; font-family: 'JetBrains Mono','Consolas',monospace; font-size: 0.78rem; line-height: 1.5; color: #cbd5e1; white-space: pre; }
+    .howto-note { padding: 0.6rem 1rem; color: #94a3b8; font-size: 0.8rem; border-top: 1px solid rgba(255,255,255,0.05); }
+
+    @@media (max-width: 720px) { .howto-body { grid-template-columns: 1fr; } }
+</style>
+
+@code {
+    /// <summary>Minimal C# to run this pipeline on our engine. Pass the page's real snippet so it stays honest.</summary>
+    [Parameter] public string OurCode { get; set; } = "";
+    /// <summary>The Transformers.js equivalent (optional) — shown side-by-side to make parity/lead explicit.</summary>
+    [Parameter] public string? TransformersJsCode { get; set; }
+    /// <summary>Optional one-line note under the code (e.g. a link or a "we go beyond this" remark).</summary>
+    [Parameter] public string? DocsNote { get; set; }
+
+    private bool _open;
+}

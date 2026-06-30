@@ -76,6 +76,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -215,6 +218,27 @@
     private string? _error;
     private List<Components.ConfidenceBars.Prediction>? _predictions;
     private List<RaceResult>? _raceResults;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load SqueezeNet onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
+var classifier = new ClassificationService(Http);
+await classifier.LoadModelAsync(modelBytes, accelerator);
+
+// Classify an RGBA image — runs entirely on the GPU
+var (results, ms) = await classifier.ClassifyAsync(rgbaPixels, width, height);
+// results: [{ Label, Confidence }, ...]
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('image-classification',
+                            'Xenova/...', { device: 'webgpu' });
+const out = await pipe(imageUrl);
+// out: [{ label, score }, ...]
+""";
 
     private List<Components.BackendSelector.BackendInfo> _backends = new()
     {

@@ -1,0 +1,146 @@
+@page "/pipelines"
+@using Microsoft.AspNetCore.Components.Routing
+
+<PageTitle>Pipelines — SpawnDev.ILGPU.ML</PageTitle>
+
+<div class="pipelines-page">
+    <div class="pipelines-header">
+        <h1 class="pipelines-title">Pipelines</h1>
+        <p class="pipelines-sub">
+            One-call ML pipelines that run entirely on <strong>your</strong> GPU in the browser — no server, no
+            ONNX Runtime, no JavaScript. The same task surface as
+            <a href="https://huggingface.co/docs/transformers.js" target="_blank">Transformers.js</a>, and several
+            things it can't do at all (local GGUF LLM chat, depth→3D, image+audio multimodal, on-device training).
+            Each demo shows the minimal <em>how-to</em> code, not just the result.
+        </p>
+        <div class="pipelines-legend">
+            <span class="legend-item"><span class="status-badge verified">verified</span> tested end to end</span>
+            <span class="legend-item"><span class="status-badge beyond">beyond TJS</span> Transformers.js can't do this</span>
+            <span class="legend-item"><span class="status-badge beta">beta</span> runs, still maturing</span>
+            <span class="legend-item"><span class="status-badge soon">soon</span> coming</span>
+            <span class="legend-item"><span class="status-badge planned">planned</span> pipeline ready, demo pending</span>
+        </div>
+    </div>
+
+    @foreach (var group in _groups)
+    {
+        <div class="pipelines-section-label">@group.Title</div>
+        <div class="pipelines-grid">
+            @foreach (var p in group.Items)
+            {
+                <div class="pipeline-card @(p.Beyond ? "is-beyond" : "")">
+                    @if (p.Beyond) { <span class="beyond-ribbon">beyond Transformers.js</span> }
+                    <div class="card-top">
+                        <span class="card-task">@p.Task</span>
+                        <span class="status-badge @p.Status.ToLower()">@StatusLabel(p.Status)</span>
+                    </div>
+                    <div class="card-model">@p.Model</div>
+                    <p class="card-desc">@p.Description</p>
+                    <div class="card-foot">
+                        @if (!string.IsNullOrEmpty(p.Route))
+                        {
+                            <NavLink class="card-try" href="@p.Route">Try it →</NavLink>
+                        }
+                        else
+                        {
+                            <span class="card-planned">demo pending</span>
+                        }
+                        @if (!string.IsNullOrEmpty(p.Tjs)) { <span class="card-tjs">TJS: <code>@p.Tjs</code></span> }
+                    </div>
+                </div>
+            }
+        </div>
+    }
+</div>
+
+<style>
+    .pipelines-page { max-width: 1100px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+    .pipelines-title { font-size: 2rem; font-weight: 700; color: #f1f5f9; margin: 0 0 0.5rem; }
+    .pipelines-sub { color: #94a3b8; font-size: 0.95rem; line-height: 1.6; max-width: 820px; }
+    .pipelines-sub a { color: #93c5fd; }
+    .pipelines-legend { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1rem; }
+    .legend-item { display: flex; align-items: center; gap: 0.35rem; color: #94a3b8; font-size: 0.78rem; }
+
+    .pipelines-section-label { color: #475569; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; margin: 2rem 0 0.75rem; }
+    .pipelines-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; }
+
+    .pipeline-card { position: relative; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 1rem; display: flex; flex-direction: column; gap: 0.5rem; transition: border-color 0.15s, transform 0.15s; }
+    .pipeline-card:hover { border-color: rgba(139,92,246,0.4); transform: translateY(-2px); }
+    .pipeline-card.is-beyond { border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.04); }
+    .beyond-ribbon { position: absolute; top: -1px; right: -1px; font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #052e16; background: #34d399; padding: 0.12rem 0.5rem; border-radius: 0 10px 0 10px; }
+
+    .card-top { display: flex; align-items: center; gap: 0.5rem; }
+    .card-task { color: #e2e8f0; font-size: 0.98rem; font-weight: 700; }
+    .card-model { color: #818cf8; font-size: 0.8rem; font-weight: 600; }
+    .card-desc { color: #94a3b8; font-size: 0.82rem; line-height: 1.45; margin: 0; flex: 1; }
+    .card-foot { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.25rem; flex-wrap: wrap; }
+    .card-try { color: #c4b5fd; font-size: 0.85rem; font-weight: 700; text-decoration: none; }
+    .card-try:hover { color: #ddd6fe; }
+    .card-planned { color: #64748b; font-size: 0.8rem; font-style: italic; }
+    .card-tjs { margin-left: auto; color: #64748b; font-size: 0.72rem; }
+    .card-tjs code { color: #94a3b8; }
+
+    .status-badge { font-size: 0.62rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; padding: 0.1rem 0.4rem; border-radius: 0.6rem; margin-left: auto; white-space: nowrap; }
+    .status-badge.verified { color: #6ee7b7; background: rgba(52,211,153,0.14); border: 1px solid rgba(52,211,153,0.3); }
+    .status-badge.beyond { color: #052e16; background: #34d399; }
+    .status-badge.beta { color: #93c5fd; background: rgba(40,90,160,0.2); border: 1px solid rgba(147,197,253,0.35); }
+    .status-badge.soon { color: #fcd34d; background: rgba(180,130,10,0.2); border: 1px solid rgba(252,211,77,0.4); }
+    .status-badge.planned { color: #94a3b8; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); }
+    .legend-item .status-badge { margin-left: 0; }
+</style>
+
+@code {
+    private string StatusLabel(string s) => s switch
+    {
+        "Verified" => "verified", "Beyond" => "beyond TJS", "Beta" => "beta",
+        "Soon" => "soon", "Planned" => "planned", _ => s.ToLower()
+    };
+
+    private record Pipe(string Task, string Model, string Description, string? Route, string Status, bool Beyond = false, string? Tjs = null);
+    private record Group(string Title, List<Pipe> Items);
+
+    private readonly List<Group> _groups = new()
+    {
+        new("Vision", new()
+        {
+            new("Image Classification", "SqueezeNet / MobileNetV2", "Label an image. ORT-matched.", "classify", "Verified", Tjs: "image-classification"),
+            new("Object Detection", "YOLOv8-Nano", "Find + box objects. ORT-matched.", "detect", "Verified", Tjs: "object-detection"),
+            new("Depth Estimation", "Depth Anything V2 Small", "Per-pixel depth. ORT-matched.", "depth", "Verified", Tjs: "depth-estimation"),
+            new("Background Removal", "RMBG-1.4", "Cut out the subject (alpha matte).", "remove-bg", "Verified", Tjs: "background-removal"),
+            new("Style Transfer", "Fast neural style (5 styles)", "Image-to-image restyle. ORT-matched.", "style", "Verified", Tjs: "image-to-image"),
+            new("Super Resolution", "ESPCN ×3", "Upscale an image. Image-to-image.", "super-res", "Verified", Tjs: "image-to-image"),
+            new("Face Detection", "BlazeFace", "Faces + landmarks. (No Transformers.js task.)", "face", "Verified", true),
+            new("Pose Estimation", "MoveNet Lightning/Thunder", "17 body keypoints. (No Transformers.js task.)", "pose", "Beta", true),
+            new("Image Segmentation", "—", "Per-pixel object masks.", null, "Planned", Tjs: "image-segmentation"),
+        }),
+        new("Language", new()
+        {
+            new("Feature Extraction / Similarity", "DistilBERT", "Embeddings + cosine similarity + semantic search.", "embeddings", "Verified", Tjs: "feature-extraction"),
+            new("Zero-Shot Classification", "CLIP ViT-B/32", "Classify into unseen labels (text↔image).", "clip", "Verified", Tjs: "zero-shot-image-classification"),
+            new("Text Generation", "GGUF LLMs (Qwen/Gemma/Llama/SmolLM)", "Local LLM chat, KV-cache decode — Ollama-class, not in Transformers.js.", "ai-chat", "Beyond", true, Tjs: "text-generation"),
+            new("Text Generation (ONNX)", "DistilGPT-2", "ONNX text-gen pipeline (vs the GGUF chat path).", "text-gen", "Verified", Tjs: "text-generation"),
+            new("Sentiment / Text Classification", "DistilBERT-SST2", "Label text (positive/negative).", null, "Planned", Tjs: "text-classification"),
+            new("Fill-Mask", "BERT", "Predict masked tokens.", null, "Planned", Tjs: "fill-mask"),
+            new("Question Answering", "DistilBERT-SQuAD", "Answer from a context passage.", null, "Planned", Tjs: "question-answering"),
+            new("Token Classification / NER", "BERT-NER", "Tag entities per token.", null, "Planned", Tjs: "token-classification"),
+            new("Summarization", "DistilBART", "Shorten a document.", null, "Planned", Tjs: "summarization"),
+            new("Translation", "NLLB / M2M", "Translate between languages.", null, "Planned", Tjs: "translation"),
+        }),
+        new("Audio", new()
+        {
+            new("Speech to Text", "Whisper Tiny", "Transcribe audio. Encoder+decoder.", "whisper", "Beta", Tjs: "automatic-speech-recognition"),
+            new("Text to Speech", "SpeechT5", "Synthesize speech (pipeline ready, demo pending).", null, "Planned", Tjs: "text-to-speech"),
+        }),
+        new("Multimodal", new()
+        {
+            new("Image + Audio + Text Chat", "Gemma 4 (multimodal)", "Chat over images AND audio — Transformers.js has no image-text-to-text pipeline.", "gemma-chat", "Beyond", true, Tjs: "image-to-text"),
+        }),
+        new("Generative & 3D (beyond Transformers.js)", new()
+        {
+            new("Image Generation", "SD-Turbo", "Text → image (Stable Diffusion). Not a Transformers.js task.", "generate", "Soon", true),
+            new("Image to 3D", "Splatter Image / TripoSR", "Single image → 3D mesh / gaussian splat → SpawnScene render.", "image-to-3d", "Soon", true),
+            new("Live Depth → 3D Voxels", "Depth Anything V2", "Webcam depth streamed into a live voxel scene.", "depth-voxel", "Beta", true),
+            new("On-Device Training", "Backprop on the GPU", "Train a model in the browser — Transformers.js is inference-only.", "train", "Beta", true),
+        }),
+    };
+}
