@@ -14,8 +14,7 @@ REM ============================================================================
 setlocal
 
 REM ---- Which cached model to use. Any name from:  dotnet run -- --list ----
-set "MODEL=qwen2.5-coder:7b-instruct-q4_K_M"
-REM set "MODEL=gemma4:12b"
+set "MODEL=gemma4:12b"
 
 REM ---- Port: Pi's ollama provider is configured (in ~/.pi/agent/models.json) to reach
 REM      http://127.0.0.1:11434/v1, so we run ON 11434. (Don't run real Ollama at the same time.)
@@ -50,25 +49,3 @@ timeout /t 2 /nobreak >nul
 curl -s -o nul -m 2 http://localhost:%PORT%/api/version
 if errorlevel 1 goto waitready
 echo   Server ready (model resident on the GPU).
-
-REM ---- Point Pi's ollama provider at our server ----
-REM   pi-ollama defaults to http://127.0.0.1:11434; OLLAMA_HOST overrides it to our port.
-set "OLLAMA_HOST=http://127.0.0.1:%PORT%"
-set "OLLAMA_BASE_URL=http://127.0.0.1:%PORT%"
-
-echo.
-echo   Launching Pi (ollama provider -^> our server). If Pi shows a stale model list, run /ollama-refresh.
-echo.
-REM Model id uses Pi's "ollama/" provider prefix (matches its enabledModels). Verified: returns "Paris".
-REM
-REM -nc (--no-context-files): SKIP auto-loading AGENTS.md + CLAUDE.md. Those are ~20K tokens of AI-agent
-REM   META-RULES (not codebase docs), and a ~20K-token prompt means a multi-MINUTE turn-1 prefill on the
-REM   current engine (large-context prefill is the open perf frontier) - i.e. "Pi never answers". Skipping
-REM   them keeps the prompt small so Pi responds fast. Drop -nc once large-context prefill is fast, or add a
-REM   small codebase-specific AGENTS.md. Pass a prompt/context explicitly with @file when you need it.
-pi -nc --model "ollama/%MODEL%"
-
-echo.
-echo   Pi exited. The server is still running in its own window - close it to stop.
-pause
-endlocal
