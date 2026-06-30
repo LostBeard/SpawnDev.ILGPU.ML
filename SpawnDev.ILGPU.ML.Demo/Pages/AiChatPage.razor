@@ -90,7 +90,14 @@
             <div class="composer">
                 <textarea @bind="_input" @bind:event="oninput" @onkeydown="OnKeyDown"
                           placeholder="Send a message…" disabled="@_busy" rows="1"></textarea>
-                <button class="primary" @onclick="SendAsync" disabled="@(_busy || string.IsNullOrWhiteSpace(_input))">Send</button>
+                @if (_busy)
+                {
+                    <button class="primary stop" @onclick="CancelGeneration">Stop</button>
+                }
+                else
+                {
+                    <button class="primary" @onclick="SendAsync" disabled="@string.IsNullOrWhiteSpace(_input)">Send</button>
+                }
             </div>
         </div>
     }
@@ -150,6 +157,7 @@ string answer = await pipe.GenerateAsync(convo,
     string _input = "";
     bool _busy;
     string _streaming = "";
+    System.Threading.CancellationTokenSource? _genCts;
 
     async Task LoadModelAsync(ModelOption model)
     {
@@ -240,22 +248,44 @@ string answer = await pipe.GenerateAsync(convo,
         await ScrollToBottom();
 
         var convo = _messages.Select(m => (m.Role, m.Content)).ToList();
+        _genCts = new System.Threading.CancellationTokenSource();
         try
         {
+            // Sampling (NOT greedy): a 0.5-2B model decoded greedily degenerates into verbatim repetition
+            // loops on open-ended chat ("Boiled and served with…" over and over). Nucleus sampling +
+            // repetition penalty keeps the correct token for factual answers while breaking the loops.
+            // (The oracle reference test uses its own greedy config, so this page change doesn't affect it.)
             string answer = await _pipeline.GenerateAsync(convo,
-                config: new GenerationConfig { MaxNewTokens = 512, Strategy = "greedy" },
-                onToken: (_, soFar) => { _streaming = soFar; InvokeAsync(async () => { StateHasChanged(); await ScrollToBottom(); }); return Task.CompletedTask; });
-            _messages.Add(new ChatMessage { Role = "assistant", Content = answer.Trim() });
+                config: new GenerationConfig
+                {
+                    MaxNewTokens = 512,
+                    Strategy = "top_p",
+                    Temperature = 0.7f,
+                    TopP = 0.9f,
+                    RepetitionPenalty = 1.3f,
+                },
+                onToken: (_, soFar) => { _streaming = soFar; InvokeAsync(async () => { StateHasChanged(); await ScrollToBottom(); }); return Task.CompletedTask; },
+                ct: _genCts.Token);
+            // On Stop, the generator returns the partial text (StopReason.Cancelled) — keep what was generated.
+            if (!string.IsNullOrWhiteSpace(answer))
+                _messages.Add(new ChatMessage { Role = "assistant", Content = answer.Trim() });
         }
         catch (Exception ex)
         {
             JS.LogError($"[AiChat] generate failed: {ex.Message}");
             _messages.Add(new ChatMessage { Role = "assistant", Content = $"[error: {ex.Message}]" });
         }
+        finally
+        {
+            _genCts?.Dispose();
+            _genCts = null;
+        }
         _busy = false; _streaming = "";
         StateHasChanged();
         await ScrollToBottom();
     }
+
+    void CancelGeneration() => _genCts?.Cancel();
 
     void ResetChat() { _messages.Clear(); _streaming = ""; }
 

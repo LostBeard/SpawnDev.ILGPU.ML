@@ -93,6 +93,8 @@ button.primary {
 }
 button.primary:hover:not(:disabled) { background: #0f57d0; }
 button.primary:disabled { background: #9db8e8; cursor: default; }
+button.primary.stop { background: #dc2626; }
+button.primary.stop:hover { background: #b91c1c; }
 
 button.link {
     background: none;

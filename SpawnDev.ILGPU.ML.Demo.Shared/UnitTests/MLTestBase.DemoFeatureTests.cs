@@ -452,6 +452,77 @@ public abstract partial class MLTestBase
         finally { await client.DisposeAsync(); }
     });
 
+    // Regression guard for the /ai-chat repetition bug TJ hit live: a 0.5B model decoded GREEDILY on an
+    // open-ended chat prompt degenerates into verbatim loops ("Boiled and served with…" over and over). The
+    // demo now decodes with nucleus sampling + repetition penalty (the same config AiChatPage uses). This
+    // reproduces TJ's exact prompt and asserts the output is NOT a degenerate loop, via trigram diversity.
+    [TestMethod(Timeout = 600000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task Pipeline_GgufLLM_ChatSampling_NoDegenerateRepetition() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // GGUF pipeline setup crashes the CPU-accelerator testhost subprocess at load time (~96 ms, before any
+        // generation — same hub-stream/CreateFromStreamAsync path the other heavy GGUF demo tests use). CPU is
+        // the last-priority backend and GGUF-on-CPU is not a demo target; the repetition fix is verified on
+        // CUDA/OpenCL/WebGPU/WebGL/Wasm. TRACKED: the CPU-subprocess GGUF crash is shared by all heavy GGUF tests.
+        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+            throw new UnsupportedTestException("GGUF decode crashes the CPU testhost subprocess (tracked) — covered on CUDA/OpenCL/WebGPU/WebGL/Wasm");
+
+        const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+        const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
+
+            var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 1024, ct: cts.Token))
+            {
+                // The exact shape of prompt that looped under greedy. Seeded sampling → deterministic assertion.
+                var messages = new[] { ("user", "List several things you can make with chicken eggs.") };
+                var answer = await pipe.GenerateAsync(messages,
+                    config: new GenerationConfig
+                    {
+                        MaxNewTokens = 140, Strategy = "top_p", Temperature = 0.7f, TopP = 0.9f,
+                        RepetitionPenalty = 1.3f, Seed = 1234,
+                    }, ct: cts.Token);
+                Console.WriteLine($"[GgufLLM/sampling] answer='{answer.Trim()}'");
+
+                if (string.IsNullOrWhiteSpace(answer))
+                    throw new Exception("chat sampling produced empty output");
+
+                // Degenerate loops collapse trigram diversity toward ~0; healthy text stays well above 0.5.
+                var words = answer.ToLowerInvariant()
+                    .Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (words.Length >= 30)
+                {
+                    var trigrams = new List<string>();
+                    for (int i = 0; i + 2 < words.Length; i++) trigrams.Add($"{words[i]} {words[i + 1]} {words[i + 2]}");
+                    double uniqueRatio = (double)trigrams.Distinct().Count() / trigrams.Count;
+                    Console.WriteLine($"[GgufLLM/sampling] words={words.Length} uniqueTrigramRatio={uniqueRatio:F2}");
+                    if (uniqueRatio < 0.5)
+                        throw new Exception($"Degenerate repetition: unique-trigram ratio {uniqueRatio:F2} < 0.5 " +
+                            $"(chat sampling should break greedy loops). Answer: '{answer.Trim()}'");
+                }
+                else
+                {
+                    Console.WriteLine($"[GgufLLM/sampling] only {words.Length} words — too short for the trigram check (not failing)");
+                }
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
+
     // ═══════════════════════════════════════════════════════════
     //  Diffusion scheduler math (SD-Turbo) — CPU-only regression guard
     // ═══════════════════════════════════════════════════════════
