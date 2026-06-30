@@ -88,6 +88,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -141,6 +144,31 @@
     private List<SearchResult>? _searchResults;
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load DistilBERT onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel);
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
+    inputShapes: new() { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 } });
+var pipeline = new FeatureExtractionPipeline(session, accelerator, maxLength: 128, hiddenSize: 768);
+
+// Embed two sentences and compare by meaning — runs entirely on the GPU
+var embA = await pipeline.EmbedAsync(tokensA);
+var embB = await pipeline.EmbedAsync(tokensB);
+float similarity = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedding);
+""";
+
+    private const string _howToJs = """
+import { pipeline, cos_sim } from '@huggingface/transformers';
+
+const extractor = await pipeline('feature-extraction',
+                                 'Xenova/distilbert-base-uncased', { device: 'webgpu' });
+const a = await extractor(sentenceA, { pooling: 'mean', normalize: true });
+const b = await extractor(sentenceB, { pooling: 'mean', normalize: true });
+const similarity = cos_sim(a.data, b.data);
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

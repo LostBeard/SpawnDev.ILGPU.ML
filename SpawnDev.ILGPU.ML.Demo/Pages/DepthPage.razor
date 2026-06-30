@@ -74,6 +74,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -166,6 +169,29 @@
     /// _gpuDepthBuffer GPU buffer — no CPU-side URL needed.</summary>
     private bool _hasDepthResult;
     private string? _statusMessage;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load Depth Anything V2 Small onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    accelerator, hub,
+    ModelHub.KnownModels.DepthAnythingV2Small, ModelHub.KnownFiles.OnnxModel,
+    inputShapes: new() { ["pixel_values"] = new[] { 1, 3, 518, 518 } });
+var pipeline = new DepthEstimationPipeline(session, accelerator);
+
+// Estimate depth — raw depth stays on the GPU (zero-copy colormap + canvas render)
+var (rawDepth, min, max, w, h) = await pipeline.EstimateGpuRawAsync(rgbaPixels, width, height);
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('depth-estimation',
+                            'Xenova/depth-anything-v2-small', { device: 'webgpu' });
+const { depth } = await pipe(imageUrl);
+// depth: a grayscale depth map image
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

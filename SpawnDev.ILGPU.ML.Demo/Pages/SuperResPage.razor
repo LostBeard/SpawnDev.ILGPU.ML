@@ -53,6 +53,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -126,6 +129,28 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load the ESPCN super-resolution model onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx");
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+var pipeline = new SuperResolutionPipeline(session, accelerator);
+
+// Upscale an RGBA image — runs entirely on the GPU
+var result = await pipeline.UpscaleAsync(rgbaPixels, width, height);
+// result.RgbaPixels: the enhanced image (result.Width × result.Height)
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('image-to-image',
+                            'Xenova/swin2SR-classical-sr-x2-64', { device: 'webgpu' });
+const out = await pipe(imageUrl);
+// out: an upscaled RawImage
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

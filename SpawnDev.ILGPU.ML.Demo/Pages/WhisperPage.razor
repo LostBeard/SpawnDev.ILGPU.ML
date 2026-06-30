@@ -87,6 +87,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -143,6 +146,31 @@
     private double _audioDurationSeconds;
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load Whisper Tiny (encoder + decoder) onto YOUR GPU (WebGPU / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var encoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx");
+var decoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx");
+var pipeline = new SpeechRecognitionPipeline(
+    InferenceSession.CreateFromFile(accelerator, encoderBytes),
+    InferenceSession.CreateFromFile(accelerator, decoderBytes), accelerator);
+pipeline.LoadTokenizer(tokenizerJson);
+
+// Transcribe 16 kHz mono PCM samples — runs entirely on the GPU
+var result = await pipeline.TranscribeAsync(samples, 16000);
+// result.Text, result.Language
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('automatic-speech-recognition',
+                            'Xenova/whisper-tiny', { device: 'webgpu' });
+const out = await pipe(audio);
+// out: { text }
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

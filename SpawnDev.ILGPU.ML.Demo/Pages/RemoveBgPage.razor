@@ -62,6 +62,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -162,6 +165,28 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load RMBG-1.4 onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.RMBG14, ModelHub.KnownFiles.OnnxModel);
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+var pipeline = new BackgroundRemovalPipeline(session, accelerator);
+
+// Run segmentation — returns a per-pixel foreground alpha mask, computed on the GPU
+var result = await pipeline.RemoveBackgroundAsync(rgbaPixels, width, height);
+// result.Mask: float[width*height] alpha (composite over transparent / white / blur)
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('background-removal',
+                            'Xenova/rmbg-1.4', { device: 'webgpu' });
+const [out] = await pipe(imageUrl);
+// out: an RGBA image with the background removed
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

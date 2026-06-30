@@ -68,6 +68,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -189,6 +192,28 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load a fast neural-style model onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.StyleMosaic, "mosaic-9.onnx");
+var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+var pipeline = new StyleTransferPipeline(session, accelerator);
+
+// Stylize an RGBA image — runs entirely on the GPU (TransferGpuAsync keeps the result GPU-side)
+var result = await pipeline.TransferAsync(rgbaPixels, width, height);
+// result.RgbaPixels: the stylized image (result.Width × result.Height)
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('image-to-image',
+                            'Xenova/fast-neural-style-mosaic', { device: 'webgpu' });
+const out = await pipe(imageUrl);
+// out: a stylized RawImage
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

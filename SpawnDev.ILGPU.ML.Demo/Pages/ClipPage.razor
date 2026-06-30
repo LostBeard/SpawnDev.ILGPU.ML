@@ -49,6 +49,9 @@
 
     <PrivacyBadge />
 
+    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
+                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+
 </DemoLayout>
 
 <style>
@@ -90,6 +93,31 @@
     private List<ConfidenceBars.Prediction>? _results;
     private int[]? _rgbaPixels;
     private int _imageWidth, _imageHeight;
+
+    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    private const string _howToCs = """
+// Load CLIP ViT-B/32 (vision + text encoders) onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+using var hub = new ModelHub(JS);
+var visionBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxVisionModel);
+var textBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxTextModel);
+var pipeline = new ZeroShotClassificationPipeline(
+    InferenceSession.CreateFromFile(accelerator, visionBytes),
+    InferenceSession.CreateFromFile(accelerator, textBytes), accelerator);
+pipeline.LoadTokenizer(tokenizerJson);
+
+// Classify an image against any labels you define — runs entirely on the GPU
+var result = await pipeline.ClassifyAsync(rgbaPixels, width, height, labels);
+// result.Predictions: [{ Label, Confidence }, ...]
+""";
+
+    private const string _howToJs = """
+import { pipeline } from '@huggingface/transformers';
+
+const pipe = await pipeline('zero-shot-image-classification',
+                            'Xenova/clip-vit-base-patch32', { device: 'webgpu' });
+const out = await pipe(imageUrl, labels);
+// out: [{ label, score }, ...]
+""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {
