@@ -30,7 +30,6 @@
         </footer>
     </main>
 
-    <VoiceCommand OnCommand="@HandleGlobalVoiceCommand" WakeWord="computer" />
     <KeyboardShortcuts />
     <WelcomeToast />
 </div>
@@ -48,11 +47,4 @@
             BuildChangeTracker.PrintDiff(JS);
         }
     }
-
-    private void HandleGlobalVoiceCommand(string command)
-    {
-        if (VerboseLogging) Console.WriteLine($"[Voice] Command: {command}");
-    }
-
-    private bool VerboseLogging { get; set; }
 }

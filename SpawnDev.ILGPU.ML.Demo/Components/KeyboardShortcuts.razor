@@ -15,7 +15,6 @@
             </div>
             <div class="shortcuts-list">
                 <div class="shortcut-row"><kbd>?</kbd><span>Show this help</span></div>
-                <div class="shortcut-row"><kbd>V</kbd><span>Toggle voice commands</span></div>
                 <div class="shortcut-row"><kbd>Esc</kbd><span>Close dialogs / clear results</span></div>
             </div>
             <div class="shortcuts-hint">Press <kbd>?</kbd> anywhere to see shortcuts</div>
@@ -24,7 +23,6 @@
 }
 
 @code {
-    [Parameter] public EventCallback OnVoiceToggle { get; set; }
     [Parameter] public EventCallback OnEscape { get; set; }
 
     private bool _showHelp;
@@ -62,10 +60,6 @@
             case "?":
                 _showHelp = !_showHelp;
                 InvokeAsync(StateHasChanged);
-                break;
-            case "v":
-            case "V":
-                OnVoiceToggle.InvokeAsync();
                 break;
             case "Escape":
                 _showHelp = false;
