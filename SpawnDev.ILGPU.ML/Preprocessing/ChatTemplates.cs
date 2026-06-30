@@ -394,6 +394,19 @@ public static class ChatTemplates
             return (BuildGemma4MultiTurnPromptTokens(tok, messages, thinking && !hasTools, toolsJson: hasTools ? toolsJson : null),
                     Ids(tok, "<turn|>"));
 
+        // Inject the model's DEFAULT system prompt (from its tokenizer.chat_template) when the conversation has
+        // none. Some instruct models were tuned to ALWAYS carry a system message and DEGENERATE (loop) without it
+        // — SmolLM2 ("You are a helpful AI assistant named SmolLM, trained by Hugging Face") is the case that
+        // surfaced this. Their template emits a literal default system when messages[0].role != 'system'; we mirror
+        // it. (Ollama applies the template, so it always had this; our hardcoded ChatML path was dropping it.)
+        if (!messages.Any(m => string.Equals(m.Role, "system", StringComparison.OrdinalIgnoreCase))
+            && TryGetDefaultSystemPrompt(model, format, out var defSys))
+        {
+            var withSys = new List<(string Role, string Content)>(messages.Count + 1) { ("system", defSys) };
+            withSys.AddRange(messages);
+            messages = withSys;
+        }
+
         // ChatML / Llama3: advertise the tools in the system message (qwen <tools>/<tool_call> convention).
         // The generated text is later scanned by ParseToolCalls.
         if (hasTools)
@@ -426,6 +439,36 @@ public static class ChatTemplates
             foreach (var m in markers) if (tok.TryGetId(m, out var id)) list.Add(id);
             return list.ToArray();
         }
+    }
+
+    /// <summary>Extract the model's DEFAULT system prompt from its <c>tokenizer.chat_template</c> — the LITERAL
+    /// system block the template emits when the conversation has no system message (e.g. SmolLM2's
+    /// "You are a helpful AI assistant named SmolLM, trained by Hugging Face"). Returns false if the template has
+    /// no such literal default. ChatML: <c>&lt;|im_start|&gt;system\n{TEXT}&lt;|im_end|&gt;</c>; Llama3:
+    /// <c>&lt;|start_header_id|&gt;system&lt;|end_header_id|&gt;\n\n{TEXT}&lt;|eot_id|&gt;</c>.</summary>
+    private static bool TryGetDefaultSystemPrompt(GGUF.GGUFModel model, ChatFormat format, out string sys)
+    {
+        sys = "";
+        var t = model.GetMetadataString("tokenizer.chat_template") ?? "";
+        if (t.Length == 0) return false;
+
+        var pattern = format switch
+        {
+            ChatFormat.ChatML => @"<\|im_start\|>system\s+(.*?)<\|im_end\|>",
+            ChatFormat.Llama3 => @"<\|start_header_id\|>system<\|end_header_id\|>\s+(.*?)<\|eot_id\|>",
+            _ => null,
+        };
+        if (pattern == null) return false;
+
+        var m = System.Text.RegularExpressions.Regex.Match(t, pattern, System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (!m.Success) return false;
+        var text = m.Groups[1].Value;
+        // The template's LITERAL default is pure text; the per-message system block uses Jinja variables. Reject any
+        // capture that carries Jinja so we never mistake the message-loop block for a default.
+        if (text.Contains("{{") || text.Contains("{%") || text.Contains("message[") || text.Contains("' +") || text.Contains("+ '"))
+            return false;
+        sys = text.Trim('\n', '\r', ' ', '\t');
+        return sys.Length > 0;
     }
 
     // ── Tool / function-calling (v2) ─────────────────────────────────────────────────────────────────

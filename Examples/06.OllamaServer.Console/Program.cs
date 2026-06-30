@@ -81,6 +81,30 @@ if (args.Length >= 1 && args[0] == "--chat-pipe")
     return;
 }
 
+// --hparams <model> : DIAGNOSTIC — dump arch hparams + tensor presence (to compare a working vs broken model).
+if (args.Length >= 1 && args[0] == "--hparams")
+{
+    var arg = args.Length >= 2 ? args[1] : "";
+    string? path = File.Exists(arg) ? arg : new OllamaModelStore().Resolve(arg)?.GgufPath;
+    if (path == null || !File.Exists(path)) { Console.WriteLine($"Not found: {arg}"); return; }
+    await using var hs = File.OpenRead(path);
+    var m = await GGUFParser.ParseHeaderAsync(hs);
+    var a = m.Architecture;
+    Console.WriteLine($"model={Path.GetFileName(path)}  arch={a}");
+    foreach (var k in new[] { "embedding_length", "block_count", "attention.head_count", "attention.head_count_kv",
+        "attention.key_length", "attention.value_length", "rope.dimension_count", "feed_forward_length", "vocab_size" })
+        Console.WriteLine($"  {a}.{k} = {m.GetMetadataInt($"{a}.{k}", -1)}");
+    foreach (var k in new[] { "rope.freq_base", "rope.scaling.factor", "attention.layer_norm_rms_epsilon",
+        "attention.layer_norm_epsilon", "logit_scale", "attention.scale", "final_logit_softcapping" })
+        Console.WriteLine($"  {a}.{k} = {m.GetMetadataFloat($"{a}.{k}", float.NaN)}");
+    var names = m.Tensors.Select(t => t.Name).ToHashSet();
+    Console.WriteLine($"  tie_word_embeddings (NO separate output.weight) = {!names.Contains("output.weight")}");
+    foreach (var tn in new[] { "output.weight", "token_embd.weight", "output_norm.weight",
+        "blk.0.attn_q.bias", "blk.0.attn_k.bias", "blk.0.attn_v.bias", "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight" })
+        Console.WriteLine($"  has {tn} = {names.Contains(tn)}");
+    return;
+}
+
 // --toks <model-file.gguf | ollama-name> "<prompt>" : DIAGNOSTIC — dump the exact chat-prompt token ids +
 // per-token decoded text + the resolved bos/eos + stop ids. No GPU. Used to debug tokenization/template
 // mismatches (e.g. a model that emits an immediate end-of-turn = a malformed prompt).

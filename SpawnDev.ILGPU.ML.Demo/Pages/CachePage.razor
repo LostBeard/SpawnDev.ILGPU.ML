@@ -19,7 +19,7 @@
         <div class="cache-summary-stat"><span class="cache-num">@_models.Count</span> models</div>
         <div class="cache-summary-stat"><span class="cache-num">@FormatBytes(_totalBytes)</span> on device</div>
         <button class="cache-btn" @onclick="Refresh" disabled="@_busy">Refresh</button>
-        <button class="cache-btn danger" @onclick="ClearAll" disabled="@(_busy || _models.Count == 0)">Clear All</button>
+        <button class="cache-btn danger" @onclick="ClearAll" disabled="@(_busy || (_models.Count == 0 && _torrents.Count == 0))">Clear All</button>
     </div>
 
     @if (_loading)
@@ -199,10 +199,18 @@
         _busy = true; StateHasChanged();
         try
         {
+            // Stop + remove ALL active model torrents (cancels downloads, stops seeding, and deletes their cached
+            // pieces + restore state) AND clear the model cache. Previously this cleared only the model cache, so
+            // the WebTorrent torrents kept running and re-appeared on the next reload.
+            foreach (var t in WebTorrent.Torrents.ToList())
+            {
+                try { await WebTorrent.RemoveAsync(t); } catch { }
+            }
             await Cache.ClearAllAsync();
-            _status = "Cleared all cached models. They'll re-download as needed.";
+            _status = "Cleared all cached models and stopped all transfers.";
         }
         finally { _busy = false; }
+        _torrents = WebTorrent.Torrents.ToList();
         await Refresh();
     }
 

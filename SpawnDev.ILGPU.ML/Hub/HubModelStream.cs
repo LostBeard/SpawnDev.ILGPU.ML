@@ -122,26 +122,27 @@ public class HubModelStream
     /// </param>
     public async Task<HubModel> OpenAsync(string repoId, string filePath, bool deselect = false, CancellationToken ct = default)
     {
-        // Ask the hub (NON-blocking) whether a torrent is ready. Ready ⇒ use it (P2P / warm load). Otherwise the
-        // hub is still preparing it (cold / first load) — stream raw over the /hf web seed, which always serves
-        // (the hub fetches + caches the missing chunks on demand), so the load starts IMMEDIATELY instead of
-        // blocking until the hub finishes its first full server-side download.
-        var status = await GetModelStatusAsync($"{HubBaseUrl.TrimEnd('/')}/model/{repoId.Trim('/')}/{filePath.TrimStart('/')}", ct).ConfigureAwait(false);
-        if (status != null && string.Equals(status.Status, "ready", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(status.MagnetUri))
-            return await OpenTorrentAsync(status.MagnetUri!, repoId, filePath, deselect, ct).ConfigureAwait(false);
-
+        // Add a LAZY-HASH torrent from the hub /hf web seed (SpawnDev.WebTorrent 3.2.11+). The model becomes a
+        // PERSISTENT torrent from the first byte: it downloads on demand from the web seed, computes its infohash
+        // as it goes, caches pieces to OPFS under a stable URL-derived key, and RESTORES on reload with ZERO
+        // re-download — and it shows on the Model Cache page. This replaces the old non-persistent HttpRangeStream
+        // fallback, which made NO torrent when the hub wasn't "ready", so every page refresh re-downloaded the whole
+        // model and it never appeared on /cache. The /hf web seed serves immediately (the hub caches missing chunks
+        // on demand), so the load still starts without waiting for the hub's first full server-side download.
+        // (Phase 2 will adopt the hub's existing .torrent when ready to also seed P2P; the re-download fix is here.)
         var hfUrl = $"{HubBaseUrl.TrimEnd('/')}/hf/{repoId.Trim('/')}/{filePath.TrimStart('/')}";
-        long size = await ProbeSizeAsync(hfUrl, ct).ConfigureAwait(false);
-        return new HubModel(null, null, new HttpRangeStream(_http, hfUrl, size));
+        return await OpenTorrentAsync(hfUrl, repoId, filePath, deselect, ct).ConfigureAwait(false);
     }
 
-    /// <summary>Add a magnet and open a seekable read stream over its (single) file — the P2P / warm path.</summary>
-    private async Task<HubModel> OpenTorrentAsync(string magnet, string repoId, string filePath, bool deselect, CancellationToken ct)
+    /// <summary>Add a torrent (magnet URI OR an http(s) web-seed URL — the latter is a Lazy-Hash add) and open a
+    /// seekable read stream over its (single) file. The torrent is persistent: pieces cache to OPFS and restore on
+    /// reload, so a subsequent open reuses them with no re-download.</summary>
+    private async Task<HubModel> OpenTorrentAsync(string magnetOrUrl, string repoId, string filePath, bool deselect, CancellationToken ct)
     {
         using var metaCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         metaCts.CancelAfter(MetadataTimeout);
         var opts = deselect ? new AddTorrentOptions { Deselect = true } : null;
-        var torrent = await _client.AddAsync(magnet, opts, metaCts.Token).ConfigureAwait(false);
+        var torrent = await _client.AddAsync(magnetOrUrl, opts, metaCts.Token).ConfigureAwait(false);
         if (torrent.Files == null || torrent.Files.Length == 0)
             throw new InvalidOperationException($"Torrent for '{repoId}/{filePath}' resolved metadata but exposes no files.");
         var file = torrent.Files[0];
@@ -262,16 +263,12 @@ public class HubModelStream
     /// for callers needing two concurrent readers (e.g. weight upload + token gather).</summary>
     public async Task<HubModel> OpenOllamaAsync(string model, string tag, string layer, bool deselect = false, CancellationToken ct = default)
     {
-        // Non-blocking status: ready ⇒ torrent (P2P / warm); preparing ⇒ stream raw over the always-serving
-        // /ollama web seed (the hub fetches + caches the missing chunks on demand) — the cold load starts now.
-        var statusUrl = $"{HubBaseUrl.TrimEnd('/')}/ollama-model/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
-        var status = await GetModelStatusAsync(statusUrl, ct).ConfigureAwait(false);
-        if (status != null && string.Equals(status.Status, "ready", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(status.MagnetUri))
-            return await OpenTorrentAsync(status.MagnetUri!, model, $"{tag}/{layer}", deselect, ct).ConfigureAwait(false);
-
+        // Add a LAZY-HASH torrent from the /ollama web seed (SpawnDev.WebTorrent 3.2.11+): the layer becomes a
+        // PERSISTENT torrent — caches to OPFS, restores on reload with ZERO re-download, shows on /cache — replacing
+        // the old non-persistent HttpRangeStream fallback that re-downloaded every refresh. The web seed serves
+        // immediately while the hub caches missing chunks. (Hub-.torrent / P2P adoption when ready is Phase 2.)
         var seedUrl = $"{HubBaseUrl.TrimEnd('/')}/ollama/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
-        long size = await ProbeSizeAsync(seedUrl, ct).ConfigureAwait(false);
-        return new HubModel(null, null, new HttpRangeStream(_http, seedUrl, size));
+        return await OpenTorrentAsync(seedUrl, model, $"{tag}/{layer}", deselect, ct).ConfigureAwait(false);
     }
 
     /// <summary>

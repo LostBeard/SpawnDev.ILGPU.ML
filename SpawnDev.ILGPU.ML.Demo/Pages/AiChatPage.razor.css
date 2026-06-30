@@ -1,10 +1,14 @@
 .ai-chat {
     max-width: 880px;
     margin: 0 auto;
-    padding: 1rem 1.25rem 2rem;
+    padding: 1rem 1.25rem 1rem;
     display: flex;
     flex-direction: column;
     min-height: 0;
+    /* Fill the viewport below the sticky 3.5rem top-row so the header + chat + composer all fit on screen
+       (the transcript scrolls internally) instead of growing the page past the fold. */
+    height: calc(100vh - 3.5rem);
+    box-sizing: border-box;
 }
 
 .hdr h1 {
@@ -28,22 +32,22 @@
 }
 
 .sub {
-    color: #5b6470;
+    color: #94a3b8;
     margin: 0 0 1rem;
     line-height: 1.5;
 }
 
 /* ── Opt-in / load panel ── */
 .optin {
-    border: 1px solid #e3e7ec;
+    border: 1px solid rgba(255,255,255,0.1);
     border-radius: 14px;
     padding: 1.25rem 1.5rem;
-    background: #fbfcfd;
+    background: rgba(255,255,255,0.03);
 }
 
-.optin h2 { margin: 0 0 .4rem; font-size: 1.15rem; }
-.optin h3 { margin: 1.25rem 0 .5rem; font-size: .95rem; color: #3a424d; }
-.optin p { color: #5b6470; line-height: 1.55; margin: 0 0 1rem; }
+.optin h2 { margin: 0 0 .4rem; font-size: 1.15rem; color: #e2e8f0; }
+.optin h3 { margin: 1.25rem 0 .5rem; font-size: .95rem; color: #cbd5e1; }
+.optin p { color: #94a3b8; line-height: 1.55; margin: 0 0 1rem; }
 
 .picker { display: flex; align-items: center; gap: .75rem; }
 .hidden-file { display: none; }
@@ -56,17 +60,17 @@
     column-gap: .6rem;
     align-items: center;
     padding: .55rem .75rem;
-    border: 1px solid #e8ebef;
+    border: 1px solid rgba(255,255,255,0.1);
     border-radius: 10px;
-    background: #fff;
+    background: rgba(255,255,255,0.04);
 }
 .models .dot { grid-area: dot; width: 9px; height: 9px; border-radius: 50%; }
 .models li.ok   .dot { background: #18a558; }
 .models li.warn .dot { background: #e8a13a; }
 .models li.bad  .dot { background: #d6483b; }
-.models .name { grid-area: name; font-weight: 600; font-size: .9rem; }
-.models .meta { grid-area: meta; font-size: .78rem; color: #8893a0; font-variant: tabular-nums; }
-.models .note { grid-area: note; font-size: .8rem; color: #5b6470; }
+.models .name { grid-area: name; font-weight: 600; font-size: .9rem; color: #e2e8f0; }
+.models .meta { grid-area: meta; font-size: .78rem; color: #94a3b8; font-variant: tabular-nums; }
+.models .note { grid-area: note; font-size: .8rem; color: #94a3b8; }
 
 .models li.selectable { cursor: pointer; transition: border-color .12s, box-shadow .12s, transform .04s; }
 .models li.selectable:hover { border-color: #1768f0; box-shadow: 0 1px 6px rgba(23,104,240,.12); }
@@ -115,7 +119,7 @@ button.link:disabled { color: #9aa6b4; cursor: default; }
 .error pre { white-space: pre-wrap; font-size: .82rem; color: #7a3b34; margin: 0 0 1rem; }
 
 /* ── Chat ── */
-.chat { display: flex; flex-direction: column; height: calc(100vh - 190px); min-height: 360px; }
+.chat { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
 
 .bar {
     display: flex;
@@ -140,8 +144,8 @@ button.link:disabled { color: #9aa6b4; cursor: default; }
 .msg { display: flex; flex-direction: column; gap: .25rem; }
 .msg .who { font-size: .72rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: #8893a0; }
 .msg .text { line-height: 1.55; white-space: pre-wrap; word-wrap: break-word; }
-.msg.user .text { background: #eef4ff; border: 1px solid #d8e6ff; border-radius: 12px; padding: .6rem .8rem; align-self: flex-start; }
-.msg.assistant .text { color: #1c2530; }
+.msg.user .text { background: #1768f0; color: #fff; border-radius: 12px; padding: .6rem .8rem; align-self: flex-start; }
+.msg.assistant .text { color: #e2e8f0; }
 .caret { color: #1768f0; animation: blink 1s step-start infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 
