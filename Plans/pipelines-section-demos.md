@@ -127,6 +127,19 @@ Priority order (cheapest + highest "show how" value first), all reuse `NLPPipeli
 Lower priority / needs a model: text2text-generation, image-feature-extraction, audio-classification,
 zero-shot-object-detection (OWL-ViT), document-QA, zero-shot-audio (CLAP).
 
+### ⚠ PREREQUISITE found 2026-06-30 — WordPiece tokenizer (blocks the BERT NLP demos)
+We have **BPETokenizer + SentencePieceTokenizer** but **NO WordPiece** tokenizer. `TokenizerLoader` parses
+`tokenizer.json` / `vocab.json+merges.txt` but always builds a **BPE** tokenizer (`NLPPipelines.cs`
+`TextClassificationPipeline.ClassifySimpleAsync` literally comments "For real use, a WordPiece tokenizer should
+be used"; `/embeddings` ships a hash-based `SimpleTokenize` = approximate results, a standing honesty caveat).
+So the BERT-family gap demos — **sentiment/text-classification, fill-mask, question-answering, NER** — CANNOT be
+demoed honestly yet (they'd produce meaningless tokens → garbage labels). **Do not ship them with fake
+tokenization.** Prerequisite (Rule 2, fix the library): add a real **WordPiece** tokenizer + wire
+`TokenizerLoader` to build it when `tokenizer.json` `model.type == "WordPiece"`; then these demos (and honest
+`/embeddings`) become feasible. Demos that DON'T need WordPiece can go first: translation (NLLB → SentencePiece),
+summarization (DistilBART → BPE), TTS (SpeechT5), image-segmentation. The text-generation / GGUF demos are
+already honest (BPE/SentencePiece via GGUF).
+
 ## 5. Sequencing
 1. Build the `/pipelines` landing grid + the reusable **How-to panel component** (renders our C# + the TJS
    equivalent; pulls the C# from a page-declared snippet so it stays honest).
