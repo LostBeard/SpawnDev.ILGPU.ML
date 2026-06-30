@@ -154,3 +154,19 @@ slower (convert kernels per fallback node). So **F16 is OPT-IN (`VAE_ACT_F16=1`)
 3. Re-measure peak LIVE (must DROP) + keep image sharp. Then flip default to F16.
 4. Address the F16 perf regression (fewer converts once fallbacks are covered; the convert kernels themselves
    may need fusing).
+
+## 🏆 THE ACTUAL SD-TURBO MEMORY WIN (2026-06-16 session 2) — attention fusion, NOT activation precision
+Composition dump of the pipeline peak (env `PEAK_COMPOSITION=1` on Example 03) proved the SD-Turbo peak is the
+**UNet** `down_block.0` self-attention materializing the full `[8,4096,4096]` fp32 scores (4× 512 MiB), NOT the
+VAE (VAE-only peak = 960, via `VAE_PEAK_ONLY=1`). So the activation-F16 work above, while correct, addressed a
+secondary bottleneck.
+
+FIX (shipped `89180ea`): `GraphOptimizer.FuseAttention` pass — pattern-match the decomposed self-attention
+subgraph and replace with one flash-style `FusedAttention` node (online softmax, scores never materialized);
+`FusedAttentionOperator` derives n_heads/head_dim from the rank-3 q so it's shape-agnostic. Plus
+`EliminateDeadNodes` → FIXPOINT (single-pass left the 512 MiB zero-bias `ConstantOfShape` resident → peak
+actually ROSE to 3519 first; see [[feedback-single-pass-dead-elimination-misses-transitive-chains]]).
+
+RESULT: SD peak LIVE **2194 → 960 MiB (−56%)**, TOTAL 3507 → 3304, gen 28.0→27.4s, image BIT-IDENTICAL. Gate
+`PMT_FILTER=AttentionFusion` 8/0 (fusion fires + matches CPU ref). The peak is now VAE-bound (960) — that's
+where the opt-in activation-F16 work (this doc) stacks next, and it's now the PRIMARY remaining lever for SD.
