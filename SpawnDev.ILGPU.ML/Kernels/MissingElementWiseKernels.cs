@@ -149,7 +149,11 @@ public class MissingElementWiseKernels : IDisposable
         // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
         var paramsData = new int[] { outC, inH, inW, blockSize, mode };
         EnsureParamsBuf(paramsData.Length);
-        _paramsBuf!.CopyFromCPU(paramsData);
+        // Copy into an EXACT-size subview: EnsureParamsBuf only grows the persistent buffer, so a smaller
+        // params payload (a lower-rank op following a higher-rank one) is shorter than _paramsBuf, and
+        // ILGPU's CopyFromCPU requires data.Length == view.Length — copying the whole (larger) view throws
+        // ArgumentOutOfRange. Sub-viewing to paramsData.Length keeps the lengths matched.
+        _paramsBuf!.View.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
 
         _depthToSpaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -231,7 +235,11 @@ public class MissingElementWiseKernels : IDisposable
         }
         // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
         EnsureParamsBuf(paramsData.Length);
-        _paramsBuf!.CopyFromCPU(paramsData);
+        // Copy into an EXACT-size subview: EnsureParamsBuf only grows the persistent buffer, so a smaller
+        // params payload (a lower-rank op following a higher-rank one) is shorter than _paramsBuf, and
+        // ILGPU's CopyFromCPU requires data.Length == view.Length — copying the whole (larger) view throws
+        // ArgumentOutOfRange. Sub-viewing to paramsData.Length keeps the lengths matched.
+        _paramsBuf!.View.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
 
         _expandKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,

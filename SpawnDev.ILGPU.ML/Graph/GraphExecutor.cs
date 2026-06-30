@@ -750,6 +750,69 @@ public class GraphExecutor : IDisposable
             if (node.OpType == "Shape" && nodeInputs.Length > 0 && nodeInputs[0] != null)
                 runtimeOutputShapes = new[] { new[] { nodeInputs[0]!.Shape.Length } };
 
+            // Runtime Concat: output shape = input0's shape with the concat axis replaced by the SUM of
+            // all inputs' axis dims. Build-time inference leaves the axis dim unresolved when an upstream
+            // produces a dynamic dim — DAv3's 2D-RoPE position grid (/backbone/Concat_12: [grid,1]+[grid,1]
+            // axis=1 -> [grid,2]) collapses the output buffer to [1], and the fused Concat kernel then
+            // overflows it (the "Concat fused launch extent exceeds output buffer" abort). Resolve from the
+            // ACTUAL runtime input shapes (all resolved by now). Only the clean same-rank case — a rank
+            // mismatch falls back to ConcatOperator's flat-concat path, so leave those on compiled shapes.
+            if (node.OpType == "Concat" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var cBase = nodeInputs[0]!.Shape;
+                int cAxis = 0;
+                if (node.Attributes.TryGetValue("axis", out var cAxObj)) cAxis = Convert.ToInt32(cAxObj);
+                if (cAxis < 0) cAxis += cBase.Length;
+                bool cOk = cAxis >= 0 && cAxis < cBase.Length;
+                if (cOk)
+                    foreach (var t in nodeInputs)
+                        if (t == null || t.Shape.Length != cBase.Length || cAxis >= t.Shape.Length) { cOk = false; break; }
+                if (cOk)
+                {
+                    int cSum = 0;
+                    foreach (var t in nodeInputs) cSum += t!.Shape[cAxis];
+                    var cResolved = (int[])cBase.Clone();
+                    cResolved[cAxis] = cSum;
+                    if (cResolved.All(d => d > 0)) runtimeOutputShapes = new[] { cResolved };
+                }
+            }
+
+            // Runtime MatMul: batched matmul output = broadcast(a.batchDims, b.batchDims) + [M, N].
+            // Compile-time inference can size the batch from the wrong operand — DAv3's multi-view attention
+            // (a=[3,6,6,64] @ b=[1,6,64,6] should broadcast batch to [3,6] → [3,6,6,6]=648, but compile-time
+            // used b's [1,6] → [1,6,6,6]=216 and the kernel overflows). Resolve from the ACTUAL runtime ranks.
+            if (node.OpType == "MatMul" && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null)
+            {
+                var mA = nodeInputs[0]!.Shape;
+                var mB = nodeInputs[1]!.Shape;
+                if (mA.Length >= 2 && mB.Length >= 2)
+                {
+                    int mM = mA[mA.Length - 2];
+                    int mN = mB[mB.Length - 1];
+                    int aBatch = mA.Length - 2, bBatch = mB.Length - 2;
+                    int batchRank = Math.Max(aBatch, bBatch);
+                    var mOut = new int[batchRank + 2];
+                    for (int d = 0; d < batchRank; d++)
+                    {
+                        int ad = d - (batchRank - aBatch); int av = ad >= 0 ? mA[ad] : 1;
+                        int bd = d - (batchRank - bBatch); int bv = bd >= 0 ? mB[bd] : 1;
+                        mOut[d] = Math.Max(av, bv); // ONNX numpy-style batch broadcast
+                    }
+                    mOut[batchRank] = mM;
+                    mOut[batchRank + 1] = mN;
+                    if (mOut.All(d => d > 0)) runtimeOutputShapes = new[] { mOut };
+                }
+            }
+
+            // Runtime shape-preserving ops: a single-output op whose output has input[0]'s exact shape
+            // (softmax + unary activations). When an upstream dynamic dim (DAv3's multi-view batch) leaves
+            // the compiled output buffer sized for the wrong batch, resolve from the actual runtime input.
+            if (nodeInputs.Length > 0 && nodeInputs[0] != null && (
+                node.OpType is "Softmax" or "LogSoftmax" or "Relu" or "Gelu" or "Sigmoid" or "Tanh"
+                or "Erf" or "Exp" or "Sqrt" or "Neg" or "Reciprocal" or "Softplus" or "Elu" or "LeakyRelu"
+                or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"))
+                runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
+
             // Runtime broadcast re-inference for elementwise/select ops poisoned by an upstream
             // value-dependent placeholder — re-infer the output from the ACTUAL runtime input shapes.
             if ((node.OpType == "Where" || node.OpType == "Cast" || node.OpType == "Add" || node.OpType == "Sub"
@@ -1383,6 +1446,69 @@ public class GraphExecutor : IDisposable
             // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
             if (node.OpType == "Shape" && nodeInputs.Length > 0 && nodeInputs[0] != null)
                 runtimeOutputShapes = new[] { new[] { nodeInputs[0]!.Shape.Length } };
+
+            // Runtime Concat: output shape = input0's shape with the concat axis replaced by the SUM of
+            // all inputs' axis dims. Build-time inference leaves the axis dim unresolved when an upstream
+            // produces a dynamic dim — DAv3's 2D-RoPE position grid (/backbone/Concat_12: [grid,1]+[grid,1]
+            // axis=1 -> [grid,2]) collapses the output buffer to [1], and the fused Concat kernel then
+            // overflows it (the "Concat fused launch extent exceeds output buffer" abort). Resolve from the
+            // ACTUAL runtime input shapes (all resolved by now). Only the clean same-rank case — a rank
+            // mismatch falls back to ConcatOperator's flat-concat path, so leave those on compiled shapes.
+            if (node.OpType == "Concat" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var cBase = nodeInputs[0]!.Shape;
+                int cAxis = 0;
+                if (node.Attributes.TryGetValue("axis", out var cAxObj)) cAxis = Convert.ToInt32(cAxObj);
+                if (cAxis < 0) cAxis += cBase.Length;
+                bool cOk = cAxis >= 0 && cAxis < cBase.Length;
+                if (cOk)
+                    foreach (var t in nodeInputs)
+                        if (t == null || t.Shape.Length != cBase.Length || cAxis >= t.Shape.Length) { cOk = false; break; }
+                if (cOk)
+                {
+                    int cSum = 0;
+                    foreach (var t in nodeInputs) cSum += t!.Shape[cAxis];
+                    var cResolved = (int[])cBase.Clone();
+                    cResolved[cAxis] = cSum;
+                    if (cResolved.All(d => d > 0)) runtimeOutputShapes = new[] { cResolved };
+                }
+            }
+
+            // Runtime MatMul: batched matmul output = broadcast(a.batchDims, b.batchDims) + [M, N].
+            // Compile-time inference can size the batch from the wrong operand — DAv3's multi-view attention
+            // (a=[3,6,6,64] @ b=[1,6,64,6] should broadcast batch to [3,6] → [3,6,6,6]=648, but compile-time
+            // used b's [1,6] → [1,6,6,6]=216 and the kernel overflows). Resolve from the ACTUAL runtime ranks.
+            if (node.OpType == "MatMul" && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null)
+            {
+                var mA = nodeInputs[0]!.Shape;
+                var mB = nodeInputs[1]!.Shape;
+                if (mA.Length >= 2 && mB.Length >= 2)
+                {
+                    int mM = mA[mA.Length - 2];
+                    int mN = mB[mB.Length - 1];
+                    int aBatch = mA.Length - 2, bBatch = mB.Length - 2;
+                    int batchRank = Math.Max(aBatch, bBatch);
+                    var mOut = new int[batchRank + 2];
+                    for (int d = 0; d < batchRank; d++)
+                    {
+                        int ad = d - (batchRank - aBatch); int av = ad >= 0 ? mA[ad] : 1;
+                        int bd = d - (batchRank - bBatch); int bv = bd >= 0 ? mB[bd] : 1;
+                        mOut[d] = Math.Max(av, bv); // ONNX numpy-style batch broadcast
+                    }
+                    mOut[batchRank] = mM;
+                    mOut[batchRank + 1] = mN;
+                    if (mOut.All(d => d > 0)) runtimeOutputShapes = new[] { mOut };
+                }
+            }
+
+            // Runtime shape-preserving ops: a single-output op whose output has input[0]'s exact shape
+            // (softmax + unary activations). When an upstream dynamic dim (DAv3's multi-view batch) leaves
+            // the compiled output buffer sized for the wrong batch, resolve from the actual runtime input.
+            if (nodeInputs.Length > 0 && nodeInputs[0] != null && (
+                node.OpType is "Softmax" or "LogSoftmax" or "Relu" or "Gelu" or "Sigmoid" or "Tanh"
+                or "Erf" or "Exp" or "Sqrt" or "Neg" or "Reciprocal" or "Softplus" or "Elu" or "LeakyRelu"
+                or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"))
+                runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
 
             // Runtime broadcast re-inference for elementwise/select ops poisoned by an upstream
             // value-dependent placeholder — re-infer the output from the ACTUAL runtime input shapes.
