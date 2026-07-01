@@ -144,6 +144,27 @@ public class Tensor
     public TensorView<float> View => new TensorView<float>(Data, Shape);
 
     /// <summary>
+    /// Stream this tensor's raw fp32 GPU bytes OUT to <paramref name="target"/> in bounded chunks (default
+    /// 16 MiB) — the SAVE mirror of the streaming-load path (<c>BufferPool.AllocatePermanentFromStreamAsync</c> /
+    /// <c>CopyFromStreamAsync</c>). On the browser backends, when <paramref name="target"/> implements
+    /// <c>SpawnDev.BlazorJS.Toolbox.IJSWriteStream</c> (e.g. an OPFS <c>FileSystemHandleWritableStream</c>), each
+    /// chunk goes GPU→JS <c>Uint8Array</c>→stream WITHOUT entering the .NET/WASM managed heap — so a large tensor
+    /// (e.g. a 588&#160;MB scene buffer) exports with one 16&#160;MiB chunk resident, never the whole buffer (no
+    /// OOM). Desktop backends stream via a managed chunk buffer. Writes <c>ElementCount * 4</c> bytes.
+    /// <para>Does NOT own or close <paramref name="target"/>. For OPFS the disk commit is the async <c>close()</c>:
+    /// <c>await using</c> the writable stream (or <c>await CloseAsync()</c>) or the file can be empty/short.</para>
+    /// <code>
+    ///   await using var writable = await fileHandle.GetWritableStream();
+    ///   await tensor.CopyToStreamAsync(writable);   // one 16 MiB chunk at a time, GPU→OPFS, zero managed-heap copy
+    /// </code>
+    /// </summary>
+    public System.Threading.Tasks.Task CopyToStreamAsync(
+        System.IO.Stream target,
+        int chunkSizeInBytes = 16 * 1024 * 1024,
+        System.Threading.CancellationToken cancellationToken = default)
+        => Data.CopyToStreamAsync(target, chunkSizeInBytes, cancellationToken);
+
+    /// <summary>
     /// Zero-copy reshape. Validates element count matches.
     /// Use -1 for one inferred dimension.
     /// </summary>
