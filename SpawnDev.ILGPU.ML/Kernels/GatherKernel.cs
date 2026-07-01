@@ -96,6 +96,14 @@ public class GatherKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gatherGenericFloatKernel;
     private MemoryBuffer1D<int, Stride1D.Dense>? _lastGenericParams;
+    // Old per-call params buffers, retired here and disposed in Dispose() — NOT inline. On WebGPU/WebGL a
+    // dispatch batches into an un-submitted command encoder; destroying the previous call's params buffer
+    // inline (while its Gather dispatch is still pending in the batch) makes the later Queue.Submit fail
+    // "[Buffer] used in submit while destroyed" (this is the DAv3-518 RoPE node-177 bug — the RoPE dynamic-shape
+    // subgraph issues several GatherGenericFloat calls that batch together). Same deferred-disposal pattern as
+    // ElementWiseKernels.BroadcastBinaryOpND's _oldStridesBufs. Each call still gets a FRESH buffer (no
+    // write-after-read hazard from reusing one), we just free the old ones at a safe point.
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldGenericParams = new();
 
     /// <summary>
     /// General Gather along any axis with float indices.
@@ -137,7 +145,9 @@ public class GatherKernel : IDisposable
         int numIdx, int innerSize, int outerSize, int axisSize)
     {
         EnsureLoaded();
-        _lastGenericParams?.Dispose();
+        // Retire the previous buffer for deferred disposal (see _oldGenericParams) instead of destroying it
+        // inline — its Gather dispatch may still be pending in an un-submitted WebGPU command batch.
+        if (_lastGenericParams != null) _oldGenericParams.Add(_lastGenericParams);
         _lastGenericParams = _accelerator.Allocate1D(new[] { numIdx, innerSize, outerSize, axisSize });
         _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, _lastGenericParams.View);
     }
@@ -155,5 +165,11 @@ public class GatherKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherGenericFloatImpl);
     }
 
-    public void Dispose() => _lastGenericParams?.Dispose();
+    public void Dispose()
+    {
+        _lastGenericParams?.Dispose();
+        _lastGenericParams = null;
+        foreach (var b in _oldGenericParams) b.Dispose();
+        _oldGenericParams.Clear();
+    }
 }

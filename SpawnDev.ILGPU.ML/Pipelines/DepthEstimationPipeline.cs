@@ -43,6 +43,85 @@ public class DepthEstimationPipeline : IDisposable
     }
 
     /// <summary>
+    /// The compiled model's input tensor shape for a CHW preprocessed frame. DAv2 = 4-D [1,3,H,W];
+    /// DAv3 = 5-D [1,1,3,H,W] (the num_images dim). Same CHW element count, different rank — we MUST feed the
+    /// rank the graph was compiled for, or the model reads the channel dim (3) as num_images and returns garbage.
+    /// </summary>
+    private int[] InputTensorShape()
+        => _session.InputShapes.TryGetValue(_session.InputNames[0], out var s)
+           && s.Length >= 4 && s.Aggregate(1, (a, b) => a * b) == 3 * _inputSize * _inputSize
+            ? s : new[] { 1, 3, _inputSize, _inputSize };
+
+    /// <summary>
+    /// Create a depth pipeline from ONNX streams — zero-copy JS→GPU on browser (the model bytes never enter the
+    /// .NET/WASM managed heap). Pass <paramref name="externalDataStream"/> for external-data models like DAv3
+    /// (model.onnx structure + model.onnx_data weights). Single-file models: leave it null.
+    /// </summary>
+    public static async Task<DepthEstimationPipeline> CreateFromStreamsAsync(
+        Accelerator accelerator, System.IO.Stream modelStream, System.IO.Stream? externalDataStream = null,
+        Action<string, int>? onProgress = null, Dictionary<string, int[]>? inputShapes = null,
+        int inputSize = 0, CancellationToken ct = default)
+    {
+        var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, modelStream,
+            onProgress: onProgress, inputShapes: inputShapes, externalDataStream: externalDataStream, ct: ct)
+            .ConfigureAwait(false);
+        return new DepthEstimationPipeline(session, accelerator, inputSize);
+    }
+
+    /// <summary>
+    /// One-call factory: download (WebTorrent + OPFS cache via <paramref name="hubStream"/>) and zero-copy
+    /// stream a depth model straight to the GPU, wrapped in a ready pipeline — the model bytes never touch the
+    /// .NET/WASM heap. Mirrors Transformers.js <c>pipeline('depth-estimation', repoId)</c>. Handles
+    /// external-data models (DAv3 = model.onnx + model.onnx_data) automatically.
+    /// <code>
+    ///   var pipe = await DepthEstimationPipeline.CreateFromHubAsync(acc, hubStream,
+    ///                  "onnx-community/depth-anything-v3-small",
+    ///                  inputShapes: new(){ ["pixel_values"] = new[]{1,1,3,518,518} });
+    ///   var depth = await pipe.EstimateGpuAsync(rgba, w, h);   // zero-copy end to end
+    /// </code>
+    /// </summary>
+    public static async Task<DepthEstimationPipeline> CreateFromHubAsync(
+        Accelerator accelerator, Hub.HubModelStream hubStream, string repoId,
+        string modelFile = "onnx/model.onnx", string externalDataFile = "onnx/model.onnx_data",
+        Action<string, int>? onProgress = null, Dictionary<string, int[]>? inputShapes = null,
+        int inputSize = 0, CancellationToken ct = default)
+    {
+        onProgress?.Invoke("open", 0);
+        System.IO.Stream modelStream;
+        Hub.HubModelStream.HubModel? extData = null;
+        if (!string.IsNullOrEmpty(externalDataFile))
+        {
+            // External-data model (DAv3): model.onnx is a SMALL structure file (weights live in model.onnx_data).
+            // Fetch it over plain HTTP (KBs) and torrent-stream ONLY the big weights file — keeps the 100+ MB
+            // weights zero-copy AND avoids a WebTorrent lazy-hash same-directory collision that otherwise gave the
+            // model.onnx_data stream model.onnx's length (both live under onnx/). If model.onnx_data is absent
+            // (a mislabeled single-file export), extData stays null and the structure file carries any weights.
+            var modelBytes = await hubStream.FetchBytesAsync(repoId, modelFile, ct).ConfigureAwait(false);
+            modelStream = new System.IO.MemoryStream(modelBytes);
+            try { extData = await hubStream.OpenAsync(repoId, externalDataFile, ct: ct).ConfigureAwait(false); }
+            catch { extData = null; }
+        }
+        else
+        {
+            // Single-file model: torrent-stream model.onnx directly (weights embedded — keep them off the heap).
+            var modelTorrent = await hubStream.OpenAsync(repoId, modelFile, ct: ct).ConfigureAwait(false);
+            modelStream = modelTorrent.Stream;
+        }
+        onProgress?.Invoke("open", 100);
+        try
+        {
+            return await CreateFromStreamsAsync(accelerator, modelStream, extData?.Stream,
+                onProgress, inputShapes, inputSize, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Weights are on the GPU by now — the streams are done.
+            await modelStream.DisposeAsync().ConfigureAwait(false);
+            if (extData != null) await extData.Stream.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// Estimate depth from an RGBA image.
     /// Returns a depth map normalized to [0, 1] (higher = closer).
     ///
@@ -63,7 +142,7 @@ public class DepthEstimationPipeline : IDisposable
         _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize);
 
         // Create input tensor
-        var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
+        var inputTensor = new Tensor(preprocessed.View, InputTensorShape());
 
         // Run inference
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
@@ -184,7 +263,7 @@ public class DepthEstimationPipeline : IDisposable
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
         _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize);
 
-        var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
+        var inputTensor = new Tensor(preprocessed.View, InputTensorShape());
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor

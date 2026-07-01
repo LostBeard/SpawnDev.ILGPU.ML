@@ -989,6 +989,7 @@ public class InferenceSession : IDisposable
         Dictionary<string, int[]>? inputShapes = null,
         bool enableOptimization = true,
         int streamThreshold = 1024 * 1024,
+        Stream? externalDataStream = null,
         CancellationToken ct = default)
     {
         if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -1156,6 +1157,31 @@ public class InferenceSession : IDisposable
                     "Give these ops a native low-p path to keep their weights native.");
             }
         }
+
+        // External-data weights (DataLocation==1 → a SEPARATE file, e.g. DAv3's model.onnx_data).
+        // StreamTensorsFromParsed above skips these, so stream them here from the provided external-data stream
+        // at their ONNX-recorded offsets — zero-copy JS→GPU (fp32 via CopyFromStreamAsync → CopyFromJS), never
+        // the managed heap. Before this, external-data ONNX models (DAv3 + most onnx-community exports) could
+        // ONLY load via the byte[] path (whole file into the WASM heap) — this is the JS-data-rule-compliant path.
+        if (externalDataStream != null)
+        {
+            int extLoaded = 0;
+            foreach (var init in parsedModel.Graph.Initializers)
+            {
+                if (init.DataLocation != 1 || init.ExternalData == null) continue;
+                if (!graph.Initializers.TryGetValue(init.Name, out var shape)) continue;
+                if (gpuWeights.ContainsKey(init.Name)) continue;
+                int elems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+                long extOffset = init.ExternalData.TryGetValue("offset", out var eo) && long.TryParse(eo, out var eov) ? eov : 0;
+                long extLen = init.ExternalData.TryGetValue("length", out var el) && long.TryParse(el, out var elv)
+                    ? elv : (long)elems * (init.DataType == 10 ? 2 : 4);
+                gpuWeights[init.Name] = await pool.AllocatePermanentFromStreamAsync(
+                    externalDataStream, extOffset, (int)extLen, init.DataType, shape, init.Name, ct).ConfigureAwait(false);
+                loaded++; extLoaded++;
+            }
+            if (VerboseLogging) Console.WriteLine($"[InferenceSession] external-data (stream): {extLoaded} weights streamed from model.onnx_data (zero-copy)");
+        }
+
         foreach (var name in compiled.InitializerNames)
         {
             if (gpuWeights.ContainsKey(name)) continue;

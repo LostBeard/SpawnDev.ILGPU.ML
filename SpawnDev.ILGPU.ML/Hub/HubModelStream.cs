@@ -134,6 +134,20 @@ public class HubModelStream
         return await OpenTorrentAsync(hfUrl, repoId, filePath, deselect, ct).ConfigureAwait(false);
     }
 
+    /// <summary>Fetch a SMALL hub file fully into a byte[] via a plain HTTP GET of the /hf web seed. Use for a
+    /// KB-scale structure file (e.g. an external-data model's <c>model.onnx</c>, which holds only the graph — the
+    /// weights live in <c>model.onnx_data</c>). Streaming that big weights file stays on the zero-copy torrent
+    /// path; fetching the tiny structure over HTTP also sidesteps a WebTorrent lazy-hash collision when two
+    /// web-seed files share a directory (<c>onnx/model.onnx</c> + <c>onnx/model.onnx_data</c>). Do NOT use for
+    /// large single-file weights — that belongs on <see cref="OpenAsync"/>.</summary>
+    public async Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken ct = default)
+    {
+        var url = $"{HubBaseUrl.TrimEnd('/')}/hf/{repoId.Trim('/')}/{filePath.TrimStart('/')}";
+        using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
+    }
+
     /// <summary>Add a torrent (magnet URI OR an http(s) web-seed URL — the latter is a Lazy-Hash add) and open a
     /// seekable read stream over its (single) file. The torrent is persistent: pieces cache to OPFS and restore on
     /// reload, so a subsequent open reuses them with no re-download.</summary>

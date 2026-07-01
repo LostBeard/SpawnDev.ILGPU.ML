@@ -522,13 +522,17 @@ public class GraphExecutor : IDisposable
                         if (ax < 0) ax += resolved.Length;
                         if (ax >= 0 && ax < resolved.Length)
                         {
-                            int s = (int)starts[si]; if (s < 0) s += resolved[ax];
+                            int s = (int)starts[si]; if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
                             int e = (int)ends[si]; if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
                             int st = steps != null && si < steps.Length ? (int)steps[si] : 1;
-                            resolved[ax] = (e - s + st - 1) / st;
+                            // Empty slices ARE valid (e<=s → 0): DAv3's extrinsics builds an EMPTY [.,.,0,4] row
+                            // (Slice [3:3] on a size-3 axis, ORT value_info [?,?,0,4]) that a later Concat treats
+                            // as a no-op. Rejecting the 0-dim here collapsed the whole shape to the compile-time
+                            // rank-2 [1,4] → the extrinsics Concat then crashed on a rank/inner mismatch.
+                            resolved[ax] = Math.Max(0, (e - s + st - 1) / st);
                         }
                     }
-                    if (resolved.All(d => d > 0))
+                    if (resolved.All(d => d >= 0))
                         runtimeOutputShapes = new[] { resolved };
                 }
             }
@@ -701,6 +705,31 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime Squeeze: output = input shape with the listed size-1 axes removed (or ALL size-1 dims if
+            // no axes). Compile-time collapses it — DAv3's DEPTH head does Reshape(target = Shape(Squeeze(...))),
+            // and a collapsed Squeeze shape made the reshape target's W dim read 0 → depth came out [50176,1,1,1]
+            // instead of [1,1,224,224] (VALUES were correct, only the final shape was wrong).
+            if (node.OpType == "Squeeze" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var sqIn = nodeInputs[0]!.Shape;
+                int[]? sqAxes = null;
+                if (node.Attributes.TryGetValue("axes", out var sqAxObj) && sqAxObj is long[] sqal)
+                    sqAxes = sqal.Select(x => (int)x).ToArray();
+                else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var sqAxV))
+                    sqAxes = sqAxV.Select(x => (int)Math.Round(x)).ToArray();
+                var sqOut = new List<int>();
+                if (sqAxes != null && sqAxes.Length > 0)
+                {
+                    var sqSet = sqAxes.Select(a => a < 0 ? a + sqIn.Length : a).ToHashSet();
+                    for (int d = 0; d < sqIn.Length; d++) if (!sqSet.Contains(d)) sqOut.Add(sqIn[d]);
+                }
+                else
+                    for (int d = 0; d < sqIn.Length; d++) if (sqIn[d] != 1) sqOut.Add(sqIn[d]);
+                if (sqOut.Count == 0) sqOut.Add(1);
+                if (sqOut.All(x => x > 0)) runtimeOutputShapes = new[] { sqOut.ToArray() };
+            }
+
             // Runtime Range: output length = ceil((limit - start) / delta), knowable only
             // from the scalar input VALUES, not their shapes. RangeOperator.InferOutputShapes
             // returns the [1] placeholder, so without this the output buffer is sized to ONE
@@ -777,6 +806,81 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime Gather: output shape = data.shape[:axis] + indices.shape + data.shape[axis+1:], computed
+            // from the ACTUAL runtime input shapes. Compile-time inference bakes an upstream multi-view dynamic
+            // dim into the output — DAv3's 2D-RoPE `Gather(Reshape_26=[1,257,2], axis=2, scalar)` was baked
+            // [3,257] (the channel-3 leak) instead of [1,257]; that 3x-bloats the RoPE cos/sin and corrupts
+            // attention from block 4 (~5%/block → ~11% depth error). Mirrors GatherOperator.InferOutputShapes.
+            if (node.OpType == "Gather" && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null)
+            {
+                var gData = nodeInputs[0]!.Shape;
+                var gIdx = nodeInputs[1]!.Shape;
+                int gAxis = 0;
+                if (node.Attributes.TryGetValue("axis", out var gAxObj)) gAxis = Convert.ToInt32(gAxObj);
+                if (gAxis < 0) gAxis += gData.Length;
+                if (gAxis >= 0 && gAxis < gData.Length)
+                {
+                    // A [1] index on multi-dim data collapses to a scalar (drops the axis) — matches the operator.
+                    var gEff = (gData.Length > 1 && gIdx.Length == 1 && gIdx[0] == 1) ? Array.Empty<int>() : gIdx;
+                    var gOut = new List<int>();
+                    for (int i = 0; i < gAxis; i++) gOut.Add(gData[i]);
+                    gOut.AddRange(gEff);
+                    for (int i = gAxis + 1; i < gData.Length; i++) gOut.Add(gData[i]);
+                    if (gOut.Count > 0 && gOut.All(d => d > 0)) runtimeOutputShapes = new[] { gOut.ToArray() };
+                }
+            }
+
+            // Runtime Einsum: resolve output shape from the equation + ACTUAL runtime input dims. Compile-time
+            // collapses a dynamic outer-product/contraction to [1] — DAv3's 2D-RoPE freqs
+            // Einsum("i,j->ij", pos[17], invfreq[16]) should be [17,16]=272 but was baked [1], which collapses
+            // the whole cos/sin chain and ZEROES the rotation (RoPE'd q loses magnitude → flat attention).
+            if (node.OpType == "Einsum" && nodeInputs.Length > 0
+                && node.Attributes.TryGetValue("equation", out var eqObj))
+            {
+                var eq = eqObj?.ToString()?.Replace(" ", "");
+                if (!string.IsNullOrEmpty(eq) && eq.Contains("->"))
+                {
+                    var eqParts = eq.Split("->");
+                    var inSpecs = eqParts[0].Split(',');
+                    var outSpec = eqParts[1];
+                    var dimOf = new Dictionary<char, int>();
+                    bool eOk = inSpecs.Length == nodeInputs.Length && !outSpec.Contains('.');
+                    for (int ii = 0; eOk && ii < inSpecs.Length; ii++)
+                    {
+                        var spec = inSpecs[ii]; var sh = nodeInputs[ii]?.Shape;
+                        if (sh == null || spec.Contains('.') || spec.Length != sh.Length) { eOk = false; break; }
+                        for (int d = 0; d < spec.Length; d++) dimOf[spec[d]] = sh[d];
+                    }
+                    if (eOk)
+                    {
+                        var eOut = new int[outSpec.Length];
+                        for (int d = 0; d < outSpec.Length; d++)
+                            eOut[d] = dimOf.TryGetValue(outSpec[d], out var dv) ? dv : 1;
+                        if (eOut.Length > 0 && eOut.All(x => x > 0)) runtimeOutputShapes = new[] { eOut };
+                    }
+                }
+            }
+
+            // Runtime Transpose: output shape = input shape permuted by perm, from the ACTUAL runtime input.
+            // Compile-time collapses dynamic dims — DAv3's RoPE position transpose input [16,16,48]=12288 got
+            // output [48,1,2]=96, and the transpose kernel (launch extent = product(input)=12288) then WRITES
+            // 12288 floats into the 96-float output buffer → a massive OOB write that corrupts a live buffer a
+            // few blocks later (illegal memory access surfacing at block 9). Permute the runtime input shape.
+            if (node.OpType == "Transpose" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var tIn = nodeInputs[0]!.Shape;
+                int[] tPerm;
+                if (node.Attributes.TryGetValue("perm", out var tPermObj) && tPermObj is long[] tpl)
+                    tPerm = tpl.Select(x => (int)x).ToArray();
+                else { tPerm = new int[tIn.Length]; for (int i = 0; i < tIn.Length; i++) tPerm[i] = tIn.Length - 1 - i; }
+                if (tPerm.Length == tIn.Length && tPerm.All(pp => pp >= 0 && pp < tIn.Length))
+                {
+                    var tOut = new int[tIn.Length];
+                    for (int i = 0; i < tIn.Length; i++) tOut[i] = tIn[tPerm[i]];
+                    if (tOut.All(d => d > 0)) runtimeOutputShapes = new[] { tOut };
+                }
+            }
+
             // Runtime MatMul: batched matmul output = broadcast(a.batchDims, b.batchDims) + [M, N].
             // Compile-time inference can size the batch from the wrong operand — DAv3's multi-view attention
             // (a=[3,6,6,64] @ b=[1,6,64,6] should broadcast batch to [3,6] → [3,6,6,6]=648, but compile-time
@@ -850,7 +954,7 @@ public class GraphExecutor : IDisposable
             if ((node.OpType == "Where" || node.OpType == "Cast" || node.OpType == "Add" || node.OpType == "Sub"
                  || node.OpType == "Mul" || node.OpType == "Div" || node.OpType == "Equal" || node.OpType == "Less"
                  || node.OpType == "Greater" || node.OpType == "And" || node.OpType == "Or" || node.OpType == "Not"
-                 || node.OpType == "Min" || node.OpType == "Max") && nodeInputs.Length > 0)
+                 || node.OpType == "Min" || node.OpType == "Max" || node.OpType == "Pow") && nodeInputs.Length > 0)
             {
                 int wr = 0;
                 foreach (var t in nodeInputs) if (t != null) wr = Math.Max(wr, t.Shape.Length);
@@ -1249,13 +1353,17 @@ public class GraphExecutor : IDisposable
                         if (ax < 0) ax += resolved.Length;
                         if (ax >= 0 && ax < resolved.Length)
                         {
-                            int s = (int)starts[si]; if (s < 0) s += resolved[ax];
+                            int s = (int)starts[si]; if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
                             int e = (int)ends[si]; if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
                             int st = steps != null && si < steps.Length ? (int)steps[si] : 1;
-                            resolved[ax] = (e - s + st - 1) / st;
+                            // Empty slices ARE valid (e<=s → 0): DAv3's extrinsics builds an EMPTY [.,.,0,4] row
+                            // (Slice [3:3] on a size-3 axis, ORT value_info [?,?,0,4]) that a later Concat treats
+                            // as a no-op. Rejecting the 0-dim here collapsed the whole shape to the compile-time
+                            // rank-2 [1,4] → the extrinsics Concat then crashed on a rank/inner mismatch.
+                            resolved[ax] = Math.Max(0, (e - s + st - 1) / st);
                         }
                     }
-                    if (resolved.All(d => d > 0))
+                    if (resolved.All(d => d >= 0))
                         runtimeOutputShapes = new[] { resolved };
                 }
             }
@@ -1430,6 +1538,31 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime Squeeze: output = input shape with the listed size-1 axes removed (or ALL size-1 dims if
+            // no axes). Compile-time collapses it — DAv3's DEPTH head does Reshape(target = Shape(Squeeze(...))),
+            // and a collapsed Squeeze shape made the reshape target's W dim read 0 → depth came out [50176,1,1,1]
+            // instead of [1,1,224,224] (VALUES were correct, only the final shape was wrong).
+            if (node.OpType == "Squeeze" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var sqIn = nodeInputs[0]!.Shape;
+                int[]? sqAxes = null;
+                if (node.Attributes.TryGetValue("axes", out var sqAxObj) && sqAxObj is long[] sqal)
+                    sqAxes = sqal.Select(x => (int)x).ToArray();
+                else if (node.InputNames.Length >= 2 && !string.IsNullOrEmpty(node.InputNames[1])
+                    && runtimeConstants.TryGetValue(node.InputNames[1], out var sqAxV))
+                    sqAxes = sqAxV.Select(x => (int)Math.Round(x)).ToArray();
+                var sqOut = new List<int>();
+                if (sqAxes != null && sqAxes.Length > 0)
+                {
+                    var sqSet = sqAxes.Select(a => a < 0 ? a + sqIn.Length : a).ToHashSet();
+                    for (int d = 0; d < sqIn.Length; d++) if (!sqSet.Contains(d)) sqOut.Add(sqIn[d]);
+                }
+                else
+                    for (int d = 0; d < sqIn.Length; d++) if (sqIn[d] != 1) sqOut.Add(sqIn[d]);
+                if (sqOut.Count == 0) sqOut.Add(1);
+                if (sqOut.All(x => x > 0)) runtimeOutputShapes = new[] { sqOut.ToArray() };
+            }
+
             // Runtime Range: output length = ceil((limit - start) / delta), knowable only
             // from the scalar input VALUES, not their shapes. RangeOperator.InferOutputShapes
             // returns the [1] placeholder, so without this the output buffer is sized to ONE
@@ -1506,6 +1639,81 @@ public class GraphExecutor : IDisposable
                 }
             }
 
+            // Runtime Gather: output shape = data.shape[:axis] + indices.shape + data.shape[axis+1:], computed
+            // from the ACTUAL runtime input shapes. Compile-time inference bakes an upstream multi-view dynamic
+            // dim into the output — DAv3's 2D-RoPE `Gather(Reshape_26=[1,257,2], axis=2, scalar)` was baked
+            // [3,257] (the channel-3 leak) instead of [1,257]; that 3x-bloats the RoPE cos/sin and corrupts
+            // attention from block 4 (~5%/block → ~11% depth error). Mirrors GatherOperator.InferOutputShapes.
+            if (node.OpType == "Gather" && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null)
+            {
+                var gData = nodeInputs[0]!.Shape;
+                var gIdx = nodeInputs[1]!.Shape;
+                int gAxis = 0;
+                if (node.Attributes.TryGetValue("axis", out var gAxObj)) gAxis = Convert.ToInt32(gAxObj);
+                if (gAxis < 0) gAxis += gData.Length;
+                if (gAxis >= 0 && gAxis < gData.Length)
+                {
+                    // A [1] index on multi-dim data collapses to a scalar (drops the axis) — matches the operator.
+                    var gEff = (gData.Length > 1 && gIdx.Length == 1 && gIdx[0] == 1) ? Array.Empty<int>() : gIdx;
+                    var gOut = new List<int>();
+                    for (int i = 0; i < gAxis; i++) gOut.Add(gData[i]);
+                    gOut.AddRange(gEff);
+                    for (int i = gAxis + 1; i < gData.Length; i++) gOut.Add(gData[i]);
+                    if (gOut.Count > 0 && gOut.All(d => d > 0)) runtimeOutputShapes = new[] { gOut.ToArray() };
+                }
+            }
+
+            // Runtime Einsum: resolve output shape from the equation + ACTUAL runtime input dims. Compile-time
+            // collapses a dynamic outer-product/contraction to [1] — DAv3's 2D-RoPE freqs
+            // Einsum("i,j->ij", pos[17], invfreq[16]) should be [17,16]=272 but was baked [1], which collapses
+            // the whole cos/sin chain and ZEROES the rotation (RoPE'd q loses magnitude → flat attention).
+            if (node.OpType == "Einsum" && nodeInputs.Length > 0
+                && node.Attributes.TryGetValue("equation", out var eqObj))
+            {
+                var eq = eqObj?.ToString()?.Replace(" ", "");
+                if (!string.IsNullOrEmpty(eq) && eq.Contains("->"))
+                {
+                    var eqParts = eq.Split("->");
+                    var inSpecs = eqParts[0].Split(',');
+                    var outSpec = eqParts[1];
+                    var dimOf = new Dictionary<char, int>();
+                    bool eOk = inSpecs.Length == nodeInputs.Length && !outSpec.Contains('.');
+                    for (int ii = 0; eOk && ii < inSpecs.Length; ii++)
+                    {
+                        var spec = inSpecs[ii]; var sh = nodeInputs[ii]?.Shape;
+                        if (sh == null || spec.Contains('.') || spec.Length != sh.Length) { eOk = false; break; }
+                        for (int d = 0; d < spec.Length; d++) dimOf[spec[d]] = sh[d];
+                    }
+                    if (eOk)
+                    {
+                        var eOut = new int[outSpec.Length];
+                        for (int d = 0; d < outSpec.Length; d++)
+                            eOut[d] = dimOf.TryGetValue(outSpec[d], out var dv) ? dv : 1;
+                        if (eOut.Length > 0 && eOut.All(x => x > 0)) runtimeOutputShapes = new[] { eOut };
+                    }
+                }
+            }
+
+            // Runtime Transpose: output shape = input shape permuted by perm, from the ACTUAL runtime input.
+            // Compile-time collapses dynamic dims — DAv3's RoPE position transpose input [16,16,48]=12288 got
+            // output [48,1,2]=96, and the transpose kernel (launch extent = product(input)=12288) then WRITES
+            // 12288 floats into the 96-float output buffer → a massive OOB write that corrupts a live buffer a
+            // few blocks later (illegal memory access surfacing at block 9). Permute the runtime input shape.
+            if (node.OpType == "Transpose" && nodeInputs.Length > 0 && nodeInputs[0] != null)
+            {
+                var tIn = nodeInputs[0]!.Shape;
+                int[] tPerm;
+                if (node.Attributes.TryGetValue("perm", out var tPermObj) && tPermObj is long[] tpl)
+                    tPerm = tpl.Select(x => (int)x).ToArray();
+                else { tPerm = new int[tIn.Length]; for (int i = 0; i < tIn.Length; i++) tPerm[i] = tIn.Length - 1 - i; }
+                if (tPerm.Length == tIn.Length && tPerm.All(pp => pp >= 0 && pp < tIn.Length))
+                {
+                    var tOut = new int[tIn.Length];
+                    for (int i = 0; i < tIn.Length; i++) tOut[i] = tIn[tPerm[i]];
+                    if (tOut.All(d => d > 0)) runtimeOutputShapes = new[] { tOut };
+                }
+            }
+
             // Runtime MatMul: batched matmul output = broadcast(a.batchDims, b.batchDims) + [M, N].
             // Compile-time inference can size the batch from the wrong operand — DAv3's multi-view attention
             // (a=[3,6,6,64] @ b=[1,6,64,6] should broadcast batch to [3,6] → [3,6,6,6]=648, but compile-time
@@ -1579,7 +1787,7 @@ public class GraphExecutor : IDisposable
             if ((node.OpType == "Where" || node.OpType == "Cast" || node.OpType == "Add" || node.OpType == "Sub"
                  || node.OpType == "Mul" || node.OpType == "Div" || node.OpType == "Equal" || node.OpType == "Less"
                  || node.OpType == "Greater" || node.OpType == "And" || node.OpType == "Or" || node.OpType == "Not"
-                 || node.OpType == "Min" || node.OpType == "Max") && nodeInputs.Length > 0)
+                 || node.OpType == "Min" || node.OpType == "Max" || node.OpType == "Pow") && nodeInputs.Length > 0)
             {
                 int wr = 0;
                 foreach (var t in nodeInputs) if (t != null) wr = Math.Max(wr, t.Shape.Length);

@@ -277,6 +277,81 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Conv2D_Batch2_ComputesBothViews() => await RunTest(async accelerator =>
+    {
+        // REGRESSION (DAv3 multi-view, num_images>1): a batched Conv MUST compute EVERY view. Conv2DImpl once
+        // decoded idx→(oc,oy,ox) with no batch offset on the input read → view 1+ was left stale garbage. Feed
+        // two DIFFERENT views sharing one weight; both must match the per-view CPU reference.
+        int inC = 3, inH = 16, inW = 16, outC = 8, kH = 3, kW = 3, stride = 1, pad = 1, batch = 2;
+        var in0 = RandomFloats(inC * inH * inW, seed: 400, scale: 0.5f);
+        var in1 = RandomFloats(inC * inH * inW, seed: 401, scale: 0.5f);
+        var weight = RandomFloats(outC * inC * kH * kW, seed: 402, scale: 0.1f);
+        var bias = RandomFloats(outC, seed: 403, scale: 0.01f);
+        var input = in0.Concat(in1).ToArray();
+        var expected = CpuConv2D(in0, weight, bias, inC, inH, inW, outC, kH, kW, stride, pad)
+            .Concat(CpuConv2D(in1, weight, bias, inC, inH, inW, outC, kH, kW, stride, pad)).ToArray();
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(expected.Length);
+        var conv = new Conv2DKernel(accelerator);
+        conv.ForwardPadded(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW,
+            stride, pad, pad, pad, pad, 1, 1, batch);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, expected.Length), expected, inC * 2e-5f, "Conv2D batch2: ");
+    });
+
+    [TestMethod]
+    public async Task ConvTranspose2D_Batch2_ComputesBothViews() => await RunTest(async accelerator =>
+    {
+        // REGRESSION (DAv3 multi-view): the DPT head resize_layers ConvTranspose must compute EVERY view. The
+        // kernel once had no batch offset → view 1 stale, which corrupted the entire head downstream.
+        int inC = 4, inH = 5, inW = 5, outC = 4, kH = 4, kW = 4, stride = 4, padding = 0, batch = 2;
+        int outH = (inH - 1) * stride + kH, outW = (inW - 1) * stride + kW;
+        var in0 = RandomFloats(inC * inH * inW, seed: 410, scale: 0.5f);
+        var in1 = RandomFloats(inC * inH * inW, seed: 411, scale: 0.5f);
+        var weight = RandomFloats(inC * outC * kH * kW, seed: 412, scale: 0.1f);
+        var bias = RandomFloats(outC, seed: 413, scale: 0.01f);
+        float[] CpuCT(float[] input)
+        {
+            var e = new float[outC * outH * outW];
+            for (int oc = 0; oc < outC; oc++)
+                for (int oy = 0; oy < outH; oy++)
+                    for (int ox = 0; ox < outW; ox++)
+                    {
+                        double sum = (double)bias[oc];
+                        for (int ic = 0; ic < inC; ic++)
+                            for (int ky = 0; ky < kH; ky++)
+                            {
+                                int diffY = oy + padding - ky; if (diffY < 0 || diffY % stride != 0) continue;
+                                int iy = diffY / stride; if (iy >= inH) continue;
+                                for (int kx = 0; kx < kW; kx++)
+                                {
+                                    int diffX = ox + padding - kx; if (diffX < 0 || diffX % stride != 0) continue;
+                                    int ix = diffX / stride; if (ix >= inW) continue;
+                                    sum += (double)input[ic * inH * inW + iy * inW + ix]
+                                         * (double)weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
+                                }
+                            }
+                        e[oc * outH * outW + oy * outW + ox] = (float)sum;
+                    }
+            return e;
+        }
+        var input = in0.Concat(in1).ToArray();
+        var expected = CpuCT(in0).Concat(CpuCT(in1)).ToArray();
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weight);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(expected.Length);
+        var convT = new ConvTranspose2DKernel(accelerator);
+        convT.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, inC, inH, inW, outC, kH, kW, stride, padding, batch);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, expected.Length), expected, inC * kH * kW * 2e-5f, "ConvTranspose2D batch2: ");
+    });
+
+    [TestMethod]
     public async Task AttentionSplitMerge_RoundTrip() => await RunTest(async accelerator =>
     {
         // SplitHeads → MergeHeads should recover the original data

@@ -47,10 +47,17 @@ public class ConvTranspose2DKernel : IDisposable
         int outH = (inH - 1) * stride - 2 * padding + kH;
         int outW = (inW - 1) * stride - 2 * padding + kW;
 
-        int ox = idx % outW;
-        int rem = idx / outW;
+        // BATCH-aware decode: idx spans (batch * outC * outH * outW). batch=1 → b==0, inBatchBase==0 =
+        // byte-identical to the old kernel; only batch>1 (DAv3 multi-view, N views through the DPT resize_layers
+        // ConvTranspose) changes. Without this it computed only view 0 and left every later view stale.
+        int perBatchOut = outC * outH * outW;
+        int b = idx / perBatchOut;
+        int r = idx - b * perBatchOut;
+        int ox = r % outW;
+        int rem = r / outW;
         int oy = rem % outH;
         int oc = rem / outH;
+        int inBatchBase = b * inC * inH * inW;
 
         float sum = bias[oc]; // f32 accumulation (ML-standard; see Conv2DKernel). Always read — no branch (ANGLE workaround)
 
@@ -70,7 +77,7 @@ public class ConvTranspose2DKernel : IDisposable
                     int ix = diffX / stride;
                     if (ix >= inW) continue;
 
-                    sum += input[ic * inH * inW + iy * inW + ix] * weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
+                    sum += input[inBatchBase + ic * inH * inW + iy * inW + ix] * weight[ic * outC * kH * kW + oc * kH * kW + ky * kW + kx];
                 }
             }
         }
@@ -85,16 +92,18 @@ public class ConvTranspose2DKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         int inC, int inH, int inW,
         int outC, int kH, int kW,
-        int stride = 1, int padding = 0)
+        int stride = 1, int padding = 0, int batch = 1)
     {
         EnsureLoaded();
         int outH = (inH - 1) * stride - 2 * padding + kH;
         int outW = (inW - 1) * stride - 2 * padding + kW;
+        if (batch < 1) batch = 1;
 
         _paramsBuf ??= _accelerator.Allocate1D<int>(8);
         _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
 
-        _kernel!(outC * outH * outW, input, weight, bias, output, _paramsBuf.View);
+        // Extent spans ALL batches; the kernel decodes the batch index (DAv3 multi-view = N views).
+        _kernel!(batch * outC * outH * outW, input, weight, bias, output, _paramsBuf.View);
     }
 
     public static int OutputSize(int inputSize, int kernelSize, int stride, int padding)

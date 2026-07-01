@@ -55,6 +55,34 @@ public abstract partial class MLTestBase
     [TestMethod] public async Task AllOps_Less() => await RunTest(async a => { var e = GetOrCreateEW(a); using var x = a.Allocate1D(new float[]{1,5,3}); using var y = a.Allocate1D(new float[]{2,2,3}); using var o = a.Allocate1D<float>(3); e.Less(x.View,y.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{1,0,0},0f,"Less:"); });
     [TestMethod] public async Task AllOps_Log() => await RunTest(async a => { var e = GetOrCreateEW(a); using var i = a.Allocate1D(new float[]{1,MathF.E}); using var o = a.Allocate1D<float>(2); e.Log(i.View,o.View,2); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{0,1},1e-4f,"Log:"); });
     [TestMethod] public async Task AllOps_MatMul() => await RunTest(async a => { var r = new OperatorRegistry(a); using var x = a.Allocate1D(new float[]{1,2,3,4}); using var y = a.Allocate1D(new float[]{5,6,7,8}); using var o = a.Allocate1D<float>(4); r.MatMul.MatMul(x.View,y.View,o.View,2,2,2); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{19,22,43,50},1e-3f,"MatMul:"); });
+    [TestMethod]
+    public async Task AllOps_MatMul_BatchedActivationsSharedWeight() => await RunTest(async a =>
+    {
+        // REGRESSION (DAv3 multi-view): a batched activation [N,S,K] @ a SHARED 2-D weight [K,Nn] (a Linear)
+        // must flatten ALL N*S rows into M, NOT route to BatchedMatMul (which strides the 2-D weight by batch
+        // and reads off its end → the multi-view qkv Linear blew to ~1e19). Each row must match the CPU ref.
+        int N = 2, S = 3, K = 4, Nn = 5;
+        var aData = RandomFloats(N * S * K, seed: 500, scale: 0.5f);
+        var wData = RandomFloats(K * Nn, seed: 501, scale: 0.5f);
+        var expected = new float[N * S * Nn];
+        for (int row = 0; row < N * S; row++)
+            for (int n = 0; n < Nn; n++)
+            {
+                double s = 0; for (int k = 0; k < K; k++) s += (double)aData[row * K + k] * (double)wData[k * Nn + n];
+                expected[row * Nn + n] = (float)s;
+            }
+        using var aBuf = a.Allocate1D(aData);
+        using var wBuf = a.Allocate1D(wData);
+        using var oBuf = a.Allocate1D<float>(N * S * Nn);
+        var reg = new OperatorRegistry(a);
+        var xT = new Tensor(aBuf.View, new[] { N, S, K });
+        var wT = new Tensor(wBuf.View, new[] { K, Nn });
+        var oT = new Tensor(oBuf.View, new[] { N, S, Nn });
+        var ctx = MakeOpCtx(a, new[] { xT, wT }, new[] { oT });
+        new SpawnDev.ILGPU.ML.Operators.MatMulOperator(reg).Execute(ctx);
+        await a.SynchronizeAsync();
+        await AssertCloseGpu(a, oBuf.View, expected, K * 2e-5f, "MatMul batched-A@2D-weight: ");
+    });
     [TestMethod] public async Task AllOps_Max() => await RunTest(async a => { var e = GetOrCreateEW(a); using var x = a.Allocate1D(new float[]{1,5,3}); using var y = a.Allocate1D(new float[]{4,2,6}); using var o = a.Allocate1D<float>(3); e.Max(x.View,y.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{4,5,6},0f,"Max:"); });
     [TestMethod] public async Task AllOps_Min() => await RunTest(async a => { var e = GetOrCreateEW(a); using var x = a.Allocate1D(new float[]{1,5,3}); using var y = a.Allocate1D(new float[]{4,2,6}); using var o = a.Allocate1D<float>(3); e.Min(x.View,y.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new float[]{1,2,3},0f,"Min:"); });
     [TestMethod] public async Task AllOps_Mish() => await RunTest(async a => { var e = GetOrCreateEW(a); using var i = a.Allocate1D(new float[]{0,1,-1}); using var o = a.Allocate1D<float>(3); e.Mish(i.View,o.View,3); await a.SynchronizeAsync(); await AssertCloseGpu(a,o.View,new[]{0f,MathF.Tanh(MathF.Log(1+MathF.Exp(1))),-MathF.Tanh(MathF.Log(1+MathF.Exp(-1)))},1e-4f,"Mish:"); });

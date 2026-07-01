@@ -4,6 +4,40 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Fix: WebGPU "buffer used in submit while destroyed" in the RoPE dynamic-shape subgraph (GatherKernel)
+
+DAv3 (Depth Anything V3) at its native 5-D input `[1,1,3,518,518]`, run through `DepthEstimationPipeline` on
+WebGPU, aborted at `/backbone/blocks.4/attn/rope/Add` (node ~177) with `[Buffer] used in submit while destroyed`
+- SpawnScene's depth blocker. Root cause: `GatherKernel.GatherGenericFloat` disposed the PREVIOUS call's params
+buffer INLINE on every call. The RoPE dynamic-shape subgraph issues several `GatherGenericFloat` calls that batch
+into one un-submitted WebGPU command encoder, so the 2nd Gather destroyed the 1st's params buffer while the 1st's
+dispatch was still pending - the next `Queue.Submit` then referenced a destroyed buffer. Synchronous CUDA/OpenCL
+submit eagerly so never hit it. Fix: defer the old params buffer to `Dispose()` via an `_oldGenericParams` list
+(the same pattern `ElementWiseKernels.BroadcastBinaryOpND` already uses) - each call still gets a fresh buffer (no
+write-after-read), the old ones are freed at a safe point. New regression guard `DA3Small_Pipeline_5D_WebGPU_ProducesDepth`
+exercises the real 5-D pipeline path. (Depth output verified byte-stable: CUDA/OpenCL `range=0.1365, NaN=0`.)
+
+### Fix: DAv3 5-D multi-view (num_images>1) - three "computes only batch 0" batch>1 bugs
+
+Depth Anything V3 multi-view (`pixel_values=[1,N,3,H,W]`, N>1) was catastrophically wrong (depth mad 1.39 vs
+ORT, confidence exploded to ~1e10) while single-view (N=1) was bit-exact. Root: the engine was built and
+tested at batch=1, so three ops each computed only batch index 0 and left every later view stale. All fixed;
+**batch=1 is byte-identical** (b==0, inBatchBase==0) so single-inference LLM/BERT/SD is unaffected.
+- **Conv2D** (`Conv2DKernel.Conv2DImpl`/`ForwardPadded`): the kernel decoded idx -> (oc,oy,ox) with no batch
+  offset on the input read. Now decodes the batch index from idx and strides the input; the ConvOperator passes
+  `batchN` from the input's leading dim.
+- **MatMul** (`MatMulOperator`): batched activations `[N,S,K]` @ a shared 2-D weight `[K,Nn]` (a Linear) were
+  routed to `BatchedMatMul`, which strides the 2-D weight by batch and reads off its end -> the qkv Linear blew
+  to ~1e19. Now: when B is 2-D, flatten all rows into M (`[N*S,K] @ [K,Nn]`); only a genuinely batched B
+  (e.g. attention QK^T) uses BatchedMatMul.
+- **ConvTranspose** (`ConvTranspose2DKernel`): same class as Conv2D (the DPT head `resize_layers` ConvTranspose
+  left view 1 stale, which corrupted the entire head downstream).
+
+Result: multi-view (N=2) is now bit-exact vs ORT (depth + confidence mad 0.000000, max 2e-6); single-view still
+bit-exact. Regression guards added: `Conv2D_Batch2_ComputesBothViews`, `ConvTranspose2D_Batch2_ComputesBothViews`,
+`AllOps_MatMul_BatchedActivationsSharedWeight`. Known remaining batch-1-only paths (no current model exercises
+them at batch>1): depthwise / grouped / NHWC / native-low-p / precision-aware-fp16 Conv variants.
+
 ### Fix: gemma3 forward pass - weightless V-norm + sliding-window rope base (fixes factually-wrong output)
 
 gemma3:270m produced fluent but factually WRONG output ("The capital of France is a place where you can

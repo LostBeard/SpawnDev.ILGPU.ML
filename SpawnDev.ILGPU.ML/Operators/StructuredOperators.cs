@@ -97,10 +97,16 @@ public class MatMulOperator(OperatorRegistry reg) : IOnnxOperator
         // Native low-p weights: if B is a low-p-backed weight (Half/bf16/FP8, no float buffer), route to the
         // generic low-p-weight kernel (reads the native type, converts in-register, fp32 accumulate, no f32
         // temp). Activations (A) stay fp32. fp32 weights take the all-fp32 path.
-        if (a.Rank == 2 && b.Rank == 2)
+        if (b.Rank == 2)
         {
-            if (LowPWeightDispatch.IsLowP(b)) LowPWeightDispatch.MatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, M, K, N);
-            else reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, M, K, N);
+            // Shared 2-D weight (a Linear): flatten ALL of a's rows into M — [totalRows, K] @ [K, N]. Covers
+            // a.Rank==2 (M unchanged) AND a.Rank>2 (batched activations = DAv3 multi-view num_images>1): the
+            // extra batch is just more rows sharing ONE weight. Previously batched-A @ 2-D-B was routed to
+            // BatchedMatMul, which strides the 2-D weight by batch and reads off its end → the multi-view qkv
+            // Linear blew up to ~1e19. Flattening rows is the correct + zero-risk form (batch=1 → mRows==M).
+            int mRows = K > 0 ? a.ElementCount / K : M;
+            if (LowPWeightDispatch.IsLowP(b)) LowPWeightDispatch.MatMul(reg.MatMul, a.Data, b, ctx.Outputs[0].Data, mRows, K, N);
+            else reg.MatMul.MatMul(a.Data, b.Data, ctx.Outputs[0].Data, mRows, K, N);
         }
         else
         {
@@ -507,8 +513,8 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
         }
         else
         {
-            // Conv2D: layout-aware dim extraction
-            var (_, inC, inH, inW) = LayoutHelper.GetDims(x.Shape, fmt);
+            // Conv2D: layout-aware dim extraction (batchN = num images/views — DAv3 multi-view feeds N>1)
+            var (batchN, inC, inH, inW) = LayoutHelper.GetDims(x.Shape, fmt);
             var (_, _, kH, kW) = LayoutHelper.GetWeightDims(w.Shape, fmt);
 
             if (group == inC && (group == outC || outC == 1))
@@ -531,7 +537,7 @@ public class ConvOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAware
                         inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
                 else
                     reg.Conv2D.ForwardPadded(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW);
+                        inC, inH, inW, outC, kH, kW, stride, padTop, padLeft, padBottom, padRight, dilationH, dilationW, batchN);
             }
             else if (group > 1 && inC % group == 0 && outC % group == 0)
             {
@@ -772,7 +778,7 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
             ? ctx.Inputs[2].Data
             : (zeroBias = ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias")).Data;
         reg.ConvTranspose.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
-            inC, inH, inW, outC, kH, kW, stride, pad);
+            inC, inH, inW, outC, kH, kW, stride, pad, x.Shape[0]);   // x.Shape[0] = batch (DAv3 multi-view N views)
         if (zeroBias != null) ctx.Pool.Return(zeroBias);
     }
 }
@@ -1624,8 +1630,16 @@ public class ResizeOperator(OperatorRegistry reg) : IOnnxOperator
             reg.ElementWise.NearestUpsample(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].Shape, ctx.Outputs[0].Shape);
             return;
         }
-        // linear/cubic → bilinear (cubic approximated). align_corners per the coordinate-transform mode.
         var ctMode = ctx.GetString("coordinate_transformation_mode", "half_pixel");
+        // cubic → true bicubic (Keys -0.75). DAv3's DINOv2 pos-embed interpolation is cubic; a bilinear
+        // approximation seeded the depth's ~1% divergence (the pos-embed Add diverged 0.003 → LayerNorm ~4x →
+        // 12-block accumulation). Bicubic uses half_pixel; align_corners cubic is rare — fall back if seen.
+        if (mode == "cubic" && ctMode != "align_corners")
+        {
+            reg.ElementWise.BicubicResize(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);
+            return;
+        }
+        // linear → bilinear. align_corners per the coordinate-transform mode.
         if (ctMode == "align_corners")
             reg.ElementWise.BilinearUpsampleAlignCorners(ctx.Inputs[0].Data, ctx.Outputs[0].Data, C, inH, inW, outH, outW);
         else

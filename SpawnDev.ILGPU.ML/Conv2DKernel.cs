@@ -84,10 +84,18 @@ public class Conv2DKernel : IDisposable
         int padTop = padTL >> 8, padLeft = padTL & 0xFF;
         int outH = outHW >> 16, outW = outHW & 0xFFFF;
         int dilationH = dilHW >> 8, dilationW = dilHW & 0xFF;
-        int ox = idx % outW;
-        int rem = idx / outW;
+        // BATCH-aware decode: idx spans (batch * outC * outH * outW). Decode the batch index and offset the input
+        // read by its stride. Single-view models launch batch=1 so b==0 and inBatchBase==0 — byte-identical to
+        // the old kernel; only batch>1 (DAv3 multi-view: pixel_values=[1,N,3,H,W] → Conv over N views) changes.
+        // Without this the kernel only ever wrote batch 0 and left every later view as uninitialized garbage.
+        int perBatchOut = outC * outH * outW;
+        int b = idx / perBatchOut;
+        int r = idx - b * perBatchOut;
+        int ox = r % outW;
+        int rem = r / outW;
         int oy = rem % outH;
         int oc = rem / outH;
+        int inBatchBase = b * inC * inH * inW;
 
         // f32 accumulation (the ML-standard for conv): the rounding error over the inC*kH*kW MACs is ~1e-5
         // relative — imperceptible in an 8-bit image and within the MAC-scaled conv-test tolerance. f64
@@ -98,7 +106,7 @@ public class Conv2DKernel : IDisposable
 
         for (int ic = 0; ic < inC; ic++)
         {
-            int icBase = ic * inH * inW;
+            int icBase = inBatchBase + ic * inH * inW;
             int wcBase = oc * inC * kH * kW + ic * kH * kW;
             for (int ky = 0; ky < kH; ky++)
             {
@@ -197,7 +205,7 @@ public class Conv2DKernel : IDisposable
         int inC, int inH, int inW,
         int outC, int kH, int kW,
         int stride, int padTop, int padLeft, int padBottom, int padRight,
-        int dilationH = 1, int dilationW = 1)
+        int dilationH = 1, int dilationW = 1, int batch = 1)
     {
         EnsureLoaded();
 
@@ -210,12 +218,15 @@ public class Conv2DKernel : IDisposable
                 $"Conv2D output dimensions are invalid: outH={outH}, outW={outW} " +
                 $"(inH={inH}, inW={inW}, kH={kH}, kW={kW}, stride={stride}, pads=[{padTop},{padLeft},{padBottom},{padRight}], dilation={dilationH}x{dilationW}). " +
                 $"This usually means SAME padding was not applied correctly.");
-        int totalOutputElements = outC * outH * outW;
+        if (batch < 1) batch = 1;
+        // Total threads span ALL batches: the kernel decodes the batch index from idx and strides the input.
+        // (DAv3 multi-view Conv sees batch = num_images; single-view models pass batch=1 = the old behavior.)
+        int totalOutputElements = batch * outC * outH * outW;
         _convCallCount++;
         if (output.Length < totalOutputElements)
             throw new InvalidOperationException(
                 $"Conv2D NCHW output buffer too small: output.Length={output.Length} but kernel will write {totalOutputElements} elements " +
-                $"(outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
+                $"(batch={batch} outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
         try
         {

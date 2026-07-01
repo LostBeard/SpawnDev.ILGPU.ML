@@ -40,6 +40,7 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleACKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bicubicResizeKernel;
 
     public ElementWiseKernels(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -347,6 +348,48 @@ public class ElementWiseKernels : IDisposable
                     + v10 * ty * (1f - tx) + v11 * ty * tx;
     }
 
+    /// <summary>Keys cubic convolution weight, coeff a (ONNX Resize cubic_coeff_a, default -0.75).</summary>
+    private static float CubicWeight(float t, float a)
+    {
+        t = MathF.Abs(t);
+        if (t <= 1f) return ((a + 2f) * t - (a + 3f)) * t * t + 1f;
+        if (t < 2f) return (((t - 5f) * t + 8f) * t - 4f) * a;
+        return 0f;
+    }
+
+    // ONNX Resize mode="cubic" (bicubic, cubic_coeff_a=-0.75, coordinate_transformation_mode=half_pixel,
+    // clamp-to-edge for out-of-bounds taps). DAv3's DINOv2 backbone interpolates the pretrained position
+    // embeddings (37x37 grid -> the input's patch grid) with CUBIC; approximating it with bilinear seeded a
+    // ~0.003 error at the pos-embed Add that the first LayerNorm amplified ~4x and 12 blocks accumulated into
+    // the depth output's ~1% scale (the Conv itself is bit-exact vs ORT). 4x4 cubic tap per output pixel.
+    private static void BicubicResizeImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int outH, int outW)
+    {
+        int ox = idx % outW; int rem = idx / outW; int oy = rem % outH; int c = rem / outH;
+        const float a = -0.75f;
+        float fy = ((float)oy + 0.5f) * inH / outH - 0.5f;
+        float fx = ((float)ox + 0.5f) * inW / outW - 0.5f;
+        int iy = (int)MathF.Floor(fy); int ix = (int)MathF.Floor(fx);
+        float dy = fy - iy; float dx = fx - ix;
+        int bC = c * inH * inW;
+        float acc = 0f;
+        for (int m = -1; m <= 2; m++)
+        {
+            int yy = iy + m; if (yy < 0) yy = 0; if (yy >= inH) yy = inH - 1;
+            float wy = CubicWeight((float)m - dy, a);
+            float row = 0f;
+            for (int n = -1; n <= 2; n++)
+            {
+                int xx = ix + n; if (xx < 0) xx = 0; if (xx >= inW) xx = inW - 1;
+                row += input[bC + yy * inW + xx] * CubicWeight((float)n - dx, a);
+            }
+            acc += row * wy;
+        }
+        output[idx] = acc;
+    }
+
     // ─────────────────────────────────────────────────────────────
     //  Public API
     // ─────────────────────────────────────────────────────────────
@@ -644,6 +687,16 @@ public class ElementWiseKernels : IDisposable
     {
         EnsureLoaded();
         _bilinearUpsampleACKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
+    }
+
+    /// <summary>ONNX Resize mode="cubic" — bicubic (Keys, coeff -0.75, half_pixel). See BicubicResizeImpl.</summary>
+    public void BicubicResize(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int C, int inH, int inW, int outH, int outW)
+    {
+        EnsureLoaded();
+        _bicubicResizeKernel!(C * outH * outW, input, output, C, inH, inW, outH, outW);
     }
 
     /// <summary>In-place add: data[i] += other[i]. Two separate buffers required.</summary>
@@ -1795,6 +1848,9 @@ public class ElementWiseKernels : IDisposable
         _bilinearUpsampleACKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int, int>(BilinearUpsampleACImpl);
+        _bicubicResizeKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int>(BicubicResizeImpl);
     }
 
     // ─────────────────────────────────────────────────────────────
