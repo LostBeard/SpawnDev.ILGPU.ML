@@ -15,7 +15,7 @@
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="22">
+            ModelSizeMB="257">
 
     <div class="embed-mode-toggle">
         <button class="mode-btn @(_mode == "similarity" ? "active" : "")" @onclick='() => _mode = "similarity"'>Similarity</button>
@@ -182,6 +182,7 @@ const similarity = cos_sim(a.data, b.data);
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
     private FeatureExtractionPipeline? _pipeline;
+    private LoadedTokenizer? _tokenizer; // real WordPiece tokenizer from the model repo (replaces the old hash)
 
     // OPT-IN: the ~257 MB DistilBERT model loads on the first run (Compute Similarity / Search), NOT on page
     // entry — see ComputeSimilarity / SearchCorpus. Visiting the page downloads nothing.
@@ -214,6 +215,11 @@ const similarity = cos_sim(a.data, b.data);
                 });
             _pipeline = new FeatureExtractionPipeline(session, _accelerator, maxLength: 128, hiddenSize: 768);
 
+            // Real WordPiece tokenizer from the model's own tokenizer.json (NOT the old word-hash) so the
+            // embeddings are computed from real vocab tokens — i.e. actually semantic.
+            var tokJson = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
+            _tokenizer = TokenizerLoader.FromTokenizerJson(System.Text.Encoding.UTF8.GetString(tokJson));
+
             _isModelLoaded = true;
         }
         catch (Exception ex)
@@ -233,37 +239,19 @@ const similarity = cos_sim(a.data, b.data);
         if (_isModelLoaded || _isModelLoading) await LoadModelAsync();
     }
 
-    /// <summary>Simple whitespace tokenizer with BERT special tokens.</summary>
-    private int[] SimpleTokenize(string text)
-    {
-        // CLS + word tokens + SEP (using common BERT vocab IDs)
-        var tokens = new List<int> { 101 }; // [CLS]
-        foreach (var word in text.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries))
-        {
-            // Hash the word to a vocab range (not real tokenization, but functional for demo)
-            int hash = Math.Abs(word.GetHashCode()) % 28000 + 1000;
-            tokens.Add(hash);
-        }
-        tokens.Add(102); // [SEP]
-        return tokens.ToArray();
-    }
-
     private async Task ComputeSimilarity()
     {
         if (string.IsNullOrWhiteSpace(_sentenceA) || string.IsNullOrWhiteSpace(_sentenceB)) return;
         if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
-        if (_pipeline == null) return;
+        if (_pipeline == null || _tokenizer == null) return;
         _isRunning = true;
         _similarityScore = null;
         StateHasChanged();
 
         try
         {
-            var tokA = SimpleTokenize(_sentenceA);
-            var tokB = SimpleTokenize(_sentenceB);
-
-            var embA = await _pipeline.EmbedAsync(tokA);
-            var embB = await _pipeline.EmbedAsync(tokB);
+            var embA = await _pipeline.EmbedAsync(_sentenceA, _tokenizer);
+            var embB = await _pipeline.EmbedAsync(_sentenceB, _tokenizer);
             _similarityScore = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedding);
             _inferenceMs = embA.InferenceTimeMs + embB.InferenceTimeMs;
         }
@@ -280,21 +268,21 @@ const similarity = cos_sim(a.data, b.data);
     {
         if (string.IsNullOrWhiteSpace(_corpus) || string.IsNullOrWhiteSpace(_searchQuery)) return;
         if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync(); // opt-in: load on first run
-        if (_pipeline == null) return;
+        if (_pipeline == null || _tokenizer == null) return;
         _isRunning = true;
         _searchResults = null;
         StateHasChanged();
 
         try
         {
-            var queryEmb = await _pipeline.EmbedAsync(SimpleTokenize(_searchQuery));
+            var queryEmb = await _pipeline.EmbedAsync(_searchQuery, _tokenizer);
             var lines = _corpus.Split('\n', StringSplitOptions.RemoveEmptyEntries)
                 .Select(l => l.Trim()).Where(l => l.Length > 0).ToArray();
 
             var results = new List<SearchResult>();
             foreach (var line in lines)
             {
-                var lineEmb = await _pipeline.EmbedAsync(SimpleTokenize(line));
+                var lineEmb = await _pipeline.EmbedAsync(line, _tokenizer);
                 float score = TextPreprocessor.CosineSimilarity(queryEmb.Embedding, lineEmb.Embedding);
                 results.Add(new SearchResult { Text = line, Score = score });
             }
