@@ -4,6 +4,31 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Measured: 128-bit vec4 GEMM loads are NOT a lever - vec4 arc closed with data on all 3 GPU backends (Seven)
+
+Consumed SpawnDev.ILGPU 4.17.1-local.1 (the WGSL AsAligned16 -> `array<vec4<f32>>` trigger + the AsAligned
+lowering fix that never shipped in 4.17.0). New `Kernels/Vec4LoadMatMul` + `GemmVec4Tests` = a THREE-way
+GEMM A/B at real DAv3 shapes: production scalar-float vs F4-struct-load (packing-only control) vs
+F4+AsAligned16 (ld.v4.b32 on PTX, single vec4<f32> load on WGSL). Full CPU-reference correctness + GPU-side
+full-output comparison vs RegisterBlockedMatMul, green on CUDA/OpenCL/WebGPU/Wasm (WebGL = tracked GLSL
+struct-load bug; CPU = 64-thread group cap). RESULT (4070): the access LAYOUT (one contiguous 16-byte
+element per thread instead of 4 strided floats) is worth 1.05-1.24x on CUDA/OpenCL and 1.12-1.14x on
+WebGPU; the 128-bit load itself adds ZERO beyond that on every backend - drivers coalesce the contiguous
+struct loads already. No production routing (decision + revisit conditions: `Plans/vec4-gemm-webgpu-integration.md`);
+the tests stay as end-to-end consumer regression coverage of the ILGPU trigger. Bench numbers persist per
+run in the PMT results JSON via test-returned resultText.
+
+### Measured: DAv3-5D WebGPU cold run - the 121s "shader-JIT wall" is dead; executor overhead is the whole fight (Seven)
+
+New `DA3_WebGPU_ColdRun_JitAndRange` (WebGPU-only, HeavyModel): create 4.2s, COLD 84.2s, WARM 69.9s at
+2524 nodes with the runtime shape interpreter's readback-skip active. Cold-warm delta = ~14s over 98 unique
+WGSL modules (~146ms/module, no specialization explosion) - shader-JIT is a small one-time cost, not a
+target. Warm decomposition: 125 surviving shape readbacks x ~345ms = ~43s (62%) + ~10.6ms/node dispatch
+orchestration = the ORT-Web-73ms gap lives entirely in the executor lane (readbacks, dispatch-elide,
+bind-group caching), not in kernels. OPEN (tracked): WebGPU depth range = 0.161563 deterministic vs desktop
+bit-exact 0.1365; the interpreter-off isolation test (`DA3_WebGPU_InterpOff_RangeIsolation`) is in this drop
+but currently blocked by in-flight GraphExecutor diagnostics.
+
 ### Perf: Conv2D implicit-GEMM tiled kernel - 3-9x on CUDA, the last by-design-naive FLOP carrier (Seven)
 
 The naive one-thread-per-output Conv2D kernel has zero data reuse (every MAC = two global loads; a 3x3 conv

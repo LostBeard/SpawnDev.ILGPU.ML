@@ -383,3 +383,6 @@ SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-tiny/
 # Diagnostic scratch (GGUF capture/teacher-forcing dumps, probe scripts, fetched refs)
 _scratch/
 Examples/04.GGUFTextGen.Console/*.txt
+
+# PMT background-run pid/scratch files (rig bookkeeping, never committed)
+pmt_*.pid
