@@ -359,15 +359,15 @@ public class MissingElementWiseKernels : IDisposable
     }
 
     /// <summary>
-    /// Ensures the persistent params buffer is at least the requested size.
-    /// Grows the buffer if needed (Expand params vary with tensor rank).
+    /// Allocates a FRESH params buffer of exactly the requested size, retiring the previous one for
+    /// deferred disposal. The old grow-only + overwrite-in-place design was a batching hazard on the
+    /// async backends: a pending dispatch in an un-submitted WebGPU encoder / on the Wasm worker pool
+    /// still references the buffer, so the next call's CopyFromCPU handed it the WRONG params (the
+    /// DAv3 Slice_4 params-content corruption class; see SliceKernel/GatherKernel).
     /// </summary>
     private void EnsureParamsBuf(int minSize)
     {
-        if (_paramsBuf == null || _paramsBuf.Length < minSize)
-        {
-            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-            _paramsBuf = _accelerator.Allocate1D<int>(minSize);
-        }
+        if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
+        _paramsBuf = _accelerator.Allocate1D<int>(minSize);
     }
 }

@@ -32,7 +32,17 @@ public class SliceKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<int, Stride1D.Dense>, int>? _sliceKernel;
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    // Per-call params buffer + deferred disposal of retired ones (the GatherKernel _oldGenericParams
+    // pattern). The previous design REUSED one _paramsBuf (CopyFromCPU overwrite per call, inline
+    // Dispose on rank growth) - both are batching hazards on the async backends: a pending dispatch in
+    // an un-submitted WebGPU encoder / on the Wasm worker pool still references the buffer, so the
+    // overwrite hands it the NEXT call's params and the growth-dispose frees memory under it (Wasm:
+    // "RangeError: offset is out of bounds" - caught by SliceKernel_MixedRankHistory_MatchesCPU; the
+    // DAv3 blocks.4 rope Slice_4 corruption on WebGPU executed with steps[3]=32 from exactly this
+    // params-content class). Each call now gets a FRESH buffer; old ones are retired here and freed
+    // in Dispose() at a safe point.
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParams;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParams = new();
 
     public SliceKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -114,15 +124,11 @@ public class SliceKernel : IDisposable
         Array.Copy(outShape, 0, packed, 2 * rank, rank);
         Array.Copy(inStrides, 0, packed, 3 * rank, rank);
 
-        // Reusable params buffer - reallocate only on rank growth (rare).
-        if (_paramsBuf == null || _paramsBuf.Length < packed.Length)
-        {
-            _paramsBuf?.Dispose();
-            _paramsBuf = _accelerator.Allocate1D<int>(packed.Length);
-        }
-        _paramsBuf.View.SubView(0, packed.Length).CopyFromCPU(packed);
+        // FRESH params buffer per call, previous one retired for deferred disposal (see _oldParams).
+        if (_lastParams != null) _oldParams.Add(_lastParams);
+        _lastParams = _accelerator.Allocate1D(packed);
 
-        _sliceKernel!(totalOutput, input, output, _paramsBuf.View.SubView(0, packed.Length), rank);
+        _sliceKernel!(totalOutput, input, output, _lastParams.View, rank);
     }
 
     private void EnsureLoaded()
@@ -134,7 +140,9 @@ public class SliceKernel : IDisposable
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose();
-        _paramsBuf = null;
+        _lastParams?.Dispose();
+        _lastParams = null;
+        foreach (var b in _oldParams) b.Dispose();
+        _oldParams.Clear();
     }
 }

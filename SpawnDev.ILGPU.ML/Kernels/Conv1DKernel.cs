@@ -31,7 +31,12 @@ public class Conv1DKernel : IDisposable
         ArrayView1D<int, Stride1D.Dense>>?   // params packed as ints
         _conv1dFlatKernel;
 
+    // Per-call params buffer + deferred disposal (GatherKernel/SliceKernel pattern). Reusing ONE
+    // buffer with CopyFromCPU-per-call is a batching hazard on async backends: a pending dispatch in
+    // an un-submitted WebGPU encoder / on the Wasm worker pool still references it, so the next
+    // call's overwrite hands the pending dispatch the WRONG params (the DAv3 Slice_4 corruption class).
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
 
     public Conv1DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -56,11 +61,11 @@ public class Conv1DKernel : IDisposable
 
         EnsureLoaded();
 
-        // Pack params into int array to avoid exceeding scalar parameter limits
-        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
-        _paramsBuf ??= _accelerator.Allocate1D<int>(12);
+        // Pack params into int array to avoid exceeding scalar parameter limits.
+        // FRESH buffer per call, previous retired for deferred disposal (see _oldParamsBufs).
         var paramsData = new int[] { inC, inL, outC, outL, kL, stride, padding, dilation, groups, inCPerGroup, outCPerGroup, kernelLoopSize };
-        _paramsBuf.CopyFromCPU(paramsData);
+        if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
+        _paramsBuf = _accelerator.Allocate1D(paramsData);
 
         _conv1dFlatKernel!(totalOutput, input, weight, bias, output, _paramsBuf.View);
     }
@@ -122,5 +127,11 @@ public class Conv1DKernel : IDisposable
             ArrayView1D<int, Stride1D.Dense>>(Conv1DFlatImpl);
     }
 
-    public void Dispose() => _paramsBuf?.Dispose();
+    public void Dispose()
+    {
+        _paramsBuf?.Dispose();
+        _paramsBuf = null;
+        foreach (var b in _oldParamsBufs) b.Dispose();
+        _oldParamsBufs.Clear();
+    }
 }

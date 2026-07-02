@@ -1820,6 +1820,13 @@ public class SplitOperator(OperatorRegistry reg) : IOnnxOperator
 public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Slice";
+
+    /// <summary>DIAGNOSTIC: when non-null, records every Slice's RESOLVED params + which resolution
+    /// path produced them (1=compiler _resolved_*, 2=runtime ConstantValues, 3=attributes/defaults),
+    /// keyed by the joined input names. The WebGPU range-deviation hunt uses this to tell a
+    /// param-resolution divergence (path/params differ per backend) from a kernel execution bug
+    /// (identical params, wrong output). Off by default; zero cost when null.</summary>
+    public static Dictionary<string, string>? CaptureResolvedParams { get; set; }
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         // Try to compute output shape from attributes (opset < 10)
@@ -1860,12 +1867,14 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
         // 3. Attributes (opset < 10)
         // 4. Full copy fallback
         int[] starts, ends, axes, steps;
+        int resolutionPath;
 
         var resolvedStarts = ctx.GetInts("_resolved_starts");
         var resolvedEnds = ctx.GetInts("_resolved_ends");
 
         if (resolvedStarts.Length > 0 && resolvedEnds.Length > 0)
         {
+            resolutionPath = 1;
             // Path 1: compiler resolved at compile time — handles opset >= 10 with constant params
             starts = new int[rank]; ends = new int[rank]; steps = new int[rank];
             for (int d = 0; d < rank; d++) { starts[d] = 0; ends[d] = inShape[d]; steps[d] = 1; }
@@ -1883,6 +1892,7 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else if (ctx.TryGetInputValues(1) is float[] startsF && ctx.TryGetInputValues(2) is float[] endsF)
         {
+            resolutionPath = 2;
             // Path 2: runtime constant values from tensor inputs
             // Clamp to int range — ONNX uses INT64_MAX (9.2e18) as "to end" sentinel
             starts = startsF.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
@@ -1894,6 +1904,7 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
+            resolutionPath = 3;
             // Path 3: attributes (opset < 10)
             var attrStarts = ctx.GetInts("starts");
             var attrEnds = ctx.GetInts("ends");
@@ -1925,6 +1936,10 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             sliceEnds[ax] = e;
             sliceSteps[ax] = st;
         }
+
+        if (CaptureResolvedParams != null)
+            CaptureResolvedParams[string.Join("|", ctx.InputNames)] =
+                $"path={resolutionPath} starts=[{string.Join(",", sliceStarts)}] ends=[{string.Join(",", sliceEnds)}] steps=[{string.Join(",", sliceSteps)}] outShape=[{string.Join(",", ctx.Outputs[0].Shape)}]";
 
         // Compute output shape and strides
         var outShape = ctx.Outputs[0].Shape;

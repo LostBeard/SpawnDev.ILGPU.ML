@@ -4,6 +4,32 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Fix: kernel params-buffer reuse/inline-dispose hazards on async backends - 4 kernels converted to fresh-buffer + deferred disposal (Seven)
+
+The WebGPU range-deviation hunt's isolation tests caught a REAL defect family: SliceKernel reused ONE
+params buffer (CopyFromCPU overwrite per call, inline Dispose on rank growth) - on the async backends a
+pending dispatch in an un-submitted WebGPU encoder / on the Wasm worker pool still references that buffer,
+so the overwrite hands it the NEXT call's params and the growth-dispose frees memory under it (Wasm fault:
+"RangeError: offset is out of bounds", reproduced by the new `SliceKernel_MixedRankHistory_MatchesCPU`).
+SliceKernel, Conv1DKernel, ColorConversionKernel (flip + colormap), and
+MissingElementWiseKernels.EnsureParamsBuf (DepthToSpace/Expand) all converted to the proven GatherKernel
+pattern: FRESH params buffer per call, previous retired for deferred disposal at Dispose(). Four new
+regression tests (`MLTestBase.SliceKernelRaceTests.cs`: single / back-to-back-no-sync / offset-subviews /
+mixed-rank-history at production rotate-half geometry) - 26/26 on all 6 backends.
+
+### Diagnosed: the WebGPU depth range deviation (0.1616 vs 0.1365) = executor Slice runtime-SHAPE cascade failure (Seven -> Tuvok)
+
+Root cause CONFIRMED by per-node first-divergence capture + resolved-params probes: at the graph's first
+rope rotate-half Slices (blocks.4), the executor's runtime output-shape override fails on WebGPU (its
+starts/ends come from runtimeConstants, filled by SYNC readback on desktop but not yet present on the
+async path) -> falls back to unreliable compile-time OutputShapes -> the Slices execute with
+outShape=[1,6,1370,1] instead of [...,16], reading input[16+32*i]; downstream broadcasting recovers the
+shape so the graph completes with plausible-but-wrong depth. Params resolution itself is fine (path-1
+compiler-resolved, byte-identical across backends) - the fix belongs in the executor's shape override
+(consult the compiler-resolved _resolved_* attrs). Diagnostics added: `SliceOperator.CaptureResolvedParams`
+(gated static) + value-pattern/input-forensic reporting in the DA3 divergence tests. Full handoff:
+DevComms `seven-ROOT-CAUSE-webgpu-range-executor-slice-shape-cascade-outshape1-2026-07-02`.
+
 ### Measured: 128-bit vec4 GEMM loads are NOT a lever - vec4 arc closed with data on all 3 GPU backends (Seven)
 
 Consumed SpawnDev.ILGPU 4.17.1-local.1 (the WGSL AsAligned16 -> `array<vec4<f32>>` trigger + the AsAligned

@@ -21,6 +21,7 @@ public class ColorConversionKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _depthToColormapKernel;
 
     private MemoryBuffer1D<float, Stride1D.Dense>? _paramsBuf;
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldColormapParamsBufs = new();
 
     public ColorConversionKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -172,7 +173,12 @@ public class ColorConversionKernel : IDisposable
         output[y * width + (width - 1 - x)] = input[idx];
     }
 
+    // Per-call params buffers + deferred disposal (GatherKernel/SliceKernel pattern): inline
+    // Dispose / CopyFromCPU overwrite of a buffer a batched dispatch still references corrupts or
+    // faults async backends (the DAv3 Slice_4 params-content class). Old buffers retire here and
+    // free in Dispose().
     private MemoryBuffer1D<int, Stride1D.Dense>? _flipParamsBuf;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldFlipParamsBufs = new();
 
     public void FlipHorizontal(
         ArrayView1D<int, Stride1D.Dense> input,
@@ -183,7 +189,7 @@ public class ColorConversionKernel : IDisposable
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlipHorizontalImpl);
-        _flipParamsBuf?.Dispose();
+        if (_flipParamsBuf != null) _oldFlipParamsBufs.Add(_flipParamsBuf);
         _flipParamsBuf = _accelerator.Allocate1D(new[] { width, height });
         _flipHorizontalKernel(width * height, input, output, _flipParamsBuf.View);
     }
@@ -265,10 +271,10 @@ public class ColorConversionKernel : IDisposable
         int pixelCount,
         float minDepth, float maxDepth, int paletteId = 0)
     {
-        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
-        _paramsBuf ??= _accelerator.Allocate1D<float>(3);
+        // FRESH buffer per call, previous retired for deferred disposal (see _oldColormapParamsBufs).
         var paramsData = new float[] { minDepth, maxDepth, paletteId };
-        _paramsBuf.CopyFromCPU(paramsData);
+        if (_paramsBuf != null) _oldColormapParamsBufs.Add(_paramsBuf);
+        _paramsBuf = _accelerator.Allocate1D(paramsData);
 
         _depthToColormapKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -280,6 +286,12 @@ public class ColorConversionKernel : IDisposable
     public void Dispose()
     {
         _paramsBuf?.Dispose();
+        _paramsBuf = null;
+        foreach (var b in _oldColormapParamsBufs) b.Dispose();
+        _oldColormapParamsBufs.Clear();
         _flipParamsBuf?.Dispose();
+        _flipParamsBuf = null;
+        foreach (var b in _oldFlipParamsBufs) b.Dispose();
+        _oldFlipParamsBufs.Clear();
     }
 }
