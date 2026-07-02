@@ -386,3 +386,6 @@ Examples/04.GGUFTextGen.Console/*.txt
 
 # PMT background-run pid/scratch files (rig bookkeeping, never committed)
 pmt_*.pid
+
+# DA3 divergence-hunt reference capture (offline-generated artifact, ~2-7MB)
+SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/
