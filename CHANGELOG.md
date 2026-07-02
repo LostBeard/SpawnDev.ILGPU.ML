@@ -4,6 +4,37 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Perf: batched register-blocked GEMM, Einsum-form attention fusion, register attention for fused graphs, fused LayerNorm (Seven)
+
+Four kernel-lane changes from the DAv3 beat-ORT campaign (all bit-consistent on the DAv3 5-D rig, CUDA/OpenCL/CPU
+`range=0.1365`; scoped PMT 392/392 across all 6 backends; clean-timing OpenCL DAv3 3642 -> ~1350 ms):
+- **`RegisterBlockedMatMul.BatchedMatMul` (new):** batched GEMM finally has a register-blocked route (4x4 per
+  thread, 64x64 tiles, batch = `Grid.IdxY`). `MatMulKernel.BatchedMatMul` routes to it at M,N >= 64 - before
+  this every batched matmul (attention scores, probs@V, einsum contractions) ran the 16x16
+  one-result-per-thread tiled kernel. Gated by `MatMul_BatchedAttentionScores` (the exact DAv3 attention
+  shape, batch=6 M=N=1370 K=64, vs CPU reference).
+- **`EinsumOperator` batched fast path = ONE dispatch:** the per-batch C# loop (batchSize sequential MatMul
+  dispatches) is gone.
+- **`GraphOptimizer.FuseAttentionEinsum` (pass 3c):** Einsum-form decomposed attention
+  (`Einsum(Q,K) -> [Mul/Div scale] -> Softmax -> [Cast] -> Einsum(probs,V)`, the DINOv2-lineage export form)
+  fuses into the same `FusedAttention` node as the MatMul form. Natural-K (`bhid,bhjd->bhij`) and
+  pre-transposed-K (`bhid,bhdj->bhij`, walks back through the Transpose) both handled. Scale semantics: a
+  found Mul/Div scalar folds into the `scale` attr; NO scale node emits `scale=1.0` explicitly (the unfused
+  graph applied none - the kernel's 1/sqrt(hd) default would diverge). New CPU-referenced tests:
+  `MLTestBase.AttentionFusionEinsumTests`.
+- **`FusedAttentionKernel.Forward` now delegates to `ForwardStrided<float>`** (`kvRowStride = seqKV*headDim`,
+  the documented byte-identical combination). Forward's old inline dispatch predated register attention and
+  never reached it, so FUSED (non-KV-cache) attention - vision transformers, SD - ran the shared-slice
+  per-query kernel even on CUDA/WebGPU where the measured-2.7x-prefill warp-register kernel was available.
+  One dispatch chain, no drift; removed the dead inline-dispatch delegate fields.
+- **`LayerNormKernel` fused single-pass path:** one GROUP per row with two barrier-separated cooperative
+  reductions (strided f64 partials; mean subtracted before squaring = Welford-grade stability), mirroring the
+  proven `RMSNormFusedImpl` gating. The old Pass 1 ran ONE thread per row doing a serial C-length f64 Welford
+  - 1/8 occupancy at DAv3 shape and Dekker-emulated f64 on WebGPU. Two-pass path kept for WebGL.
+- ORT-Web comparison harness: DAv3-Small case in `ort-comparison.html` (per-EP buttons, load/cold/warm
+  timing) + `dav3-ort-baseline.mjs` driver (serves wwwroot with COOP/COEP, drives both EPs). Baseline on the
+  4070: WebGPU load 5.1 s / cold 3.45 s / warm ~73-78 ms; Wasm(4 threads) warm ~9.3 s.
+
 ### Fix: WebGPU "buffer used in submit while destroyed" in the RoPE dynamic-shape subgraph (GatherKernel)
 
 DAv3 (Depth Anything V3) at its native 5-D input `[1,1,3,518,518]`, run through `DepthEstimationPipeline` on

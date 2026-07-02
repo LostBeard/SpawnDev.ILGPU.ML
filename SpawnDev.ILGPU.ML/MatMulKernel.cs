@@ -478,6 +478,15 @@ public class MatMulKernel
             // kernel pads each batch entry's single row to a 16-row tile (15/16 idle).
             _simpleBatchedMatMulKernel!(batchSize * M * N, A, B, C, batchSize, M, K, N);
         }
+        else if (M >= REG_TILE && N >= REG_TILE)
+        {
+            // Large batched matrices (prefill-shaped attention scores/probs·V, einsum contractions):
+            // register-blocked path, same gate as the non-batched MatMul above. Before this route existed,
+            // batched matmuls could ONLY hit the 16×16 one-result-per-thread tiled kernel - the ~100 GFLOPS
+            // floor the DAv3 per-op profile exposed as the dominant cost.
+            _regBlockedMatMul ??= new RegisterBlockedMatMul(accelerator);
+            _regBlockedMatMul.BatchedMatMul(A, B, C, batchSize, M, K, N);
+        }
         else
         {
             int numTilesM = (M + TILE - 1) / TILE;

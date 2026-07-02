@@ -193,6 +193,158 @@ public class RegisterBlockedMatMul
         C[idx] = sum;
     }
 
+    // ── Batched variant: C[b] = A[b] × B[b], register-blocked ──
+    // The batched matmuls are attention's scores (Q·Kᵀ) and probs·V — until this entry existed they could
+    // only run on the 16×16 one-result-per-thread tiled kernel (MatMulKernel.BatchedMatMul had no
+    // register-blocked route), which is exactly the ~100 GFLOPS-class floor the DAv3 profile exposed.
+    // Same 64×64-tile / 4×4-register core as RegBlockedImpl; batch index from Grid.IdxY, flat per-batch
+    // offsets. Grid stays (tiles, batch) 2D — the layout the existing batched tiled kernel already uses
+    // on every backend including WebGPU.
+
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _batchedKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int, int, int, int>? _simpleBatchedKernel;
+
+    /// <summary>
+    /// Batched C[b,M,N] = A[b,M,K] × B[b,K,N] for b in [0, batchSize), register-blocked (4×4 per thread,
+    /// 64×64 output tiles). Small matrices and sub-256-thread hardware fall back to the simple
+    /// one-thread-per-output batched kernel.
+    /// </summary>
+    public void BatchedMatMul(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int batchSize, int M, int K, int N)
+    {
+        if (M < TILE || N < TILE || _accelerator.MaxNumThreadsPerGroup < BLOCK * BLOCK)
+        {
+            _simpleBatchedKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int, int, int, int>(SimpleBatchedMatMulImpl);
+            _simpleBatchedKernel(batchSize * M * N, A, B, C, M, K, N, batchSize);
+            return;
+        }
+
+        int numTilesM = (M + TILE - 1) / TILE;
+        int numTilesN = (N + TILE - 1) / TILE;
+
+        _batchedKernel ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int>(RegBlockedBatchedImpl);
+
+        var config = new KernelConfig(
+            new Index2D(numTilesM * numTilesN, batchSize),
+            new Index2D(BLOCK * BLOCK, 1));
+        _batchedKernel(config, A, B, C, M, K, N, numTilesN);
+    }
+
+    // Identical to RegBlockedImpl except the Grid.IdxY batch index offsets A/B/C by whole matrices.
+    private static void RegBlockedBatchedImpl(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N, int numTilesN)
+    {
+        var aTile = SharedMemory.Allocate<float>(TILE * BLOCK);
+        var bTile = SharedMemory.Allocate<float>(BLOCK * TILE);
+
+        int batch = Grid.IdxY;
+        int aOff = batch * M * K;
+        int bOff = batch * K * N;
+        int cOff = batch * M * N;
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;
+        int tileCol = tileIdx % numTilesN;
+        int localIdx = Group.IdxX;
+        int threadRow = localIdx / BLOCK;
+        int threadCol = localIdx % BLOCK;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
+        float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
+        float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + BLOCK - 1) / BLOCK;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            for (int r = 0; r < REG; r++)
+            {
+                int aRow = tileRow * TILE + threadRow * REG + r;
+                int aCol = t * BLOCK + threadCol;
+                int sIdx = (threadRow * REG + r) * BLOCK + threadCol;
+                aTile[sIdx] = (aRow < M && aCol < K) ? A[aOff + aRow * K + aCol] : 0f;
+            }
+            for (int r = 0; r < REG; r++)
+            {
+                int bRow = t * BLOCK + threadRow;
+                int bCol = tileCol * TILE + threadCol * REG + r;
+                int sIdx = threadRow * TILE + threadCol * REG + r;
+                bTile[sIdx] = (bRow < K && bCol < N) ? B[bOff + bRow * N + bCol] : 0f;
+            }
+
+            Group.Barrier();
+
+            for (int k = 0; k < BLOCK; k++)
+            {
+                float a0 = aTile[(threadRow * REG + 0) * BLOCK + k];
+                float a1 = aTile[(threadRow * REG + 1) * BLOCK + k];
+                float a2 = aTile[(threadRow * REG + 2) * BLOCK + k];
+                float a3 = aTile[(threadRow * REG + 3) * BLOCK + k];
+                float b0 = bTile[k * TILE + threadCol * REG + 0];
+                float b1 = bTile[k * TILE + threadCol * REG + 1];
+                float b2 = bTile[k * TILE + threadCol * REG + 2];
+                float b3 = bTile[k * TILE + threadCol * REG + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+
+            Group.Barrier();
+        }
+
+        int baseRow = tileRow * TILE + threadRow * REG;
+        int baseCol = tileCol * TILE + threadCol * REG;
+        if (baseRow + 0 < M && baseCol + 0 < N) C[cOff + (baseRow + 0) * N + baseCol + 0] = c00;
+        if (baseRow + 0 < M && baseCol + 1 < N) C[cOff + (baseRow + 0) * N + baseCol + 1] = c01;
+        if (baseRow + 0 < M && baseCol + 2 < N) C[cOff + (baseRow + 0) * N + baseCol + 2] = c02;
+        if (baseRow + 0 < M && baseCol + 3 < N) C[cOff + (baseRow + 0) * N + baseCol + 3] = c03;
+        if (baseRow + 1 < M && baseCol + 0 < N) C[cOff + (baseRow + 1) * N + baseCol + 0] = c10;
+        if (baseRow + 1 < M && baseCol + 1 < N) C[cOff + (baseRow + 1) * N + baseCol + 1] = c11;
+        if (baseRow + 1 < M && baseCol + 2 < N) C[cOff + (baseRow + 1) * N + baseCol + 2] = c12;
+        if (baseRow + 1 < M && baseCol + 3 < N) C[cOff + (baseRow + 1) * N + baseCol + 3] = c13;
+        if (baseRow + 2 < M && baseCol + 0 < N) C[cOff + (baseRow + 2) * N + baseCol + 0] = c20;
+        if (baseRow + 2 < M && baseCol + 1 < N) C[cOff + (baseRow + 2) * N + baseCol + 1] = c21;
+        if (baseRow + 2 < M && baseCol + 2 < N) C[cOff + (baseRow + 2) * N + baseCol + 2] = c22;
+        if (baseRow + 2 < M && baseCol + 3 < N) C[cOff + (baseRow + 2) * N + baseCol + 3] = c23;
+        if (baseRow + 3 < M && baseCol + 0 < N) C[cOff + (baseRow + 3) * N + baseCol + 0] = c30;
+        if (baseRow + 3 < M && baseCol + 1 < N) C[cOff + (baseRow + 3) * N + baseCol + 1] = c31;
+        if (baseRow + 3 < M && baseCol + 2 < N) C[cOff + (baseRow + 3) * N + baseCol + 2] = c32;
+        if (baseRow + 3 < M && baseCol + 3 < N) C[cOff + (baseRow + 3) * N + baseCol + 3] = c33;
+    }
+
+    private static void SimpleBatchedMatMulImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N, int batchSize)
+    {
+        int elementsPerBatch = M * N;
+        int batch = idx / elementsPerBatch;
+        if (batch >= batchSize) return;
+        int local = idx % elementsPerBatch;
+        int row = local / N;
+        int col = local % N;
+        int aOff = batch * M * K;
+        int bOff = batch * K * N;
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += A[aOff + row * K + k] * B[bOff + k * N + col];
+        C[idx] = sum;
+    }
+
     // ── Native low-precision weight B (ILGPU.Half / BFloat16 / Float8E*) ──
     // Same 64×64-tile / 4×4-register GEMM, but B is read in its native low-p type and converted to float ONCE
     // as it stages into the float shared-memory tile (PrecisionConvert) — so the decode is amortized over the

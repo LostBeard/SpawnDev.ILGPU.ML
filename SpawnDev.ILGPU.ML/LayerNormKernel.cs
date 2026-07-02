@@ -36,7 +36,104 @@ public class LayerNormKernel : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _means;
     private MemoryBuffer1D<float, Stride1D.Dense>? _invStds;
 
+    // Single-pass (group-per-row) fused LayerNorm - loaded lazily on the first non-WebGL call. Mirrors the
+    // proven RMSNormFusedImpl pattern (NormalizationKernels.cs): the two-pass path's Pass 1 had ONE THREAD
+    // do a serial C-length f64 Welford per row - at DAv3-518 that is 1,370 threads on the whole card
+    // (~1/8 occupancy) each running C=384 f64 steps, and on WebGPU every f64 op is Dekker-EMULATED.
+    // The fused kernel gives the row a whole group and needs no f64-emulated Welford, no mean/invStd
+    // global round-trip, and one dispatch instead of two.
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, float>? _fusedKernel;
+    private int _fusedGroup;
+    // Upper bound on the fused group size - also the compile-time size of the kernel's per-thread
+    // partial-sums shared array. The runtime group T is capped to this.
+    private const int MaxLnGroup = 256;
+
     public LayerNormKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>
+    /// Single-pass LayerNorm - one GROUP per row, two barrier-separated cooperative reductions.
+    /// Phase 1: strided per-thread f64 partial SUMS → thread 0 combines → mean. Phase 2: strided per-thread
+    /// f64 partial sums of (x-mean)² → thread 0 combines → invStd. Subtracting the mean BEFORE squaring is
+    /// Welford-grade stable (no E[x²]-E[x]² cancellation), so the only divergence from the serial two-pass
+    /// Welford is the f32 partial exchange + tree order (~1e-7 relative - within the CPU-reference test
+    /// tolerance, same accepted trade as RMSNormFusedImpl). The row is re-read for phase 2 and the apply,
+    /// but it is L2/L1-resident by then. Shared partials array is reused across both reductions
+    /// (barrier-separated). Gated to backends with a group (WebGL's TF path keeps the two-pass).
+    /// </summary>
+    private static void LayerNormFusedImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> gamma,
+        ArrayView1D<float, Stride1D.Dense> beta,
+        int C, float epsilon)
+    {
+        int row = Grid.IdxX;   // one group per row
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int offset = row * C;
+
+        var part = SharedMemory.Allocate<float>(MaxLnGroup);
+        var stats = SharedMemory.Allocate<float>(2); // [0]=mean, [1]=invStd
+
+        double localSum = 0.0;
+        for (int i = tid; i < C; i += T) localSum += (double)input[offset + i];
+        part[tid] = (float)localSum;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            double sum = 0.0;
+            for (int t = 0; t < T; t++) sum += part[t];
+            stats[0] = (float)(sum / C);
+        }
+        Group.Barrier();
+
+        float mean = stats[0];
+        double localVar = 0.0;
+        for (int i = tid; i < C; i += T)
+        {
+            double d = (double)input[offset + i] - mean;
+            localVar += d * d;
+        }
+        part[tid] = (float)localVar;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            double m2 = 0.0;
+            for (int t = 0; t < T; t++) m2 += part[t];
+            stats[1] = 1f / MathF.Sqrt((float)(m2 / C) + epsilon);
+        }
+        Group.Barrier();
+
+        float invStd = stats[1];
+        for (int i = tid; i < C; i += T)
+            output[offset + i] = gamma[i] * ((input[offset + i] - mean) * invStd) + beta[i];
+    }
+
+    // Fused single-pass dispatch - same gate shape as NormalizationKernels.TryFusedRMSNorm. Returns false to
+    // fall through to the two-pass path (WebGL, tiny groups).
+    private bool TryFusedLayerNorm(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> gamma,
+        ArrayView1D<float, Stride1D.Dense> beta,
+        int rows, int C, float epsilon)
+    {
+        if (rows <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
+        int T = _fusedGroup != 0 ? _fusedGroup
+            : (_fusedGroup = Math.Min(MaxLnGroup, (int)_accelerator.MaxNumThreadsPerGroup));
+        if (T < 32) return false; // group too small to be worth it - keep the two-pass
+        _fusedKernel ??= _accelerator.LoadStreamKernel<
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, float>(LayerNormFusedImpl);
+        _fusedKernel(new KernelConfig(new Index1D(rows), new Index1D(T)),
+            input, output, gamma, beta, C, epsilon);
+        return true;
+    }
 
     /// <summary>
     /// Pass 1: One thread per row. Compute mean and invStd via double-precision Welford.
@@ -93,6 +190,10 @@ public class LayerNormKernel : IDisposable
         int rows, int C, float epsilon = 1e-6f)
     {
         var accelerator = _accelerator;
+
+        // Single-pass group-per-row path (all backends with a group; WebGL falls through to the two-pass).
+        if (TryFusedLayerNorm(input, output, gamma, beta, rows, C, epsilon)) return;
+
         EnsureLoaded(accelerator);
 
         // Allocate/resize persistent temp buffers

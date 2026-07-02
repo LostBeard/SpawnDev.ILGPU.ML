@@ -66,6 +66,13 @@ public static class GraphOptimizer
         // win (the [8,4096,4096] scores at down_block.0 were the pipeline peak).
         int fusedAttn = FuseAttention(optimized);
 
+        // Pass 3c: Same attention fusion for the EINSUM-form export (DINOv2/DAv3: Einsum(Q·Kᵀ) → scale →
+        // Softmax → [Cast] → Einsum(probs·V)). The MatMul-form pass above never fires on these graphs, so
+        // attention fell to EinsumOperator's per-batch MatMul loop (6 dispatches/node × 26 nodes on DAv3-518
+        // = the dominant per-op cost on every backend). Emits the same FusedAttention node.
+        int fusedAttnEinsum = FuseAttentionEinsum(optimized);
+        fusedAttn += fusedAttnEinsum;
+
         // Pass 4: Fuse MatMul → Mul/Div (scale) into FusedScaledMatMul (attention Q*K^T/sqrt(d))
         int fusedScaled = FuseScaledMatMul(optimized);
 
@@ -422,6 +429,208 @@ public static class GraphOptimizer
                 OpType = "FusedAttention",
                 Inputs = new List<string> { qName, kName, vName },
                 Outputs = new List<string> { attnOut },
+                Attributes = new Dictionary<string, JsonElement>
+                {
+                    ["causal"] = JsonSerializer.SerializeToElement(0),
+                    ["window"] = JsonSerializer.SerializeToElement(0),
+                    ["scale"] = JsonSerializer.SerializeToElement(scale),
+                }
+            };
+            remove.Add(si);
+            foreach (var b in between) remove.Add(b);
+            fusedCount++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(i => i)) nodes.RemoveAt(idx);
+        return fusedCount;
+    }
+
+    /// <summary>
+    /// Fuse the EINSUM-form self-attention subgraph into ONE <c>FusedAttention</c> node. DINOv2-lineage ONNX
+    /// exports (Depth Anything V3) emit attention as Einsum instead of MatMul, so <see cref="FuseAttention"/>
+    /// never matches them. Anchored at the <c>Softmax</c>:
+    ///   Einsum(Q·Kᵀ: "P.id,P.jd->P.ij" or "P.id,P.dj->P.ij" with an explicit K-Transpose)
+    ///     → [Mul/Div ×scale] → Softmax(last axis) → [Cast] → Einsum(probs·V: "P.ij,P.jd->P.id")
+    /// becomes <c>FusedAttention(Q, K, V)</c> with attrs causal=0, window=0, scale. P is a shared batch
+    /// prefix of 1 or 2 labels (rank-3/4 operands — the ranks FusedAttentionOperator derives heads/head_dim
+    /// from at runtime). K reaches the kernel UN-transposed ([.., seqKV, head_dim]), matching the kernel's
+    /// input contract, so the "P.dj" variant walks back through the producing Transpose and removes it.
+    /// Scale semantics differ deliberately from the MatMul-form pass: an unfused graph with NO scale node
+    /// between Q·Kᵀ and Softmax computed softmax(Q·Kᵀ·1.0) — any intended scaling is upstream (pre-scaled Q)
+    /// or folded into weights — so the fused node must pass scale=1.0, NOT the kernel's 1/sqrt(head_dim)
+    /// default, to stay bit-consistent with what the unfused graph actually did.
+    /// Guards: explicit "->" equations, 2 activation inputs, exactly one contracted label, label-structure
+    /// match on all three tensors, softmax over the last axis, single-consumer on every fused edge. Falls
+    /// through (no fusion) on any mismatch — correctness is never at risk, only the perf win.
+    /// </summary>
+    private static int FuseAttentionEinsum(ModelGraph graph)
+    {
+        int fusedCount = 0;
+        var nodes = graph.Nodes;
+
+        var producer = new Dictionary<string, int>();
+        for (int i = 0; i < nodes.Count; i++)
+            foreach (var o in nodes[i].Outputs)
+                if (!string.IsNullOrEmpty(o)) producer[o] = i;
+        var consumerCount = new Dictionary<string, int>();
+        foreach (var n in nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp)) consumerCount[inp] = consumerCount.GetValueOrDefault(inp, 0) + 1;
+
+        bool IsActivation(string name) => !string.IsNullOrEmpty(name) && !graph.Initializers.ContainsKey(name);
+        int Prod(string name) => producer.TryGetValue(name, out var idx) ? idx : -1;
+        int SingleConsumer(string name)
+        {
+            for (int i = 0; i < nodes.Count; i++) if (nodes[i].Inputs.Contains(name)) return i;
+            return -1;
+        }
+        float? ScalarConst(string name)
+        {
+            if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var f) && f.Length >= 1) return f[0];
+            if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var d) && d.Length >= 1) return d[0];
+            return null;
+        }
+        // Parse an explicit-form einsum equation ("P.id,P.jd->P.ij"). Implicit form falls through (no fusion).
+        (char[] a, char[] b, char[] o)? ParseEq(GraphNode n)
+        {
+            if (n.Attributes == null || !n.Attributes.TryGetValue("equation", out var eqEl)) return null;
+            string eq = (eqEl.ValueKind == JsonValueKind.String ? eqEl.GetString() : eqEl.ToString())?.Replace(" ", "") ?? "";
+            if (!eq.Contains("->")) return null;
+            var io = eq.Split("->");
+            var terms = io[0].Split(',');
+            if (terms.Length != 2) return null;
+            return (terms[0].ToCharArray(), terms[1].ToCharArray(), io[1].ToCharArray());
+        }
+        static bool SamePrefix(char[] x, char[] y, int len)
+        {
+            for (int i = 0; i < len; i++) if (x[i] != y[i]) return false;
+            return true;
+        }
+
+        var remove = new HashSet<int>();
+
+        for (int si = 0; si < nodes.Count; si++)
+        {
+            if (remove.Contains(si)) continue;
+            var softmax = nodes[si];
+            if (softmax.OpType != "Softmax" || softmax.Inputs.Count < 1 || softmax.Outputs.Count < 1) continue;
+
+            var between = new List<int>();
+            string scoresName = softmax.Inputs[0];
+            if (consumerCount.GetValueOrDefault(scoresName, 0) != 1) continue;
+
+            // Optional scale: Mul/Div by scalar const between the scores Einsum and the Softmax.
+            float scale = 1f; // no scale node => the unfused graph applied none here; fused must match (see doc)
+            string scoresOut = scoresName;
+            int pScale = Prod(scoresName);
+            if (pScale >= 0 && !remove.Contains(pScale)
+                && (nodes[pScale].OpType == "Mul" || nodes[pScale].OpType == "Div") && nodes[pScale].Inputs.Count == 2)
+            {
+                var sN = nodes[pScale];
+                float? sc = ScalarConst(sN.Inputs[1]); string actIn = sN.Inputs[0];
+                if (sc == null) { sc = ScalarConst(sN.Inputs[0]); actIn = sN.Inputs[1]; }
+                if (sc != null && IsActivation(actIn) && consumerCount.GetValueOrDefault(actIn, 0) == 1)
+                {
+                    scale = sN.OpType == "Div" ? 1f / sc.Value : sc.Value;
+                    scoresOut = actIn;
+                    between.Add(pScale);
+                }
+            }
+
+            // Scores Einsum: Q·Kᵀ as "P.id,P.jd->P.ij" (K natural) or "P.id,P.dj->P.ij" (K pre-transposed).
+            int pQK = Prod(scoresOut);
+            if (pQK < 0 || remove.Contains(pQK) || nodes[pQK].OpType != "Einsum" || nodes[pQK].Inputs.Count != 2) continue;
+            var qk = nodes[pQK];
+            if (!IsActivation(qk.Inputs[0]) || !IsActivation(qk.Inputs[1])) continue;
+            var eqQK = ParseEq(qk);
+            if (eqQK == null) continue;
+            var (aL, bL, oL) = eqQK.Value;
+
+            // Structure: aL = P+[i,d]; oL = P+[i,j]; P of length 1 or 2 (operator derives dims from rank 3/4).
+            int pre = aL.Length - 2;
+            if (pre < 1 || pre > 2) continue;
+            if (bL.Length != pre + 2 || oL.Length != pre + 2) continue;
+            if (!SamePrefix(aL, bL, pre) || !SamePrefix(aL, oL, pre)) continue;
+            char iLbl = aL[pre], dLbl = aL[pre + 1];
+            if (oL[pre] != iLbl) continue;
+            char jLbl = oL[pre + 1];
+            if (iLbl == jLbl || iLbl == dLbl || jLbl == dLbl) continue;
+
+            string qName = qk.Inputs[0];
+            string kName;
+            if (bL[pre] == jLbl && bL[pre + 1] == dLbl)
+            {
+                // K natural [P, j, d] - exactly the kernel's K layout, feed directly.
+                kName = qk.Inputs[1];
+            }
+            else if (bL[pre] == dLbl && bL[pre + 1] == jLbl)
+            {
+                // K pre-transposed [P, d, j] - walk back through the Transpose that swapped the last two axes.
+                string kTName = qk.Inputs[1];
+                if (consumerCount.GetValueOrDefault(kTName, 0) != 1) continue;
+                int pKT = Prod(kTName);
+                if (pKT < 0 || remove.Contains(pKT) || nodes[pKT].OpType != "Transpose" || nodes[pKT].Inputs.Count < 1) continue;
+                // perm must be identity on the prefix and swap the last two dims.
+                if (nodes[pKT].Attributes == null || !nodes[pKT].Attributes.TryGetValue("perm", out var permEl)
+                    || permEl.ValueKind != JsonValueKind.Array) continue;
+                var perm = permEl.EnumerateArray().Select(e => e.GetInt32()).ToArray();
+                if (perm.Length != pre + 2) continue;
+                bool identPrefix = true;
+                for (int d0 = 0; d0 < pre; d0++) if (perm[d0] != d0) identPrefix = false;
+                if (!identPrefix || perm[pre] != pre + 1 || perm[pre + 1] != pre) continue;
+                kName = nodes[pKT].Inputs[0];
+                between.Add(pKT);
+            }
+            else continue;
+            if (!IsActivation(kName)) continue;
+            between.Add(pQK);
+
+            // Forward: Softmax(last axis) → [Cast] → Einsum(probs·V: "P.ij,P.jd->P.id").
+            if (softmax.Attributes != null && softmax.Attributes.TryGetValue("axis", out var axEl)
+                && axEl.ValueKind == JsonValueKind.Number)
+            {
+                int axis = axEl.GetInt32();
+                if (axis != -1 && axis != pre + 1) continue; // must normalize over j (the last axis)
+            }
+            string probs = softmax.Outputs[0];
+            if (consumerCount.GetValueOrDefault(probs, 0) != 1) continue;
+            int cIdx = SingleConsumer(probs);
+            if (cIdx < 0 || remove.Contains(cIdx)) continue;
+            if (nodes[cIdx].OpType == "Cast")
+            {
+                between.Add(cIdx);
+                probs = nodes[cIdx].Outputs[0];
+                if (consumerCount.GetValueOrDefault(probs, 0) != 1) continue;
+                cIdx = SingleConsumer(probs);
+                if (cIdx < 0 || remove.Contains(cIdx)) continue;
+            }
+            var av = nodes[cIdx];
+            if (av.OpType != "Einsum" || av.Inputs.Count != 2) continue;
+            var eqAV = ParseEq(av);
+            if (eqAV == null) continue;
+            int probsPos = av.Inputs[0] == probs ? 0 : av.Inputs[1] == probs ? 1 : -1;
+            if (probsPos < 0) continue;
+            var pL = probsPos == 0 ? eqAV.Value.a : eqAV.Value.b; // probs term labels
+            var vL = probsPos == 0 ? eqAV.Value.b : eqAV.Value.a; // V term labels
+            var avOut = eqAV.Value.o;
+            string vName = av.Inputs[1 - probsPos];
+            if (!IsActivation(vName)) continue;
+            // probs [P, i, j] × V [P, j, d] → out [P, i, d] (labels are per-equation; structure must match).
+            if (pL.Length != pre + 2 || vL.Length != pre + 2 || avOut.Length != pre + 2) continue;
+            if (!SamePrefix(pL, vL, pre) || !SamePrefix(pL, avOut, pre)) continue;
+            char i2 = pL[pre], j2 = pL[pre + 1];
+            if (i2 == j2) continue;
+            if (vL[pre] != j2) continue;              // V's row label = the contracted (softmaxed) label
+            char d2 = vL[pre + 1];
+            if (d2 == i2 || d2 == j2) continue;
+            if (avOut[pre] != i2 || avOut[pre + 1] != d2) continue; // out = [P, i, d] = q's layout
+
+            // Replace the probs·V Einsum (produces the kept output) with FusedAttention; remove the rest.
+            nodes[cIdx] = new GraphNode
+            {
+                OpType = "FusedAttention",
+                Inputs = new List<string> { qName, kName, vName },
+                Outputs = new List<string> { av.Outputs[0] },
                 Attributes = new Dictionary<string, JsonElement>
                 {
                     ["causal"] = JsonSerializer.SerializeToElement(0),

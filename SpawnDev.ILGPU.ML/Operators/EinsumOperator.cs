@@ -146,15 +146,13 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
                             "is not supported - its float Data is empty. Consume the low-p weight as MatMul/Gemm " +
                             "(native low-p), or add a low-p einsum kernel.");
 
-                    // Batched matmul: treat batch dims as outer, contract K
-                    for (int b = 0; b < batchSize; b++)
-                    {
-                        reg.MatMul.MatMul(
-                            ctx.Inputs[0].Data.SubView(b * M * K, M * K),
-                            ctx.Inputs[1].Data.SubView(b * K * N, K * N),
-                            ctx.Outputs[0].Data.SubView(b * M * N, M * N),
-                            M, K, N);
-                    }
+                    // Batched matmul: ONE batched dispatch, batch dims as Grid.IdxY. The old per-batch C#
+                    // loop issued batchSize separate MatMul dispatches (DAv3 attention: 6 heads × 26 einsum
+                    // nodes = 156 dispatches per inference of pure launch churn on every backend, and each
+                    // was a skinny per-head GEMM). BatchedMatMul routes register-blocked for large M/N.
+                    reg.MatMul.BatchedMatMul(
+                        ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data,
+                        batchSize, M, K, N);
                     return true;
                 }
             }

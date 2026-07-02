@@ -37,11 +37,6 @@ public class FusedAttentionKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _kernel;
-
     // Strided + native-low-p K/V variant (the KV-cache decode path): K/V read in their native type
     // (BFloat16 / float) and converted to float in-register, with a per-head element STRIDE (p[10]) that
     // decouples the store's row pitch from the logical seqKV — so the cache reads its maxSeq-strided store
@@ -147,10 +142,6 @@ public class FusedAttentionKernel : IDisposable
         Environment.GetEnvironmentVariable("GGUF_ATTN_REG") != "0";
     private const int RegTileD = 16; // per-lane register tile width (≤16 scalar-replaces; divides 64/128/256)
 
-    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<int, Stride1D.Dense>>? _groupedKernel, _tiledKernel;
     private readonly Dictionary<Type, object> _groupedStridedKernels = new();
     private readonly Dictionary<Type, object> _tiledStridedKernels = new();
 
@@ -202,91 +193,17 @@ public class FusedAttentionKernel : IDisposable
         int nHeads, int kvHeads, int seqQ, int seqKV, int headDim,
         bool causal, int window, int kvOffset, float scale,
         ArrayView1D<float, Stride1D.Dense>? sinks = null, int sinkCount = 0,
-        bool seqMajorOut = false, bool seqMajorQ = false, bool seqMajorKV = false)
-    {
-        if (window <= 0) throw new ArgumentOutOfRangeException(nameof(window), "window must be positive");
-        if (kvHeads <= 0 || nHeads % kvHeads != 0)
-            throw new ArgumentOutOfRangeException(nameof(kvHeads),
-                $"kvHeads ({kvHeads}) must evenly divide nHeads ({nHeads}) for grouped-query attention.");
-        // Clamp so the in-kernel sign-bit arithmetic cannot underflow int.MinValue:
-        // any window >= seqKV + seqQ + kvOffset constrains nothing.
-        long noConstraint = (long)seqKV + seqQ + Math.Max(kvOffset, 0) + 1;
-        int effWindow = (int)Math.Min(window, noConstraint);
-
-        // Exact float scale passed as raw bits (the old (int)(scale*10000) quantized the
-        // scale to 1e-4 - a real precision loss for large headDim).
-        float effScale = scale > 0f ? scale : 1f / MathF.Sqrt(headDim);
-        var paramsData = new int[]
-        {
-            nHeads, seqQ, seqKV, headDim,
-            BitConverter.SingleToInt32Bits(effScale),
-            causal ? 1 : 0, effWindow, kvOffset,
-            nHeads / kvHeads, // GQA group size: query head h reads kv head h / group
-            sinkCount,        // p[9]: >0 => fold per-head sink logit into the softmax denominator
-            seqKV * headDim,  // p[10]: kvRowStride (contiguous K/V = seqKV*headDim; read only by the per-query kernel)
-            seqMajorOut ? 1 : 0, // p[11]: write output SEQ-major [1,seq,heads,hd] (oBase=(sq*BH+bh)*D) instead of
-                                 // heads-major — lets the graph drop the post-attention Transpose[0,2,1,3] (universal).
-            seqMajorQ ? 1 : 0,   // p[12]: read Q SEQ-major (qBase=(sq*BH+bh)*D) — lets the graph drop the Q
-                                 // PRE-attention Transpose[0,2,1,3] (step 2; K/V keep theirs until the KV-cache goes seq-major).
-            seqMajorKV ? 1 : 0,  // p[13]: read K/V SEQ-major ([kv,kvHeads,hd] → kBase=(kv*kvHeads+kvHead)*D, headStride=D,
-                                 // tokenStride=kvHeads*D) — drops the K/V PRE-attention transposes (step 3, KV-cache seq-major).
-        };
-
-        var paramsView = RentParamsSlot(paramsData);
-
-        _dummySinks ??= _accelerator.Allocate1D(new float[1]);
-        var sinksView = sinks ?? _dummySinks.View;
-
-        // Grouped-per-query path (the dot computed ONCE; bit-identical, opt-in, non-browser-GPU). SKV ≤ cap uses
-        // the fast single-pass kernel (all scores in shared); larger SKV uses the KV-tiled kernel (unbounded).
-        if (UseGrouped(seqKV, headDim))
-        {
-            var cfg = new KernelConfig(nHeads * seqQ, AttnGroupSize);
-            if (seqKV <= AttnSharedSkvMax)
-            {
-                _groupedKernel ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<int, Stride1D.Dense>>(FusedAttentionGroupedImpl);
-                _groupedKernel(cfg, Q, K, V, output, sinksView, paramsView);
-            }
-            else
-            {
-                _tiledKernel ??= _accelerator.LoadStreamKernel<ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<int, Stride1D.Dense>>(FusedAttentionTiledImpl);
-                _tiledKernel(cfg, Q, K, V, output, sinksView, paramsView);
-            }
-            return;
-        }
-
-        // Barrier-free per-query path (same as ForwardStrided): the universal non-grouped attention. T=float here
-        // (contiguous K/V); with kvRowStride=seqKV*headDim (p[10] above) it's byte-identical to the per-element
-        // kernel. Excludes WebGL (no workgroup shared memory) and headDim > MaxAttnHeadDimPQ → per-element below.
-        if (!DisablePerQuery && headDim <= MaxAttnHeadDimPQ && _accelerator.AcceleratorType != AcceleratorType.WebGL)
-        {
-            if (!_perQueryStridedKernels.TryGetValue(typeof(float), out var pq))
-                _perQueryStridedKernels[typeof(float)] = pq = _accelerator.LoadStreamKernel<
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionPerQueryStridedImpl<float>);
-            int pqBlocks = (nHeads * seqQ + PQGroup - 1) / PQGroup;
-            ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)pq)(
-                new KernelConfig(pqBlocks, PQGroup), Q, K, V, output, sinksView, paramsView);
-            return;
-        }
-
-        _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
-
-        // One thread per output element: nHeads * seqQ * headDim
-        _kernel(nHeads * seqQ * headDim, Q, K, V, output, sinksView, paramsView);
-    }
+        bool seqMajorOut = false, bool seqMajorQ = false, bool seqMajorKV = false) =>
+        // Delegate to the strided dispatch: T=float + kvRowStride=seqKV*headDim is byte-identical (documented
+        // on ForwardStrided), and its chain is a strict SUPERSET of the old inline one - grouped (opt-in) →
+        // warp-register per-query (CUDA + WebGPU) → barrier-free per-query (all but WebGL) → per-element.
+        // The old inline dispatch here predated register attention and never reached it, so the FUSED
+        // (non-KV-cache) attention path - vision transformers like DAv3, SD - ran the shared-slice per-query
+        // kernel even on backends where the measured-2.7x-prefill register kernel was available. One chain,
+        // no drift.
+        ForwardStrided(Q, K, V, output, nHeads, kvHeads, seqQ, seqKV, headDim,
+            causal, window, kvOffset, scale, kvRowStride: seqKV * headDim,
+            sinks, sinkCount, seqMajorOut, seqMajorQ, seqMajorKV);
 
     /// <summary>
     /// Whether the grouped-per-query kernel applies: opted in, a non-browser-GPU backend (WebGL has no
