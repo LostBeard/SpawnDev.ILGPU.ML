@@ -94,8 +94,17 @@ public class FusedAttentionOperator(OperatorRegistry reg) : IOnnxOperator
             if (qs.Length == 3) { nHeads = qs[0]; headDim = qs[2]; }
             else if (qs.Length == 4) { nHeads = qs[0] * qs[1]; headDim = qs[3]; }
             else
+                // Include tensor-identity evidence: a wrong-rank q here has meant the executor handed us a
+                // stale/aliased tensor object, not a mis-computed shape. elemCount matching the WRONG
+                // shape's volume = the Tensor object was re-rented to another node's output while our dict
+                // entry still pointed at it (pool aliasing); elemCount matching the real producer's volume
+                // = shape metadata mutated on a live tensor. objHash correlates identity across the
+                // executor's Rent/Return logs.
                 throw new InvalidOperationException(
-                    $"FusedAttention needs n_heads+head_dim attrs, or a rank-3/4 q to derive them; got q rank {qs.Length}.");
+                    $"FusedAttention needs n_heads+head_dim attrs, or a rank-3/4 q to derive them; got q rank {qs.Length} "
+                    + $"(q shape=[{string.Join(",", qs)}] elemCount={q.ElementCount} dataLen={q.Data.Length} objHash={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(q):x8}; "
+                    + $"k shape=[{string.Join(",", k.Shape)}] elemCount={k.ElementCount} objHash={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(k):x8}; "
+                    + $"v shape=[{string.Join(",", v.Shape)}] elemCount={v.ElementCount} objHash={System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(v):x8}).");
         }
         int kvHeads = ctx.GetInt("n_kv_heads", nHeads);
         bool causal = ctx.GetInt("causal", 1) == 1;

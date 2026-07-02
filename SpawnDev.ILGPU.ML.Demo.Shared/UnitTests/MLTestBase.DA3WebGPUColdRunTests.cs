@@ -169,6 +169,80 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// DISPATCH-ELIDE phantom-shape repro (Seven+Tuvok tag-team): under elide on CUDA, block-4
+    /// FusedAttention receives q (Mul_output_0) as rank-5 [3,1,6,1370,64] though the Mul produced
+    /// [1,6,1370,64]. FusedAttentionOperator's rank-throw now reports the identity evidence
+    /// (elemCount/dataLen/objHash) that discriminates pool-tensor aliasing (elemCount = the wrong
+    /// shape's 1,578,240) from shape-metadata mutation (elemCount = the real 526,080). CUDA-only;
+    /// expected to FAIL with that diagnostic until the elide bug is fixed - run manually, not a
+    /// green-suite member (Tuvok's rig test is the permanent gate once elide works).
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task<string> DA3_Cuda_ElidePhantomShape_IdentityEvidence() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.Cuda)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: CUDA-only elide repro (the crash is backend-independent; CUDA is the fast lane)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+        try
+        {
+            var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+                externalData: extDataBytes);
+            using var pipeline = new Pipelines.DepthEstimationPipeline(session, accelerator);
+
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    int v = (int)(x / (float)(W - 1) * 255f);
+                    rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v;
+                }
+
+            try
+            {
+                var swCold = System.Diagnostics.Stopwatch.StartNew();
+                var (rawDepth, minD, maxD, _, _) = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+                swCold.Stop();
+                rawDepth.Dispose();
+                double coldExec = Graph.GraphExecutor.LastRunTotalMs;
+                long resolved = Graph.GraphExecutor.LastRunShapeInterpResolved;
+                // Warm forward = the orchestration-lever number (the clean CUDA baseline was ~1350ms,
+                // ~1200ms of it per-node orchestration; elide's whole purpose is to cut that).
+                var swWarm = System.Diagnostics.Stopwatch.StartNew();
+                var (rawDepth2, minD2, maxD2, _, _) = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+                swWarm.Stop();
+                rawDepth2.Dispose();
+                var healed = $"ELIDE RAN CLEAN: range cold={maxD - minD:F6} warm={maxD2 - minD2:F6} (ref 0.136469) resolved={resolved} "
+                    + $"| cold {swCold.Elapsed.TotalMilliseconds:F0}ms (exec {coldExec:F0}ms) | WARM {swWarm.Elapsed.TotalMilliseconds:F0}ms (exec {Graph.GraphExecutor.LastRunTotalMs:F0}ms) - phantom-shape bug not hit";
+                Console.WriteLine($"[ElideRepro] {healed}");
+                return healed;
+            }
+            catch (Exception ex) when (ex.Message.Contains("FusedAttention"))
+            {
+                // The evidence IS the deliverable - return it as resultText, green.
+                var evidence = $"REPRODUCED: {ex.Message}";
+                Console.WriteLine($"[ElideRepro] {evidence}");
+                return evidence;
+            }
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        }
+    });
+
+    /// <summary>
     /// RESOLUTION-PATH probe for the range deviation: the input forensics proved Slice_4's data and
     /// starts tensors are IDENTICAL across backends, so either SliceOperator resolved its params
     /// differently on WebGPU (missing ConstantValues entry -> silent full-copy fallback) or the
