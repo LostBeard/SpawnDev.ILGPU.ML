@@ -345,6 +345,68 @@ public static class GraphOptimizer
                     if (IsActivation(inp) && ReachesScoresMatMul(inp, depth + 1)) return true;
             return false;
         }
+        // TRUE only when `name` is PROVABLY a 1-element tensor (scalar or [1]/[1,1]... - all broadcast-
+        // equivalent), so multiplying by it commutes with any transpose. Sound-by-construction rules only;
+        // anything unproven returns false and the fusion falls through (correctness never at risk).
+        // Covers the DINOv2 scale chain: Shape -> Gather(scalar idx) -> Cast -> Pow/Div/Sqrt -> ... -> Sqrt.
+        bool IsProvablyScalar(string name, int depth)
+        {
+            if (depth > 10 || string.IsNullOrEmpty(name)) return false;
+            if (graph.Initializers.TryGetValue(name, out var shp))
+            {
+                long prod = 1;
+                foreach (var d in shp) prod *= d;
+                return prod == 1; // [] is normalized to [1] by Optimize pass 0
+            }
+            if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var fc) && fc.Length == 1) return true;
+            if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var dc) && dc.Length == 1) return true;
+            int p = Prod(name);
+            if (p < 0) return false;
+            var n = nodes[p];
+            switch (n.OpType)
+            {
+                case "Sqrt": case "Cast": case "Reciprocal": case "Neg": case "Exp":
+                case "Log": case "Abs": case "Floor": case "Ceil": case "Identity":
+                case "Squeeze": case "Unsqueeze": // 1 element stays 1 element
+                    return n.Inputs.Count >= 1 && IsProvablyScalar(n.Inputs[0], depth + 1);
+                case "Mul": case "Div": case "Add": case "Sub": case "Pow":
+                    return n.Inputs.Count == 2
+                        && IsProvablyScalar(n.Inputs[0], depth + 1) && IsProvablyScalar(n.Inputs[1], depth + 1);
+                case "Gather":
+                    // Gather(data, 1-element index) is 1-element only when data is 1-D; the one 1-D-by-
+                    // construction source is a Shape output.
+                    return n.Inputs.Count == 2
+                        && Prod(n.Inputs[0]) >= 0 && nodes[Prod(n.Inputs[0])].OpType == "Shape"
+                        && IsProvablyScalar(n.Inputs[1], depth + 1);
+                case "Slice":
+                    // Slice of a Shape output (1-D by construction) with resolvable starts/ends producing
+                    // exactly ONE element. The element count is rank-independent when both indices share a
+                    // sign regime: [a,b) both >=0 -> b-a; both <0 -> b-a; a<0 with b clamped to the end
+                    // (int.MaxValue after the int64->int32 clamp) -> -a. DAv3's scale chain is
+                    // Slice(Shape(q), starts=[-1], ends=[MAX]) = the head_dim - count 1.
+                    {
+                        if (n.Inputs.Count < 3) return false;
+                        if (Prod(n.Inputs[0]) < 0 || nodes[Prod(n.Inputs[0])].OpType != "Shape") return false;
+                        if (n.Inputs.Count >= 5 && !string.IsNullOrEmpty(n.Inputs[4]))
+                        {
+                            var st = ScalarConst(n.Inputs[4]);
+                            if (st == null || st.Value != 1f) return false; // step must be 1
+                        }
+                        var s0 = ScalarConst(n.Inputs[1]);
+                        var e0 = ScalarConst(n.Inputs[2]);
+                        if (s0 == null || e0 == null) return false;
+                        // Compare as float: int64.MaxValue sentinels arrive as ~9.2e18 (a float->int cast
+                        // on that is undefined); small indices are exact in float.
+                        float a = s0.Value, b = e0.Value;
+                        if (a >= 0f && b >= 0f && b < int.MaxValue) return b - a == 1f;
+                        if (a < 0f && b < 0f) return b - a == 1f;
+                        if (a < 0f && b >= int.MaxValue) return a == -1f; // [-1, end) = last element
+                        return false;
+                    }
+                default:
+                    return false;
+            }
+        }
 
         var remove = new HashSet<int>();
 
@@ -398,11 +460,48 @@ public static class GraphOptimizer
             if (consumerCount.GetValueOrDefault(kTName, 0) != 1) continue;
             between.Add(pMM);
 
-            // K transpose.
+            // K side. Two export forms:
+            //  (a) diffusers/SD: MatMul's K input is a direct Transpose - take its input as K.
+            //  (b) DINOv2/DAv3: K is PRE-SCALED after the transpose - MatMul(Mul(q,s), Mul(Transpose(k),s))
+            //      with NO scale node before the Softmax (the scale s lives in the two Muls; s is a computed
+            //      scalar like sqrt(1/sqrt(d)), NOT resolvable at optimize time). A provably-SCALAR multiply
+            //      commutes with the transpose, so we retarget the K-side Mul to the UN-transposed k and drop
+            //      the Transpose: FusedAttention(q·s, k·s, V) computes (q·s)·(k·s)^T == s²·qk^T - exactly what
+            //      the unfused graph computed. The kernel's scale attr must then be 1.0 (NOT the 1/sqrt(hd)
+            //      default), unless an explicit between-scale node was ALSO found (then that value).
+            //      The retarget mutates the Mul node, so it is DEFERRED until the whole pattern matches -
+            //      a half-matched pattern must never edit the graph.
             int pKT = Prod(kTName);
-            if (pKT < 0 || nodes[pKT].OpType != "Transpose" || nodes[pKT].Inputs.Count < 1) continue;
-            string kName = nodes[pKT].Inputs[0];
-            between.Add(pKT);
+            if (pKT < 0) continue;
+            string kName;
+            bool kPreScaled = false;
+            int retargetMulIdx = -1, retargetSlot = -1, retargetTransposeIdx = -1;
+            string retargetNewInput = "";
+            if (nodes[pKT].OpType == "Transpose" && nodes[pKT].Inputs.Count >= 1)
+            {
+                kName = nodes[pKT].Inputs[0];
+                between.Add(pKT);
+            }
+            else if (nodes[pKT].OpType == "Mul" && nodes[pKT].Inputs.Count == 2)
+            {
+                var mulK = nodes[pKT];
+                int tSlot = -1, pT = -1;
+                for (int mi = 0; mi < 2; mi++)
+                {
+                    int cand = Prod(mulK.Inputs[mi]);
+                    if (cand >= 0 && nodes[cand].OpType == "Transpose" && IsSwapLastTwoPerm(nodes[cand]))
+                    { tSlot = mi; pT = cand; break; }
+                }
+                if (tSlot < 0) continue;
+                if (consumerCount.GetValueOrDefault(mulK.Inputs[tSlot], 0) != 1) continue;
+                if (!IsProvablyScalar(mulK.Inputs[1 - tSlot], 0)) continue;
+                // Defer: retarget mulK.Inputs[tSlot] -> Transpose's input; remove the Transpose.
+                retargetMulIdx = pKT; retargetSlot = tSlot; retargetTransposeIdx = pT;
+                retargetNewInput = nodes[pT].Inputs[0];
+                kName = kTName; // the Mul's output = pre-scaled, un-transposed K (after the retarget)
+                kPreScaled = true;
+            }
+            else continue;
 
             // Forward: softmax → [Cast] → MatMul(probs, V).
             string probs = softmax.Outputs[0];
@@ -422,6 +521,17 @@ public static class GraphOptimizer
             string vName = av.Inputs[0] == probs ? av.Inputs[1] : av.Inputs[0];
             if (!IsActivation(vName)) continue;
             string attnOut = av.Outputs[0];
+
+            // Full pattern matched - NOW apply the deferred K-side rewrite (pre-scaled form only).
+            if (kPreScaled)
+            {
+                nodes[retargetMulIdx].Inputs[retargetSlot] = retargetNewInput;
+                between.Add(retargetTransposeIdx);
+                // The graph's scaling lives in the q/k pre-scale Muls (now feeding the fused node's
+                // tensors), so the kernel must NOT add its 1/sqrt(hd) default on top. An explicit
+                // between-scale node, if one was also found, still folds in as usual.
+                if (scale == 0f) scale = 1f;
+            }
 
             // Replace the probs·V MatMul (produces the kept output) with FusedAttention; remove the rest.
             nodes[cIdx] = new GraphNode
@@ -443,6 +553,20 @@ public static class GraphOptimizer
 
         foreach (var idx in remove.OrderByDescending(i => i)) nodes.RemoveAt(idx);
         return fusedCount;
+    }
+
+    /// <summary>Transpose whose perm is identity except the LAST TWO axes swapped (any rank >= 2) -
+    /// the only transpose shape a scalar multiply is allowed to commute through in FuseAttention's
+    /// pre-scaled-K rewrite.</summary>
+    private static bool IsSwapLastTwoPerm(GraphNode transpose)
+    {
+        if (transpose.Attributes == null || !transpose.Attributes.TryGetValue("perm", out var permEl)
+            || permEl.ValueKind != JsonValueKind.Array) return false;
+        var perm = permEl.EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        int r = perm.Length;
+        if (r < 2) return false;
+        for (int i = 0; i < r - 2; i++) if (perm[i] != i) return false;
+        return perm[r - 2] == r - 1 && perm[r - 1] == r - 2;
     }
 
     /// <summary>

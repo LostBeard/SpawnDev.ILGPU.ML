@@ -4,6 +4,31 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Perf: attention fusion now fires on DAv3 - pre-scaled-QK MatMul-form support (Seven)
+
+DAv3's actual export is MatMul-form attention with DINOv2's split scale: Q and K are each pre-multiplied by
+the SAME runtime-computed scalar (`s = sqrt(1/sqrt(head_dim))` via a `Shape -> Slice(-1,MAX) -> Cast -> Sqrt
+-> Div -> Sqrt` chain), the K side as `Mul(Transpose(K), s)`, and NO scale node between the QK^T MatMul and
+the Softmax. `GraphOptimizer.FuseAttention` required the MatMul's K input to be produced directly by a
+Transpose, so the K-side pre-scale Mul blocked the fusion - all 24 attention MatMuls ran raw (the dominant
+per-op cost after the readback work). Now:
+- The K side accepts `Mul(Transpose(k), s)` when `s` is PROVABLY a 1-element tensor (new sound
+  `IsProvablyScalar` walk: scalar constants/initializers, scalar-preserving unary/binary ops,
+  `Gather(Shape(x), scalar-idx)`, and `Slice(Shape(x), starts, ends)` with resolvable indices producing
+  exactly one element - rank-independent for `[-1, MAX)`). A scalar multiply commutes with the transpose, so
+  the Mul is retargeted to the UN-transposed k and the Transpose is dropped:
+  `FusedAttention(q·s, k·s, V)` computes `(q·s)·(k·s)^T = s²·qk^T` - exactly the unfused graph's math.
+- The fused node then carries `scale=1.0` explicitly (the graph's scaling lives in the two Muls; the
+  kernel's 1/sqrt(hd) default would double-scale). An explicit between-scale node, when also present,
+  still folds in as before.
+- The rewrite (Mul retarget + Transpose removal) is DEFERRED until the whole pattern matches - a
+  half-matched pattern never edits the graph.
+Verified offline against the real DAv3-Small graph: 12/12 attention blocks fuse (Softmax remaining 0,
+2560 -> 2524 nodes). With `FusedAttentionKernel.Forward`'s delegation (below), DAv3's fused attention now
+runs the warp-register kernel on CUDA + WebGPU. New regression test
+`AttentionFusion_PreScaledQK_DAv3Form_FusedMatchesCpu_AllBackends` reproduces the exact block structure
+including the runtime scale chain.
+
 ### Perf: batched register-blocked GEMM, Einsum-form attention fusion, register attention for fused graphs, fused LayerNorm (Seven)
 
 Four kernel-lane changes from the DAv3 beat-ORT campaign (all bit-consistent on the DAv3 5-D rig, CUDA/OpenCL/CPU
