@@ -392,14 +392,6 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task DA3Small_Pipeline_5D_ElideDispatch() => await RunTest(async accelerator =>
     {
-        // WIP - dispatch-elide (ShapeInterpElideDispatch) is a deferred, flag-OFF perf optimization (the CUDA
-        // ~1200ms orchestration lever). Progress: Concat_19 (Add_2 size+rank gate) + the path-c rank-changing
-        // consumer gap (block-4 Gather channel-3 leak, node 172) are FIXED. Remaining: under elide the block-4
-        // FusedAttention reads q (Mul_output) as rank-5 [3,...] even though the Mul PRODUCES [1,6,1370,64] - a
-        // tensor-shape mutation between producer and consumer in the fused-attention path (with Seven, his lane;
-        // see tuvok-TO-SEVEN-elide-fusedattn-q-shape-mutates-3). Skipped so it never gates - feature off by default.
-        throw new UnsupportedTestException("dispatch-elide WIP: block-4 FusedAttention q-shape mutates to rank-5 under elide (with Seven); flag-off feature");
-#pragma warning disable CS0162 // rest intentionally unreachable while the WIP skip above stands
         if (accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.OpenCL))
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: dispatch-elide diag runs on CUDA/OpenCL only");
 
@@ -482,7 +474,6 @@ public abstract partial class MLTestBase
             Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
             Graph.GraphExecutor.ShapeInterpElideDispatch = false;
         }
-#pragma warning restore CS0162
     });
 
     /// <summary>
