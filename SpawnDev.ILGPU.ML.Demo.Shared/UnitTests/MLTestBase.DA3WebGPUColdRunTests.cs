@@ -213,10 +213,22 @@ public abstract partial class MLTestBase
             rawDepth.Dispose();
             var cap = Operators.SliceOperator.CaptureResolvedParams;
             int path3Total = cap.Values.Count(v => v.StartsWith("path=3"));
-            // ONLY the rotate-half Slices (Slice_4/Slice_6 class): starts [0,0,0,16] - the divergent ones.
-            var rope4 = cap.Where(kv => kv.Key.Contains("blocks.4/attn/rope") && kv.Value.Contains("starts=[0,0,0,16]"))
-                .Select(kv => $"{ShortKey(kv.Key)} -> {kv.Value}").ToList();
-            var report = $"range={maxD - minD:F6} | slices={cap.Count} path3Total={path3Total} | b4 rotate-half: {string.Join(" ; ", rope4)}";
+            // The whole blocks.4 attention Slice chain (q_norm split -> rope Slice_1/2 -> rotate-half),
+            // compact: last-axis start:end + inShape/outShape - the executor-cascade forensics Tuvok needs
+            // (inShape already [.,.,.,1] => upstream cascade; inShape [.,.,.,32] + out [.,.,.,1] => his
+            // override not running/overwritten).
+            // Rope-INTERNAL slices only (data input = a rope Slice output): the q_norm splits and Shape
+            // slices already proved healthy; the corruption enters at this level.
+            var chain = cap.Where(kv => kv.Key.Contains("blocks.4/attn/rope") && kv.Key.Contains("Slice_"))
+                .Select(kv =>
+                {
+                    var v = kv.Value;
+                    static string Grab(string s, string tag)
+                    { int i = s.IndexOf(tag); if (i < 0) return "?"; int j = s.IndexOf(']', i); return s.Substring(i + tag.Length, j - i - tag.Length); }
+                    var st = Grab(v, "starts=[").Split(','); var en = Grab(v, "ends=[").Split(',');
+                    return $"{ShortKey(kv.Key)}[{st[^1]}:{en[^1]}] in[{Grab(v, "inShape=[")}] out[{Grab(v, "outShape=[")}]";
+                }).ToList();
+            var report = $"range={maxD - minD:F6} | slices={cap.Count} path3={path3Total} | b4: {string.Join(" ; ", chain)}";
             Console.WriteLine($"[DA3-SliceProbe] {report}");
             return report;
         }

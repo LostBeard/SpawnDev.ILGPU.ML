@@ -1939,7 +1939,7 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
 
         if (CaptureResolvedParams != null)
             CaptureResolvedParams[string.Join("|", ctx.InputNames)] =
-                $"path={resolutionPath} starts=[{string.Join(",", sliceStarts)}] ends=[{string.Join(",", sliceEnds)}] steps=[{string.Join(",", sliceSteps)}] outShape=[{string.Join(",", ctx.Outputs[0].Shape)}]";
+                $"path={resolutionPath} starts=[{string.Join(",", sliceStarts)}] ends=[{string.Join(",", sliceEnds)}] steps=[{string.Join(",", sliceSteps)}] inShape=[{string.Join(",", inShape)}] outShape=[{string.Join(",", ctx.Outputs[0].Shape)}]";
 
         // Compute output shape and strides
         var outShape = ctx.Outputs[0].Shape;
