@@ -4,6 +4,26 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Perf: Conv2D implicit-GEMM tiled kernel - 3-9x on CUDA, the last by-design-naive FLOP carrier (Seven)
+
+The naive one-thread-per-output Conv2D kernel has zero data reuse (every MAC = two global loads; a 3x3 conv
+re-reads each input pixel 9x from DRAM) - measured 420-960 GFLOPS on the 4070 while the register-blocked
+GEMM does 4.3-5.7 TFLOPS at the same scale. Convolution IS a GEMM
+(`C[outC, oH*oW] = W[outC, inC*kH*kW] x im2col(input)`), and the NCHW weight is already row-major
+`[outC, K]`, so `Conv2DImplicitGemmImpl` reuses the exact RegisterBlockedMatMul structure (64x64 output
+tile, 4x4 register block, 256-thread groups) with the B-tile stage doing the im2col ADDRESSING on the fly -
+no materialized im2col buffer. Batch via `Grid.IdxY` (DAv3 multi-view preserved). Measured on the 4070 at
+DAv3/DPT shapes: patch-embed 14x14 1.30 -> 0.147 ms (8.9x), DPT 3x3 refines ~3.9 -> 0.72-0.87 ms (~4.7x),
+518² head 3x3 5.17 -> 1.68 ms (3.1x), 1x1 projections 4.7x; ~2-5 TFLOPS = GEMM-class. Routing: backends
+with a 256-thread group + shared memory and at least one full tile of work; WebGL/CPU and tiny convs keep
+the naive kernel. Low-precision-weight conv variants stay on their existing path (tiled low-p follows).
+
+Context (measured this session, correcting the strategy post's "everything ~100 GFLOPS" claim - that was
+WebGPU-era data): CUDA kernels were NOT the DAv3 wall - all matmuls/linears ~20 ms + convs ~60-100 ms of
+the ~1350 ms clean total; the residual is per-node orchestration (GraphExecutor lane). This change plus the
+attention fusion closes the kernel side; conv also matters strategically for SD-Turbo's conv-heavy UNet and
+much more on browser backends where the naive kernel was proportionally slower.
+
 ### Perf: attention fusion now fires on DAv3 - pre-scaled-QK MatMul-form support (Seven)
 
 DAv3's actual export is MatMul-form attention with DINOv2's split scale: Q and K are each pre-multiplied by

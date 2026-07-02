@@ -63,6 +63,153 @@ public class Conv2DKernel : IDisposable
 
     private static long _convCallCount;
 
+    // ── Implicit-GEMM tiled conv (NCHW) ──
+    // The naive one-thread-per-output kernel has ZERO data reuse: every MAC does two global loads, and a
+    // 3x3 conv re-reads each input pixel 9x from DRAM - measured 420-960 GFLOPS on the 4070 vs the
+    // register-blocked GEMM's 4.3-5.7 TFLOPS at DAv3 shapes. Convolution IS a GEMM:
+    //   C[outC, outH*outW] = W[outC, inC*kH*kW] x im2col(input)[inC*kH*kW, outH*outW]
+    // and the weight is ALREADY row-major [outC, K] - so this kernel reuses RegisterBlockedMatMul's exact
+    // 64x64-tile / 4x4-register structure, with the B-tile stage doing the im2col ADDRESSING on the fly
+    // (no materialized im2col buffer, no extra memory). Shared-memory staging supplies the data reuse the
+    // naive kernel forfeits: 64 outC rows share each input patch, 64 output pixels share each weight row.
+    // Gated to backends with a 256-thread group + shared memory (WebGL/CPU keep the naive kernel).
+    private const int RbBlock = 16;              // 16x16 = 256 threads (WebGPU max workgroup)
+    private const int RbReg = 4;                 // 4x4 outputs per thread
+    private const int RbTile = RbBlock * RbReg;  // 64x64 output tile
+
+    private Action<KernelConfig,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int>?
+        _implicitGemmKernel;
+
+    private static void Conv2DImplicitGemmImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weight,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int inC, int inH, int inW, int outC, int kH, int kW,
+        int strideDilHW, int padTL, int outHW, int numTilesN)
+    {
+        // strideDilHW = (stride << 16) | (dilationH << 8) | dilationW - LoadStreamKernel's typed loaders
+        // cap at 14 params, so stride and the dilations share one int (all fit 8/16 bits by construction).
+        int stride = strideDilHW >> 16;
+        int padTop = padTL >> 8, padLeft = padTL & 0xFF;
+        int outH = outHW >> 16, outW = outHW & 0xFFFF;
+        int dilationH = (strideDilHW >> 8) & 0xFF, dilationW = strideDilHW & 0xFF;
+
+        int K = inC * kH * kW;
+        int N = outH * outW;
+
+        // Batch from Grid.IdxY (DAv3 multi-view); batch=1 dispatches Y=1 so both bases are 0.
+        int batch = Grid.IdxY;
+        int inBatchBase = batch * inC * inH * inW;
+        int outBatchBase = batch * outC * N;
+
+        var aTile = SharedMemory.Allocate<float>(RbTile * RbBlock); // weights: 64 outC x 16 k
+        var bTile = SharedMemory.Allocate<float>(RbBlock * RbTile); // patches: 16 k x 64 n
+
+        int tileIdx = Grid.IdxX;
+        int tileRow = tileIdx / numTilesN;  // outC tile
+        int tileCol = tileIdx % numTilesN;  // output-pixel tile
+        int localIdx = Group.IdxX;
+        int threadRow = localIdx / RbBlock;
+        int threadCol = localIdx % RbBlock;
+
+        float c00 = 0, c01 = 0, c02 = 0, c03 = 0;
+        float c10 = 0, c11 = 0, c12 = 0, c13 = 0;
+        float c20 = 0, c21 = 0, c22 = 0, c23 = 0;
+        float c30 = 0, c31 = 0, c32 = 0, c33 = 0;
+
+        int numKTiles = (K + RbBlock - 1) / RbBlock;
+        for (int t = 0; t < numKTiles; t++)
+        {
+            // A tile: plain weight loads (row-major [outC, K] - coalesced along k).
+            for (int r = 0; r < RbReg; r++)
+            {
+                int oc = tileRow * RbTile + threadRow * RbReg + r;
+                int kk = t * RbBlock + threadCol;
+                int sIdx = (threadRow * RbReg + r) * RbBlock + threadCol;
+                aTile[sIdx] = (oc < outC && kk < K) ? weight[oc * K + kk] : 0f;
+            }
+            // B tile: implicit im2col - decode (k -> ic,ky,kx) and (n -> oy,ox), bounds-checked padded read.
+            for (int r = 0; r < RbReg; r++)
+            {
+                int kk = t * RbBlock + threadRow;
+                int n = tileCol * RbTile + threadCol * RbReg + r;
+                int sIdx = threadRow * RbTile + threadCol * RbReg + r;
+                int ic = kk / (kH * kW);
+                int rem = kk - ic * (kH * kW);
+                int ky = rem / kW;
+                int kx = rem - ky * kW;
+                int oy = n / outW;
+                int ox = n - oy * outW;
+                int iy = oy * stride + ky * dilationH - padTop;
+                int ix = ox * stride + kx * dilationW - padLeft;
+                bTile[sIdx] = (kk < K && n < N && iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+                    ? input[inBatchBase + (ic * inH + iy) * inW + ix] : 0f;
+            }
+
+            Group.Barrier();
+
+            for (int k = 0; k < RbBlock; k++)
+            {
+                float a0 = aTile[(threadRow * RbReg + 0) * RbBlock + k];
+                float a1 = aTile[(threadRow * RbReg + 1) * RbBlock + k];
+                float a2 = aTile[(threadRow * RbReg + 2) * RbBlock + k];
+                float a3 = aTile[(threadRow * RbReg + 3) * RbBlock + k];
+                float b0 = bTile[k * RbTile + threadCol * RbReg + 0];
+                float b1 = bTile[k * RbTile + threadCol * RbReg + 1];
+                float b2 = bTile[k * RbTile + threadCol * RbReg + 2];
+                float b3 = bTile[k * RbTile + threadCol * RbReg + 3];
+                c00 += a0 * b0; c01 += a0 * b1; c02 += a0 * b2; c03 += a0 * b3;
+                c10 += a1 * b0; c11 += a1 * b1; c12 += a1 * b2; c13 += a1 * b3;
+                c20 += a2 * b0; c21 += a2 * b1; c22 += a2 * b2; c23 += a2 * b3;
+                c30 += a3 * b0; c31 += a3 * b1; c32 += a3 * b2; c33 += a3 * b3;
+            }
+
+            Group.Barrier();
+        }
+
+        // Epilogue: C[oc, n] = acc + bias[oc] (bias always read, matching the naive kernel's contract).
+        int baseOc = tileRow * RbTile + threadRow * RbReg;
+        int baseN = tileCol * RbTile + threadCol * RbReg;
+        if (baseOc + 0 < outC)
+        {
+            float bb = bias[baseOc + 0];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 0] = c00 + bb;
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 1] = c01 + bb;
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 2] = c02 + bb;
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 0) * N + baseN + 3] = c03 + bb;
+        }
+        if (baseOc + 1 < outC)
+        {
+            float bb = bias[baseOc + 1];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 0] = c10 + bb;
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 1] = c11 + bb;
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 2] = c12 + bb;
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 1) * N + baseN + 3] = c13 + bb;
+        }
+        if (baseOc + 2 < outC)
+        {
+            float bb = bias[baseOc + 2];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 0] = c20 + bb;
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 1] = c21 + bb;
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 2] = c22 + bb;
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 2) * N + baseN + 3] = c23 + bb;
+        }
+        if (baseOc + 3 < outC)
+        {
+            float bb = bias[baseOc + 3];
+            if (baseN + 0 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 0] = c30 + bb;
+            if (baseN + 1 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 1] = c31 + bb;
+            if (baseN + 2 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 2] = c32 + bb;
+            if (baseN + 3 < N) output[outBatchBase + (baseOc + 3) * N + baseN + 3] = c33 + bb;
+        }
+    }
+
     /// <summary>
     /// Conv2D NCHW: one thread per output element. inC, inH, inW, outC, kH, kW,
     /// stride, padding, dilationH, dilationW are captured as scalar parameters.
@@ -228,6 +375,33 @@ public class Conv2DKernel : IDisposable
                 $"Conv2D NCHW output buffer too small: output.Length={output.Length} but kernel will write {totalOutputElements} elements " +
                 $"(batch={batch} outH={outH} outW={outW} outC={outC}, inC={inC} inH={inH} inW={inW} kH={kH} kW={kW} stride={stride} pads=[{padTop},{padLeft},{padBottom},{padRight}] dilation={dilationH}x{dilationW}). " +
                 $"Upstream shape inference allocated wrong size.");
+
+        // Implicit-GEMM tiled route: backends with a 256-thread group + shared memory (not WebGL, not CPU's
+        // 16/axis groups), and enough work that a 64x64-tiled launch beats the naive kernel's zero-setup
+        // (tiny convs keep the naive path - a 1-tile launch has no reuse to win). K/N thresholds are the
+        // tile geometry, not tuning magic.
+        int gemmK = inC * kH * kW;
+        int gemmN = outH * outW;
+        if (_accelerator.MaxNumThreadsPerGroup >= RbBlock * RbBlock
+            && _accelerator.AcceleratorType != global::ILGPU.Runtime.AcceleratorType.WebGL
+            && gemmK >= RbBlock && gemmN >= RbTile && outC >= RbReg)
+        {
+            _implicitGemmKernel ??= _accelerator.LoadStreamKernel<
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                int, int, int, int, int, int, int, int, int, int>(Conv2DImplicitGemmImpl);
+            int numTilesM = (outC + RbTile - 1) / RbTile;
+            int numTilesN = (gemmN + RbTile - 1) / RbTile;
+            var cfg = new KernelConfig(
+                new Index2D(numTilesM * numTilesN, batch),
+                new Index2D(RbBlock * RbBlock, 1));
+            _implicitGemmKernel(cfg, input, weight, bias, output,
+                inC, inH, inW, outC, kH, kW,
+                (stride << 16) | (dilationH << 8) | dilationW,
+                (padTop << 8) | padLeft, (outH << 16) | outW, numTilesN);
+            return;
+        }
+
         try
         {
             _conv2dKernel!(totalOutputElements, input, weight, bias, output,
