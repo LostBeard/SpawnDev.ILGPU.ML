@@ -1180,9 +1180,15 @@ public class GraphExecutor : IDisposable
         var blocked = new HashSet<string>(_graph.OutputNames.Where(o => !string.IsNullOrEmpty(o)));
         foreach (var c in _graph.Nodes)
         {
+            // A consumer "reads all inputs via Vals" (tensor-consumes nothing) ONLY if it actually resolves on the
+            // CPU AND is elided. A rank-CHANGING op is interpreter-resolvable (a shape value) BUT is excluded from
+            // dispatch-elide (IsRankChangingShapeOp) - so it DISPATCHES and reads its data input as a real GPU
+            // tensor (ONNX Reshape keep-dim reads nodeInputs[0].Shape). Treating it as consumerIsShape left its
+            // data producer un-blocked -> elided -> materialized wrong -> the channel-3 leak (Reshape_26 dim0=3
+            // -> block-4 RoPE Gather -> q/k rank-5). So a rank-changing consumer is a REAL tensor consumer.
             bool consumerIsShape = c.OutputNames.Length == 1 && !string.IsNullOrEmpty(c.OutputNames[0])
-                && shapeValue.Contains(c.OutputNames[0]);
-            if (consumerIsShape) continue;   // resolves on the CPU -> reads every input via Vals -> tensor-consumes nothing
+                && shapeValue.Contains(c.OutputNames[0]) && !IsRankChangingShapeOp(c.OpType);
+            if (consumerIsShape) continue;   // resolves on the CPU AND elided -> reads every input via Vals
             for (int i = 0; i < c.InputNames.Length; i++)
             {
                 var inName = c.InputNames[i];
