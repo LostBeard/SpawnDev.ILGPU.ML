@@ -11,6 +11,17 @@ public class GraphCompiler
 {
     private readonly OperatorRegistry _registry;
 
+    /// <summary>Diagnostic: number of shape-subgraph nodes folded out of the last Compile (no runtime
+    /// dispatch/readback). ~1400 for DAv3-518. Read by perf tests to prove the fold engaged.</summary>
+    public static int LastCompileFoldedNodeCount;
+
+    /// <summary>WIP compile-time shape-subgraph fold (2026-07-01). Removes pure compile-time shape-math nodes
+    /// (Shape/Gather/Concat/Unsqueeze/Slice/Cast/Mul/Add/Sub/Div on non-dynamic inputs) from the executed graph
+    /// to kill ~1400 per-inference GPU shape readbacks on DAv3-518. DEFAULT OFF until proven correct across
+    /// DAv3 + full PMT - the folded values live on the optimizer graph clone and some are consumed as GPU
+    /// tensors (Resize data, Gather), which is still being wired end to end. Tests flip it on explicitly.</summary>
+    public static bool ShapeSubgraphFoldEnabled = false;
+
     public GraphCompiler(OperatorRegistry registry) => _registry = registry;
 
     /// <summary>Check if constant data is valid (no INT_MAX/INT_MIN sentinels from dynamic dims).</summary>
@@ -100,6 +111,10 @@ public class GraphCompiler
         // Compile each node
         var compiledNodes = new List<CompiledNode>();
         int nodeCompileIdx = 0;
+        int foldedNodeCount = 0;
+        // Compile-time-constant node outputs (name -> fp32) whose per-node <=64-elem readback the executor can
+        // skip: it seeds runtimeConstants from these instead of doing the GPU->CPU drain. Nodes still execute.
+        var foldedConstants = new Dictionary<string, float[]>();
         foreach (var node in sorted)
         {
           try
@@ -686,6 +701,43 @@ public class GraphCompiler
                 knownShapes[outName] = outputShapes[i];
             }
 
+            // COMPILE-TIME READBACK ELIMINATION (2026-07-01): the inline evaluators above (Shape/Gather/Concat/
+            // Unsqueeze/Slice/Cast/Mul/Add/Sub/Div on non-dynamic inputs) proved this node's output is a small
+            // compile-time constant. The node still RUNS (so every tensor + shape is produced exactly as before -
+            // no removal, no shape-resolution or missing-tensor hazards), but the executor's per-node <=64-elem
+            // capture readback of it (a full GPU->CPU pipeline drain, ~1400 of them on DAv3-518 = the dominant
+            // cost) is REDUNDANT: we already know the value. Record it so the executor seeds runtimeConstants from
+            // it and SKIPS the readback. Net: same correctness, ~1400 drains removed. (Node REMOVAL was tried and
+            // corrupts shape resolution - a folded Concat input regressed to the wrong rank; readback-skip keeps
+            // the graph intact.) The readback only fires for <=64-elem outputs, so match that bound.
+            bool isReadbackConstOp = ShapeSubgraphFoldEnabled && (node.OpType is "Shape" or "Gather" or "Concat"
+                or "Unsqueeze" or "Squeeze" or "Slice" or "Cast" or "Mul" or "Add" or "Sub" or "Div");
+            // IsValidConstant rejects INT_MAX/INT_MIN sentinels the compiler stores for dims it could NOT resolve
+            // at compile time (dynamic / unknown). Seeding those is garbage - only skip the readback for outputs
+            // that are fully, correctly resolved. This is the reliability gate: the readback stays for anything
+            // uncertain (so the executor's runtime value wins), the readback-skip applies only to proven constants.
+            if (isReadbackConstOp && node.Outputs.Count > 0 && graph.ConstantData != null
+                && node.Outputs.All(o => !string.IsNullOrEmpty(o)
+                    && graph.ConstantData.TryGetValue(o, out var cv) && cv.Length > 0 && cv.Length <= 64
+                    && IsValidConstant(cv)))
+            {
+                foreach (var o in node.Outputs)
+                {
+                    var intVals = graph.ConstantData[o];
+                    float[] floatVals;
+                    if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(o, out var fv)
+                        && fv.Length == intVals.Length)
+                        floatVals = fv;
+                    else
+                    {
+                        floatVals = new float[intVals.Length];
+                        for (int k = 0; k < intVals.Length; k++) floatVals[k] = intVals[k];
+                    }
+                    foldedConstants[o] = floatVals;
+                }
+                foldedNodeCount++;
+                // NOTE: no `continue` - the node is still compiled + executed below.
+            }
 
             compiledNodes.Add(new CompiledNode
             {
@@ -730,8 +782,10 @@ public class GraphCompiler
         }
 
         // Log compile-time evaluation stats
+        LastCompileFoldedNodeCount = foldedNodeCount;
         if (InferenceSession.VerboseLogging && graph.ConstantData != null && graph.ConstantData.Count > 0)
-            Console.WriteLine($"[GraphCompiler] Compile-time constants: {graph.ConstantData.Count} tensors evaluated");
+            Console.WriteLine($"[GraphCompiler] Compile-time constants: {graph.ConstantData.Count} tensors evaluated; "
+                + $"{foldedNodeCount} shape-subgraph nodes folded out (no runtime dispatch/readback)");
 
         return new CompiledGraph
         {
@@ -751,6 +805,7 @@ public class GraphCompiler
             OutputShapes = graph.Outputs.ToDictionary(o => o.Name, o => knownShapes.TryGetValue(o.Name, out var s) ? s : Array.Empty<int>()),
             InitializerNames = graph.Initializers.Keys.ToHashSet(),
             InitializerDataTypes = graph.InitializerDataTypes,
+            FoldedShapeConstants = foldedConstants,
         };
       }
       catch (Exception compileEx)
@@ -845,6 +900,11 @@ public class CompiledGraph
     /// to seed integer-tensor dataflow propagation. Null when the source model didn't
     /// supply dtype information (e.g., TFLite / CoreML paths).</summary>
     public Dictionary<string, int>? InitializerDataTypes { get; init; }
+    /// <summary>Compile-time-constant node outputs (&lt;=64 elem, name -&gt; fp32) proven by the compiler
+    /// (Shape/Gather/Concat/Unsqueeze/Slice/Cast/Mul/Add/Sub/Div on non-dynamic inputs). The producing nodes
+    /// STILL execute (graph unchanged) - the executor seeds runtimeConstants from these and SKIPS their per-node
+    /// &lt;=64-elem capture readback (the GPU-&gt;CPU drain that dominates DAv3-518). Null/empty when the fold is off.</summary>
+    public Dictionary<string, float[]>? FoldedShapeConstants { get; init; }
 }
 
 /// <summary>A single compiled operation.</summary>

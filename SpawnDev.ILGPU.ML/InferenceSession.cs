@@ -394,7 +394,6 @@ public class InferenceSession : IDisposable
                 loadedCount++;
             }
         }
-
         // Log weight loading stats
         int missingCount = allInitNames.Count - loadedCount;
         if (VerboseLogging)

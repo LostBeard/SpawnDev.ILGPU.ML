@@ -190,7 +190,11 @@ public class CastOperator(OperatorRegistry reg) : IOnnxOperator
         // Shape tensors may only exist in ConstantData/runtime constants — their GPU buffers
         // can be empty if they were produced by folded/eliminated nodes.
         var inVals = ctx.TryGetInputValues(0);
-        if (inVals != null && count <= 64)
+        // Only the CPU fast path when the constant value length matches the tensor's element count. The runtime
+        // CPU shape interpreter can publish a (correct) shape value whose length differs from a mis-inferred
+        // input buffer's ElementCount; copying that into the count-sized output view would throw. In that case
+        // fall through to the GPU path (operates on the actual buffer), which stays self-consistent.
+        if (inVals != null && inVals.Length == count && count <= 64)
         {
             float[] result;
             if (targetType == 6 || targetType == 7 || targetType == 12 || targetType == 5 || targetType == 3 || targetType == 2)

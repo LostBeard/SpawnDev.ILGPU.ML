@@ -505,14 +505,15 @@ public class GraphExecutor : IDisposable
             // the actual shape, so the executor always runs a graph compiled for THESE dims.
             int[][] runtimeOutputShapes = node.OutputShapes;
 
-            // Runtime Slice: resolve output shape from starts/ends/axes constants
+            // Runtime Slice: resolve output shape from compiler-resolved attrs (backend/elide-independent),
+            // falling back to runtimeConstants. See the async-path copy for the root cause (Seven's Slice_4).
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
             {
                 var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
-                float[]? starts = node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null;
-                float[]? ends = node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null;
-                float[]? axes = node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null;
-                float[]? steps = node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null;
+                float[]? starts = ResolvedShapeAttr(node, "_resolved_starts") ?? (node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null);
+                float[]? ends = ResolvedShapeAttr(node, "_resolved_ends") ?? (node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null);
+                float[]? axes = ResolvedShapeAttr(node, "_resolved_axes") ?? (node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null);
+                float[]? steps = ResolvedShapeAttr(node, "_resolved_steps") ?? (node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null);
                 if (starts != null && ends != null)
                 {
                     var resolved = inShape.ToArray();
@@ -522,9 +523,9 @@ public class GraphExecutor : IDisposable
                         if (ax < 0) ax += resolved.Length;
                         if (ax >= 0 && ax < resolved.Length)
                         {
-                            int s = (int)starts[si]; if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
-                            int e = (int)ends[si]; if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
-                            int st = steps != null && si < steps.Length ? (int)steps[si] : 1;
+                            int s = SatFloatToInt(starts[si]); if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
+                            int e = SatFloatToInt(ends[si]); if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
+                            int st = steps != null && si < steps.Length ? SatFloatToInt(steps[si]) : 1;
                             // Empty slices ARE valid (e<=s → 0): DAv3's extrinsics builds an EMPTY [.,.,0,4] row
                             // (Slice [3:3] on a size-3 axis, ORT value_info [?,?,0,4]) that a later Concat treats
                             // as a no-op. Rejecting the 0-dim here collapsed the whole shape to the compile-time
@@ -1087,6 +1088,395 @@ public class GraphExecutor : IDisposable
     /// SynchronizeAsync() to AWAIT GPU completion. Periodically awaits SynchronizeAsync() to
     /// flush + drain GPU command buffers.
     /// </summary>
+    /// <summary>DIAGNOSTIC: shape-interp values that disagreed with the GPU readback on the last run (validation
+    /// mode). Must be 0 - any mismatch is a bug in the CPU shape eval.</summary>
+    public static int LastRunShapeInterpMismatches;
+    /// <summary>DIAGNOSTIC: number of shape-op outputs the CPU interpreter resolved on the last run.</summary>
+    public static int LastRunShapeInterpResolved;
+    /// <summary>Dispatch-elide (all-backend): when true, shape ops the CPU interpreter resolves are NOT dispatched
+    /// to the GPU at all (not just their readback skipped) — they run entirely on the CPU like ORT. This removes
+    /// ~1200 nodes of per-node dispatch/sync/alloc orchestration (the ~1200ms CUDA residual Seven measured) on
+    /// EVERY backend. GPU-tensor consumers of an elided output get it materialized on-demand from the CPU value.
+    /// Requires ShapeSubgraphFoldEnabled. Default off until validated bit-exact on the DAv3 rig.</summary>
+    public static bool ShapeInterpElideDispatch;
+    /// <summary>DIAGNOSTIC: when non-null, the executor records "OpType in=[shapes]" for each FLOP-carrying node
+    /// (MatMul/Conv/Einsum/FusedLinear/FusedAttention/Gemm/ConvTranspose) so we can histogram the actual kernel
+    /// shapes (M,K,N / C,H,W,k) — the input Seven needs to pick per-shape tile configs for the SGEMM core.</summary>
+    public static System.Collections.Generic.List<string>? CaptureKernelShapes;
+    /// <summary>When true, the CPU shape interpreter STILL does the GPU readback and compares (populating
+    /// <see cref="LastRunShapeInterpMismatches"/>) instead of skipping it - used to prove the eval is correct
+    /// before trusting it. Default false (skip the readback = the actual perf win).</summary>
+    public static bool ShapeInterpValidate;
+
+    /// <summary>
+    /// Runtime CPU shape interpreter. Computes a shape-subgraph op on the CPU from the ACTUAL runtime tensor
+    /// shapes (metadata the CPU already has) + already-resolved shape values - so its tiny integer result never
+    /// has to be read back from the GPU (the WebGPU per-op mapAsync round-trip that dominates DAv3). Returns true
+    /// + the fp32 value array (runtimeConstants' representation) for a supported single-output shape op whose
+    /// inputs are all CPU-available; false otherwise (the node then runs + reads back as usual). The heavy tensor
+    /// math is untouched - only the shape bookkeeping moves to the CPU, where ORT does it too.
+    /// </summary>
+    /// <summary>
+    /// Rank-CHANGING shape ops: their CPU value (a flat integer list in runtimeConstants) corresponds to a
+    /// tensor whose true rank is NOT 1 — Unsqueeze/Squeeze add/drop axes, Reshape/Expand/ConstantOfShape build
+    /// a multi-dim tensor. Dispatch-elide must NOT skip these: an elided output consumed as a GPU tensor is
+    /// materialized on-demand as rank-1 [len] (see the input-gather materialization), which is only correct when
+    /// the true output IS rank-1. A rank-1 materialization of a genuinely multi-dim tensor collapses a downstream
+    /// rank-matched op (the DAv3 2D-RoPE Concat_12: [grid,1]+[grid,1] → [grid,2]). All the OTHER interpreter ops
+    /// (Shape/Gather/Concat-axis0/Slice-axis0/Cast/Identity/arithmetic/compare) produce a rank-1 vector, so their
+    /// rank-1 materialization is exact and they elide freely.
+    /// </summary>
+    private static bool IsRankChangingShapeOp(string opType) => opType is
+        "Unsqueeze" or "Squeeze" or "Reshape" or "Expand" or "ConstantOfShape";
+
+    // Cached per-graph set of shape-op outputs that dispatch-elide must NOT skip (path-c consumer gate).
+    private HashSet<string>? _elideBlockedOutputs;
+
+    /// <summary>
+    /// Path-c dispatch-elide safety: an interpreter-resolved shape op may skip its GPU dispatch ONLY if its
+    /// output is never read as a GPU tensor - every consumer must read it as a CPU shape-param (from
+    /// runtimeConstants) OR be itself a pure CPU-resolvable shape op (reads all inputs as CPU values). If ANY
+    /// consumer reads it as a real tensor (on-demand materialization, or a runtime shape-resolver reading
+    /// nodeInputs[i].Shape), eliding it corrupts that consumer (the DAv3 Concat_19 / FusedAttention class).
+    /// Blocking such an output just makes it dispatch (the proven elide-off path) - provably non-regressive.
+    /// Computed once from the fixed graph + cached.
+    /// </summary>
+    private HashSet<string> ElideBlockedOutputs()
+    {
+        if (_elideBlockedOutputs != null) return _elideBlockedOutputs;
+
+        // 1) shapeValue: the pure CPU shape subgraph (least-fixpoint). A name is a shape value if it's a
+        //    compile-time constant, or the single output of an interpreter-resolvable op whose EVERY value
+        //    input is itself a shape value. (Shape reads tensor metadata, so it's a shape value unconditionally.)
+        var shapeValue = new HashSet<string>();
+        if (_constantValues != null) foreach (var k in _constantValues.Keys) shapeValue.Add(k);
+        foreach (var n in _graph.Nodes)
+            if (n.OpType == "Constant")
+                foreach (var o in n.OutputNames) if (!string.IsNullOrEmpty(o)) shapeValue.Add(o);
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var n in _graph.Nodes)
+            {
+                if (n.OutputNames.Length != 1) continue;
+                var outName = n.OutputNames[0];
+                if (string.IsNullOrEmpty(outName) || shapeValue.Contains(outName)) continue;
+                if (!IsInterpreterResolvableOp(n)) continue;
+                bool allVals = n.OpType == "Shape";   // Shape needs no value inputs
+                if (!allVals)
+                {
+                    allVals = true;
+                    foreach (var vi in n.InputNames)
+                        if (!string.IsNullOrEmpty(vi) && !shapeValue.Contains(vi)) { allVals = false; break; }
+                }
+                if (allVals) { shapeValue.Add(outName); changed = true; }
+            }
+        }
+
+        // 2) blocked: a graph output, OR consumed by some node in a NON-shape-param slot where that consumer is
+        //    NOT itself a pure shape value (so it reads the input as a real GPU tensor).
+        var blocked = new HashSet<string>(_graph.OutputNames.Where(o => !string.IsNullOrEmpty(o)));
+        foreach (var c in _graph.Nodes)
+        {
+            bool consumerIsShape = c.OutputNames.Length == 1 && !string.IsNullOrEmpty(c.OutputNames[0])
+                && shapeValue.Contains(c.OutputNames[0]);
+            if (consumerIsShape) continue;   // resolves on the CPU -> reads every input via Vals -> tensor-consumes nothing
+            for (int i = 0; i < c.InputNames.Length; i++)
+            {
+                var inName = c.InputNames[i];
+                if (string.IsNullOrEmpty(inName)) continue;
+                if (IsShapeParamSlot(c.OpType, i)) continue;   // read from runtimeConstants, never as a tensor
+                blocked.Add(inName);
+            }
+        }
+        _elideBlockedOutputs = blocked;
+        return blocked;
+    }
+
+    // Ops the CPU interpreter (TryComputeShapeOnCpu) can resolve, with their statically-checkable op-conditions.
+    private static bool IsInterpreterResolvableOp(CompiledNode n) => n.OpType switch
+    {
+        "Shape" => true,
+        "Concat" or "Gather" => AttrAxisIsZero(n),   // interpreter only handles axis 0
+        "Slice" or "Unsqueeze" or "Squeeze" or "Identity" or "Cast" or "Reshape"
+            or "Mul" or "Add" or "Sub" or "Div" or "Where" or "Equal" or "Greater" or "Less"
+            or "Floor" or "Ceil" or "Neg" or "Abs" or "Mod" or "Min" or "Max"
+            or "ConstantOfShape" or "Expand" => true,
+        _ => false,
+    };
+
+    private static bool AttrAxisIsZero(CompiledNode n)
+    {
+        if (n.Attributes != null && n.Attributes.TryGetValue("axis", out var a) && a != null)
+        {
+            try { return Convert.ToInt32(a) == 0; } catch { return false; }
+        }
+        return true;   // ONNX default axis is 0
+    }
+
+    // Input slots an op reads as a CPU shape-PARAM (from runtimeConstants) even when it dispatches on the GPU.
+    // Conservative: anything NOT listed here is treated as a real-tensor slot (blocks elide of its producer).
+    private static bool IsShapeParamSlot(string opType, int slot) => opType switch
+    {
+        "Reshape" or "Expand" or "Unsqueeze" or "Squeeze" or "Tile" or "Pad" => slot == 1,
+        "ConstantOfShape" => slot == 0,
+        "Slice" => slot >= 1 && slot <= 4,
+        "Resize" => slot >= 1 && slot <= 3,
+        "Range" => slot >= 0 && slot <= 2,
+        _ => false,
+    };
+
+    // Compiler-resolved shape params (`_resolved_starts`/`_resolved_ends`/... on the node's attrs, stored by
+    // GraphCompiler when it can resolve a Slice at compile time). Backend-independent, no GPU readback - the
+    // reliable source for the runtime shape override, vs runtimeConstants which is NOT populated at cascade
+    // time on the WebGPU async path OR when the producing shape op is dispatch-elided. Returns null if absent
+    // (non-compiler-resolvable Slice) so the caller falls back to runtimeConstants.
+    // Saturating float->int for slice params. The ONNX "to the end" sentinel is INT_MAX (2147483647), but a
+    // float can't hold it exactly: (float)2147483647 rounds to 2147483648f, and a plain (int) cast of that
+    // OVERFLOWS to INT_MIN - which then reads as a huge NEGATIVE start/end and collapses the slice to 0 (DAv3
+    // blocks.4 rope [16:32] -> [.,.,.,0]). Saturate instead, exactly like SliceOperator path-2.
+    private static int SatFloatToInt(float v) => v <= int.MinValue ? int.MinValue : v >= int.MaxValue ? int.MaxValue : (int)v;
+
+    private static float[]? ResolvedShapeAttr(CompiledNode node, string key)
+    {
+        if (node.Attributes != null && node.Attributes.TryGetValue(key, out var o) && o != null)
+        {
+            switch (o)
+            {
+                case long[] la: { var r = new float[la.Length]; for (int i = 0; i < la.Length; i++) r[i] = la[i]; return r; }
+                case int[] ia: { var r = new float[ia.Length]; for (int i = 0; i < ia.Length; i++) r[i] = ia[i]; return r; }
+                case float[] fa: return fa;
+            }
+        }
+        return null;
+    }
+
+    private bool TryComputeShapeOnCpu(CompiledNode node,
+        Dictionary<string, Tensor> tensors,
+        Dictionary<string, HalfTensor> halfTensors,
+        Dictionary<string, float[]> runtimeConstants,
+        out float[] result)
+    {
+        result = System.Array.Empty<float>();
+        if (node.OutputNames.Length != 1 || string.IsNullOrEmpty(node.OutputNames[0])) return false;
+        var ins = node.InputNames;
+
+        float[]? Vals(string? name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            if (runtimeConstants.TryGetValue(name!, out var v)) return v;
+            if (_constantValues != null && _constantValues.TryGetValue(name!, out var c)) return c;
+            return null;
+        }
+        int[]? ShapeOf(string? name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            if (tensors.TryGetValue(name!, out var t)) return t.Shape;
+            if (halfTensors.TryGetValue(name!, out var h)) return h.Shape;
+            return null;
+        }
+        long AttrLong(string key, long dflt)
+        {
+            if (node.Attributes == null || !node.Attributes.TryGetValue(key, out var o) || o == null) return dflt;
+            return o switch
+            {
+                long l => l,
+                int i => i,
+                long[] la when la.Length > 0 => la[0],
+                int[] ia when ia.Length > 0 => ia[0],
+                _ => dflt
+            };
+        }
+
+        switch (node.OpType)
+        {
+            case "Shape":
+            {
+                var s = ShapeOf(ins.Length > 0 ? ins[0] : null);
+                if (s == null) return false;
+                int rank = s.Length;
+                long start = AttrLong("start", 0), end = AttrLong("end", rank);
+                if (start < 0) start += rank;
+                if (end < 0) end += rank;
+                start = System.Math.Clamp(start, 0, rank);
+                end = System.Math.Clamp(end, 0, rank);
+                if (end < start) end = start;
+                var outv = new float[end - start];
+                for (int i = 0; i < outv.Length; i++) outv[i] = s[start + i];
+                result = outv; return true;
+            }
+            case "Gather":
+            {
+                var data = Vals(ins.Length > 0 ? ins[0] : null);
+                var idx = Vals(ins.Length > 1 ? ins[1] : null);
+                if (data == null || idx == null || AttrLong("axis", 0) != 0) return false;
+                var outv = new float[idx.Length];
+                for (int i = 0; i < idx.Length; i++)
+                {
+                    int ii = (int)idx[i]; if (ii < 0) ii += data.Length;
+                    if (ii < 0 || ii >= data.Length) return false;
+                    outv[i] = data[ii];
+                }
+                result = outv; return true;
+            }
+            case "Concat":
+            {
+                if (AttrLong("axis", 0) != 0) return false;
+                var parts = new System.Collections.Generic.List<float>();
+                foreach (var inp in ins) { var v = Vals(inp); if (v == null) return false; parts.AddRange(v); }
+                result = parts.ToArray(); return true;
+            }
+            case "Unsqueeze":
+            case "Squeeze":
+            case "Identity":
+            case "Cast":
+            {
+                // These change RANK/dtype but not the flat integer value list runtimeConstants stores.
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                result = v; return true;
+            }
+            case "Slice":
+            {
+                var data = Vals(ins.Length > 0 ? ins[0] : null);
+                var starts = Vals(ins.Length > 1 ? ins[1] : null);
+                var ends = Vals(ins.Length > 2 ? ins[2] : null);
+                if (data == null || starts == null || ends == null || starts.Length < 1 || ends.Length < 1) return false;
+                var axesV = Vals(ins.Length > 3 ? ins[3] : null);
+                var stepsV = Vals(ins.Length > 4 ? ins[4] : null);
+                if ((axesV != null && axesV.Length > 0 && (long)axesV[0] != 0)) return false;
+                if (stepsV != null && stepsV.Length > 0 && (long)stepsV[0] != 1) return false;
+                int st = (int)starts[0], en = (int)ends[0];
+                if (st < 0) st += data.Length;
+                if (en < 0) en += data.Length;
+                st = System.Math.Clamp(st, 0, data.Length);
+                en = System.Math.Clamp(en, 0, data.Length);
+                if (en < st) en = st;
+                var outv = new float[en - st];
+                for (int i = 0; i < outv.Length; i++) outv[i] = data[st + i];
+                result = outv; return true;
+            }
+            case "Mul": case "Add": case "Sub": case "Div":
+            {
+                var a = Vals(ins.Length > 0 ? ins[0] : null);
+                var b = Vals(ins.Length > 1 ? ins[1] : null);
+                if (a == null || b == null) return false;
+                int len = System.Math.Max(a.Length, b.Length);
+                if ((a.Length != len && a.Length != 1) || (b.Length != len && b.Length != 1)) return false;
+                var outv = new float[len];
+                for (int i = 0; i < len; i++)
+                {
+                    float av = a[a.Length == 1 ? 0 : i], bv = b[b.Length == 1 ? 0 : i];
+                    outv[i] = node.OpType switch { "Mul" => av * bv, "Add" => av + bv, "Sub" => av - bv, "Div" => bv != 0 ? av / bv : 0, _ => av };
+                }
+                result = outv; return true;
+            }
+            case "Reshape":
+            {
+                // Reshaping a SHAPE VECTOR (in runtimeConstants) only changes rank, not the flat values. If the
+                // input isn't a CPU shape value (it's GPU feature data), Vals returns null -> fall through to GPU.
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                result = v; return true;
+            }
+            case "Where":
+            {
+                var cond = Vals(ins.Length > 0 ? ins[0] : null);
+                var x = Vals(ins.Length > 1 ? ins[1] : null);
+                var y = Vals(ins.Length > 2 ? ins[2] : null);
+                if (cond == null || x == null || y == null) return false;
+                int len = System.Math.Max(cond.Length, System.Math.Max(x.Length, y.Length));
+                if ((cond.Length != len && cond.Length != 1) || (x.Length != len && x.Length != 1) || (y.Length != len && y.Length != 1)) return false;
+                var outv = new float[len];
+                for (int i = 0; i < len; i++)
+                    outv[i] = (cond[cond.Length == 1 ? 0 : i] != 0f) ? x[x.Length == 1 ? 0 : i] : y[y.Length == 1 ? 0 : i];
+                result = outv; return true;
+            }
+            case "Equal": case "Greater": case "Less":
+            {
+                var a = Vals(ins.Length > 0 ? ins[0] : null);
+                var b = Vals(ins.Length > 1 ? ins[1] : null);
+                if (a == null || b == null) return false;
+                int len = System.Math.Max(a.Length, b.Length);
+                if ((a.Length != len && a.Length != 1) || (b.Length != len && b.Length != 1)) return false;
+                var outv = new float[len];
+                for (int i = 0; i < len; i++)
+                {
+                    float av = a[a.Length == 1 ? 0 : i], bv = b[b.Length == 1 ? 0 : i];
+                    outv[i] = node.OpType switch { "Equal" => av == bv ? 1f : 0f, "Greater" => av > bv ? 1f : 0f, "Less" => av < bv ? 1f : 0f, _ => 0f };
+                }
+                result = outv; return true;
+            }
+            case "Floor": case "Ceil": case "Neg": case "Abs":
+            {
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                var outv = new float[v.Length];
+                for (int i = 0; i < v.Length; i++)
+                    outv[i] = node.OpType switch { "Floor" => (float)System.Math.Floor(v[i]), "Ceil" => (float)System.Math.Ceiling(v[i]), "Neg" => -v[i], "Abs" => System.Math.Abs(v[i]), _ => v[i] };
+                result = outv; return true;
+            }
+            case "Mod": case "Min": case "Max":
+            {
+                var a = Vals(ins.Length > 0 ? ins[0] : null);
+                var b = Vals(ins.Length > 1 ? ins[1] : null);
+                if (a == null || b == null) return false;
+                int len = System.Math.Max(a.Length, b.Length);
+                if ((a.Length != len && a.Length != 1) || (b.Length != len && b.Length != 1)) return false;
+                var outv = new float[len];
+                for (int i = 0; i < len; i++)
+                {
+                    float av = a[a.Length == 1 ? 0 : i], bv = b[b.Length == 1 ? 0 : i];
+                    outv[i] = node.OpType switch { "Mod" => bv != 0 ? av - bv * (float)System.Math.Floor(av / bv) : 0, "Min" => System.Math.Min(av, bv), "Max" => System.Math.Max(av, bv), _ => av };
+                }
+                result = outv; return true;
+            }
+            case "ConstantOfShape":
+            {
+                var shp = Vals(ins.Length > 0 ? ins[0] : null);
+                if (shp == null) return false;
+                long len = 1; foreach (var d in shp) len *= (long)d;
+                if (len < 0 || len > 4096) return false;
+                // The fill value is a tensor-valued "value" attribute (default 0 per ONNX, but often 1). Parse it
+                // across the representations the loader may produce; if we can't, DON'T guess - read it back.
+                float val;
+                object? vo = null;
+                node.Attributes?.TryGetValue("value", out vo);
+                switch (vo)
+                {
+                    case float[] vf when vf.Length > 0: val = vf[0]; break;
+                    case int[] vi when vi.Length > 0: val = vi[0]; break;
+                    case long[] vl when vl.Length > 0: val = vl[0]; break;
+                    case float f: val = f; break;
+                    case int ii: val = ii; break;
+                    case long ll: val = ll; break;
+                    case null: val = 0f; break; // no attribute → ONNX default 0
+                    default: return false;      // unknown representation → fall through to GPU readback
+                }
+                var outv = new float[len];
+                for (int i = 0; i < len; i++) outv[i] = val;
+                result = outv; return true;
+            }
+            case "Expand":
+            {
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                var shp = Vals(ins.Length > 1 ? ins[1] : null);
+                if (v == null || shp == null) return false;
+                long len = 1; foreach (var d in shp) len *= (long)d;
+                if (len < 0 || len > 4096) return false;
+                if (v.Length == 1) { var outv = new float[len]; for (int i = 0; i < len; i++) outv[i] = v[0]; result = outv; return true; }
+                if (v.Length == len) { result = v; return true; }
+                return false;
+            }
+            // NOTE: Range/Pow/Reciprocal/Cos/Sin are NOT handled - they generate FLOAT data (RoPE/positional
+            // frequencies), not integer shape vectors. They are float tensors, so the integer-tensor readback gate
+            // skips their (unused) readback anyway; a CPU re-derivation would be float-rounding-unreliable.
+            default: return false;
+        }
+    }
+
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
         ForwardGeneration++;   // signals per-forward "stable capture slot" counters to reset (CUDA-graph capture)
@@ -1113,6 +1503,21 @@ public class GraphExecutor : IDisposable
         foreach (var name in inputs.Keys) refCounts[name] = int.MaxValue;
 
         var runtimeConstants = new Dictionary<string, float[]>(_cleanConstants!);
+        // Runtime CPU shape interpreter (gated on ShapeSubgraphFoldEnabled): shape-op outputs it resolves on the
+        // CPU this run. Their value is put straight into runtimeConstants and their per-node GPU->CPU readback is
+        // skipped - correct by construction because it reads the REAL runtime tensor shapes as tensors flow.
+        var shapeInterpVals = new Dictionary<string, float[]>();
+        // Gate the CPU shape interpreter to the browser GPU backends. On WebGPU/WebGL a per-op readback is a
+        // ~345ms mapAsync round-trip, so computing shape ops on the CPU + skipping the readback is a massive win.
+        // On CUDA/OpenCL/CPU a readback is a cheap synchronous memcpy, so the interpreter's CPU->GPU write cost is
+        // a slight net loss there (and its CPU-backend path can fault) — so it stays off on native backends.
+        // Interpreter runs on the browser GPU backends (readback-skip win) OR whenever dispatch-elide is on
+        // (all-backend: eliding the node removes orchestration everywhere, not just the readback).
+        bool shapeInterp = GraphCompiler.ShapeSubgraphFoldEnabled
+            && (_accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.WebGL
+                || ShapeInterpElideDispatch);
+        LastRunShapeInterpMismatches = 0;
+        LastRunShapeInterpResolved = 0;
 
         // Decode-loop output recycling: this executor is reused every step (fixed-shape decode), but
         // the graph's OUTPUT buffers (logits + present.*) are never refcount-released — they're the
@@ -1284,6 +1689,50 @@ public class GraphExecutor : IDisposable
                 continue;
             }
 
+            // Runtime CPU shape interpreter: resolve this shape op's value on the CPU from the REAL tensor shapes
+            // now flowing through, and publish it into runtimeConstants so downstream shape params read it without
+            // a GPU->CPU readback. The node STILL runs on the GPU below (so any tensor consumer is unaffected) -
+            // we only eliminate the round-trip of its value. Correct because it mirrors the GPU op on real inputs.
+            if (shapeInterp && TryComputeShapeOnCpu(node, tensors, halfTensors, runtimeConstants, out var cpuShapeVal))
+            {
+                runtimeConstants[node.OutputNames[0]] = cpuShapeVal;
+                shapeInterpVals[node.OutputNames[0]] = cpuShapeVal;
+                LastRunShapeInterpResolved++;
+                // DISPATCH-ELIDE: a CPU-resolved shape op (value now in runtimeConstants) need not dispatch to the
+                // GPU — that removes its per-node orchestration (dispatch/sync/alloc), the ~1200ms CUDA residual. A
+                // GPU consumer of an elided output materializes it on-demand at input-gather below AS RANK-1 [len],
+                // which is EXACT only when the true output is a rank-<=1 SHAPE VECTOR. So elide ONLY a genuine
+                // shape vector: (a) not a rank-changing op (Unsqueeze/Squeeze/Reshape/Expand/ConstantOfShape), AND
+                // (b) a SMALL value (<=64 — a real shape/dim list is tiny; its LENGTH is the described tensor's
+                // RANK, <=8), AND (c) compile rank <=1. This rejects the interpreter OVER-REACHING on a feature
+                // tensor it merely happened to be able to compute on the CPU — DAv3's /backbone/Add_2 is the
+                // 2738-elem [1,1,1369,2] RoPE position grid; eliding it and materializing rank-1 collapsed its
+                // rank-matched Concat_19 (axis=2) consumer to [3] -> buffer overflow. Non-elided ops still gained
+                // the readback-skip (value already in runtimeConstants); only their GPU dispatch is retained.
+                // Provably safe: a non-elided op falls back to the proven elide-off path (dispatch + real tensor).
+                bool elideSafe = !IsRankChangingShapeOp(node.OpType)
+                    && cpuShapeVal.Length <= 64
+                    && node.OutputShapes.Length > 0 && node.OutputShapes[0].Length <= 1
+                    && !ElideBlockedOutputs().Contains(node.OutputNames[0]);   // path-c: no GPU-tensor consumer
+                if (ShapeInterpElideDispatch && elideSafe)
+                {
+                    ReleaseConsumedInputs(node);
+                    nodeIdx++;
+                    LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~cpu-elided");
+                    continue;
+                }
+            }
+
+            // Kernel-shape histogram for Seven's SGEMM tile-config design: record the actual operand shapes of each
+            // FLOP-carrying node. Input tensors are already in `tensors` (producers ran in topo order).
+            if (CaptureKernelShapes != null && (node.OpType is "MatMul" or "Conv" or "ConvTranspose" or "Einsum"
+                    or "FusedLinear" or "FusedAttention" or "Gemm" or "BatchedMatMul"))
+            {
+                var inShapes = string.Join(";", node.InputNames.Where(n => !string.IsNullOrEmpty(n))
+                    .Select(n => tensors.TryGetValue(n, out var t) ? "[" + string.Join(",", t.Shape) + "]" : "?"));
+                CaptureKernelShapes.Add($"{node.OpType} in={inShapes}");
+            }
+
             // ── F16 precision-aware pass-through (approach i) ──
             // Before the fp32 gather, if this op can run read-low-p / write-low-p with no fp32 temp, do so. On
             // success the node is fully handled here (output stored low-p, inputs released, drain advanced) and
@@ -1321,7 +1770,21 @@ public class GraphExecutor : IDisposable
                     continue;
                 }
                 if (!tensors.TryGetValue(name, out var tensor))
-                    throw new InvalidOperationException($"Tensor '{name}' not found (needed by {node.OpType})");
+                {
+                    // A dispatch-elided shape op's output consumed here as a GPU tensor: materialize it on-demand
+                    // from the CPU value the interpreter computed (the producing node was never dispatched). Rare —
+                    // most elided outputs are consumed only as CPU shape params. Refcount for `name` is tracked
+                    // normally, so this pooled tensor is released after its last consumer.
+                    if (shapeInterp && runtimeConstants.TryGetValue(name, out var cval) && cval.Length > 0)
+                    {
+                        var mt = _pool.Rent(new[] { cval.Length }, name);
+                        mt.Data.SubView(0, cval.Length).CopyFromCPU(cval);
+                        tensors[name] = mt;
+                        tensor = mt;
+                    }
+                    else
+                        throw new InvalidOperationException($"Tensor '{name}' not found (needed by {node.OpType})");
+                }
                 nodeInputs[i] = tensor;
             }
 
@@ -1336,14 +1799,17 @@ public class GraphExecutor : IDisposable
             // for the actual shape, so this executor always runs a graph compiled for THESE dims.
             int[][] runtimeOutputShapes = node.OutputShapes;
 
-            // Runtime Slice (same as sync Run)
+            // Runtime Slice (same as sync Run). Prefer compiler-resolved attrs over runtimeConstants (Seven's
+            // root cause: on WebGPU async / under dispatch-elide the runtimeConstants values are not present at
+            // cascade time, the override silently no-ops, and the compile-time OutputShapes garbage stands -
+            // DAv3 blocks.4 rope Slice_4 got [1,6,1370,1] not [...,16] -> wrong RoPE -> 0.1616 vs 0.1365).
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
             {
                 var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
-                float[]? starts = node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null;
-                float[]? ends = node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null;
-                float[]? axes = node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null;
-                float[]? steps = node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null;
+                float[]? starts = ResolvedShapeAttr(node, "_resolved_starts") ?? (node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null);
+                float[]? ends = ResolvedShapeAttr(node, "_resolved_ends") ?? (node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null);
+                float[]? axes = ResolvedShapeAttr(node, "_resolved_axes") ?? (node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null);
+                float[]? steps = ResolvedShapeAttr(node, "_resolved_steps") ?? (node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null);
                 if (starts != null && ends != null)
                 {
                     var resolved = inShape.ToArray();
@@ -1353,9 +1819,9 @@ public class GraphExecutor : IDisposable
                         if (ax < 0) ax += resolved.Length;
                         if (ax >= 0 && ax < resolved.Length)
                         {
-                            int s = (int)starts[si]; if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
-                            int e = (int)ends[si]; if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
-                            int st = steps != null && si < steps.Length ? (int)steps[si] : 1;
+                            int s = SatFloatToInt(starts[si]); if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
+                            int e = SatFloatToInt(ends[si]); if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
+                            int st = steps != null && si < steps.Length ? SatFloatToInt(steps[si]) : 1;
                             // Empty slices ARE valid (e<=s → 0): DAv3's extrinsics builds an EMPTY [.,.,0,4] row
                             // (Slice [3:3] on a size-3 axis, ORT value_info [?,?,0,4]) that a later Concat treats
                             // as a no-op. Rejecting the 0-dim here collapsed the whole shape to the compile-time
@@ -2089,6 +2555,20 @@ public class GraphExecutor : IDisposable
                     // pure waste (token-dependent, so the warm cache can't help). See BuildReadbackSkipSet.
                     if (outName != null && _readbackSkipNames.Contains(outName))
                         continue;
+                    // Runtime CPU shape interpreter resolved this output already (value in runtimeConstants) — skip
+                    // the redundant GPU->CPU drain (DAv3-518's ~1400 of these are the WebGPU-dominant cost). In
+                    // validate mode we DON'T skip: we read back + compare below to prove the CPU eval is correct.
+                    if (outName != null && shapeInterpVals.ContainsKey(outName) && !ShapeInterpValidate)
+                        continue;
+                    // Skip the readback for pure-DATA producer ops whose small output is RoPE/positional FLOAT math
+                    // (trig/reciprocal/pow/einsum, and float Range frequencies) — only consumed by GPU element-wise
+                    // ops, never read as a CPU shape value. Their INPUTS are outputs of OTHER nodes and are read
+                    // back normally, so Range still gets its scalars. Integer Range (indices) is NOT skipped.
+                    if (shapeInterp && !ShapeInterpValidate && outName != null
+                        && (node.OpType is "Cos" or "Sin" or "Reciprocal" or "Pow" or "Einsum" or "Sqrt" or "Erf"
+                                or "Exp" or "Tanh" or "Sigmoid"
+                            || (node.OpType == "Range" && !_integerTensorNames.Contains(outName))))
+                        continue;
                     // Warm readback cache: value already seeded into runtimeConstants from the proven-
                     // stable set — skip the GPU round-trip entirely.
                     if (outName != null && warmReadback && _readbackStable!.ContainsKey(outName))
@@ -2120,6 +2600,21 @@ public class GraphExecutor : IDisposable
                             await _accelerator.SynchronizeAsync();
                             captureStage = $"copy-back[{elCount}]";
                             runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
+                            // Validation: the CPU shape interpreter claimed this value — confirm it matches the GPU
+                            // truth. Any mismatch is a bug in TryComputeShapeOnCpu; log the first few loud.
+                            if (ShapeInterpValidate && shapeInterpVals.TryGetValue(outName, out var cpuCheck))
+                            {
+                                var gpu = runtimeConstants[outName];
+                                bool match = gpu.Length == cpuCheck.Length;
+                                for (int c = 0; match && c < gpu.Length; c++)
+                                    if (System.Math.Abs(gpu[c] - cpuCheck[c]) > 0.5f) match = false;
+                                if (!match)
+                                {
+                                    LastRunShapeInterpMismatches++;
+                                    if (LastRunShapeInterpMismatches <= 20)
+                                        LastRunReadbackNames.Add($"SHAPEMISMATCH {node.OpType}:{outName} cpu=[{string.Join(",", cpuCheck)}] gpu=[{string.Join(",", gpu)}]");
+                                }
+                            }
                             _rbSw.Stop();
                             LastRunReadbackCount++;
                             LastRunReadbackMs += _rbSw.Elapsed.TotalMilliseconds;
