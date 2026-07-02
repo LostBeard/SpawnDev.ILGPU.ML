@@ -558,17 +558,27 @@ public class ElementWiseKernels : IDisposable
         // BroadcastBinaryOpND calls are queued (e.g., decomposed LayerNorm:
         // Sub, Pow, Div, Mul all dispatch in sequence without sync).
         int paramsSize = 1 + 3 * rank;
-        // Accumulate stride buffers — disposal happens in Dispose().
-        // On WebGPU/WebGL/Wasm, inline disposal causes ObjectDisposedException because
-        // the buffer may still be referenced by pending dispatches in the command encoder.
-        if (_lastStridesBuf != null) _oldStridesBufs.Add(_lastStridesBuf);
-        _lastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
         var paramsData = new float[paramsSize];
         paramsData[0] = rank;
         for (int i = 0; i < rank; i++) paramsData[1 + i] = aStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = bStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = outStrides[i];
-        _lastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+        ArrayView1D<float, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward float slot (no per-call cuMemAlloc/H2D mid-capture).
+            paramsView = Kernels.CaptureParamArena.Shared(_accelerator).RentStableSlotFloat(paramsData);
+        }
+        else
+        {
+            // Accumulate stride buffers — disposal happens in Dispose().
+            // On WebGPU/WebGL/Wasm, inline disposal causes ObjectDisposedException because
+            // the buffer may still be referenced by pending dispatches in the command encoder.
+            if (_lastStridesBuf != null) _oldStridesBufs.Add(_lastStridesBuf);
+            _lastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
+            _lastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+            paramsView = _lastStridesBuf.View.SubView(0, paramsSize);
+        }
 
         var opSpec = op switch
         {
@@ -584,7 +594,7 @@ public class ElementWiseKernels : IDisposable
             BroadcastOp.GreaterOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastGreaterOrEqualOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
-        _broadcastBinaryKernel!(outCount, a, b, output, _lastStridesBuf.View, opSpec);
+        _broadcastBinaryKernel!(outCount, a, b, output, paramsView, opSpec);
     }
 
     /// <summary>Fill every element with a constant value. Handles -Infinity, Infinity, NaN.</summary>

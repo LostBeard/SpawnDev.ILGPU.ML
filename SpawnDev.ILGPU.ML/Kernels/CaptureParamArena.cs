@@ -47,6 +47,12 @@ public sealed class CaptureParamArena : IDisposable
     private int _next;
     private long _gen = -1;
 
+    // Float-typed param slots (e.g. BroadcastBinaryOpND packs strides as float) — an INDEPENDENT cursor, since
+    // the int-rent and float-rent sequences are each deterministic per forward but interleave arbitrarily.
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _floatSlots = new();
+    private int _floatNext;
+    private long _floatGen = -1;
+
     public CaptureParamArena(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -81,9 +87,36 @@ public sealed class CaptureParamArena : IDisposable
         return view;
     }
 
+    /// <summary>Float-typed analogue of <see cref="RentStableSlot"/> (independent cursor).</summary>
+    public ArrayView1D<float, Stride1D.Dense> RentStableSlotFloat(float[] data)
+    {
+        long gen = GraphExecutor.ForwardGeneration;
+        if (gen != _floatGen) { _floatGen = gen; _floatNext = 0; }
+        int i = _floatNext++;
+
+        MemoryBuffer1D<float, Stride1D.Dense> slot;
+        if (i < _floatSlots.Count && _floatSlots[i].Length >= data.Length)
+        {
+            slot = _floatSlots[i];
+        }
+        else
+        {
+            slot = _accelerator.Allocate1D<float>(data.Length);
+            if (i < _floatSlots.Count) { _floatSlots[i].Dispose(); _floatSlots[i] = slot; }
+            else _floatSlots.Add(slot);
+        }
+
+        var view = slot.View.SubView(0, data.Length);
+        if (!GraphExecutor.SuppressDrains)
+            view.CopyFromCPU(data);
+        return view;
+    }
+
     public void Dispose()
     {
         foreach (var s in _slots) s.Dispose();
         _slots.Clear();
+        foreach (var s in _floatSlots) s.Dispose();
+        _floatSlots.Clear();
     }
 }

@@ -851,7 +851,10 @@ public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
             // dispose). DA3-Small inference exhausted Wasm 4GB memory on its 5+ Expand
             // ops with this pattern. CopyFromCPU is the same GPU-resident write path
             // (queue.writeBuffer on WebGPU, equivalent on other backends), no temp.
-            output.Data.SubView(0, outCount).CopyFromCPU(result);
+            // Skipped under CUDA-graph capture (synchronous H2D is illegal mid-capture; the deterministic
+            // pool buffer already holds this constant-broadcast value from the warm pass).
+            if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+                output.Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else
         {

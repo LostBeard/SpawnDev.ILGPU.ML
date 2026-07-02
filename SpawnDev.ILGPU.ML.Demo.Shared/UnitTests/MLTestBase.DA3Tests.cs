@@ -584,12 +584,14 @@ public abstract partial class MLTestBase
                         await session.RunAsync(inputs);
                         await accelerator.SynchronizeAsync();
 
-                        // Warm B (drains SUPPRESSED = capture footprint): grow the pool to the no-drain working
-                        // set so the capture pass allocates NOTHING (a cuMemAlloc mid-capture is illegal).
+                        // Warm B (drains ON = NORMAL): grows the buffer pool to the (higher) deferred-release peak
+                        // AND fully returns every intermediate to its size-bucket at the final drain — so the pool
+                        // is OVER-provisioned relative to the capture pass's lower immediate-return peak, and the
+                        // capture pass finds a warm buffer in every bucket instead of a cuMemAlloc (illegal mid-
+                        // capture — the node-58 [1,1,2] output Rent crash). Priming the pool matters more here than
+                        // matching the capture footprint.
                         Mark("WARM B");
-                        Graph.GraphExecutor.SuppressDrains = true;
                         await session.RunAsync(inputs);
-                        Graph.GraphExecutor.SuppressDrains = false;
                         await accelerator.SynchronizeAsync();
 
                         // CAPTURE one forward (drains suppressed = capture-clean).

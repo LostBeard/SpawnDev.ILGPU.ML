@@ -201,8 +201,12 @@ public class CastOperator(OperatorRegistry reg) : IOnnxOperator
                 result = inVals.Select(v => (float)Math.Truncate(v)).ToArray();
             else
                 result = inVals.ToArray();
-            // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
-            ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
+            // Direct CPU->GPU upload (was AllocatePermanent + Scale leak). During CUDA-graph capture a
+            // synchronous CopyFromCPU (H2D) is illegal; this fast-path value is deterministic for a fixed input
+            // shape and the pool is deterministic, so the output buffer already holds it from the warm pass —
+            // skip the re-upload during the capture pass.
+            if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+                ctx.Outputs[0].Data.SubView(0, count).CopyFromCPU(result);
             return;
         }
 
