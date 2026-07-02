@@ -124,11 +124,21 @@ public class SliceKernel : IDisposable
         Array.Copy(outShape, 0, packed, 2 * rank, rank);
         Array.Copy(inStrides, 0, packed, 3 * rank, rank);
 
-        // FRESH params buffer per call, previous one retired for deferred disposal (see _oldParams).
-        if (_lastParams != null) _oldParams.Add(_lastParams);
-        _lastParams = _accelerator.Allocate1D(packed);
+        ArrayView1D<int, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward slot (no per-call cuMemAlloc — illegal mid-capture).
+            paramsView = CaptureParamArena.Shared(_accelerator).RentStableSlot(packed);
+        }
+        else
+        {
+            // FRESH params buffer per call, previous one retired for deferred disposal (see _oldParams).
+            if (_lastParams != null) _oldParams.Add(_lastParams);
+            _lastParams = _accelerator.Allocate1D(packed);
+            paramsView = _lastParams.View;
+        }
 
-        _sliceKernel!(totalOutput, input, output, _lastParams.View, rank);
+        _sliceKernel!(totalOutput, input, output, paramsView, rank);
     }
 
     private void EnsureLoaded()

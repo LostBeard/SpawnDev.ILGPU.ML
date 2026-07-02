@@ -159,6 +159,15 @@ public class GraphExecutor : IDisposable
     public static int? BreakAtNode { get; set; }
 
     /// <summary>
+    /// DIAGNOSTIC: when set, RunAsync appends "{nodeIdx} {OpType} {outName}" to this file
+    /// (flushed) immediately BEFORE each operator dispatch. Survives a hard NATIVE crash
+    /// (access violation / driver fault) that the managed try/catch cannot catch — after the
+    /// crash the file's LAST line names the exact op that faulted. Used to localize the CUDA-graph
+    /// capture access violation (a per-node native fault leaves no managed stack). Off in production.
+    /// </summary>
+    public static string? CaptureTraceFile { get; set; }
+
+    /// <summary>
     /// DIAGNOSTIC: captures the OpType + node index of every operator run in
     /// the most recent RunAsync invocation. Cleared at the start of each call.
     /// </summary>
@@ -228,6 +237,18 @@ public class GraphExecutor : IDisposable
     /// allocates nothing and reads nothing back. Always reset to false immediately after EndCapture.
     /// </summary>
     public static bool SuppressDrains;
+
+    /// <summary>
+    /// CUDA-GRAPH CAPTURE: when true, per-node kernels that upload a small int[] params array route it
+    /// through a <see cref="SpawnDev.ILGPU.ML.Kernels.CaptureParamArena"/> instead of a fresh
+    /// <c>Allocate1D</c> per call. The arena hands the k-th param-rent of every forward the SAME stable
+    /// device buffer (reset on <see cref="ForwardGeneration"/> tick) and SKIPS the H2D upload while
+    /// <see cref="SuppressDrains"/> is set. This removes the per-call <c>cuMemAlloc</c> (ILLEGAL during
+    /// capture — it crashes with a native access violation) and the per-call <c>CopyFromCPU</c> (a
+    /// synchronize, also illegal). When false, kernels keep their normal fresh-alloc + defer-dispose path,
+    /// so the browser backends (WebGPU/Wasm) are byte-identical to today. CUDA-only capability.
+    /// </summary>
+    public static bool UseCaptureParamSlots;
 
     /// <summary>
     /// CUDA-GRAPH CAPTURE: bumped once at the start of every <see cref="RunAsync"/>. Per-node operators
@@ -1676,6 +1697,14 @@ public class GraphExecutor : IDisposable
 
         foreach (var node in _graph.Nodes)
         {
+            // DIAGNOSTIC (CaptureTraceFile): append+flush BEFORE any per-node work so a native fault
+            // (access violation / driver fault, uncatchable) on ANY path — elided, view, f16, or real
+            // dispatch — leaves this node as the file's last line. See CaptureTraceFile doc.
+            if (CaptureTraceFile != null)
+            {
+                try { System.IO.File.AppendAllText(CaptureTraceFile,
+                    $"{nodeIdx} {node.OpType} {(node.OutputNames.Length > 0 ? node.OutputNames[0] : "")}\n"); } catch { }
+            }
             if (VerboseLogging)
             {
                 var shapeInfo = string.Join(", ", node.OutputShapes.Select(s => $"[{string.Join(",", s)}]"));
@@ -1722,6 +1751,7 @@ public class GraphExecutor : IDisposable
                     && !ElideBlockedOutputs().Contains(node.OutputNames[0]);   // path-c: no GPU-tensor consumer
                 if (ShapeInterpElideDispatch && elideSafe)
                 {
+                    if (CaptureTraceFile != null) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> ELIDED\n"); } catch { } }
                     ReleaseConsumedInputs(node);
                     nodeIdx++;
                     LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~cpu-elided");
@@ -1784,7 +1814,11 @@ public class GraphExecutor : IDisposable
                     if (shapeInterp && runtimeConstants.TryGetValue(name, out var cval) && cval.Length > 0)
                     {
                         var mt = _pool.Rent(new[] { cval.Length }, name);
-                        mt.Data.SubView(0, cval.Length).CopyFromCPU(cval);
+                        // CUDA-graph capture: a synchronous CopyFromCPU (H2D) is illegal mid-capture. The pool is
+                        // deterministic for a fixed input shape, so the buffer Rented here is the SAME one the warm
+                        // pass wrote this (constant) shape value into — skip the re-upload during the capture pass.
+                        if (!SuppressDrains)
+                            mt.Data.SubView(0, cval.Length).CopyFromCPU(cval);
                         tensors[name] = mt;
                         tensor = mt;
                     }
@@ -2503,6 +2537,7 @@ public class GraphExecutor : IDisposable
                 // browser-safe readback; all others fall through to the synchronous Execute via
                 // the default interface method. This is the browser-parity path.
                 // shapeCacheHit: buffer already holds the correct dims from a prior step — skip.
+                if (CaptureTraceFile != null && !shapeCacheHit) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> DISPATCH\n"); } catch { } }
                 if (!shapeCacheHit) await node.Operator.ExecuteAsync(ctx);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,
@@ -2591,6 +2626,7 @@ public class GraphExecutor : IDisposable
                         try
                         {
                             int elCount = outTensor.ElementCount;
+                            if (CaptureTraceFile != null) { try { System.IO.File.AppendAllText(CaptureTraceFile, $"   -> READBACK-alloc[{elCount}] out={outName}\n"); } catch { } }
                             captureStage = $"alloc[{elCount}]";
                             using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
                             captureStage = $"data-subview[{elCount}]";

@@ -111,11 +111,21 @@ public class PadKernel : IDisposable
         for (int i = 0; i < 2 * rank; i++) paramsData[2 + rank + i] = pads[i];
         for (int i = 0; i < rank; i++) paramsData[2 + 3 * rank + i] = inStrides[i];
         for (int i = 0; i < rank; i++) paramsData[2 + 4 * rank + i] = outStrides[i];
-        var paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
-        paramsBuf.CopyFromCPU(paramsData);
-        _allParamsBufs.Add(paramsBuf);
+        ArrayView1D<int, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward slot (no per-call cuMemAlloc/H2D — illegal mid-capture).
+            paramsView = CaptureParamArena.Shared(_accelerator).RentStableSlot(paramsData);
+        }
+        else
+        {
+            var paramsBuf = _accelerator.Allocate1D<int>(paramsSize);
+            paramsBuf.CopyFromCPU(paramsData);
+            _allParamsBufs.Add(paramsBuf);
+            paramsView = paramsBuf.View;
+        }
 
-        _padKernel!(totalOut, input, output, paramsBuf.View, constantValue);
+        _padKernel!(totalOut, input, output, paramsView, constantValue);
     }
 
     private void EnsureLoaded()

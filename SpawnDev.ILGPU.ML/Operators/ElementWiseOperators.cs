@@ -650,9 +650,11 @@ public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < count; i++)
             data[i] = start + i * delta;
 
-        // Upload to output GPU buffer
+        // Upload to output GPU buffer. During CUDA-graph capture a synchronous CopyFromCPU (H2D) is illegal;
+        // Range is deterministic for a fixed input shape and the pool is deterministic, so the buffer already
+        // holds this value from the warm pass — skip the re-upload during the capture pass.
         var output = ctx.Outputs[0];
-        if (output.ElementCount >= count)
+        if (output.ElementCount >= count && !SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
         {
             output.Data.SubView(0, count).CopyFromCPU(data);
         }

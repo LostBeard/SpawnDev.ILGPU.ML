@@ -469,7 +469,17 @@ namespace PlaywrightMultiTest
                             var unitTest = testResltTest != null ? JsonSerializer.Deserialize<UnitTest>(testResltTest) : null;
                             if (unitTest == null)
                             {
-                                throw new Exception("Test run failed");
+                                // No `TEST: {json}` line => the subprocess crashed (often a NATIVE abort:
+                                // access violation, CUDA/driver fault, stack overflow) BEFORE the in-process
+                                // runner could report, so there is no catchable managed exception. Surface the
+                                // exit code + captured output tails so the failure is diagnosable instead of a
+                                // context-free "Test run failed".
+                                static string Tail(string? s, int n) => string.IsNullOrEmpty(s) ? "(empty)"
+                                    : (s!.Length <= n ? s : "..." + s.Substring(s.Length - n));
+                                throw new Exception(
+                                    $"Test run failed (no 'TEST:' line - subprocess crashed). exit={result.ExitCode}\n"
+                                    + $"stdout tail:\n{Tail(result.StdOut, 2200)}\n"
+                                    + $"stderr tail:\n{Tail(result.StdErr, 1400)}");
                             }
                             var stateMessage = unitTest.ResultText;
                             rowTest.Result = unitTest.Result;

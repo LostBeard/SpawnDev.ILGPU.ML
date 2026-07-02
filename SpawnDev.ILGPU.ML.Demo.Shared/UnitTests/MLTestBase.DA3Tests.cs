@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Runtime.Cuda;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
@@ -468,6 +469,179 @@ public abstract partial class MLTestBase
             // Return normally = TestResult.Success (UnitTestRunner: throw => Error, return => Success).
             Console.WriteLine($"[ELIDE] PASSED. elided={elided} maxAbsDiff={maxAbsDiff:E3} "
                 + $"refRange={refRange:F6} testRange={testRange:F6} elideOnTotalMs={elideOnMs} ({tR.outW}x{tR.outH})");
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        }
+    });
+
+    /// <summary>
+    /// CUDA-GRAPH CAPTURE probe for the DAv3 forward — the 270ms per-node CPU launch-prep lever (param-buffer
+    /// alloc + H2D upload + cuLaunchKernel per dispatched op; ~68% of the warm 724ms elide-on forward). Records
+    /// ONE warm forward into a CUDA graph and replays it with a single cuGraphLaunch, collapsing per-node host
+    /// dispatch toward the ~40ms GPU-kernel floor. Mirrors the proven GGUF decode capture (Example 04):
+    ///   • FusedAttentionKernel.UseStableCaptureSlots — captured attention nodes read a FIXED device pointer
+    ///     the warm pass populated (the production ring hands a different slot each call → replay would bake a
+    ///     stale slot). ForwardGeneration ticks per RunAsync → the per-forward slot counter auto-resets.
+    ///   • CacheShapeReadbacks — the warm pass finalizes a stable readback cache so the capture pass performs
+    ///     ZERO GPU-syncing readbacks (a sync mid-capture is illegal).
+    ///   • GraphExecutor.SuppressDrains — no periodic drain / final synchronize / buffer-return aborts capture.
+    ///   • 3-pass warm: (A drains-on) populate slots + prime JIT + finalize readback cache; (B drains-suppressed)
+    ///     grow the pool to the no-drain working set so the capture pass allocates NOTHING (a cuMemAlloc
+    ///     mid-capture crashes); (capture) record the forward.
+    /// On capture failure this dumps LastRunOpLog so the exact breaking op (unstable alloc / freed param buffer /
+    /// in-operator sync) is NAMED rather than guessed. GATE: replay output must be bit-identical to a fresh
+    /// non-graph forward at the same input. CUDA-only (graph capture is a CUDA driver feature).
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task DA3Small_Pipeline_5D_CudaGraphCapture() => await RunTest(async accelerator =>
+    {
+        // WIP capture probe — env-gated (same pattern as GGUF_DECODE_GRAPH_PROBE). The DAv3 shape subgraph has
+        // host-sync sites (CopyFromCPU of compile-time-constant shape values) still being made capture-clean;
+        // until that lands, this crashes the CUDA lane, so it is OFF by default. Set DA3_CAPTURE_PROBE=1 to run.
+        if (Environment.GetEnvironmentVariable("DA3_CAPTURE_PROBE") != "1")
+            throw new UnsupportedTestException("DA3 CUDA-graph capture probe (WIP) — set DA3_CAPTURE_PROBE=1 to run");
+        if (accelerator is not CudaAccelerator)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: CUDA graph capture is CUDA-only");
+        if (!CudaStream.SupportsGraphCapture)
+            throw new UnsupportedTestException("driver does not expose the CUDA graph API");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // ELIDE ON is the capturable regime: interpreter-resolved shape ops (Shape/Gather/Cast/... on shape
+        // vectors) are NOT dispatched, so none of their host-side CopyFromCPU fast-paths run during capture.
+        // The ONE remaining host-sync site is the on-demand materialization of an elided shape value consumed
+        // by a GPU op — made capture-safe by skipping the H2D under SuppressDrains (the deterministic pool
+        // buffer already holds the value the warm pass wrote). Non-elide would instead dispatch every shape op
+        // and expose dozens of host-upload sites — the wrong regime for capture.
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+        try
+        {
+            var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+                externalData: extDataBytes);
+            session.CacheShapeReadbacks = true;   // finalize a stable readback cache → capture pass syncs nothing
+
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    int v = (int)(x / (float)(W - 1) * 255f);
+                    rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v;
+                }
+
+            // Stable preprocessed input (NOT `using` — a captured input-consuming node bakes this device
+            // pointer, so it must not move across warm/capture/replay). Preprocess ONCE.
+            var preprocess = new ImagePreprocessKernel(accelerator);
+            using var rgbaBuf = accelerator.Allocate1D(rgba);
+            var inputBuf = accelerator.Allocate1D<float>(3 * W * H);
+            var capStream = (CudaStream)accelerator.CreateStream();
+            try
+            {
+                preprocess.Forward(rgbaBuf.View, inputBuf.View, W, H, W, H);
+                await accelerator.SynchronizeAsync();
+                var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, 3, W, H }, session.InputNames[0]);
+                var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = inputTensor };
+
+                float[] ReadOut(Tensor t) { var h = new float[t.ElementCount]; t.Data.CopyToCPU(h); return h; }
+
+                // DIAGNOSTIC: crash-surviving per-node trace across ALL passes. A native access violation
+                // leaves NO managed stack; after the crash this file's last line names the exact faulting op
+                // and the pass marker names which pass it was in.
+                var traceFile = @"D:\users\tj\Projects\SpawnDev.ILGPU.ML\_mldump\capture-trace.txt";
+                void Mark(string s) { try { System.IO.File.AppendAllText(traceFile, $"== {s} ==\n"); } catch { } }
+                try { System.IO.File.WriteAllText(traceFile, ""); } catch { }
+                Graph.GraphExecutor.CaptureTraceFile = traceFile;
+
+                // REFERENCE: non-graph forward at this input (the correctness oracle).
+                Mark("REFERENCE");
+                var refOut = await session.RunAsync(inputs);
+                await accelerator.SynchronizeAsync();
+                float[] refData = ReadOut(refOut[session.OutputNames[0]]);
+                int outCount = refData.Length;
+
+                const int R = 10;
+                double directMs = 0, graphMs = 0; float maxAbsDiff = -1f;
+                try
+                {
+                    FusedAttentionKernel.UseStableCaptureSlots = true;
+                    Graph.GraphExecutor.UseCaptureParamSlots = true;   // per-op params → stable capture slots
+                    using (accelerator.WithDefaultStream(capStream))   // reroute *StreamKernel launches → capStream
+                    {
+                        // Warm A (drains ON): populate stable attention slots, prime JIT, finalize readback cache.
+                        Mark("WARM A");
+                        await session.RunAsync(inputs);
+                        await accelerator.SynchronizeAsync();
+
+                        // Warm B (drains SUPPRESSED = capture footprint): grow the pool to the no-drain working
+                        // set so the capture pass allocates NOTHING (a cuMemAlloc mid-capture is illegal).
+                        Mark("WARM B");
+                        Graph.GraphExecutor.SuppressDrains = true;
+                        await session.RunAsync(inputs);
+                        Graph.GraphExecutor.SuppressDrains = false;
+                        await accelerator.SynchronizeAsync();
+
+                        // CAPTURE one forward (drains suppressed = capture-clean).
+                        Mark("CAPTURE");
+                        Graph.GraphExecutor.SuppressDrains = true;
+                        capStream.BeginCapture(CudaStreamCaptureMode.Global);
+                        var capOut = await session.RunAsync(inputs);
+                        using var graph = capStream.EndCapture();
+                        Graph.GraphExecutor.CaptureTraceFile = null;   // capture pass survived — stop tracing
+                        Graph.GraphExecutor.SuppressDrains = false;
+                        var capTensor = capOut[session.OutputNames[0]];
+
+                        using var gexec = graph.Instantiate();
+                        gexec.Upload(capStream);
+
+                        // REPLAY once → compare to the non-graph reference (same kernels, same buffers).
+                        gexec.Launch(capStream);
+                        await capStream.SynchronizeAsync();
+                        float[] replayData = ReadOut(capTensor);
+                        maxAbsDiff = 0f;
+                        for (int i = 0; i < outCount; i++)
+                            maxAbsDiff = MathF.Max(maxAbsDiff, MathF.Abs(replayData[i] - refData[i]));
+
+                        // TIME graph replays (pure cuGraphLaunch + GPU compute, ~zero host dispatch).
+                        var gsw = System.Diagnostics.Stopwatch.StartNew();
+                        for (int r = 0; r < R; r++) { gexec.Launch(capStream); await capStream.SynchronizeAsync(); }
+                        gsw.Stop(); graphMs = gsw.Elapsed.TotalMilliseconds / R;
+                    }
+
+                    // TIME direct non-graph forwards (production ring path) at the same input — the apples-to-apples baseline.
+                    FusedAttentionKernel.UseStableCaptureSlots = false;
+                    var dsw = System.Diagnostics.Stopwatch.StartNew();
+                    for (int r = 0; r < R; r++) { await session.RunAsync(inputs); await accelerator.SynchronizeAsync(); }
+                    dsw.Stop(); directMs = dsw.Elapsed.TotalMilliseconds / R;
+                }
+                catch (Exception ex)
+                {
+                    var log = Graph.GraphExecutor.LastRunOpLog;
+                    int start = Math.Max(0, log.Count - 120);
+                    // No inner exception: UnitTestRunner surfaces THIS message (with the breaking-op trace).
+                    throw new Exception($"[CAPTURE] failed: {ex.Message}\n"
+                        + $"ops={log.Count} totalNodes~{session.NodeCount}\nlast {log.Count - start} ops:\n  "
+                        + string.Join("\n  ", log.GetRange(start, log.Count - start)));
+                }
+                finally { FusedAttentionKernel.UseStableCaptureSlots = false; Graph.GraphExecutor.UseCaptureParamSlots = false; Graph.GraphExecutor.SuppressDrains = false; Graph.GraphExecutor.CaptureTraceFile = null; }
+
+                if (maxAbsDiff > 1e-3f)
+                    throw new Exception($"[CAPTURE] replay DIVERGED from non-graph forward: maxAbsDiff={maxAbsDiff:E3} (outCount={outCount})");
+                Console.WriteLine($"[CAPTURE] PASSED. maxAbsDiff={maxAbsDiff:E3} directMs={directMs:F1} "
+                    + $"graphMs={graphMs:F1} speedup={directMs / graphMs:F2}x (outCount={outCount})");
+            }
+            finally { inputBuf.Dispose(); try { capStream.Dispose(); } catch { } }
         }
         finally
         {

@@ -145,11 +145,22 @@ public class GatherKernel : IDisposable
         int numIdx, int innerSize, int outerSize, int axisSize)
     {
         EnsureLoaded();
-        // Retire the previous buffer for deferred disposal (see _oldGenericParams) instead of destroying it
-        // inline — its Gather dispatch may still be pending in an un-submitted WebGPU command batch.
-        if (_lastGenericParams != null) _oldGenericParams.Add(_lastGenericParams);
-        _lastGenericParams = _accelerator.Allocate1D(new[] { numIdx, innerSize, outerSize, axisSize });
-        _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, _lastGenericParams.View);
+        var packed = new[] { numIdx, innerSize, outerSize, axisSize };
+        ArrayView1D<int, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward slot (no per-call cuMemAlloc — illegal mid-capture).
+            paramsView = CaptureParamArena.Shared(_accelerator).RentStableSlot(packed);
+        }
+        else
+        {
+            // Retire the previous buffer for deferred disposal (see _oldGenericParams) instead of destroying it
+            // inline — its Gather dispatch may still be pending in an un-submitted WebGPU command batch.
+            if (_lastGenericParams != null) _oldGenericParams.Add(_lastGenericParams);
+            _lastGenericParams = _accelerator.Allocate1D(packed);
+            paramsView = _lastGenericParams.View;
+        }
+        _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, paramsView);
     }
 
     private void EnsureLoaded()
