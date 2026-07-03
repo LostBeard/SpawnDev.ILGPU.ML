@@ -378,6 +378,78 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// WebGPU PERF MEASUREMENT vs ORT-Web (73ms warm). Runs the real DAv3 5-D pipeline on WebGPU with the CPU
+    /// shape interpreter + readback-skip (Seven's kernels are on master), does a COLD forward (incl. shader-JIT)
+    /// then a WARM forward, and reports the warm ms + the executor breakdown (readbacks / sync-drains / total) so
+    /// we can see whether we're close to ORT-Web and what the wall is. Also confirms WebGPU depth correctness
+    /// (range ≈ desktop 0.1365 after the INT_MAX-sentinel Slice fix 60c94fd). Env-gated DA3_WEBGPU_PERF=1
+    /// (WebGPU-only, slow — off by default). Set DA3_WEBGPU_ELIDE=1 to also enable dispatch-elide.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task DA3Small_Pipeline_5D_WebGPU_Perf() => await RunTest(async accelerator =>
+    {
+        // NOTE: browser (WASM) tests do NOT see shell env vars, so this is gated by the HeavyModel category
+        // (excluded by default; run with `PMT_EXCLUDE_CATEGORIES= PMT_FILTER=DA3Small_Pipeline_5D_WebGPU_Perf`).
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU perf probe runs on WebGPU only");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        bool elide = false;   // baseline = readback-skip only (elide on WebGPU is unvalidated; measure it separately)
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;   // interpreter + browser readback-skip
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = elide;
+        try
+        {
+            var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+                externalData: extDataBytes);
+
+            using var pipeline = new Pipelines.DepthEstimationPipeline(session, accelerator);
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) { int v = (int)(x / (float)(W - 1) * 255f); rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v; }
+
+            // COLD forward (includes per-kernel WGSL shader-JIT).
+            var csw = System.Diagnostics.Stopwatch.StartNew();
+            var c = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+            await accelerator.SynchronizeAsync();
+            csw.Stop();
+            double coldWall = csw.Elapsed.TotalMilliseconds;
+            double coldExec = Graph.GraphExecutor.LastRunTotalMs;
+            c.RawDepth.Dispose();
+
+            // WARM forward (kernels JITed) — the ORT-Web (73ms warm) comparison.
+            var wsw = System.Diagnostics.Stopwatch.StartNew();
+            var w = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+            await accelerator.SynchronizeAsync();
+            wsw.Stop();
+            double warmWall = wsw.Elapsed.TotalMilliseconds;
+            double warmExec = Graph.GraphExecutor.LastRunTotalMs;
+            double warmReadbackMs = Graph.GraphExecutor.LastRunReadbackMs;
+            int warmReadbacks = Graph.GraphExecutor.LastRunReadbackCount;
+            double warmDrainMs = Graph.GraphExecutor.LastRunSyncDrainMs;
+            float range = w.MaxDepth - w.MinDepth;
+            w.RawDepth.Dispose();
+
+            Console.WriteLine($"[Benchmark] [DA3-WEBGPU-PERF] elide={elide} nodes={session.NodeCount} range={range:F6} (desktop ref 0.1365) | "
+                + $"COLD wall={coldWall:F0}ms exec={coldExec:F0}ms | WARM wall={warmWall:F0}ms exec={warmExec:F0}ms "
+                + $"readbacks={warmReadbacks}({warmReadbackMs:F0}ms) drains={warmDrainMs:F0}ms | ORT-Web warm ref=73ms");
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        }
+    });
+
+    /// <summary>
     /// DIAGNOSTIC + regression guard for DISPATCH-ELIDE (the CUDA ~1200ms orchestration lever).
     /// Runs the real DAv3 5-D pipeline on the fast desktop lanes with the CPU shape interpreter AND
     /// dispatch-elide ON (ShapeInterpElideDispatch): interpreter-resolved shape ops are NOT dispatched to
