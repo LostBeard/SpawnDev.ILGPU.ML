@@ -14,6 +14,88 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public partial class MLTestBase
 {
     /// <summary>
+    /// LONG-CONTEXT identity + page-config perf gate (Captain's try-3 follow-up: quality concern at
+    /// pastLen ~400 + 9 tok/s vs expected 25-30). (1) 200 GREEDY tokens at the page's maxSeqLen=4096,
+    /// captured vs direct, char-exact - the affine patches must hold at DEPTH, not just the 48-token
+    /// shallow gate (a non-affine cursor value would silently corrupt long generations exactly like a
+    /// "dumb model"). (2) A 200-token SAMPLED (page config) generation timed per-token in the harness
+    /// (no UI): the engine+sampler ms/tok that Captain's page wall-clock is compared against - the
+    /// difference is page/UI/GC territory.
+    /// </summary>
+    [TestMethod(Timeout = 1200000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task<string> GGUF_WebGPU_DecodeCapture_LongContext() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU long-context decode gate");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+        const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        bool prevPrefix = GgufGenerator.EnablePrefixCache;
+        bool prevGemv = FusedDequantMatMul.EnableWebGPUGemv;
+        GgufGenerator.EnablePrefixCache = false;
+        FusedDequantMatMul.EnableWebGPUGemv = true;
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(18));
+            var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))   // the PAGE's maxSeqLen
+            {
+                var messages = new[] { ("user", "Tell a long story about a ship, its crew, and a storm. Keep going in detail.") };
+                var greedyCfg = new GenerationConfig { MaxNewTokens = 200, Strategy = "greedy" };
+
+                var direct = await pipe.GenerateAsync(messages, config: greedyCfg, ct: cts.Token);
+                pipe.EnableWebGPUDecodeCapture = true;
+                var captured = await pipe.GenerateAsync(messages, config: greedyCfg, ct: cts.Token);
+                if (captured != direct)
+                {
+                    // Name the divergence point (first differing char) - depth tells which pastLen broke.
+                    int at = 0; while (at < Math.Min(direct.Length, captured.Length) && direct[at] == captured[at]) at++;
+                    throw new Exception($"LONG-CONTEXT DIVERGENCE at char {at}/{direct.Length}: "
+                        + $"direct '...{direct.Substring(Math.Max(0, at - 40), Math.Min(80, direct.Length - Math.Max(0, at - 40)))}' vs "
+                        + $"captured '...{captured.Substring(Math.Max(0, at - 40), Math.Min(80, captured.Length - Math.Max(0, at - 40)))}'");
+                }
+
+                // Page-config sampled perf, 200 tokens, no UI: the honest engine+sampler ms/tok.
+                var stamps = new List<double>();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                await pipe.GenerateAsync(new[] { ("user", "Describe four seasons in a small village, at length.") },
+                    config: new GenerationConfig
+                    {
+                        MaxNewTokens = 200, Strategy = "top_p", Temperature = 0.7f, TopP = 0.9f,
+                        RepetitionPenalty = 1.3f, Seed = 42,
+                    },
+                    onToken: (_, _) => { stamps.Add(sw.Elapsed.TotalMilliseconds); return Task.CompletedTask; },
+                    ct: cts.Token);
+                double sampledMs = stamps.Count >= 20 ? (stamps[^1] - stamps[0]) / (stamps.Count - 1) : double.NaN;
+                // Median of the LAST 50 inter-token gaps = the deep-context steady state.
+                var gaps = new List<double>();
+                for (int i = Math.Max(1, stamps.Count - 50); i < stamps.Count; i++) gaps.Add(stamps[i] - stamps[i - 1]);
+                gaps.Sort();
+                double deepMs = gaps.Count > 0 ? gaps[gaps.Count / 2] : double.NaN;
+
+                var report = $"LONG-CONTEXT IDENTITY OK ({direct.Length} chars, 200 toks greedy @ maxSeq 4096) "
+                    + $"| sampled(page cfg) {sampledMs:F1}ms/tok avg = {1000.0 / sampledMs:F1} tok/s; deep-context median {deepMs:F1}ms/tok "
+                    + $"| step split: patch {pipe.LastDecodeCaptureStepMs?.Patch:F1} + plan {pipe.LastDecodeCaptureStepMs?.Replay:F1} + fence {pipe.LastDecodeCaptureStepMs?.Sync:F1}";
+                Console.WriteLine($"[GGUF-LongContext] {report}");
+                return report;
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally { GgufGenerator.EnablePrefixCache = prevPrefix; FusedDequantMatMul.EnableWebGPUGemv = prevGemv; await client.DisposeAsync(); }
+    });
+
+    /// <summary>
     /// STAGE-2 GATE: token-identity of the full patched-replay decode loop. Same pipeline, same
     /// prompt, greedy: run A direct (capture OFF), run B with EnableWebGPUDecodeCapture (first decode
     /// step captures + probes, the rest are patched single-crossing replays). Prefix cache is
