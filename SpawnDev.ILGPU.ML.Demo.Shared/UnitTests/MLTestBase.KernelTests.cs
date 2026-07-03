@@ -30,6 +30,30 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "LayerNorm [1370x384]: ");
     });
 
+    /// <summary>
+    /// GPU min/max reduction (ImagePostprocessKernel.MinMaxAsync - the 8-byte readback replacing the
+    /// video path's full-map host readback): random data with negatives, count NOT a multiple of the
+    /// 1024-thread partial stage, exact match vs host min/max (float comparisons, no arithmetic -
+    /// result must be EXACT). Runs on all 6 backends (one store per thread per array + a positional
+    /// 2-slot final store - WebGL-safe).
+    /// </summary>
+    [TestMethod]
+    public async Task MinMax_GpuReduction_MatchesHost() => await RunTest(async accelerator =>
+    {
+        int count = 518 * 518 + 37;   // video-path size, deliberately not 1024-aligned
+        var data = RandomFloats(count, seed: 777, scale: 5f);
+        data[123] = -42.5f; data[count - 1] = 99.25f;   // known extremes at awkward positions
+
+        float expMin = data[0], expMax = data[0];
+        foreach (var v in data) { if (v < expMin) expMin = v; if (v > expMax) expMax = v; }
+
+        using var buf = accelerator.Allocate1D(data);
+        using var post = new Kernels.ImagePostprocessKernel(accelerator);
+        var (mn, mx) = await post.MinMaxAsync(buf.View, count);
+        if (mn != expMin || mx != expMax)
+            throw new Exception($"GPU min/max mismatch: got ({mn}, {mx}) expected ({expMin}, {expMax})");
+    });
+
     [TestMethod]
     public async Task GELU_MatchesCpuErf() => await RunTest(async accelerator =>
     {

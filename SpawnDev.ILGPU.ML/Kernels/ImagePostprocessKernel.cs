@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// All operations stay on GPU. Results can be presented directly via ICanvasRenderer
 /// for zero-copy GPU→canvas rendering.
 /// </summary>
-public class ImagePostprocessKernel
+public class ImagePostprocessKernel : IDisposable
 {
     private readonly Accelerator _accelerator;
 
@@ -27,8 +27,87 @@ public class ImagePostprocessKernel
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int, int>? _resizeFloatKernel;
     private Action<Index1D, Tensors.TensorView<float>, Tensors.TensorView<float>>? _resizeFloatTensorViewKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int>? _minMaxPartialKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int>? _minMaxFinalKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _minMaxPartials;   // [2*P]: mins then maxs
+    private MemoryBuffer1D<float, Stride1D.Dense>? _minMaxResult;     // [2]: min, max
+    private const int MinMaxP = 1024;
 
     public ImagePostprocessKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>Releases the small internal reduction buffers (only allocated if <see cref="MinMaxAsync"/>
+    /// was used). Hold ONE instance per pipeline and dispose it - do not construct-and-drop per frame.</summary>
+    public void Dispose()
+    {
+        _minMaxPartials?.Dispose(); _minMaxPartials = null;
+        _minMaxResult?.Dispose(); _minMaxResult = null;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  GPU min/max reduction (colormap normalization scalars)
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Min + max of <paramref name="count"/> floats entirely on the GPU - the readback is 8 BYTES
+    /// (two floats) instead of the whole buffer. Two dispatches: P=1024 grid-stride threads write
+    /// per-thread partials (one store each per array - WebGL-safe), then one thread folds the
+    /// partials. Replaces the full-buffer readback + host LINQ Min()/Max() in the video path (the
+    /// depth map is ~1MB/frame at 518x518 - the readback dominated the per-frame postprocess).
+    /// NaN handling: NaN comparisons are false, so NaNs are SKIPPED (host LINQ Min/Max would
+    /// poison to NaN) - for depth maps NaN-freeness is separately asserted by the finite checks.
+    /// </summary>
+    public async Task<(float Min, float Max)> MinMaxAsync(ArrayView1D<float, Stride1D.Dense> data, int count)
+    {
+        const int p = MinMaxP;
+        _minMaxPartials ??= _accelerator.Allocate1D<float>(2 * p);
+        _minMaxResult ??= _accelerator.Allocate1D<float>(2);
+        _minMaxPartialKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(MinMaxPartialImpl);
+        _minMaxFinalKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(MinMaxFinalImpl);
+        _minMaxPartialKernel(p, data, _minMaxPartials.View, count, p);
+        _minMaxFinalKernel(1, _minMaxPartials.View, _minMaxResult.View, p);
+        var r = await _minMaxResult.View.SubView(0, 2).CopyToHostAsync();
+        return (r[0], r[1]);
+    }
+
+    private static void MinMaxPartialImpl(Index1D tid,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> partials,
+        int count, int stride)
+    {
+        float mn = float.MaxValue, mx = float.MinValue;
+        for (int i = tid; i < count; i += stride)
+        {
+            float v = data[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        // INTERLEAVED [2*tid]=min, [2*tid+1]=max - the positional v*K+slot multi-store shape, the
+        // ONLY multi-store WebGL Transform Feedback captures (a split [tid] + [P+tid] layout
+        // silently dropped the max half on WebGL - caught by MinMax_GpuReduction_MatchesHost).
+        partials[tid * 2] = mn;
+        partials[tid * 2 + 1] = mx;
+    }
+
+    private static void MinMaxFinalImpl(Index1D _,
+        ArrayView1D<float, Stride1D.Dense> partials,
+        ArrayView1D<float, Stride1D.Dense> result,
+        int p)
+    {
+        float mn = float.MaxValue, mx = float.MinValue;
+        for (int t = 0; t < p; t++)
+        {
+            float a = partials[t * 2];
+            if (a < mn) mn = a;
+            float b = partials[t * 2 + 1];
+            if (b > mx) mx = b;
+        }
+        result[0] = mn;
+        result[1] = mx;
+    }
 
     // ═══════════════════════════════════════════════════════════
     //  Float bilinear resize (single-channel maps: depth, mask, heatmap)

@@ -23,6 +23,7 @@ public class DepthEstimationPipeline : IDisposable
     private readonly InferenceSession _session;
     private readonly Accelerator _accelerator;
     private readonly Kernels.ImagePreprocessKernel _preprocess;
+    private readonly Kernels.ImagePostprocessKernel _postprocess;
     private readonly int _inputSize;
 
     /// <summary>
@@ -46,6 +47,7 @@ public class DepthEstimationPipeline : IDisposable
         _session = session;
         _accelerator = accelerator;
         _preprocess = new Kernels.ImagePreprocessKernel(accelerator);
+        _postprocess = new Kernels.ImagePostprocessKernel(accelerator);
         // Derive input size from session's compiled input shapes if not specified.
         // Prevents mismatch between preprocessing resolution and compiled graph shapes,
         // which causes silent GPU memory corruption (OOB writes from Conv kernels).
@@ -178,7 +180,7 @@ public class DepthEstimationPipeline : IDisposable
 
         // GPU-side bilinear resize from raw model output (rawW × rawH) → (outW × outH).
         // TensorView<float> carries shape inline — no scalar W/H kernel params needed.
-        var post = new Kernels.ImagePostprocessKernel(_accelerator);
+        var post = _postprocess;
         using var resized = _accelerator.Allocate1D<float>(outSize);
         var srcView = new Tensors.TensorView<float>(output.Data.SubView(0, rawSize), new[] { rawH, rawW });
         var dstView = new Tensors.TensorView<float>(resized.View, new[] { outH, outW });
@@ -341,25 +343,24 @@ public class DepthEstimationPipeline : IDisposable
         var (outW, outH) = ResolveOutputSize(width, height, rawW, rawH, outputWidth, outputHeight);
         int outSize = outW * outH;
 
-        var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
-
         // GPU bilinear resize from rawW×rawH → outW×outH. The caller-owned buffer is
-        // returned untouched after this; the only readback is a small min/max for the
-        // colormap normalization scalar pair (TODO: replace with a GPU reduction so the
-        // raw path is entirely host-touch-free).
+        // returned untouched after this; the only readback is the 8-BYTE min/max scalar
+        // pair from the GPU reduction (was: the full ~1MB resized map + host LINQ - the
+        // dominant share of the video-path postprocess cost).
         int readRawSize = Math.Min(rawSize, (int)output.Data.Length);
         var rawDepth = _accelerator.Allocate1D<float>(outSize);
         // TensorView<float> carries shape inline — kernel reads dims from D0/D1.
         var srcView = new Tensors.TensorView<float>(output.Data.SubView(0, readRawSize), new[] { rawH, rawW });
         var dstView = new Tensors.TensorView<float>(rawDepth.View, new[] { outH, outW });
-        postprocess.ResizeBilinear(srcView, dstView);
-        await _accelerator.SynchronizeAsync();
+        _postprocess.ResizeBilinear(srcView, dstView);
+        var (minD, maxD) = await _postprocess.MinMaxAsync(rawDepth.View, outSize);
 
-        var resizedHost = await rawDepth.CopyToHostAsync<float>(0, outSize);
-        float minD = resizedHost.Min();
-        float maxD = resizedHost.Max();
-
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
+        if (InferenceSession.VerboseLogging)
+        {
+            // Diagnostic-only full readback (the production path above never touches the host).
+            var resizedHost = await rawDepth.CopyToHostAsync<float>(0, outSize);
+            Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
+        }
 
         transientInput?.Dispose();   // the stable capture input buffer is a member (disposed in Dispose)
         return (rawDepth, minD, maxD, outW, outH);
@@ -377,7 +378,7 @@ public class DepthEstimationPipeline : IDisposable
         ArrayView1D<float, Stride1D.Dense> rawDepth, int width, int height,
         float minDepth, float maxDepth, int palette)
     {
-        var postprocess = new Kernels.ImagePostprocessKernel(_accelerator);
+        var postprocess = _postprocess;
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(width, height));
         // Phase 2 TensorView<float> + TensorView<int> overload. Both tensors are
         // row-major [H, W]; the kernel reads count from depth.ElementCount.
@@ -399,5 +400,6 @@ public class DepthEstimationPipeline : IDisposable
         _webGpuCapture = null;
         _captureInputBuf?.Dispose();
         _captureInputBuf = null;
+        _postprocess.Dispose();
     }
 }
