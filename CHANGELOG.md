@@ -4,6 +4,22 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### 🎥 WebGPU VIDEO PATH: DepthEstimationPipeline.EnableGraphCapture now works in the browser - 10.4 fps end-to-end (Seven)
+
+`EnableGraphCapture` gains the WebGPU twin of the CUDA wiring: first frame captures the forward into
+a `WebGPUGraphCapture` dispatch plan, every subsequent frame replays it (the per-frame preprocess
+dispatch writes fresh pixels into the capture's stable input buffer; re-captures on resolution
+change). Measured end-to-end (`DA3_WebGPU_Pipeline_GraphCapture_VideoPath`, RTX 4070): capture frame
+27.8s one-time, then **96.2ms/frame = 10.4 fps INCLUDING preprocess + bilinear resize + the min/max
+readback** - the full SpawnScene webcam-depth cost. Capture output bit-exact vs direct
+(capDiff=0.00E+000); a flipped-input frame changes the depth (stale-replay guard).
+Found + fixed upstream in SpawnDev.ILGPU `4.17.2-local.6`: the plan replay submitted its own command
+buffer WITHOUT flushing the accelerator's pending encoder, so an input refreshed by a KERNEL
+DISPATCH (this exact preprocess pattern) landed after the replay - the replay silently read the
+previous frame. `ReplayAsync` now flushes first; the ILGPU DispatchPlan guard grew the
+dispatch-written-input case. Known headroom: the min/max readback should become a GPU reduction
+(existing TODO) - it is a large share of the 96.2-vs-~70ms gap.
+
 ### WebGPU dispatch-elide gap FIXED (zero-length values) + elide-ON plan capture (Seven)
 
 The tracked executor gap - "Tensor 'X' not found (needed by Cast)" under fold+elide on WebGPU -

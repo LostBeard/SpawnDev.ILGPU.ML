@@ -485,6 +485,95 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// THE VIDEO PATH, end-to-end: <see cref="Pipelines.DepthEstimationPipeline.EnableGraphCapture"/> on
+    /// WebGPU (the WebGPUGraphCapture wiring - capture at first frame, replay per frame, preprocess writes
+    /// into the capture's stable input buffer). Frame 1 pays capture; frames 2+ are the production per-frame
+    /// cost INCLUDING preprocess + bilinear resize + the min/max readback (what SpawnScene webcam depth pays
+    /// per frame). Gates: depth range must match the direct forward's (same session, capture off) AND frames
+    /// must react to CHANGED input (frame 3 feeds a different image - a stale-replay bug would return frame
+    /// 2's depth; the gradient flip must change the raw depth map).
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> DA3_WebGPU_Pipeline_GraphCapture_VideoPath() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU video-path wiring test (CUDA wiring has its own coverage)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+        var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+            externalData: extDataBytes);
+        using var pipeline = new Pipelines.DepthEstimationPipeline(session, accelerator);
+
+        const int W = 518, H = 518;
+        int[] MakeGradient(bool flip)
+        {
+            var px = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    int v = (int)((flip ? W - 1 - x : x) / (float)(W - 1) * 255f);
+                    px[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v;
+                }
+            return px;
+        }
+        var frameA = MakeGradient(false);
+        var frameB = MakeGradient(true);
+
+        // Reference: direct forward (capture off), same session/pipeline.
+        var (refDepth, refMin, refMax, outW, outH) = await pipeline.EstimateGpuRawAsync(frameA, W, H);
+        float refRange = refMax - refMin;
+        var refHost = await refDepth.CopyToHostAsync<float>(0, Math.Min(1024, outW * outH));
+        refDepth.Dispose();
+
+        pipeline.EnableGraphCapture = true;
+        // Frame 1: pays the capture (warm A/B + record inside TryCaptureAsync).
+        var f1sw = Stopwatch.StartNew();
+        var (d1, min1, max1, _, _) = await pipeline.EstimateGpuRawAsync(frameA, W, H);
+        f1sw.Stop();
+        var d1Host = await d1.CopyToHostAsync<float>(0, Math.Min(1024, outW * outH));
+        d1.Dispose();
+        float cap1Diff = 0f;
+        for (int i = 0; i < d1Host.Length; i++) cap1Diff = MathF.Max(cap1Diff, MathF.Abs(d1Host[i] - refHost[i]));
+        if (cap1Diff > 1e-4f)
+            throw new Exception($"capture-frame depth diverged from direct: maxAbsDiff={cap1Diff:E3} (range {max1 - min1:F6} vs {refRange:F6})");
+
+        // Frames 2..4: pure replay - the production per-frame cost (preprocess + replay + resize + min/max).
+        const int R = 3;
+        var rsw = Stopwatch.StartNew();
+        float lastRange = 0f;
+        for (int r = 0; r < R; r++)
+        {
+            var (dr, mnr, mxr, _, _) = await pipeline.EstimateGpuRawAsync(frameA, W, H);
+            dr.Dispose();
+            lastRange = mxr - mnr;
+        }
+        rsw.Stop();
+        double frameMs = rsw.Elapsed.TotalMilliseconds / R;
+        if (MathF.Abs(lastRange - refRange) > 1e-4f)
+            throw new Exception($"replay frame range drifted: {lastRange:F6} vs direct {refRange:F6}");
+
+        // Changed-input frame: the replay must react (stale-replay guard). Flipped gradient -> the depth
+        // map must actually differ from frame A's.
+        var (dB, minB, maxB, _, _) = await pipeline.EstimateGpuRawAsync(frameB, W, H);
+        var dBHost = await dB.CopyToHostAsync<float>(0, Math.Min(1024, outW * outH));
+        dB.Dispose();
+        float inputDelta = 0f;
+        for (int i = 0; i < dBHost.Length; i++) inputDelta = MathF.Max(inputDelta, MathF.Abs(dBHost[i] - refHost[i]));
+        if (inputDelta < 1e-4f)
+            throw new Exception($"replay IGNORED changed input (flipped gradient produced identical depth, maxDelta={inputDelta:E3}) - stale-replay bug");
+
+        var report = $"capture frame {f1sw.Elapsed.TotalSeconds:F1}s -> video frames {frameMs:F1}ms/frame (incl preprocess+resize+minmax readback) = {1000.0 / frameMs:F1} fps | capDiff={cap1Diff:E2} | range={lastRange:F6} (ref {refRange:F6}) | changed-input delta={inputDelta:F4} OK";
+        Console.WriteLine($"[DA3-VideoPath] {report}");
+        return report;
+    });
+
+    /// <summary>
     /// ELIDE-ON WebGPU forward: the tracked executor gap ("Tensor 'X' not found (needed by Cast)"
     /// under fold+elide on WebGPU) blocks stripping ~1200 shape dispatches (~10-12ms of the 63ms
     /// GPU frame) from the captured plan. This test IS the repro + the gate: it runs the full DAv3

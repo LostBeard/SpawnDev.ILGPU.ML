@@ -26,14 +26,17 @@ public class DepthEstimationPipeline : IDisposable
     private readonly int _inputSize;
 
     /// <summary>
-    /// Opt-in CUDA-graph capture for the VIDEO / repeat-inference path (default off; CUDA-only, no-op elsewhere).
+    /// Opt-in graph capture for the VIDEO / repeat-inference path (default off; CUDA + WebGPU, no-op elsewhere).
     /// When set, <see cref="EstimateGpuRawAsync"/> captures the forward once at the first resolution it sees and
-    /// REPLAYS it for every subsequent frame at that resolution — a single cuGraphLaunch instead of re-running
-    /// the ~2524-node loop (~3x on DAv3-Small, bit-identical). The first frame pays the capture cost (a few warm
-    /// forwards); the resolution is re-captured if it changes.
+    /// REPLAYS it for every subsequent frame at that resolution. CUDA: a single cuGraphLaunch instead of the
+    /// ~2524-node loop (~3x on DAv3-Small, bit-identical). WebGPU: a single interop crossing re-encodes the
+    /// captured dispatch plan (<see cref="WebGPUGraphCapture"/>) - the 10.8s-warm-direct → ~65-75ms/frame
+    /// production path (bit-identical, beats ORT-Web's 73ms warm). The first frame pays the capture cost
+    /// (a few warm forwards); the resolution is re-captured if it changes.
     /// </summary>
     public bool EnableGraphCapture { get; set; }
     private CudaGraphCapture? _capture;
+    private WebGPUGraphCapture? _webGpuCapture;
     private MemoryBuffer1D<float, Stride1D.Dense>? _captureInputBuf;
     private int[]? _captureShape;
 
@@ -273,10 +276,14 @@ public class DepthEstimationPipeline : IDisposable
     {
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
 
-        // CUDA-graph capture path (opt-in, CUDA-only): preprocess into a STABLE input buffer the captured graph
-        // reads, then capture-once / replay-many. Falls back to a normal forward on any other backend or if the
-        // driver has no graph API (TryCaptureAsync returns null). Non-capture path uses a transient input buffer.
-        bool useCapture = EnableGraphCapture && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+        // Graph-capture path (opt-in; CUDA graphs / WebGPU dispatch plans): preprocess into a STABLE input
+        // buffer the captured graph reads, then capture-once / replay-many. The per-frame preprocess dispatch
+        // writes fresh data into that stable buffer and is queue-ordered before the replay's submit, so the
+        // replay reads the new frame with NO extra copy. Falls back to a normal forward on other backends or
+        // if capture is unavailable (TryCaptureAsync returns null). Non-capture path uses a transient input.
+        bool useCapture = EnableGraphCapture
+            && (_accelerator.AcceleratorType == AcceleratorType.Cuda
+                || _accelerator.AcceleratorType == AcceleratorType.WebGPU);
         MemoryBuffer1D<float, Stride1D.Dense>? transientInput = null;
         ArrayView1D<float, Stride1D.Dense> preInput;
         if (useCapture)
@@ -295,7 +302,7 @@ public class DepthEstimationPipeline : IDisposable
         var inputDict = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
 
         Dictionary<string, Tensor> outputs;
-        if (useCapture)
+        if (useCapture && _accelerator.AcceleratorType == AcceleratorType.Cuda)
         {
             var shape = InputTensorShape();
             if (_capture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
@@ -305,6 +312,19 @@ public class DepthEstimationPipeline : IDisposable
                 _captureShape = shape;
             }
             outputs = _capture != null ? await _capture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
+        }
+        else if (useCapture)   // WebGPU
+        {
+            var shape = InputTensorShape();
+            if (_webGpuCapture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
+            {
+                _webGpuCapture?.Dispose();
+                _webGpuCapture = await WebGPUGraphCapture.TryCaptureAsync(_session, inputDict);   // first frame at this resolution
+                _captureShape = shape;
+            }
+            // inputDict wraps the SAME stable buffer the capture reads (fresh frame written by the
+            // preprocess dispatch above), so ReplayAsync's same-buffer check skips the input copy.
+            outputs = _webGpuCapture != null ? await _webGpuCapture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
         }
         else
         {
@@ -375,6 +395,8 @@ public class DepthEstimationPipeline : IDisposable
     {
         _capture?.Dispose();
         _capture = null;
+        _webGpuCapture?.Dispose();
+        _webGpuCapture = null;
         _captureInputBuf?.Dispose();
         _captureInputBuf = null;
     }
