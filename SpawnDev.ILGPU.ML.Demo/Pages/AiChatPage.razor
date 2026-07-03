@@ -121,7 +121,7 @@ var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, m
 // Chat — architecture + chat template auto-detected; tokens stream as they decode
 var convo = new[] { ("user", "What is the capital of France?") };
 string answer = await pipe.GenerateAsync(convo,
-    config: new GenerationConfig { MaxNewTokens = 512, Strategy = "greedy" },
+    config: new GenerationConfig { MaxNewTokens = 256, Strategy = "greedy" },
     onToken: (_, soFar) => { Show(soFar); return Task.CompletedTask; });
 """;
     string _status = "";
@@ -273,7 +273,7 @@ string answer = await pipe.GenerateAsync(convo,
             string answer = await _pipeline.GenerateAsync(convo,
                 config: new GenerationConfig
                 {
-                    MaxNewTokens = 512,
+                    MaxNewTokens = 256,
                     Strategy = "top_p",
                     Temperature = 0.7f,
                     TopP = 0.9f,
@@ -287,7 +287,7 @@ string answer = await pipe.GenerateAsync(convo,
                 {
                     tokStamps.Add(genClock.Elapsed.TotalMilliseconds);
                     _streaming = soFar;
-                    if (renderClock.ElapsedMilliseconds >= 100)
+                    if (renderClock.ElapsedMilliseconds >= 250)
                     {
                         renderClock.Restart();
                         // Scroll forces a LAYOUT pass on every call - at ~10 renders/sec on a long
