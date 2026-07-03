@@ -276,7 +276,11 @@ string answer = await pipe.GenerateAsync(convo,
                     Strategy = "top_p",
                     Temperature = 0.7f,
                     TopP = 0.9f,
-                    RepetitionPenalty = 1.3f,
+                    // 1.1 (was 1.3): on a 0.5B model, 1.3 penalizes common grammatical tokens hard
+                    // enough to visibly break sentence structure (Captain's baseball-rules runs).
+                    // 1.1 still breaks verbatim loops (the bug the penalty was added for) with far
+                    // less grammar damage - the standard setting for small models.
+                    RepetitionPenalty = 1.1f,
                 },
                 onToken: (_, soFar) =>
                 {
