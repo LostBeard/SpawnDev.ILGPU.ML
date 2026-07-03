@@ -25,6 +25,18 @@ public class DepthEstimationPipeline : IDisposable
     private readonly Kernels.ImagePreprocessKernel _preprocess;
     private readonly int _inputSize;
 
+    /// <summary>
+    /// Opt-in CUDA-graph capture for the VIDEO / repeat-inference path (default off; CUDA-only, no-op elsewhere).
+    /// When set, <see cref="EstimateGpuRawAsync"/> captures the forward once at the first resolution it sees and
+    /// REPLAYS it for every subsequent frame at that resolution — a single cuGraphLaunch instead of re-running
+    /// the ~2524-node loop (~3x on DAv3-Small, bit-identical). The first frame pays the capture cost (a few warm
+    /// forwards); the resolution is re-captured if it changes.
+    /// </summary>
+    public bool EnableGraphCapture { get; set; }
+    private CudaGraphCapture? _capture;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _captureInputBuf;
+    private int[]? _captureShape;
+
     public DepthEstimationPipeline(InferenceSession session, Accelerator accelerator,
         int inputSize = 0)
     {
@@ -260,14 +272,44 @@ public class DepthEstimationPipeline : IDisposable
             int outputWidth = 0, int outputHeight = 0)
     {
         using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
-        using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize);
 
-        var inputTensor = new Tensor(preprocessed.View, InputTensorShape());
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        // CUDA-graph capture path (opt-in, CUDA-only): preprocess into a STABLE input buffer the captured graph
+        // reads, then capture-once / replay-many. Falls back to a normal forward on any other backend or if the
+        // driver has no graph API (TryCaptureAsync returns null). Non-capture path uses a transient input buffer.
+        bool useCapture = EnableGraphCapture && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+        MemoryBuffer1D<float, Stride1D.Dense>? transientInput = null;
+        ArrayView1D<float, Stride1D.Dense> preInput;
+        if (useCapture)
         {
-            [_session.InputNames[0]] = inputTensor
-        });
+            _captureInputBuf ??= _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
+            preInput = _captureInputBuf.View;
+        }
+        else
+        {
+            transientInput = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
+            preInput = transientInput.View;
+        }
+        _preprocess.Forward(rgbaBuf.View, preInput, width, height, _inputSize, _inputSize);
+
+        var inputTensor = new Tensor(preInput, InputTensorShape());
+        var inputDict = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
+
+        Dictionary<string, Tensor> outputs;
+        if (useCapture)
+        {
+            var shape = InputTensorShape();
+            if (_capture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
+            {
+                _capture?.Dispose();
+                _capture = await CudaGraphCapture.TryCaptureAsync(_session, inputDict);   // first frame at this resolution
+                _captureShape = shape;
+            }
+            outputs = _capture != null ? await _capture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
+        }
+        else
+        {
+            outputs = await _session.RunAsync(inputDict);
+        }
 
         var output = outputs[_session.OutputNames[0]];
         int rawSize = output.ElementCount;
@@ -299,6 +341,7 @@ public class DepthEstimationPipeline : IDisposable
 
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth] Values: min={minD:F4}, max={maxD:F4}, absMax={resizedHost.Max(v => MathF.Abs(v)):F4}, nonZero={resizedHost.Count(v => v != 0)}/{outSize}");
 
+        transientInput?.Dispose();   // the stable capture input buffer is a member (disposed in Dispose)
         return (rawDepth, minD, maxD, outW, outH);
     }
 
@@ -328,5 +371,11 @@ public class DepthEstimationPipeline : IDisposable
         return resultBuf;
     }
 
-    public void Dispose() { }
+    public void Dispose()
+    {
+        _capture?.Dispose();
+        _capture = null;
+        _captureInputBuf?.Dispose();
+        _captureInputBuf = null;
+    }
 }

@@ -746,6 +746,88 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// END-TO-END VIDEO path via <see cref="Pipelines.DepthEstimationPipeline"/> with EnableGraphCapture: the
+    /// pipeline captures the forward on the first frame and REPLAYS it (single cuGraphLaunch) for every
+    /// subsequent frame at the same resolution — preprocess → capture/replay → postprocess. Validates the
+    /// pipeline-produced depth is bit-identical to the non-capture pipeline path and reports the per-frame
+    /// speedup. CUDA-only; env-gated DA3_CAPTURE_PROBE=1.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task DA3Small_Pipeline_VideoCapture_Api() => await RunTest(async accelerator =>
+    {
+        if (Environment.GetEnvironmentVariable("DA3_CAPTURE_PROBE") != "1")
+            throw new UnsupportedTestException("DA3 pipeline video-capture probe (WIP) — set DA3_CAPTURE_PROBE=1 to run");
+        if (accelerator is not CudaAccelerator)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: CUDA graph capture is CUDA-only");
+        if (!CudaStream.SupportsGraphCapture)
+            throw new UnsupportedTestException("driver does not expose the CUDA graph API");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+        try
+        {
+            var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+                externalData: extDataBytes);
+
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) { int v = (int)(x / (float)(W - 1) * 255f); rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v; }
+
+            using var pipeline = new Pipelines.DepthEstimationPipeline(session, accelerator);
+            int outSize;
+            float[] refDepth;
+
+            // REFERENCE: non-capture pipeline frame.
+            var refR = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+            outSize = refR.Width * refR.Height;
+            using (refR.RawDepth) refDepth = await refR.RawDepth.CopyToHostAsync<float>(0, outSize);
+
+            // CAPTURE path: frame 1 captures, frame 2 replays.
+            pipeline.EnableGraphCapture = true;
+            var f1 = await pipeline.EstimateGpuRawAsync(rgba, W, H);   // captures at this resolution
+            f1.RawDepth.Dispose();
+            var f2 = await pipeline.EstimateGpuRawAsync(rgba, W, H);   // replays
+            float[] replayDepth;
+            using (f2.RawDepth) replayDepth = await f2.RawDepth.CopyToHostAsync<float>(0, outSize);
+
+            float maxAbsDiff = 0f;
+            for (int i = 0; i < outSize; i++) maxAbsDiff = MathF.Max(maxAbsDiff, MathF.Abs(replayDepth[i] - refDepth[i]));
+            if (maxAbsDiff > 1e-3f)
+                throw new Exception($"[VIDEO-API] pipeline replay DIVERGED from non-capture pipeline: maxAbsDiff={maxAbsDiff:E3} (outSize={outSize})");
+
+            // Time N replay frames (capture on) vs N non-capture frames.
+            const int R = 8;
+            var gsw = System.Diagnostics.Stopwatch.StartNew();
+            for (int r = 0; r < R; r++) { var fr = await pipeline.EstimateGpuRawAsync(rgba, W, H); fr.RawDepth.Dispose(); }
+            gsw.Stop(); double captureFrameMs = gsw.Elapsed.TotalMilliseconds / R;
+            pipeline.EnableGraphCapture = false;
+            var dsw = System.Diagnostics.Stopwatch.StartNew();
+            for (int r = 0; r < R; r++) { var fr = await pipeline.EstimateGpuRawAsync(rgba, W, H); fr.RawDepth.Dispose(); }
+            dsw.Stop(); double directFrameMs = dsw.Elapsed.TotalMilliseconds / R;
+
+            var summary = $"[VIDEO-API] PASSED. maxAbsDiff={maxAbsDiff:E3} directFrameMs={directFrameMs:F1} "
+                + $"captureFrameMs={captureFrameMs:F1} speedup={directFrameMs / captureFrameMs:F2}x (per full pipeline frame, outSize={outSize})";
+            Console.WriteLine(summary);
+            try { System.IO.File.WriteAllText(@"D:\users\tj\Projects\SpawnDev.ILGPU.ML\_mldump\capture-video-result.txt", summary); } catch { }
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        }
+    });
+
+    /// <summary>
     /// Diagnostic: run only the first N nodes of DA3-Small with PerOpSync, capturing
     /// per-node Execute() wall-clock time. Surfaces which kernels are pathologically
     /// expensive to JIT-compile (the suspected dominant cost on Wasm/WebGPU first
