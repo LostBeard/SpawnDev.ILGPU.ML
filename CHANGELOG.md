@@ -4,6 +4,30 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### 🏆 DAv3 WebGPU 66.1ms/frame bit-exact - UNDER ORT-Web's 73ms (Seven)
+
+The beat-ORT milestone. Attribution named `FusedAttentionPerQueryRegister` as 56% of the frame
+(49.5ms of 88ms GPU in 12 dispatches) and the kernel read found two load-path defects; fixing them
+took the replay frame from ~104ms to **66.1ms, maxAbsDiff=0.00E+000** (253.6x over the 16.8s direct
+forward; ORT-Web warm = 73ms):
+
+- **Q-hoist (generic register kernel, all K/V types):** the kv loop re-read the SAME 16 Q floats
+  from global memory every iteration (SKV x 16 redundant loads per lane). Q is now hoisted into a
+  const-16 register array once per query. Pure load hoist - arithmetic order unchanged, output
+  bit-identical; the GGUF bf16/quant KV decode path gets it too.
+- **`FusedAttentionPerQueryRegisterF32Impl`:** f32 specialization where K/V (+ the one-time Q hoist)
+  stream through 128-bit `F4`/`AsAligned16()` loads (PTX `ld.v4.b32` / WGSL `vec4<f32>`) - 4 loads
+  per 16-dim tile instead of 16, same MAC order (bit-identical). Q/K/V are cast to `ArrayView<F4>`
+  HOST-side (the WGSL backend has no in-kernel ViewCast lowering - fail-loud NotSupportedException;
+  flagged to the ILGPU lane). Host routes here for T=float when all three view offsets are
+  16-byte-aligned (AsAligned16 is an alignment assertion); falls back to the scalar generic form
+  otherwise. Type specialization, identical on all 6 backends - not a backend variant.
+- **Measured:** attention 49.5ms -> **13.4ms (3.7x)**. New attribution top: RegBlockedLinear 11.0ms,
+  Conv2DImplicitGemm 7.1ms, LayerNormFused 5.6ms - the next vec4 candidates; ~10ms shape-op tail
+  pending dispatch-elide.
+- **Gates:** Attn oracle 98/98 all backends (incl. WGSL vec4 trigger on real Dawn); PlanReplay
+  bit-exact; GGUF decode byte-identical gate.
+
 ### Per-kernel GPU-time attribution of the replay frame (Seven)
 
 `WebGPUGraphCapture.ReplayTimedAsync()` (consuming SpawnDev.ILGPU `4.17.2-local.5`'s timed

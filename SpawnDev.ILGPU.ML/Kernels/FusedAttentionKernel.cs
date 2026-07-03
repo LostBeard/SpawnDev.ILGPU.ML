@@ -45,6 +45,9 @@ public class FusedAttentionKernel : IDisposable
     // Barrier-free per-query kernel cache (the universal non-grouped path; replaces the per-element strided kernel).
     private readonly Dictionary<Type, object> _perQueryStridedKernels = new();
     private readonly Dictionary<Type, object> _perQueryRegisterKernels = new();
+    private Action<KernelConfig, ArrayView<Vec4LoadMatMul.F4>, ArrayView<Vec4LoadMatMul.F4>,
+        ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _perQueryRegisterF32Kernel;
 
     // Dummy 1-element sinks buffer for the no-sinks case (the kernel always takes a sinks view but only
     // reads it when sinkCount > 0). gpt-oss/OpenAI-MoE attention passes real per-head sink logits.
@@ -297,13 +300,36 @@ public class FusedAttentionKernel : IDisposable
             && (_accelerator.AcceleratorType == AcceleratorType.Cuda
                 || _accelerator.AcceleratorType == AcceleratorType.WebGPU))
         {
+            int regT = headDim / RegTileD, regQPerWarp = 32 / regT;
+            int regWarps = (nHeads * seqQ + regQPerWarp - 1) / regQPerWarp;
+            // F32 vec4 route: same kernel shape but K/V (+ the one-time Q hoist) stream through
+            // 128-bit F4/AsAligned16 loads - bit-identical output, 4x fewer load instructions on
+            // the frame-dominant kv loop. Requires 16-byte-aligned view offsets (AsAligned16 is an
+            // alignment ASSERTION); pool tensors are 256-aligned in practice, but gate at runtime
+            // and fall through to the scalar generic form when any view is offset-misaligned.
+            if (typeof(T) == typeof(float)
+                && (((IContiguousArrayView)Q.BaseView).IndexInBytes & 15) == 0
+                && (((IContiguousArrayView)K.BaseView).IndexInBytes & 15) == 0
+                && (((IContiguousArrayView)V.BaseView).IndexInBytes & 15) == 0)
+            {
+                _perQueryRegisterF32Kernel ??= _accelerator.LoadStreamKernel<
+                    ArrayView<Vec4LoadMatMul.F4>, ArrayView<Vec4LoadMatMul.F4>,
+                    ArrayView<Vec4LoadMatMul.F4>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionPerQueryRegisterF32Impl);
+                // Cast HOST-side (in-kernel ViewCast has no WGSL lowering); AsAligned16 stays at
+                // the kernel's use sites on the raw params - the recognized vec4-trigger shape.
+                _perQueryRegisterF32Kernel(new KernelConfig(regWarps, 32),
+                    Q.BaseView.Cast<Vec4LoadMatMul.F4>(),
+                    ((ArrayView1D<float, Stride1D.Dense>)(object)K).BaseView.Cast<Vec4LoadMatMul.F4>(),
+                    ((ArrayView1D<float, Stride1D.Dense>)(object)V).BaseView.Cast<Vec4LoadMatMul.F4>(),
+                    output, sinksView, paramsView);
+                return;
+            }
             if (!_perQueryRegisterKernels.TryGetValue(typeof(T), out var rg))
                 _perQueryRegisterKernels[typeof(T)] = rg = _accelerator.LoadStreamKernel<
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
                     ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(FusedAttentionPerQueryRegisterImpl<T>);
-            int regT = headDim / RegTileD, regQPerWarp = 32 / regT;
-            int regWarps = (nHeads * seqQ + regQPerWarp - 1) / regQPerWarp;
             ((Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<T, Stride1D.Dense>,
                 ArrayView1D<T, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>)rg)(
@@ -665,6 +691,12 @@ public class FusedAttentionKernel : IDisposable
 
         var acc = new float[RegTileD];  // REGISTERS (const 16 → scalar-replaced; no shared mem)
         for (int d = 0; d < RegTileD; d++) acc[d] = 0f;
+        // Hoist this lane's 16 Q floats into registers ONCE - the kv loop previously re-read the
+        // SAME 16 values from global memory every iteration (SKV x 16 redundant loads per lane;
+        // attribution measured this kernel at 56% of the DAv3 WebGPU frame). Pure load hoist -
+        // arithmetic order unchanged, output bit-identical.
+        var qr = new float[RegTileD];
+        for (int d = 0; d < RegTileD; d++) qr[d] = Q[qBase + myDim + d];
         float runningMax = -1e10f;
         float runningSum = 0f;
 
@@ -673,7 +705,7 @@ public class FusedAttentionKernel : IDisposable
             int kBase = kvHead * kvHeadStride + kv * kvTokenStride;
             float pd = 0f;
             for (int d = 0; d < RegTileD; d++)
-                pd += Q[qBase + myDim + d] * PrecisionConvert.ConvertToSingle(K[kBase + myDim + d]);
+                pd += qr[d] * PrecisionConvert.ConvertToSingle(K[kBase + myDim + d]);
             // butterfly-reduce the partial dot across this query's nLanes (aligned power-of-2 → all lanes get it).
             for (int off = nLanes >> 1; off > 0; off >>= 1)
                 pd += Warp.ShuffleXor(pd, off);
@@ -689,6 +721,119 @@ public class FusedAttentionKernel : IDisposable
             runningSum = runningSum * correction + weight;
             for (int d = 0; d < RegTileD; d++)
                 acc[d] = acc[d] * correction + weight * PrecisionConvert.ConvertToSingle(V[kBase + myDim + d]);
+            runningMax = newMax;
+        }
+
+        if (sinkCount > 0)
+        {
+            float sink = sinks[bh % sinkCount];
+            float newMax = MathF.Max(runningMax, sink);
+            float correction = MathF.Exp(runningMax - newMax);
+            runningSum = runningSum * correction + MathF.Exp(sink - newMax);
+            for (int d = 0; d < RegTileD; d++) acc[d] = acc[d] * correction;
+            runningMax = newMax;
+        }
+
+        float inv = 1f / (runningSum + 1e-10f);
+        if (active)
+            for (int d = 0; d < RegTileD; d++)
+                output[oBase + myDim + d] = acc[d] * inv;
+    }
+
+    /// <summary>F32 specialization of <see cref="FusedAttentionPerQueryRegisterImpl{T}"/>: same lanes/tiles/
+    /// masking/recurrence and the same MAC ORDER (output bit-identical to the generic form at T=float), but the
+    /// K/V streams and the one-time Q hoist go through 128-bit <see cref="Vec4LoadMatMul.F4"/> loads via
+    /// <c>AsAligned16()</c> (PTX ld.v4.b32 / WGSL vec4&lt;f32&gt;) - 4 loads per 16-dim tile instead of 16.
+    /// The kv loop is the DAv3 WebGPU frame's dominant term (attribution: 49.5ms of 88ms = 56%) and is
+    /// load-bound, so load width is the lever. Host routes here for T=float when the Q/K/V view byte offsets
+    /// are 16-aligned (AsAligned16 is an alignment ASSERTION - misalignment is UB); every float offset used is
+    /// a multiple of 4 by construction (D%16==0, myDim=t*16, strides are D-multiples), so F4-unit indexing is
+    /// exact.</summary>
+    private static void FusedAttentionPerQueryRegisterF32Impl(
+        ArrayView<Vec4LoadMatMul.F4> Q4,
+        ArrayView<Vec4LoadMatMul.F4> K4,
+        ArrayView<Vec4LoadMatMul.F4> V4,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> sinks,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        // Q/K/V arrive PRE-CAST to F4 (host-side Cast<F4>()) because the WGSL backend has no
+        // in-kernel ViewCast lowering (fail-loud NotSupportedException; same reason Vec4LoadImpl
+        // takes ArrayView<F4> params) - AsAligned16 on the raw param at the use site below is the
+        // exact shape the WGSL vec4 trigger (and the PTX ld.v4 path) recognizes.
+        int BH = p[0], SQ = p[1], SKV = p[2], D = p[3];
+        float scale = Interop.IntAsFloat((uint)p[4]);
+        int causal = p[5];
+        int window = p[6];
+        int kvOffset = p[7];
+        int gqaGroup = p[8];
+        int sinkCount = p[9];
+        int kvStride = p[10];
+
+        int lane = Group.IdxX;
+        int nLanes = D / RegTileD;
+        int qPerWarp = 32 / nLanes;
+        int rawQuery = Grid.IdxX * qPerWarp + lane / nLanes;
+        int t = lane % nLanes;
+        bool active = rawQuery < BH * SQ;   // same no-early-return uniformity contract as the generic form
+        int query = active ? rawQuery : 0;
+
+        int sq = query % SQ;
+        int bh = query / SQ;
+        int kvHead = bh / gqaGroup;
+        int hBase = (bh * SQ + sq) * D, sBase = (sq * BH + bh) * D;
+        int qBase = p[12] == 1 ? sBase : hBase;
+        int oBase = p[11] == 1 ? sBase : hBase;
+        int qPos = kvOffset + sq;
+        int kvHeadStride = p[13] == 1 ? D : kvStride;
+        int kvTokenStride = p[13] == 1 ? (BH / gqaGroup) * D : D;
+        int myDim = t * RegTileD;
+
+        var acc = new float[RegTileD];
+        for (int d = 0; d < RegTileD; d++) acc[d] = 0f;
+        // One-time Q hoist into registers (the generic form re-read these SKV times), F4-wide.
+        var qr = new float[RegTileD];
+        int qOff4 = (qBase + myDim) >> 2;
+        for (int i = 0; i < RegTileD / 4; i++)
+        {
+            var qv = Q4.AsAligned16()[qOff4 + i];
+            qr[i * 4 + 0] = qv.A; qr[i * 4 + 1] = qv.B; qr[i * 4 + 2] = qv.C; qr[i * 4 + 3] = qv.D;
+        }
+        float runningMax = -1e10f;
+        float runningSum = 0f;
+
+        for (int kv = 0; kv < SKV; kv++)
+        {
+            int kBase4 = (kvHead * kvHeadStride + kv * kvTokenStride + myDim) >> 2;
+            float pd = 0f;
+            for (int i = 0; i < RegTileD / 4; i++)
+            {
+                var kv4 = K4.AsAligned16()[kBase4 + i];   // one 128-bit load; MAC order below matches the scalar form
+                pd += qr[i * 4 + 0] * kv4.A;
+                pd += qr[i * 4 + 1] * kv4.B;
+                pd += qr[i * 4 + 2] * kv4.C;
+                pd += qr[i * 4 + 3] * kv4.D;
+            }
+            for (int off = nLanes >> 1; off > 0; off >>= 1)
+                pd += Warp.ShuffleXor(pd, off);
+            float score = pd * scale;
+            int causalOk = 1 - (causal & ((qPos - kv) >> 31) & 1);
+            int windowOk = ((qPos - window - kv) >> 31) & 1;
+            int valid = causalOk & windowOk;
+            score = score * valid + -1e30f * (1 - valid);
+
+            float newMax = MathF.Max(runningMax, score);
+            float correction = MathF.Exp(runningMax - newMax);
+            float weight = MathF.Exp(score - newMax);
+            runningSum = runningSum * correction + weight;
+            for (int i = 0; i < RegTileD / 4; i++)
+            {
+                var vv4 = V4.AsAligned16()[kBase4 + i];   // one 128-bit load; update order matches the scalar form
+                acc[i * 4 + 0] = acc[i * 4 + 0] * correction + weight * vv4.A;
+                acc[i * 4 + 1] = acc[i * 4 + 1] * correction + weight * vv4.B;
+                acc[i * 4 + 2] = acc[i * 4 + 2] * correction + weight * vv4.C;
+                acc[i * 4 + 3] = acc[i * 4 + 3] * correction + weight * vv4.D;
+            }
             runningMax = newMax;
         }
 
