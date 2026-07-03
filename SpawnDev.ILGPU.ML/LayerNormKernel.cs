@@ -77,34 +77,61 @@ public class LayerNormKernel : IDisposable
         var part = SharedMemory.Allocate<float>(MaxLnGroup);
         var stats = SharedMemory.Allocate<float>(2); // [0]=mean, [1]=invStd
 
-        double localSum = 0.0;
-        for (int i = tid; i < C; i += T) localSum += (double)input[offset + i];
-        part[tid] = (float)localSum;
+        // KAHAN-compensated f32 accumulation instead of f64 (2026-07-03). On WebGPU every f64 op is
+        // Dekker-EMULATED (~15-20 f32 ops); the f64 partial sums made this kernel ~6x its bandwidth
+        // floor (attribution: 5.7ms/48 dispatches on the DAv3 frame, 0.119ms vs ~21us of traffic).
+        // Kahan is ~4 f32 ops per add with near-f64 accuracy at these lengths (C=384 partials +
+        // T<=256 combine; error ~2eps vs the oracle's 1e-4 tolerance), and it is the SAME C# on all
+        // 6 backends. WGSL/PTX/.NET do not reassociate float ops, so the compensation term survives.
+        float localSum = 0f, cSum = 0f;
+        for (int i = tid; i < C; i += T)
+        {
+            float y = input[offset + i] - cSum;
+            float s = localSum + y;
+            cSum = (s - localSum) - y;
+            localSum = s;
+        }
+        part[tid] = localSum;
         Group.Barrier();
 
         if (tid == 0)
         {
-            double sum = 0.0;
-            for (int t = 0; t < T; t++) sum += part[t];
-            stats[0] = (float)(sum / C);
+            float sum = 0f, c0 = 0f;
+            for (int t = 0; t < T; t++)
+            {
+                float y = part[t] - c0;
+                float s = sum + y;
+                c0 = (s - sum) - y;
+                sum = s;
+            }
+            stats[0] = sum / C;
         }
         Group.Barrier();
 
         float mean = stats[0];
-        double localVar = 0.0;
+        float localVar = 0f, cVar = 0f;
         for (int i = tid; i < C; i += T)
         {
-            double d = (double)input[offset + i] - mean;
-            localVar += d * d;
+            float d = input[offset + i] - mean;
+            float y = d * d - cVar;
+            float s = localVar + y;
+            cVar = (s - localVar) - y;
+            localVar = s;
         }
-        part[tid] = (float)localVar;
+        part[tid] = localVar;
         Group.Barrier();
 
         if (tid == 0)
         {
-            double m2 = 0.0;
-            for (int t = 0; t < T; t++) m2 += part[t];
-            stats[1] = 1f / MathF.Sqrt((float)(m2 / C) + epsilon);
+            float m2 = 0f, c1 = 0f;
+            for (int t = 0; t < T; t++)
+            {
+                float y = part[t] - c1;
+                float s = m2 + y;
+                c1 = (s - m2) - y;
+                m2 = s;
+            }
+            stats[1] = 1f / MathF.Sqrt(m2 / C + epsilon);
         }
         Group.Barrier();
 
