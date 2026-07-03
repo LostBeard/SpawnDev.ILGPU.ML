@@ -38,6 +38,9 @@ public sealed record GenerationResult(string Text, int PromptTokens, int Generat
 public sealed class GgufGenerator : IDisposable
 {
     private readonly InferenceSession _session;
+
+    /// <summary>The underlying decode-enabled <see cref="InferenceSession"/> (owned by the pipeline/creator).</summary>
+    public InferenceSession Session => _session;
     private readonly Accelerator _accelerator;
     private readonly SentencePieceTokenizer _tokenizer;
     private readonly GGUFDecodeKVCache _cache;

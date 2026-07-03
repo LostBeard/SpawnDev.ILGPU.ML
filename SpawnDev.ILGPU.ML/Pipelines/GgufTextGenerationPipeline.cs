@@ -47,6 +47,11 @@ public sealed class GgufTextGenerationPipeline : IDisposable
     /// <summary>The model architecture string from the GGUF metadata (e.g. "qwen2", "llama", "gemma3").</summary>
     public string Architecture => _model.Architecture;
 
+    /// <summary>The underlying decode-enabled <see cref="InferenceSession"/>. Advanced consumers -
+    /// capture/replay probes, the Ollama-server model runner - drive decode state directly through it;
+    /// the pipeline still owns its lifetime (do not dispose).</summary>
+    public InferenceSession Session => _gen.Session;
+
     /// <summary>Default cap on generated tokens when neither the call nor the <see cref="GenerationConfig"/> sets one.</summary>
     public int MaxNewTokens { get; set; } = 256;
 
