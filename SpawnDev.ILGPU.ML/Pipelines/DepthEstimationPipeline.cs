@@ -35,7 +35,11 @@ public class DepthEstimationPipeline : IDisposable
     /// production path (bit-identical, beats ORT-Web's 73ms warm). The first frame pays the capture cost
     /// (a few warm forwards); the resolution is re-captured if it changes.
     /// </summary>
-    public bool EnableGraphCapture { get; set; }
+    public bool EnableGraphCapture { get; set; } = true;   // ON by default: consumers forgetting the
+    // flag is how /depth ran 6s-per-estimate direct forwards for weeks while the 66ms replay path
+    // sat unused (Captain's rule: if it should always be on, it lives in the pipeline). Opt OUT for
+    // one-shot workloads where the first-capture warmup (a few forwards) outweighs the replay win.
+    // CUDA + WebGPU; no-op elsewhere. Bit-exactness gated (video gate + Captured_518_MatchesHost).
     private CudaGraphCapture? _capture;
     private WebGPUGraphCapture? _webGpuCapture;
     private MemoryBuffer1D<float, Stride1D.Dense>? _captureInputBuf;

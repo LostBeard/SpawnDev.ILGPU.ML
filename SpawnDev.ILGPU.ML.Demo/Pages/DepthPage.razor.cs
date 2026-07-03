@@ -77,12 +77,7 @@ public partial class DepthPage : IDisposable
                     ["pixel_values"] = new[] { 1, 3, 518, 518 }
                 });
 
-            _pipeline = new DepthEstimationPipeline(_session, _accelerator);
-            // Capture/replay: the first estimate captures the forward as one dispatch plan (a few
-            // warm forwards), every estimate after replays it - multi-second direct forward drops
-            // to the DAv3-class ~66-75ms/frame. Gated by
-            // CreateFromFile_DepthAnything_Captured_518_MatchesHost (captured == direct + structure).
-            _pipeline.EnableGraphCapture = true;
+            _pipeline = new DepthEstimationPipeline(_session, _accelerator);   // capture/replay ON by pipeline default
 
             _isModelLoaded = true;
             _statusMessage = null;
