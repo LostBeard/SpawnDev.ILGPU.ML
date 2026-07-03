@@ -274,6 +274,14 @@ public abstract partial class MLTestBase
     public async Task CreateFromFile_DepthAnything_GpuRawMatchesHostPath_518()
         => await DepthGpuRawVsHostBody(inputSize: 518);
 
+    /// <summary>The CAPTURED path at the page's resolution: EnableGraphCapture replays the whole
+    /// forward as one dispatch plan (the DAv3 lever - 66ms/frame vs multi-second direct). The
+    /// captured raw map must still match the direct host path AND pass the content-free guard -
+    /// this is the gate that lets /depth turn capture ON. Also times the replay estimate.</summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task CreateFromFile_DepthAnything_Captured_518_MatchesHost()
+        => await DepthGpuRawVsHostBody(inputSize: 518, enableCapture: true);
+
     /// <summary>
     /// BYTE-IDENTITY of the two weight-delivery paths: ModelHub.LoadAsync (what the /depth page
     /// feeds CreateFromHuggingFaceAsync - JS fetch + browser cache) vs DownloadBytesChunkedAsync
@@ -309,13 +317,17 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[HubBytes] IDENTICAL: {hubBytes.Length} bytes");
     });
 
-    private async Task DepthGpuRawVsHostBody(int inputSize) => await RunTest(async accelerator =>
+    private async Task DepthGpuRawVsHostBody(int inputSize, bool enableCapture = false) => await RunTest(async accelerator =>
     {
         // GPU lanes only: the gate runs the 95MB model TWICE (host + raw paths) - on the serialized
         // CPU lane that exceeds every timeout and starves the rest of the depth family (measured:
         // 4 downstream CPU timeouts). CPU EstimateAsync correctness is covered by the other gates.
         if (accelerator.AcceleratorType == AcceleratorType.CPU)
             throw new UnsupportedTestException("CPU too slow for the double-run cross-path gate");
+        // Capture variant: CUDA graphs + WebGPU dispatch plans only (no-op elsewhere) - run it
+        // where it exists so the gate is meaningful, skip the rest.
+        if (enableCapture && accelerator.AcceleratorType is not (AcceleratorType.Cuda or AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("graph capture is CUDA/WebGPU only");
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available for this backend");
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
@@ -327,7 +339,18 @@ public abstract partial class MLTestBase
         var (pixels, w, h) = await LoadCatImage(http);
 
         var host = await pipeline.EstimateAsync(pixels, w, h);
+        pipeline.EnableGraphCapture = enableCapture;
+        if (enableCapture)
+        {
+            // First raw call captures (pays a few warm forwards); the SECOND is the pure replay -
+            // that's the one compared and timed (what every /depth estimate after the first costs).
+            var (warmBuf, _, _, _, _) = await pipeline.EstimateGpuRawAsync(pixels, w, h);
+            warmBuf.Dispose();
+        }
+        var swReplay = System.Diagnostics.Stopwatch.StartNew();
         var (rawBuf, minD, maxD, gw, gh) = await pipeline.EstimateGpuRawAsync(pixels, w, h);
+        swReplay.Stop();
+        if (enableCapture) Console.WriteLine($"[CaptureGate] replay estimate: {swReplay.Elapsed.TotalMilliseconds:F1}ms");
         try
         {
             if (gw != host.Width || gh != host.Height)
