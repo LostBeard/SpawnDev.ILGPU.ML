@@ -59,11 +59,18 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
         var parsed = ParseEquation(ctx.GetString("equation"), ctx.Inputs.Length);
         var dimSizes = BuildDimSizes(ctx, parsed);
         if (TryGpuFastPath(ctx, parsed, dimSizes)) return;
-        // CUDA-graph capture: the general-contraction fallback reads inputs BACK to CPU (Allocate1D +
-        // CopyToHostAsync = a synchronize, illegal mid-capture). This path only runs for small non-GPU-fast
-        // einsums (shape/position contractions like RoPE positions⊗inv_freq), whose output is CONSTANT for a
-        // fixed input shape — so the deterministic node-output buffer already holds the warm result; skip.
-        if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains) return;
+        // CUDA-graph capture pass: the general contraction reads inputs BACK to CPU (illegal mid-capture). This
+        // path only runs for small non-GPU-fast einsums (shape/position contractions like RoPE positions⊗inv_freq),
+        // whose output is CONSTANT for a fixed shape. The warm pass staged that constant into a stable arena slot
+        // (ComputeGeneralContraction below, same cursor position); copy it via a CAPTURED GPU CopyFrom so replay
+        // reproduces the write. (Skipping the write leaves the reused pooled output buffer stale on replay.)
+        if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+        {
+            int outSz = ctx.Outputs[0].ElementCount;
+            var slot = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(new float[outSz]);
+            ctx.Outputs[0].Data.SubView(0, outSz).CopyFrom(slot);
+            return;
+        }
         var inputArrays = await ReadInputsAsync(ctx);
         ComputeGeneralContraction(ctx, parsed, dimSizes, inputArrays);
     }
@@ -328,10 +335,12 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
             result[outIdx] = sum;
         }
 
-        // Upload result to GPU. Skipped under CUDA-graph capture (this CPU path runs only when all inputs are
-        // constants → the output is constant; the deterministic node-output buffer already holds it from the
-        // warm pass; a synchronous H2D is illegal mid-capture).
-        if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+        // Upload result to GPU. Under CUDA-graph capture-mode this stages the (constant) result into a stable
+        // arena slot (at the einsum's deterministic cursor position) + does a captured GPU CopyFrom; the capture
+        // pass reads that same slot (see ExecuteAsync). This runs on the WARM pass (capture skips it above).
+        if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+            Kernels.CaptureParamArena.CaptureConstWrite(reg.Accelerator, ctx.Outputs[0].Data.SubView(0, outputSize), result);
+        else
             ctx.Outputs[0].Data.SubView(0, outputSize).CopyFromCPU(result);
     }
 

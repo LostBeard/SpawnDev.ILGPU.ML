@@ -40,11 +40,12 @@ internal static class BroadcastHelper
                     bIdx < bVals.Length ? bVals[bIdx] : 0f);
             }
 
-            // Direct CPU->GPU upload to output (was AllocatePermanent + Scale, leaked
-            // a permanent buffer per call - see ExpandOperator for the same fix). Skipped under CUDA-graph
-            // capture (both inputs constant → output constant; the deterministic node-output buffer already
-            // holds it from the warm pass; a synchronous H2D is illegal mid-capture).
-            if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+            // Direct CPU->GPU upload to output (was AllocatePermanent + Scale, leaked a permanent buffer per
+            // call). Both inputs constant → output constant. Under CUDA-graph capture: arena stable-slot +
+            // captured GPU CopyFrom so replay reproduces the write (skipping leaves the pooled buffer stale).
+            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+                Kernels.CaptureParamArena.CaptureConstWrite(reg.Accelerator, ctx.Outputs[0].Data.SubView(0, outCount), result);
+            else
                 ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else if (bVals != null && a.ElementCount > b.ElementCount)
@@ -879,9 +880,10 @@ public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
             // dispose). DA3-Small inference exhausted Wasm 4GB memory on its 5+ Expand
             // ops with this pattern. CopyFromCPU is the same GPU-resident write path
             // (queue.writeBuffer on WebGPU, equivalent on other backends), no temp.
-            // Skipped under CUDA-graph capture (synchronous H2D is illegal mid-capture; the deterministic
-            // pool buffer already holds this constant-broadcast value from the warm pass).
-            if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+            // Under CUDA-graph capture: arena stable-slot + captured GPU CopyFrom so replay reproduces the write.
+            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+                Kernels.CaptureParamArena.CaptureConstWrite(reg.Accelerator, output.Data.SubView(0, outCount), result);
+            else
                 output.Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else

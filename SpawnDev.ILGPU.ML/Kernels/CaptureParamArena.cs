@@ -39,6 +39,26 @@ public sealed class CaptureParamArena : IDisposable
     public static CaptureParamArena Shared(Accelerator accelerator)
         => _perAccelerator.GetValue(accelerator, a => new CaptureParamArena(a));
 
+    /// <summary>
+    /// Capture-safe write of a CONSTANT CPU-computed result into a GPU node-output view. Ops that write a
+    /// small constant to their output via <c>CopyFromCPU</c> (Cast/Expand/BroadcastBinaryOp/Slice CPU paths)
+    /// MUST use this in capture-mode: a plain CopyFromCPU is a synchronous H2D (illegal mid-capture), and
+    /// SKIPPING it is WRONG — the pooled output buffer is reused between the warm and capture passes, so the
+    /// captured graph would contain no write for this node and REPLAY would read stale data. Instead we stage
+    /// the constant in a STABLE arena slot (written on the warm pass, held thereafter) and, on the capture
+    /// pass, issue a GPU→GPU <c>CopyFrom</c> — which IS capturable — so the write lands in the graph and
+    /// replay reproduces it. Call in BOTH warm and capture (the rent keeps the float cursor deterministic).
+    /// </summary>
+    public static void CaptureConstWrite(Accelerator accelerator,
+        ArrayView1D<float, Stride1D.Dense> output, float[] result)
+    {
+        var slot = Shared(accelerator).RentStableSlotFloat(result);   // warm: writes slot; capture: warm value
+        if (GraphExecutor.SuppressDrains)
+            output.CopyFrom(slot);            // capture pass: captured GPU→GPU copy (in the graph → replay-safe)
+        else
+            output.CopyFromCPU(result);       // warm pass: direct host upload
+    }
+
     private readonly Accelerator _accelerator;
 
     // Distinct stable slot per per-forward call ordinal. Grows on demand; each slot is allocated once and

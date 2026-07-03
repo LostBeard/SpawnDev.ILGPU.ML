@@ -640,8 +640,11 @@ public abstract partial class MLTestBase
 
                 if (maxAbsDiff > 1e-3f)
                     throw new Exception($"[CAPTURE] replay DIVERGED from non-graph forward: maxAbsDiff={maxAbsDiff:E3} (outCount={outCount})");
-                Console.WriteLine($"[CAPTURE] PASSED. maxAbsDiff={maxAbsDiff:E3} directMs={directMs:F1} "
-                    + $"graphMs={graphMs:F1} speedup={directMs / graphMs:F2}x (outCount={outCount})");
+                var passSummary = $"[CAPTURE] PASSED. maxAbsDiff={maxAbsDiff:E3} directMs={directMs:F1} "
+                    + $"graphMs={graphMs:F1} speedup={directMs / graphMs:F2}x (outCount={outCount})";
+                Console.WriteLine(passSummary);
+                // Surface the perf result (PMT discards subprocess stdout on a PASS).
+                try { System.IO.File.WriteAllText(@"D:\users\tj\Projects\SpawnDev.ILGPU.ML\_mldump\capture-result.txt", passSummary); } catch { }
             }
             finally { inputBuf.Dispose(); try { capStream.Dispose(); } catch { } }
         }
