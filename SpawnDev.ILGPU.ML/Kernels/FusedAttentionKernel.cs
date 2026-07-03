@@ -72,6 +72,12 @@ public class FusedAttentionKernel : IDisposable
     // capture pass (GraphExecutor.SuppressDrains) the H2D is SKIPPED — a CopyFromCPU synchronizes, which is
     // illegal mid-capture; the slot already holds the immediately-preceding warm pass's params (same state).
     public static bool UseStableCaptureSlots;
+
+    /// <summary>Patch-point discovery observer (parameterized replay - WebGPUDecodeCapture): fired on
+    /// every STABLE-slot params rent that carries data (warm passes; not under SuppressDrains) with
+    /// (slotIndex, paramsData, slotView). Same probe-and-diff contract as
+    /// <see cref="CaptureParamArena.IntSlotObserver"/>. Static - null in production.</summary>
+    public static Action<int, int[], ArrayView1D<int, Stride1D.Dense>>? CaptureSlotObserver;
     private const int CaptureSlotMax = 512;   // >= attention nodes per forward (28-layer qwen = 28)
     private readonly MemoryBuffer1D<int, Stride1D.Dense>?[] _captureSlots
         = new MemoryBuffer1D<int, Stride1D.Dense>?[CaptureSlotMax];
@@ -90,7 +96,10 @@ public class FusedAttentionKernel : IDisposable
             var sview = sbuf.View.SubView(0, paramsData.Length);
             // Skip the synchronizing H2D during capture; the warm pass already populated this stable slot.
             if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+            {
                 sview.CopyFromCPU(paramsData);
+                CaptureSlotObserver?.Invoke(slot, paramsData, sview);
+            }
             return sview;
         }
         var slotIdx = _ringNext;

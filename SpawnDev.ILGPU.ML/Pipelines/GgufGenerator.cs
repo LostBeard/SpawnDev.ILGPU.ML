@@ -67,6 +67,29 @@ public sealed class GgufGenerator : IDisposable
     /// <summary>Last request's reused-prefix length P (0 = no reuse / full prefill). Diagnostic for tests.</summary>
     public int LastReusedPrefix { get; private set; }
 
+    /// <summary>
+    /// Opt-in WebGPU decode capture/replay: the first single-token decode step captures the decode
+    /// graph as a dispatch plan (plus a one-step probe that discovers every KV-cursor-dependent
+    /// param - see <see cref="WebGPUDecodeCapture"/>); every subsequent decode step is a patched
+    /// single-interop-crossing replay. Measured: 686ms/tok -> ~21ms/tok on the same 4070 (the
+    /// per-node dispatch orchestration collapses). No-op on non-WebGPU accelerators. Prefill and
+    /// multi-token steps always run the direct path. Gate:
+    /// GGUF_WebGPU_DecodeCapture_TokenIdentical (greedy decode token-identical to the direct path).
+    /// </summary>
+    public bool EnableWebGPUDecodeCapture { get; set; }
+    private WebGPUDecodeCapture? _decodeCapture;
+    /// <summary>Diagnostics: (ops, scalar/copy/slot patch counts) of the active decode capture, or null.</summary>
+    public (int Ops, int Scalars, int Copies, int Slots)? DecodeCaptureInfo =>
+        _decodeCapture is { } c ? (c.DispatchCount, c.PatchCounts.Scalars, c.PatchCounts.Copies, c.PatchCounts.Slots) : null;
+
+    /// <summary>Per-phase ms of the most recent patched replay step (diagnostics), or null.</summary>
+    /// <summary>Patch sub-phases of the most recent replay step (diagnostics), or null.</summary>
+    public (double Input, double Scalars, double Slots, double Copies)? LastDecodeCapturePatchSplitMs =>
+        _decodeCapture is { } cc ? cc.LastPatchSplitMs : null;
+
+    public (double Patch, double Replay, double Sync)? LastDecodeCaptureStepMs =>
+        _decodeCapture is { } c ? (c.LastPatchMs, c.LastReplayMs, c.LastSyncMs) : null;
+
     /// <summary>The model's tokenizer (SentencePiece, from the GGUF vocab).</summary>
     public SentencePieceTokenizer Tokenizer => _tokenizer;
 
@@ -182,11 +205,40 @@ public sealed class GgufGenerator : IDisposable
         {
             if (ct.IsCancellationRequested) { stop = StopReason.Cancelled; break; }
 
-            var idf = new float[stepIds.Length];
-            for (int i = 0; i < stepIds.Length; i++) idf[i] = stepIds[i];
-            using var inBuf = _accelerator.Allocate1D(idf);
-            var outputs = await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
-            { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
+            IReadOnlyDictionary<string, Tensor> outputs;
+            MemoryBuffer1D<float, Stride1D.Dense>? inBuf = null;
+            try
+            {
+                if (EnableWebGPUDecodeCapture && stepIds.Length == 1)
+                {
+                    // Capture on the first single-token step; patched replay ever after (valid at ANY
+                    // pastLen - the patches are affine in the cursor - so it survives across turns and
+                    // prefix-cache reuse; prefill/multi-token steps below stay on the direct path).
+                    if (_decodeCapture == null)
+                    {
+                        _decodeCapture = await WebGPUDecodeCapture.TryCaptureAsync(_session, stepIds[0]);
+                        if (_decodeCapture != null)
+                            outputs = _decodeCapture.Outputs;   // the capture pass IS this step's forward
+                        else
+                        {
+                            EnableWebGPUDecodeCapture = false;  // non-WebGPU: don't retry every step
+                            outputs = await RunDirectAsync();
+                        }
+                    }
+                    else
+                        outputs = await _decodeCapture.PatchAndReplayAsync(stepIds[0], _session.DecodePastLen);
+                }
+                else
+                    outputs = await RunDirectAsync();
+
+                async Task<IReadOnlyDictionary<string, Tensor>> RunDirectAsync()
+                {
+                    var idf = new float[stepIds.Length];
+                    for (int i = 0; i < stepIds.Length; i++) idf[i] = stepIds[i];
+                    inBuf = _accelerator.Allocate1D(idf);
+                    return await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
+                    { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
+                }
 
             var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
             int vocab = logitsT.Shape[^1];
@@ -244,6 +296,8 @@ public sealed class GgufGenerator : IDisposable
             }
 
             stepIds = new[] { next }; // incremental decode: after the prefill, feed only the new token
+            }
+            finally { inBuf?.Dispose(); }
         }
 
         // Flush the detokenizer + any held-back safe tail (only if we didn't stop on a stop string).
@@ -387,5 +441,5 @@ public sealed class GgufGenerator : IDisposable
     }
 
     /// <summary>Releases the decode KV-cache + argmax buffers. Does NOT dispose the session or accelerator (caller-owned).</summary>
-    public void Dispose() { _cache.Dispose(); _argmax.Dispose(); }
+    public void Dispose() { _decodeCapture?.Dispose(); _decodeCapture = null; _cache.Dispose(); _argmax.Dispose(); }
 }

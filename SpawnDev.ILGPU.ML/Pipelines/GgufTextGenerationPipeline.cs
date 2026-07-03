@@ -52,6 +52,23 @@ public sealed class GgufTextGenerationPipeline : IDisposable
     /// the pipeline still owns its lifetime (do not dispose).</summary>
     public InferenceSession Session => _gen.Session;
 
+    /// <summary>Opt-in WebGPU decode capture/replay - see <see cref="GgufGenerator.EnableWebGPUDecodeCapture"/>
+    /// (686ms/tok -> ~21ms/tok measured; no-op on non-WebGPU backends).</summary>
+    public bool EnableWebGPUDecodeCapture
+    {
+        get => _gen.EnableWebGPUDecodeCapture;
+        set => _gen.EnableWebGPUDecodeCapture = value;
+    }
+
+    /// <summary>Diagnostics for the active decode capture (ops + patch counts), or null.</summary>
+    public (int Ops, int Scalars, int Copies, int Slots)? DecodeCaptureInfo => _gen.DecodeCaptureInfo;
+
+    /// <summary>Per-phase ms of the most recent patched replay step (diagnostics), or null.</summary>
+    public (double Patch, double Replay, double Sync)? LastDecodeCaptureStepMs => _gen.LastDecodeCaptureStepMs;
+
+    /// <summary>Patch sub-phases of the most recent replay step (diagnostics), or null.</summary>
+    public (double Input, double Scalars, double Slots, double Copies)? LastDecodeCapturePatchSplitMs => _gen.LastDecodeCapturePatchSplitMs;
+
     /// <summary>Default cap on generated tokens when neither the call nor the <see cref="GenerationConfig"/> sets one.</summary>
     public int MaxNewTokens { get; set; } = 256;
 

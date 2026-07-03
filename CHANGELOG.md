@@ -4,6 +4,28 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### 🏆 WebGPU LLM decode 15x: 1.5 -> 22.3 tok/s TOKEN-IDENTICAL via patched dispatch-plan replay (Seven)
+
+The browser Ollama-clone/ai-chat decode lever, end-to-end. `WebGPUDecodeCapture` captures the decode
+step ONCE as a dispatch plan and replays it per token with a single interop crossing; every
+KV-cursor-dependent value is DISCOVERED (not hard-coded): two captures at pastLen P0/P0+1 plus
+stable-slot observer probes are diffed, and each difference is fitted as value(P)=v0+slope*(P-P0)
+(fail-loud on any structural/non-affine mismatch). Discovered surface on qwen2.5-0.5b: 48 scalar
+patches (RoPE startPosition x q/k x 24 layers), 48 copy-destination patches (K/V cache appends),
+24 attention param slots. Per token: raw queue.WriteBuffer patches (1.9ms) + plan call (0.3ms) +
+GPU 23.3ms. Opt-in via `GgufTextGenerationPipeline.EnableWebGPUDecodeCapture` (no-op elsewhere;
+prefill/multi-token steps stay direct; patches are affine in pastLen so ONE capture survives across
+turns and prefix-cache reuse).
+- Gates: `GGUF_WebGPU_DecodeCapture_TokenIdentical` (greedy 48 toks, captured == direct, char-exact)
+  + `GGUF_WebGPU_DecodePlanReplay_Probe` (same-state bit-exact, 20.8ms floor) + KV-cache suite +
+  attention oracle unchanged.
+- Uses SpawnDev.ILGPU `4.17.2-local.7` (dispatch-plan patch surface). Enablers: stable-slot
+  observers on `FusedAttentionKernel`/`CaptureParamArena` (null-checked, inert in production).
+- FOUND on the way (tracked): ILGPU `ArrayView.CopyFromCPU` on WebGPU costs ~14ms/call (vs 0.02ms
+  raw writeBuffer) - it made the first patched replay 456ms/tok; the driver uses raw writes.
+- Remaining per-token costs: GPU 23.3ms (72% = the WGSL Q8_0 dequant GEMV - stage 3) + ~19ms
+  argmax/detok/loop residual (the argmax readback fence - stage 4 candidate).
+
 ### 🎥 WebGPU VIDEO PATH: DepthEstimationPipeline.EnableGraphCapture now works in the browser - 10.4 fps end-to-end (Seven)
 
 `EnableGraphCapture` gains the WebGPU twin of the CUDA wiring: first frame captures the forward into

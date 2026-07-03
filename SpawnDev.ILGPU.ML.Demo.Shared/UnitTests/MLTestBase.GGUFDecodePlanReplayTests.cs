@@ -14,6 +14,76 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public partial class MLTestBase
 {
     /// <summary>
+    /// STAGE-2 GATE: token-identity of the full patched-replay decode loop. Same pipeline, same
+    /// prompt, greedy: run A direct (capture OFF), run B with EnableWebGPUDecodeCapture (first decode
+    /// step captures + probes, the rest are patched single-crossing replays). Prefix cache is
+    /// disabled so run B re-prefills identically - the outputs must be TOKEN-IDENTICAL. Run C (a
+    /// second captured turn, replay-only) is timed per-token: the production number vs the 686ms/tok
+    /// direct baseline and the 20.8ms/tok same-state floor.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task<string> GGUF_WebGPU_DecodeCapture_TokenIdentical() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU decode-capture gate");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+        const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        bool prevPrefix = GgufGenerator.EnablePrefixCache;
+        GgufGenerator.EnablePrefixCache = false;   // force identical full prefills for A and B
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(12));
+            var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token))
+            {
+                var messages = new[] { ("user", "Describe a lighthouse in two sentences.") };
+                var cfg = new GenerationConfig { MaxNewTokens = 48, Strategy = "greedy" };
+
+                var direct = await pipe.GenerateAsync(messages, config: cfg, ct: cts.Token);
+
+                pipe.EnableWebGPUDecodeCapture = true;
+                var captured = await pipe.GenerateAsync(messages, config: cfg, ct: cts.Token);
+                var info = pipe.DecodeCaptureInfo;
+
+                if (captured != direct)
+                    throw new Exception($"TOKEN DIVERGENCE - direct: '{direct.Trim()}' vs captured: '{captured.Trim()}' "
+                        + $"(capture: {info})");
+
+                // Run C: replay-only turn (capture already built) - the production per-token number.
+                var stamps = new List<double>();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                await pipe.GenerateAsync(new[] { ("user", "Name three colors and say why you like each.") },
+                    config: new GenerationConfig { MaxNewTokens = 32, Strategy = "greedy" },
+                    onToken: (_, _) => { stamps.Add(sw.Elapsed.TotalMilliseconds); return Task.CompletedTask; },
+                    ct: cts.Token);
+                double decodeMs = stamps.Count >= 8 ? (stamps[^1] - stamps[0]) / (stamps.Count - 1) : double.NaN;
+                var split = pipe.LastDecodeCaptureStepMs;
+
+                var report = $"TOKEN-IDENTICAL ({direct.Trim().Length} chars) | capture: ops={info?.Ops} patches: scalars={info?.Scalars} copies={info?.Copies} slots={info?.Slots} "
+                    + $"| replay-turn decode {decodeMs:F1}ms/tok = {1000.0 / decodeMs:F1} tok/s (direct baseline 686ms/tok = 1.5 tok/s) "
+                    + $"| lastStep split: patch {split?.Patch:F1}ms + planCall {split?.Replay:F1}ms + gpuWait {split?.Sync:F1}ms (residual = argmax/detok/loop) "
+                    + $"| patch split: input {pipe.LastDecodeCapturePatchSplitMs?.Input:F1} scalars {pipe.LastDecodeCapturePatchSplitMs?.Scalars:F1} slots {pipe.LastDecodeCapturePatchSplitMs?.Slots:F1} copies {pipe.LastDecodeCapturePatchSplitMs?.Copies:F1}";
+                Console.WriteLine($"[GGUF-DecodeCapture] {report}");
+                return report;
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally { GgufGenerator.EnablePrefixCache = prevPrefix; await client.DisposeAsync(); }
+    });
+
+    /// <summary>
     /// STAGE-1 WebGPU decode dispatch-plan capture/replay probe - the browser twin of Example 04's
     /// CUDA graph probe, against the measured 1.5 tok/s baseline (686ms/tok of which ~570ms is
     /// per-node dispatch orchestration; CUDA does 11.4ms/tok on the same card). SAME-STATE replay:

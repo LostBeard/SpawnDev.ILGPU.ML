@@ -76,6 +76,17 @@ public sealed class CaptureParamArena : IDisposable
     public CaptureParamArena(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
+    /// Patch-point discovery observers (parameterized replay - WebGPUDecodeCapture): fired on every
+    /// stable-slot rent that CARRIES data (warm passes; not during SuppressDrains, where data is
+    /// skipped) with (slotIndex, data, slotView). A driver records two probe forwards at two values
+    /// of the loop variable and diffs the data per slot to find variable-dependent params. Static -
+    /// set only around probe forwards, null in production.
+    /// </summary>
+    public static Action<int, int[], ArrayView1D<int, Stride1D.Dense>>? IntSlotObserver;
+    /// <summary>Float analogue of <see cref="IntSlotObserver"/>.</summary>
+    public static Action<int, float[], ArrayView1D<float, Stride1D.Dense>>? FloatSlotObserver;
+
+    /// <summary>
     /// Returns a stable device view of <paramref name="data"/> for the current forward's next param rent.
     /// Only valid to call while <see cref="GraphExecutor.UseCaptureParamSlots"/> is set (the kernel keeps
     /// its normal path otherwise). The H2D upload is skipped while <see cref="GraphExecutor.SuppressDrains"/>
@@ -105,7 +116,10 @@ public sealed class CaptureParamArena : IDisposable
         var view = slot.View.SubView(0, data.Length);
         // Skip the synchronizing H2D during the capture pass; the warm pass already populated this slot.
         if (!GraphExecutor.SuppressDrains)
+        {
             view.CopyFromCPU(data);
+            IntSlotObserver?.Invoke(i, data, view);
+        }
         return view;
     }
 
@@ -132,7 +146,10 @@ public sealed class CaptureParamArena : IDisposable
 
         var view = slot.View.SubView(0, data.Length);
         if (!GraphExecutor.SuppressDrains)
+        {
             view.CopyFromCPU(data);
+            FloatSlotObserver?.Invoke(i, data, view);
+        }
         return view;
     }
 
