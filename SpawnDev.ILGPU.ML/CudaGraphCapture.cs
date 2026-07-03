@@ -65,6 +65,17 @@ public sealed class CudaGraphCapture : IDisposable
         var capStream = (CudaStream)acc.CreateStream();
         Dictionary<string, Tensor> capOut;
         CudaGraph graph;
+
+        // The capture path is built for the dispatch-ELIDE regime: shape ops are CPU-resolved (not dispatched),
+        // so the captured graph is the pure GPU-compute forward. Force it here (save + restore) so a caller that
+        // has elide off still gets a working capture. Elide is bit-identical to non-elide, so the captured result
+        // matches a normal forward regardless of the caller's prior setting.
+        bool prevFold = GraphCompiler.ShapeSubgraphFoldEnabled;
+        bool prevElide = GraphExecutor.ShapeInterpElideDispatch;
+        bool prevValidate = GraphExecutor.ShapeInterpValidate;
+        GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        GraphExecutor.ShapeInterpElideDispatch = true;
+        GraphExecutor.ShapeInterpValidate = false;
         FusedAttentionKernel.UseStableCaptureSlots = true;
         GraphExecutor.UseCaptureParamSlots = true;
         try
@@ -94,6 +105,9 @@ public sealed class CudaGraphCapture : IDisposable
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
             GraphExecutor.SuppressDrains = false;
+            GraphCompiler.ShapeSubgraphFoldEnabled = prevFold;
+            GraphExecutor.ShapeInterpElideDispatch = prevElide;
+            GraphExecutor.ShapeInterpValidate = prevValidate;
         }
 
         CudaGraphExec exec;

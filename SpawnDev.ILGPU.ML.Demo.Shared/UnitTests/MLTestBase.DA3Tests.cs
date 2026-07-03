@@ -765,9 +765,10 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
-        Graph.GraphExecutor.ShapeInterpValidate = false;
-        Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+        // NOTE: deliberately do NOT enable dispatch-elide here — CudaGraphCapture.TryCaptureAsync forces the
+        // elide regime internally (and restores after), so EnableGraphCapture works regardless of caller state.
+        // The non-capture reference frame below runs elide-OFF; the replay runs the elide-ON captured graph;
+        // bit-identical == the capture is self-contained + elide is a pure orchestration no-op.
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
