@@ -38,10 +38,25 @@ public static class TextGenerationSampler
         rng ??= Random.Shared;
         k = Math.Min(k, logits.Length);
 
-        // Top-K indices: full descending argsort (Array.Sort, intrinsic float compares) then take the
-        // first k. The old O(n*k) selection was ~2.5M interpreted-WASM iterations/step for k=50 over a
-        // ~50k vocab; ArgsortDescending is O(n log n) with no per-element delegate, far cheaper there.
-        var indices = ArgsortDescending(logits);
+        // CANDIDATE PRUNING (2026-07-03, same as TopP): the top-K by logit all sit within a window of
+        // the max unless K is enormous - prune to logit >= max - 20*T first, then argsort the
+        // (usually tiny) candidate set instead of the full ~152K vocab (the full Array.Sort was
+        // ~100-250ms/token in non-AOT WASM). If pruning leaves fewer than K candidates, the missing
+        // ones carried < e^-20 relative probability each - sampling among the survivors is the same
+        // distribution to ~1e-4 mass.
+        float pruneMax = float.MinValue;
+        for (int i = 0; i < logits.Length; i++)
+            if (logits[i] > pruneMax) pruneMax = logits[i];
+        float pruneCutoff = pruneMax - 20f * temperature;
+        var candIdx = new List<int>(Math.Max(256, k));
+        for (int i = 0; i < logits.Length; i++)
+            if (logits[i] >= pruneCutoff) candIdx.Add(i);
+        var candLogits = new float[candIdx.Count];
+        for (int i = 0; i < candIdx.Count; i++) candLogits[i] = logits[candIdx[i]];
+        k = Math.Min(k, candIdx.Count);
+        var candOrder = ArgsortDescending(candLogits);
+        var indices = new int[candOrder.Length];
+        for (int i = 0; i < candOrder.Length; i++) indices[i] = candIdx[candOrder[i]];
 
         // Apply temperature and softmax over top-K only
         var probs = new float[k];
@@ -73,24 +88,36 @@ public static class TextGenerationSampler
     {
         rng ??= Random.Shared;
 
-        // Softmax with temperature
+        // CANDIDATE PRUNING (2026-07-03): the nucleus never contains a token whose scaled logit sits
+        // more than LogitWindow below the max - e^-20 ≈ 2e-9, so even 150K such tokens contribute
+        // < 3e-4 total probability mass, far below any p cutoff. Pruning first means the softmax
+        // EXP and the argsort run over ~10s-100s of candidates instead of the FULL vocabulary
+        // (qwen2.5 = 151,936). This is the difference between ~1ms and ~100-250ms PER TOKEN in
+        // non-AOT Blazor WASM (152K MathF.Exp + a 152K Array.Sort each step made the /ai-chat page
+        // sampler-bound). The nucleus itself is mathematically unchanged (same candidates, same
+        // order, same renormalization) up to the negligible pruned mass.
+        const float LogitWindow = 20f;
         float maxLogit = float.MinValue;
         for (int i = 0; i < logits.Length; i++)
             if (logits[i] > maxLogit) maxLogit = logits[i];
+        float cutoff = maxLogit - LogitWindow * temperature;   // (l - max)/T >= -window
 
-        var probs = new float[logits.Length];
-        float sum = 0;
+        var candIdx = new List<int>(256);
         for (int i = 0; i < logits.Length; i++)
+            if (logits[i] >= cutoff) candIdx.Add(i);
+
+        int nCand = candIdx.Count;
+        var probs = new float[nCand];
+        float sum = 0;
+        for (int i = 0; i < nCand; i++)
         {
-            probs[i] = MathF.Exp((logits[i] - maxLogit) / temperature);
+            probs[i] = MathF.Exp((logits[candIdx[i]] - maxLogit) / temperature);
             sum += probs[i];
         }
-        for (int i = 0; i < probs.Length; i++) probs[i] /= sum;
+        for (int i = 0; i < nCand; i++) probs[i] /= sum;
 
-        // Sort indices by probability (descending). MUST be Array.Sort, not LINQ OrderByDescending:
-        // in interpreted Blazor WASM (RunAOTCompilation=false) the LINQ path over the full ~50k vocab
-        // (iterator + per-element keySelector delegate + boxed comparer) cost ~tens of seconds PER STEP
-        // and hung multi-token sampling. ArgsortDescending uses Array.Sort with intrinsic float compares.
+        // Sort candidates by probability (descending). MUST be Array.Sort, not LINQ (interpreted-
+        // WASM delegate cost - see ArgsortDescending). Now over the pruned candidate set only.
         var sortedIndices = ArgsortDescending(probs);
 
         // Find nucleus (smallest set where cumulative prob >= p)
@@ -115,7 +142,7 @@ public static class TextGenerationSampler
 
         // Sample from nucleus
         int sampledIdx = SampleFromDistribution(nucleusProbs, rng);
-        return sortedIndices[sampledIdx];
+        return candIdx[sortedIndices[sampledIdx]];
     }
 
     /// <summary>

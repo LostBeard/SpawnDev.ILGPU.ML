@@ -262,6 +262,11 @@ string answer = await pipe.GenerateAsync(convo,
             // loops on open-ended chat ("Boiled and served with…" over and over). Nucleus sampling +
             // repetition penalty keeps the correct token for factual answers while breaking the loops.
             // (The oracle reference test uses its own greedy config, so this page change doesn't affect it.)
+            // Throttle streaming renders to ~10Hz: a full StateHasChanged + scroll PER TOKEN re-lays-out
+            // the whole growing transcript on the single WASM thread between decode steps - at 30 tok/s
+            // that alone throttled generation to word-per-second (2026-07-03). 10 renders/sec reads the
+            // same to a human; the final render after GenerateAsync shows the complete text.
+            var renderClock = System.Diagnostics.Stopwatch.StartNew();
             string answer = await _pipeline.GenerateAsync(convo,
                 config: new GenerationConfig
                 {
@@ -271,7 +276,16 @@ string answer = await pipe.GenerateAsync(convo,
                     TopP = 0.9f,
                     RepetitionPenalty = 1.3f,
                 },
-                onToken: (_, soFar) => { _streaming = soFar; InvokeAsync(async () => { StateHasChanged(); await ScrollToBottom(); }); return Task.CompletedTask; },
+                onToken: (_, soFar) =>
+                {
+                    _streaming = soFar;
+                    if (renderClock.ElapsedMilliseconds >= 100)
+                    {
+                        renderClock.Restart();
+                        InvokeAsync(async () => { StateHasChanged(); await ScrollToBottom(); });
+                    }
+                    return Task.CompletedTask;
+                },
                 ct: _genCts.Token);
             // On Stop, the generator returns the partial text (StopReason.Cancelled) — keep what was generated.
             if (!string.IsNullOrWhiteSpace(answer))
