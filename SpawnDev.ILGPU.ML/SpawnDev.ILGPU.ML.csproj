@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>4.0.0-preview.5</Version>
+		<Version>4.0.0-preview.6-local.1</Version>
 		<PackageReleaseNotes>GGUF LLM inference (Qwen/Gemma/Llama) + Ollama-compatible server example; warp-cooperative register/flash attention on CUDA and WebGPU; ~4.6x faster decode (1.75x of Ollama). Full changelog: https://github.com/LostBeard/SpawnDev.ILGPU.ML/blob/master/CHANGELOG.md</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
