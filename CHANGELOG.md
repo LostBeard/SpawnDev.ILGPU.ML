@@ -4,6 +4,21 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### BREAKTHROUGH: WebGPU dispatch-plan capture/replay - DAv3 at 99.5ms/frame bit-exact (1.36x from ORT-Web), + the SwiftShader discovery (Seven)
+
+Two coupled findings. (1) The PMT Playwright bundled Chromium NEVER had hardware WebGPU - every prior
+WebGPU perf number (77s warm, 4-5 GF GEMM benches, the drains decomposition) was the SwiftShader CPU
+software rasterizer (caught by the new `WebGPU_AdapterIdentity_Probe`; correctness results all stand).
+Harness fixed: `Channel = "chrome"` + `--disable-software-rasterizer` + removed the Windows-hostile
+Vulkan feature flag -> vendor=nvidia arch=lovelace. (2) New `WebGPUGraphCapture` (consuming SpawnDev.ILGPU
+4.17.2-local.3's `WebGPUDispatchPlan` capture/replay - the browser twin of `CudaGraphCapture`, same warm
+A/B + stable-slots + readback-cache + suppress-drains regime; dispatch-elide off on WebGPU pending its
+executor gap): capture the forward once, replay per frame with ONE interop crossing. Measured on real
+hardware (`DA3_WebGPU_PlanReplay_VsOrtWeb`): direct 18.9s -> **replay 99.5ms/frame, 190x, bit-exact
+(maxAbsDiff=0)** vs ORT-Web's 73ms warm. Also: `MatMulKernel.MatMulTiled16` direct entry + tiled16 bench
+column (the register-pressure control), adapter probe as a permanent harness guard.
+
+
 ### Fix: kernel params-buffer reuse/inline-dispose hazards on async backends - 4 kernels converted to fresh-buffer + deferred disposal (Seven)
 
 The WebGPU range-deviation hunt's isolation tests caught a REAL defect family: SliceKernel reused ONE

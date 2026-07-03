@@ -138,6 +138,7 @@ public abstract partial class MLTestBase
 
         var vec4 = new Vec4LoadMatMul(accelerator);
         var scalar = new RegisterBlockedMatMul(accelerator);
+        var tiled = new MatMulKernel(accelerator);
         var report = new StringBuilder();
         report.Append($"{accelerator.AcceleratorType} {accelerator.Name}");
         foreach (var (label, M, K, N) in new[] { ("qkv", 1344, 384, 1152), ("fc1", 1344, 384, 1536), ("fc2", 1344, 1536, 384) })
@@ -167,8 +168,12 @@ public abstract partial class MLTestBase
             double msScalar = await Time(() => scalar.MatMul(aBuf.View, bBuf.View, cScalar.View, M, K, N));
             double msStruct = await Time(() => vec4.MatMulStructLoad(a4Buf.View, b4Buf.View, cStruct.View, M, K, N));
             double msVec4 = await Time(() => vec4.MatMul(a4Buf.View, b4Buf.View, cVec4.View, M, K, N));
+            // 16x16 tiled (1 result/thread, low register pressure) - the WGSL spill-hypothesis control:
+            // if this beats the register-blocked kernel by an order of magnitude on WebGPU, the
+            // reg-blocked kernel's function-local bloat is spilling registers there.
+            double msTiled = await Time(() => tiled.MatMulTiled16(aBuf.View, bBuf.View, cScalar.View, M, K, N));
             double gf = 2.0 * M * K * N * 1e-6;
-            var line = $"{label} M={M} K={K} N={N}: scalar {msScalar:F3}ms {gf / msScalar:F0}GF | struct {msStruct:F3}ms {gf / msStruct:F0}GF | vec4 {msVec4:F3}ms {gf / msVec4:F0}GF | vec4/scalar {msScalar / msVec4:F2}x";
+            var line = $"{label} M={M} K={K} N={N}: scalar {msScalar:F3}ms {gf / msScalar:F0}GF | struct {msStruct:F3}ms {gf / msStruct:F0}GF | vec4 {msVec4:F3}ms {gf / msVec4:F0}GF | tiled16 {msTiled:F3}ms {gf / msTiled:F0}GF | vec4/scalar {msScalar / msVec4:F2}x";
             Console.WriteLine($"[GemmVec4] BENCH [{accelerator.AcceleratorType}] {line}");
             report.Append(" || ").Append(line);
         }

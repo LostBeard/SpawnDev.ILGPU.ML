@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.BlazorJS;
 using SpawnDev.UnitTesting;
 using System.Diagnostics;
 
@@ -165,6 +166,141 @@ public abstract partial class MLTestBase
             Graph.GraphExecutor.CapturedOutputs = null;
             Graph.GraphExecutor.CapturedNodeInfo = null;
             Graph.GraphExecutor.CaptureMaxElements = 1024;
+        }
+    });
+
+    /// <summary>
+    /// ADAPTER IDENTITY PROBE: every WebGPU perf number this campaign produced came from the PMT
+    /// Playwright Chromium - if that browser fell back to the SwiftShader SOFTWARE adapter, the
+    /// measured "~1000x slow WGSL kernels" (uniform 1-5 GFLOPS on kernels that hit 1500-6900 GFLOPS
+    /// via CUDA/OpenCL on the same silicon) is an ENVIRONMENT artifact, not a codegen problem.
+    /// Reports vendor/architecture/device/description + isFallbackAdapter.
+    /// </summary>
+    [TestMethod]
+    public async Task<string> WebGPU_AdapterIdentity_Probe() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only adapter probe");
+        var JS = SpawnDev.BlazorJS.BlazorJSRuntime.JS;
+        using var gpu = JS.Get<SpawnDev.BlazorJS.JSObject>("navigator.gpu");
+        if (gpu == null) throw new Exception("navigator.gpu missing");
+        using var adapter = await gpu.JSRef!.CallAsync<SpawnDev.BlazorJS.JSObject>("requestAdapter");
+        if (adapter == null) throw new Exception("requestAdapter returned null");
+        string vendor = "?", arch = "?", device = "?", desc = "?";
+        bool fallback = false;
+        try
+        {
+            using var info = adapter.JSRef!.Get<SpawnDev.BlazorJS.JSObject?>("info");
+            if (info != null)
+            {
+                vendor = info.JSRef!.Get<string?>("vendor") ?? "?";
+                arch = info.JSRef!.Get<string?>("architecture") ?? "?";
+                device = info.JSRef!.Get<string?>("device") ?? "?";
+                desc = info.JSRef!.Get<string?>("description") ?? "?";
+            }
+        }
+        catch { }
+        try { fallback = adapter.JSRef!.Get<bool?>("isFallbackAdapter") ?? false; } catch { }
+        var report = $"vendor={vendor} arch={arch} device={device} desc='{desc}' isFallbackAdapter={fallback}";
+        Console.WriteLine($"[Benchmark][AdapterProbe] {report}");
+        return report;
+    });
+
+    /// <summary>
+    /// THE ORT-WEB FIGHT: WebGPU dispatch-plan capture/replay of the full DAv3-5D forward via
+    /// <see cref="WebGPUGraphCapture"/> (the browser twin of the CUDA graph capture). Captures the
+    /// ~1300-dispatch forward once under the stable regime, then replays it with a SINGLE interop
+    /// crossing per frame. Gates: replay output matches the direct forward (the correctness oracle),
+    /// and reports direct-vs-replay per-frame ms - the number that competes with ORT-Web's 73ms warm.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> DA3_WebGPU_PlanReplay_VsOrtWeb() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU plan-replay measurement (CUDA has its own graph capture)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+        var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+            externalData: extDataBytes);
+
+        const int W = 518, H = 518;
+        var rgba = new int[W * H];
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) { int v = (int)(x / (float)(W - 1) * 255f); rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v; }
+
+        var preprocess = new Kernels.ImagePreprocessKernel(accelerator);
+        using var rgbaBuf = accelerator.Allocate1D(rgba);
+        using var inputBuf = accelerator.Allocate1D<float>(3 * W * H);
+        preprocess.Forward(rgbaBuf.View, inputBuf.View, W, H, W, H);
+        await accelerator.SynchronizeAsync();
+        var inputTensor = new Tensors.Tensor(inputBuf.View, new[] { 1, 1, 3, W, H }, session.InputNames[0]);
+        var inputs = new Dictionary<string, Tensors.Tensor> { [session.InputNames[0]] = inputTensor };
+
+        // Direct reference forward (readback-skip regime; elide OFF - it has a WebGPU-specific gap,
+        // tracked on the executor lane) - the correctness oracle AND the "before" per-frame time.
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        try
+        {
+            var dsw = System.Diagnostics.Stopwatch.StartNew();
+            var refOut = await session.RunAsync(inputs);
+            await accelerator.SynchronizeAsync();
+            dsw.Stop();
+            double directMs = dsw.Elapsed.TotalMilliseconds;
+            var refData = await refOut[session.OutputNames[0]].Data
+                .SubView(0, refOut[session.OutputNames[0]].ElementCount).CopyToHostAsync();
+            int outCount = refData.Length;
+
+            Console.WriteLine($"[Benchmark][PlanReplay] direct forward {directMs:F0}ms - starting capture");
+            // Capture once (warm A + warm B + recording pass happen inside).
+            var csw = System.Diagnostics.Stopwatch.StartNew();
+            using var cap = await WebGPUGraphCapture.TryCaptureAsync(session, inputs);
+            csw.Stop();
+            if (cap == null) throw new Exception("WebGPUGraphCapture.TryCaptureAsync returned null on WebGPU");
+            Console.WriteLine($"[Benchmark][PlanReplay] capture done in {csw.Elapsed.TotalSeconds:F1}s, ops={cap.DispatchCount}");
+
+            // Discriminator 1: was the CAPTURE PASS itself correct? (stable-slots/suppress-drains
+            // regime correctness on WebGPU, independent of replay).
+            var capT = cap.Outputs[session.OutputNames[0]];
+            var cd = await capT.Data.SubView(0, outCount).CopyToHostAsync();
+            float capDiff = 0f;
+            for (int i = 0; i < outCount; i++) capDiff = MathF.Max(capDiff, MathF.Abs(cd[i] - refData[i]));
+
+            // Discriminator 2: replay correctness - same input -> output must match the direct forward.
+            var r1sw = System.Diagnostics.Stopwatch.StartNew();
+            var replayOut = await cap.ReplayAsync(inputs);
+            r1sw.Stop();
+            Console.WriteLine($"[Benchmark][PlanReplay] first replay {r1sw.Elapsed.TotalMilliseconds:F0}ms");
+            var outT = replayOut[session.OutputNames[0]];
+            var rd = await outT.Data.SubView(0, outCount).CopyToHostAsync();
+            float maxAbsDiff = 0f;
+            for (int i = 0; i < outCount; i++) maxAbsDiff = MathF.Max(maxAbsDiff, MathF.Abs(rd[i] - refData[i]));
+            if (maxAbsDiff > 1e-3f)
+                throw new Exception($"plan replay DIVERGED: replayDiff={maxAbsDiff:E3} capturePassDiff={capDiff:E3} dispatches={cap.DispatchCount} (outCount={outCount}) - capturePassDiff>tol means the capture REGIME broke the forward; else the REPLAY itself diverges from a correct capture");
+
+            Console.WriteLine($"[Benchmark][PlanReplay] correctness OK - timing loop");
+            // Per-frame replay timing (the ORT-Web-73ms competitor).
+            const int R = 3;
+            var rsw = System.Diagnostics.Stopwatch.StartNew();
+            for (int r = 0; r < R; r++) await cap.ReplayAsync(inputs);
+            rsw.Stop();
+            double replayMs = rsw.Elapsed.TotalMilliseconds / R;
+
+            var report = $"dispatches={cap.DispatchCount} | direct {directMs:F0}ms -> replay {replayMs:F1}ms/frame = {directMs / replayMs:F1}x | maxAbsDiff={maxAbsDiff:E2} | ORT-Web warm ref 73ms";
+            Console.WriteLine($"[DA3-PlanReplay] {report}");
+            return report;
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
         }
     });
 

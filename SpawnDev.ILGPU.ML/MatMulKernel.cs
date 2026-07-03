@@ -358,11 +358,29 @@ public class MatMulKernel
         }
         else
         {
-            int numTilesM = (M + TILE - 1) / TILE;
-            int numTilesN = (N + TILE - 1) / TILE;
-            int totalTiles = numTilesM * numTilesN;
-            _matMulKernel!(new KernelConfig(totalTiles, TILE * TILE), A, B, C, M, K, N, numTilesN);
+            MatMulTiled16(A, B, C, M, K, N);
         }
+    }
+
+    /// <summary>
+    /// The 16x16 shared-memory tiled GEMM (1 result/thread, ~10 live values/thread) as a DIRECT
+    /// entry, bypassing the size-based routing. Exists because the register-blocked kernel's WGSL
+    /// lowering carries hundreds of function-scope locals - on WebGPU that spills registers and
+    /// collapses throughput (measured 4-5 GFLOPS vs this kernel's historical 92-101 GFLOPS on the
+    /// same lane), so WebGPU routing prefers this kernel until the codegen emits register-friendly
+    /// WGSL. Also the A/B instrument for that decision (GemmVec4 bench).
+    /// </summary>
+    public void MatMulTiled16(
+        ArrayView1D<float, Stride1D.Dense> A,
+        ArrayView1D<float, Stride1D.Dense> B,
+        ArrayView1D<float, Stride1D.Dense> C,
+        int M, int K, int N)
+    {
+        EnsureKernelsLoaded(_accelerator);
+        int numTilesM = (M + TILE - 1) / TILE;
+        int numTilesN = (N + TILE - 1) / TILE;
+        int totalTiles = numTilesM * numTilesN;
+        _matMulKernel!(new KernelConfig(totalTiles, TILE * TILE), A, B, C, M, K, N, numTilesN);
     }
 
     /// <summary>

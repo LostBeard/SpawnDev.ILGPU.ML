@@ -218,11 +218,26 @@ namespace PlaywrightMultiTest
                             new BrowserTypeLaunchPersistentContextOptions
                             {
                                 Headless = false,
+                                // Installed Chrome, NOT Playwright's bundled Chromium: the bundled build
+                                // only ever exposes the SwiftShader SOFTWARE WebGPU adapter on this
+                                // machine (probe: vendor=google arch=swiftshader isFallbackAdapter=true,
+                                // fresh profile + ignore-blocklist made no difference) - every WebGPU perf
+                                // number before 2026-07-03 was CPU-rasterizer time. Real Chrome exposes
+                                // the hardware adapter (it is what users run anyway).
+                                Channel = "chrome",
                                 Args = new[]
                                 {
                                     "--enable-unsafe-webgpu",
-                                    "--enable-features=Vulkan,WebGPUService,SkiaGraphite,FileSystemAccessPersistentPermission",
+                                    // NO "Vulkan" here: forcing Chromium's Vulkan feature on Windows pushed
+                                    // Dawn off its native D3D12 path and the bundled Chromium silently fell
+                                    // back to the SwiftShader SOFTWARE adapter (vendor=google,
+                                    // arch=swiftshader, isFallbackAdapter=true - caught by
+                                    // WebGPU_AdapterIdentity_Probe 2026-07-03). Every WebGPU perf number
+                                    // measured before this fix was CPU-software-rasterizer time.
+                                    "--enable-features=WebGPUService,SkiaGraphite,FileSystemAccessPersistentPermission",
                                     "--ignore-gpu-blocklist",
+                                    // Fail loudly rather than silently falling back to SwiftShader again.
+                                    "--disable-software-rasterizer",
                                     "--no-sandbox",
                                     // Auto-grant file system write permission (no prompt)
                                     "--disable-features=FileSystemAccessPermissionPrompt",
