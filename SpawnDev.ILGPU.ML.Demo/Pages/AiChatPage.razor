@@ -317,7 +317,13 @@ string answer = await pipe.GenerateAsync(convo,
             }
             // On Stop, the generator returns the partial text (StopReason.Cancelled) — keep what was generated.
             if (!string.IsNullOrWhiteSpace(answer))
+            {
+                // Honest truncation marker: small models rarely emit EOS on open prompts, so answers
+                // regularly hit MaxNewTokens mid-sentence - show that it was cut, not that it "ended".
+                if (_pipeline.LastStopReason == SpawnDev.ILGPU.ML.Pipelines.StopReason.Length)
+                    answer += " […length limit reached]";
                 _messages.Add(new ChatMessage { Role = "assistant", Content = answer.Trim() });
+            }
         }
         catch (Exception ex)
         {

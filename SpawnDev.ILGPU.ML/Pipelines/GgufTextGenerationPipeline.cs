@@ -175,8 +175,14 @@ public sealed class GgufTextGenerationPipeline : IDisposable
                 await onToken(count, sb.ToString()).ConfigureAwait(false);
             },
             ct: ct).ConfigureAwait(false);
+        LastStopReason = res.Stop;
         return res.Text;
     }
+
+    /// <summary>Why the most recent <see cref="GenerateAsync(IReadOnlyList{ValueTuple{string,string}},GenerationConfig?,Func{int,string,Task}?,CancellationToken)"/>
+    /// stopped - <see cref="StopReason.Length"/> means the answer was TRUNCATED at MaxNewTokens
+    /// (small models often never emit EOS on open prompts; a UI should show a length-limit marker).</summary>
+    public StopReason LastStopReason { get; private set; }
 
     /// <summary>Releases the decode KV-cache + argmax buffers, and the session ONLY if this pipeline created
     /// it (factory path). Never disposes a session/accelerator passed into the constructor (caller-owned).</summary>
