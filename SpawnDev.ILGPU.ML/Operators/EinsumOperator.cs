@@ -59,6 +59,11 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
         var parsed = ParseEquation(ctx.GetString("equation"), ctx.Inputs.Length);
         var dimSizes = BuildDimSizes(ctx, parsed);
         if (TryGpuFastPath(ctx, parsed, dimSizes)) return;
+        // CUDA-graph capture: the general-contraction fallback reads inputs BACK to CPU (Allocate1D +
+        // CopyToHostAsync = a synchronize, illegal mid-capture). This path only runs for small non-GPU-fast
+        // einsums (shape/position contractions like RoPE positions⊗inv_freq), whose output is CONSTANT for a
+        // fixed input shape — so the deterministic node-output buffer already holds the warm result; skip.
+        if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains) return;
         var inputArrays = await ReadInputsAsync(ctx);
         ComputeGeneralContraction(ctx, parsed, dimSizes, inputArrays);
     }
@@ -323,8 +328,11 @@ public class EinsumOperator(OperatorRegistry reg) : IOnnxOperator
             result[outIdx] = sum;
         }
 
-        // Upload result to GPU
-        ctx.Outputs[0].Data.SubView(0, outputSize).CopyFromCPU(result);
+        // Upload result to GPU. Skipped under CUDA-graph capture (this CPU path runs only when all inputs are
+        // constants → the output is constant; the deterministic node-output buffer already holds it from the
+        // warm pass; a synchronous H2D is illegal mid-capture).
+        if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+            ctx.Outputs[0].Data.SubView(0, outputSize).CopyFromCPU(result);
     }
 
     // ═══════════════════════════════════════════════════════════

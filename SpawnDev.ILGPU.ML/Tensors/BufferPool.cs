@@ -21,6 +21,13 @@ public class BufferPool : IDisposable
     private readonly Accelerator _accelerator;
     private readonly Dictionary<int, Stack<MemoryBuffer1D<float, Stride1D.Dense>>> _buckets = new();
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allBuffers = new();
+    // CUDA-graph capture: an UNNAMED Rent is never Returned (Return keys on name), so it would allocate a fresh
+    // buffer every call → a cuMemAlloc mid-capture (illegal). In capture-mode we hand unnamed Rents a STABLE
+    // per-forward-ordinal slot (allocated in the WARM pass, reused thereafter; reset on ForwardGeneration). The
+    // op's GPU write into the buffer is captured normally; only the buffer address must stay fixed for replay.
+    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _captureUnnamedSlots = new();
+    private int _captureUnnamedNext;
+    private long _captureUnnamedGen = -1;
     // fp16 weight buffers (ILGPU.Half) — half the bytes of the fp32 _allBuffers. Tracked separately for
     // disposal (different element type). See AllocateHalfWeightFromStreamAsync.
     private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _allHalfBuffers = new();
@@ -101,6 +108,26 @@ public class BufferPool : IDisposable
         int count = TensorHelpers.ElementCount(shape);
         int bucketSize = NextPowerOf2(count);
 
+        // CUDA-graph capture: unnamed Rents get a stable per-forward slot (see _captureUnnamedSlots). Populated
+        // during the warm pass (UseCaptureParamSlots set, SuppressDrains not) so no allocation on the capture pass.
+        if (name == null && Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            long cgen = Graph.GraphExecutor.ForwardGeneration;
+            if (cgen != _captureUnnamedGen) { _captureUnnamedGen = cgen; _captureUnnamedNext = 0; }
+            int ci = _captureUnnamedNext++;
+            MemoryBuffer1D<float, Stride1D.Dense> cbuf;
+            if (ci < _captureUnnamedSlots.Count && _captureUnnamedSlots[ci].Length >= bucketSize)
+                cbuf = _captureUnnamedSlots[ci];
+            else
+            {
+                cbuf = _accelerator.Allocate1D<float>(bucketSize);
+                if (ci < _captureUnnamedSlots.Count) { _captureUnnamedSlots[ci].Dispose(); _captureUnnamedSlots[ci] = cbuf; }
+                else _captureUnnamedSlots.Add(cbuf);
+            }
+            UpdatePeaks();
+            return new Tensor(cbuf.View.SubView(0, count), shape, null);
+        }
+
         if (_buckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
         {
             var buffer = stack.Pop();
@@ -110,6 +137,14 @@ public class BufferPool : IDisposable
             return tensor;
         }
 
+        // CUDA-graph capture diagnostic: a pool allocation while SuppressDrains means the warm passes did NOT
+        // prime this size-bucket, so the capture pass is about to cuMemAlloc (illegal mid-capture → native crash).
+        // Naming it here (survives the crash) reveals which Rent site is under-primed. Inert in production.
+        if (Graph.GraphExecutor.SuppressDrains && Graph.GraphExecutor.CaptureTraceFile != null)
+        {
+            try { System.IO.File.AppendAllText(Graph.GraphExecutor.CaptureTraceFile,
+                $"   -> POOL-ALLOC '{name}' count={count} bucket={bucketSize}  (capture priming gap)\n"); } catch { }
+        }
         // Memory-bounded execution: the pool retains every Returned buffer in size-buckets for reuse, so a
         // 1-pass large model (e.g. a 512x512 VAE decode = ~227 distinct-size feature maps, each used once)
         // grows the pool to the SUM of its intermediates (multi-GB), not the live working set. Under GPU memory
@@ -496,6 +531,11 @@ public class BufferPool : IDisposable
         {
             try { buffer.Dispose(); }
             catch { /* Buffer may already be disposed by executor ref-counting or external code */ }
+        }
+        foreach (var buffer in _captureUnnamedSlots)
+        {
+            try { buffer.Dispose(); }
+            catch { /* may already be disposed */ }
         }
         foreach (var buffer in _allHalfBuffers)
         {

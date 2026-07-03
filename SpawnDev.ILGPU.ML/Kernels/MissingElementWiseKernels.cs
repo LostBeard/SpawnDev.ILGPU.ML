@@ -233,19 +233,29 @@ public class MissingElementWiseKernels : IDisposable
             paramsData[1 + rank + i] = outputShape[i];
             paramsData[1 + 2 * rank + i] = inputStrides[i];
         }
-        // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
-        EnsureParamsBuf(paramsData.Length);
-        // Copy into an EXACT-size subview: EnsureParamsBuf only grows the persistent buffer, so a smaller
-        // params payload (a lower-rank op following a higher-rank one) is shorter than _paramsBuf, and
-        // ILGPU's CopyFromCPU requires data.Length == view.Length — copying the whole (larger) view throws
-        // ArgumentOutOfRange. Sub-viewing to paramsData.Length keeps the lengths matched.
-        _paramsBuf!.View.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        ArrayView1D<int, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward slot (no per-call CopyFromCPU/alloc mid-capture).
+            paramsView = CaptureParamArena.Shared(_accelerator).RentStableSlot(paramsData);
+        }
+        else
+        {
+            // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
+            EnsureParamsBuf(paramsData.Length);
+            // Copy into an EXACT-size subview: EnsureParamsBuf only grows the persistent buffer, so a smaller
+            // params payload (a lower-rank op following a higher-rank one) is shorter than _paramsBuf, and
+            // ILGPU's CopyFromCPU requires data.Length == view.Length — copying the whole (larger) view throws
+            // ArgumentOutOfRange. Sub-viewing to paramsData.Length keeps the lengths matched.
+            _paramsBuf!.View.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+            paramsView = _paramsBuf.View.SubView(0, paramsData.Length);
+        }
 
         _expandKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ExpandImpl);
-        _expandKernel(totalOutput, input, output, _paramsBuf.View);
+        _expandKernel(totalOutput, input, output, paramsView);
     }
 
     // ──────────────────────────────────────────────

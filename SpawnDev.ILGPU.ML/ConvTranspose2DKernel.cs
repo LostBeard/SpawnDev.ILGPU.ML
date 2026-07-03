@@ -99,11 +99,23 @@ public class ConvTranspose2DKernel : IDisposable
         int outW = (inW - 1) * stride - 2 * padding + kW;
         if (batch < 1) batch = 1;
 
-        _paramsBuf ??= _accelerator.Allocate1D<int>(8);
-        _paramsBuf.CopyFromCPU(new int[] { inC, inH, inW, outC, kH, kW, stride, padding });
+        var packed = new int[] { inC, inH, inW, outC, kH, kW, stride, padding };
+        ArrayView1D<int, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward slot (the cached _paramsBuf's per-call CopyFromCPU is a
+            // synchronous H2D, illegal mid-capture, and would alias across distinct ConvTranspose configs).
+            paramsView = Kernels.CaptureParamArena.Shared(_accelerator).RentStableSlot(packed);
+        }
+        else
+        {
+            _paramsBuf ??= _accelerator.Allocate1D<int>(8);
+            _paramsBuf.CopyFromCPU(packed);
+            paramsView = _paramsBuf.View;
+        }
 
         // Extent spans ALL batches; the kernel decodes the batch index (DAv3 multi-view = N views).
-        _kernel!(batch * outC * outH * outW, input, weight, bias, output, _paramsBuf.View);
+        _kernel!(batch * outC * outH * outW, input, weight, bias, output, paramsView);
     }
 
     public static int OutputSize(int inputSize, int kernelSize, int stride, int padding)

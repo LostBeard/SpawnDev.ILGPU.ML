@@ -41,8 +41,11 @@ internal static class BroadcastHelper
             }
 
             // Direct CPU->GPU upload to output (was AllocatePermanent + Scale, leaked
-            // a permanent buffer per call - see ExpandOperator for the same fix).
-            ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
+            // a permanent buffer per call - see ExpandOperator for the same fix). Skipped under CUDA-graph
+            // capture (both inputs constant → output constant; the deterministic node-output buffer already
+            // holds it from the warm pass; a synchronous H2D is illegal mid-capture).
+            if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+                ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
         }
         else if (bVals != null && a.ElementCount > b.ElementCount)
         {
@@ -57,8 +60,20 @@ internal static class BroadcastHelper
                 int bIdx = MapIndex(i, outStrides, bStrides, outShape.Length);
                 bExpanded[i] = bIdx < bVals.Length ? bVals[bIdx] : 0f;
             }
-            var bExpandedTensor = ctx.Pool.Rent(outShape, "_broadcast_b_expanded");
-            bExpandedTensor.Data.SubView(0, outCount).CopyFromCPU(bExpanded);
+            Tensor bExpandedTensor;
+            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+            {
+                // CUDA-graph capture: "_broadcast_b_expanded" is a transient reused pool buffer, so skipping its
+                // H2D would leave stale data. The expanded constant is deterministic — use a stable arena slot
+                // (written in warm, skip-write in capture). Not pool-registered → Pool.Return is a safe no-op.
+                var bView = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(bExpanded);
+                bExpandedTensor = new Tensor(bView, outShape, "_broadcast_b_expanded");
+            }
+            else
+            {
+                bExpandedTensor = ctx.Pool.Rent(outShape, "_broadcast_b_expanded");
+                bExpandedTensor.Data.SubView(0, outCount).CopyFromCPU(bExpanded);
+            }
             // Use GPU N-D broadcast kernel (a and bExpanded are same shape → element-wise)
             reg.ElementWise.BroadcastBinaryOpND(
                 a.Data, bExpandedTensor.Data, ctx.Outputs[0].Data,
@@ -551,8 +566,21 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
                 var expanded = new float[outCount];
                 for (int i = 0; i < outCount; i++)
                     expanded[i] = bVals[i % bVals.Length];
-                var expandedTensor = ctx.Pool.Rent(ctx.Outputs[0].Shape, "_pow_exp");
-                expandedTensor.Data.SubView(0, outCount).CopyFromCPU(expanded);
+                Tensor expandedTensor;
+                if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+                {
+                    // CUDA-graph capture: the exponent is constant for a fixed input shape, but "_pow_exp" is a
+                    // transient reused pool buffer — skipping its H2D would leave STALE data. Use a stable arena
+                    // slot (deterministic k-th float rent → this Pow's exponent), written in warm, skip-write in
+                    // capture. Not pool-registered, so the Pool.Return below is a safe no-op.
+                    var expView = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(expanded);
+                    expandedTensor = new Tensor(expView, ctx.Outputs[0].Shape, "_pow_exp");
+                }
+                else
+                {
+                    expandedTensor = ctx.Pool.Rent(ctx.Outputs[0].Shape, "_pow_exp");
+                    expandedTensor.Data.SubView(0, outCount).CopyFromCPU(expanded);
+                }
                 reg.ElementWise.Pow(a.Data, expandedTensor.Data, ctx.Outputs[0].Data, outCount);
                 ctx.Pool.Return(expandedTensor);
             }

@@ -74,6 +74,8 @@ public sealed class CaptureParamArena : IDisposable
         }
         else
         {
+            if (GraphExecutor.SuppressDrains && GraphExecutor.CaptureTraceFile != null)
+            { try { System.IO.File.AppendAllText(GraphExecutor.CaptureTraceFile, $"   -> ARENA-ALLOC int slot={i} len={data.Length}  (capture sizing gap)\n"); } catch { } }
             // First time this cursor is used, or a longer params array than the slot was sized for.
             slot = _accelerator.Allocate1D<int>(data.Length);
             if (i < _slots.Count) { _slots[i].Dispose(); _slots[i] = slot; }
@@ -101,6 +103,8 @@ public sealed class CaptureParamArena : IDisposable
         }
         else
         {
+            if (GraphExecutor.SuppressDrains && GraphExecutor.CaptureTraceFile != null)
+            { try { System.IO.File.AppendAllText(GraphExecutor.CaptureTraceFile, $"   -> ARENA-ALLOC float slot={i} len={data.Length}  (capture sizing gap)\n"); } catch { } }
             slot = _accelerator.Allocate1D<float>(data.Length);
             if (i < _floatSlots.Count) { _floatSlots[i].Dispose(); _floatSlots[i] = slot; }
             else _floatSlots.Add(slot);

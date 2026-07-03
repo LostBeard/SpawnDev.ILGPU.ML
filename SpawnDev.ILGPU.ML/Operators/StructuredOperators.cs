@@ -1959,8 +1959,11 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
                 var result = new float[outCount];
                 int outIdx = 0;
                 SliceCPU(inVals, result, inShape, sliceStarts, sliceEnds, sliceSteps, inStrides, rank, 0, 0, ref outIdx);
-                // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
-                ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
+                // Direct CPU->GPU upload (was AllocatePermanent + Scale leak). Skipped under CUDA-graph capture
+                // (synchronous H2D is illegal mid-capture; the deterministic pool buffer already holds this
+                // constant slice value from the warm pass).
+                if (!SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+                    ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
                 return;
             }
         }

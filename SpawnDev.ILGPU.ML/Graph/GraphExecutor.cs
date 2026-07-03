@@ -33,6 +33,9 @@ public class GraphExecutor : IDisposable
     // super-linear per-node CPU residual that forced multimodal prefill token-by-token. Built lazily.
     private Dictionary<string, int>? _baseRefCounts;       // node-input refcounts; graph OUTPUTS + WEIGHTS pinned to int.MaxValue
     private Dictionary<string, float[]>? _cleanConstants;   // _constantValues with non-Constant-node outputs already stripped
+    // CUDA-graph capture: the full runtimeConstants snapshot from the last warm pass (UseCaptureParamSlots &&
+    // !SuppressDrains). Seeded into the capture pass so it needs no readbacks yet elides identically to warm.
+    private Dictionary<string, float[]>? _captureRuntimeSeed;
 
     private void EnsureRunTemplates()
     {
@@ -1530,6 +1533,13 @@ public class GraphExecutor : IDisposable
         foreach (var name in inputs.Keys) refCounts[name] = int.MaxValue;
 
         var runtimeConstants = new Dictionary<string, float[]>(_cleanConstants!);
+        // CUDA-graph capture: seed the FULL runtime-constant set captured from the warm pass. The capture pass
+        // skips ALL per-node readbacks (a readback is illegal mid-capture), so without this seed a downstream
+        // shape op whose value was read back in warm would be MISSING here → it would dispatch instead of elide
+        // → the per-forward arena rent sequence would diverge from warm → a slot resize (cuMemAlloc) mid-capture.
+        // Seeding keeps the elide decisions (and thus the whole rent/dispatch sequence) identical to the warm pass.
+        if (UseCaptureParamSlots && SuppressDrains && _captureRuntimeSeed != null)
+            foreach (var kv in _captureRuntimeSeed) runtimeConstants[kv.Key] = kv.Value;
         // Runtime CPU shape interpreter (gated on ShapeSubgraphFoldEnabled): shape-op outputs it resolves on the
         // CPU this run. Their value is put straight into runtimeConstants and their per-node GPU->CPU readback is
         // skipped - correct by construction because it reads the REAL runtime tensor shapes as tensors flow.
@@ -1813,12 +1823,22 @@ public class GraphExecutor : IDisposable
                     // normally, so this pooled tensor is released after its last consumer.
                     if (shapeInterp && runtimeConstants.TryGetValue(name, out var cval) && cval.Length > 0)
                     {
-                        var mt = _pool.Rent(new[] { cval.Length }, name);
-                        // CUDA-graph capture: a synchronous CopyFromCPU (H2D) is illegal mid-capture. The pool is
-                        // deterministic for a fixed input shape, so the buffer Rented here is the SAME one the warm
-                        // pass wrote this (constant) shape value into — skip the re-upload during the capture pass.
-                        if (!SuppressDrains)
+                        Tensor mt;
+                        if (UseCaptureParamSlots)
+                        {
+                            // CUDA-graph capture: a pool Rent here can cuMemAlloc (illegal mid-capture — the pool's
+                            // on-demand materialization buckets aren't primed like the per-node output buckets). Use a
+                            // stable arena buffer holding this constant shape value instead. It is NOT registered in the
+                            // pool's _namedBuffers, so ReleaseConsumedInputs' _pool.Return(mt) is a safe no-op. The H2D
+                            // is skipped under SuppressDrains (the warm pass already wrote this slot; value is constant).
+                            var matView = Kernels.CaptureParamArena.Shared(_accelerator).RentStableSlotFloat(cval);
+                            mt = new Tensor(matView, new[] { cval.Length }, name);
+                        }
+                        else
+                        {
+                            mt = _pool.Rent(new[] { cval.Length }, name);
                             mt.Data.SubView(0, cval.Length).CopyFromCPU(cval);
+                        }
                         tensors[name] = mt;
                         tensor = mt;
                     }
@@ -2584,7 +2604,10 @@ public class GraphExecutor : IDisposable
             // operators need for parameter resolution (Slice starts/ends, Reshape dims, Expand shapes).
             // Was ≤2048 with double-sync per node — killed GPT-2 perf with hundreds of unnecessary syncs.
             // Shape-cache hit already published its value above (no GPU output to read) — skip.
-            if (!shapeCacheHit)
+            // CUDA-graph capture: a readback (Allocate1D + SynchronizeAsync + CopyToHostAsync) is illegal
+            // mid-capture. For a fixed input shape these values are constant and the warm passes already
+            // seeded/consumed them; skip the whole readback loop during the capture pass.
+            if (!shapeCacheHit && !SuppressDrains)
             for (int oi = 0; oi < nodeOutputs.Length; oi++)
             {
                 var outTensor = nodeOutputs[oi];
@@ -2880,6 +2903,11 @@ public class GraphExecutor : IDisposable
                 _readbackProbe = null;
             }
         }
+
+        // CUDA-graph capture: snapshot this warm pass's full runtimeConstants so the capture pass can seed it
+        // (see the seed at RunAsync start) and thus skip every readback while eliding identically.
+        if (UseCaptureParamSlots && !SuppressDrains)
+            _captureRuntimeSeed = new Dictionary<string, float[]>(runtimeConstants);
 
         _runSw.Stop(); LastRunTotalMs = _runSw.Elapsed.TotalMilliseconds;
         return results;
