@@ -4,6 +4,23 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### WebGPU dispatch-elide gap FIXED (zero-length values) + elide-ON plan capture (Seven)
+
+The tracked executor gap - "Tensor 'X' not found (needed by Cast)" under fold+elide on WebGPU -
+root-caused by a new throw-site invariant diagnostic (`producerOp=Slice elidedThisRun=True
+inRuntimeConstants=True constLen=0`): a shape op producing a legitimately EMPTY value (DAv3
+`blocks.N/attn` Slice -> Cast, an empty dim-list slice) was elided, but the on-demand materializer
+requires len>0, so its GPU consumer threw. Fix: zero-length values are excluded from `elideSafe`
+and DISPATCH via the proven path (which produces the real empty GPU tensor). New gate
+`DA3_WebGPU_ElideOn_Forward` - full elide-ON forward, range 0.136470 correct. `WebGPUGraphCapture`
+now captures under dispatch-elide (CUDA-capture parity): plan 2515 -> 2130 ops. Honest accounting:
+the elidable class on this graph is ~385 tiny shape passes (~2-3ms), NOT the ~1200 once hoped - the
+tail is mostly feature-tensor elementwise ops. Replay frame: best measured **64.4ms**, run-to-run
+band ~64-76ms (GPU clock state; measured by identical back-to-back runs), vs ORT-Web 73ms.
+Also: measured-NEGATIVE result recorded - a vec4 F4/AsAligned16 tile-load variant of the
+reg-blocked fused linear passed 62/62 but measured 11.0 -> 11.9ms in-frame (shared-tile staging is
+already coalesced); reverted, documented in the new aligned-shape test's doc block.
+
 ### 🏆 DAv3 WebGPU 66.1ms/frame bit-exact - UNDER ORT-Web's 73ms (Seven)
 
 The beat-ORT milestone. Attribution named `FusedAttentionPerQueryRegister` as 56% of the frame

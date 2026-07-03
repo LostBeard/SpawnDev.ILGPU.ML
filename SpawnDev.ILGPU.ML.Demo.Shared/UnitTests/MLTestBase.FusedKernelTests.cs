@@ -144,6 +144,53 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// ALIGNED-SHAPE + ragged-M coverage of the register-blocked path: K%16==0 and N%64==0 (exact K-tiles,
+    /// full N-tiles) with M=70 ragged rows - the DAv3 linear regime (K/N are 16/64-multiples, M = token
+    /// count). The sibling tests above use K=130/N=100 on purpose (partial-tile coverage); this is the
+    /// aligned twin, covering None + GELU write-backs vs the CPU reference. HISTORY (2026-07-03): a vec4
+    /// F4/AsAligned16 tile-load variant of the reg-blocked kernel was built, gated on exactly these shapes,
+    /// passed this test 62/62 - and measured NEUTRAL-TO-NEGATIVE in the DAv3 WebGPU frame (11.0 -> 11.9ms;
+    /// the shared-tile staging is already fully coalesced, so load width is not this kernel's bottleneck,
+    /// unlike the per-thread-streaming attention loop where vec4+hoist gave 3.7x). Reverted per measurement;
+    /// don't re-add without a new attribution case.
+    /// </summary>
+    [TestMethod]
+    public async Task FusedLinear_RegBlocked_AlignedShape_RaggedM_MatchesReference() => await RunTest(async accelerator =>
+    {
+        int M = 70, K = 128, N = 128; // K%16==0, N%64==0 (aligned tiles); M ragged
+        var input = RandomFloats(M * K, seed: 430);
+        var weights = RandomFloats(K * N, seed: 431, scale: 0.1f);
+        var bias = RandomFloats(N, seed: 432, scale: 0.5f);
+
+        var expectedNone = CpuMatMul(input, weights, M, K, N);
+        for (int r = 0; r < M; r++)
+        for (int c = 0; c < N; c++)
+            expectedNone[r * N + c] += bias[c];
+
+        using var inBuf = accelerator.Allocate1D(input);
+        using var wBuf = accelerator.Allocate1D(weights);
+        using var bBuf = accelerator.Allocate1D(bias);
+        using var outBuf = accelerator.Allocate1D<float>(M * N);
+
+        var fused = new FusedLinearKernel(accelerator);
+        fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.None);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expectedNone, 1e-3f, "FusedLinear+None (reg-blocked, aligned tiles, ragged M): ");
+
+        var expectedGelu = new float[M * N];
+        for (int i = 0; i < M * N; i++)
+        {
+            float x = expectedNone[i];
+            if (x > 10f) expectedGelu[i] = x;
+            else if (x < -10f) expectedGelu[i] = 0f;
+            else expectedGelu[i] = 0.5f * x * (1f + ErfApprox(x * 0.7071067811865475f));
+        }
+        fused.Forward(inBuf.View, wBuf.View, bBuf.View, outBuf.View, M, K, N, FusedActivation.GELU);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View.SubView(0, M * N), expectedGelu, 1e-2f, "FusedLinear+GELU (reg-blocked, aligned tiles, ragged M): ");
+    });
+
+    /// <summary>
     /// REGISTER-BLOCKED FusedLinear with a NATIVE low-precision weight (fp16/bf16) at M,N >= 64 — the SD
     /// ResNet/FFN regime. ForwardLowP routes the large low-p linear to the 64×64-tile / 4×4-register kernel
     /// (weight decoded once on the shared-mem load, bias+activation fused in the write-back) instead of the

@@ -485,6 +485,58 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// ELIDE-ON WebGPU forward: the tracked executor gap ("Tensor 'X' not found (needed by Cast)"
+    /// under fold+elide on WebGPU) blocks stripping ~1200 shape dispatches (~10-12ms of the 63ms
+    /// GPU frame) from the captured plan. This test IS the repro + the gate: it runs the full DAv3
+    /// forward with fold+elide ON - a failure names the missing tensor and its consumer; a pass
+    /// (correct range) means the gap is fixed and the elide-ON plan capture can proceed.
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> DA3_WebGPU_ElideOn_Forward() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only elide-gap repro/gate");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+        try
+        {
+            var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+                externalData: extDataBytes);
+            using var pipeline = new Pipelines.DepthEstimationPipeline(session, accelerator);
+
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) { int v = (int)(x / (float)(W - 1) * 255f); rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v; }
+
+            var sw = Stopwatch.StartNew();
+            var (rawDepth, minD, maxD, outW, outH) = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+            sw.Stop();
+            rawDepth.Dispose();
+            float range = maxD - minD;
+            var report = $"ELIDE-ON forward {sw.Elapsed.TotalSeconds:F1}s | range={range:F6} (ref 0.1365) | elided: see LastRunOpLog | {outW}x{outH}";
+            Console.WriteLine($"[DA3-ElideOn] {report}");
+            if (MathF.Abs(range - 0.1365f) > 0.01f)
+                throw new Exception($"elide-ON forward range WRONG: {range:F6} vs ref 0.1365 - elide corrupted the forward");
+            return report;
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        }
+    });
+
+    /// <summary>
     /// ISOLATION for the WebGPU range deviation (0.161563 vs desktop 0.1365, found by the cold run
     /// with the interpreter ON): the SAME forward with the interpreter fully OFF - the pure master
     /// executor path (every shape op readback happens, ~1416 x ~345ms, so ONE forward only).

@@ -1544,6 +1544,7 @@ public class GraphExecutor : IDisposable
         // CPU this run. Their value is put straight into runtimeConstants and their per-node GPU->CPU readback is
         // skipped - correct by construction because it reads the REAL runtime tensor shapes as tensors flow.
         var shapeInterpVals = new Dictionary<string, float[]>();
+        var elidedOutputs = new HashSet<string>();   // elide-gap diagnostics (throw-site invariant report)
         // Gate the CPU shape interpreter to the browser GPU backends. On WebGPU/WebGL a per-op readback is a
         // ~345ms mapAsync round-trip, so computing shape ops on the CPU + skipping the readback is a massive win.
         // On CUDA/OpenCL/CPU a readback is a cheap synchronous memcpy, so the interpreter's CPU->GPU write cost is
@@ -1756,12 +1757,20 @@ public class GraphExecutor : IDisposable
                 // the readback-skip (value already in runtimeConstants); only their GPU dispatch is retained.
                 // Provably safe: a non-elided op falls back to the proven elide-off path (dispatch + real tensor).
                 bool elideSafe = !IsRankChangingShapeOp(node.OpType)
+                    // Zero-length values canNOT be elided: the on-demand materializer requires len>0
+                    // (a pool tensor can't be empty), so a GPU consumer of an elided EMPTY value throws
+                    // "Tensor not found". Empty results are legitimate (DAv3 blocks.N/attn Slice → Cast:
+                    // an empty dim-list slice) - they just must DISPATCH via the proven path, which
+                    // produces the real empty GPU tensor. This was THE WebGPU elide gap (2026-07-03;
+                    // diagnostic: elidedThisRun=True inRuntimeConstants=True constLen=0).
+                    && cpuShapeVal.Length > 0
                     && cpuShapeVal.Length <= 64
                     && node.OutputShapes.Length > 0 && node.OutputShapes[0].Length <= 1
                     && !ElideBlockedOutputs().Contains(node.OutputNames[0]);   // path-c: no GPU-tensor consumer
                 if (ShapeInterpElideDispatch && elideSafe)
                 {
                     if (CaptureTraceFile != null) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> ELIDED\n"); } catch { } }
+                    elidedOutputs.Add(node.OutputNames[0]);
                     ReleaseConsumedInputs(node);
                     nodeIdx++;
                     LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~cpu-elided");
@@ -1843,7 +1852,17 @@ public class GraphExecutor : IDisposable
                         tensor = mt;
                     }
                     else
-                        throw new InvalidOperationException($"Tensor '{name}' not found (needed by {node.OpType})");
+                    {
+                        // Elide-gap diagnostic: name every invariant so the failure mode reads off the message.
+                        var producer = _graph.Nodes.FirstOrDefault(n => n.OutputNames.Contains(name));
+                        throw new InvalidOperationException(
+                            $"Tensor '{name}' not found (needed by {node.OpType}). Diagnostic: " +
+                            $"producerOp={producer?.OpType ?? "NONE"} elidedThisRun={elidedOutputs.Contains(name)} " +
+                            $"inRuntimeConstants={runtimeConstants.ContainsKey(name)} " +
+                            $"constLen={(runtimeConstants.TryGetValue(name, out var dv) ? dv.Length : -1)} " +
+                            $"shapeInterp={shapeInterp} inHalf={halfTensors.ContainsKey(name)} " +
+                            $"elideBlocked={ElideBlockedOutputs().Contains(name)}");
+                    }
                 }
                 nodeInputs[i] = tensor;
             }

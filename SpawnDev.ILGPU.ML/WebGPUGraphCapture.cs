@@ -96,12 +96,12 @@ public sealed class WebGPUGraphCapture : IDisposable
         bool prevValidate = GraphExecutor.ShapeInterpValidate;
         bool prevBgCache = WebGPUBackend.EnableBindGroupCaching;
         GraphCompiler.ShapeSubgraphFoldEnabled = true;
-        // NOTE: dispatch-elide stays OFF here (unlike the CUDA capture): elide has a WebGPU-specific
-        // gap (an elided shape value consumed by a GPU-tensor reader is missing from runtimeConstants
-        // -> "Tensor not found"; tracked, executor lane). The plan does not need elide - the shape-op
-        // dispatches are simply recorded as extra tiny entries, and a REPLAY never needs the shape
-        // VALUES at all (they only steer .NET-side orchestration during the capture pass itself).
-        GraphExecutor.ShapeInterpElideDispatch = false;
+        // Dispatch-elide ON (same as the CUDA capture): CPU-resolved shape ops don't dispatch, so the
+        // captured plan is the pure compute forward - ~1200 fewer per-frame GPU passes on replay.
+        // (The old WebGPU gap - "Tensor not found" when a GPU consumer read an elided EMPTY value -
+        // was fixed 2026-07-03: zero-length values are excluded from elide in GraphExecutor.elideSafe
+        // and dispatch normally; gate = DA3_WebGPU_ElideOn_Forward.)
+        GraphExecutor.ShapeInterpElideDispatch = true;
         GraphExecutor.ShapeInterpValidate = false;
         WebGPUBackend.EnableBindGroupCaching = false;
         FusedAttentionKernel.UseStableCaptureSlots = true;
