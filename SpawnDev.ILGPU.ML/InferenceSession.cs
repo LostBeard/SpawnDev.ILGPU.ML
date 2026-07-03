@@ -132,6 +132,9 @@ public class InferenceSession : IDisposable
     /// <summary>Access to the underlying GraphExecutor (for KV cache management).</summary>
     public GraphExecutor Executor => _executor;
 
+    /// <summary>The accelerator this session runs on (used by the CUDA-graph capture path).</summary>
+    public Accelerator Accelerator => _accelerator;
+
     private InferenceSession(Accelerator accelerator, OperatorRegistry registry,
         CompiledGraph compiled, GraphExecutor executor, BufferPool pool,
         Dictionary<string, Tensor> weights)

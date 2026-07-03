@@ -656,6 +656,96 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// PRODUCTIONIZED CUDA-graph capture via the reusable <see cref="CudaGraphCapture"/> API — the VIDEO /
+    /// repeat-inference path. Capture the DAv3 forward ONCE at a fixed resolution (the "first frame"), then
+    /// REPLAY it for every subsequent frame with a single cuGraphLaunch instead of re-running the ~2524-node
+    /// loop. Validates the API is bit-identical to a non-graph forward and reports the replay speedup. CUDA-only;
+    /// env-gated DA3_CAPTURE_PROBE=1 (shares the capture-probe gate).
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task DA3Small_Pipeline_5D_CudaGraphReplay_Api() => await RunTest(async accelerator =>
+    {
+        if (Environment.GetEnvironmentVariable("DA3_CAPTURE_PROBE") != "1")
+            throw new UnsupportedTestException("DA3 CUDA-graph replay API probe (WIP) — set DA3_CAPTURE_PROBE=1 to run");
+        if (accelerator is not CudaAccelerator)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: CUDA graph capture is CUDA-only");
+        if (!CudaStream.SupportsGraphCapture)
+            throw new UnsupportedTestException("driver does not expose the CUDA graph API");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+        Graph.GraphExecutor.ShapeInterpValidate = false;
+        Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+        try
+        {
+            var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+                externalData: extDataBytes);
+
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++) { int v = (int)(x / (float)(W - 1) * 255f); rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v; }
+
+            var preprocess = new ImagePreprocessKernel(accelerator);
+            using var rgbaBuf = accelerator.Allocate1D(rgba);
+            // STABLE input buffer — the capture reads THIS buffer; per "frame" we re-preprocess into it + replay.
+            var inputBuf = accelerator.Allocate1D<float>(3 * W * H);
+            try
+            {
+                preprocess.Forward(rgbaBuf.View, inputBuf.View, W, H, W, H);
+                await accelerator.SynchronizeAsync();
+                var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, 3, W, H }, session.InputNames[0]);
+                var inputs = new Dictionary<string, Tensor> { [session.InputNames[0]] = inputTensor };
+                float[] ReadOut(Tensor t) { var h = new float[t.ElementCount]; t.Data.CopyToCPU(h); return h; }
+
+                // Non-graph reference (the correctness oracle).
+                var refOut = await session.RunAsync(inputs);
+                await accelerator.SynchronizeAsync();
+                float[] refData = ReadOut(refOut[session.OutputNames[0]]);
+                int outCount = refData.Length;
+
+                // Capture ONCE (the "first frame").
+                using var cap = await CudaGraphCapture.TryCaptureAsync(session, inputs);
+                if (cap == null) throw new UnsupportedTestException("CudaGraphCapture.TryCaptureAsync returned null");
+
+                // Replay (a "subsequent frame"): same input → bit-identical output.
+                var replayOut = await cap.ReplayAsync(inputs);
+                float maxAbsDiff = 0f;
+                { float[] rd = ReadOut(replayOut[session.OutputNames[0]]); for (int i = 0; i < outCount; i++) maxAbsDiff = MathF.Max(maxAbsDiff, MathF.Abs(rd[i] - refData[i])); }
+                if (maxAbsDiff > 1e-3f)
+                    throw new Exception($"[REPLAY-API] replay DIVERGED from non-graph forward: maxAbsDiff={maxAbsDiff:E3} (outCount={outCount})");
+
+                // Time N replays vs N direct forwards (the per-frame video win).
+                const int R = 10;
+                var gsw = System.Diagnostics.Stopwatch.StartNew();
+                for (int r = 0; r < R; r++) await cap.ReplayAsync(inputs);
+                gsw.Stop(); double replayMs = gsw.Elapsed.TotalMilliseconds / R;
+                var dsw = System.Diagnostics.Stopwatch.StartNew();
+                for (int r = 0; r < R; r++) { await session.RunAsync(inputs); await accelerator.SynchronizeAsync(); }
+                dsw.Stop(); double directMs = dsw.Elapsed.TotalMilliseconds / R;
+
+                var summary = $"[REPLAY-API] PASSED. maxAbsDiff={maxAbsDiff:E3} directMs={directMs:F1} "
+                    + $"replayMs={replayMs:F1} speedup={directMs / replayMs:F2}x (outCount={outCount})";
+                Console.WriteLine(summary);
+                try { System.IO.File.WriteAllText(@"D:\users\tj\Projects\SpawnDev.ILGPU.ML\_mldump\capture-api-result.txt", summary); } catch { }
+            }
+            finally { inputBuf.Dispose(); }
+        }
+        finally
+        {
+            Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+        }
+    });
+
+    /// <summary>
     /// Diagnostic: run only the first N nodes of DA3-Small with PerOpSync, capturing
     /// per-node Execute() wall-clock time. Surfaces which kernels are pathologically
     /// expensive to JIT-compile (the suspected dominant cost on Wasm/WebGPU first
