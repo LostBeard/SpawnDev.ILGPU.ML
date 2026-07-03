@@ -4,6 +4,15 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Per-kernel GPU-time attribution of the replay frame (Seven)
+
+`WebGPUGraphCapture.ReplayTimedAsync()` (consuming SpawnDev.ILGPU `4.17.2-local.5`'s timed
+dispatch-plan replay): replays the captured forward with a WebGPU 'timestamp-query' timestamp per
+compute pass and returns GPU ms aggregated by kernel label, sorted descending - the instrument that
+decomposes the ~102ms GPU floor into named kernels on hardware. `DA3_WebGPU_PlanReplay_VsOrtWeb` now
+logs the full attribution JSON and appends the top-5 kernels to its report. PMT harness adds
+`--enable-webgpu-developer-features` (unquantized GPU timestamps; Chrome otherwise rounds to 100us).
+
 ### Replay-frame split measured: the WebGPU replay is ~98.5% GPU execution - pipelining is NOT the lever (Seven)
 
 `WebGPUGraphCapture` replay instrumentation (consuming SpawnDev.ILGPU `4.17.2-local.4`'s

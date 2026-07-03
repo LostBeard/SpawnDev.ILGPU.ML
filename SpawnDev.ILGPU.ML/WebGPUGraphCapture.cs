@@ -187,6 +187,15 @@ public sealed class WebGPUGraphCapture : IDisposable
         return _outputs;
     }
 
+    /// <summary>
+    /// Replays the captured forward with per-pass GPU timestamps and returns the JSON kernel
+    /// attribution from <see cref="WebGPUDispatchPlan.ReplayTimedAsync"/> (GPU ms by kernel label,
+    /// sorted descending; <c>{"supported":false}</c> when the device lacks 'timestamp-query').
+    /// Same validity contract as <see cref="ReplayAsync"/>; runs against the current stable input
+    /// buffer contents and waits for completion internally. Diagnostic - do not frame-time with it.
+    /// </summary>
+    public Task<string> ReplayTimedAsync() => _plan.ReplayTimedAsync();
+
     public void Dispose()
     {
         try { _plan.Dispose(); } catch { }

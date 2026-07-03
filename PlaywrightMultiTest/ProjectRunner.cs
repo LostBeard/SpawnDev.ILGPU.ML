@@ -238,6 +238,10 @@ namespace PlaywrightMultiTest
                                     "--ignore-gpu-blocklist",
                                     // Fail loudly rather than silently falling back to SwiftShader again.
                                     "--disable-software-rasterizer",
+                                    // Unquantized GPU timestamps for 'timestamp-query' (Chrome otherwise
+                                    // rounds to 100us, which zeroes most per-pass durations in the
+                                    // dispatch-plan kernel attribution).
+                                    "--enable-webgpu-developer-features",
                                     "--no-sandbox",
                                     // Auto-grant file system write permission (no prompt)
                                     "--disable-features=FileSystemAccessPermissionPrompt",

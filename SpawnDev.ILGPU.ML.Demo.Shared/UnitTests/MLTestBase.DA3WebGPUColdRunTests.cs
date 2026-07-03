@@ -307,7 +307,24 @@ public abstract partial class MLTestBase
             double replayMs = rsw.Elapsed.TotalMilliseconds / R;
             string split = $"planCall {sumPlan / R:F1}ms (jsEncode {sumJsEncode / R:F1} + jsSubmit {sumJsSubmit / R:F1}) + gpuWait {sumSync / R:F1}ms";
 
-            var report = $"dispatches={cap.DispatchCount} | direct {directMs:F0}ms -> replay {replayMs:F1}ms/frame = {directMs / replayMs:F1}x | split: {split} | maxAbsDiff={maxAbsDiff:E2} | ORT-Web warm ref 73ms";
+            // Per-kernel GPU-time attribution (timestamp-query): decomposes the gpuWait term by
+            // kernel label. Chunk the JSON across console lines (single huge lines get truncated).
+            var attribution = await cap.ReplayTimedAsync();
+            for (int ofs = 0; ofs < attribution.Length; ofs += 800)
+                Console.WriteLine($"[Benchmark][PlanReplay][Attribution {ofs / 800}] {attribution.Substring(ofs, Math.Min(800, attribution.Length - ofs))}");
+            string topKernels = "";
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(attribution);
+                if (doc.RootElement.TryGetProperty("kernels", out var kernels))
+                    topKernels = " | topGPU: " + string.Join(", ", kernels.EnumerateArray().Take(5)
+                        .Select(k => $"{k.GetProperty("label").GetString()}={k.GetProperty("ms").GetDouble():F1}ms x{k.GetProperty("count").GetInt32()}"));
+                else if (doc.RootElement.TryGetProperty("reason", out var reason))
+                    topKernels = $" | attribution unavailable: {reason.GetString()}";
+            }
+            catch (Exception ex) { topKernels = $" | attribution parse failed: {ex.Message}"; }
+
+            var report = $"dispatches={cap.DispatchCount} | direct {directMs:F0}ms -> replay {replayMs:F1}ms/frame = {directMs / replayMs:F1}x | split: {split}{topKernels} | maxAbsDiff={maxAbsDiff:E2} | ORT-Web warm ref 73ms";
             Console.WriteLine($"[DA3-PlanReplay] {report}");
             return report;
         }
