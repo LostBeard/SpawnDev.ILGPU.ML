@@ -402,6 +402,63 @@ public abstract partial class MLTestBase
         }
     });
 
+    // GGUF DECODE PERF (the Ollama-clone / ai-chat hot loop): same hub-stream qwen2.5-0.5b load as the
+    // correctness tests, then MEASURE prefill ms + decode ms/token via onDelta timestamps, plus the
+    // executor's per-step split (readbacks / sync drains / total). WebGPU is the campaign target; CUDA
+    // runs as the desktop reference. This is the baseline the decode capture/replay lever is judged by.
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task<string> GGUF_DecodePerf_Baseline() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU && accelerator.AcceleratorType != AcceleratorType.Cuda)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: decode-perf baseline runs on the campaign target (WebGPU) + desktop reference (CUDA)");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+        const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(12));
+            var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 512, ct: cts.Token))
+            {
+                var messages = new[] { ("user", "Write one sentence about the ocean.") };
+                var cfg = new GenerationConfig { MaxNewTokens = 32, Strategy = "greedy" };
+
+                // Warm pass: shader JIT + pools (not measured).
+                await pipe.GenerateAsync(new[] { ("user", "Hi") },
+                    config: new GenerationConfig { MaxNewTokens = 4, Strategy = "greedy" }, ct: cts.Token);
+
+                // Measured pass: per-delta timestamps split prefill (start -> first token) from decode.
+                var stamps = new List<double>();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var answer = await pipe.GenerateAsync(messages, config: cfg,
+                    onToken: (_, _) => { stamps.Add(sw.Elapsed.TotalMilliseconds); return Task.CompletedTask; },
+                    ct: cts.Token);
+                sw.Stop();
+                if (stamps.Count < 8) throw new Exception($"decode produced only {stamps.Count} deltas: '{answer.Trim()}'");
+                double prefillMs = stamps[0];
+                double decodeMs = (stamps[^1] - stamps[0]) / (stamps.Count - 1);
+                var report = $"prefill {prefillMs:F0}ms | decode {decodeMs:F1}ms/tok = {1000.0 / decodeMs:F1} tok/s ({stamps.Count} toks) "
+                    + $"| lastStep: total {Graph.GraphExecutor.LastRunTotalMs:F1}ms readbacks {Graph.GraphExecutor.LastRunReadbackMs:F1}ms/{Graph.GraphExecutor.LastRunReadbackCount} "
+                    + $"drains {Graph.GraphExecutor.LastRunSyncDrainMs:F1}ms/{Graph.GraphExecutor.LastRunSyncDrainCount}";
+                Console.WriteLine($"[GGUF-DecodePerf][{accelerator.AcceleratorType}] {report}");
+                return report;
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
+
     // EXACT /ai-chat page path: stream a real GGUF LLM (qwen2.5:0.5b-instruct q8_0) from OUR live hub
     // (hub.spawndev.com → HF repo, seekable torrent / web-seed) and load it via the architecture-agnostic
     // GgufTextGenerationPipeline.CreateFromStreamAsync — weights stream straight to the GPU, never held whole in
