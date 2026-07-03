@@ -267,6 +267,7 @@ string answer = await pipe.GenerateAsync(convo,
             // that alone throttled generation to word-per-second (2026-07-03). 10 renders/sec reads the
             // same to a human; the final render after GenerateAsync shows the complete text.
             var renderClock = System.Diagnostics.Stopwatch.StartNew();
+            var scrollClock = System.Diagnostics.Stopwatch.StartNew();
             var tokStamps = new List<double>();   // perf telemetry (JS console) - negligible cost
             var genClock = System.Diagnostics.Stopwatch.StartNew();
             string answer = await _pipeline.GenerateAsync(convo,
@@ -289,7 +290,13 @@ string answer = await pipe.GenerateAsync(convo,
                     if (renderClock.ElapsedMilliseconds >= 100)
                     {
                         renderClock.Restart();
-                        InvokeAsync(async () => { StateHasChanged(); await ScrollToBottom(); });
+                        // Scroll forces a LAYOUT pass on every call - at ~10 renders/sec on a long
+                        // transcript that cost ~tens of ms/token on the single WASM thread (it
+                        // executes inside the decode loop's awaits). Text renders at 10Hz; the
+                        // scroll snaps at 2Hz, which the eye can't tell apart while streaming.
+                        bool doScroll = scrollClock.ElapsedMilliseconds >= 500;
+                        if (doScroll) scrollClock.Restart();
+                        InvokeAsync(async () => { StateHasChanged(); if (doScroll) await ScrollToBottom(); });
                     }
                     return Task.CompletedTask;
                 },

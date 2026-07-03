@@ -117,6 +117,9 @@ public sealed class WebGPUDecodeCapture : IDisposable
     private GpuArgMax? _argmax;
     private int _vocab;
     private ArrayView1D<float, Stride1D.Dense> _lastLogitsView;
+    private float[]? _logitsHost;            // REUSED host logits buffer - see PatchAndReadLogitsAsync
+    private WebGPUMemoryBuffer? _logitsMb;   // raw readback handle of the logits view
+    private long _logitsByteOfs;
 
     /// <summary>
     /// Capture with the greedy ARGMAX folded into the plan: the partial-argmax kernel over the
@@ -391,7 +394,24 @@ public sealed class WebGPUDecodeCapture : IDisposable
         var t1 = await PatchAllAsync(tokenId, pastLen);
         await _plan.ReplayAsync();
         var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-        var logits = await _lastLogitsView.SubView(0, _vocab).CopyToHostAsync();   // the ONLY per-token fence
+        // REUSED readback: CopyToHostAsync allocated a fresh vocab-sized array per token (~600KB x
+        // 512 toks = 300MB of managed garbage per response; the Mono GC pauses landed inside the
+        // decode fence on the /ai-chat page). Instead: mapAsync readback to a JS Uint8Array (the
+        // per-token fence), then one JS-side Set into a pinned view of ONE reused float[] - zero
+        // managed allocation per token, bytes cross into .NET exactly once.
+        if (_logitsMb == null)
+        {
+            var c = (IContiguousArrayView)_lastLogitsView.BaseView;
+            _logitsMb = c.Buffer as WebGPUMemoryBuffer
+                ?? throw new InvalidOperationException("logits view is not backed by a WebGPU buffer");
+            _logitsByteOfs = c.IndexInBytes;
+            _logitsHost = new float[_vocab];
+        }
+        using (var u8 = await _logitsMb.CopyToHostUint8ArrayAsync(_logitsByteOfs, (long)_vocab * 4))   // the ONLY per-token fence
+        using (var hv = new SpawnDev.BlazorJS.Toolbox.HeapView<float>(_logitsHost!))
+        using (var pinned = hv.As<SpawnDev.BlazorJS.JSObjects.Uint8Array>())
+            pinned.Set(u8);
+        var logits = _logitsHost!;
         var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
         LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
