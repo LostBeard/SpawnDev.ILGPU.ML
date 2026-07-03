@@ -116,6 +116,7 @@ public sealed class WebGPUDecodeCapture : IDisposable
     /// </summary>
     private GpuArgMax? _argmax;
     private int _vocab;
+    private ArrayView1D<float, Stride1D.Dense> _lastLogitsView;
 
     /// <summary>
     /// Capture with the greedy ARGMAX folded into the plan: the partial-argmax kernel over the
@@ -303,7 +304,9 @@ public sealed class WebGPUDecodeCapture : IDisposable
             var cap = new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
                 scalarPatches, copyPatches, slotPatches);
             cap._argmax = argmax;
-            cap._vocab = argmax != null ? LastLogits(capOut).Vocab : 0;
+            var (lastView, lastVocab) = LastLogits(capOut);
+            cap._vocab = lastVocab;
+            cap._lastLogitsView = lastView;
             return cap;
         }
         catch
@@ -374,6 +377,26 @@ public sealed class WebGPUDecodeCapture : IDisposable
         LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
         _session.SetGGUFDecodePastLen(pastLen + 1);
         return token;
+    }
+
+    /// <summary>
+    /// SAMPLED decode step with a SINGLE GPU round-trip: patch + replay + read the last-position
+    /// logits to the host directly - the readback's own mapAsync fence orders after the replay (no
+    /// separate SynchronizeAsync, no intermediate device copy). The caller applies repetition
+    /// penalty / top-k / top-p on the returned array (the /ai-chat page path). ~vocab*4 bytes per
+    /// token; the fence latency dominates, not the bytes.
+    /// </summary>
+    public async Task<float[]> PatchAndReadLogitsAsync(float tokenId, int pastLen)
+    {
+        var t1 = await PatchAllAsync(tokenId, pastLen);
+        await _plan.ReplayAsync();
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        var logits = await _lastLogitsView.SubView(0, _vocab).CopyToHostAsync();   // the ONLY per-token fence
+        var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+        LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
+        LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
+        _session.SetGGUFDecodePastLen(pastLen + 1);
+        return logits;
     }
 
     // Shared patch phase: input token + scalar bytes + slot arrays + copy destinations, with the

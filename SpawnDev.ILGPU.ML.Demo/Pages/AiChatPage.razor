@@ -193,6 +193,13 @@ string answer = await pipe.GenerateAsync(convo,
                 maxSeqLen: 4096,
                 onProgress: (stage, pct) => { _status = $"{Humanize(stage)} {pct}%"; InvokeAsync(StateHasChanged); },
                 ct: _loadCts.Token);
+            // WebGPU decode capture/replay (2026-07-03): the first decode step captures the graph as
+            // a dispatch plan; every token after is a patched single-interop replay with ONE GPU
+            // round-trip (folded argmax on greedy; direct host-logits read for this page's top_p +
+            // repetition-penalty config). Measured qwen2.5-0.5b @ RTX 4070: 1.5 -> 34 tok/s greedy.
+            // No-op on non-WebGPU accelerators. The GEMV reroute un-does a SwiftShader-era exclusion.
+            _pipeline.EnableWebGPUDecodeCapture = true;
+            SpawnDev.ILGPU.ML.Kernels.FusedDequantMatMul.EnableWebGPUGemv = true;
             _arch = _pipeline.Architecture;
             _chatFormat = _pipeline.ChatFormat.ToString();
             _messages.Clear();

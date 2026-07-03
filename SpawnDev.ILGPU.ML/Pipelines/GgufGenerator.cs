@@ -205,9 +205,10 @@ public sealed class GgufGenerator : IDisposable
         {
             if (ct.IsCancellationRequested) { stop = StopReason.Cancelled; break; }
 
-            IReadOnlyDictionary<string, Tensor> outputs;
+            IReadOnlyDictionary<string, Tensor>? outputs;
             MemoryBuffer1D<float, Stride1D.Dense>? inBuf = null;
-            int? fastToken = null;   // greedy single-fence replay token (skips the logits section)
+            int? fastToken = null;        // greedy single-fence replay token (skips the logits section)
+            float[]? fastLogits = null;   // sampled single-fence replay logits (host array, skips the GPU read)
             bool wantSampling = config?.Strategy is "top_k" or "top_p";
             bool wantRepPen = config?.RepetitionPenalty is float rpv && rpv != 1.0f;
             try
@@ -232,10 +233,15 @@ public sealed class GgufGenerator : IDisposable
                     {
                         // Greedy fast path: the plan's folded argmax + ONE fence per token.
                         fastToken = await _decodeCapture.PatchAndDecodeGreedyAsync(stepIds[0], _session.DecodePastLen);
-                        outputs = _decodeCapture.Outputs;
+                        outputs = null;
                     }
                     else
-                        outputs = await _decodeCapture.PatchAndReplayAsync(stepIds[0], _session.DecodePastLen);
+                    {
+                        // Sampled fast path (the /ai-chat top_p + repetition-penalty config): patch +
+                        // replay + direct host logits read - still ONE fence per token.
+                        fastLogits = await _decodeCapture.PatchAndReadLogitsAsync(stepIds[0], _session.DecodePastLen);
+                        outputs = null;
+                    }
                 }
                 else
                     outputs = await RunDirectAsync();
@@ -254,9 +260,21 @@ public sealed class GgufGenerator : IDisposable
             {
                 next = ft;   // greedy replay already produced the token (folded argmax, one fence)
             }
+            else if (fastLogits != null)
+            {
+                // Sampled replay already produced host logits (one fence) - sample on the host.
+                if (wantRepPen && generated.Count > 0)
+                    TextGenerationSampler.ApplyRepetitionPenalty(fastLogits, generated.ToArray(), config!.RepetitionPenalty);
+                next = config?.Strategy switch
+                {
+                    "top_k" => TextGenerationSampler.TopK(fastLogits, config.TopK, config.Temperature, rng),
+                    "top_p" => TextGenerationSampler.TopP(fastLogits, config.TopP, config.Temperature, rng),
+                    _ => TextGenerationSampler.Greedy(fastLogits),
+                };
+            }
             else
             {
-            var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
+            var logitsT = outputs!.TryGetValue("logits", out var l) ? l : outputs.Values.First();
             int vocab = logitsT.Shape[^1];
             int seqOut = logitsT.ElementCount / vocab;
             long lastOff = (long)(seqOut - 1) * vocab;

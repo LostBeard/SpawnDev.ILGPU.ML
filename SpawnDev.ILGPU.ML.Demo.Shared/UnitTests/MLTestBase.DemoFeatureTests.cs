@@ -539,6 +539,10 @@ public abstract partial class MLTestBase
             using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
                 accelerator, model.Stream, maxSeqLen: 1024, ct: cts.Token))
             {
+                // Mirror the /ai-chat page (2026-07-03): decode capture/replay ON (WebGPU-only, no-op
+                // elsewhere) - this test's sampled decode now exercises the single-fence
+                // PatchAndReadLogitsAsync path, exactly what the page runs.
+                pipe.EnableWebGPUDecodeCapture = true;
                 // The exact shape of prompt that looped under greedy. Seeded sampling → deterministic assertion.
                 var messages = new[] { ("user", "List several things you can make with chicken eggs.") };
                 var answer = await pipe.GenerateAsync(messages,
