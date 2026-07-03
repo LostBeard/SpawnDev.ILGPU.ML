@@ -81,6 +81,41 @@ public sealed class GpuArgMax : IDisposable
         return bestIdx;
     }
 
+    /// <summary>
+    /// Dispatch ONLY the partial-argmax kernel (no sync, no readback) - used by the decode
+    /// capture/replay driver to record the argmax INTO the captured dispatch plan, so a replayed
+    /// token needs no separate argmax dispatch. Pair with <see cref="ReadPartialsAsync"/>.
+    /// </summary>
+    public void DispatchPartials(ArrayView1D<float, Stride1D.Dense> logits, int n)
+    {
+        if (n <= 0) return;
+        int P = Math.Min(_numPartials, n);
+        _kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(PartialArgMaxImpl);
+        _partials ??= _accelerator.Allocate1D<float>(2 * _numPartials);
+        _kernel(P, logits, _partials.View, n, P);
+    }
+
+    /// <summary>
+    /// Read the partial pairs and reduce to the argmax index WITHOUT a separate SynchronizeAsync -
+    /// the readback's own mapAsync fence waits for all previously queued work (the replayed plan +
+    /// the in-plan partial kernel), making it the decode loop's ONLY per-token GPU round-trip.
+    /// </summary>
+    public async Task<int> ReadPartialsAsync(int n)
+    {
+        int P = Math.Min(_numPartials, n);
+        var host = await _partials!.CopyToHostAsync<float>(0, 2 * P);
+        float best = float.NegativeInfinity;
+        int bestIdx = 0;
+        for (int p = 0; p < P; p++)
+        {
+            float v = host[2 * p];
+            int pi = (int)host[2 * p + 1];
+            if (v > best || (v == best && pi < bestIdx)) { best = v; bestIdx = pi; }
+        }
+        return bestIdx;
+    }
+
     public void Dispose()
     {
         _partials?.Dispose();

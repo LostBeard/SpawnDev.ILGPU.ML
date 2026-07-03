@@ -71,6 +71,12 @@ public class FusedDequantMatMul : IDisposable
     // achieved bandwidth — the llama.cpp MMVQ structure. CUDA-only (warp==32). Power-of-two.
     private const int Dp4aWarps = 4;
 
+    /// <summary>Route WebGPU M==1 onto the cooperative shared-mem GEMV (hardware re-measurement of
+    /// the voided 2026-06-13 SwiftShader-era "75x slower" exclusion - see the routing comment).
+    /// Env GGUF_GEMV_WEBGPU=1 or set directly. Default OFF until the A/B verdict.</summary>
+    public static bool EnableWebGPUGemv =
+        Environment.GetEnvironmentVariable("GGUF_GEMV_WEBGPU") == "1";
+
     // DIAGNOSTIC TOGGLE (env GGUF_GEMV_OFF=1): force M==1 onto the per-element M*N kernel instead of
     // the shared-memory/barrier GEMV. A/B switch for isolating the M=1 GEMV as a suspect in the CPU
     // KV-decode non-determinism investigation (2026-06-15). Read once; zero cost in production.
@@ -179,15 +185,15 @@ public class FusedDequantMatMul : IDisposable
         // grid-stride emitter bug). But both browser-GPU backends are EXCLUDED for different reasons:
         //  - WebGL: NO workgroup shared memory / barriers (GLSL ES 3.0 Transform-Feedback vertex path) -
         //    a hard capability wall; the GLSL codegen would throw UnsupportedKernelFeatureException.
-        //  - WebGPU: PERF, not correctness. The shared-mem/barrier cooperative GEMV is now correct on
-        //    WebGPU but ~75x SLOWER than the per-element fallback there (MEASURED 2026-06-13, M=1
-        //    K=4096 N=8192 Q4_K, consistent across per-iter-sync / batched-same-output / batched-diff-
-        //    output: WebGPU GEMV ~530 ms/dispatch vs WebGL per-element ~7 ms and CUDA GEMV ~1 ms). The
-        //    workgroup-reduction maps catastrophically onto Tint/Dawn. Until that's fixed, M==1 on
-        //    WebGPU stays on the per-element kernel below. Tracked with Geordi (WGSL workgroup perf).
-        // Both fall through to the general per-element M*N kernel below (correct; the pre-GEMV path).
+        //  - WebGPU: was excluded on a "~75x SLOWER" measurement from 2026-06-13 - which the
+        //    2026-07-03 SwiftShader discovery VOIDED (the PMT browser had no hardware WebGPU then;
+        //    that 530ms/dispatch was a CPU rasterizer choking on workgroup barriers, not Dawn).
+        //    <see cref="EnableWebGPUGemv"/> re-routes WebGPU M==1 onto the cooperative GEMV for the
+        //    hardware re-measurement (decode attribution: the per-element fallback is 72% of the
+        //    decode GPU floor at ~33GB/s effective vs the GEMV's 292GB/s on CUDA).
+        // WebGL falls through to the general per-element M*N kernel below (correct; the pre-GEMV path).
         bool gpuBrowser = _accelerator.AcceleratorType == AcceleratorType.WebGL
-                       || _accelerator.AcceleratorType == AcceleratorType.WebGPU;
+                       || (_accelerator.AcceleratorType == AcceleratorType.WebGPU && !EnableWebGPUGemv);
         if (M == 1 && !gpuBrowser && !ForcePerElementGemv)
         {
             var gemvConfig = new KernelConfig(N, GemvGroupSize);

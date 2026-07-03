@@ -4,6 +4,24 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### 🏆 WebGPU LLM decode 34.1 tok/s (23x): GEMV un-exclusion + argmax folded into the plan (Seven)
+
+Two more levers on top of the patched-replay decode, both token-identical:
+- **`FusedDequantMatMul.EnableWebGPUGemv`**: WebGPU M==1 re-routed onto the cooperative shared-mem
+  GEMV. The old exclusion ("~75x slower", 2026-06-13) was measured on the SwiftShader-CPU harness -
+  VOID; on real Dawn the GEMV nearly HALVED the decode GPU floor (23.3 -> 12.3ms/tok, the
+  FusedDequantQ8_0 term). Opt-in flag (env GGUF_GEMV_WEBGPU=1) pending broader soak; the decode
+  gates run with it ON.
+- **Greedy argmax FOLDED into the captured plan** (`GpuArgMax.DispatchPartials`/`ReadPartialsAsync` +
+  `WebGPUDecodeCapture.PatchAndDecodeGreedyAsync`): the partial-argmax kernel is recorded as the
+  plan's final dispatch, and the partials readback's own mapAsync fence orders after the replay -
+  ONE GPU round-trip per token (was three: replay sync + argmax sync + readback). Decode
+  38.7 -> 29.3ms/tok. The generator's greedy path uses it automatically under
+  EnableWebGPUDecodeCapture; sampling/repetition-penalty steps keep the full-logits path.
+- Net campaign: **1.5 -> 34.1 tok/s in the browser (23x), token-identical** (CUDA reference 87.9).
+  Remaining wall: the single mapAsync fence (~15ms round-trip latency, not bytes) - candidates:
+  speculative double-buffering or a JS-side decode loop (the shared-worker library-ization).
+
 ### 🏆 WebGPU LLM decode 15x: 1.5 -> 22.3 tok/s TOKEN-IDENTICAL via patched dispatch-plan replay (Seven)
 
 The browser Ollama-clone/ai-chat decode lever, end-to-end. `WebGPUDecodeCapture` captures the decode

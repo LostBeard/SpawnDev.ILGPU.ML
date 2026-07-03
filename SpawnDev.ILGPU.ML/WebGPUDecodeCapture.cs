@@ -114,7 +114,18 @@ public sealed class WebGPUDecodeCapture : IDisposable
     /// before attention reads it (the decode step always writes its own row first), so no stale
     /// data survives. Returns null on non-WebGPU accelerators.
     /// </summary>
-    public static async Task<WebGPUDecodeCapture?> TryCaptureAsync(InferenceSession session, float tokenId)
+    private GpuArgMax? _argmax;
+    private int _vocab;
+
+    /// <summary>
+    /// Capture with the greedy ARGMAX folded into the plan: the partial-argmax kernel over the
+    /// step's last-position logits is recorded as the plan's final dispatch, so
+    /// <see cref="PatchAndDecodeGreedyAsync"/> needs exactly ONE GPU round-trip per token (the
+    /// partials readback's own mapAsync fence - no separate SynchronizeAsync, no separate argmax
+    /// dispatch). <paramref name="argmax"/> is the caller's (generator's) instance - shared so the
+    /// capture pass and non-captured steps reduce identically (lowest-index tie-break preserved).
+    /// </summary>
+    public static async Task<WebGPUDecodeCapture?> TryCaptureAsync(InferenceSession session, float tokenId, GpuArgMax? argmax = null)
     {
         var acc = session.Accelerator;
         if (acc is not WebGPUAccelerator webGpu) return null;
@@ -151,10 +162,26 @@ public sealed class WebGPUDecodeCapture : IDisposable
             SlotProbe.Detach();
             await StepAt(p0, true); await acc.SynchronizeAsync();
 
+            // Last-position logits view of a step's outputs + the argmax fold: recorded INTO the
+            // plan as its final dispatch (constant params - the logits tensor is stable, vocab
+            // fixed), so replays carry their own argmax. Dispatched in BOTH captures (B's discarded)
+            // to keep the A/B structural parity check exact.
+            (ArrayView1D<float, Stride1D.Dense> View, int Vocab) LastLogits(Dictionary<string, Tensor> o)
+            {
+                var t = o.TryGetValue("logits", out var l) ? l : o.Values.First();
+                int vocab = t.Shape[^1];
+                int so = t.ElementCount / vocab;
+                return (t.Data.SubView((long)(so - 1) * vocab, vocab), vocab);
+            }
+
             Dictionary<string, Tensor> capOut;
             var planA = webGpu.BeginDispatchCapture();
             planA.CaptureScalarSnapshots = true;
-            try { capOut = await StepAt(p0, true); }
+            try
+            {
+                capOut = await StepAt(p0, true);
+                if (argmax != null) { var (lv, vc) = LastLogits(capOut); argmax.DispatchPartials(lv, vc); }
+            }
             catch { webGpu.EndDispatchCapture().Dispose(); throw; }
             webGpu.EndDispatchCapture();
             await acc.SynchronizeAsync();
@@ -167,7 +194,11 @@ public sealed class WebGPUDecodeCapture : IDisposable
 
             var planB = webGpu.BeginDispatchCapture();
             planB.CaptureScalarSnapshots = true;
-            try { await StepAt(p0 + 1, true); }
+            try
+            {
+                var outB = await StepAt(p0 + 1, true);
+                if (argmax != null) { var (lv, vc) = LastLogits(outB); argmax.DispatchPartials(lv, vc); }
+            }
             catch { webGpu.EndDispatchCapture().Dispose(); throw; }
             webGpu.EndDispatchCapture();
             await acc.SynchronizeAsync();
@@ -269,8 +300,11 @@ public sealed class WebGPUDecodeCapture : IDisposable
             // consistent with the FIRST PatchAndReplay being at pastLen P0+1, which rewrites all of
             // them anyway. Cursor: leave at P0+1 (the capture pass consumed the real token at P0).
             session.SetGGUFDecodePastLen(p0 + 1);
-            return new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
+            var cap = new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
                 scalarPatches, copyPatches, slotPatches);
+            cap._argmax = argmax;
+            cap._vocab = argmax != null ? LastLogits(capOut).Vocab : 0;
+            return cap;
         }
         catch
         {
@@ -310,6 +344,41 @@ public sealed class WebGPUDecodeCapture : IDisposable
     public double LastSyncMs { get; private set; }
 
     public async Task<IReadOnlyDictionary<string, Tensor>> PatchAndReplayAsync(float tokenId, int pastLen)
+    {
+        var t1 = await PatchAllAsync(tokenId, pastLen);
+        await _plan.ReplayAsync();
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        await _accelerator.SynchronizeAsync();
+        var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+        LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
+        LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
+        _session.SetGGUFDecodePastLen(pastLen + 1);
+        return _outputs;
+    }
+
+    /// <summary>
+    /// Greedy decode ONE token with a SINGLE GPU round-trip: patch + replay (the plan's final
+    /// dispatch is the folded argmax partial kernel) + read the partial pairs - the readback's own
+    /// mapAsync fence orders after the replay, so no separate SynchronizeAsync is needed. Requires
+    /// the capture to have been built with an argmax instance.
+    /// </summary>
+    public async Task<int> PatchAndDecodeGreedyAsync(float tokenId, int pastLen)
+    {
+        if (_argmax == null) throw new InvalidOperationException("capture was built without an argmax fold");
+        var t1 = await PatchAllAsync(tokenId, pastLen);
+        await _plan.ReplayAsync();
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        int token = await _argmax.ReadPartialsAsync(_vocab);   // the ONLY per-token fence
+        var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+        LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
+        LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
+        _session.SetGGUFDecodePastLen(pastLen + 1);
+        return token;
+    }
+
+    // Shared patch phase: input token + scalar bytes + slot arrays + copy destinations, with the
+    // sub-phase diagnostics. Returns the end-of-patch timestamp.
+    private async Task<long> PatchAllAsync(float tokenId, int pastLen)
     {
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         int dp = pastLen - _p0;
@@ -355,15 +424,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
             System.Diagnostics.Stopwatch.GetElapsedTime(ta, tb).TotalMilliseconds,
             System.Diagnostics.Stopwatch.GetElapsedTime(tb, tc).TotalMilliseconds,
             System.Diagnostics.Stopwatch.GetElapsedTime(tc, t1).TotalMilliseconds);
-        await _plan.ReplayAsync();
-        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-        await _accelerator.SynchronizeAsync();
-        var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         LastPatchMs = System.Diagnostics.Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds;
-        LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
-        LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
-        _session.SetGGUFDecodePastLen(pastLen + 1);
-        return _outputs;
+        return t1;
     }
 
     public void Dispose()

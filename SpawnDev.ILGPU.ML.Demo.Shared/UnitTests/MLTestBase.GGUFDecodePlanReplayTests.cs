@@ -33,7 +33,12 @@ public partial class MLTestBase
         const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
         var client = new SpawnDev.WebTorrent.WebTorrentClient();
         bool prevPrefix = GgufGenerator.EnablePrefixCache;
+        bool prevGemv = FusedDequantMatMul.EnableWebGPUGemv;
         GgufGenerator.EnablePrefixCache = false;   // force identical full prefills for A and B
+        // Hardware re-measurement of the cooperative GEMV (the 2026-06-13 "75x slower" exclusion was
+        // SwiftShader-era, voided): both the direct and captured runs use it; token-identity still
+        // gates correctness, and the replay-turn timing is the A/B vs the per-element 44.8ms/tok.
+        FusedDequantMatMul.EnableWebGPUGemv = true;
         try
         {
             var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
@@ -80,7 +85,7 @@ public partial class MLTestBase
         {
             throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
         }
-        finally { GgufGenerator.EnablePrefixCache = prevPrefix; await client.DisposeAsync(); }
+        finally { GgufGenerator.EnablePrefixCache = prevPrefix; FusedDequantMatMul.EnableWebGPUGemv = prevGemv; await client.DisposeAsync(); }
     });
 
     /// <summary>

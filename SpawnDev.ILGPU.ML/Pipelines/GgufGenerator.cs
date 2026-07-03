@@ -207,6 +207,9 @@ public sealed class GgufGenerator : IDisposable
 
             IReadOnlyDictionary<string, Tensor> outputs;
             MemoryBuffer1D<float, Stride1D.Dense>? inBuf = null;
+            int? fastToken = null;   // greedy single-fence replay token (skips the logits section)
+            bool wantSampling = config?.Strategy is "top_k" or "top_p";
+            bool wantRepPen = config?.RepetitionPenalty is float rpv && rpv != 1.0f;
             try
             {
                 if (EnableWebGPUDecodeCapture && stepIds.Length == 1)
@@ -216,7 +219,7 @@ public sealed class GgufGenerator : IDisposable
                     // prefix-cache reuse; prefill/multi-token steps below stay on the direct path).
                     if (_decodeCapture == null)
                     {
-                        _decodeCapture = await WebGPUDecodeCapture.TryCaptureAsync(_session, stepIds[0]);
+                        _decodeCapture = await WebGPUDecodeCapture.TryCaptureAsync(_session, stepIds[0], _argmax);
                         if (_decodeCapture != null)
                             outputs = _decodeCapture.Outputs;   // the capture pass IS this step's forward
                         else
@@ -224,6 +227,12 @@ public sealed class GgufGenerator : IDisposable
                             EnableWebGPUDecodeCapture = false;  // non-WebGPU: don't retry every step
                             outputs = await RunDirectAsync();
                         }
+                    }
+                    else if (!wantSampling && !(wantRepPen && generated.Count > 0))
+                    {
+                        // Greedy fast path: the plan's folded argmax + ONE fence per token.
+                        fastToken = await _decodeCapture.PatchAndDecodeGreedyAsync(stepIds[0], _session.DecodePastLen);
+                        outputs = _decodeCapture.Outputs;
                     }
                     else
                         outputs = await _decodeCapture.PatchAndReplayAsync(stepIds[0], _session.DecodePastLen);
@@ -240,15 +249,21 @@ public sealed class GgufGenerator : IDisposable
                     { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
                 }
 
+            int next;
+            if (fastToken is int ft)
+            {
+                next = ft;   // greedy replay already produced the token (folded argmax, one fence)
+            }
+            else
+            {
             var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
             int vocab = logitsT.Shape[^1];
             int seqOut = logitsT.ElementCount / vocab;
             long lastOff = (long)(seqOut - 1) * vocab;
             var lastLogits = logitsT.Data.SubView(lastOff, vocab);
 
-            bool sampling = config?.Strategy is "top_k" or "top_p";
-            bool repPen = config?.RepetitionPenalty is float r && r != 1.0f && generated.Count > 0;
-            int next;
+            bool sampling = wantSampling;
+            bool repPen = wantRepPen && generated.Count > 0;
             if (!sampling && !repPen)
             {
                 next = await _argmax.ArgMaxAsync(lastLogits, vocab); // greedy on the GPU, read back one int
@@ -268,6 +283,7 @@ public sealed class GgufGenerator : IDisposable
                     _ => TextGenerationSampler.Greedy(logits),
                 };
             }
+            }   // end !fastToken (logits path)
 
             // Stop tokens (EOS + caller list) end the turn WITHOUT contributing text.
             if (next == _eosId) { stop = StopReason.Eos; break; }
