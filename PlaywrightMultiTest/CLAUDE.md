@@ -34,6 +34,7 @@ Execution runs in `ProjectRunner.StartUp` (NUnit `OneTimeSetUp`) as backend **la
 **Env switches:**
 - `PMT_PARALLEL=off` → original sequential per-case path (escape hatch).
 - `PMT_FILTER=<substring>` → scopes the scheduled set (matches Name/TypeName/MethodName).
+- `PMT_EXCLUDE_CATEGORIES` → comma-separated category exclusion list, default includes `HeavyModel` (big-model end-to-end tests, ~minutes each). **Applied REGARDLESS of PMT_FILTER** — a scoped run targeting a HeavyModel test (e.g. the DA3 tests) silently schedules 0 tests and reports a fast trivial pass. To run one: clear the set AND scope by name: `PMT_EXCLUDE_CATEGORIES= PMT_FILTER=DA3_WebGPU_PlanReplay dotnet test ...`. A sub-minute "Passed" on a scoped heavy run means NOTHING RAN — check the `Phase A ... : 0 tests` line.
 - `PMT_CPU_PARALLELISM` (4) · `PMT_CUDA_PARALLELISM` (1) · `PMT_OPENCL_PARALLELISM` (1) — per-lane caps. GPU lanes default 1 to avoid OOM/contention with the browser WebGPU lane sharing the card.
 
 **⚠ `--filter` GOTCHA:** with the scheduler ON, `dotnet test --filter` does NOT scope EXECUTION — the NUnit adapter consumes `--filter` before it reaches this testhost, and the scheduler already ran the full enumerated set in `StartUp`. `--filter` only narrows what NUnit *reports*. **Use `PMT_FILTER` for scoped runs.**

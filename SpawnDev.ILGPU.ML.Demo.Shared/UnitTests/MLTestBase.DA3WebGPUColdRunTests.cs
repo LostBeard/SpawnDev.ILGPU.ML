@@ -286,14 +286,28 @@ public abstract partial class MLTestBase
                 throw new Exception($"plan replay DIVERGED: replayDiff={maxAbsDiff:E3} capturePassDiff={capDiff:E3} dispatches={cap.DispatchCount} (outCount={outCount}) - capturePassDiff>tol means the capture REGIME broke the forward; else the REPLAY itself diverges from a correct capture");
 
             Console.WriteLine($"[Benchmark][PlanReplay] correctness OK - timing loop");
-            // Per-frame replay timing (the ORT-Web-73ms competitor).
+            // Per-frame replay timing (the ORT-Web-73ms competitor) + the frame's internal split:
+            // planCall = one interop crossing + JS encode loop + queue.submit (jsEncode/jsSubmit are
+            // the JS-side sub-split of it); sync = the GPU-execution wait (onSubmittedWorkDone).
+            // What the plan call costs is hideable by pipelining (encode frame N+1 during frame N's
+            // GPU work); the sync term is the true GPU floor.
             const int R = 3;
+            cap.CollectTimings = true;
+            double sumPlan = 0, sumSync = 0, sumJsEncode = 0, sumJsSubmit = 0;
             var rsw = System.Diagnostics.Stopwatch.StartNew();
-            for (int r = 0; r < R; r++) await cap.ReplayAsync(inputs);
+            for (int r = 0; r < R; r++)
+            {
+                await cap.ReplayAsync(inputs);
+                sumPlan += cap.LastPlanCallMs; sumSync += cap.LastSyncMs;
+                sumJsEncode += cap.LastJsEncodeMs; sumJsSubmit += cap.LastJsSubmitMs;
+                Console.WriteLine($"[Benchmark][PlanReplay] frame {r}: planCall={cap.LastPlanCallMs:F1}ms (jsEncode={cap.LastJsEncodeMs:F1} jsSubmit={cap.LastJsSubmitMs:F1}) sync={cap.LastSyncMs:F1}ms");
+            }
             rsw.Stop();
+            cap.CollectTimings = false;
             double replayMs = rsw.Elapsed.TotalMilliseconds / R;
+            string split = $"planCall {sumPlan / R:F1}ms (jsEncode {sumJsEncode / R:F1} + jsSubmit {sumJsSubmit / R:F1}) + gpuWait {sumSync / R:F1}ms";
 
-            var report = $"dispatches={cap.DispatchCount} | direct {directMs:F0}ms -> replay {replayMs:F1}ms/frame = {directMs / replayMs:F1}x | maxAbsDiff={maxAbsDiff:E2} | ORT-Web warm ref 73ms";
+            var report = $"dispatches={cap.DispatchCount} | direct {directMs:F0}ms -> replay {replayMs:F1}ms/frame = {directMs / replayMs:F1}x | split: {split} | maxAbsDiff={maxAbsDiff:E2} | ORT-Web warm ref 73ms";
             Console.WriteLine($"[DA3-PlanReplay] {report}");
             return report;
         }

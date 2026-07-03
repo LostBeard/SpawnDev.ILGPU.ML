@@ -4,6 +4,18 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Replay-frame split measured: the WebGPU replay is ~98.5% GPU execution - pipelining is NOT the lever (Seven)
+
+`WebGPUGraphCapture` replay instrumentation (consuming SpawnDev.ILGPU `4.17.2-local.4`'s
+`WebGPUDispatchPlan.GetLastReplayTimings()`): new `CollectTimings` opt-in + per-replay
+`LastInputCopyMs` / `LastPlanCallMs` / `LastSyncMs` / `LastJsEncodeMs` / `LastJsSubmitMs`
+(.NET splits are Stopwatch-free and always recorded; the JS split costs 2 interop reads only when
+`CollectTimings`). Measured on hardware (`DA3_WebGPU_PlanReplay_VsOrtWeb`, RTX 4070): per ~104ms frame,
+planCall = **1.5ms** (jsEncode 1.3ms for all 2515 ops + jsSubmit ~0.05ms + interop wrapper ~0.2ms),
+gpuWait = **~102ms**. Verdict: the frame is ~98.5% GPU execution - pipelining encode/writeBuffer against
+GPU work can hide at most ~1.5%; the sub-73ms path is reducing GPU work itself (dispatch-elide of the
+~1200 shape ops in the plan + WGSL kernel throughput). Replay stayed bit-exact under instrumentation.
+
 ### BREAKTHROUGH: WebGPU dispatch-plan capture/replay - DAv3 at 99.5ms/frame bit-exact (1.36x from ORT-Web), + the SwiftShader discovery (Seven)
 
 Two coupled findings. (1) The PMT Playwright bundled Chromium NEVER had hardware WebGPU - every prior

@@ -43,6 +43,25 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// <summary>The stable output tensors the captured plan writes (also returned by ReplayAsync).</summary>
     public IReadOnlyDictionary<string, Tensor> Outputs => _outputs;
 
+    /// <summary>
+    /// When true, each <see cref="ReplayAsync"/> also fetches the JS-side encode/submit split into
+    /// <see cref="LastJsEncodeMs"/>/<see cref="LastJsSubmitMs"/> (two extra interop reads per replay -
+    /// diagnostic only, leave off in production). The .NET-side splits below are recorded always
+    /// (Stopwatch timestamps, effectively free).
+    /// </summary>
+    public bool CollectTimings { get; set; }
+
+    /// <summary>ms the last replay spent copying fresh inputs into the stable input buffers (0 when the caller reuses the stable tensor - the video path).</summary>
+    public double LastInputCopyMs { get; private set; }
+    /// <summary>ms the last replay spent in the plan call: one .NET->JS crossing + the JS encode loop + queue.submit.</summary>
+    public double LastPlanCallMs { get; private set; }
+    /// <summary>ms the last replay spent awaiting GPU completion (SynchronizeAsync = onSubmittedWorkDone).</summary>
+    public double LastSyncMs { get; private set; }
+    /// <summary>JS-side ms of the last replay's encode loop (only when <see cref="CollectTimings"/>).</summary>
+    public double LastJsEncodeMs { get; private set; }
+    /// <summary>JS-side ms of the last replay's enc.finish()+queue.submit (only when <see cref="CollectTimings"/>).</summary>
+    public double LastJsSubmitMs { get; private set; }
+
     private WebGPUGraphCapture(Accelerator accelerator, WebGPUDispatchPlan plan,
         Dictionary<string, Tensor> inputBuffers, Dictionary<string, Tensor> outputs,
         Dictionary<string, int[]> inputShapes)
@@ -143,6 +162,7 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// </summary>
     public async Task<Dictionary<string, Tensor>> ReplayAsync(Dictionary<string, Tensor> newInputs)
     {
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         foreach (var (name, t) in newInputs)
         {
             if (!_inputBuffers.TryGetValue(name, out var stable)) continue;
@@ -154,8 +174,16 @@ public sealed class WebGPUGraphCapture : IDisposable
             if (n > 0)
                 await stable.Data.SubView(0, n).CopyFromAsync(t.Data.SubView(0, n));
         }
+        var t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         await _plan.ReplayAsync();
+        var t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         await _accelerator.SynchronizeAsync();
+        var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
+        LastInputCopyMs = System.Diagnostics.Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds;
+        LastPlanCallMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
+        LastSyncMs = System.Diagnostics.Stopwatch.GetElapsedTime(t2, t3).TotalMilliseconds;
+        if (CollectTimings)
+            (LastJsEncodeMs, LastJsSubmitMs) = WebGPUDispatchPlan.GetLastReplayTimings();
         return _outputs;
     }
 
