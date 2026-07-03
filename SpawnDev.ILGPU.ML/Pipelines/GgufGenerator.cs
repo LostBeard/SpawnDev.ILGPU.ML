@@ -264,7 +264,7 @@ public sealed class GgufGenerator : IDisposable
             {
                 // Sampled replay already produced host logits (one fence) - sample on the host.
                 if (wantRepPen && generated.Count > 0)
-                    TextGenerationSampler.ApplyRepetitionPenalty(fastLogits, generated.ToArray(), config!.RepetitionPenalty);
+                    TextGenerationSampler.ApplyRepetitionPenalty(fastLogits, RepeatWindow(generated, config!.RepeatLastN), config!.RepetitionPenalty);
                 next = config?.Strategy switch
                 {
                     "top_k" => TextGenerationSampler.TopK(fastLogits, config.TopK, config.Temperature, rng),
@@ -293,7 +293,7 @@ public sealed class GgufGenerator : IDisposable
                 await _accelerator.SynchronizeAsync();
                 var logits = await read.CopyToHostAsync<float>(0, vocab);
                 if (repPen)
-                    TextGenerationSampler.ApplyRepetitionPenalty(logits, generated.ToArray(), config!.RepetitionPenalty);
+                    TextGenerationSampler.ApplyRepetitionPenalty(logits, RepeatWindow(generated, config!.RepeatLastN), config!.RepetitionPenalty);
                 next = config?.Strategy switch
                 {
                     "top_k" => TextGenerationSampler.TopK(logits, config.TopK, config.Temperature, rng),
@@ -434,6 +434,18 @@ public sealed class GgufGenerator : IDisposable
         else _cachedIds = null;
 
         return (generated.ToArray(), ttftMs);
+    }
+
+    /// <summary>The repetition-penalty window: the last <paramref name="repeatLastN"/> generated
+    /// tokens (Ollama's repeat_last_n semantics), or the full history when n &lt;= 0. Penalizing the
+    /// FULL history permanently punishes every common grammar token and decays long generations
+    /// into word salad - the window keeps the penalty anti-loop, not anti-language.</summary>
+    private static int[] RepeatWindow(List<int> generated, int repeatLastN)
+    {
+        if (repeatLastN <= 0 || generated.Count <= repeatLastN) return generated.ToArray();
+        var window = new int[repeatLastN];
+        generated.CopyTo(generated.Count - repeatLastN, window, 0, repeatLastN);
+        return window;
     }
 
     /// <summary>Index of the earliest stop-string match at or after <paramref name="from"/>, or -1.</summary>

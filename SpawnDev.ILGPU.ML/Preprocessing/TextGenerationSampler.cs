@@ -239,6 +239,13 @@ public class GenerationConfig
     /// <summary>Repetition penalty (>1.0 reduces repetition).</summary>
     public float RepetitionPenalty { get; set; } = 1.0f;
 
+    /// <summary>How many of the MOST RECENT generated tokens the repetition penalty applies to
+    /// (Ollama's repeat_last_n; 64 matches its default). 0 or negative = penalize the entire
+    /// generated history - which measurably degrades long generations: by token ~150 every common
+    /// grammar token is permanently penalized and small models decay into word salad (observed on
+    /// qwen2.5-1.5b at penalty 1.15, 256-token answers).</summary>
+    public int RepeatLastN { get; set; } = 64;
+
     /// <summary>Optional RNG seed for reproducible sampling. Null → non-deterministic (Random.Shared).
     /// Set for unit tests that must assert identical output across runs.</summary>
     public int? Seed { get; set; }
