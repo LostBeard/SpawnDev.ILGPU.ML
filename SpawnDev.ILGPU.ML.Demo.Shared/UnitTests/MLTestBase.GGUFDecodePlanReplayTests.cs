@@ -23,20 +23,44 @@ public partial class MLTestBase
     /// difference is page/UI/GC territory.
     /// </summary>
     [TestMethod(Timeout = 1200000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
-    public async Task<string> GGUF_WebGPU_DecodeCapture_LongContext() => await RunTestWithResult(async accelerator =>
+    public async Task<string> GGUF_WebGPU_DecodeCapture_LongContext()
+        => await DecodeCaptureLongContextBody("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", enableGemv: true);
+
+    /// <summary>The same identity-at-depth gate on the LARGER arch dims (1.5B Q4_K_M): the affine
+    /// patches were discovered on 0.5B; every model size the AI demo serves must be identity-proven
+    /// before capture/replay is trusted there (Captain's 1.5B word-salad report - the rep-penalty
+    /// window explained it, but "explains" isn't "proven" until the engine is formally exonerated).</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task<string> GGUF_WebGPU_DecodeCapture_LongContext_Qwen15B()
+        // enableGemv:false = what the AI demo actually runs today. The Q4_K GEMV is INVALID on WGSL
+        // ("workgroupBarrier must only be called from uniform control flow" - the sub-block scale
+        // cache barriers sit under a storage-dependent loop; Q8_0's GEMV is barrier-free in the hot
+        // loop, which is why it compiles). Tracked: barrier-free Q4_K restructure or ILGPU
+        // workgroupUniformLoad support, then flip this to true.
+        => await DecodeCaptureLongContextBody("Qwen/Qwen2.5-1.5B-Instruct-GGUF", "qwen2.5-1.5b-instruct-q4_k_m.gguf", enableGemv: false);
+
+    private async Task<string> DecodeCaptureLongContextBody(string repoId, string file, bool enableGemv) => await RunTestWithResult(async accelerator =>
     {
         if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU long-context decode gate");
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        const string repoId = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
-        const string file = "qwen2.5-0.5b-instruct-q8_0.gguf";
-        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        // OPFS-backed pieces, COLD: a bare in-memory client holds every fetched piece in the WASM
+        // heap - a 0.5B (531MB) fits, the 1.5B (1.1GB) OOMs in WebConn's coalesced fetch. And the
+        // app's SHARED client restores torrent state at startup, so deleting the OPFS dir under it
+        // yields "piece verified but data not in store". The cold pattern (per WebTorrentTests):
+        // clean the OPFS dir, then a FRESH client over the same IAsyncFS - no restored state, no
+        // heap-resident pieces.
+        var fs = GetAsyncFS();
+        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
+        var client = fs != null
+            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
+            : new SpawnDev.WebTorrent.WebTorrentClient();
         bool prevPrefix = GgufGenerator.EnablePrefixCache;
         bool prevGemv = FusedDequantMatMul.EnableWebGPUGemv;
         GgufGenerator.EnablePrefixCache = false;
-        FusedDequantMatMul.EnableWebGPUGemv = true;
+        FusedDequantMatMul.EnableWebGPUGemv = enableGemv;
         try
         {
             var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
@@ -92,7 +116,12 @@ public partial class MLTestBase
         {
             throw new UnsupportedTestException($"Hub/network unavailable: {ex.Message}");
         }
-        finally { GgufGenerator.EnablePrefixCache = prevPrefix; FusedDequantMatMul.EnableWebGPUGemv = prevGemv; await client.DisposeAsync(); }
+        finally
+        {
+            GgufGenerator.EnablePrefixCache = prevPrefix;
+            FusedDequantMatMul.EnableWebGPUGemv = prevGemv;
+            await client.DisposeAsync();   // ours - fresh per gate run
+        }
     });
 
     /// <summary>
