@@ -265,6 +265,7 @@ public partial class DepthPage : IDisposable
 
         Console.WriteLine($"[Depth] Recolor palette={_colorPalette}(id={paletteId}) dim={_depthWidth}x{_depthHeight} present={present} renderer={(_canvasRenderer != null ? "ATTACHED" : "NULL")}");
 
+
         if (present && _canvasRenderer != null)
         {
             try

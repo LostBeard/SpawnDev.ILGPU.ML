@@ -255,6 +255,224 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// THE PAGE PATH vs THE HOST PATH: <see cref="DepthEstimationPipeline.EstimateGpuRawAsync"/> (what
+    /// /depth actually renders from) must produce the SAME depth map as EstimateAsync (what every
+    /// other gate tests). Captain's regression (2026-07-03): the page showed a featureless positional
+    /// RAMP with plausible min/max while all six EstimateAsync gates stayed green - the two paths had
+    /// no cross-check. Also guards that the raw map isn't a smooth ramp: real depth must correlate
+    /// poorly with a pure x+y gradient.
+    /// </summary>
+    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    public async Task CreateFromFile_DepthAnything_GpuRawMatchesHostPath()
+        => await DepthGpuRawVsHostBody(inputSize: 224);
+
+    /// <summary>The SAME gate at 518x518 - the /depth PAGE's actual compiled resolution (1369 patch
+    /// tokens vs 224's 256). Captain's structureless-ramp report reproduces at 518 while every
+    /// 224 gate stays green - resolution is the divergence axis, and the anti-ramp correlation
+    /// guard is the quality oracle that catches a smooth-garbage forward.</summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task CreateFromFile_DepthAnything_GpuRawMatchesHostPath_518()
+        => await DepthGpuRawVsHostBody(inputSize: 518);
+
+    /// <summary>
+    /// BYTE-IDENTITY of the two weight-delivery paths: ModelHub.LoadAsync (what the /depth page
+    /// feeds CreateFromHuggingFaceAsync - JS fetch + browser cache) vs DownloadBytesChunkedAsync
+    /// (what every depth gate uses). All compute stages are gate-green while the page ramps -
+    /// corrupted hub bytes are the last suspect standing (this path has short-read history).
+    /// </summary>
+    [TestMethod(Timeout = 600000, Category = "HeavyModel")]
+    public async Task DepthAnything_HubBytes_MatchHttpBytes() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is not (AcceleratorType.WebGPU))
+            throw new UnsupportedTestException("hub/browser path gate runs once, on the WebGPU lane");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var js = SpawnDev.BlazorJS.BlazorJSRuntime.JS;
+        if (js == null) throw new UnsupportedTestException("BlazorJSRuntime not available (not a browser lane)");
+
+        var httpBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        using var hub = new Hub.ModelHub(js);
+        var hubBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.DepthAnythingV2Small, Hub.ModelHub.KnownFiles.OnnxModel);
+
+        if (hubBytes.Length != httpBytes.Length)
+            throw new Exception($"HUB BYTES WRONG LENGTH: hub={hubBytes.Length} http={httpBytes.Length} (delta {hubBytes.Length - (long)httpBytes.Length})");
+        int firstDiff = -1;
+        for (int i = 0; i < hubBytes.Length; i++)
+            if (hubBytes[i] != httpBytes[i]) { firstDiff = i; break; }
+        if (firstDiff >= 0)
+        {
+            int diffCount = 0;
+            for (int i = firstDiff; i < hubBytes.Length; i++) if (hubBytes[i] != httpBytes[i]) diffCount++;
+            throw new Exception($"HUB BYTES CORRUPT: first diff at {firstDiff}/{hubBytes.Length}, {diffCount} bytes differ");
+        }
+        Console.WriteLine($"[HubBytes] IDENTICAL: {hubBytes.Length} bytes");
+    });
+
+    private async Task DepthGpuRawVsHostBody(int inputSize) => await RunTest(async accelerator =>
+    {
+        // GPU lanes only: the gate runs the 95MB model TWICE (host + raw paths) - on the serialized
+        // CPU lane that exceeds every timeout and starves the rest of the depth family (measured:
+        // 4 downstream CPU timeouts). CPU EstimateAsync correctness is covered by the other gates.
+        if (accelerator.AcceleratorType == AcceleratorType.CPU)
+            throw new UnsupportedTestException("CPU too slow for the double-run cross-path gate");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available for this backend");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 3, inputSize, inputSize } });
+        var pipeline = new DepthEstimationPipeline(session, accelerator);
+
+        // Real image (same fetch as CatImage) - a gradient input can't distinguish depth from a ramp.
+        var (pixels, w, h) = await LoadCatImage(http);
+
+        var host = await pipeline.EstimateAsync(pixels, w, h);
+        var (rawBuf, minD, maxD, gw, gh) = await pipeline.EstimateGpuRawAsync(pixels, w, h);
+        try
+        {
+            if (gw != host.Width || gh != host.Height)
+                throw new Exception($"dim mismatch: gpuRaw {gw}x{gh} vs host {host.Width}x{host.Height}");
+            var raw = await rawBuf.CopyToHostAsync<float>(0, gw * gh);
+
+            // 1) The two paths must agree. EstimateAsync returns a NORMALIZED map (0-1); the raw
+            // path returns raw values - normalize identically before comparing (first gate cut
+            // compared raw-vs-normalized and read its own mismatch as a 249% divergence - Rule 4c).
+            double maxAbs = 0; float rawRange = Math.Max(1e-6f, maxD - minD);
+            for (int i = 0; i < raw.Length; i++)
+                maxAbs = Math.Max(maxAbs, Math.Abs((raw[i] - minD) / rawRange - host.DepthMap[i]));
+            if (maxAbs > 0.02)
+                throw new Exception($"PAGE PATH DIVERGES from host path: normalized maxAbs={maxAbs:F5}");
+
+            // 2) Min/max reduction must match the buffer it reduced.
+            float trueMin = raw.Min(), trueMax = raw.Max();
+            if (Math.Abs(trueMin - minD) > 1e-3 || Math.Abs(trueMax - maxD) > 1e-3)
+                throw new Exception($"MinMax reduction wrong: reported [{minD:F4},{maxD:F4}] vs actual [{trueMin:F4},{trueMax:F4}]");
+
+            // 3) STRUCTURE guard (calibrated vs ORT ground truth + the 2026-07-03 bug): real DA2
+            // depth of the cat has 1000+ strong normalized edges; the mis-fused-attention output
+            // (double-scaled scores -> near-uniform softmax) had 6 and STILL passed range checks
+            // and a lax rampCorr threshold. Edges are the honest oracle.
+            double corr = CorrelationWithXYRamp(raw, gw, gh);
+            int strongEdges = 0;
+            for (int y = 0; y < gh; y++)
+                for (int x = 1; x < gw; x++)
+                    if (Math.Abs((raw[y * gw + x] - raw[y * gw + x - 1]) / rawRange) > 0.10f) strongEdges++;
+            Console.WriteLine($"[GpuRawGate] maxAbs={maxAbs:F5} range=[{minD:F4},{maxD:F4}] rampCorr={corr:F3} strongEdges={strongEdges}");
+            if (strongEdges < 100)
+                throw new Exception($"Depth map is CONTENT-FREE: {strongEdges} strong edges (real output: 1000+; "
+                    + $"the mis-fused-attention failure mode produced 6). rampCorr={corr:F3}");
+        }
+        finally { rawBuf.Dispose(); }
+    });
+
+    private static double CorrelationWithXYRamp(float[] map, int w, int h)
+    {
+        int n = map.Length;
+        double meanM = 0, meanR = 0;
+        for (int i = 0; i < n; i++) { meanM += map[i]; meanR += (i % w) + (i / w); }
+        meanM /= n; meanR /= n;
+        double cov = 0, varM = 0, varR = 0;
+        for (int i = 0; i < n; i++)
+        {
+            double dm = map[i] - meanM, dr = (i % w) + (i / w) - meanR;
+            cov += dm * dr; varM += dm * dm; varR += dr * dr;
+        }
+        return varM < 1e-9 ? 1.0 : cov / Math.Sqrt(varM * varR);   // a flat map counts as degenerate too
+    }
+
+    /// <summary>
+    /// The COLORMAP seam isolated (no model): a checkerboard depth map through
+    /// DepthToColormapPalette must come back as a two-color checkerboard. The /depth page renders a
+    /// featureless positional RAMP while the raw depth is proven correct (GpuRawMatchesHostPath) -
+    /// this splits the remaining suspects: a gradient here convicts the colormap kernel; a clean
+    /// checkerboard convicts PresentAsync/the canvas renderer.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DepthColormap_Checkerboard_NotARamp() => await RunTest(async accelerator =>
+    {
+        const int w = 64, h = 48, block = 8;
+        var depth = new float[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                depth[y * w + x] = ((x / block + y / block) % 2 == 0) ? 0.2f : 0.8f;
+
+        var post = new SpawnDev.ILGPU.ML.Kernels.ImagePostprocessKernel(accelerator);
+        try
+        {
+            using var depthBuf = accelerator.Allocate1D(depth);
+            using var rgba = accelerator.Allocate1D<int>(w * h);
+            var depthView = new SpawnDev.ILGPU.ML.Tensors.TensorView<float>(depthBuf.View, new[] { h, w });
+            var rgbaView = new SpawnDev.ILGPU.ML.Tensors.TensorView<int>(rgba.View, new[] { h, w });
+            post.DepthToColormapPalette(depthView, rgbaView, 0f, 1f, 0 /* plasma */);
+            await accelerator.SynchronizeAsync();
+            var px = await rgba.CopyToHostAsync<int>(0, w * h);
+
+            int distinct = px.Distinct().Count();
+            if (distinct != 2)
+                throw new Exception($"COLORMAP BROKEN: checkerboard depth produced {distinct} distinct colors (expected exactly 2) - "
+                    + (distinct > w ? "a RAMP (position-dependent output)" : "wrong quantization"));
+            // The two colors must follow the DEPTH pattern, not position.
+            int cA = px[0];
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    bool isA = (x / block + y / block) % 2 == 0;
+                    if ((px[y * w + x] == cA) != isA)
+                        throw new Exception($"COLORMAP pattern mismatch at ({x},{y}): color does not follow depth");
+                }
+            Console.WriteLine($"[ColormapOracle] PASS - 2 colors, pattern follows depth (cA=0x{cA:X8})");
+        }
+        finally { post.Dispose(); }
+    });
+
+    /// <summary>
+    /// The SHARED-INSTANCE lifecycle (the /depth page's exact kernel sequence, 9cf63f3): ONE
+    /// ImagePostprocessKernel runs ResizeBilinear then MinMaxAsync then DepthToColormapPalette.
+    /// The standalone checkerboard oracle passes with a FRESH instance - this one reproduces the
+    /// page's ordering, where the pipeline comment records a prior "scalar-slot drift -> flat-blue"
+    /// battle on this exact seam.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task DepthColormap_SharedKernelLifecycle_NotARamp() => await RunTest(async accelerator =>
+    {
+        const int srcW = 32, srcH = 24, w = 64, h = 48, block = 8;
+        var src = new float[srcW * srcH];
+        for (int y = 0; y < srcH; y++)
+            for (int x = 0; x < srcW; x++)
+                src[y * srcW + x] = ((x / (block / 2) + y / (block / 2)) % 2 == 0) ? 0.2f : 0.8f;
+
+        var post = new SpawnDev.ILGPU.ML.Kernels.ImagePostprocessKernel(accelerator);
+        try
+        {
+            using var srcBuf = accelerator.Allocate1D(src);
+            using var resized = accelerator.Allocate1D<float>(w * h);
+            var srcView = new SpawnDev.ILGPU.ML.Tensors.TensorView<float>(srcBuf.View, new[] { srcH, srcW });
+            var dstView = new SpawnDev.ILGPU.ML.Tensors.TensorView<float>(resized.View, new[] { h, w });
+            post.ResizeBilinear(srcView, dstView);                       // page step 1
+            var (minD, maxD) = await post.MinMaxAsync(resized.View, w * h); // page step 2 (the NEW reduction)
+            if (Math.Abs(minD - 0.2f) > 1e-3 || Math.Abs(maxD - 0.8f) > 1e-3)
+                throw new Exception($"MinMax after resize wrong: [{minD:F4},{maxD:F4}] expected [0.2,0.8]");
+
+            using var rgba = accelerator.Allocate1D<int>(w * h);
+            var depthView = new SpawnDev.ILGPU.ML.Tensors.TensorView<float>(resized.View, new[] { h, w });
+            var rgbaView = new SpawnDev.ILGPU.ML.Tensors.TensorView<int>(rgba.View, new[] { h, w });
+            post.DepthToColormapPalette(depthView, rgbaView, minD, maxD, 0); // page step 3
+            await accelerator.SynchronizeAsync();
+            var px = await rgba.CopyToHostAsync<int>(0, w * h);
+
+            // Bilinear edges blend, so allow a few colors - but a positional RAMP has ~w*h distinct
+            // values, and the dominant two must cover most of the image.
+            int distinct = px.Distinct().Count();
+            var top2 = px.GroupBy(v => v).OrderByDescending(g => g.Count()).Take(2).Sum(g => g.Count());
+            double top2Frac = (double)top2 / px.Length;
+            Console.WriteLine($"[SharedLifecycle] distinct={distinct} top2Frac={top2Frac:F3} minMax=[{minD:F3},{maxD:F3}]");
+            if (top2Frac < 0.60)
+                throw new Exception($"SHARED-INSTANCE COLORMAP BROKEN: top-2 colors cover only {top2Frac:P0} (ramp-like, {distinct} distinct)");
+        }
+        finally { post.Dispose(); }
+    });
+
+    /// <summary>
     /// Depth estimation with real cat image — more meaningful than gradient.
     /// </summary>
     [TestMethod(Timeout = 300000, Category = "HeavyModel")]

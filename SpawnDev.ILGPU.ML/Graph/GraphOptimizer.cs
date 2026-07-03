@@ -64,13 +64,17 @@ public static class GraphOptimizer
         // [Cast] → probs·V) into ONE flash-style FusedAttention node — never materializes the [B·H, S, S]
         // scores. Runs BEFORE FuseScaledMatMul so the Q·Kᵀ MatMul is still raw. This is the SD-UNet memory
         // win (the [8,4096,4096] scores at down_block.0 were the pipeline peak).
-        int fusedAttn = FuseAttention(optimized);
+        // ML_NO_ATTN_FUSION=1 disables both attention-fusion passes - the bisect/diagnosis switch
+        // (the DA2 content-free-depth bug hid inside a mis-fused ViT attention for 6+ weeks; being
+        // able to A/B the fusion without a rebuild is how it was isolated).
+        bool noAttnFusion = Environment.GetEnvironmentVariable("ML_NO_ATTN_FUSION") == "1";
+        int fusedAttn = noAttnFusion ? 0 : FuseAttention(optimized);
 
         // Pass 3c: Same attention fusion for the EINSUM-form export (DINOv2/DAv3: Einsum(Q·Kᵀ) → scale →
         // Softmax → [Cast] → Einsum(probs·V)). The MatMul-form pass above never fires on these graphs, so
         // attention fell to EinsumOperator's per-batch MatMul loop (6 dispatches/node × 26 nodes on DAv3-518
         // = the dominant per-op cost on every backend). Emits the same FusedAttention node.
-        int fusedAttnEinsum = FuseAttentionEinsum(optimized);
+        int fusedAttnEinsum = noAttnFusion ? 0 : FuseAttentionEinsum(optimized);
         fusedAttn += fusedAttnEinsum;
 
         // Pass 4: Fuse MatMul → Mul/Div (scale) into FusedScaledMatMul (attention Q*K^T/sqrt(d))
@@ -502,6 +506,20 @@ public static class GraphOptimizer
                 kPreScaled = true;
             }
             else continue;
+
+            // DA2/onnx-community ViT form: Q PRE-scaled (Mul(Q, scalar)) with a PLAIN Transpose K
+            // and no post-MatMul scale node. The graph already applies the full 1/sqrt(hd) on Q, so
+            // the kernel must NOT add its default on top - double-scaling shrinks scores 8x, softmax
+            // goes near-uniform, and the model emits plausible-range but CONTENT-FREE outputs (the
+            // DepthAnythingV2 blank-depth bug hid exactly this way for 6 weeks; found by bisect +
+            // ORT ground-truth diff 2026-07-03). Q's Mul stays in the graph as a normal producer.
+            if (scale == 0f && !kPreScaled)
+            {
+                int pQ = Prod(qName);
+                if (pQ >= 0 && nodes[pQ].OpType == "Mul" && nodes[pQ].Inputs.Count == 2
+                    && (IsProvablyScalar(nodes[pQ].Inputs[0], 0) || IsProvablyScalar(nodes[pQ].Inputs[1], 0)))
+                    scale = 1f;
+            }
 
             // Forward: softmax → [Cast] → MatMul(probs, V).
             string probs = softmax.Outputs[0];
