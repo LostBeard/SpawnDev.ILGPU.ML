@@ -37,6 +37,7 @@ public class ElementWiseKernels : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _broadcastStridesBuf;
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldStridesBufs = new();
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _addScaledInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bilinearUpsampleACKernel;
@@ -250,6 +251,15 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> other)
     {
         data[idx] += other[idx];
+    }
+
+    /// <summary>In-place axpy: data[i] += other[i] * scalar. Two separate bindings.</summary>
+    private static void AddScaledInPlaceImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> other,
+        float scalar)
+    {
+        data[idx] += other[idx] * scalar;
     }
 
     /// <summary>
@@ -715,6 +725,16 @@ public class ElementWiseKernels : IDisposable
     {
         EnsureLoaded();
         _addInPlaceKernel!(count, data, other);
+    }
+
+    /// <summary>In-place axpy: data[i] += other[i] * scalar. Two separate buffers required.
+    /// The Euler diffusion step (latent += epsilon * dt) as ONE dispatch - replaces the per-step
+    /// readback/host-loop/re-upload round trip in the image-generation denoise loop.</summary>
+    public void AddScaledInPlace(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> other, int count, float scalar)
+    {
+        EnsureLoaded();
+        _addScaledInPlaceKernel!(count, data, other, scalar);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -1618,20 +1638,34 @@ public class ElementWiseKernels : IDisposable
         int denseStride = 1;
         for (int i = rank - 1; i >= 0; i--) { outStrides[i] = denseStride; denseStride *= outShape[i]; }
 
-        // Pack: [rank, cStrides, xStrides, yStrides, outStrides]. Allocate a fresh buffer per
-        // call and defer disposal (browser dispatch is async; reuse races pending dispatches).
+        // Pack: [rank, cStrides, xStrides, yStrides, outStrides].
         int paramsSize = 1 + 4 * rank;
-        if (_broadcastStridesBuf != null) _oldStridesBufs.Add(_broadcastStridesBuf);
-        _broadcastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
         var paramsData = new float[paramsSize];
         paramsData[0] = rank;
         for (int i = 0; i < rank; i++) paramsData[1 + i] = cStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + rank + i] = xStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 2 * rank + i] = yStrides[i];
         for (int i = 0; i < rank; i++) paramsData[1 + 3 * rank + i] = outStrides[i];
-        _broadcastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
 
-        _whereBroadcastKernel!(outCount, cond, x, y, output, _broadcastStridesBuf.View);
+        ArrayView1D<float, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // Graph capture: stable per-forward slot - a per-call cuMemAlloc mid-capture is a
+            // native 0xC0000005 (SD-Turbo CLIP Where under CudaGraphCapture, 2026-07-03). Same
+            // pattern d0cd5a6 gave BroadcastBinaryOpND; this op was missed.
+            paramsView = Kernels.CaptureParamArena.Shared(_accelerator).RentStableSlotFloat(paramsData);
+        }
+        else
+        {
+            // Fresh buffer per call, deferred disposal (browser dispatch is async; reuse races
+            // pending dispatches).
+            if (_broadcastStridesBuf != null) _oldStridesBufs.Add(_broadcastStridesBuf);
+            _broadcastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
+            _broadcastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
+            paramsView = _broadcastStridesBuf.View;
+        }
+
+        _whereBroadcastKernel!(outCount, cond, x, y, output, paramsView);
     }
 
     public void Floor(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
@@ -1849,6 +1883,8 @@ public class ElementWiseKernels : IDisposable
             DelegateSpecialization<Func<float, float, float>>>(BroadcastBinaryKernel);
         _addInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(AddInPlaceImpl);
+        _addScaledInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>(AddScaledInPlaceImpl);
         _concatLastDimKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int, int>(ConcatLastDimImpl);

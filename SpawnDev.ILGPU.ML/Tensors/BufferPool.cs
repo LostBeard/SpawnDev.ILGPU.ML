@@ -178,6 +178,11 @@ public class BufferPool : IDisposable
     /// </summary>
     private long DisposeBucketedBuffers()
     {
+        // NEVER free during a graph-capture window: cuMemFree while CUDA stream capture is active
+        // corrupts the context (native 0xC0000005 at the NEXT free - SD-Turbo UNet capture under
+        // VRAM pressure, 2026-07-03). Reclaiming nothing makes the OOM throw cleanly instead; the
+        // capture wrapper falls back to the direct forward.
+        if (Graph.GraphExecutor.SuppressDrains) return 0;
         long freed = 0;
         foreach (var stack in _buckets.Values)
             while (stack.Count > 0)

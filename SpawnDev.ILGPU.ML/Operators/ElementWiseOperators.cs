@@ -665,8 +665,22 @@ public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
         var limitVals = ctx.TryGetInputValues(1);
         var deltaVals = ctx.TryGetInputValues(2);
 
-        if (startVals == null || limitVals == null || deltaVals == null)
-            throw new NotSupportedException("Range: scalar inputs not available as runtime constants");
+        if (startVals == null || limitVals == null || deltaVals == null
+            || startVals.Length == 0 || limitVals.Length == 0 || deltaVals.Length == 0)
+        {
+            // Mid-capture the scalar runtime constants can be UNAVAILABLE/EMPTY (readbacks
+            // suppressed) - startVals[0] threw IndexOutOfRange under WebGPU capture (SD-Turbo CLIP,
+            // 2026-07-03). Range is deterministic per shape and the output buffer already holds the
+            // warm-pass value; the H2D upload below is capture-skipped anyway - nothing to do.
+            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains) return;
+            static string D(float[]? v) => v == null ? "null" : v.Length == 0 ? "EMPTY" : $"[{v[0]}]";
+            throw new NotSupportedException(
+                $"Range: scalar inputs not available as runtime constants: "
+                + $"start('{(ctx.InputNames.Length > 0 ? ctx.InputNames[0] : "?")}')={D(startVals)} "
+                + $"limit('{(ctx.InputNames.Length > 1 ? ctx.InputNames[1] : "?")}')={D(limitVals)} "
+                + $"delta('{(ctx.InputNames.Length > 2 ? ctx.InputNames[2] : "?")}')={D(deltaVals)} "
+                + $"elide={SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch}");
+        }
 
         float start = startVals[0];
         float limit = limitVals[0];

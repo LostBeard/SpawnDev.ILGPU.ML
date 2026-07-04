@@ -4,6 +4,40 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### 🔧 DA2 content-free depth FIXED: FuseAttention double-scaled Q-pre-scaled ViT attention (Seven)
+
+Since 89180ea (2026-06-16) the MatMul-form attention fusion accepted DA2/onnx-community ViT exports
+(Q PRE-scaled, plain-Transpose K, no post-MatMul scale) with scale left at the kernel default -
+stacking 1/sqrt(hd) on Q's embedded scale. Scores /8 → near-uniform softmax → plausible-range but
+CONTENT-FREE outputs that passed every range-based gate for 17 days (found from Captain's "depth map
+isn't good" via bisect over 353 commits + onnxruntime ground truth). Fix: detect the Q-side scalar
+Mul → scale=1.0. Plus: `ML_NO_ATTN_FUSION=1` kill-switch; structure-measuring gates (cross-path
+identity at 224 AND 518 + calibrated strongEdges content-free guard, colormap oracles, hub-bytes
+identity); `DepthEstimationPipeline.EnableGraphCapture` now defaults ON (the always-on switch lives
+in the pipeline - /depth went 6252ms → ~300ms per estimate).
+
+### 🖼️ SD-Turbo generates IN THE BROWSER: E2E green on WebGPU + CUDA + OpenCL (Seven)
+
+`SDTurbo_Generate_E2E` passes on WebGPU (the browser lane), CUDA, and OpenCL - hub-streamed 2.5GB
+trio, single-step diffusion, verified non-degenerate 512x512 (photorealistic on visual check).
+- **GPU Euler step**: `ElementWiseKernels.AddScaledInPlace` (axpy) replaces the per-denoise-step
+  two-readbacks-plus-upload host round trip; element-exact gate vs the CPU scheduler reference.
+- **`Graph.SessionGraphCapture`** (new): reusable capture-once/replay-many wrapper per
+  InferenceSession, owning stable input clones (capture binds input buffers into the graph - caller
+  transients being disposed was a native crash). CLIP/UNet/VAE wired; **defaults OFF for this
+  pipeline**: SD-class activation volumes guarantee pool misses mid-capture and ILGPU's
+  AllocateWithReclaim (flush/alloc/free during stream capture) corrupts the CUDA context -
+  bisect-proven per sub-model; tracked in `Plans/sd-capture-pool-priming.md`
+  (`SDTURBO_FORCE_CAPTURE=1` opts in for that work).
+- Capture-safety fixes (permanent, all captured models): `WhereBroadcastND` stable param slot
+  (d0cd5a6 pattern - was missed), `InstanceNorm(/InPlace)` cached stats scratch,
+  `BufferPool.DisposeBucketedBuffers` refuses to free under SuppressDrains, `RangeOperator`
+  empty-scalar guards + diagnostics.
+- E2E hardening: cold OPFS WebTorrent client (restored-shared-client trap), Wasm lane skip with a
+  tracked plan (`Plans/wasm-weight-paging.md` - fp16-resident weights / OPFS per-layer paging).
+- Known remaining: CPU console lane crashes during VAE weight upload (captures off too - separate
+  investigation); WebGL lane timeout (slow-lane class).
+
 ### 🏆 WebGPU LLM decode 34.1 tok/s (23x): GEMV un-exclusion + argmax folded into the plan (Seven)
 
 Two more levers on top of the patched-replay decode, both token-identical:

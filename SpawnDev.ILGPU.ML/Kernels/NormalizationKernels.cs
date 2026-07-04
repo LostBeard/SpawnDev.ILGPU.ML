@@ -478,10 +478,7 @@ public class NormalizationKernels : IDisposable
         // on Wasm where Pass 1 of a subsequent call would overwrite means/invStds before
         // the previous call's Pass 2 had finished reading them. Buffers stay alive in
         // _allTempBufs until Dispose() (typical InferenceSession lifetime).
-        var inMeans = _accelerator.Allocate1D<float>(numSlices);
-        var inInvStds = _accelerator.Allocate1D<float>(numSlices);
-        _allTempBufs.Add(inMeans);
-        _allTempBufs.Add(inInvStds);
+        var (inMeans, inInvStds) = GetStatsScratch(numSlices);
 
         // Pass 1: compute mean + invStd per slice
         _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, 1e-5f);
@@ -516,10 +513,7 @@ public class NormalizationKernels : IDisposable
     {
         EnsureLoaded();
         int numSlices = N * C;
-        var inMeans = _accelerator.Allocate1D<float>(numSlices);
-        var inInvStds = _accelerator.Allocate1D<float>(numSlices);
-        _allTempBufs.Add(inMeans);
-        _allTempBufs.Add(inInvStds);
+        var (inMeans, inInvStds) = GetStatsScratch(numSlices);
         _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, 1e-5f);
         _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
@@ -562,6 +556,34 @@ public class NormalizationKernels : IDisposable
     // before Pass 2 of call N has finished reading. Buffers stay alive in this list
     // until Dispose() (typical InferenceSession lifetime).
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allTempBufs = new();
+    private MemoryBuffer1D<float, Stride1D.Dense>? _capMeans, _capInvStds;
+
+    /// <summary>Per-call InstanceNorm mean/invStd scratch. Normal mode: fresh buffers (Wasm
+    /// async-safety - a reused pair races pending dispatches), held in _allTempBufs until Dispose.
+    /// Capture mode (UseCaptureParamSlots): ONE reused pair sized during the warm passes - a
+    /// per-call cuMemAlloc mid-capture is a native 0xC0000005 (SD-Turbo UNet GroupNorm under
+    /// CudaGraphCapture, 2026-07-03); sequential stream order makes reuse safe there.</summary>
+    private (MemoryBuffer1D<float, Stride1D.Dense> Means, MemoryBuffer1D<float, Stride1D.Dense> InvStds) GetStatsScratch(int numSlices)
+    {
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            if (_capMeans == null || _capMeans.Length < numSlices)
+            {
+                if (Graph.GraphExecutor.SuppressDrains)
+                    throw new InvalidOperationException(
+                        $"InstanceNorm scratch would grow to {numSlices} mid-capture - warm passes must cover the largest shape first.");
+                _capMeans?.Dispose(); _capInvStds?.Dispose();
+                _capMeans = _accelerator.Allocate1D<float>(numSlices);
+                _capInvStds = _accelerator.Allocate1D<float>(numSlices);
+            }
+            return (_capMeans, _capInvStds!);
+        }
+        var means = _accelerator.Allocate1D<float>(numSlices);
+        var invStds = _accelerator.Allocate1D<float>(numSlices);
+        _allTempBufs.Add(means);
+        _allTempBufs.Add(invStds);
+        return (means, invStds);
+    }
 
     // RMSNorm two-pass invRms ring: the invRms buffer (one float per row) is written by Pass 1 and read by the
     // immediately-following Pass 2 (apply). A FIXED ring of reusable buffers (each grown to the max rows it has
@@ -593,6 +615,9 @@ public class NormalizationKernels : IDisposable
     {
         foreach (var b in _allTempBufs) try { b.Dispose(); } catch { }
         _allTempBufs.Clear();
+        try { _capMeans?.Dispose(); } catch { }
+        try { _capInvStds?.Dispose(); } catch { }
+        _capMeans = null; _capInvStds = null;
         foreach (var b in _invRmsRing) try { b?.Dispose(); } catch { }
         try { _dummyRmsWeight?.Dispose(); } catch { }
         _dummyRmsWeight = null;

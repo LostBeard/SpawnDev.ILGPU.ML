@@ -29,6 +29,8 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGenerationResult>
 {
     private readonly Accelerator _accelerator;
+    private ElementWiseKernels? _elementWise;
+    private ElementWiseKernels ElementWise => _elementWise ??= new ElementWiseKernels(_accelerator);   // one instance per pipeline (kernels lazy-load once, not per step)
     private InferenceSession? _textEncoder;
     private InferenceSession? _unet;
     private InferenceSession? _vaeDecoder;
@@ -61,6 +63,26 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
 
     /// <summary>Progress callback: (currentStep, totalSteps).</summary>
     public event Action<int, int>? OnProgress;
+
+    /// <summary>Graph capture (CUDA graphs / WebGPU dispatch plans) for the three sub-models: first
+    /// call per model captures, every later call replays - across steps AND across generations (the
+    /// shapes are fixed). ON by default per the pipeline rule (the always-on switch lives here, not
+    /// in consumers); no-op on non-capture backends. Opt out for one-shot use.</summary>
+    // DEFAULT OFF for THIS pipeline (unlike depth): SD-class activation volumes guarantee pool
+    // misses during the capture pass, and ILGPU's AllocateWithReclaim (flush/sync/alloc mid-capture)
+    // corrupts the CUDA context under VRAM pressure - 0xC0000005, bisect-proven per sub-model
+    // 2026-07-03. Direct generation is correct + fast (single-step); capture needs the pool-priming
+    // work extended to SD scale first (tracked: Plans/sd-capture-pool-priming.md). Opt IN via
+    // SDTURBO_FORCE_CAPTURE=1 for that development.
+    public bool EnableGraphCapture { get; set; } = Environment.GetEnvironmentVariable("SDTURBO_FORCE_CAPTURE") == "1";
+    // SDTURBO_CAPTURE scopes which sub-models capture (diagnostic): "clip"/"unet"/"vae" (comma list)
+    // or unset = all. With ML_NO_SESSION_CAPTURE=1 nothing captures regardless.
+    private static bool CapScope(string m)
+    { var s = Environment.GetEnvironmentVariable("SDTURBO_CAPTURE"); return string.IsNullOrEmpty(s) || s.Contains(m, StringComparison.OrdinalIgnoreCase); }
+    private Graph.SessionGraphCapture? _textEncoderCap, _unetCap, _vaeCap;
+    private Graph.SessionGraphCapture TextEncoderCap => _textEncoderCap ??= new Graph.SessionGraphCapture(_textEncoder!, _accelerator) { Enabled = EnableGraphCapture && CapScope("clip") };
+    private Graph.SessionGraphCapture UnetCap => _unetCap ??= new Graph.SessionGraphCapture(_unet!, _accelerator) { Enabled = EnableGraphCapture && CapScope("unet") };
+    private Graph.SessionGraphCapture VaeCap => _vaeCap ??= new Graph.SessionGraphCapture(_vaeDecoder!, _accelerator) { Enabled = EnableGraphCapture && CapScope("vae") };
 
     private ImageGenerationPipeline(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -198,7 +220,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         {
             [_textEncoder!.InputNames[0]] = tokenTensor,
         };
-        var textOutputs = await _textEncoder.RunAsync(textInputs);
+        var textOutputs = await TextEncoderCap.RunAsync(textInputs);
         var textEmbeddings = textOutputs[_textEncoder.OutputNames[0]]; // [1, 77, 1024]
 
         // ═══════════════════════════════════════════════════════════
@@ -244,7 +266,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             if (euler)
             {
                 float c = 1f / MathF.Sqrt(sigmas![step] * sigmas[step] + 1f);
-                new ElementWiseKernels(_accelerator).Scale(
+                ElementWise.Scale(
                     latentTensor.Data.SubView(0, noiseData.Length), scaledBuf!.View, noiseData.Length, c);
                 await _accelerator.SynchronizeAsync();
                 unetSample = new Tensor(scaledBuf.View, new[] { 1, 4, latentH, latentW });
@@ -260,25 +282,39 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
                 [_unet.InputNames[2]] = textEmbeddings,   // encoder_hidden_states [1,77,1024]
             };
 
-            var unetOutputs = await _unet.RunAsync(unetInputs);
+            var unetOutputs = await UnetCap.RunAsync(unetInputs);
             var noisePred = unetOutputs[_unet.OutputNames[0]]; // epsilon [1,4,64,64]
 
             // (b,c) scheduler step on the ORIGINAL (unscaled) latent.
-            var noisePredCpu = await ReadTensorToCpu(noisePred, noiseData.Length);
-            var latentCpu = await ReadTensorToCpu(latentTensor, noiseData.Length);
-            float[] updated = euler
-                ? DiffusionScheduler.EulerStep(noisePredCpu, latentCpu, sigmas![step], sigmas[step + 1])
-                : DiffusionScheduler.DDIMStep(noisePredCpu, latentCpu, timestepValues[step],
+            if (euler)
+            {
+                // GPU Euler step: latent += epsilon * (sigma_next - sigma) - ONE axpy dispatch. The
+                // old path read BOTH tensors to the host, looped, and re-uploaded - two readbacks +
+                // an upload per denoise step for math the GPU does in microseconds (zero-copy law).
+                float dt = sigmas![step + 1] - sigmas[step];
+                ElementWise.AddScaledInPlace(
+                    latentTensor.Data.SubView(0, noiseData.Length),
+                    noisePred.Data.SubView(0, noiseData.Length),
+                    noiseData.Length, dt);
+                await _accelerator.SynchronizeAsync();
+            }
+            else
+            {
+                // DDIM keeps the host step (alpha-cumprod indexing; not on the SD-Turbo hot path).
+                var noisePredCpu = await ReadTensorToCpu(noisePred, noiseData.Length);
+                var latentCpu = await ReadTensorToCpu(latentTensor, noiseData.Length);
+                float[] updated = DiffusionScheduler.DDIMStep(noisePredCpu, latentCpu, timestepValues[step],
                     step + 1 < timestepValues.Length ? timestepValues[step + 1] : -1, _alphasCumprod!);
-            latentTensor.Data.SubView(0, updated.Length).CopyFromCPU(updated);
-            await _accelerator.SynchronizeAsync();
+                latentTensor.Data.SubView(0, updated.Length).CopyFromCPU(updated);
+                await _accelerator.SynchronizeAsync();
+            }
         }
 
         // ═══════════════════════════════════════════════════════════
         //  Step 5: Scale latent for VAE (1 / 0.18215)
         // ═══════════════════════════════════════════════════════════
         const float vaeScaleFactor = 1f / 0.18215f;
-        new ElementWiseKernels(_accelerator).ScaleInPlace(
+        ElementWise.ScaleInPlace(
             latentTensor.Data.SubView(0, noiseData.Length),
             noiseData.Length, vaeScaleFactor);
         await _accelerator.SynchronizeAsync();
@@ -345,8 +381,10 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         }
         else
         {
-            var vaeOutputs = await _vaeDecoder!.RunAsync(new Dictionary<string, Tensor>
-                { [_vaeDecoder.InputNames[0]] = latentTensor });
+            // Captured (replay after gen 1). Tiled/diagnostic VAE paths above stay DIRECT - they
+            // mutate GraphExecutor break/capture globals mid-run, which a replayed plan ignores.
+            var vaeOutputs = await VaeCap.RunAsync(new Dictionary<string, Tensor>
+                { [_vaeDecoder!.InputNames[0]] = latentTensor });
             rgbData = await ReadTensorToCpu(vaeOutputs[_vaeDecoder.OutputNames[0]], 3 * imagePixels);
         }
         Graph.GraphExecutor.MaxPendingReleaseBytes = _savedByteCap;
@@ -582,7 +620,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
     private async Task<float[]> ReadTensorToCpu(Tensor tensor, int count)
     {
         using var readBuf = _accelerator.Allocate1D<float>(count);
-        new ElementWiseKernels(_accelerator).Scale(
+        ElementWise.Scale(
             tensor.Data.SubView(0, count), readBuf.View, count, 1f);
         await _accelerator.SynchronizeAsync();
         return await readBuf.CopyToHostAsync<float>(0, count);
@@ -590,6 +628,9 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
 
     public void Dispose()
     {
+        _textEncoderCap?.Dispose();
+        _unetCap?.Dispose();
+        _vaeCap?.Dispose();
         _textEncoder?.Dispose();
         _unet?.Dispose();
         _vaeDecoder?.Dispose();
