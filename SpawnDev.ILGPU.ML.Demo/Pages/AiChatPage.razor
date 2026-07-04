@@ -187,7 +187,9 @@ string answer = await pipe.GenerateAsync(convo,
             _status = $"Streaming {model.Label} ({model.Size}) from the hub to the GPU…";
             await InvokeAsync(StateHasChanged);
             _openModel?.Stream.Dispose();
-            _openModel = await hub.OpenAsync(model.Repo, model.File, deselect: false, _loadCts.Token);
+            // deselect:true - only the pieces the weight-stream reads; false background-downloaded the
+            // ENTIRE repo (every quant, 10-15GB) behind the working stream (caught 2026-07-04).
+            _openModel = await hub.OpenAsync(model.Repo, model.File, deselect: true, _loadCts.Token);
 
             _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, _openModel.Stream,
                 maxSeqLen: 4096,
