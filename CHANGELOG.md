@@ -2,7 +2,11 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 4.0.0-preview.7 (2026-07-04)
+
+### 🔧 Storage-quota browser-download runaway fixed via dependency bump — WebTorrent 3.2.12 + BlazorJS 3.5.15 (Tuvok)
+
+Bumps `SpawnDev.WebTorrent` 3.2.11 → **3.2.12** and `SpawnDev.BlazorJS` 3.5.14 → **3.5.15** to pull in the OPFS storage-quota runaway fix. Previously, a browser model download whose OPFS piece store failed (the origin out of space) would re-request the same piece forever - 169 identical range GETs observed live on the 1.5B model - because the failing write leaked an OPFS swap file per attempt (BlazorJS) and the picker re-requested the unflagged piece (WebTorrent). Now the write aborts-on-throw (no swap leak) and the torrent classifies the failure and pauses with an `OnError` event instead of hot-looping. The successful download/decode path is byte-identical - this only changes the out-of-space failure behavior. No ML API change.
 
 ### 🔧 DA2 content-free depth FIXED: FuseAttention double-scaled Q-pre-scaled ViT attention (Seven)
 
