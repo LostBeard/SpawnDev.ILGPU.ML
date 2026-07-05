@@ -130,24 +130,29 @@ public static partial class OnnxParser
     private static async Task<OnnxTensorProto> ParseInitializerFromStreamAsync(
         StreamProtoReader r, long len, int streamThreshold)
     {
-        // Small initializer (incl. all inline-data constants): read whole, reuse the byte[] parser verbatim.
-        if (len <= streamThreshold)
-        {
-            var bytes = await r.ReadBytesAsync(checked((int)len)).ConfigureAwait(false);
-            return ParseTensorFromBytes(bytes);
-        }
-
-        // Large initializer: dominated by raw_data. Walk fields; record raw_data offset + skip the bytes.
+        // ALWAYS field-walk, at ANY size. A raw_data / packed-float_data weight BLOB records its stream
+        // OFFSET and is NEVER materialized (JS-side zero-copy upload straight to the GPU), regardless of
+        // size. The old `len <= streamThreshold` early-return read every sub-1MB weight WHOLE into a .NET
+        // byte[] (RawDataStreamOffset stayed -1 → CopyFromCPU) — SD-Turbo's ~4651 small fp16 weights all
+        // fell into .NET, which was the entire ~26x WebGPU load gap (Geordi root-caused 2026-07-05, from
+        // the CUDA-vs-WebGPU 7.6s-vs-200s measurement). `streamThreshold` is now vestigial (kept for the
+        // caller signature). The stream-vs-materialize decision is by ELEMENT COUNT, matching the CPU
+        // constant-extraction threshold (<=64 elems): a float WEIGHT (dtype 1/10, >64 elems) streams
+        // zero-copy; everything <=64 elems (CPU shape/scalar constants) and all non-float raw_data +
+        // inline int32/int64/double_data materialize into .NET — those genuinely ARE small .NET-side
+        // constants the graph reads on the CPU for shape inference.
+        _ = streamThreshold;
         long end = r.Position + len;
         var tensor = new OnnxTensorProto();
         var dims = new List<long>();
+        List<int>? int32s = null; List<long>? int64s = null; List<double>? doubles = null;
 
         while (r.Position < end)
         {
             var (field, wire) = await r.ReadTagAsync().ConfigureAwait(false);
             switch (field)
             {
-                case 1:                                                                    // dims
+                case 1:                                                                    // dims (packed int64)
                     if (wire == 2)
                     {
                         int plen = checked((int)await r.ReadVarintAsync().ConfigureAwait(false));
@@ -157,39 +162,99 @@ public static partial class OnnxParser
                     else dims.Add((long)await r.ReadVarintAsync().ConfigureAwait(false));
                     break;
                 case 2: tensor.DataType = (int)await r.ReadVarintAsync().ConfigureAwait(false); break;  // data_type
-                case 4:                                                                                 // float_data (packed)
-                    // Packed repeated float is contiguous little-endian float32 — the SAME byte layout as
-                    // raw_data for a FLOAT tensor, so it streams identically (offset + skip, upload as f32).
-                    // Some exporters (e.g. SqueezeNet) store large weights here instead of raw_data.
+                case 4:                                                                                 // float_data (packed f32)
                     if (wire == 2)
                     {
                         long fLen = (long)await r.ReadVarintAsync().ConfigureAwait(false);
-                        tensor.RawDataStreamOffset = r.Position;
-                        tensor.RawDataLength = checked((int)fLen);
-                        if (tensor.DataType == 0) tensor.DataType = 1;   // FLOAT (float_data is always f32)
-                        await r.SkipAsync(fLen).ConfigureAwait(false);
+                        if (tensor.DataType == 0) tensor.DataType = 1;   // float_data is always f32
+                        if (TensorElems(dims) > 64)                      // WEIGHT: stream (contiguous LE f32 == raw_data layout)
+                        {
+                            tensor.RawDataStreamOffset = r.Position;
+                            tensor.RawDataLength = checked((int)fLen);
+                            await r.SkipAsync(fLen).ConfigureAwait(false);
+                        }
+                        else                                             // small float CONSTANT (<=64): materialize its CPU value
+                        {
+                            var pb = await r.ReadBytesAsync(checked((int)fLen)).ConfigureAwait(false);
+                            var fl = new List<float>();
+                            AppendPackedFloats(pb, fl);
+                            tensor.FloatData = fl.ToArray();
+                        }
                     }
                     else await r.SkipFieldAsync(wire).ConfigureAwait(false);
+                    break;
+                case 5:                                                                                 // int32_data — inline (small constant)
+                    if (wire == 2)
+                    {
+                        int plen = checked((int)await r.ReadVarintAsync().ConfigureAwait(false));
+                        var pb = await r.ReadBytesAsync(plen).ConfigureAwait(false);
+                        AppendPackedInt32s(pb, int32s ??= new());
+                    }
+                    else (int32s ??= new()).Add((int)(long)await r.ReadVarintAsync().ConfigureAwait(false));
+                    break;
+                case 7:                                                                                 // int64_data — inline
+                    if (wire == 2)
+                    {
+                        int plen = checked((int)await r.ReadVarintAsync().ConfigureAwait(false));
+                        var pb = await r.ReadBytesAsync(plen).ConfigureAwait(false);
+                        AppendPackedInt64s(pb, int64s ??= new());
+                    }
+                    else (int64s ??= new()).Add((long)await r.ReadVarintAsync().ConfigureAwait(false));
+                    break;
+                case 10:                                                                                // double_data — inline
+                    if (wire == 2)
+                    {
+                        int plen = checked((int)await r.ReadVarintAsync().ConfigureAwait(false));
+                        var pb = await r.ReadBytesAsync(plen).ConfigureAwait(false);
+                        AppendPackedDoubles(pb, doubles ??= new());
+                    }
+                    else
+                    {
+                        var db = await r.ReadBytesAsync(8).ConfigureAwait(false); // fixed64
+                        (doubles ??= new()).Add(BitConverter.ToDouble(db, 0));
+                    }
                     break;
                 case 8: tensor.Name = await r.ReadStringAsync().ConfigureAwait(false); break;           // name
                 case 9:                                                                                 // raw_data
                 {
                     long rawLen = (long)await r.ReadVarintAsync().ConfigureAwait(false);
-                    tensor.RawDataStreamOffset = r.Position;          // absolute offset of the weight blob
-                    tensor.RawDataLength = checked((int)rawLen);
-                    await r.SkipAsync(rawLen).ConfigureAwait(false);
+                    // Stream ONLY a float WEIGHT: dtype FLOAT32(1)/FLOAT16(10) AND >64 elements. Everything
+                    // else materializes into .NET (identical to the old byte[] path; downstream ToFloatArray/
+                    // constant extraction consumes RawData): (a) non-float raw_data — INT64/INT32 shape
+                    // constants, bool masks — the GPU uploader is float-only; (b) a SMALL float tensor
+                    // (<=64 elems) is a CPU constant (shape/scalar the graph reads on the CPU for shape
+                    // inference) — streaming it to GPU-only would lose that value and corrupt downstream
+                    // shapes (a Conv saw rank-3 instead of rank-4, 2026-07-05). data_type + dims precede
+                    // raw_data in standard ONNX, so both are known here; if unset we materialize (safe).
+                    if ((tensor.DataType == 1 || tensor.DataType == 10) && TensorElems(dims) > 64)
+                    {
+                        tensor.RawDataStreamOffset = r.Position;      // absolute offset of the weight blob
+                        tensor.RawDataLength = checked((int)rawLen);
+                        await r.SkipAsync(rawLen).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        tensor.RawData = await r.ReadBytesAsync(checked((int)rawLen)).ConfigureAwait(false);
+                    }
                     break;
                 }
-                default: await r.SkipFieldAsync(wire).ConfigureAwait(false); break;
+                case 14: tensor.DataLocation = (int)await r.ReadVarintAsync().ConfigureAwait(false); break; // data_location (1 = external → loader skips)
+                default: await r.SkipFieldAsync(wire).ConfigureAwait(false); break;                     // string_data(6)/uint64(11)/doc_string(12)/external_data(13)
             }
         }
 
         tensor.Dims = dims.ToArray();
-        if (tensor.RawDataStreamOffset < 0)
+        tensor.Int32Data = int32s?.ToArray();
+        tensor.Int64Data = int64s?.ToArray();
+        tensor.DoubleData = doubles?.ToArray();
+
+        // Unsupported ONLY if the tensor has NO data in any recognized field AND is not external.
+        if (tensor.RawDataStreamOffset < 0 && tensor.RawData == null && tensor.FloatData == null
+            && tensor.Int32Data == null && tensor.Int64Data == null && tensor.DoubleData == null
+            && tensor.DataLocation != 1)
             throw new NotSupportedException(
-                $"Streaming load: large initializer '{tensor.Name}' (dtype {tensor.DataType}) stores its data in a " +
-                "field other than raw_data or packed float_data (e.g. int32/int64/double_data); not yet supported " +
-                "by the stream parser. Load this model via CreateFromOnnx(byte[]).");
+                $"Streaming load: initializer '{tensor.Name}' (dtype {tensor.DataType}) has no raw_data, packed " +
+                "float_data, or int32/int64/double_data. Load this model via CreateFromOnnx(byte[]).");
         return tensor;
     }
 
@@ -222,5 +287,33 @@ public static partial class OnnxParser
     {
         var pr = new ProtobufReader(packed);
         while (pr.HasMore) into.Add(pr.ReadInt64());
+    }
+
+    private static void AppendPackedInt32s(byte[] packed, List<int> into)
+    {
+        var pr = new ProtobufReader(packed);
+        while (pr.HasMore) into.Add(pr.ReadInt32());
+    }
+
+    private static void AppendPackedDoubles(byte[] packed, List<double> into)
+    {
+        var pr = new ProtobufReader(packed);
+        while (pr.HasMore) into.Add(pr.ReadDouble());
+    }
+
+    private static void AppendPackedFloats(byte[] packed, List<float> into)
+    {
+        var pr = new ProtobufReader(packed);
+        while (pr.HasMore) into.Add(pr.ReadFloat());
+    }
+
+    /// <summary>Element count from parsed dims (empty dims = scalar = 1). Used to tell a small CPU
+    /// constant (&lt;=64 elems, must materialize its value for shape inference) from a streamable weight.</summary>
+    private static long TensorElems(List<long> dims)
+    {
+        if (dims.Count == 0) return 1;
+        long e = 1;
+        foreach (var d in dims) e *= d;
+        return e;
     }
 }

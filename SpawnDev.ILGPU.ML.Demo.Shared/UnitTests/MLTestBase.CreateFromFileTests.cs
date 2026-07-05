@@ -649,6 +649,70 @@ public abstract partial class MLTestBase
         bytePipe.Dispose();
     });
 
+    /// <summary>
+    /// FP16 weight streaming: a fp16-source weight that needs an fp32 GPU buffer must upload the raw fp16
+    /// bytes to the GPU and upcast Half→float ON THE GPU (browser: zero-copy, bytes never enter .NET) — NOT
+    /// read into a managed byte[] + CPU BitConverter loop (the old path that pulled every SD-Turbo weight
+    /// through .NET and made the browser load take ~10 min; Captain 2026-07-05). This proves the new GPU
+    /// upcast in <see cref="BufferPool.AllocatePermanentFromStreamAsync"/> is BIT-EXACT to both the CPU
+    /// convert path (forced via DisableJsZeroCopyWeights) and the reference (float)BitConverter.ToHalf.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task StreamLoadFp16_GpuUpcast_BitExact_VsCpu() => await RunTest(async accelerator =>
+    {
+        const int count = 8192;
+        var rnd = new Random(20260705);
+        var srcBytes = new byte[count * 2];
+        var expected = new float[count];
+        for (int i = 0; i < count; i++)
+        {
+            var h = (System.Half)((float)(rnd.NextDouble() * 40.0 - 20.0)); // finite fp16, no NaN/Inf edge cases
+            ushort bits = BitConverter.HalfToUInt16Bits(h);
+            srcBytes[i * 2] = (byte)(bits & 0xFF);
+            srcBytes[i * 2 + 1] = (byte)(bits >> 8);
+            expected[i] = (float)BitConverter.ToHalf(srcBytes, i * 2); // exactly what the code must produce
+        }
+        int[] shape = { count };
+
+        // Read a loaded weight's GPU data back to host cross-backend: GPU→GPU CopyFrom into a temp buffer
+        // (safe on all backends), then CopyToHostAsync (WebGPU-safe mapAsync path).
+        async Task<float[]> ReadBack(SpawnDev.ILGPU.ML.Tensors.Tensor t)
+        {
+            using var dst = accelerator.Allocate1D<float>(count);
+            dst.View.CopyFrom(t.Data);
+            return await dst.CopyToHostAsync<float>(0, count);
+        }
+
+        bool priorFlag = SpawnDev.ILGPU.ML.Tensors.BufferPool.DisableJsZeroCopyWeights;
+        var pool = new SpawnDev.ILGPU.ML.Tensors.BufferPool(accelerator);
+        try
+        {
+            // NEW path: GPU Half→float upcast (bytes stream JS→GPU on browser; managed→Half→GPU-convert on desktop).
+            SpawnDev.ILGPU.ML.Tensors.BufferPool.DisableJsZeroCopyWeights = false;
+            using (var ms = new MemoryStream(srcBytes, writable: false))
+            {
+                var got = await ReadBack(await pool.AllocatePermanentFromStreamAsync(ms, 0, srcBytes.Length, 10, shape, "gpu"));
+                int bad = 0;
+                for (int i = 0; i < count; i++)
+                    if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(expected[i])) bad++;
+                if (bad > 0) throw new Exception($"GPU fp16 upcast NOT bit-exact: {bad}/{count} floats differ from (float)BitConverter.ToHalf");
+            }
+
+            // OLD path: CPU BitConverter loop (forced) — must also match (guards the fallback).
+            SpawnDev.ILGPU.ML.Tensors.BufferPool.DisableJsZeroCopyWeights = true;
+            using (var ms = new MemoryStream(srcBytes, writable: false))
+            {
+                var got = await ReadBack(await pool.AllocatePermanentFromStreamAsync(ms, 0, srcBytes.Length, 10, shape, "cpu"));
+                int bad = 0;
+                for (int i = 0; i < count; i++)
+                    if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(expected[i])) bad++;
+                if (bad > 0) throw new Exception($"CPU fp16 convert path regressed: {bad}/{count} differ");
+            }
+        }
+        finally { SpawnDev.ILGPU.ML.Tensors.BufferPool.DisableJsZeroCopyWeights = priorFlag; pool.Dispose(); }
+        Console.WriteLine($"[Fp16StreamLoad] PASS — GPU upcast == CPU convert == reference, {count} fp16 weights bit-exact");
+    });
+
     // ──────────────────────────────────────────────────────────────
     // Helper: create a gradient test image
     // ──────────────────────────────────────────────────────────────

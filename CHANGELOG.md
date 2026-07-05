@@ -2,6 +2,17 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.8 (2026-07-05)
+
+### ⚡ SD-Turbo WebGPU: generation ~4.5× + zero-copy weight load (Tuvok)
+
+Two independent WebGPU wins for the SD-Turbo image pipeline, measured on an RTX 4070.
+
+- **Warm shape-readback cache** — generation ~106s → ~23.4s. `ImageGenerationPipeline` enables `CacheShapeReadbacks` on all three sub-models; SD-Turbo shapes are fixed across generations, so the shape constants (2746 in the UNet alone, ~345ms each on WebGPU) are served from the CPU after generation 1 instead of a per-node GPU→CPU readback. Output bit-identical. Same lever the GGUF decode loop already uses.
+- **Zero-copy weight loading** — the ONNX parser now streams every float weight >64 elems JS-side straight to the GPU (never materializing into the .NET/WASM managed heap); only ≤64-elem CPU shape constants materialize. Fixes the ~26× WebGPU load gap where SD-Turbo's ~4651 small fp16 weights fell onto the .NET `CopyFromCPU` path. fp16 weights upcast to fp32 **on the GPU** (bit-exact vs CPU — PMT `StreamLoadFp16` 8/8 all backends), and a `BrowserBufferPolicy.StrictHostCopyMaxBytes` guard fails loud in PMT if a weight ever regresses off the JS-stream path.
+- **Dependency:** SpawnDev.ILGPU **4.17.3** (browser zero-copy `CopyFromCPU` + `BrowserBufferPolicy`).
+- Diagnostics: `SDTURBO_NODE_TIMING=1` (per-sub-model readback/drain split), `TraceWeightLoad` (`[WL SUMMARY]`), and console `--repeat` / `--prompts`.
+
 ## 4.0.0-preview.7 (2026-07-04)
 
 ### 🔧 Storage-quota browser-download runaway fixed via dependency bump — WebTorrent 3.2.12 + BlazorJS 3.5.15 (Tuvok)

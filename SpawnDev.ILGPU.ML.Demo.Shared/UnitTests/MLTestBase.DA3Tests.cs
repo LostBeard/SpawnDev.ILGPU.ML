@@ -435,12 +435,16 @@ public abstract partial class MLTestBase
             double warmReadbackMs = Graph.GraphExecutor.LastRunReadbackMs;
             int warmReadbacks = Graph.GraphExecutor.LastRunReadbackCount;
             double warmDrainMs = Graph.GraphExecutor.LastRunSyncDrainMs;
+            int warmDrains = Graph.GraphExecutor.LastRunSyncDrainCount;
             float range = w.MaxDepth - w.MinDepth;
             w.RawDepth.Dispose();
+            double perDrain = warmDrains > 0 ? warmDrainMs / warmDrains : 0;
+            double perReadback = warmReadbacks > 0 ? warmReadbackMs / warmReadbacks : 0;
 
             Console.WriteLine($"[Benchmark] [DA3-WEBGPU-PERF] elide={elide} nodes={session.NodeCount} range={range:F6} (desktop ref 0.1365) | "
                 + $"COLD wall={coldWall:F0}ms exec={coldExec:F0}ms | WARM wall={warmWall:F0}ms exec={warmExec:F0}ms "
-                + $"readbacks={warmReadbacks}({warmReadbackMs:F0}ms) drains={warmDrainMs:F0}ms | ORT-Web warm ref=73ms");
+                + $"readbacks={warmReadbacks}({warmReadbackMs:F0}ms={perReadback:F1}ms/rb) drains={warmDrains}({warmDrainMs:F0}ms={perDrain:F1}ms/drain) "
+                + $"residual={warmExec - warmReadbackMs - warmDrainMs:F0}ms | ORT-Web warm ref=73ms");
         }
         finally
         {

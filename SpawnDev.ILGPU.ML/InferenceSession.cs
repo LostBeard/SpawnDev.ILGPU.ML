@@ -54,6 +54,11 @@ public class InferenceSession : IDisposable
     /// <summary>Enable diagnostic logging to Console.</summary>
     public static bool VerboseLogging { get; set; }
 
+    /// <summary>Diagnostic: log per-tensor weight-upload timing (only tensors &gt;50ms) + a stream-vs-.NET
+    /// summary, to attribute a slow model load to torrent seek-back waits vs .NET materialization. Off by
+    /// default (a healthy load is silent anyway). Enable from a consumer for a one-run load-perf trace.</summary>
+    public static bool TraceWeightLoad { get; set; }
+
     /// <summary>DIAGNOSTIC: wall-clock ms of the most recent per-shape recompile (Compile + executor
     /// build). 0 when the last Run hit the base/cached executor (no recompile). Lets the decode loop
     /// attribute per-step cost to CPU recompile vs GPU forward.</summary>
@@ -1084,6 +1089,12 @@ public class InferenceSession : IDisposable
         // kernels later will let the loader half ALL fp16 weights with no gating; until then, conservative.)
         var halfEligible = new HashSet<string>();
         var halfBlocked = new HashSet<string>();
+        // Every initializer a compiled KERNEL actually consumes as an input. An initializer NOT in this set
+        // is used only by CPU-side shape inference (a folded shape/scalar constant) or is unreferenced — it
+        // needs NO GPU buffer, so its upload (a CopyFromCPU per tensor on WebGPU) is pure waste (Captain
+        // 2026-07-05: "don't upload what the GPU never consumes"). We skip those below. CPU shape inference
+        // reads its values from the SEPARATE cpuSmallWeights/ConstantData, so skipping the GPU upload is safe.
+        var gpuConsumed = new HashSet<string>();
         // Diagnostic (VerboseLogging): for each blocked weight, the op-type(s) that force it off the native
         // low-p path — so we can see which op still needs a native low-p kernel to widen the gate.
         var blockingOps = new Dictionary<string, HashSet<string>>();
@@ -1094,6 +1105,7 @@ public class InferenceSession : IDisposable
             {
                 var inName = ins[oi];
                 if (string.IsNullOrEmpty(inName)) continue;
+                gpuConsumed.Add(inName);
                 int convGroup = node.OpType == "Conv" && node.Attributes.TryGetValue("group", out var gv) && gv is long gl ? (int)gl : 1;
                 bool okAsWeight = oi == 1 && (node.OpType == "MatMul" || node.OpType == "Gemm" || (node.OpType == "Conv" && convGroup == 1));
                 if (okAsWeight) halfEligible.Add(inName);
@@ -1113,15 +1125,37 @@ public class InferenceSession : IDisposable
 
         // Stream weights to GPU: large tensors are seeked to + chunk-uploaded straight from the stream
         // (never materialized); small/inline tensors use the in-memory chunked/standard path.
+        // WeightLoadTrace: attribute a slow load to torrent seek-back waits (stream branch) vs .NET
+        // materialization (chunked branch). Only anomalies (>50ms) log; a healthy load is silent.
+        long _prevOff = -1; double _streamMs = 0, _chunkedMs = 0; int _nStream = 0, _nChunked = 0;
+        int skippedCpuOnly = 0; long _maxChunkedBytes = 0;
+        // Fail-loud (Geordi's ILGPU 4.17.2-local.8 guard, my ILGPU-side placement call): during weight
+        // upload, ANY host CopyFromCPU over 64KB throws — i.e. a bulk weight that regressed onto the .NET
+        // path instead of streaming JS-side. Largest LEGIT materialized constant is ~308B (measured), so 64KB
+        // never false-fires on a real weight; a regression (KB-MB) screams in PMT. ENFORCE ONLY when the
+        // source is a browser zero-copy stream (IJSReadStream = the hub in production) — where zero-copy IS
+        // available so a bulk CopyFromCPU is a genuine regression. A plain .NET stream (MemoryStream in
+        // equivalence tests, or desktop) legitimately CopyFromCPUs (no zero-copy source), so don't guard it.
+        bool _guardHostCopy = stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream;
+        if (_guardHostCopy) SpawnDev.ILGPU.BrowserBufferPolicy.StrictHostCopyMaxBytes = 65536;
+        try
+        {
         foreach (var (name, tensor) in Onnx.OnnxLoader.StreamTensorsFromParsed(parsedModel))
         {
             if (!graph.Initializers.TryGetValue(name, out var shape)) continue;
+            // No compiled kernel consumes this initializer → it is a CPU-only shape/scalar constant (or
+            // unreferenced). CPU shape inference already has its value (cpuSmallWeights); a GPU buffer +
+            // upload would be pure waste (the many tiny CopyFromCPU on WebGPU). Skip it.
+            if (!gpuConsumed.Contains(name)) { skippedCpuOnly++; continue; }
             int expectedElems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+            long _t0 = TraceWeightLoad ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            string _branch;
             // fp16-source (dtype 10) weight, consumed exclusively by a half-capable op as its weight: keep
             // it fp16 on the GPU (half the bytes). Only fp16 SOURCE — never downcast a fp32 weight to fp16
             // (that would lose precision the model expects). Streaming path only (large weights = the win).
             if (halfEligible.Contains(name) && tensor.DataType == 10 && tensor.RawDataStreamOffset >= 0)
             {
+                _branch = "half-stream";
                 var halfW = await pool.AllocateHalfWeightFromStreamAsync(
                     stream, tensor.RawDataStreamOffset, tensor.RawDataLength, tensor.DataType, shape, name, ct).ConfigureAwait(false);
                 gpuWeights[name] = Tensor.FromHalf(halfW);
@@ -1129,6 +1163,7 @@ public class InferenceSession : IDisposable
             }
             else if (tensor.RawDataStreamOffset >= 0)
             {
+                _branch = "f32-stream";
                 if (tensor.DataType == 10) // a BLOCKED fp16 weight: no native consumer -> downcast to f32 (the unpacking)
                 {
                     blockedFp16Count++; blockedFp16Elems += expectedElems;
@@ -1139,13 +1174,28 @@ public class InferenceSession : IDisposable
                     stream, tensor.RawDataStreamOffset, tensor.RawDataLength, tensor.DataType, shape, name, ct).ConfigureAwait(false);
             }
             else if (tensor.ElementCount == 0 && expectedElems > 0)
-                gpuWeights[name] = pool.AllocatePermanent(new float[expectedElems], shape, name);
+            { _branch = "empty"; gpuWeights[name] = pool.AllocatePermanent(new float[expectedElems], shape, name); }
             else
-                gpuWeights[name] = pool.AllocatePermanentChunked(tensor, shape, name);
+            { _branch = "NET-chunked"; gpuWeights[name] = pool.AllocatePermanentChunked(tensor, shape, name); }
             loaded++;
+            if (TraceWeightLoad)
+            {
+                double _ms = System.Diagnostics.Stopwatch.GetElapsedTime(_t0).TotalMilliseconds;
+                long _off = tensor.RawDataStreamOffset;
+                if (_branch == "NET-chunked" || _branch == "empty") { _chunkedMs += _ms; _nChunked++; _maxChunkedBytes = Math.Max(_maxChunkedBytes, (long)expectedElems * 4); } else { _streamMs += _ms; _nStream++; }
+                if (_ms > 50)
+                    Console.WriteLine($"[WL SLOW] {_branch,-11} off={_off,-11} dOff={(_prevOff >= 0 && _off >= 0 ? _off - _prevOff : 0),-11} bytes={tensor.RawDataLength,-9} dt={tensor.DataType} {_ms,7:F0}ms  {name}");
+                if (_off >= 0) _prevOff = _off;
+            }
             int uploadPct = (int)Math.Min(99, loaded * 100L / totalWeights);
             if (uploadPct != lastUploadPct) { lastUploadPct = uploadPct; onProgress?.Invoke("upload", uploadPct); }
         }
+        }
+        finally { if (_guardHostCopy) SpawnDev.ILGPU.BrowserBufferPolicy.StrictHostCopyMaxBytes = -1; }
+        // Drain once + free the deferred fp16-upcast temp buffers (one drain for the whole load, not per weight).
+        await pool.FlushPendingFp16ConvertsAsync().ConfigureAwait(false);
+        if (TraceWeightLoad)
+            Console.WriteLine($"[WL SUMMARY] stream(zero-copy)={_nStream} tensors {_streamMs:F0}ms | NET-chunked={_nChunked} tensors {_chunkedMs:F0}ms (maxMaterialized={_maxChunkedBytes}B) | skipped(CPU-only, no GPU upload)={skippedCpuOnly}  → time is in the larger bucket");
         if (VerboseLogging)
         {
             Console.WriteLine($"[InferenceSession] f16 weights: {halfLoaded} loaded as fp16 (half GPU bytes) of {halfEligible.Count} half-eligible; the rest fp32.");

@@ -31,6 +31,15 @@ public class BufferPool : IDisposable
     // fp16 weight buffers (ILGPU.Half) — half the bytes of the fp32 _allBuffers. Tracked separately for
     // disposal (different element type). See AllocateHalfWeightFromStreamAsync.
     private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _allHalfBuffers = new();
+
+    // GPU fp16->fp32 upcast for the zero-copy weight-load path: lets an fp16-source weight that needs an
+    // fp32 GPU buffer stream JS->GPU (bytes never enter .NET) instead of the CPU read+convert loop.
+    private SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels? _fp16Convert;
+    // Deferred fp16-upcast temp buffers: freed as a BATCH after ONE drain (see AllocatePermanentFromStreamAsync)
+    // — a per-weight drain is 52s on WebGPU. Caller MUST call FlushPendingFp16ConvertsAsync at end-of-load.
+    private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _pendingFp16Temps = new();
+    private long _pendingFp16Bytes;
+    private const long Fp16TempFlushCap = 64L * 1024 * 1024; // 64MB of pending temps → drain + free the batch
     // fp16 ACTIVATION pool (mixed-precision activations): bucketed Half buffers for graph intermediates,
     // the half-bytes counterpart to the fp32 _buckets/_namedBuffers. Returned buffers reuse by size bucket.
     private readonly Dictionary<int, Stack<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>>> _halfBuckets = new();
@@ -387,6 +396,33 @@ public class BufferPool : IDisposable
             return new Tensor(buffer.View, shape, name);
         }
 
+        // RAW FLOAT16 -> FP32: stream the fp16 bytes to a TEMP GPU Half buffer (zero-copy JS->GPU on a
+        // browser IJSReadStream, identical to AllocateHalfWeightFromStreamAsync's fast path) then upcast
+        // Half->float ON THE GPU via the existing PrecisionConvertKernels. The weight bytes never enter the
+        // .NET/WASM managed heap and there is no per-element CPU BitConverter loop - this replaces the slow
+        // ReadExact + CopyFromCPU loop below for the common SD-Turbo (fp16) weight case, which was pulling
+        // every weight through .NET (Captain 2026-07-05). Works on all backends (browser gets true zero-copy;
+        // desktop streams managed into the Half buffer, still a GPU convert not a CPU one).
+        if (dataType == 10 && byteLength == count * 2 && !DisableJsZeroCopyWeights)
+        {
+            var halfTmp = _accelerator.Allocate1D<global::ILGPU.Half>(count);
+            await halfTmp.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+            (_fp16Convert ??= new SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels(_accelerator))
+                .HalfToFloat(halfTmp.View, buffer.View, count);
+            // The convert dispatch READS halfTmp, so halfTmp must survive until the convert runs. A per-weight
+            // `await SynchronizeAsync()` here is CATASTROPHIC on WebGPU — each is a full async GPU round-trip
+            // (~76ms × 686 unet weights = 52s; measured 2026-07-05). Instead DEFER: every fp16 weight gets its
+            // OWN temp (no reuse hazard), held in a pending list, and freed as a BATCH after ONE drain once the
+            // list crosses the cap (or at end-of-load via FlushPendingFp16ConvertsAsync). ~13 drains, not 686.
+            _pendingFp16Temps.Add(halfTmp);
+            _pendingFp16Bytes += (long)count * 2;
+            if (stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+                ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
+            if (_pendingFp16Bytes >= Fp16TempFlushCap)
+                await FlushPendingFp16ConvertsAsync().ConfigureAwait(false);
+            return new Tensor(buffer.View, shape, name);
+        }
+
         const int CHUNK = 262144; // 256K floats = 1 MB float buffer
         var byteBuf = new byte[CHUNK * srcElemBytes];
         var floatChunk = new float[CHUNK];
@@ -408,6 +444,19 @@ public class BufferPool : IDisposable
             uploaded += n;
         }
         return new Tensor(buffer.View, shape, name);
+    }
+
+    /// <summary>Drain once, then free the batch of deferred fp16-upcast temp buffers (see the fp16 branch of
+    /// <see cref="AllocatePermanentFromStreamAsync"/>). The single drain guarantees every pending Half→float
+    /// convert has read its temp before we free it — replacing a per-weight drain that costs ~52s on WebGPU.
+    /// The CALLER (weight-load loop) must invoke this at end-of-load so the last sub-cap batch is flushed.</summary>
+    public async Task FlushPendingFp16ConvertsAsync()
+    {
+        if (_pendingFp16Temps.Count == 0) return;
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false); // ONE drain: all pending converts complete
+        foreach (var t in _pendingFp16Temps) { try { t.Dispose(); } catch { /* may already be gone */ } }
+        _pendingFp16Temps.Clear();
+        _pendingFp16Bytes = 0;
     }
 
     /// <summary>
@@ -550,6 +599,10 @@ public class BufferPool : IDisposable
         _allBuffers.Clear();
         _allHalfBuffers.Clear();
         _buckets.Clear();
+        try { _fp16Convert?.Dispose(); } catch { /* kernel cache may already be torn down */ }
+        _fp16Convert = null;
+        foreach (var t in _pendingFp16Temps) { try { t.Dispose(); } catch { /* may already be gone */ } }
+        _pendingFp16Temps.Clear();
     }
 
     private static int NextPowerOf2(int v)
