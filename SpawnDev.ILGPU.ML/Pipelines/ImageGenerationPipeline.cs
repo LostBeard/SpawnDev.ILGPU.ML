@@ -173,6 +173,19 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
 
         pipe._alphasCumprod = DiffusionScheduler.ComputeAlphasCumprod();
 
+        // Warm shape-readback cache. SD-Turbo's tensor shapes are FIXED across generations (latent
+        // 1x4x64x64, tokens 1x77, embeddings 1x77x1024), so every generation reads back the IDENTICAL
+        // shape constants (Reshape/Slice/Concat dims). On the browser GPU backends each such readback is
+        // a ~345ms mapAsync round-trip, and the UNet alone triggers thousands (measured raw, CUDA/no-
+        // interp: text_encoder 897x, unet 2746x, vae 71x). CacheShapeReadbacks makes generation 1 record
+        // the proven-stable set and every LATER generation serve those values from the CPU cache — the
+        // GPU round-trip is skipped entirely on the warm path. Same lever GgufGenerator uses for its
+        // fixed-shape decode loop; the sub-models each run once per generation and their outputs are fully
+        // consumed before the next generation, so the fixed-shape recycling is safe here.
+        pipe._textEncoder!.CacheShapeReadbacks = true;
+        pipe._unet!.CacheShapeReadbacks = true;
+        pipe._vaeDecoder!.CacheShapeReadbacks = true;
+
         return pipe;
     }
 
@@ -220,7 +233,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         {
             [_textEncoder!.InputNames[0]] = tokenTensor,
         };
-        var textOutputs = await TextEncoderCap.RunAsync(textInputs);
+        var textOutputs = await TimedRun("text_encoder", _textEncoder!, TextEncoderCap, textInputs);
         var textEmbeddings = textOutputs[_textEncoder.OutputNames[0]]; // [1, 77, 1024]
 
         // ═══════════════════════════════════════════════════════════
@@ -282,7 +295,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
                 [_unet.InputNames[2]] = textEmbeddings,   // encoder_hidden_states [1,77,1024]
             };
 
-            var unetOutputs = await UnetCap.RunAsync(unetInputs);
+            var unetOutputs = await TimedRun("unet", _unet!, UnetCap, unetInputs);
             var noisePred = unetOutputs[_unet.OutputNames[0]]; // epsilon [1,4,64,64]
 
             // (b,c) scheduler step on the ORIGINAL (unscaled) latent.
@@ -383,7 +396,7 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         {
             // Captured (replay after gen 1). Tiled/diagnostic VAE paths above stay DIRECT - they
             // mutate GraphExecutor break/capture globals mid-run, which a replayed plan ignores.
-            var vaeOutputs = await VaeCap.RunAsync(new Dictionary<string, Tensor>
+            var vaeOutputs = await TimedRun("vae_decoder", _vaeDecoder!, VaeCap, new Dictionary<string, Tensor>
                 { [_vaeDecoder!.InputNames[0]] = latentTensor });
             rgbData = await ReadTensorToCpu(vaeOutputs[_vaeDecoder.OutputNames[0]], 3 * imagePixels);
         }
@@ -615,6 +628,26 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         if (blendStart && overlapPx > 0 && i < overlapPx) w *= (i + 0.5f) / overlapPx;
         if (blendEnd && overlapPx > 0 && i >= len - overlapPx) w *= (len - i - 0.5f) / overlapPx;
         return w;
+    }
+
+    // Per-sub-model perf decomposition (SDTURBO_NODE_TIMING=1): wall time + the GraphExecutor
+    // readback/drain split (the DAv3 attribution tool) so we SEE whether the WebGPU generation cost is
+    // per-node shape readbacks, sync drains, or raw dispatch/compute — not guess it. No-op unless set.
+    // The readback/drain COUNTS are graph-structural (identical on CUDA and WebGPU); only the per-op MS
+    // differs by backend, so a CUDA run already reveals the shape of the problem.
+    private static readonly bool _nodeTiming = Environment.GetEnvironmentVariable("SDTURBO_NODE_TIMING") == "1";
+    private static async Task<Dictionary<string, Tensor>> TimedRun(string tag, InferenceSession sess,
+        Graph.SessionGraphCapture cap, Dictionary<string, Tensor> inputs)
+    {
+        if (!_nodeTiming) return await cap.RunAsync(inputs);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var outs = await cap.RunAsync(inputs);
+        sw.Stop();
+        Console.WriteLine($"[NODETIME] {tag,-12} nodes={sess.NodeCount,4} wall={sw.Elapsed.TotalMilliseconds,9:F1}ms" +
+            $" | readback {Graph.GraphExecutor.LastRunReadbackCount,4}x {Graph.GraphExecutor.LastRunReadbackMs,8:F1}ms" +
+            $" | drain {Graph.GraphExecutor.LastRunSyncDrainCount,4}x {Graph.GraphExecutor.LastRunSyncDrainMs,8:F1}ms" +
+            $" | shapeResolved={Graph.GraphExecutor.LastRunShapeInterpResolved} execTotal={Graph.GraphExecutor.LastRunTotalMs:F1}ms");
+        return outs;
     }
 
     private async Task<float[]> ReadTensorToCpu(Tensor tensor, int count)

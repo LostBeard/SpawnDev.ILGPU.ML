@@ -37,6 +37,8 @@ using SpawnDev.ILGPU.ML.Tensors;
 bool ci = false;
 int? seed = null;
 string? outPath = null;
+int repeat = 1;                                                   // --repeat N: generate the same prompt N times in ONE process
+List<string>? promptSeq = null;                                   // --prompts "a|b|c": generate each in sequence, ONE resident process
 var promptWords = new List<string>();
 for (int i = 0; i < args.Length; i++)
 {
@@ -45,11 +47,16 @@ for (int i = 0; i < args.Length; i++)
         case "--ci": ci = true; break;
         case "--seed" when i + 1 < args.Length: seed = int.Parse(args[++i]); break;
         case "--out" when i + 1 < args.Length: outPath = args[++i]; break;
+        case "--repeat" when i + 1 < args.Length: repeat = Math.Max(1, int.Parse(args[++i])); break;
+        case "--prompts" when i + 1 < args.Length:
+            promptSeq = args[++i].Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList(); break;
         default: if (!args[i].StartsWith("--")) promptWords.Add(args[i]); break;
     }
 }
 
 string prompt = string.Join(' ', promptWords);
+if (promptSeq is { Count: > 0 } && string.IsNullOrWhiteSpace(prompt))
+    prompt = promptSeq[0];                                        // satisfy the has-prompt guard; Run iterates the full sequence
 if (ci)
 {
     seed ??= 42;                                                  // deterministic image for the self-check
@@ -67,7 +74,7 @@ if (string.IsNullOrWhiteSpace(prompt) && !ci && !interactive)
 
 try
 {
-    return await Run(prompt, seed, outPath, ci, interactive);
+    return await Run(prompt, seed, outPath, ci, interactive, repeat, promptSeq);
 }
 catch (Exception ex)
 {
@@ -75,7 +82,7 @@ catch (Exception ex)
     return 1;
 }
 
-async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, bool interactive)
+async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, bool interactive, int repeat = 1, List<string>? promptSeq = null)
 {
     // The application owns the accelerator (library code never disposes it). Prefer CUDA (SD-Turbo's
     // verified path), then OpenCL, then whatever ILGPU prefers.
@@ -87,6 +94,7 @@ async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, boo
                   : context.GetPreferredDevice(preferCPU: false);
     using var accelerator = device.CreateAccelerator(context);
     if (Environment.GetEnvironmentVariable("ML_VERBOSE") == "1") InferenceSession.VerboseLogging = true;
+    if (Environment.GetEnvironmentVariable("WL_TRACE") == "1") InferenceSession.TraceWeightLoad = true; // per-tensor upload attribution
     Console.WriteLine($"Accelerator: {accelerator.Name} ({accelerator.AcceleratorType})");
 
     // Model acquisition: the SpawnDev hub streams SD-Turbo's ONNX weights (cached after first run).
@@ -125,7 +133,31 @@ async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, boo
             BufferPool.TrackLivePeakComposition = true;
 
         if (!interactive)
+        {
+            // A batch of generations in ONE resident process. --prompts "a|b|c" runs each distinct prompt;
+            // --repeat N runs the same prompt N times. Generation 1 is cold; the warm shape-readback cache
+            // finalizes from two probe runs (ideally different prompts) and is active from generation 3 on —
+            // that warm path is what matters for perf (the model stays resident, users generate many images).
+            // Distinct out names per iteration so they can be diffed (a bit-identical repeat proves the warm
+            // cache preserved output). NODETIME (SDTURBO_NODE_TIMING=1) prints the per-gen readback split.
+            var seq = promptSeq is { Count: > 0 } ? promptSeq
+                    : Enumerable.Repeat(firstPrompt, repeat).ToList();
+            if (seq.Count > 1)
+            {
+                int rc = 0;
+                for (int r = 0; r < seq.Count; r++)
+                {
+                    string? op = outPath == null ? null
+                        : Path.Combine(Path.GetDirectoryName(outPath) is { Length: > 0 } d ? d : ".",
+                            $"{Path.GetFileNameWithoutExtension(outPath)}_{r}{Path.GetExtension(outPath)}");
+                    string tag = r == 0 ? "COLD" : r == 1 ? "PROBE2" : "WARM";
+                    Console.WriteLine($"\n=== generation {r + 1}/{seq.Count} ({tag}): \"{seq[r]}\" ===");
+                    rc = await GenerateOne(pipe, seq[r], seed, op, ci);
+                }
+                return rc;
+            }
             return await GenerateOne(pipe, firstPrompt, seed, outPath, ci);
+        }
 
         // ── Continuous session: load once (done), then prompt → image → repeat until /exit ──
         var rng = new Random();
