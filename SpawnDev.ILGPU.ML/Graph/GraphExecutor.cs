@@ -362,6 +362,11 @@ public class GraphExecutor : IDisposable
     /// <summary>DIAGNOSTIC: total wall-clock ms spent in those periodic + final GPU sync-drains. Reset per RunAsync.</summary>
     public static double LastRunSyncDrainMs;
 
+    /// <summary>DIAGNOSTIC (VAE-decode "external Instance reference no longer exists" hunt): the node index the
+    /// executor is CURRENTLY at, published every node so <see cref="Tensors.BufferPool"/> can name the node an
+    /// under-pressure <c>AllocateWithReclaim</c> reclaim (buffer dispose) fired at. -1 when no run is active.</summary>
+    public static int CurrentRunNodeIndex = -1;
+
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
         Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null,
@@ -1641,7 +1646,8 @@ public class GraphExecutor : IDisposable
                     var tailLen = LastRunOpLog.Count - tailStart;
                     var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
                     throw new Exception(
-                        $"[GE node-{nodeIdx} sync] {syncEx.Message} || last {tailLen} ops: {tail}");
+                        $"[GE node-{nodeIdx} sync] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
+                        $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
                 }
                 _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
                 // Now safe to return deferred buffers — GPU has finished reading them
@@ -1708,6 +1714,7 @@ public class GraphExecutor : IDisposable
 
         foreach (var node in _graph.Nodes)
         {
+            CurrentRunNodeIndex = nodeIdx;   // published for BufferPool reclaim attribution (see CurrentRunNodeIndex doc)
             // DIAGNOSTIC (CaptureTraceFile): append+flush BEFORE any per-node work so a native fault
             // (access violation / driver fault, uncatchable) on ANY path — elided, view, f16, or real
             // dispatch — leaves this node as the file's last line. See CaptureTraceFile doc.
@@ -2847,7 +2854,8 @@ public class GraphExecutor : IDisposable
                 var tailLen = LastRunOpLog.Count - tailStart;
                 var tail = string.Join(" | ", LastRunOpLog.GetRange(tailStart, tailLen));
                 throw new Exception(
-                    $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || last {tailLen} ops: {tail}");
+                    $"[GE final sync, {LastRunOpLog.Count} ops total] {syncEx.Message} || reclaims-this-process={Tensors.BufferPool.ReclaimFireCount} " +
+                    $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed) || last {tailLen} ops: {tail}");
             }
             _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
             // Release any remaining deferred buffers

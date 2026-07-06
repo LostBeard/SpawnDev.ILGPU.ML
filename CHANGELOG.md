@@ -2,6 +2,17 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.9 (2026-07-06)
+
+### 🐛 SD-Turbo WebGPU image-gen regression FIXED — reclaim disposed a buffer still referenced by an un-submitted dispatch (Tuvok)
+
+preview.8 regressed WebGPU SD-Turbo image generation on GPUs under memory pressure: generation died at the VAE decode with `[GE node-256 sync] A valid external Instance reference no longer exists` (equivalently `[Buffer] used in submit while destroyed`). Root-caused and fixed at the source; **both preview.8 wins (warm shape-readback cache + zero-copy weight load) are kept**.
+
+- **Root cause:** under GPU memory pressure, `BufferPool.AllocateWithReclaim` disposes the pool's Returned-but-not-live bucketed buffers to free VRAM. It is *designed* to flush pending GPU work first (so a disposed buffer is not still referenced by a batched dispatch), but it flushed via `Accelerator.Synchronize()`, which **throws `NotSupportedException` on WebGPU/WebGL and is swallowed** — so the command encoder was never submitted, and the reclaim `destroy()`'d buffers still referenced by un-submitted dispatches → the next `Queue.Submit` failed. It only fires under real GPU pressure (a clean 12GB card fits SD-Turbo and never reclaims — `totalReclaims=0`), which is why it hit the live demo but not the test bench.
+- **Fix:** `BufferPool.DisposeBucketedBuffers` now calls `Accelerator.Flush()` (submit the pending encoder — valid synchronously on every backend, a no-op on desktop) **before** disposing any bucketed buffer. WebGPU permits `destroy()` on a buffer once its work is in-flight (submitted), so the reclaim is now self-safe regardless of the caller.
+- **Regression gate:** new WebGPU-only HeavyModel tests — `SDTurbo_WebGPU_ImageGen_MultiGen` (4 real generations, cold+warm) and `SDTurbo_WebGPU_ForcedReclaim_Probe` (forces the reclaim deterministically via `BufferPool.ForceReclaimEveryNRents` without needing an OOM — reproduced the crash pre-fix, 238 safe reclaims disposing ~15GB mid-forward post-fix). Diagnostics: `BufferPool.TraceReclaim` / `ReclaimFireCount`, `GraphExecutor.CurrentRunNodeIndex`, and the drain-fail message now reports the reclaim count.
+- No API change. Same dependency (SpawnDev.ILGPU 4.17.3). The canonical mechanism fix (make `AllocateWithReclaim` flush via `Flush()` not `Synchronize()`) is proposed to the SpawnDev.ILGPU lane; this ML-side fix makes the reclaim safe today for every consumer.
+
 ## 4.0.0-preview.8 (2026-07-05)
 
 ### ⚡ SD-Turbo WebGPU: generation ~4.5× + zero-copy weight load (Tuvok)

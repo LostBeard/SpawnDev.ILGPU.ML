@@ -58,6 +58,32 @@ public class BufferPool : IDisposable
     /// cached source to isolate the JS&lt;-&gt;.NET copy cost. Default false (zero-copy on where applicable).</summary>
     public static bool DisableJsZeroCopyWeights = false;
 
+    /// <summary>DIAGNOSTIC (VAE-decode "external Instance reference no longer exists" regression hunt): count of
+    /// times the under-pressure <c>AllocateWithReclaim</c> reclaim (<see cref="DisposeBucketedBuffers"/>) has
+    /// FIRED — i.e. the pool hit GPU memory pressure mid-run and disposed bucketed buffers. On WebGPU the pre-
+    /// reclaim flush is a sync <c>Synchronize()</c> (flush, NOT a drain), so a reclaim firing mid-forward is the
+    /// prime suspect for a disposed-while-referenced buffer. Non-zero after a crashing VAE decode = confirmed.
+    /// Cumulative; a consumer resets via <see cref="ResetReclaimTrace"/> before a measured generation.</summary>
+    public static int ReclaimFireCount;
+    /// <summary>Total bytes disposed across all reclaim fires (see <see cref="ReclaimFireCount"/>).</summary>
+    public static long ReclaimFreedBytes;
+    /// <summary>When true, each reclaim fire logs its node (GraphExecutor.CurrentRunNodeIndex), buffer count, and
+    /// bytes to the console. Default off (a healthy run never reclaims).</summary>
+    public static bool TraceReclaim = false;
+    /// <summary>Zero the reclaim trace counters before a measured generation.</summary>
+    public static void ResetReclaimTrace() { ReclaimFireCount = 0; ReclaimFreedBytes = 0; }
+
+    /// <summary>DIAGNOSTIC (node-256 disposed-instance repro): when &gt;0, FORCE a reclaim
+    /// (<see cref="DisposeBucketedBuffers"/>) every N in-run <see cref="Rent"/>s — deterministically injecting the
+    /// exact buffer-disposal an under-pressure <c>AllocateWithReclaim</c> does in production, WITHOUT needing a
+    /// real OOM (which a fat GPU never hits with SD-Turbo). If disposing bucketed buffers mid-forward is unsafe
+    /// (a bucketed buffer is still referenced by a batched dispatch), this reproduces "external Instance reference
+    /// no longer exists" at the next drain — deterministically, in ANY environment. If it stays green, bucketed
+    /// buffers are drain-safe and the reclaim path is EXONERATED. Only fires while a run is active
+    /// (GraphExecutor.CurrentRunNodeIndex &gt;= 0). Default 0 = off.</summary>
+    public static int ForceReclaimEveryNRents = 0;
+    private int _rentsSinceForcedReclaim;
+
     /// <summary>Total weight bytes uploaded straight from JS to the GPU (zero-copy: never entered the .NET heap)
     /// by the browser streaming-load path. Stays 0 on desktop / non-JS streams. Lets a load measurement confirm
     /// the zero-copy path actually fired instead of the .NET byte[] fallback.</summary>
@@ -116,6 +142,17 @@ public class BufferPool : IDisposable
     {
         int count = TensorHelpers.ElementCount(shape);
         int bucketSize = NextPowerOf2(count);
+
+        // DIAGNOSTIC: deterministically inject the production reclaim disposal mid-forward (see
+        // ForceReclaimEveryNRents). Only while a run is active (not during weight load) so it exercises the
+        // inference-time bucket contents, exactly like an under-pressure AllocateWithReclaim would.
+        if (ForceReclaimEveryNRents > 0 && Graph.GraphExecutor.CurrentRunNodeIndex >= 0
+            && !Graph.GraphExecutor.SuppressDrains
+            && ++_rentsSinceForcedReclaim >= ForceReclaimEveryNRents)
+        {
+            _rentsSinceForcedReclaim = 0;
+            DisposeBucketedBuffers();
+        }
 
         // CUDA-graph capture: unnamed Rents get a stable per-forward slot (see _captureUnnamedSlots). Populated
         // during the warm pass (UseCaptureParamSlots set, SuppressDrains not) so no allocation on the capture pass.
@@ -192,12 +229,32 @@ public class BufferPool : IDisposable
         // VRAM pressure, 2026-07-03). Reclaiming nothing makes the OOM throw cleanly instead; the
         // capture wrapper falls back to the direct forward.
         if (Graph.GraphExecutor.SuppressDrains) return 0;
-        long freed = 0;
+
+        // Nothing bucketed → nothing to reclaim (and no need to flush).
+        bool anyToDispose = false;
+        foreach (var stack in _buckets.Values) if (stack.Count > 0) { anyToDispose = true; break; }
+        if (!anyToDispose)
+            foreach (var stack in _halfBuckets.Values) if (stack.Count > 0) { anyToDispose = true; break; }
+        if (!anyToDispose) return 0;
+
+        // ── WebGPU/WebGL command-encoder SAFETY (the SD-Turbo node-256 regression fix) ──
+        // A bucketed (Returned) buffer can still be referenced by an UN-SUBMITTED dispatch batched in the
+        // current command encoder. Destroying it now → "[Buffer] used in submit while destroyed" /
+        // "external Instance reference no longer exists" at the next Queue.Submit (reproduced deterministically
+        // via ForceReclaimEveryNRents). Flush() SUBMITS the pending encoder first — valid SYNCHRONOUSLY on every
+        // backend (a no-op on desktop, the encoder submit on browser) — so every referenced buffer is now in an
+        // IN-FLIGHT (submitted) command buffer, which WebGPU permits destroy() on (the memory is freed only once
+        // the queued work completes). AllocateWithReclaim's OWN pre-reclaim flush is Accelerator.Synchronize(),
+        // which THROWS on WebGPU and is swallowed (MemoryPressure.cs) → the encoder was never submitted before
+        // this reclaim disposed. Flushing HERE makes the reclaim self-safe regardless of the caller.
+        try { _accelerator.Flush(); } catch { /* desktop: no-op; browser: already-flushed is harmless */ }
+
+        long freed = 0; int nBuf = 0;
         foreach (var stack in _buckets.Values)
             while (stack.Count > 0)
             {
                 var buf = stack.Pop();
-                freed += buf.LengthInBytes;
+                freed += buf.LengthInBytes; nBuf++;
                 _allBuffers.Remove(buf);
                 buf.Dispose();
             }
@@ -207,11 +264,19 @@ public class BufferPool : IDisposable
             while (stack.Count > 0)
             {
                 var buf = stack.Pop();
-                freed += buf.LengthInBytes;
+                freed += buf.LengthInBytes; nBuf++;
                 _allHalfBuffers.Remove(buf);
                 buf.Dispose();
             }
         _halfBuckets.Clear();
+        // DIAGNOSTIC: a reclaim FIRING mid-forward is the prime suspect for the WebGPU VAE-decode
+        // "external Instance reference no longer exists" crash — the pre-reclaim flush is a sync
+        // Synchronize() (flush, not drain), so a bucketed buffer whose last dispatch is still in-flight
+        // could be disposed here. Record node + magnitude so a crashing run names exactly where it fired.
+        ReclaimFireCount++; ReclaimFreedBytes += freed;
+        if (TraceReclaim)
+            Console.WriteLine($"[RECLAIM #{ReclaimFireCount}] fired at node {Graph.GraphExecutor.CurrentRunNodeIndex}: " +
+                $"disposed {nBuf} bucketed buffers, {freed / 1048576.0:F1} MiB (flush-not-drain on browser backends)");
         return freed;
     }
 
