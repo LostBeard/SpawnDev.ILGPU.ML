@@ -58,6 +58,13 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
     /// <summary>Random seed for reproducible generation. Null = random.</summary>
     public int? Seed { get; set; }
 
+    /// <summary>Seam-free tiled VAE decode grid (NxN). 0 = auto (tile 2x2 when the output is >=512 on a side, so
+    /// the decode's GPU peak stays bounded by one tile instead of the full-res up_blocks intermediates). -1 =
+    /// force the full single-pass decode. Set explicitly to override. Added 2026-07-07 (Tuvok): the full 512x512
+    /// VAE decode's peak resident set OOM-kills the GPU process at up_blocks.3 on constrained machines; tiling the
+    /// up-blocks avoids the 256MiB full-res intermediates entirely. The VAE_TILE_EXACT env var still overrides.</summary>
+    public int VaeTileGrid { get; set; } = 0;
+
     /// <summary>Scheduler type: "ddim" or "euler".</summary>
     public string Scheduler { get; set; } = "euler";
 
@@ -371,7 +378,16 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         // the UP-BLOCKS tiled with global GroupNorm stats + halo-refreshed convs, so the result is bit-near-
         // identical to the full decode (no seams) at a much lower GPU peak. VAE_EXACT_VERIFY=1 additionally runs
         // the full fp32 decode and reports tiled-vs-full max/mean abs diff (the correctness gate).
-        int exactTile = int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_EXACT"), out var ext) ? ext : 0;
+        // Effective exact-tile grid: the VAE_TILE_EXACT env var overrides (desktop); else the VaeTileGrid
+        // property, where 0 = AUTO (2x2 when the output is >=512 on a side, so the VAE decode's GPU peak is
+        // bounded by one tile instead of the full-res up_blocks intermediates that OOM-kill the GPU process),
+        // -1 = force the full single-pass decode. Env vars are null in Blazor WASM, so the property is how the
+        // browser demo gets tiling.
+        int exactTile;
+        if (int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_EXACT"), out var ext)) exactTile = ext;
+        else if (VaeTileGrid == -1) exactTile = 0;
+        else if (VaeTileGrid > 0) exactTile = VaeTileGrid;
+        else exactTile = Math.Max(Width, Height) >= 512 ? 2 : 0;
         bool exactVerify = Environment.GetEnvironmentVariable("VAE_EXACT_VERIFY") == "1";
         if (exactTile > 0 || exactVerify)
         {

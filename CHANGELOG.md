@@ -2,6 +2,15 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.10 (2026-07-07)
+
+### 🐛 SD-Turbo WebGPU image-gen device loss ACTUALLY FIXED — it was a peak-resident-memory OOM, not the reclaim path (Tuvok)
+
+The preview.9 reclaim fix was the WRONG target. Verified on the real 4070 this session: the demo's `reclaimFires=0` — the reclaim path never fires, so preview.9 did not fix the crash. The image gen still died deterministically at the VAE decoder's `up_blocks.3` (first 512×512 stage) with a WebGPU device loss (`reason=unknown`, no validation error).
+
+- **Real root cause:** the full-resolution 512×512 VAE decode's **peak resident GPU memory** — the 256 MiB full-res `up_blocks.3` intermediates stacked on the resident SD-Turbo weights — crosses the browser GPU process's per-process D3D12 memory budget (below physical VRAM). A single allocation returns `E_OUTOFMEMORY` → device lost → `chrome://gpu`: *"The GPU process died due to out of memory"* (surfaced via Chrome's `exit_on_context_lost` workaround). This is why it was deterministic at `up_blocks.3`, independent of total headroom, and impossible to reproduce with a standalone probe (a fresh device never builds the peak). ~15 code hypotheses (grid, OOB, TDR, reclaim, disposal, workgroup-mismatch, HeapView, …) were empirically excluded first.
+- **Fix:** `ImageGenerationPipeline.VaeTileGrid` (new; default `0` = auto → seam-free 2×2 tiled VAE decode when the output is ≥512 on a side; `-1` forces the full single-pass decode; the `VAE_TILE_EXACT` env var still overrides). The seam-free `ExactTiledVaeDecodeAsync` decoder already existed but was **env-var-gated only, and env vars are null in Blazor WASM** — so the browser always hit the full-res OOM path. Tiling the up-blocks bounds the GPU peak to one tile, so `up_blocks.3` never allocates the 256 MiB full-res intermediates. Verified end-to-end: the browser demo now generates a 512×512 SD-Turbo image on a memory-constrained machine.
+
 ## 4.0.0-preview.9 (2026-07-06)
 
 ### 🐛 SD-Turbo WebGPU image-gen regression FIXED — reclaim disposed a buffer still referenced by an un-submitted dispatch (Tuvok)
