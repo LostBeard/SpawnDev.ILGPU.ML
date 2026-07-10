@@ -73,11 +73,19 @@ public sealed class CudaGraphCapture : IDisposable
         bool prevFold = GraphCompiler.ShapeSubgraphFoldEnabled;
         bool prevElide = GraphExecutor.ShapeInterpElideDispatch;
         bool prevValidate = GraphExecutor.ShapeInterpValidate;
+        long prevReleaseCap = GraphExecutor.MaxPendingReleaseBytes;
         GraphCompiler.ShapeSubgraphFoldEnabled = true;
         GraphExecutor.ShapeInterpElideDispatch = true;
         GraphExecutor.ShapeInterpValidate = false;
         FusedAttentionKernel.UseStableCaptureSlots = true;
         GraphExecutor.UseCaptureParamSlots = true;
+        // Bound the warm passes' deferred-release backlog so the pool footprint stays near the TRUE
+        // simultaneous-live set instead of (live + 512MB pending). On a memory-tight card the default
+        // 512MB backlog inflates warm VRAM enough to trip AllocateWithReclaim mid-warm, whose bucket
+        // disposal leaves the capture pass under-primed → cuMemAlloc mid-capture (0xC0000005). A small
+        // cap = frequent warm drains = buckets returned promptly = primed to the real peak. One-time
+        // warm cost; the provable guard below refuses capture if a warm reclaim fired anyway.
+        GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
         try
         {
             using (acc.WithDefaultStream(capStream))   // reroute *StreamKernel launches → capStream
@@ -86,18 +94,42 @@ public sealed class CudaGraphCapture : IDisposable
                 // runtimeConstants for the capture pass to seed.
                 await session.RunAsync(inputs);
                 await acc.SynchronizeAsync();
-                // Warm B (normal drains): over-provision the buffer pool to the deferred-release peak AND fully
-                // return every size-bucket, so the capture pass finds a warm buffer in every bucket (no cuMemAlloc,
-                // which is illegal mid-capture).
+                // Warm B: primes every size-bucket. Reset the reclaim trace first so the guard below can
+                // PROVE this pass held resident without disposing bucketed buffers.
+                BufferPool.ResetReclaimTrace();
                 await session.RunAsync(inputs);
                 await acc.SynchronizeAsync();
+                // Provable priming guard: if Warm B tripped AllocateWithReclaim, the pool's bucket contents
+                // are no longer a superset of the capture pass's rentals → a mid-capture cuMemAlloc would AV
+                // (0xC0000005, uncatchable). Do NOT enter the capture window; degrade to the direct forward.
+                if (BufferPool.ReclaimFireCount > 0)
+                {
+                    Console.WriteLine($"[CudaGraphCapture] warm reclaimed {BufferPool.ReclaimFireCount}x " +
+                        $"({BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB) - working set not resident, " +
+                        "capture not provably safe; running direct forward.");
+                    capStream.Dispose();
+                    return null;
+                }
                 // Capture: record the forward. Drains suppressed → no periodic drain / final sync / buffer-return
                 // aborts the capture; the seeded runtimeConstants keep eliding identical to warm.
                 GraphExecutor.SuppressDrains = true;
                 capStream.BeginCapture(CudaStreamCaptureMode.Global);
-                capOut = await session.RunAsync(inputs);
-                graph = capStream.EndCapture();
-                GraphExecutor.SuppressDrains = false;
+                try
+                {
+                    capOut = await session.RunAsync(inputs);
+                    graph = capStream.EndCapture();
+                }
+                catch
+                {
+                    // A capture-illegal op (e.g. a mid-capture stream sync in a dynamic Resize) INVALIDATES the
+                    // capture. EndCapture MUST still run to take the stream OUT of capture mode - otherwise the
+                    // stream stays capturing, the CUDA context is poisoned, and the caller's direct-forward
+                    // fallback AVs on its next cuMemAlloc (0xC0000005). The invalidated EndCapture reports
+                    // failure itself; swallow it - we only need the capture-mode reset. Mirrors the WebGPU path.
+                    try { capStream.EndCapture(); } catch { /* expected: capture was invalidated */ }
+                    throw;
+                }
+                finally { GraphExecutor.SuppressDrains = false; }
             }
         }
         finally
@@ -108,6 +140,7 @@ public sealed class CudaGraphCapture : IDisposable
             GraphCompiler.ShapeSubgraphFoldEnabled = prevFold;
             GraphExecutor.ShapeInterpElideDispatch = prevElide;
             GraphExecutor.ShapeInterpValidate = prevValidate;
+            GraphExecutor.MaxPendingReleaseBytes = prevReleaseCap;
         }
 
         CudaGraphExec exec;

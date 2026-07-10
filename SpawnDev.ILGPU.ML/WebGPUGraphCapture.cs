@@ -95,6 +95,7 @@ public sealed class WebGPUGraphCapture : IDisposable
         bool prevElide = GraphExecutor.ShapeInterpElideDispatch;
         bool prevValidate = GraphExecutor.ShapeInterpValidate;
         bool prevBgCache = WebGPUBackend.EnableBindGroupCaching;
+        long prevReleaseCap = GraphExecutor.MaxPendingReleaseBytes;
         GraphCompiler.ShapeSubgraphFoldEnabled = true;
         // Dispatch-elide ON (same as the CUDA capture): CPU-resolved shape ops don't dispatch, so the
         // captured plan is the pure compute forward - ~1200 fewer per-frame GPU passes on replay.
@@ -106,16 +107,31 @@ public sealed class WebGPUGraphCapture : IDisposable
         WebGPUBackend.EnableBindGroupCaching = false;
         FusedAttentionKernel.UseStableCaptureSlots = true;
         GraphExecutor.UseCaptureParamSlots = true;
+        // Bound the warm passes' deferred-release backlog (default 512MB) so warm's pool footprint stays
+        // near the true live set and doesn't trip AllocateWithReclaim mid-warm, which would leave the
+        // capture pass under-primed. Mirror of the CUDA capture fix; the guard below is the safety gate.
+        GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
         try
         {
             // Warm A: shader JIT + populate stable attention/param slots + finalize the readback cache +
             // snapshot runtimeConstants for the capture pass to seed.
             await session.RunAsync(inputs);
             await acc.SynchronizeAsync();
-            // Warm B (normal drains): over-provision the buffer pool to the deferred-release peak AND fully
-            // return every size-bucket, so the capture pass finds a warm buffer in every bucket.
+            // Warm B: primes every size-bucket. Reset the reclaim trace first so the guard below can PROVE
+            // this pass held resident without disposing bucketed buffers.
+            BufferPool.ResetReclaimTrace();
             await session.RunAsync(inputs);
             await acc.SynchronizeAsync();
+            // Provable priming guard: if Warm B tripped AllocateWithReclaim, the pool's buckets are no
+            // longer a superset of the capture pass's rentals → an allocation mid-dispatch-capture would
+            // perturb the recorded plan. Do NOT capture; degrade to the direct forward.
+            if (BufferPool.ReclaimFireCount > 0)
+            {
+                Console.WriteLine($"[WebGPUGraphCapture] warm reclaimed {BufferPool.ReclaimFireCount}x " +
+                    $"({BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB) - working set not resident, " +
+                    "capture not provably safe; running direct forward.");
+                return null;
+            }
 
             // Capture: record the forward. Drains suppressed → no mid-forward submit-and-wait or
             // buffer-return perturbs the stable regime; the plan records every dispatch as it encodes.
@@ -151,6 +167,7 @@ public sealed class WebGPUGraphCapture : IDisposable
             GraphExecutor.ShapeInterpElideDispatch = prevElide;
             GraphExecutor.ShapeInterpValidate = prevValidate;
             WebGPUBackend.EnableBindGroupCaching = prevBgCache;
+            GraphExecutor.MaxPendingReleaseBytes = prevReleaseCap;
         }
     }
 

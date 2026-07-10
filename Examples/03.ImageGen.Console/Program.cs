@@ -207,8 +207,37 @@ async Task<int> GenerateOne(ImageGenerationPipeline pipe, string prompt, int? se
     BufferPool.ResetPeaks();
 
     Console.WriteLine($"Generating: \"{prompt}\"" + (seed.HasValue ? $" (seed {seed})" : ""));
+    bool perOp = Environment.GetEnvironmentVariable("SDTURBO_PEROP") == "1";
+    if (perOp)
+    {
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new();
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true; // true per-op GPU attribution
+    }
     var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = prompt });
     Console.WriteLine($"{result.Width}x{result.Height} in {result.InferenceTimeMs:F0}ms ({result.NumSteps} step)");
+    if (perOp && SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs is { } _pt && _pt.Count > 0)
+    {
+        // Aggregate by TRUE op-type ("NNN_OpType_/path" -> "OpType") with node COUNT + avg, so it diffs
+        // cleanly against the WebGPU per-op run (find where WGSL codegen/exec is worst vs PTX). Plus top nodes.
+        static string OpType(string n) { var p = n.Split('_'); return p.Length > 1 ? p[1] : n; }
+        var byType = new Dictionary<string, double>();
+        var cntType = new Dictionary<string, int>();
+        foreach (var kv in _pt)
+        {
+            var key = OpType(kv.Key);
+            byType[key] = byType.TryGetValue(key, out var v) ? v + kv.Value : kv.Value;
+            cntType[key] = cntType.TryGetValue(key, out var c) ? c + 1 : 1;
+        }
+        double tot = _pt.Values.Sum();
+        Console.WriteLine($"[PEROP] total captured = {tot:F0}ms across {_pt.Count} nodes. By op-type (ms / count / avg):");
+        foreach (var kv in byType.OrderByDescending(k => k.Value).Take(20))
+            Console.WriteLine($"    {kv.Value,8:F1}ms  {100 * kv.Value / tot,5:F1}%  {cntType[kv.Key],5}n  {kv.Value / cntType[kv.Key],7:F2}avg  {kv.Key}");
+        Console.WriteLine("[PEROP] top 15 individual nodes:");
+        foreach (var kv in _pt.OrderByDescending(k => k.Value).Take(15))
+            Console.WriteLine($"    {kv.Value,8:F1}ms  {kv.Key}");
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = false;
+    }
     Console.WriteLine($"[POOL] peak TOTAL allocated = {BufferPool.PeakTotalBytes / 1048576.0:F0} MiB" +
                       $" | peak LIVE (working set) = {BufferPool.PeakLiveBytes / 1048576.0:F0} MiB");
     var snap = BufferPool.PeakLiveSnapshot;

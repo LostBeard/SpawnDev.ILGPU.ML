@@ -205,4 +205,79 @@ public abstract partial class MLTestBase
             await client.DisposeAsync();
         }
     });
+
+    /// <summary>
+    /// WEBGPU SD-Turbo CAPTURE/REPLAY measurement (Tuvok 2026-07-10). Enables
+    /// <see cref="ImageGenerationPipeline.EnableGraphCapture"/> (which WASM env cannot set) and runs 3
+    /// generations at a FIXED 512x512 shape/seed: gen-1 pays the capture (2 warm forwards + record the
+    /// WebGPUDispatchPlan), gen-2/3 REPLAY. Reports per-gen InferenceTimeMs so the replay speedup is
+    /// visible, and validates every image is non-degenerate + no capture crash. Capture is BEST-EFFORT
+    /// (a capture-unsafe op degrades to the direct forward), so this does NOT hard-assert a speedup — it
+    /// measures it. A replay time ~= capture time means capture fell back (investigate); a large drop
+    /// confirms the replay lever. Run:
+    ///   PMT_EXCLUDE_CATEGORIES= PMT_FILTER=SDTurbo_WebGPU_Capture_Replay dotnet test PlaywrightMultiTest/...
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> SDTurbo_WebGPU_Capture_Replay() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only capture/replay measurement");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var fs = GetAsyncFS();
+        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
+        var client = fs != null
+            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
+            : new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new Hub.HubModelStream(client, http);
+            var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
+                Hub.ModelHub.KnownModels.SDTurbo,
+                onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
+            using (pipe)
+            {
+                if (!pipe.IsReady) throw new Exception("SD-Turbo pipeline not ready after CreateAsync.");
+                pipe.NumInferenceSteps = 1;
+                pipe.GuidanceScale = 0f;
+                pipe.EnableGraphCapture = true;   // the thing under measurement (WASM env can't set it)
+
+                // FIXED prompt + seed → fixed shapes → gen-1 captures, gen-2/3 replay the same plan.
+                const string prompt = "a lighthouse in a storm";
+                pipe.Seed = 42;
+                var times = new List<double>();
+                for (int g = 0; g < 3; g++)
+                {
+                    var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = prompt });
+                    times.Add(result.InferenceTimeMs);
+                    int px = result.Width * result.Height;
+                    if (result.Width != 512 || result.Height != 512)
+                        throw new Exception($"gen {g + 1}: expected 512x512, got {result.Width}x{result.Height}.");
+                    long nonZero = 0; double sum = 0, sumSq = 0;
+                    for (int i = 0; i < px; i++)
+                    {
+                        byte r = result.ImageRGBA[i * 4], gg = result.ImageRGBA[i * 4 + 1], b = result.ImageRGBA[i * 4 + 2];
+                        if (r != 0 || gg != 0 || b != 0) nonZero++;
+                        double lum = r + gg + b; sum += lum; sumSq += lum * lum;
+                    }
+                    double mean = sum / px, std = Math.Sqrt(Math.Max(0, sumSq / px - mean * mean));
+                    string tag = g == 0 ? "CAPTURE" : "REPLAY";
+                    Console.WriteLine($"[SDTurbo-WebGPU-Capture] gen {g + 1} ({tag}) {result.InferenceTimeMs:F0}ms nonZero={nonZero}/{px} lumStd={std:F1}");
+                    if (nonZero < px / 100) throw new Exception($"gen {g + 1}: image all-black ({nonZero}/{px}) — no image produced.");
+                    if (std < 5.0) throw new Exception($"gen {g + 1}: image near-constant (lumStd={std:F1}) — flat/degenerate.");
+                }
+                double capMs = times[0], replayMs = (times[1] + times[2]) / 2.0;
+                var report = $"capture(gen1)={capMs:F0}ms replay(gen2-3 avg)={replayMs:F0}ms speedup={capMs / Math.Max(1, replayMs):F2}x";
+                Console.WriteLine($"[SDTurbo-WebGPU-Capture] {report}");
+                return report;
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
+        {
+            throw new UnsupportedTestException($"SD-Turbo hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
 }

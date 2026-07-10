@@ -690,10 +690,23 @@ public class ElementWiseKernels : IDisposable
 
         int totalOut = inC * outH * outW;
 
-        _nearestParamsBuf ??= _accelerator.Allocate1D<float>(5);
-        _nearestParamsBuf.CopyFromCPU(new float[] { inC, inH, inW, outH, outW });
+        var nearestParams = new float[] { inC, inH, inW, outH, outW };
+        ArrayView1D<float, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: stable per-forward float slot. The shared _nearestParamsBuf + synchronous
+            // CopyFromCPU is a stream sync = illegal mid-capture (SD-Turbo VAE upsampler Resize aborted the
+            // whole capture: node 2589 SynchronizeStream, 2026-07-10). Same migration Gather/Slice/Pad got.
+            paramsView = Kernels.CaptureParamArena.Shared(_accelerator).RentStableSlotFloat(nearestParams);
+        }
+        else
+        {
+            _nearestParamsBuf ??= _accelerator.Allocate1D<float>(5);
+            _nearestParamsBuf.CopyFromCPU(nearestParams);
+            paramsView = _nearestParamsBuf.View;
+        }
 
-        _nearestUpsampleKernel(totalOut, input, output, _nearestParamsBuf.View);
+        _nearestUpsampleKernel(totalOut, input, output, paramsView);
     }
 
     /// <summary>
