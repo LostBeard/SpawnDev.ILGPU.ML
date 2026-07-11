@@ -2,6 +2,12 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.12 (2026-07-11)
+
+### 🐛 SD-Turbo WebGPU image-gen "external Instance reference no longer exists" crash FIXED (dependency: SpawnDev.ILGPU 4.17.5)
+
+The live SD-Turbo WebGPU image-gen (`/v1/images/generations`) crashed with **"A valid external Instance reference no longer exists"** under real managed-heap pressure (a co-resident LLM worker + the elide path's transient `float[]` allocations). Root cause was in SpawnDev.ILGPU: the browser backends' zero-copy `CopyFrom` upload paths viewed the WASM heap through the unprimed `HeapView.GetHeapBuffer()`, so a `memory.grow` (triggered by managed allocation) could **detach** the heap view mid-upload. Fixed in **SpawnDev.ILGPU 4.17.5** (wrap via `HeapViewPtr`, which primes the heap) + **SpawnDev.BlazorJS 3.5.21** (prime once per grow-epoch, not per view — so hot upload loops don't pay a forced GC each). No ML code change; this is a dependency bump (ILGPU 4.17.4→4.17.5, BlazorJS 3.5.20→3.5.21). Carries all of preview.11 (dispatch-elide default-on, ~1.9x SD-Turbo).
+
 ## 4.0.0-preview.11 (2026-07-11)
 
 ### ⚡ Dispatch-elide ON by default — ~1.9x faster SD-Turbo WebGPU image-gen, bit-exact (Tuvok)
