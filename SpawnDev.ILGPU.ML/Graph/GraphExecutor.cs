@@ -1126,11 +1126,11 @@ public class GraphExecutor : IDisposable
     /// to the GPU at all (not just their readback skipped) — they run entirely on the CPU like ORT. This removes
     /// ~1200 nodes of per-node dispatch/sync/alloc orchestration (the ~1200ms CUDA residual Seven measured) on
     /// EVERY backend. GPU-tensor consumers of an elided output get it materialized on-demand from the CPU value.
-    /// Requires ShapeSubgraphFoldEnabled. DEFAULT OFF (opt-in) — bit-exact on the DAv3 rig
+    /// Requires ShapeSubgraphFoldEnabled. **DEFAULT ON (Tuvok 2026-07-11)** — bit-exact on the DAv3 rig
     /// (DA3Small_Pipeline_5D_ElideDispatch) + SD-Turbo WebGPU (SDTurbo_WebGPU_ElideAB, 0.00% pixel-diff, 1.9x)
-    /// after the CLIP Range INT64_MAX-sentinel fix, but NOT yet a safe global default: the 2026-07-11 sweep
-    /// surfaced a MoveNet regression (shape-interp integer arithmetic ≠ GPU integer-truncation). Fix before flip.</summary>
-    public static bool ShapeInterpElideDispatch = false;
+    /// after the CLIP Range INT64_MAX-sentinel fix AND the MoveNet integer-floordiv fix (truncating integer Div
+    /// in TryComputeShapeOnCpu). Validated by the standard 6-backend PMT sweep.</summary>
+    public static bool ShapeInterpElideDispatch = true;
     /// <summary>DIAGNOSTIC (Tuvok 2026-07-11): log every shape op the CPU interpreter resolves to an EMPTY value,
     /// with each input's resolved value + tensor shape. The FIRST such line whose inputs are all non-empty is the
     /// root op that collapses a real shape to empty (the CLIP text_model Range-limit keystone). Console-only.</summary>
@@ -1295,6 +1295,16 @@ public class GraphExecutor : IDisposable
         return null;
     }
 
+    // True when EVERY input of the node is a declared integer tensor — mirrors IOnnxOperator.AllInputsAreInteger,
+    // so the CPU shape interpreter can match the GPU operator's integer semantics (e.g. truncating Div).
+    private bool AllNodeInputsInteger(CompiledNode node)
+    {
+        if (node.InputNames.Length == 0) return false;
+        foreach (var nm in node.InputNames)
+            if (string.IsNullOrEmpty(nm) || !_integerTensorNames.Contains(nm!)) return false;
+        return true;
+    }
+
     private bool TryComputeShapeOnCpu(CompiledNode node,
         Dictionary<string, Tensor> tensors,
         Dictionary<string, HalfTensor> halfTensors,
@@ -1414,11 +1424,18 @@ public class GraphExecutor : IDisposable
                 if (a == null || b == null) return false;
                 int len = System.Math.Max(a.Length, b.Length);
                 if ((a.Length != len && a.Length != 1) || (b.Length != len && b.Length != 1)) return false;
+                // ONNX Div on INTEGER dtypes truncates toward zero (C-style), matching the GPU DivOperator's
+                // AllInputsAreInteger -> TruncateInPlace (ElementWiseOperators.cs). Without it the interpreter
+                // returns 887/48=18.479 instead of 18, breaking MoveNet's argmax->coord decode (TF floordiv_1)
+                // by ~0.4 per keypoint when the Div is shape-interp-resolved under fold/elide (Tuvok 2026-07-11).
+                // Mul/Add/Sub of integers are already integer-valued, so only Div needs truncation.
+                bool truncInt = node.OpType == "Div" && AllNodeInputsInteger(node);
                 var outv = new float[len];
                 for (int i = 0; i < len; i++)
                 {
                     float av = a[a.Length == 1 ? 0 : i], bv = b[b.Length == 1 ? 0 : i];
-                    outv[i] = node.OpType switch { "Mul" => av * bv, "Add" => av + bv, "Sub" => av - bv, "Div" => bv != 0 ? av / bv : 0, _ => av };
+                    float r = node.OpType switch { "Mul" => av * bv, "Add" => av + bv, "Sub" => av - bv, "Div" => bv != 0 ? av / bv : 0, _ => av };
+                    outv[i] = truncInt ? System.MathF.Truncate(r) : r;
                 }
                 result = outv; return true;
             }

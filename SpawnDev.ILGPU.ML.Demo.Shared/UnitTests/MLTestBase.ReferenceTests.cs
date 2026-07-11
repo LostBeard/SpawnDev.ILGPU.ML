@@ -214,6 +214,67 @@ public abstract partial class MLTestBase
         Console.WriteLine("[MoveNet-Ref] PASS");
     });
 
+    /// <summary>
+    /// DIAGNOSTIC (Tuvok 2026-07-11): pinpoint the shape op the CPU interpreter resolves WRONG on MoveNet
+    /// (the elide-default-on regression: X keypoint coord collapsed to ~0). Runs on WebGPU with fold ON, elide
+    /// OFF, ShapeInterpValidate ON — so EVERY shape op still dispatches + reads back + is compared CPU-vs-GPU
+    /// (elide-off is required: an ELIDED op skips the readback, so it can't be validated). The SHAPEMISMATCH
+    /// entries in LastRunReadbackNames name the diverging op + its cpu/gpu values = the root of the MoveNet
+    /// integer-decode regression. WebGPU-only (browser enables shapeInterp without needing the elide flag).
+    /// </summary>
+    [TestMethod(Timeout = 120000, Category = "HeavyModel")]
+    public async Task<string> MoveNet_ElideShapeInterp_ValidateDiag() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: MoveNet shape-interp validate diag is WebGPU-only");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var inputInt32Bytes = await http.GetByteArrayAsync("references/movenet-lightning/cat_input_nhwc_int32.bin");
+        int elemCount = inputInt32Bytes.Length / 4;
+        var inputFloats = new float[elemCount];
+        for (int i = 0; i < elemCount; i++) inputFloats[i] = (float)BitConverter.ToInt32(inputInt32Bytes, i * 4);
+
+        bool pf = SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled;
+        bool pe = SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch;
+        bool pv = SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpValidate;
+        try
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;   // CPU shape interpreter on
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch = false;  // but do NOT elide (so every op reads back)
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpValidate = true;        // compare CPU-vs-GPU, log SHAPEMISMATCH
+            using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, "models/movenet-lightning/model.onnx");
+            using var inputBuf = accelerator.Allocate1D(inputFloats);
+            var inputTensor = new Tensor(inputBuf.View, new[] { 1, 192, 192, 3 });
+            await session.RunAsync(new Dictionary<string, Tensor> { [session.InputNames[0]] = inputTensor });
+            int mm = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunShapeInterpMismatches;
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"[MoveNet-ElideValidate] shapeInterp-mismatches={mm}; SHAPEMISMATCH ops:");
+            int shown = 0;
+            foreach (var n in SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunReadbackNames)
+            {
+                if (!n.StartsWith("SHAPEMISMATCH")) continue;
+                sb.Append("\n  " + n);
+                if (++shown >= 20) break;
+            }
+            if (shown == 0) sb.Append(" (none)");
+            var report = sb.ToString();
+            SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(report);
+            Console.WriteLine(report);
+            // REGRESSION GUARD: the CPU shape interpreter MUST match the GPU for every resolved shape op, or
+            // eliding it corrupts the result. mm>0 = a shape-interp op diverges from GPU truth (the integer
+            // floordiv gap that broke MoveNet's coord decode under elide — fixed 2026-07-11 by truncating
+            // integer Div in TryComputeShapeOnCpu). Any nonzero count = a new/regressed divergence.
+            if (mm != 0) throw new Exception($"MoveNet shape-interp diverges from GPU ({mm} mismatch(es)) — elide would corrupt the output. {report}");
+            return report;
+        }
+        finally
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled = pf;
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch = pe;
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpValidate = pv;
+        }
+    });
+
     // ── Style Transfer Reference Tests ──
 
     [TestMethod(Timeout = 120000, Category = "HeavyCpu,WasmHeavy")]
