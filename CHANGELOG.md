@@ -2,6 +2,19 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.11 (2026-07-11)
+
+### ⚡ Dispatch-elide ON by default — ~1.9x faster SD-Turbo WebGPU image-gen, bit-exact (Tuvok)
+
+Dispatch-elide (`GraphExecutor.ShapeInterpElideDispatch` + `GraphCompiler.ShapeSubgraphFoldEnabled`) is now **ON by default** for all inference. It CPU-resolves the pure shape-math nodes (Shape/Gather/Concat/Unsqueeze/Slice/Cast/Div/…) and skips dispatching them to the GPU, removing the per-node orchestration that dominated the WebGPU wall time. SD-Turbo WebGPU image generation is **~1.9x faster** (measured 201s → 106s on an RTX 4070, 4719 fewer dispatches) with a **0.00% pixel-diff** vs the non-elided path — a pure orchestration no-op. Validated by the standard 6-backend PMT sweep (4070 passing) plus the bit-exact `SDTurbo_WebGPU_ElideAB` and `DA3Small_Pipeline_5D_ElideDispatch` guards.
+
+Two CPU-shape-interpreter correctness fixes were required to make elide safe as a global default (both: the interpreter must match the GPU operator's exact semantics, because eliding makes the CPU-resolved value authoritative):
+
+- **CLIP Range keystone** — `TryComputeShapeOnCpu`'s Slice did a raw `(int)` cast of ONNX's INT64_MAX "to-the-end" `ends` sentinel (`9.223372E+18`), overflowing to `int.MinValue` and collapsing the CLIP causal-mask seq-len Slice `[77,77][-1:INT64_MAX]` to EMPTY → `Squeeze`→`Cast`→`Range(limit=EMPTY)` threw under elide. Fixed with the saturating `SatFloatToInt` (the GPU `SliceOperator` already saturated it). Also closed the same-class `long→int` overflow in the opset<10 `InferOutputShapes` path.
+- **MoveNet integer floordiv** — the interpreter's `Div` did float division where the GPU `DivOperator` truncates toward zero for integer inputs (`AllInputsAreInteger`). A TF `floordiv` in MoveNet's argmax→coordinate decode resolved to `21.4375` on the CPU vs `21` on the GPU → keypoint X-coord off ~0.4. Fixed by truncating integer `Div` in `TryComputeShapeOnCpu`. Regression guard: `MoveNet_ElideShapeInterp_ValidateDiag` (asserts the CPU interp matches the GPU for MoveNet).
+
+New gated diagnostics (zero-cost when off): `GraphExecutor.LogEmptyShapeInterp`, `ImageGenerationPipeline.TextEncoder`, Examples/03 `TE_INTROSPECT` / `SDTURBO_ELIDE` / `SDTURBO_ELIDE_DIAG`. No public API change; elide can be turned off with `ShapeInterpElideDispatch = false`.
+
 ## 4.0.0-preview.10 (2026-07-07)
 
 ### 🐛 SD-Turbo WebGPU image-gen device loss ACTUALLY FIXED — it was a peak-resident-memory OOM, not the reclaim path (Tuvok)
