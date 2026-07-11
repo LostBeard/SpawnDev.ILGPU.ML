@@ -230,6 +230,13 @@ public abstract partial class MLTestBase
                 var report = $"[SDTURBO-ELIDE-AB] elideOFF={aMs:F0}ms/{dispA}disp -> elideON={bMs:F0}ms/{dispB}disp = {(bMs > 0 ? aMs / bMs : 0):F2}x faster ({dispA - dispB} fewer dispatches); elideON image std={std:F1} nz={nz}/{px}; A-vs-B pixel-diff={diffPx:F0}/{px} ({(px > 0 ? 100.0 * diffPx / px : 0):F2}%)";
                 SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(report);
                 if (std < 5.0) throw new Exception($"elide-ON image degenerate (std={std:F1}) - elide broke SD-Turbo. {report}");
+                // Elide is a PURE orchestration no-op (CPU-resolve shape ops instead of dispatching them) - it must
+                // NOT change any FEATURE math, so the elide-ON image must be bit-identical to elide-OFF. The CLIP
+                // Range keystone (SatFloatToInt in TryComputeShapeOnCpu) was proven here at exactly 0.00% diff;
+                // allow a tiny margin only against non-determinism. A regression that reintroduces the empty-shape
+                // bug (or any elide divergence) shows up as a nonzero diff here.
+                if (diffPx > px * 0.005)
+                    throw new Exception($"elide-ON diverged from elide-OFF by {diffPx:F0}/{px} pixels ({100.0 * diffPx / px:F2}%) - elide must be bit-exact. {report}");
                 return report;
             }
         }
@@ -246,4 +253,9 @@ public abstract partial class MLTestBase
             await client.DisposeAsync();
         }
     });
+
+    // NOTE (Tuvok 2026-07-11): the one-shot SDTurbo_WebGPU_ElideEmptyDiag scaffold (used to capture the
+    // empty-shape-interp log that located the keystone - node 25 Slice INT64_MAX-sentinel overflow) was
+    // removed once SDTurbo_WebGPU_ElideAB proved elide bit-exact (0.00% diff). The gated, zero-cost
+    // GraphExecutor.LogEmptyShapeInterp flag it drove REMAINS for future manual diagnosis.
 }

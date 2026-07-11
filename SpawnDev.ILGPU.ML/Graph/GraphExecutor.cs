@@ -1126,8 +1126,15 @@ public class GraphExecutor : IDisposable
     /// to the GPU at all (not just their readback skipped) — they run entirely on the CPU like ORT. This removes
     /// ~1200 nodes of per-node dispatch/sync/alloc orchestration (the ~1200ms CUDA residual Seven measured) on
     /// EVERY backend. GPU-tensor consumers of an elided output get it materialized on-demand from the CPU value.
-    /// Requires ShapeSubgraphFoldEnabled. Default off until validated bit-exact on the DAv3 rig.</summary>
-    public static bool ShapeInterpElideDispatch;
+    /// Requires ShapeSubgraphFoldEnabled. DEFAULT OFF (opt-in) — bit-exact on the DAv3 rig
+    /// (DA3Small_Pipeline_5D_ElideDispatch) + SD-Turbo WebGPU (SDTurbo_WebGPU_ElideAB, 0.00% pixel-diff, 1.9x)
+    /// after the CLIP Range INT64_MAX-sentinel fix, but NOT yet a safe global default: the 2026-07-11 sweep
+    /// surfaced a MoveNet regression (shape-interp integer arithmetic ≠ GPU integer-truncation). Fix before flip.</summary>
+    public static bool ShapeInterpElideDispatch = false;
+    /// <summary>DIAGNOSTIC (Tuvok 2026-07-11): log every shape op the CPU interpreter resolves to an EMPTY value,
+    /// with each input's resolved value + tensor shape. The FIRST such line whose inputs are all non-empty is the
+    /// root op that collapses a real shape to empty (the CLIP text_model Range-limit keystone). Console-only.</summary>
+    public static bool LogEmptyShapeInterp;
     /// <summary>DIAGNOSTIC: when non-null, the executor records "OpType in=[shapes]" for each FLOP-carrying node
     /// (MatMul/Conv/Einsum/FusedLinear/FusedAttention/Gemm/ConvTranspose) so we can histogram the actual kernel
     /// shapes (M,K,N / C,H,W,k) — the input Seven needs to pick per-shape tile configs for the SGEMM core.</summary>
@@ -1383,7 +1390,14 @@ public class GraphExecutor : IDisposable
                 var stepsV = Vals(ins.Length > 4 ? ins[4] : null);
                 if ((axesV != null && axesV.Length > 0 && (long)axesV[0] != 0)) return false;
                 if (stepsV != null && stepsV.Length > 0 && (long)stepsV[0] != 1) return false;
-                int st = (int)starts[0], en = (int)ends[0];
+                // SATURATE float->int (NOT a plain (int) cast): the ONNX "to the end" sentinel is INT64_MAX
+                // (9223372036854775807), stored here as a float ≈9.223372E+18. A plain (int)9.2e18f OVERFLOWS
+                // to int.MinValue → after `en += data.Length` + clamp it collapses the slice to EMPTY. This is
+                // THE CLIP text_model Range keystone: Slice([77,77], starts=[-1], ends=[9.2e18], axes=[0]) must
+                // yield the last element [77], but the overflow produced [] → Squeeze→Cast→Range(limit=EMPTY)
+                // threw under elide. Mirrors the compiler-resolved Slice path (SatFloatToInt, line ~1275) + the
+                // SliceOperator. Verified: SatFloatToInt(9.2e18f)=int.MaxValue → en=clamp(MaxValue,0,2)=2 → [77].
+                int st = SatFloatToInt(starts[0]), en = SatFloatToInt(ends[0]);
                 if (st < 0) st += data.Length;
                 if (en < 0) en += data.Length;
                 st = System.Math.Clamp(st, 0, data.Length);
@@ -1751,6 +1765,23 @@ public class GraphExecutor : IDisposable
                 runtimeConstants[node.OutputNames[0]] = cpuShapeVal;
                 shapeInterpVals[node.OutputNames[0]] = cpuShapeVal;
                 LastRunShapeInterpResolved++;
+                if (LogEmptyShapeInterp && cpuShapeVal.Length == 0)
+                {
+                    var _sb = new System.Text.StringBuilder();
+                    _sb.Append($"[EMPTY-SHAPEINTERP] node {nodeIdx} {node.OpType} -> {node.OutputNames[0]} = EMPTY; in:");
+                    foreach (var _inn in node.InputNames)
+                    {
+                        if (string.IsNullOrEmpty(_inn)) { _sb.Append(" <null>"); continue; }
+                        float[]? _iv = runtimeConstants.TryGetValue(_inn!, out var _rv) ? _rv
+                                     : (_constantValues != null && _constantValues.TryGetValue(_inn!, out var _cvv) ? _cvv : null);
+                        string _ts = tensors.TryGetValue(_inn!, out var _tt) ? $"[{string.Join(",", _tt.Shape)}]" : "-";
+                        string _vs = _iv == null ? "null" : _iv.Length == 0 ? "EMPTY" : $"[{string.Join(",", _iv.Take(8))}]";
+                        _sb.Append($" {_inn}={_vs}(t={_ts})");
+                    }
+                    Console.WriteLine(_sb.ToString());
+                    // Browser: PMT captures console.error → browser_console.log. JS is null on desktop.
+                    SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(_sb.ToString());
+                }
                 // DISPATCH-ELIDE: a CPU-resolved shape op (value now in runtimeConstants) need not dispatch to the
                 // GPU — that removes its per-node orchestration (dispatch/sync/alloc), the ~1200ms CUDA residual. A
                 // GPU consumer of an elided output materializes it on-demand at input-gather below AS RANK-1 [len],

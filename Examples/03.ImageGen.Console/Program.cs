@@ -126,8 +126,43 @@ async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, boo
             Console.WriteLine("[INTROSPECT] done"); return 0;
         }
 
+        // TE_INTROSPECT=1: dump the CLIP text_encoder node sequence (the Range keystone chain). Focus the walk
+        // on the Range op + its input cone so we can see exactly what feeds /text_model/Cast_output_0.
+        if (Environment.GetEnvironmentVariable("TE_INTROSPECT") == "1")
+        {
+            var te = pipe.TextEncoder!;
+            Console.WriteLine($"[TE-INTROSPECT] text_encoder nodes={te.NodeCount}, weights={te.WeightCount}");
+            for (int i = 0; i < te.NodeCount; i++)
+            {
+                var (op, ins, outs) = te.GetNode(i);
+                string outName = outs.Length > 0 ? outs[0] : "";
+                // Print the shape/index-math ops (skip the bulk transformer MatMul/Add/LayerNorm body)
+                if (op is "Range" or "Shape" or "Gather" or "Cast" or "Slice" or "Unsqueeze" or "Squeeze"
+                        or "Concat" or "ConstantOfShape" or "Reshape" or "Expand" or "Mul" or "Add" or "Sub"
+                        or "Div" or "Where" or "Equal" or "Constant" or "Sub" or "Min" or "Max")
+                    Console.WriteLine($"  [{i,3}] {op,-16} in=[{string.Join(", ", ins)}] -> {outName}");
+            }
+            Console.WriteLine("[TE-INTROSPECT] done"); return 0;
+        }
+
         pipe.NumInferenceSteps = 1;  // SD-Turbo is single-step
         pipe.GuidanceScale = 0f;     // SD-Turbo uses no classifier-free guidance
+
+        // SDTURBO_ELIDE=1: force dispatch-elide + shape-subgraph-fold ON (the keystone repro). This is the
+        // WebGPU normal-gen config that throws at the CLIP text_model Range op; reproduces on CUDA too since
+        // ShapeInterpElideDispatch forces the CPU shape interpreter on all backends. SDTURBO_ELIDE_DIAG=1 also
+        // logs every shape op the interpreter collapses to EMPTY (first non-empty-input line = the root op).
+        if (Environment.GetEnvironmentVariable("SDTURBO_ELIDE") == "1")
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch = true;
+            SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
+            Console.WriteLine("[SDTURBO_ELIDE] dispatch-elide + shape-subgraph-fold ENABLED");
+        }
+        if (Environment.GetEnvironmentVariable("SDTURBO_ELIDE_DIAG") == "1")
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.LogEmptyShapeInterp = true;
+            Console.WriteLine("[SDTURBO_ELIDE_DIAG] empty-shape-interp logging ENABLED");
+        }
         BufferPool.TrackPeaks = true;
         if (Environment.GetEnvironmentVariable("PEAK_COMPOSITION") == "1")
             BufferPool.TrackLivePeakComposition = true;

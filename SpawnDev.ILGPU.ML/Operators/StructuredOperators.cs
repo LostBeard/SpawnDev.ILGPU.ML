@@ -1844,7 +1844,12 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             for (int idx = 0; idx < axes.Length; idx++)
             {
                 int dim = axes[idx] < 0 ? axes[idx] + outShape.Length : axes[idx];
-                int s2 = (int)starts[idx]; int e2 = (int)ends[idx]; int st2 = steps[idx];
+                // SATURATE long->int: ONNX uses INT64_MAX (9223372036854775807) as the "to the end" ends
+                // sentinel; a plain (int) truncates it to -1 → collapses the slice. Clamp to int range (mirrors
+                // Execute path-2, lines ~1897-1899, and the runtime-interp SatFloatToInt). opset<10 attr path.
+                int s2 = starts[idx] < int.MinValue ? int.MinValue : starts[idx] > int.MaxValue ? int.MaxValue : (int)starts[idx];
+                int e2 = ends[idx] < int.MinValue ? int.MinValue : ends[idx] > int.MaxValue ? int.MaxValue : (int)ends[idx];
+                int st2 = steps[idx];
                 if (s2 < 0) s2 += outShape[dim];
                 if (e2 < 0) e2 += outShape[dim];
                 s2 = Math.Clamp(s2, 0, outShape[dim]);

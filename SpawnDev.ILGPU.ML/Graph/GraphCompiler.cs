@@ -15,11 +15,15 @@ public class GraphCompiler
     /// dispatch/readback). ~1400 for DAv3-518. Read by perf tests to prove the fold engaged.</summary>
     public static int LastCompileFoldedNodeCount;
 
-    /// <summary>WIP compile-time shape-subgraph fold (2026-07-01). Removes pure compile-time shape-math nodes
+    /// <summary>Compile-time shape-subgraph fold (2026-07-01). Removes pure compile-time shape-math nodes
     /// (Shape/Gather/Concat/Unsqueeze/Slice/Cast/Mul/Add/Sub/Div on non-dynamic inputs) from the executed graph
-    /// to kill ~1400 per-inference GPU shape readbacks on DAv3-518. DEFAULT OFF until proven correct across
-    /// DAv3 + full PMT - the folded values live on the optimizer graph clone and some are consumed as GPU
-    /// tensors (Resize data, Gather), which is still being wired end to end. Tests flip it on explicitly.</summary>
+    /// to kill ~1400 per-inference GPU shape readbacks on DAv3-518. DEFAULT OFF (opt-in) — proven bit-exact on
+    /// the DAv3 rig (DA3Small_Pipeline_5D_ElideDispatch, maxAbsDiff&lt;1e-3) and SD-Turbo WebGPU
+    /// (SDTurbo_WebGPU_ElideAB, 0.00% pixel-diff) after the CLIP Range INT64_MAX-sentinel fix. NOT yet a safe
+    /// GLOBAL default: the full sweep (2026-07-11) surfaced a MoveNet regression — TryComputeShapeOnCpu's
+    /// integer-tensor arithmetic (Div/Mul/etc.) doesn't match the GPU operator's integer-truncation, corrupting
+    /// MoveNet's argmax→coordinate decode. Fix that (shape-interp integer semantics) before flipping the default.
+    /// Tests + the SD-Turbo/DAv3 pipelines opt in explicitly.</summary>
     public static bool ShapeSubgraphFoldEnabled = false;
 
     public GraphCompiler(OperatorRegistry registry) => _registry = registry;
