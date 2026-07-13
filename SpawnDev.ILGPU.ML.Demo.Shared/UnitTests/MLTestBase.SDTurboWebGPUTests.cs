@@ -398,4 +398,78 @@ public abstract partial class MLTestBase
             await client.DisposeAsync();
         }
     });
+
+    /// <summary>
+    /// PER-STEP UNet COST measurement (Tuvok 2026-07-12, TJ request). Now that the VAE-decode memory path is
+    /// wide open (full-res GPU-resident), measure the marginal cost of one SD-Turbo denoise step on WebGPU by
+    /// running the SAME generation at NumInferenceSteps=1 vs =4. Only the denoise loop scales with steps
+    /// (CLIP text-encode + VAE decode + RGBA pack are one-time), so per-step UNet ~ (t4 - t1) / 3, and the fixed
+    /// (non-UNet) overhead ~ t1 - perStep. Warms the pipeline first (kernel compile + shape caches) so the
+    /// numbers are steady-state; capture is OFF (EnableGraphCapture default false) so this is the raw per-node
+    /// .NET-orchestration + GPU-exec cost. Reports the medians; does not hard-assert a threshold — it measures.
+    ///   PMT_EXCLUDE_CATEGORIES= PMT_FILTER=SDTurbo_WebGPU_PerStepUnetCost dotnet test PlaywrightMultiTest/...
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> SDTurbo_WebGPU_PerStepUnetCost() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only per-step UNet cost measurement");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var fs = GetAsyncFS();
+        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
+        var client = fs != null
+            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
+            : new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new Hub.HubModelStream(client, http);
+            var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
+                Hub.ModelHub.KnownModels.SDTurbo,
+                onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
+            using (pipe)
+            {
+                if (!pipe.IsReady)
+                    throw new Exception("SD-Turbo pipeline not ready after CreateAsync.");
+                pipe.GuidanceScale = 0f;
+                pipe.Seed = 42;
+
+                async Task<double> Gen(int steps)
+                {
+                    pipe.NumInferenceSteps = steps;
+                    var r = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a photo of a cat" });
+                    if (r.Width != 512 || r.Height != 512)
+                        throw new Exception($"steps={steps}: expected 512x512, got {r.Width}x{r.Height}.");
+                    return r.InferenceTimeMs;
+                }
+
+                // Warm: kernel compile + shape-readback caches (the UNet graph is identical for steps=1 and =4,
+                // so one warm-up covers both). Discard.
+                await Gen(1); await Gen(1);
+
+                var t1 = new List<double>(); for (int i = 0; i < 3; i++) t1.Add(await Gen(1));
+                var t4 = new List<double>(); for (int i = 0; i < 3; i++) t4.Add(await Gen(4));
+                t1.Sort(); t4.Sort();
+                double m1 = t1[1], m4 = t4[1];                 // median of 3
+                double perStep = (m4 - m1) / 3.0;              // 3 extra UNet steps between steps=1 and steps=4
+                double fixedCost = m1 - perStep;               // CLIP text-encode + VAE decode + RGBA pack
+
+                var report = $"steps=1 median={m1:F0}ms (runs {string.Join("/", t1.Select(x => x.ToString("F0")))}) | " +
+                    $"steps=4 median={m4:F0}ms ({string.Join("/", t4.Select(x => x.ToString("F0")))}) => " +
+                    $"per-step UNet ~{perStep:F0}ms; fixed CLIP+VAE+pack ~{fixedCost:F0}ms";
+                // JS.LogError => console.error, which PMT captures (dumps the text) WITHOUT tripping
+                // #blazor-error-ui (info-level Console.WriteLine is summarized-away by PMT). Same pattern as
+                // SDTurboProfile. Does not fail the test.
+                SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError("[SDTurbo-PerStep] " + report);
+                return report;
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
+        {
+            throw new UnsupportedTestException($"SD-Turbo hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
 }
