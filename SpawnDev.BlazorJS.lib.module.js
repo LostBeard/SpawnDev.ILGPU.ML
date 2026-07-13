@@ -1,16 +1,26 @@
 (function () {
+    // Blazor Wasm's JS interop reviver can throw an exception when reviving a JS 
+    // object like a cross-origin window simply by looking for a property that 
+    // does not exist like '__internalId'.
+    // This patch simply allows the revive to work without crashing
+    const originalHasOwnPropertyPrototype = Object.prototype.hasOwnProperty;
+    Object.prototype.hasOwnProperty = function (prop) {
+        try {
+            // Attempt the normal engine execution
+            return originalHasOwnPropertyPrototype.apply(this, [prop]);
+        } catch (error) {
+            // Catch DOMException / SecurityError (e.g., cross-origin window access)
+            if (error instanceof DOMException || error.name === 'SecurityError') {
+                // Return false so Blazor treats it as a non-existent property
+                return false;
+            }
+            // Re-throw genuine, unrelated engine errors
+            throw error;
+        }
+    };
     // helper function used in place of 'in' operator for checking if a property exists to allow a consistent operation regardless of obj's type
     function _in(key, obj) {
         if (obj === null || obj === void 0) return false;
-        // Fast path: objects and functions support the 'in' operator directly - no Object() wrapper
-        // allocation, no try/catch (which blocks JIT optimization of this hot helper). This helper is
-        // on the per-interop-call path (pathObjectInfo + the JSON reviver), so it must stay lean.
-        var t = typeof obj;
-        if (t === 'object' || t === 'function') {
-            try { return key in obj; } catch { return false; }
-        }
-        // Primitives (string/number/boolean/symbol/bigint): box to check prototype properties,
-        // exactly as before.
         try {
             return key in Object(obj);
         } catch { }
@@ -69,36 +79,29 @@
         ObjectPropertyKeys(obj, key, hasOwnProperty) {
             if (obj === void 0 || obj === null) throw new Error('obj null or undefined');
             var { target, shortCircuit } = this.pathObjectInfo(obj, key);
-            // Set-based dedup: the previous keys.indexOf(k) membership test made this O(n^2)
-            // for objects with many properties. Same output, same order.
             var keys = [];
-            var seen = new Set();
             if (hasOwnProperty && target.hasOwnProperty) {
                 for (var k in target) {
                     if (typeof k !== 'string') continue;
                     if (target.hasOwnProperty(k)) {
                         keys.push(k);
-                        seen.add(k);
                     }
                 }
                 var ownKeys = Reflect.ownKeys(target).filter(o => typeof o === 'string');
                 for (var k of ownKeys) {
-                    if (!seen.has(k) && target.hasOwnProperty(k)) {
+                    if (keys.indexOf(k) == -1 && target.hasOwnProperty(k)) {
                         keys.push(k);
-                        seen.add(k);
                     }
                 }
             } else {
                 for (var k in target) {
                     if (typeof k !== 'string') continue;
                     keys.push(k);
-                    seen.add(k);
                 }
                 var ownKeys = Reflect.ownKeys(target).filter(o => typeof o === 'string');
                 for (var k of ownKeys) {
-                    if (!seen.has(k)) {
+                    if (keys.indexOf(k) == -1) {
                         keys.push(k);
-                        seen.add(k);
                     }
                 }
             }
@@ -250,36 +253,29 @@
         // returns string[]
         ObjectKeys(obj, hasOwnProperty) {
             if (obj === void 0 || obj === null) throw new Error('obj null or undefined');
-            // Set-based dedup: the previous keys.indexOf(k) membership test made this O(n^2)
-            // for objects with many properties. Same output, same order.
             var keys = [];
-            var seen = new Set();
             if (hasOwnProperty && obj.hasOwnProperty) {
                 for (var k in obj) {
                     if (obj.hasOwnProperty(k)) {
                         if (typeof k !== 'string') continue;
                         keys.push(k);
-                        seen.add(k);
                     }
                 }
                 var ownKeys = Reflect.ownKeys(obj).filter(o => typeof o === 'string');
                 for (var k of ownKeys) {
-                    if (!seen.has(k) && obj.hasOwnProperty(k)) {
+                    if (keys.indexOf(k) == -1 && obj.hasOwnProperty(k)) {
                         keys.push(k);
-                        seen.add(k);
                     }
                 }
             } else {
                 for (var k in obj) {
                     if (typeof k !== 'string') continue;
                     keys.push(k);
-                    seen.add(k);
                 }
                 var ownKeys = Reflect.ownKeys(obj).filter(o => typeof o === 'string');
                 for (var k of ownKeys) {
-                    if (!seen.has(k)) {
+                    if (keys.indexOf(k) == -1) {
                         keys.push(k);
-                        seen.add(k);
                     }
                 }
             }
@@ -316,31 +312,13 @@
         // Invoke and InvokeAsync call other Javascript BlazorJSInterop methods and prepare the return value for C#
         Invoke(fnName, args, returnType) {
             this.runtimeReady = true;
-            // Arity fast-path: avoid the spread's intermediate array/iterator work on the hot path.
-            // Every BlazorJS interop call comes through here; interop methods take 1-4 args.
-            var fn = this[fnName];
-            var ret;
-            switch (args.length) {
-                case 1: ret = fn.call(this, args[0]); break;
-                case 2: ret = fn.call(this, args[0], args[1]); break;
-                case 3: ret = fn.call(this, args[0], args[1], args[2]); break;
-                case 4: ret = fn.call(this, args[0], args[1], args[2], args[3]); break;
-                default: ret = fn.apply(this, args); break;
-            }
+            var ret = this[fnName](...args);
             if (returnType === void 0 || returnType === null) return;
             return this.serializeToDotNet(ret, returnType);
         }
         async InvokeAsync(fnName, args, returnType) {
             this.runtimeReady = true;
-            var fn = this[fnName];
-            var ret;
-            switch (args.length) {
-                case 1: ret = await fn.call(this, args[0]); break;
-                case 2: ret = await fn.call(this, args[0], args[1]); break;
-                case 3: ret = await fn.call(this, args[0], args[1], args[2]); break;
-                case 4: ret = await fn.call(this, args[0], args[1], args[2], args[3]); break;
-                default: ret = await fn.apply(this, args); break;
-            }
+            var ret = await this[fnName](...args);
             if (returnType === void 0 || returnType === null) return;
             return this.serializeToDotNet(ret, returnType);
         }
@@ -359,11 +337,81 @@
         wrapJSObject(o) {
             return { __wrappedJSObject: o };
         }
+        heapViewTagger(value) {
+            const runtimeModule = globalThis.Blazor?.runtime?.Module || globalThis.Module;
+            const liveBuffer = runtimeModule.HEAPU8.buffer;
+            if (_in('buffer', value)) {
+                // if it is attached to the current heap make sure it has heapViewInfo
+                if (value.buffer === liveBuffer && !value._heapViewInfo) {
+                    // this ArrayBuffer view is a view on the .Net heap and needs info saved
+                    value._heapViewInfo = {
+                        viewType: value.constructor.name,
+                        address: value.byteOffset,
+                        byteLength: value.byteLength,
+                        heapSize: liveBuffer.byteLength
+                    };
+                    if (this.verbose) console.log('Tagged heap view', value);
+                }
+            } else if (value === liveBuffer && !value._heapAutoRestore) {
+                value._heapAutoRestore = 1;
+                if (this.verbose) console.log('Tagged heap', value);
+            }
+        }
+        heapViewRestore(value) {
+            var _this = this;
+            const constructorName = value.constructor?.name;
+            const runtimeModule = globalThis.Blazor?.runtime?.Module || globalThis.Module;
+            const liveBuffer = runtimeModule.HEAPU8.buffer;
+            // ArrayBuffer views on the .Net heap can become detached whe nit is resized.
+            // This code was added to this reviver to allow detached heap views to always revive as attached
+            // heap views by replacing detached views with new ones.
+            //
+            // if view (value) is detached,
+            // - first check for an existing view replacement and if it is not itself detached use that
+            // - if there is no existing replacement or it is detached we create a new replacement and use that
+            var heapViewInfo = value._heapViewInfo;
+            const valueIsValidView = heapViewInfo.byteLength === value.byteLength && (value.buffer?.byteLength ?? 0) > 0;
+            if (valueIsValidView) {
+                // return the view that is still valid
+                return value;
+            }
+            // check if it already has a valid override view
+            const overrideViewIsValid = heapViewInfo.byteLength === value._overrideView?.byteLength && (value._overrideView?.buffer?.byteLength ?? 0) > 0;
+            if (overrideViewIsValid) {
+                // return the already existing and still valid override view
+                return value._overrideView;
+            }
+            // create the new view
+            const TypedArrayConstructor = globalThis[heapViewInfo.viewType];
+            const elementSize = TypedArrayConstructor.BYTES_PER_ELEMENT ?? 1;
+            const length = heapViewInfo.byteLength / elementSize;
+            // new TypedArray/DataView
+            value._overrideView = new TypedArrayConstructor(liveBuffer, heapViewInfo.address, length);
+            // attach the heapView info to it
+            value._overrideView._heapViewInfo = Object.assign({}, heapViewInfo, { heapSize: liveBuffer.byteLength });
+            if (_this.verbose) {
+                if (value.buffer) {
+                    console.log('Recreated heap view', value._overrideView._heapViewInfo);
+                } else {
+                    console.log('Created heap view', value._overrideView._heapViewInfo);
+                }
+            } 
+            // return the new valid view
+            return value._overrideView;
+        }
         serializeToDotNet(value, returnType) {
             var typeOfValue = typeof value;
             if (typeOfValue === 'undefined') {
                 typeOfValue = 'object';
                 value = null;
+            }
+            // heap view info check
+            // checks if this is an ArrayBuffer view on the .Net heap, and if it is it makes sure it is properly tagged for revive
+            if (value && typeof value === 'object') {
+                if (_in('_heapViewInfo', value)) {
+                    value =  this.heapViewRestore(value);
+                }
+                this.heapViewTagger(value);
             }
             if (!returnType) {
                 return value;
@@ -424,18 +472,6 @@
                 // callers must call with the globalThis if they wish to use it as the rootObject.
                 throw new DOMException('blazorJSInterop.pathObjectInfo error: rootObject cannot be null');
             }
-            // Fast path: a string key with no '.' can never path-walk, and the split branch would
-            // resolve it identically to a direct access - so skip the _in() existence probe (which
-            // costs a try/catch + possible Object() boxing) entirely. This is the overwhelmingly
-            // common case (single-property get/set/call), and it is on EVERY interop call.
-            if (typeof path === 'string' && path.indexOf('.') === -1) {
-                return {
-                    shortCircuit: false,
-                    parent: rootObject,
-                    propertyName: path,
-                    target: rootObject[path],
-                };
-            }
             var parent = rootObject;
             var target;
             var propertyName;
@@ -478,11 +514,12 @@
         customReviverfunction(key, value) {
             var _this = this;
             if (value && typeof value === 'object') {
-                // This reviver runs for EVERY object node of EVERY JSON.parse on EVERY interop call
-                // (DotNet.attachReviver), so it is the hottest code in the module. The values here are
-                // always plain JSON.parse products (objects/arrays), so the direct 'in' operator is
-                // safe - no _in() helper (try/catch + boxing) needed on this path.
-                if ('_callbackId' in value) {
+                if (_in('_heapViewInfo', value)) {
+                    return _this.heapViewRestore(value);
+                } else if (_in('_heapAutoRestore', value)) {
+                    const runtimeModule = globalThis.Blazor?.runtime?.Module || globalThis.Module;
+                    return runtimeModule.HEAPU8.buffer;
+                } else if (_in('_callbackId', value)) {
                     var _callbackId = value._callbackId;
                     var callback = _this.callbacks[_callbackId];
                     if (callback) return callback;
@@ -510,7 +547,7 @@
                     _this.callbacks[_callbackId] = callback;
                     return callback;
                 }
-                else if ('_callbackAsyncId' in value) {
+                else if (_in('_callbackAsyncId', value)) {
                     var _callbackId = value._callbackAsyncId;
                     var callback = _this.asyncCallbacks[_callbackId];
                     if (callback) return callback;
@@ -539,13 +576,13 @@
                     _this.asyncCallbacks[_callbackId] = callback;
                     return callback;
                 }
-                else if ('__wrappedJSObject' in value) {
+                else if (_in('__wrappedJSObject', value)) {
                     return value.__wrappedJSObject;
                 }
-                else if ('__undefinedref__' in value) {
+                else if (_in('__undefinedref__', value)) {
                     return;
                 }
-                else if ('$bigint' in value) {
+                else if (_in('$bigint', value)) {
                     return BigInt(value.$bigint);
                 }
             }
