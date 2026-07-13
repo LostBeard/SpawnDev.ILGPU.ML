@@ -158,6 +158,12 @@ async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, boo
             SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled = true;
             Console.WriteLine("[SDTURBO_ELIDE] dispatch-elide + shape-subgraph-fold ENABLED");
         }
+        else if (Environment.GetEnvironmentVariable("SDTURBO_ELIDE") == "0")
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.ShapeInterpElideDispatch = false;
+            SpawnDev.ILGPU.ML.Graph.GraphCompiler.ShapeSubgraphFoldEnabled = false;
+            Console.WriteLine("[SDTURBO_ELIDE] dispatch-elide + shape-subgraph-fold DISABLED");
+        }
         if (Environment.GetEnvironmentVariable("SDTURBO_ELIDE_DIAG") == "1")
         {
             SpawnDev.ILGPU.ML.Graph.GraphExecutor.LogEmptyShapeInterp = true;
@@ -166,6 +172,12 @@ async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, boo
         BufferPool.TrackPeaks = true;
         if (Environment.GetEnvironmentVariable("PEAK_COMPOSITION") == "1")
             BufferPool.TrackLivePeakComposition = true;
+        if (Environment.GetEnvironmentVariable("SDTURBO_LEAKTRACE") == "1")
+        {
+            BufferPool.LogLargeRunAllocs = true;   // log large NEW allocs during a run (per-gen not-Returned leak hunt)
+            BufferPool.LargeRunAllocThresholdBytes = 8L * 1024 * 1024; // 8 MiB
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.LogLeakedBuffers = true; // run-end: name leaked buffers + stuck refcount
+        }
 
         if (!interactive)
         {

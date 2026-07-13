@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>4.0.0-preview.12</Version>
-		<PackageReleaseNotes>Depends SpawnDev.ILGPU 4.17.5 (browser heap-view priming fix: the zero-copy CopyFrom upload paths no longer detach a WASM heap view under managed-heap pressure -> fixes the SD-Turbo WebGPU "external Instance reference no longer exists" crash). Carries preview.11: dispatch-elide ON by default (~1.9x faster SD-Turbo WebGPU image-gen, bit-exact) + CPU shape-interpreter fixes (CLIP Range INT64 sentinel + MoveNet integer floordiv). Full changelog: https://github.com/LostBeard/SpawnDev.ILGPU.ML/blob/master/CHANGELOG.md</PackageReleaseNotes>
+		<Version>4.0.0-preview.13</Version>
+		<PackageReleaseNotes>FIX SD-Turbo WebGPU 2nd-gen GPU-process OOM crash ("GPU process died due to out of memory" -> device lost -> "external Instance reference no longer exists"). The tiled VAE decode's break-based partial run left the buffers whose consumers were past the break stranded LIVE (up_blocks.2 conv_shortcut + norm2 = 128 MiB/gen), so the pool re-allocated them every gen and peak GPU memory grew until the browser's D3D12 budget was crossed on gen 2. Fix: return break-stranded working buffers at run end (bit-identical output). Depends ILGPU 4.17.6 + BlazorJS 3.5.25 - heap-view re-attach replaces priming (a detached WASM heap view is re-created on revive instead of pre-grown; also fixes a cross-origin-window SecurityError in the interop tagger). Carries preview.11 (dispatch-elide default-on ~1.9x). Full changelog: https://github.com/LostBeard/SpawnDev.ILGPU.ML/blob/master/CHANGELOG.md</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -39,8 +39,8 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SpawnDev.BlazorJS" Version="3.5.21" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="4.17.5" />
+		<PackageReference Include="SpawnDev.BlazorJS" Version="3.5.25" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="4.17.6" />
 		<PackageReference Include="SpawnDev.WebTorrent" Version="3.2.12" />
 	</ItemGroup>
 

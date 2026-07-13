@@ -486,6 +486,39 @@ public class ElementWiseKernels : IDisposable
         _scaleKernel!(count, input, output, scalar);
     }
 
+    // ── GPU RGBA pack (Tuvok 2026-07-12): VAE output NCHW [3,H,W] in [-1,1] -> packed RGBA int per pixel.
+    //    Replaces the old GPU->.NET float readback (3*H*W floats) + a per-pixel .NET pack loop — Rule 4, no
+    //    unnecessary copies. Math is bit-identical to the former loop ((v+1)*0.5*255, round, clamp, A=255). ──
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int>? _nchwDenormToRgbaKernel;
+    private static void NchwDenormToRgbaImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> nchw,   // planar NCHW [3,H,W] in [-1,1]
+        ArrayView1D<int, Stride1D.Dense> rgba,     // [H*W] packed little-endian R | G<<8 | B<<16 | A<<24
+        int pixelCount)                            // H*W = per-channel plane stride
+    {
+        int p = idx;
+        float rf = (nchw[p] + 1f) * 0.5f * 255f;
+        float gf = (nchw[pixelCount + p] + 1f) * 0.5f * 255f;
+        float bf = (nchw[2 * pixelCount + p] + 1f) * 0.5f * 255f;
+        int r = (int)(rf + 0.5f); int g = (int)(gf + 0.5f); int b = (int)(bf + 0.5f);
+        r = r < 0 ? 0 : (r > 255 ? 255 : r);
+        g = g < 0 ? 0 : (g > 255 ? 255 : g);
+        b = b < 0 ? 0 : (b > 255 ? 255 : b);
+        rgba[p] = r | (g << 8) | (b << 16) | (255 << 24);
+    }
+    /// <summary>
+    /// GPU pack: VAE-decoder output NCHW [3,H,W] in [-1,1] -&gt; packed little-endian RGBA int per pixel
+    /// (R | G&lt;&lt;8 | B&lt;&lt;16 | 255&lt;&lt;24 — canvas/putImageData byte order). Replaces a GPU-&gt;.NET float
+    /// readback + a per-pixel .NET pack loop (Rule 4). <paramref name="pixelCount"/> = H*W.
+    /// </summary>
+    public void NchwDenormToRgba(ArrayView1D<float, Stride1D.Dense> nchw,
+        ArrayView1D<int, Stride1D.Dense> rgba, int pixelCount)
+    {
+        _nchwDenormToRgbaKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<int, Stride1D.Dense>, int>(NchwDenormToRgbaImpl);
+        _nchwDenormToRgbaKernel(pixelCount, nchw, rgba, pixelCount);
+    }
+
     /// <summary>Transpose last two dims: [batch, rows, cols] → [batch, cols, rows].</summary>
     public void TransposeLastTwo(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output, int batch, int rows, int cols)

@@ -7,6 +7,40 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 public abstract partial class MLTestBase
 {
+    /// <summary>
+    /// GPU RGBA pack (ElementWiseKernels.NchwDenormToRgba) vs the former .NET pixel-pack loop the SD-Turbo
+    /// image-gen pipeline used to run on the host. Rule 4 replaced a GPU-&gt;.NET float readback (3*H*W floats)
+    /// + a 262K-iteration .NET pack loop with this one GPU kernel; this guard proves the swap is correct —
+    /// [-1,1] denorm, rounding, clamping past-range values BOTH ways, and little-endian R|G&lt;&lt;8|B&lt;&lt;16|255&lt;&lt;24
+    /// byte order (canvas/putImageData). Tolerance is ±1 per 8-bit channel (GPU vs CPU float differ up to 1 ULP
+    /// at a rounding boundary — imperceptible); alpha must be EXACTLY 255. Runs on all backends.
+    /// </summary>
+    [TestMethod]
+    public async Task NchwDenormToRgba_MatchesCpuPixelLoop() => await RunTest(async accelerator =>
+    {
+        const int H = 3, W = 4, px = H * W;   // small image; 3 planes (NCHW)
+        var nchw = new float[3 * px];
+        var rng = new Random(1234);
+        for (int i = 0; i < 3 * px; i++) nchw[i] = (float)(rng.NextDouble() * 3.0 - 1.5); // [-1.5,1.5] to hit clamps
+        nchw[0] = -5f; nchw[1] = 5f;   // explicit under/over-range -> clamp to 0 / 255
+
+        using var inBuf = accelerator.Allocate1D(nchw);
+        using var outBuf = accelerator.Allocate1D<int>(px);
+        new ElementWiseKernels(accelerator).NchwDenormToRgba(inBuf.View, outBuf.View, px);
+        await accelerator.SynchronizeAsync();
+        var packed = await outBuf.CopyToHostAsync<int>(0, px);
+
+        for (int i = 0; i < px; i++)
+        {
+            int gr = (byte)packed[i], gg = (byte)(packed[i] >> 8), gb = (byte)(packed[i] >> 16), ga = (byte)(packed[i] >> 24);
+            int r = Math.Clamp((int)((nchw[0 * px + i] + 1f) * 0.5f * 255f + 0.5f), 0, 255);
+            int g = Math.Clamp((int)((nchw[1 * px + i] + 1f) * 0.5f * 255f + 0.5f), 0, 255);
+            int b = Math.Clamp((int)((nchw[2 * px + i] + 1f) * 0.5f * 255f + 0.5f), 0, 255);
+            if (Math.Abs(gr - r) > 1 || Math.Abs(gg - g) > 1 || Math.Abs(gb - b) > 1 || ga != 255)
+                throw new Exception($"px {i}: GPU R{gr}/G{gg}/B{gb}/A{ga} vs CPU R{r}/G{g}/B{b}/A255 (>1 channel diff or bad alpha)");
+        }
+    });
+
     [TestMethod]
     public async Task LayerNorm_Dav3Dimensions() => await RunTest(async accelerator =>
     {

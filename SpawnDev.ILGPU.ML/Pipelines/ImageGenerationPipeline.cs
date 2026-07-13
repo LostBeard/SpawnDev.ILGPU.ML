@@ -371,7 +371,10 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
             Graph.GraphExecutor.MaxPendingReleaseBytes = (long)capMb * 1024 * 1024;
 
         int imagePixels = Width * Height;                // latentH/latentW computed above (Height/8, Width/8)
-        float[] rgbData;                                 // NCHW [3, Height, Width] in [-1,1]
+        float[]? rgbData = null;                          // NCHW [3, Height, Width] in [-1,1] — set ONLY by the
+                                                         // opt-in tiled decode paths (legacy, CPU float[]).
+        byte[]? rgbaPacked = null;                        // set by the DEFAULT full-res path via a GPU RGBA pack
+                                                         // (no float readback, no .NET pixel loop — Rule 4).
 
         // Tiled VAE decode (opt-in, for low-VRAM): VAE_TILE_LATENT=N decodes the latent in NxN-ish overlapping
         // tiles, bounding the GPU peak to one tile's decode (the full peak scales with spatial AREA). Default
@@ -380,16 +383,18 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         // the UP-BLOCKS tiled with global GroupNorm stats + halo-refreshed convs, so the result is bit-near-
         // identical to the full decode (no seams) at a much lower GPU peak. VAE_EXACT_VERIFY=1 additionally runs
         // the full fp32 decode and reports tiled-vs-full max/mean abs diff (the correctness gate).
-        // Effective exact-tile grid: the VAE_TILE_EXACT env var overrides (desktop); else the VaeTileGrid
-        // property, where 0 = AUTO (2x2 when the output is >=512 on a side, so the VAE decode's GPU peak is
-        // bounded by one tile instead of the full-res up_blocks intermediates that OOM-kill the GPU process),
-        // -1 = force the full single-pass decode. Env vars are null in Blazor WASM, so the property is how the
-        // browser demo gets tiling.
+        // Effective exact-tile grid: the VAE_TILE_EXACT env var overrides (desktop testing); else the VaeTileGrid
+        // property. DEFAULT (0 or -1) is now FULL-RES GPU-resident decode (Tuvok 2026-07-12). The old default
+        // auto-tiled the up-blocks into the .NET managed heap (TiledFeatureMap float[][]) with a per-tile
+        // upload->compute->readback->writeback treadmill — a bulk-data-into-.NET violation (Rule 4) that OOM'd the
+        // WASM heap AND starved the GPU on the readbacks. The full-res GPU peak is bounded on browser backends by
+        // proactive buffer RECLAIM below (the pool hoards freed buffers to ~3.2 GiB vs an ~896 MiB working set),
+        // NOT by copying into the managed heap. Plans/vae-decode-gpu-resident-fix-2026-07-12.md. VaeTileGrid = N
+        // (>0) still opts INTO the exact tiled decode for comparison/testing.
         int exactTile;
         if (int.TryParse(Environment.GetEnvironmentVariable("VAE_TILE_EXACT"), out var ext)) exactTile = ext;
-        else if (VaeTileGrid == -1) exactTile = 0;
         else if (VaeTileGrid > 0) exactTile = VaeTileGrid;
-        else exactTile = Math.Max(Width, Height) >= 512 ? 2 : 0;
+        else exactTile = 0;   // full-res GPU-resident (VaeTileGrid 0 [default] or -1)
         bool exactVerify = Environment.GetEnvironmentVariable("VAE_EXACT_VERIFY") == "1";
         if (exactTile > 0 || exactVerify)
         {
@@ -412,31 +417,70 @@ public class ImageGenerationPipeline : IPipeline<ImageGenerationInput, ImageGene
         }
         else
         {
-            // Captured (replay after gen 1). Tiled/diagnostic VAE paths above stay DIRECT - they
-            // mutate GraphExecutor break/capture globals mid-run, which a replayed plan ignores.
-            var vaeOutputs = await TimedRun("vae_decoder", _vaeDecoder!, VaeCap, new Dictionary<string, Tensor>
-                { [_vaeDecoder!.InputNames[0]] = latentTensor });
-            rgbData = await ReadTensorToCpu(vaeOutputs[_vaeDecoder.OutputNames[0]], 3 * imagePixels);
+            // FULL-RES GPU-resident VAE decode — the default (Tuvok 2026-07-12). Genuine working set ~896 MiB,
+            // but the buffer pool HOARDS freed buffers (bucket retention + deferred-release backlog) to ~3.2 GiB,
+            // which crossed the browser GPU-process budget and forced the old .NET-tiling workaround. On BROWSER
+            // backends, reclaim dead buffers proactively during the decode (bucket-trim every N rents + a low
+            // deferred-release backlog cap) so peak GPU residency tracks the working set — GPU-memory management,
+            // NO copies. Desktop has budget to spare, so it runs full-res with no reclaim churn. NOT applied under
+            // graph capture (a forced dispose would invalidate a buffer the captured plan records). Proven on
+            // WebGPU: SDTurbo_WebGPU_FullResReclaim_Probe. Captured/replayed after gen 1 via VaeCap (unchanged).
+            bool browserVae = _accelerator.AcceleratorType is AcceleratorType.WebGPU
+                or AcceleratorType.WebGL or AcceleratorType.Wasm;
+            int _savedForceReclaim = Tensors.BufferPool.ForceReclaimEveryNRents;
+            if (browserVae && capMb <= 0 && !EnableGraphCapture)
+            {
+                Graph.GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
+                Tensors.BufferPool.ForceReclaimEveryNRents = 8;
+            }
+            try
+            {
+                var vaeOutputs = await TimedRun("vae_decoder", _vaeDecoder!, VaeCap, new Dictionary<string, Tensor>
+                    { [_vaeDecoder!.InputNames[0]] = latentTensor });
+                var vaeOut = vaeOutputs[_vaeDecoder.OutputNames[0]];
+                // GPU RGBA pack: NCHW [3,H,W] in [-1,1] -> packed RGBA on the GPU, then ONE terminal readback of
+                // the FINISHED image. Replaces the old 3*H*W float readback + a 262K-iteration .NET pixel loop
+                // (Rule 4: no unnecessary copies). The remaining single readback is the image leaving the GPU;
+                // the fully zero-copy browser delivery (GPU buffer -> CopyToHostUint8ArrayAsync -> canvas, no .NET
+                // bytes) is the next step (SpawnDev.ILGPU/Rendering already provides it) once the result contract
+                // exposes it.
+                using var rgbaBuf = _accelerator.Allocate1D<int>(imagePixels);
+                ElementWise.NchwDenormToRgba(vaeOut.Data.SubView(0, 3 * imagePixels), rgbaBuf.View, imagePixels);
+                await _accelerator.SynchronizeAsync();
+                var packedInts = await rgbaBuf.CopyToHostAsync<int>(0, imagePixels);
+                rgbaPacked = new byte[4 * imagePixels];
+                Buffer.BlockCopy(packedInts, 0, rgbaPacked, 0, 4 * imagePixels);
+            }
+            finally { Tensors.BufferPool.ForceReclaimEveryNRents = _savedForceReclaim; }
         }
         Graph.GraphExecutor.MaxPendingReleaseBytes = _savedByteCap;
 
         haveRgb:
         // ═══════════════════════════════════════════════════════════
-        //  Step 7: Convert NCHW [-1,1] → RGBA [0,255]
+        //  Step 7: RGBA image bytes [0,255]
         // ═══════════════════════════════════════════════════════════
-
-        var rgba = new byte[4 * imagePixels];
-        for (int i = 0; i < imagePixels; i++)
+        // DEFAULT (full-res) path already packed RGBA on the GPU (rgbaPacked) — no float readback, no .NET pixel
+        // loop. The opt-in tiled decode paths return a CPU float[] NCHW (rgbData); pack that here (legacy path).
+        byte[] rgba;
+        if (rgbaPacked != null)
         {
-            // NCHW layout: R at [0*HW+i], G at [1*HW+i], B at [2*HW+i]
-            float r = (rgbData[0 * imagePixels + i] + 1f) * 0.5f * 255f;
-            float g = (rgbData[1 * imagePixels + i] + 1f) * 0.5f * 255f;
-            float b = (rgbData[2 * imagePixels + i] + 1f) * 0.5f * 255f;
+            rgba = rgbaPacked;
+        }
+        else
+        {
+            rgba = new byte[4 * imagePixels];
+            for (int i = 0; i < imagePixels; i++)
+            {
+                // NCHW layout: R at [0*HW+i], G at [1*HW+i], B at [2*HW+i]
+                float r = (rgbData![0 * imagePixels + i] + 1f) * 0.5f * 255f;
+                float g = (rgbData![1 * imagePixels + i] + 1f) * 0.5f * 255f;
+                float b = (rgbData![2 * imagePixels + i] + 1f) * 0.5f * 255f;
 
-            rgba[i * 4 + 0] = (byte)Math.Clamp((int)(r + 0.5f), 0, 255);
-            rgba[i * 4 + 1] = (byte)Math.Clamp((int)(g + 0.5f), 0, 255);
-            rgba[i * 4 + 2] = (byte)Math.Clamp((int)(b + 0.5f), 0, 255);
-            rgba[i * 4 + 3] = 255; // Full alpha
+                rgba[i * 4 + 0] = (byte)Math.Clamp((int)(r + 0.5f), 0, 255);
+                rgba[i * 4 + 1] = (byte)Math.Clamp((int)(g + 0.5f), 0, 255);
+                rgba[i * 4 + 2] = (byte)Math.Clamp((int)(b + 0.5f), 0, 255);
+                rgba[i * 4 + 3] = 255; // Full alpha
+            }
         }
 
         OnProgress?.Invoke(steps + 2, steps + 2);

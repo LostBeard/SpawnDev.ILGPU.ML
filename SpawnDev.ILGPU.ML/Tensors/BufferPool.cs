@@ -94,6 +94,11 @@ public class BufferPool : IDisposable
     //    (→ needs fp16 activations / tiling). Static so a console measurement reads it without wiring. ──
     /// <summary>Enable peak-bytes tracking on Rent (diagnostic; default false).</summary>
     public static bool TrackPeaks = false;
+    /// <summary>DIAGNOSTIC: log every NEW (not bucket-reused) allocation ≥ LargeRunAllocThresholdBytes that
+    /// happens DURING a graph run — for hunting a per-gen not-Returned leak on a warm resident pipeline.</summary>
+    public static bool LogLargeRunAllocs = false;
+    /// <summary>Threshold (bytes) for LogLargeRunAllocs. Default 64 MiB.</summary>
+    public static long LargeRunAllocThresholdBytes = 64L * 1024 * 1024;
     /// <summary>Max total fp32+fp16 bytes ever allocated by ANY pool at one Rent (sum of all live buffers).</summary>
     public static long PeakTotalBytes;
     /// <summary>Max simultaneously-RENTED (named/live, not yet Returned) bytes at one Rent — the true working set.</summary>
@@ -210,6 +215,12 @@ public class BufferPool : IDisposable
                        "needs tiled execution or fp16 activations.";
             });
         _allBuffers.Add(newBuffer);
+        // DIAGNOSTIC (Tuvok 2026-07-11): a NEW (not bucket-reused) large allocation DURING a run. On a warm,
+        // resident pipeline these should be ~0 per gen (the working set reuses returned buckets). A buffer that
+        // allocates fresh EVERY gen = a not-Returned leak (the +128MiB/gen SD-Turbo 2nd-gen OOM). Logs name+MiB.
+        if (LogLargeRunAllocs && Graph.GraphExecutor.CurrentRunNodeIndex >= 0
+            && newBuffer.LengthInBytes >= LargeRunAllocThresholdBytes)
+            Console.WriteLine($"[NEW-ALLOC] node {Graph.GraphExecutor.CurrentRunNodeIndex} {newBuffer.LengthInBytes / 1048576.0:F1}MiB name='{name}' bucket={bucketSize}");
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) _namedBuffers[name] = newBuffer;
         UpdatePeaks();

@@ -44,7 +44,9 @@ public abstract partial class MLTestBase
         // Diagnostic: name any under-pressure reclaim fire (node + MiB). Reset the process-cumulative counters
         // so the numbers below are THIS test's. Restored in finally so we leave no cross-test global state.
         bool _savedTrace = BufferPool.TraceReclaim;
+        bool _savedPeaks = BufferPool.TrackPeaks;
         BufferPool.TraceReclaim = true;
+        BufferPool.TrackPeaks = true;   // per-gen peak-TOTAL leak guard (see the assert in the loop)
         BufferPool.ResetReclaimTrace();
         try
         {
@@ -64,10 +66,12 @@ public abstract partial class MLTestBase
                 // gen fully reads its image back (drained) before the next — matching the demo's usage.
                 var prompts = new[] { "a chicken boxing match", "a nice house", "a watercolor fox", "a photo of a cat" };
                 var results = new System.Text.StringBuilder();
+                long gen1PeakTotal = 0;
                 for (int g = 0; g < prompts.Length; g++)
                 {
                     pipe.Seed = 42 + g;
                     long reclaimsBefore = BufferPool.ReclaimFireCount;
+                    BufferPool.ResetPeaks();   // measure THIS gen's peak-TOTAL for the leak guard
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     // A crash surfaces here as the GraphExecutor drain-fail exception (op tail + reclaim count +
                     // node) — let it propagate so the test fails WITH the diagnostic rather than swallowing it.
@@ -99,7 +103,19 @@ public abstract partial class MLTestBase
                         throw new Exception($"gen {g + 1}: image essentially all-black ({nonZero}/{px} non-zero) — diffusion produced no image.");
                     if (std < 5.0)
                         throw new Exception($"gen {g + 1}: image near-constant (lumStd={std:F1}) — flat/degenerate.");
-                    results.Append($"g{g + 1}:std={std:F1},rc={reclaimsThisGen} ");
+
+                    // PER-GEN PEAK-TOTAL LEAK GUARD (Tuvok 2026-07-11): the tiled VAE decode's break-based partial
+                    // run used to strand up_blocks.2 conv_shortcut + norm2 (128 MiB/gen) live -> pool couldn't
+                    // reuse them -> peak-TOTAL grew +128 MiB EVERY gen -> browser GPU-process OOM on the 2nd gen
+                    // ("external Instance reference no longer exists"). Fixed by returning break-stranded buffers.
+                    // Guard: after the cold gen 1 warms the pool, no later gen may grow peak-TOTAL beyond a small
+                    // margin (pre-fix this grew by a full 128 MiB feature-map per gen).
+                    long peakTotalMiB = BufferPool.PeakTotalBytes / 1048576;
+                    if (g == 0) gen1PeakTotal = peakTotalMiB;
+                    else if (peakTotalMiB > gen1PeakTotal + 32)
+                        throw new Exception($"gen {g + 1}: peak-TOTAL GPU memory grew to {peakTotalMiB} MiB (gen 1 = {gen1PeakTotal} MiB) " +
+                            $"— a per-gen buffer leak (the SD-Turbo 2nd-gen OOM regression). Must stay flat on a warm resident pipeline.");
+                    results.Append($"g{g + 1}:std={std:F1},peakTot={peakTotalMiB}MiB,rc={reclaimsThisGen} ");
                 }
                 var report = $"{prompts.Length} WebGPU generations OK | totalReclaims={BufferPool.ReclaimFireCount} " +
                     $"({BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB) | {results}";
@@ -115,6 +131,7 @@ public abstract partial class MLTestBase
         finally
         {
             BufferPool.TraceReclaim = _savedTrace;
+            BufferPool.TrackPeaks = _savedPeaks;
             await client.DisposeAsync();
         }
     });
@@ -279,5 +296,106 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException($"SD-Turbo hub/network unavailable: {ex.Message}");
         }
         finally { await client.DisposeAsync(); }
+    });
+
+    /// <summary>
+    /// FULL-RES VAE DECODE PROBE (Tuvok 2026-07-12). Design experiment for Plans/vae-decode-gpu-resident-
+    /// fix-2026-07-12.md: does a FULL-RES GPU-resident VAE decode (NO .NET tiling) survive on WebGPU when the
+    /// buffer pool reclaims aggressively? CUDA measured the full-res VAE working set at 896 MiB LIVE but the
+    /// pool HOARDED 3224 MiB (freed-but-retained buckets + deferred-release backlog) — THAT pool bloat crossed
+    /// the browser per-process GPU budget, not genuine need. The current "fix" shoves whole feature maps into
+    /// the .NET managed heap (a Rule-4 violation that starves the GPU and OOMs the WASM heap). This probe forces
+    /// <see cref="ImageGenerationPipeline.VaeTileGrid"/>=-1 (full-res, WASM env can't set it) + proactive reclaim
+    /// (<see cref="BufferPool.ForceReclaimEveryNRents"/> bucket-trim + a low
+    /// <see cref="Graph.GraphExecutor.MaxPendingReleaseBytes"/> backlog cap) and generates once on WebGPU.
+    ///   - GREEN + a peak-TOTAL far below 3224 MiB => Option A: delete the .NET tiling, run full-res GPU-resident.
+    ///   - OOM ("out of memory" / device lost) => Option B: GPU-RESIDENT tiling (tiles stay GPU buffers) is needed.
+    /// Either outcome decides the fix. Run:
+    ///   PMT_EXCLUDE_CATEGORIES= PMT_FILTER=SDTurbo_WebGPU_FullResReclaim_Probe dotnet test PlaywrightMultiTest/...
+    /// </summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    public async Task<string> SDTurbo_WebGPU_FullResReclaim_Probe() => await RunTestWithResult(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only full-res-decode design probe");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var fs = GetAsyncFS();
+        if (fs != null && await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true);
+        var client = fs != null
+            ? new SpawnDev.WebTorrent.WebTorrentClient(new SpawnDev.WebTorrent.WebTorrentClientOptions { AsyncFileSystem = fs })
+            : new SpawnDev.WebTorrent.WebTorrentClient();
+
+        bool _savedTrace = BufferPool.TraceReclaim, _savedPeaks = BufferPool.TrackPeaks;
+        int _savedForce = BufferPool.ForceReclaimEveryNRents;
+        long _savedCap = SpawnDev.ILGPU.ML.Graph.GraphExecutor.MaxPendingReleaseBytes;
+        BufferPool.TraceReclaim = true;
+        BufferPool.TrackPeaks = true;
+        BufferPool.ResetReclaimTrace();
+        try
+        {
+            var hub = new Hub.HubModelStream(client, http);
+            var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub,
+                Hub.ModelHub.KnownModels.SDTurbo,
+                onProgress: (stage, pct) => Console.WriteLine($"[SDTurbo/load] {stage} {pct}%"));
+            using (pipe)
+            {
+                if (!pipe.IsReady)
+                    throw new Exception("SD-Turbo pipeline not ready after CreateAsync.");
+                pipe.NumInferenceSteps = 1;
+                pipe.GuidanceScale = 0f;
+                pipe.Seed = 42;
+                pipe.VaeTileGrid = -1;   // FORCE full-res GPU-resident VAE decode (no .NET tiling)
+
+                BufferPool.ResetPeaks();
+                ImageGenerationResult result;
+                // Proactive reclaim ONLY for the generation: bucket-trim every 8 rents + a 64 MiB deferred-release
+                // backlog cap, so the resident total tracks the working set instead of hoarding to 3224 MiB.
+                SpawnDev.ILGPU.ML.Graph.GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
+                BufferPool.ForceReclaimEveryNRents = 8;
+                try { result = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a photo of a cat" }); }
+                finally
+                {
+                    BufferPool.ForceReclaimEveryNRents = _savedForce;
+                    SpawnDev.ILGPU.ML.Graph.GraphExecutor.MaxPendingReleaseBytes = _savedCap;
+                }
+
+                int px = result.Width * result.Height;
+                if (result.Width != 512 || result.Height != 512)
+                    throw new Exception($"expected 512x512, got {result.Width}x{result.Height}.");
+                long nonZero = 0; double sum = 0, sumSq = 0;
+                for (int i = 0; i < px; i++)
+                {
+                    byte r = result.ImageRGBA[i * 4], g = result.ImageRGBA[i * 4 + 1], b = result.ImageRGBA[i * 4 + 2];
+                    if (r != 0 || g != 0 || b != 0) nonZero++;
+                    double lum = r + g + b; sum += lum; sumSq += lum * lum;
+                }
+                double mean = sum / px, std = Math.Sqrt(Math.Max(0, sumSq / px - mean * mean));
+                if (nonZero < px / 100) throw new Exception($"full-res: image all-black ({nonZero}/{px}) — no image produced.");
+                if (std < 5.0) throw new Exception($"full-res: image flat (lumStd={std:F1}) — degenerate.");
+
+                long peakTotalMiB = BufferPool.PeakTotalBytes / 1048576, peakLiveMiB = BufferPool.PeakLiveBytes / 1048576;
+                var report = $"FULL-RES GPU-resident VAE decode SURVIVED on WebGPU: peakTOTAL={peakTotalMiB} MiB " +
+                    $"peakLIVE={peakLiveMiB} MiB reclaims={BufferPool.ReclaimFireCount} " +
+                    $"({BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB) image std={std:F1} " +
+                    $"=> Option A viable (delete .NET tiling). CUDA baseline was 896 LIVE / 3224 TOTAL (default cap).";
+                Console.WriteLine($"[SDTurbo-FullResReclaim] {report}");
+                return report;
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
+        {
+            throw new UnsupportedTestException($"SD-Turbo hub/network unavailable: {ex.Message}");
+        }
+        finally
+        {
+            BufferPool.TraceReclaim = _savedTrace;
+            BufferPool.TrackPeaks = _savedPeaks;
+            BufferPool.ForceReclaimEveryNRents = _savedForce;
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.MaxPendingReleaseBytes = _savedCap;
+            await client.DisposeAsync();
+        }
     });
 }

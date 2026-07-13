@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
 using System.Diagnostics;
@@ -378,6 +379,10 @@ public class TextGenerationPipeline : IDisposable
         var posFloat = new float[ctx];
         for (int i = 0; i < ctx; i++) { maskFloat[i] = 1f; posFloat[i] = i; }
 
+        // Greedy selection stays GPU-side (read back one index, not the vocab). Sampling needs the host
+        // distribution, so it reuses ONE readback buffer across tokens instead of allocating per token.
+        using var argmax = new GpuArgMax(_accelerator);
+        MemoryBuffer1D<float, Stride1D.Dense>? sampleBuf = null;
         for (int step = 0; step < maxTokens; step++)
         {
             int valid = allTokens.Count;       // number of real tokens so far
@@ -414,11 +419,24 @@ public class TextGenerationPipeline : IDisposable
                 lastOffset = Math.Max(0, output.ElementCount - vocabSize);
 
             var readSw = Stopwatch.StartNew();
-            using var readBuf = _accelerator.Allocate1D<float>(vocabSize);
-            new ElementWiseKernels(_accelerator).Scale(
-                output.Data.SubView(lastOffset, vocabSize), readBuf.View, vocabSize, 1f);
-            await _accelerator.SynchronizeAsync();
-            var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
+            int nextToken = 0;
+            float[]? logits = null;   // host distribution — ONLY the sampling path needs it (filled below)
+            if (config == null || config.Strategy == "greedy")
+            {
+                // Greedy stays GPU-side: read back only the winning index, not the whole ~50K-float vocab
+                // every token (Rule 4: no unnecessary copies). GpuArgMax tie-breaks lowest-index — bit-exact
+                // vs the ORT reference (matches TextGenerationSampler.Greedy's first-max-wins).
+                nextToken = await argmax.ArgMaxAsync(output.Data.SubView(lastOffset, vocabSize), vocabSize);
+            }
+            else
+            {
+                // Sampling needs the full distribution on the host. Reuse ONE readback buffer across tokens (no
+                // per-token GPU alloc) + CopyFrom (native GPU->GPU copy, no Scale temp-dispatch); sample below.
+                sampleBuf ??= _accelerator.Allocate1D<float>(vocabSize);
+                sampleBuf.View.CopyFrom(output.Data.SubView(lastOffset, vocabSize));
+                await _accelerator.SynchronizeAsync();
+                logits = await sampleBuf.CopyToHostAsync<float>(0, vocabSize);
+            }
             readSw.Stop();
 
             // DIAGNOSTIC: attribute per-step decode cost to CPU recompile vs GPU forward vs readback.
@@ -438,19 +456,15 @@ public class TextGenerationPipeline : IDisposable
                 if (InferenceSession.VerboseLogging) Console.WriteLine(line);
             }
 
-            // Pick the next token. Default (config == null) is pure greedy argmax — this keeps the
-            // GPT-2==ORT reference tests bit-exact. Sampling (top-k / top-p / temperature / repetition
-            // penalty) is opt-in via GenerationConfig; it's what the demo uses so DistilGPT-2 doesn't
-            // collapse into "the first time I saw the first time I saw" greedy loops.
-            int nextToken;
-            if (config == null || config.Strategy == "greedy")
-            {
-                nextToken = TextGenerationSampler.Greedy(logits);
-            }
-            else
+            // Pick the next token. Default (config == null) is pure greedy argmax — computed GPU-side above
+            // (bit-exact vs the GPT-2==ORT reference). Sampling (top-k / top-p / temperature / repetition
+            // penalty) is opt-in via GenerationConfig — it's what the demo uses so DistilGPT-2 doesn't
+            // collapse into "the first time I saw the first time I saw" greedy loops — and picks from the
+            // host logits read above.
+            if (logits != null)
             {
                 // Repetition penalty first (in-place on the CPU logits), THEN strategy sampling.
-                if (config.RepetitionPenalty != 1.0f)
+                if (config!.RepetitionPenalty != 1.0f)
                     TextGenerationSampler.ApplyRepetitionPenalty(logits, allTokens.ToArray(), config.RepetitionPenalty);
                 nextToken = config.Strategy switch
                 {
@@ -474,6 +488,7 @@ public class TextGenerationPipeline : IDisposable
                 await onToken(allTokens.Count - promptTokens.Count, soFar);
             }
         }
+        sampleBuf?.Dispose();
 
         sw.Stop();
 

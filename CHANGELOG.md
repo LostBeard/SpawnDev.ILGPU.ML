@@ -2,6 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.13 (2026-07-12)
+
+### 🚀 SD-Turbo VAE decode: full-res GPU-resident (removes the .NET-tiling copies) + GPU RGBA pack
+
+The SD-Turbo WebGPU image-gen previously bounded the VAE-decode GPU peak by **tiling the up-blocks into the .NET managed heap** (`TiledFeatureMap` `float[][]`) with a per-tile upload→compute→readback→writeback treadmill. That **OOM'd the WASM managed heap on a single 512² generation** AND **starved the GPU** on the readbacks (WebGPU rode ~30% GPU-util vs ~80-100% on CUDA for the same code). Measured root cause: the buffer pool **HOARDED freed buffers to ~3.2 GiB** when the genuine working set was only ~896 MiB — the browser's per-process D3D12 budget was crossed by **pool bloat, not genuine need** (the GPU was never the limit).
+
+Fix: VAE decode is now **full-res GPU-resident by default** (no .NET tiling), with **proactive buffer reclaim on browser backends** (bucket-trim + a low deferred-release backlog cap) so peak GPU residency tracks the working set — GPU-memory management, **zero managed-heap copies**. Verified on WebGPU: single-gen `SDTurbo_Generate_E2E` (which previously OOM'd) GREEN; 4-gen `SDTurbo_WebGPU_ImageGen_MultiGen` GREEN with the per-gen peak-TOTAL leak guard flat; CUDA gen bit-consistent (lumStd 114.6 vs the full-res reference). The exact seam-free tiled decode remains **opt-in** via `VaeTileGrid > 0`.
+
+The final image is packed to RGBA by a **GPU kernel** (`ElementWiseKernels.NchwDenormToRgba`), replacing a GPU→.NET float readback (3·H·W floats) + a 262K-iteration **.NET pixel loop**. Proven **bit-identical (±1/channel)** to the old loop on all 8 backend variants (`NchwDenormToRgba_MatchesCpuPixelLoop`).
+
+### 🧹 Per-token vocab readback removed from Whisper + GPT-2 greedy decode (Rule 4: no unnecessary copies)
+
+Whisper (`AudioPipelines`) and GPT-2 greedy (`TextGenerationPipeline`) decode read the **entire ~50K-float vocab to the host every token** then argmaxed on the CPU. Greedy now selects **on the GPU** via `GpuArgMax` — reads back one index, tie-break lowest-index, **bit-exact vs the DistilGPT-2==ORT greedy reference** (`TextGen_ReadbackCache_MatchesReference`). GPT-2 sampling (which genuinely needs the host distribution) now **reuses one readback buffer** across tokens + a native `CopyFrom`, instead of a per-token GPU allocation + a `Scale` temp-dispatch.
+
+### ⬆️ Dependencies
+**SpawnDev.ILGPU 4.17.6** + **SpawnDev.BlazorJS 3.5.25** — heap-view **re-attach** replaces priming (a `memory.grow`-detached view is re-created on revive; `HeapView.UsePrimer` defaults false) + a cross-origin-`Window` `_in` `SecurityError` fix. Also retained: a `GraphExecutor` break-stranded-buffer reclaim for the **opt-in** tiled decode path (the earlier per-gen GPU-process leak fix, now off the default path). Carries preview.11's dispatch-elide default-on (~1.9x SD-Turbo WebGPU).
+
 ## 4.0.0-preview.12 (2026-07-11)
 
 ### 🐛 SD-Turbo WebGPU image-gen "external Instance reference no longer exists" crash FIXED (dependency: SpawnDev.ILGPU 4.17.5)

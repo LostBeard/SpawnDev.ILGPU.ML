@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
 using System.Diagnostics;
@@ -82,6 +83,8 @@ public class SpeechRecognitionPipeline : IDisposable
         // 5. Autoregressive decoder
         var tokens = new List<int> { SOT, LANG_EN, TRANSCRIBE, NO_TIMESTAMPS };
 
+        // Greedy next-token selection stays GPU-side: read back one index per token, not the whole vocab.
+        using var argmax = new GpuArgMax(_accelerator);
         for (int step = 0; step < MaxTokens; step++)
         {
             // Create input_ids tensor
@@ -98,23 +101,14 @@ public class SpeechRecognitionPipeline : IDisposable
             var decoderOutputs = await _decoderSession.RunAsync(decoderInputs);
             var logits = decoderOutputs[_decoderSession.OutputNames[0]];
 
-            // Read last position logits — shape [1, seq_len, vocab_size]
+            // Last-position logits — shape [1, seq_len, vocab_size].
             int vocabSize = logits.Shape.Length >= 3 ? logits.Shape[^1] : 51865;
             int lastPosOffset = (tokens.Count - 1) * vocabSize;
 
-            using var readBuf = _accelerator.Allocate1D<float>(vocabSize);
-            new ElementWiseKernels(_accelerator).Scale(
-                logits.Data.SubView(lastPosOffset, vocabSize), readBuf.View, vocabSize, 1f);
-            await _accelerator.SynchronizeAsync();
-            var lastLogits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
-
-            // Greedy argmax
-            int nextToken = 0;
-            float maxVal = float.MinValue;
-            for (int i = 0; i < lastLogits.Length; i++)
-            {
-                if (lastLogits[i] > maxVal) { maxVal = lastLogits[i]; nextToken = i; }
-            }
+            // Greedy argmax ON THE GPU — read back ONLY the winning index, not the whole ~52K-float vocab every
+            // token (Rule 4: no unnecessary copies). GpuArgMax tie-breaks lowest-index, identical to the old CPU
+            // first-max-wins scan; its partial buffers are reused, so there is no per-token allocation.
+            int nextToken = await argmax.ArgMaxAsync(logits.Data.SubView(lastPosOffset, vocabSize), vocabSize);
 
             if (nextToken == EOT) break;
             tokens.Add(nextToken);

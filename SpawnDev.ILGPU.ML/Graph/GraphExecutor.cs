@@ -1135,6 +1135,9 @@ public class GraphExecutor : IDisposable
     /// with each input's resolved value + tensor shape. The FIRST such line whose inputs are all non-empty is the
     /// root op that collapses a real shape to empty (the CLIP text_model Range-limit keystone). Console-only.</summary>
     public static bool LogEmptyShapeInterp;
+    /// <summary>DIAGNOSTIC (Tuvok 2026-07-11): at run end, log large pooled buffers whose refcount never hit 0
+    /// (a per-gen not-Returned leak — the SD-Turbo 2nd-gen OOM). Console-only.</summary>
+    public static bool LogLeakedBuffers;
     /// <summary>DIAGNOSTIC: when non-null, the executor records "OpType in=[shapes]" for each FLOP-carrying node
     /// (MatMul/Conv/Einsum/FusedLinear/FusedAttention/Gemm/ConvTranspose) so we can histogram the actual kernel
     /// shapes (M,K,N / C,H,W,k) — the input Seven needs to pick per-shape tile configs for the SGEMM core.</summary>
@@ -2913,6 +2916,48 @@ public class GraphExecutor : IDisposable
                 _pool.ReturnHalf(h);
             pendingReleases.Clear();
             pendingHalfReleases.Clear();
+        }
+
+        // BREAK-LEAK RECLAIM (Tuvok 2026-07-11): a break-based PARTIAL run (the tiled VAE decode captures the
+        // mid-block / a tiling boundary to CPU, then abandons the rest) leaves every buffer whose consumers are
+        // PAST the break stranded LIVE — its refcount never reaches 0, so the pool can't reuse it and the next
+        // gen re-allocates → a per-gen GPU leak that OOMs the 2nd SD-Turbo gen (up_blocks.2 conv_shortcut +
+        // norm2 = 128 MiB/gen). After a break the caller only reads the CPU capture + graph outputs, so every
+        // still-live working buffer (0 < rc < MaxValue; outputs/weights/inputs are pinned to MaxValue) is dead:
+        // return it. _pool.Return no-ops for handed-off/aliased names (not owned in _namedBuffers), so this is
+        // safe against the zero-copy Reshape handoffs. Not needed on a FULL run (refcounts reach 0 normally).
+        if (BreakAtNode.HasValue && nodeIdx >= BreakAtNode.Value && !SuppressDrains)
+        {
+            foreach (var (nm, t) in tensors)
+            {
+                if (string.IsNullOrEmpty(nm)) continue;
+                if (refCounts.TryGetValue(nm, out var rc) && rc > 0 && rc < int.MaxValue)
+                {
+                    _pool.Return(t);
+                    refCounts[nm] = 0;   // mark released (so the leak diagnostic below reads clean)
+                }
+            }
+            foreach (var (nm, h) in halfTensors)
+            {
+                if (string.IsNullOrEmpty(nm)) continue;
+                if (refCounts.TryGetValue(nm, out var rc) && rc > 0 && rc < int.MaxValue)
+                {
+                    _pool.ReturnHalf(h);
+                    refCounts[nm] = 0;
+                }
+            }
+        }
+
+        // DIAGNOSTIC (Tuvok 2026-07-11): a live pooled buffer whose refcount never hit 0 = a per-gen leak (the
+        // SD-Turbo 2nd-gen OOM). Report large non-output/weight/input buffers still holding refCount > 0.
+        if (LogLeakedBuffers)
+        {
+            foreach (var (nm, t) in tensors)
+            {
+                if (string.IsNullOrEmpty(nm) || _graph.OutputNames.Contains(nm) || _weights.ContainsKey(nm) || inputs.ContainsKey(nm)) continue;
+                if (refCounts.TryGetValue(nm, out var rc) && rc > 0 && rc < int.MaxValue && (long)t.ElementCount * 4 >= 32L * 1024 * 1024)
+                    Console.WriteLine($"[LEAKED] rc={rc} {(long)t.ElementCount * 4 / 1048576.0:F1}MiB {nm}");
+            }
         }
 
         var results = new Dictionary<string, Tensor>();
