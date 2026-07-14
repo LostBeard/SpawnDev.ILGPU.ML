@@ -47,7 +47,7 @@ public class OperatorRegistry : IDisposable
         "OneHot", "Optional", "OptionalGetElement", "OptionalHasElement", "Or", "PRelu", "Pad", "Pow",
         "QLinearConv", "QLinearMatMul", "QuantizeLinear", "RNN", "RandomNormal", "RandomNormalLike", "RandomUniform", "RandomUniformLike",
         "Range", "Reciprocal", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp", "ReduceMax", "ReduceMean",
-        "RoPE",
+        "RoPE", "ShortConv",
         "ReduceMin", "ReduceProd", "ReduceSum", "ReduceSumSquare", "Relu", "Reshape", "Resize", "ReverseSequence",
         "RMSNormalization",
         "RoiAlign", "Round", "STFT", "Scan", "Scatter", "ScatterElements", "ScatterND", "Selu",
@@ -66,6 +66,7 @@ public class OperatorRegistry : IDisposable
     public ElementWiseKernels ElementWise { get; }
     public Conv2DKernel Conv2D { get; }
     public Conv1DKernel Conv1D { get; }
+    public ShortConvKernel ShortConv { get; }
     public ActivationKernels Activations { get; }
     public ReductionKernels Reductions { get; }
     public PoolingKernels Pooling { get; }
@@ -109,6 +110,7 @@ public class OperatorRegistry : IDisposable
         ElementWise = new ElementWiseKernels(accelerator);
         Conv2D = new Conv2DKernel(accelerator);
         Conv1D = new Conv1DKernel(accelerator);
+        ShortConv = new ShortConvKernel(accelerator);
         Activations = new ActivationKernels(accelerator);
         Reductions = new ReductionKernels(accelerator);
         Pooling = new PoolingKernels(accelerator);
@@ -378,6 +380,7 @@ public class OperatorRegistry : IDisposable
         // True RMSNorm (every RMS decoder: llama/mistral/qwen/gemma). Distinct from the
         // mean-centered LayerNormalization — see RMSNormOperator.
         Register(new RMSNormOperator(this));
+        Register(new ShortConvOperator(this));
         Register(new AddRMSNormOperator(this));
     }
 
@@ -396,6 +399,7 @@ public class OperatorRegistry : IDisposable
         try { (ElementWise as IDisposable)?.Dispose(); } catch { }
         try { (Conv2D as IDisposable)?.Dispose(); } catch { }
         try { (Conv1D as IDisposable)?.Dispose(); } catch { }
+        try { (ShortConv as IDisposable)?.Dispose(); } catch { }
         try { (Activations as IDisposable)?.Dispose(); } catch { }
         try { (Reductions as IDisposable)?.Dispose(); } catch { }
         try { (Pooling as IDisposable)?.Dispose(); } catch { }

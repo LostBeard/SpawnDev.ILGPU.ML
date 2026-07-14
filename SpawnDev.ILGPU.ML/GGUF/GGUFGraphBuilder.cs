@@ -93,7 +93,11 @@ public static class GGUFGraphBuilder
         // both wrong, before this).
         bool isGemma = arch.StartsWith("gemma", StringComparison.Ordinal);
         // gpt-oss (gptoss) uses RMSNorm (attention.layer_norm_rms_epsilon; llama.cpp openai-moe = LLM_NORM_RMS).
-        bool useRMSNorm = isGemma || arch is "llama" or "mistral" or "qwen" or "qwen2" or "gptoss";
+        // Every Qwen decoder (qwen, qwen2, qwen2.5, qwen3, qwen3moe, ...) uses RMSNorm - match the whole family
+        // by prefix so a new Qwen arch doesn't silently fall through to the 2-input LayerNorm path (which reads
+        // an absent bias -> IndexOutOfRange). qwen3 (arch "qwen3") hit exactly that before this.
+        bool useRMSNorm = isGemma || arch.StartsWith("qwen", StringComparison.Ordinal)
+            || arch is "llama" or "mistral" or "gptoss" or "lfm2";
         bool useSiLU = !isGemma
             && arch is not "phi" and not "phi3" and not "gpt2" and not "falcon" and not "bloom" and not "mpt";
 
@@ -164,6 +168,25 @@ public static class GGUFGraphBuilder
             string normOut = $"{pfx}_attn_norm";
             AddNorm(graph, model, weights, $"{pfx}.attn_norm", layerIn, normOut, embedDim, useRMSNorm);
 
+            // ── Mixer selection ── LFM2 interleaves short-conv layers (blk.N.shortconv.*) with attention
+            // layers. A short-conv layer replaces the whole attention sublayer with the gated causal
+            // short-conv: in_proj -> ShortConv(B*x gated, causal depthwise conv, then C-gated) -> out_proj.
+            // Everything else (and LFM2's own attention layers) takes the attention path in the else below.
+            string attnResInput;
+            if (FindTensor(model, $"{pfx}.shortconv.in_proj.weight") != null)
+            {
+                string bcx = $"{pfx}_sc_bcx";
+                AddLinear(graph, model, weights, $"{pfx}.shortconv.in_proj", normOut, bcx, quantizedBytes, transposeOnUpload, lowPBytes);
+                var convW = FindTensor(model, $"{pfx}.shortconv.conv.weight")!;
+                if (!weights.ContainsKey(convW.Name)) { ExtractWeight(model, convW, weights); graph.Initializers[convW.Name] = convW.Shape; }
+                string convY = $"{pfx}_sc_y";
+                AddNode(graph, "ShortConv", new[] { bcx, convW.Name }, new[] { convY });
+                string scOut = $"{pfx}_sc_out";
+                AddLinear(graph, model, weights, $"{pfx}.shortconv.out_proj", convY, scOut, quantizedBytes, transposeOnUpload, lowPBytes);
+                attnResInput = scOut;
+            }
+            else
+            {
             // ── Per-layer attention geometry ──
             // head_dim VARIES per layer (gemma4: 256 sliding / 512 global) — NEVER embedDim/nHeads.
             // GetLayerAttnConfig resolves window / rope-base / rotary-dim / KV-heads / head-dim from the
@@ -292,13 +315,14 @@ public static class GGUFGraphBuilder
 
             // ── Post-attention norm (gemma 2/3/4 norm-sandwich: normalize the sublayer OUTPUT before the
             //    residual add). Presence-based — llama/mistral/etc. have no such tensor and are unaffected. ──
-            string attnResInput = attnOut;
+            attnResInput = attnOut;
             if (FindTensor(model, $"{pfx}.post_attention_norm.weight") != null)
             {
                 string postAttnOut = $"{pfx}_post_attn_norm";
                 AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm);
                 attnResInput = postAttnOut;
             }
+            } // end attention-mixer else (short-conv layers set attnResInput above)
 
             // ── Residual 1 + FFN norm ──
             // Fuse the residual Add into the following RMSNorm (AddRMSNorm: 2 nodes → 1, residualOut + normedOut)
