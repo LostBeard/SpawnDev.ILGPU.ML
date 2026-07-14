@@ -169,6 +169,20 @@ if (!File.Exists(modelPath))
     return 1;
 }
 
+// GGUF_META=<substr> → header-only: dump every metadata key containing <substr> (empty-safe: ""=all)
+// with its value (arrays truncated). For arch bring-up: ssm dims, rope base, eps, per-layer arrays, etc.
+if (Environment.GetEnvironmentVariable("GGUF_META") is { } msub && Environment.GetEnvironmentVariable("GGUF_META") != null)
+{
+    await using var ps = File.OpenRead(modelPath);
+    var pm = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(ps);
+    Console.WriteLine($"arch={pm.Architecture} keys={pm.Metadata.Count}");
+    string Fmt(object v) => v is Array a ? $"[{string.Join(",", a.Cast<object>().Take(40))}{(a.Length > 40 ? ",..." : "")}] (len {a.Length})" : v?.ToString() ?? "null";
+    foreach (var kv in pm.Metadata.Where(k => k.Key.Contains(msub, StringComparison.OrdinalIgnoreCase)).OrderBy(k => k.Key))
+        if (!kv.Key.Contains("tokenizer.ggml.tokens") && !kv.Key.Contains("token_type") && !kv.Key.Contains("merges") && !kv.Key.Contains("scores"))
+            Console.WriteLine($"  {kv.Key,-46} = {Fmt(kv.Value)}");
+    return 0;
+}
+
 // GGUF_TENSORS=<substr> → header-only: dump every tensor whose name contains <substr> with its GGUF
 // Dimensions (ne order, ne[0] contiguous) + Type. Decisive for layout questions (e.g. is the LFM2
 // shortconv.conv.weight [d_conv, d_inner] or [d_inner, d_conv]?). No GPU, no weight load.
