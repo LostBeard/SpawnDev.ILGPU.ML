@@ -107,6 +107,13 @@ public class GraphExecutor : IDisposable
     /// runs: 0 for prefill, then prompt-length, then +1 per decoded token). All layers in a run share it.</summary>
     public int DecodePastLen { get; set; }
 
+    /// <summary>LFM2 (short-conv mixer) incremental-decode conv-state cache — the conv analogue of
+    /// <see cref="DecodeKVCache"/>. When non-null, each ShortConv node (tagged with a "layer" attr) is run via
+    /// the cache so decode-step conv sees the previous L-1 tokens' history (<see cref="DecodePastLen"/>&gt;0)
+    /// instead of zero-padding every step. Null = normal full-recompute conv (untouched). Set by the session
+    /// alongside <see cref="DecodeKVCache"/> for models that carry ShortConv nodes.</summary>
+    public Kernels.ShortConvStateCache? ConvStateCache { get; set; }
+
     /// <summary>When set, the mid-graph runtime-constant readbacks (the ≤64-elem shape/scalar tensors
     /// captured via SynchronizeAsync+CopyToHostAsync — measured at ~7.8s of a 1554-node DistilGPT-2
     /// forward) are cached and reused across calls. This executor is shape-specialized (one input
@@ -2623,6 +2630,29 @@ public class GraphExecutor : IDisposable
                 Registry = _registry,
                 IntegerTensorNames = _integerTensorNames,
             };
+            // ── LFM2 short-conv decode intercept (conv analogue of the FusedAttention KV intercept above) ──
+            // When the conv-state cache is active, run ShortConv THROUGH it so a decode step (pastLen>0) sees
+            // the previous L-1 tokens' history instead of zero-padding. Prefill (pastLen==0) runs the plain
+            // zero-pad conv AND snapshots the tail as the initial state. Skips the operator's normal Execute.
+            bool convStateHandled = false;
+            if (ConvStateCache != null && node.OpType == "ShortConv" && !shapeCacheHit
+                && node.Attributes != null && node.Attributes.TryGetValue("layer", out var _scLayerEl)
+                && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null
+                && nodeOutputs.Length >= 1 && nodeOutputs[0] != null)
+            {
+                var scBcxShape = nodeInputs[0]!.Shape;
+                int scSeq = scBcxShape.Length >= 2 ? scBcxShape[^2] : 1;
+                int scH = scBcxShape[^1] / 3;
+                int scL = scH > 0 ? (int)(nodeInputs[1]!.ElementCount / scH) : 0;
+                if (scH > 0 && scL > 0)
+                {
+                    ConvStateCache.Forward(Convert.ToInt32(_scLayerEl),
+                        nodeInputs[0]!.Data, nodeInputs[1]!.Data, nodeOutputs[0]!.Data,
+                        scSeq, scH, scL, DecodePastLen);
+                    convStateHandled = true;
+                }
+            }
+
             // CapturedNodeTimingsMs (opt-in): wall-clock time per Execute + optional sync.
             // Captures via Stopwatch around node.Operator.Execute (and the PerOpSync sync
             // when enabled). Pairs with CapturedOutputs key for cross-lookup.
@@ -2634,8 +2664,9 @@ public class GraphExecutor : IDisposable
                 // browser-safe readback; all others fall through to the synchronous Execute via
                 // the default interface method. This is the browser-parity path.
                 // shapeCacheHit: buffer already holds the correct dims from a prior step — skip.
+                // convStateHandled: ShortConv already ran through the conv-state cache above — skip.
                 if (CaptureTraceFile != null && !shapeCacheHit) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> DISPATCH\n"); } catch { } }
-                if (!shapeCacheHit) await node.Operator.ExecuteAsync(ctx);
+                if (!shapeCacheHit && !convStateHandled) await node.Operator.ExecuteAsync(ctx);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,
                 // WebGPU command-encoder errors) surface AT the failing node instead of

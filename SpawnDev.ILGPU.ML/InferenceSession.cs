@@ -2219,6 +2219,9 @@ public class InferenceSession : IDisposable
 
     // ── GGUF incremental decode (full-precision KV-cache) ──
     private Kernels.GGUFDecodeKVCache? _decodeCache;
+    // LFM2 / short-conv mixer models also need a per-conv-layer conv-state cache (the KV cache only covers
+    // attention). Auto-created in EnableGGUFDecode when the graph carries ShortConv nodes; null otherwise.
+    private Kernels.ShortConvStateCache? _convStateCache;
 
     /// <summary>Tokens already cached (advances per <see cref="RunDecodeStepAsync"/>; 0 before prefill).</summary>
     public int DecodePastLen { get; private set; }
@@ -2232,10 +2235,17 @@ public class InferenceSession : IDisposable
     {
         _decodeCache = cache ?? throw new ArgumentNullException(nameof(cache));
         DecodePastLen = 0;
+        // Short-conv mixer models (LFM2): decode needs a conv-state cache so ShortConv layers see the prior
+        // L-1 tokens' history (else every 1-token decode step zero-pads and diverges from full-recompute).
+        // Auto-detect from the graph; inert (never created) for pure-attention models like gemma/qwen.
+        bool hasShortConv = _recompileGraph?.Nodes.Any(n => n.OpType == "ShortConv") ?? false;
+        if (hasShortConv)
+            (_convStateCache ??= new Kernels.ShortConvStateCache(_accelerator, _registry.ShortConv)).Reset();
+        else { _convStateCache?.Dispose(); _convStateCache = null; }
     }
 
     /// <summary>Reset the decode cursor to begin a fresh sequence (reuses the cache allocation).</summary>
-    public void ResetGGUFDecode() => DecodePastLen = 0;
+    public void ResetGGUFDecode() { DecodePastLen = 0; _convStateCache?.Reset(); }
 
     /// <summary>Set the decode cursor to <paramref name="p"/> WITHOUT clearing the KV-cache contents — the
     /// prefix-cache reuse path. When tokens 0..p-1 already hold the bit-identical K/V from a previous request
@@ -2254,7 +2264,7 @@ public class InferenceSession : IDisposable
 
     /// <summary>Detach the KV-cache: clears the session's reference and resets the cursor. Call before
     /// disposing the cache so the session never holds a dangling reference to freed GPU buffers.</summary>
-    public void DisableGGUFDecode() { _decodeCache = null; DecodePastLen = 0; }
+    public void DisableGGUFDecode() { _decodeCache = null; DecodePastLen = 0; _convStateCache?.Dispose(); _convStateCache = null; }
 
     /// <summary>Run ONE decode/prefill step with the KV-cache active. The step's tokens are written at
     /// the current <see cref="DecodePastLen"/> and attended against all cached history; the cursor then
@@ -2268,6 +2278,7 @@ public class InferenceSession : IDisposable
             throw new InvalidOperationException("Call EnableGGUFDecode(cache) before RunDecodeStepAsync.");
         var exec = ResolveExecutor(inputs);
         exec.DecodeKVCache = _decodeCache;
+        exec.ConvStateCache = _convStateCache;   // LFM2 short-conv history (null for pure-attention models)
         exec.DecodePastLen = DecodePastLen;
         try
         {
@@ -2281,7 +2292,7 @@ public class InferenceSession : IDisposable
             DecodePastLen += seq;
             return result;
         }
-        finally { exec.DecodeKVCache = null; }
+        finally { exec.DecodeKVCache = null; exec.ConvStateCache = null; }
     }
 
     /// <summary>
@@ -2423,6 +2434,7 @@ public class InferenceSession : IDisposable
 
     public void Dispose()
     {
+        _convStateCache?.Dispose(); _convStateCache = null;   // session-owned conv-state buffers (LFM2 decode)
         _executor.Dispose();
         // Dispose per-shape recompiled executors (each owns its own intermediate buffer pool).
         foreach (var exec in _shapeExecutors.Values)

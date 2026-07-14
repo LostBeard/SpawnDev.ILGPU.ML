@@ -169,6 +169,40 @@ if (!File.Exists(modelPath))
     return 1;
 }
 
+// GGUF_TENSORS=<substr> → header-only: dump every tensor whose name contains <substr> with its GGUF
+// Dimensions (ne order, ne[0] contiguous) + Type. Decisive for layout questions (e.g. is the LFM2
+// shortconv.conv.weight [d_conv, d_inner] or [d_inner, d_conv]?). No GPU, no weight load.
+if (Environment.GetEnvironmentVariable("GGUF_TENSORS") is { Length: > 0 } tsub)
+{
+    await using var ps = File.OpenRead(modelPath);
+    var pm = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(ps);
+    Console.WriteLine($"arch={pm.Architecture} embd={pm.EmbeddingLength} blocks={pm.BlockCount} heads={pm.AttentionHeadCount} kv={pm.AttentionHeadCountKV}");
+    foreach (var t in pm.Tensors.Where(t => t.Name.Contains(tsub, StringComparison.OrdinalIgnoreCase)).OrderBy(t => t.Name))
+        Console.WriteLine($"  {t.Name,-42} {t.Type,-8} ne=[{string.Join(",", t.Dimensions)}]");
+    return 0;
+}
+
+// GGUF_ATTNCFG=1 → header-only: print GetLayerAttnConfig (isGlobal/window/ropeBase/rotaryDim/nkv/headDim)
+// for EVERY layer. Confirms per-layer KV-head resolution (LFM2 stores head_count_kv as a per-layer array;
+// a scalar-fallback bug would silently give attention layers the wrong KV-head count). No GPU.
+if (Environment.GetEnvironmentVariable("GGUF_ATTNCFG") == "1")
+{
+    await using var ps = File.OpenRead(modelPath);
+    var pm = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(ps);
+    int nH = (int)pm.AttentionHeadCount, defKV = (int)pm.AttentionHeadCountKV; if (defKV == 0) defKV = nH;
+    int embd = (int)pm.EmbeddingLength, defHd = nH > 0 ? embd / nH : 0;
+    Console.WriteLine($"arch={pm.Architecture} embd={embd} blocks={pm.BlockCount} nH={nH} defKV={defKV} defHd={defHd}");
+    bool hasKvArr = pm.Metadata.TryGetValue($"{pm.Architecture}.attention.head_count_kv", out var kvRaw);
+    Console.WriteLine($"  head_count_kv metadata: present={hasKvArr} type={(kvRaw?.GetType().Name ?? "null")} value={(kvRaw is Array ar ? "[" + string.Join(",", ar.Cast<object>()) + "]" : kvRaw?.ToString() ?? "null")}");
+    for (int L = 0; L < (int)pm.BlockCount; L++)
+    {
+        var c = SpawnDev.ILGPU.ML.GGUF.GGUFGraphBuilder.GetLayerAttnConfig(pm, L, nH, defKV, defHd);
+        bool isConv = pm.Tensors.Any(t => t.Name == $"blk.{L}.shortconv.in_proj.weight");
+        Console.WriteLine($"  L{L,2} {(isConv ? "CONV" : "attn")}  nkv={c.NKVHeads,2} headDim={c.HeadDim,3} rotaryDim={c.RotaryDim,3} ropeBase={c.RopeBase,10:F0} global={c.IsGlobal} window={c.Window}");
+    }
+    return 0;
+}
+
 // GGUF_PROBE=1 → header-only diagnostic: dump norm-weight stats per layer + decode named token ids.
 // No GPU, no full load - just reads the small F32 norm tensors on demand from the stream.
 if (Environment.GetEnvironmentVariable("GGUF_PROBE") == "1")
@@ -204,6 +238,18 @@ if (Environment.GetEnvironmentVariable("GGUF_PROBE") == "1")
             Console.WriteLine($"  token {id,7} = '{tok.Decode(new[] { id })}'");
     else Console.WriteLine("  (tokenizer FromGGUF returned null)");
     return 0;
+}
+
+// GGUF_DECODE_EQUIV="<prompt>" → decode-equivalence gate: greedy full-recompute (O(n^2), zero-pad conv)
+// MUST produce token-identical output to KV-cache decode (O(n), conv-STATE cache). This is the LFM2
+// short-conv regression guard - a broken/absent conv-state cache diverges after the prefill. GGUF_BACKEND
+// selects the backend. Returns 0 on identity, 3 on divergence. (Tuvok 2026-07-14.)
+string? equivPrompt = Environment.GetEnvironmentVariable("GGUF_DECODE_EQUIV");
+if (!string.IsNullOrEmpty(equivPrompt))
+{
+    try { return await DecodeEquivTestAsync(modelPath, equivPrompt,
+        maxNew: int.TryParse(Environment.GetEnvironmentVariable("GGUF_GEN_N"), out var en) ? en : 24); }
+    catch (Exception ex) { Console.Error.WriteLine($"EQUIV TEST FAILED: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}"); return 1; }
 }
 
 // GGUF_GEN="<prompt>" → greedy autoregressive decode (the real production correctness test:
@@ -367,7 +413,11 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
     int Id(string s) => idOf.TryGetValue(s, out var v) ? v : -1;
     // gemma4 control tokens (NOT gemma2/3's <start_of_turn>): turn-open <|turn> / turn-close <turn|>,
     // thinking toggle <|think|>, and the eot/eos. Verified by scanning the GGUF vocab.
-    int bos = Id("<bos>"), turnO = Id("<|turn>"), turnC = Id("<turn|>"), think = Id("<|think|>"), eos = Id("<eos>");
+    // BOS: prefer the tokenizer's bos_token_id (from GGUF metadata) over a NAME lookup — LFM2's BOS is
+    // "<|startoftext|>" (id 1), not "<bos>", so Id("<bos>")=-1 would silently skip it. Many models
+    // (LFM2, llama) set add_bos_token=true and produce degenerate output WITHOUT the leading BOS.
+    int bos = tok.BosId >= 0 ? tok.BosId : Id("<bos>");
+    int turnO = Id("<|turn>"), turnC = Id("<turn|>"), think = Id("<|think|>"), eos = Id("<eos>");
 
     var ids = new List<int>();
     if (raw) { if (bos >= 0) ids.Add(bos); ids.AddRange(tok.Encode(prompt)); }
@@ -673,13 +723,99 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
     return 0;
 }
 
+// Decode-equivalence gate: full-recompute greedy MUST equal KV-cache greedy, token-for-token. The LFM2
+// short-conv regression guard (conv-state cache correctness). Runs on the GGUF_BACKEND-selected device.
+async Task<int> DecodeEquivTestAsync(string path, string prompt, int maxNew)
+{
+    using var context = MLContext.Create().ToContext();
+    var cuda = context.GetCudaDevices(); var opencl = context.GetCLDevices();
+    string? be = Environment.GetEnvironmentVariable("GGUF_BACKEND")?.ToLowerInvariant();
+    Device device = be == "cpu" ? context.GetPreferredDevice(preferCPU: true)
+                  : be == "opencl" && opencl.Count > 0 ? (Device)opencl[0]
+                  : cuda.Count > 0 ? (Device)cuda[0]
+                  : opencl.Count > 0 ? (Device)opencl[0]
+                  : context.GetPreferredDevice(preferCPU: false);
+    using var accelerator = device.CreateAccelerator(context);
+
+    await using var hs = File.OpenRead(path);
+    var gm = await SpawnDev.ILGPU.ML.GGUF.GGUFParser.ParseHeaderAsync(hs); gm.SourceStream = hs;
+    var tok = SpawnDev.ILGPU.ML.Preprocessing.SentencePieceTokenizer.FromGGUF(gm)!;
+    using var session = await InferenceSession.CreateFromGGUFFileAsync(accelerator, path);
+
+    var promptIds = new List<int>();
+    if (tok.BosId >= 0) promptIds.Add(tok.BosId);
+    promptIds.AddRange(tok.Encode(prompt));
+    Console.WriteLine($"Accelerator: {accelerator.Name} ({accelerator.AcceleratorType})");
+    Console.WriteLine($"Prompt ids ({promptIds.Count}): [{string.Join(",", promptIds)}]  budget={maxNew}\n");
+
+    int Argmax(float[] h, int off, int vocab) { int a = 0; float b = h[off]; for (int v = 1; v < vocab; v++) if (h[off + v] > b) { b = h[off + v]; a = v; } return a; }
+
+    // ── Path A: full-recompute greedy (zero-pad conv; the O(n^2) reference) ──
+    var full = new List<int>();
+    for (int step = 0; step < maxNew; step++)
+    {
+        var cur = promptIds.Concat(full).Select(i => (float)i).ToArray();
+        using var inBuf = accelerator.Allocate1D(cur);
+        var outs = await session.RunAsync(new Dictionary<string, Tensor> { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, cur.Length }, "input_ids") });
+        await accelerator.SynchronizeAsync();
+        var lg = outs.TryGetValue("logits", out var l) ? l : outs.Values.First();
+        int vocab = lg.Shape[^1]; int seqOut = lg.ElementCount / vocab;
+        var host = new float[lg.ElementCount]; lg.Data.CopyToCPU(host);
+        full.Add(Argmax(host, (seqOut - 1) * vocab, vocab));
+    }
+
+    // ── Path B: KV-cache greedy (conv-STATE cache; the O(n) production path) ──
+    int nLayers = (int)gm.BlockCount, nH = (int)gm.AttentionHeadCount;
+    int defNKV = (int)gm.AttentionHeadCountKV; if (defNKV == 0) defNKV = nH;
+    int embd = (int)gm.EmbeddingLength, defHd = embd / nH;
+    var kvHeadsArr = new int[nLayers]; var hdArr = new int[nLayers];
+    for (int L = 0; L < nLayers; L++) { var c = GGUFGraphBuilder.GetLayerAttnConfig(gm, L, nH, defNKV, defHd); kvHeadsArr[L] = c.NKVHeads; hdArr[L] = c.HeadDim; }
+    using var kv = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen: promptIds.Count + maxNew + 8);
+    session.EnableGGUFDecode(kv);
+    session.CacheShapeReadbacks = true;
+    var kvGen = new List<int>();
+    int[] stepIds = promptIds.ToArray();
+    for (int step = 0; step < maxNew; step++)
+    {
+        var idf = stepIds.Select(i => (float)i).ToArray();
+        using var inBuf = accelerator.Allocate1D(idf);
+        var outs = await session.RunDecodeStepAsync(new Dictionary<string, Tensor> { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
+        await accelerator.SynchronizeAsync();
+        var lg = outs.TryGetValue("logits", out var l) ? l : outs.Values.First();
+        int vocab = lg.Shape[^1]; int seqOut = lg.ElementCount / vocab;
+        var host = new float[lg.ElementCount]; lg.Data.CopyToCPU(host);
+        int arg = Argmax(host, (seqOut - 1) * vocab, vocab);
+        kvGen.Add(arg); stepIds = new[] { arg };
+    }
+
+    // ── Compare ──
+    int firstDiv = -1; int n = Math.Min(full.Count, kvGen.Count);
+    for (int i = 0; i < n; i++) if (full[i] != kvGen[i]) { firstDiv = i; break; }
+    Console.WriteLine($"full-recompute: {tok.Decode(full.ToArray())}");
+    Console.WriteLine($"kv-decode     : {tok.Decode(kvGen.ToArray())}");
+    if (firstDiv < 0 && full.Count == kvGen.Count)
+    {
+        Console.WriteLine($"\nDECODE-EQUIVALENCE: PASS ({full.Count} tokens identical on {accelerator.AcceleratorType})");
+        return 0;
+    }
+    Console.WriteLine($"\nDECODE-EQUIVALENCE: FAIL (first divergence at index {firstDiv})");
+    Console.WriteLine($"  full=[{string.Join(",", full)}]");
+    Console.WriteLine($"  kv  =[{string.Join(",", kvGen)}]");
+    return 3;
+}
+
 async Task<int> RunAsync(string path, int[] ids)
 {
     // The application owns the accelerator (library code never disposes it). Prefer CUDA.
+    // GGUF_BACKEND=cpu|opencl|cuda forces a backend (for CPU-vs-GPU kernel-codegen bisection).
     using var context = MLContext.Create().ToContext();
     var cuda = context.GetCudaDevices();
     var opencl = context.GetCLDevices();
-    Device device = cuda.Count > 0 ? (Device)cuda[0]
+    string? beSel = Environment.GetEnvironmentVariable("GGUF_BACKEND")?.ToLowerInvariant();
+    Device device = beSel == "cpu" ? context.GetPreferredDevice(preferCPU: true)
+                  : beSel == "opencl" && opencl.Count > 0 ? (Device)opencl[0]
+                  : beSel == "cuda" && cuda.Count > 0 ? (Device)cuda[0]
+                  : cuda.Count > 0 ? (Device)cuda[0]
                   : opencl.Count > 0 ? (Device)opencl[0]
                   : context.GetPreferredDevice(preferCPU: false);
     using var accelerator = device.CreateAccelerator(context);
@@ -719,7 +855,9 @@ async Task<int> RunAsync(string path, int[] ids)
     {
         SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs = new();
         SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeInfo = new();
-        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureMaxElements = 20000;
+        // 40000 covers the widest layer-0/1 tensor (sc_bcx = 5 tokens * 3*2048 = 30720) so the LAST
+        // position is captured in full for numerical diff against an external (numpy) reference.
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureMaxElements = 40000;
     }
 
     sw.Restart();
@@ -730,7 +868,13 @@ async Task<int> RunAsync(string path, int[] ids)
     if (capture)
     {
         var caps = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedOutputs!;
-        int hdim = 3840, sq = ids.Length;
+        int sq = ids.Length;
+        // hdim = embed_out width (arch-agnostic: derive from the embedding output, not a hard-coded gemma dim).
+        int hdim = 0;
+        foreach (var kv in caps) if (kv.Key.EndsWith("embed_out") && sq > 0) { hdim = kv.Value.Length / sq; break; }
+        if (hdim <= 0) hdim = sq > 0 ? caps.Values.First().Length / sq : caps.Values.First().Length;
+        // GGUF_CAPTURE_ALL=1 → dump EVERY captured node (full trajectory, incl. shortconv sc_bcx/sc_y/sc_out).
+        bool capAll = Environment.GetEnvironmentVariable("GGUF_CAPTURE_ALL") == "1";
         // RMS/absMax of a slice; and per-position RMS to test differentiation.
         (double rms, double amax) Stat(float[] v, int off, int n)
         {
@@ -738,15 +882,14 @@ async Task<int> RunAsync(string path, int[] ids)
             for (int i = off; i < off + n && i < v.Length; i++) { s2 += (double)v[i] * v[i]; am = Math.Max(am, Math.Abs(v[i])); c++; }
             return (c > 0 ? Math.Sqrt(s2 / c) : 0, am);
         }
-        Console.WriteLine("\n=== RESIDUAL-STREAM TRAJECTORY (per-node stats; pos-RMS = RMS of each position's 3840-d hidden) ===");
-        // Show: embed_out, every 6th layer's residual output, final_norm_out, logits_presoftcap.
+        Console.WriteLine($"\n=== RESIDUAL-STREAM TRAJECTORY (hdim={hdim}, seq={sq}; pos-RMS = RMS of each position's hidden) ===");
         var keys = caps.Keys.ToList();
         foreach (var key in keys)
         {
             string name = key.Substring(key.IndexOf('_', 4) + 1);
-            bool interesting = name == "embed_out" || name == "final_norm_out" || name.Contains("logits")
+            bool interesting = capAll || name == "embed_out" || name == "final_norm_out" || name.Contains("logits")
                 || name.EndsWith("_attn_merged")
-                || System.Text.RegularExpressions.Regex.IsMatch(name, @"^scaled_out|^blk\.(0|1|5|6|11|23|24|47)_");
+                || System.Text.RegularExpressions.Regex.IsMatch(name, @"^scaled_out|^blk[\._](0|1|5|6|11|23|24|47)[\._]");
             if (!interesting) continue;
             var v = caps[key];
             var (rms, amax) = Stat(v, 0, v.Length);
@@ -765,7 +908,19 @@ async Task<int> RunAsync(string path, int[] ids)
                 double c = (n0 > 0 && nl > 0) ? dot / (Math.Sqrt(n0) * Math.Sqrt(nl)) : 0;
                 cos = $" cos(p0,p{last})={c:F3}";
             }
-            Console.WriteLine($"  {key,-44} rms={rms,8:F3} absMax={amax,10:F3}{cos}");
+            // GGUF_CAPTURE_VALS=1 → also print RMS + first-8 values of the LAST position (matches an
+            // external numpy reference dump that reports position sq-1). width = per-position stride.
+            string vals = "";
+            if (Environment.GetEnvironmentVariable("GGUF_CAPTURE_VALS") == "1" && nPos >= 1)
+            {
+                int width = v.Length / nPos;                 // hidden=hdim; sc_bcx=3*hdim; etc.
+                int off = (nPos - 1) * width;                // last captured position
+                var (lrms, _) = Stat(v, off, width);
+                var head = new List<string>();
+                for (int i = off; i < off + 8 && i < v.Length; i++) head.Add(v[i].ToString("F4"));
+                vals = $"\n        last-pos(w={width}) rms={lrms:F4} first8=[{string.Join(", ", head)}]";
+            }
+            Console.WriteLine($"  {key,-44} rms={rms,8:F3} absMax={amax,10:F3}{cos}{vals}");
         }
     }
 

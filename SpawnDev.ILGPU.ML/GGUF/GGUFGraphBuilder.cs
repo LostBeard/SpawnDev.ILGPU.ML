@@ -180,7 +180,9 @@ public static class GGUFGraphBuilder
                 var convW = FindTensor(model, $"{pfx}.shortconv.conv.weight")!;
                 if (!weights.ContainsKey(convW.Name)) { ExtractWeight(model, convW, weights); graph.Initializers[convW.Name] = convW.Shape; }
                 string convY = $"{pfx}_sc_y";
-                AddNode(graph, "ShortConv", new[] { bcx, convW.Name }, new[] { convY });
+                // "layer" attr: lets the incremental-decode conv-state cache (ShortConvStateCache) associate
+                // this ShortConv with its per-layer conv history. Unused in full-recompute; read only in decode.
+                AddNode(graph, "ShortConv", new[] { bcx, convW.Name }, new[] { convY }, Attrs("layer", (long)layer));
                 string scOut = $"{pfx}_sc_out";
                 AddLinear(graph, model, weights, $"{pfx}.shortconv.out_proj", convY, scOut, quantizedBytes, transposeOnUpload, lowPBytes);
                 attnResInput = scOut;
