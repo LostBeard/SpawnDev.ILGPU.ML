@@ -435,8 +435,10 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
 
     var ids = new List<int>();
     if (raw) { if (bos >= 0) ids.Add(bos); ids.AddRange(tok.Encode(prompt)); }
-    // gemma4 chat template, now via the library helper (dogfooding ChatTemplates.BuildGemma4PromptTokens).
-    else ids.AddRange(SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.BuildGemma4PromptTokens(tok, systemPrompt: null, userMessage: prompt, thinking: true));
+    // General chat template via the library dispatcher (ChatTemplates.BuildChatPrompt) — routes per-arch
+    // (gemma4 / ChatML / Llama3) AND honors add_bos_token (LFM2's <|startoftext|> BOS). Dogfoods the exact
+    // path the demo/server uses, so the console tests any model's real chat prompt, not just gemma4's.
+    else ids.AddRange(SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.BuildChatPrompt(gm, tok, new[] { ("user", prompt) }).PromptIds);
     Console.WriteLine($"Prompt: \"{prompt}\"  (raw={raw})\nPrompt token ids ({ids.Count}): [{string.Join(",", ids)}]");
     Console.WriteLine($"control: bos={bos} turn_open={turnO} turn_close={turnC} think={think} eos={eos}\n");
 

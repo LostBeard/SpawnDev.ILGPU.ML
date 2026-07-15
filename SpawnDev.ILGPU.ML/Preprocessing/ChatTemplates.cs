@@ -429,8 +429,15 @@ public static class ChatTemplates
                         Ids(tok, "<|eot_id|>", "<|eom_id|>"));
             case ChatFormat.ChatML:
             default:
-                return (BuildChatMLPromptTokens(tok, messages),
-                        Ids(tok, "<|im_end|>"));
+                var chatmlIds = BuildChatMLPromptTokens(tok, messages);
+                // Most ChatML models are BOS-less (qwen2.5/qwen3/smollm2 begin at <|im_start|>), but some
+                // declare their own BOS via add_bos_token (LFM2: add_bos_token=true, <|startoftext|>=1).
+                // A missing BOS puts the model OFF its training distribution -> coherent for a token or two
+                // then degenerate garbage. Honor the GGUF's own add_bos_token so the prompt matches training.
+                // See feedback-missing-bos-looks-like-a-numerical-bug (same trap, production chat path).
+                if (ModelAddsBos(model) && tok.BosId >= 0)
+                    chatmlIds = Prepend(tok.BosId, chatmlIds);
+                return (chatmlIds, Ids(tok, "<|im_end|>"));
         }
 
         static int[] Ids(SentencePieceTokenizer tok, params string[] markers)
@@ -439,6 +446,21 @@ public static class ChatTemplates
             foreach (var m in markers) if (tok.TryGetId(m, out var id)) list.Add(id);
             return list.ToArray();
         }
+    }
+
+    /// <summary>True when the GGUF declares <c>tokenizer.ggml.add_bos_token = true</c> (the model was trained
+    /// with its BOS prepended). Stored as a bool in the metadata dict; absent -> false (BOS-less, the ChatML
+    /// default). Used to conditionally prepend the BOS on the ChatML path (LFM2 needs it, qwen does not).</summary>
+    private static bool ModelAddsBos(GGUF.GGUFModel model)
+        => model.Metadata.TryGetValue("tokenizer.ggml.add_bos_token", out var v)
+           && v is not null && Convert.ToBoolean(v);
+
+    private static int[] Prepend(int id, int[] rest)
+    {
+        var outArr = new int[rest.Length + 1];
+        outArr[0] = id;
+        System.Array.Copy(rest, 0, outArr, 1, rest.Length);
+        return outArr;
     }
 
     /// <summary>Extract the model's DEFAULT system prompt from its <c>tokenizer.chat_template</c> — the LITERAL

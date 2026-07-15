@@ -2,6 +2,25 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.15 (2026-07-15)
+
+### 🐛 FIX: LFM2 (add_bos_token models) degenerate chat output - missing BOS on the ChatML path
+
+The ChatML prompt builder (`ChatTemplates.BuildChatMLPromptTokens`) never prepended a BOS token - correct
+for qwen2.5/qwen3/smollm2 (BOS-less ChatML, `add_bos_token=false`), but WRONG for **LFM2**, which declares
+`tokenizer.ggml.add_bos_token=true` with its own BOS `<|startoftext|>` (id 1). Dropping the BOS put LFM2 off
+its training distribution: it stayed coherent for a token or two, then collapsed into fragmented garbage
+("Ch: A chicken is a domesticated definition of a chicken, but not a bird # A, to the answer:"). The factual
+`Contains("Paris")` test oracle missed it (a strong association survives a mild prompt error).
+
+Fix: `ChatTemplates.BuildChatPrompt` now honors the GGUF's own `tokenizer.ggml.add_bos_token` on the ChatML
+path - prepends `tok.BosId` when the model declares it, leaves BOS-less ChatML models unchanged. Verified:
+LFM2 now answers coherently ("A chicken is a domesticated bird of the genus *Gallus*, family Galliformes...").
+The new-arch LLM test now includes a **trigram-diversity coherence gate** (not just a keyword check) so a
+future BOS/decode regression fails loudly. Also: the GGUF text-gen console (`Examples/04`) now dogfoods
+`ChatTemplates.BuildChatPrompt` (per-arch dispatch) instead of hardcoding the gemma4 template, so it can
+drive any model's real chat prompt.
+
 ## 4.0.0-preview.14 (2026-07-15)
 
 ### 🚀 Three new GGUF LLM architectures: qwen3, LFM2, qwen3.5 (Qwen3-Next)

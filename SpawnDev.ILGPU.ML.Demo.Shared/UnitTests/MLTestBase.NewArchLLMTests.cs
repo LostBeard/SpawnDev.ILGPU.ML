@@ -24,7 +24,7 @@ public abstract partial class MLTestBase
     // Shared driver: stream a GGUF instruct model from the hub, greedy-decode the France prompt,
     // assert the answer mentions Paris. Network/hub outage → UnsupportedTestException (not a failure).
     private async Task GgufLLM_AnswersParis(Accelerator accelerator, string repoId, string file, string tag,
-        string userSuffix = "", int maxTokens = 16)
+        string userSuffix = "", int maxTokens = 64)
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -53,6 +53,22 @@ public abstract partial class MLTestBase
                     throw new Exception($"[{tag}] produced empty output");
                 if (!answer.Contains("Paris", StringComparison.OrdinalIgnoreCase))
                     throw new Exception($"[{tag}] answer did not mention Paris (oracle): '{answer.Trim()}'");
+                // COHERENCE gate (not just "contains Paris"): a missing BOS / broken decode emits a few
+                // plausible tokens then degenerates into fragmented garbage that a Contains() check misses
+                // (this exact hole hid the LFM2 add_bos_token bug). Degenerate text collapses trigram
+                // diversity; healthy text stays well above 0.5. Only meaningful once enough words exist.
+                var words = answer.ToLowerInvariant()
+                    .Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (words.Length >= 24)
+                {
+                    var tri = new List<string>();
+                    for (int i = 0; i + 2 < words.Length; i++) tri.Add($"{words[i]} {words[i + 1]} {words[i + 2]}");
+                    double uniqueRatio = (double)tri.Distinct().Count() / tri.Count;
+                    Console.WriteLine($"[{tag}] words={words.Length} uniqueTrigramRatio={uniqueRatio:F2}");
+                    if (uniqueRatio < 0.5)
+                        throw new Exception($"[{tag}] degenerate output (unique-trigram ratio {uniqueRatio:F2} < 0.5) " +
+                            $"- coherent-generation gate failed. Answer: '{answer.Trim()}'");
+                }
             }
         }
         catch (UnsupportedTestException) { throw; }
