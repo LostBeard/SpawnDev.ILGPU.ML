@@ -254,6 +254,34 @@ public static class GGUFGraphBuilder
                 AddLinear(graph, model, weights, $"{pfx}.attn_v", normOut, vOut, quantizedBytes, transposeOnUpload, lowPBytes);
             string vSrc = hasV ? vOut : kOut;
 
+            // ── Qwen3-Next (arch qwen35) GATED full-attention: attn_q is DOUBLE-width per head
+            //    ([query(hd) | gate(hd)], 2*nHeads*hd). Split off the gate; the query feeds the normal
+            //    attention path, and the merged attention output is later × sigmoid(gate) before attn_output
+            //    (HF Qwen3NextAttention: attn_output * torch.sigmoid(gate)). numpy-ref verified.
+            string qForAttn = qOut;
+            string? qwen35GateFlat = null;
+            if (arch == "qwen35")
+            {
+                string qg4d = $"{pfx}_qg_4d";        // [1,seq,nHeads,2*hd]
+                AddNode(graph, "Reshape", new[] { qOut }, new[] { qg4d },
+                    Attrs("shape", new long[] { 1, -1, (long)nHeads, 2L * hd }));
+                string query4d = $"{pfx}_q_split", gate4d = $"{pfx}_gate_split";
+                AddNode(graph, "Split", new[] { qg4d }, new[] { query4d, gate4d },
+                    new Dictionary<string, JsonElement>
+                    {
+                        ["axis"] = JsonSerializer.SerializeToElement(3L),
+                        ["split"] = JsonSerializer.SerializeToElement(new long[] { hd, hd }),
+                    });
+                // Flatten query back to [1,seq,nHeads*hd] (EmitAttnHead reshapes it to [1,-1,heads,hd]).
+                qForAttn = $"{pfx}_q_flat";
+                AddNode(graph, "Reshape", new[] { query4d }, new[] { qForAttn },
+                    Attrs("shape", new long[] { 1, -1, (long)(nHeads * hd) }));
+                // Gate flattened head-major to [1,seq,nHeads*hd] to match the merged attention layout.
+                qwen35GateFlat = $"{pfx}_gate_flat";
+                AddNode(graph, "Reshape", new[] { gate4d }, new[] { qwen35GateFlat },
+                    Attrs("shape", new long[] { 1, -1, (long)(nHeads * hd) }));
+            }
+
             // gemma4-style attention is signalled by the QK-norm tensors. When present we ALSO apply the
             // weightless V RMS-norm and (global layers) the rope_freqs NTK factors — all gemma4 behaviors.
             // Absent (llama/mistral/gemma2/...) = standard attention: no QK-norm, no V-norm.
@@ -277,7 +305,7 @@ public static class GGUFGraphBuilder
             // Q/K/V: reshape → (QK-norm/weightless-norm) → (RoPE) — ALL drop their PRE-attention transpose now
             // (steps 2+3): FusedAttention reads Q/K/V seq-major (seq_major_q/seq_major_kv below), and the decode
             // KV-cache store is seq-major. RoPE still runs on the pre-transpose [1,seq,heads,hd] layout.
-            string qReshaped = EmitAttnHead(graph, model, weights, pfx, "q", qOut, nHeads, hd, cfg,
+            string qReshaped = EmitAttnHead(graph, model, weights, pfx, "q", qForAttn, nHeads, hd, cfg,
                 gemmaAttn ? $"{pfx}.attn_q_norm" : null, freqFactors, doRope: true, weightlessNorm: false,
                 skipTranspose: true);
             string kReshaped = EmitAttnHead(graph, model, weights, pfx, "k", kOut, cfg.NKVHeads, hd, cfg,
@@ -356,15 +384,31 @@ public static class GGUFGraphBuilder
             AddNode(graph, "Reshape", new[] { attnValues }, new[] { attnMerged },
                 Attrs("shape", new long[] { 1, -1, (long)(nHeads * hd) }));
 
+            // Qwen3-Next gated attention: attn_output_in = merged × sigmoid(gate) (HF: attn_output *
+            // torch.sigmoid(gate)). Applied AFTER head-merge, BEFORE the output projection (numpy-ref order).
+            if (qwen35GateFlat != null)
+            {
+                string sigGate = $"{pfx}_gate_sig";
+                AddNode(graph, "Sigmoid", new[] { qwen35GateFlat }, new[] { sigGate });
+                string gated = $"{pfx}_attn_gated";
+                AddNode(graph, "Mul", new[] { attnMerged, sigGate }, new[] { gated });
+                attnMerged = gated;
+            }
+
             // ── Output projection ── (gpt-oss names it attn_out; llama/gemma/etc. use attn_output)
             string attnOut = $"{pfx}_attn_out";
             string attnOutPrefix = FindTensor(model, $"{pfx}.attn_output.weight") != null ? $"{pfx}.attn_output" : $"{pfx}.attn_out";
             AddLinear(graph, model, weights, attnOutPrefix, attnMerged, attnOut, quantizedBytes, transposeOnUpload, lowPBytes);
 
             // ── Post-attention norm (gemma 2/3/4 norm-sandwich: normalize the sublayer OUTPUT before the
-            //    residual add). Presence-based — llama/mistral/etc. have no such tensor and are unaffected. ──
+            //    residual add). ONLY a real sandwich when a SEPARATE ffn_norm also exists (gemma has both).
+            //    qwen3-next (qwen35) has post_attention_norm but NO ffn_norm — there post_attention_norm is
+            //    the pre-FFN norm (applied to the residual below), NOT an attn-output sandwich. llama/mistral
+            //    have neither and are unaffected. ──
             attnResInput = attnOut;
-            if (FindTensor(model, $"{pfx}.post_attention_norm.weight") != null)
+            bool attnOutputSandwich = FindTensor(model, $"{pfx}.post_attention_norm.weight") != null
+                                      && FindTensor(model, $"{pfx}.ffn_norm.weight") != null;
+            if (attnOutputSandwich)
             {
                 string postAttnOut = $"{pfx}_post_attn_norm";
                 AddNorm(graph, model, weights, $"{pfx}.post_attention_norm", attnOut, postAttnOut, embedDim, useRMSNorm);
@@ -381,8 +425,14 @@ public static class GGUFGraphBuilder
             // fed by post_attention_norm) — keep it unfused so the sandwich semantics are explicit + verified.
             string residual1 = $"{pfx}_res1";
             string ffnNormOut = $"{pfx}_ffn_norm";
-            bool hasNormSandwich = FindTensor(model, $"{pfx}.post_attention_norm.weight") != null;
-            var ffnNormW = (useRMSNorm && !hasNormSandwich) ? FindTensor(model, $"{pfx}.ffn_norm.weight") : null;
+            // The pre-FFN norm tensor: ffn_norm when present, else post_attention_norm (qwen3-next/qwen35 uses
+            // post_attention_norm AS the pre-FFN norm - it has no separate ffn_norm). gemma has BOTH: its
+            // post_attention_norm is the attn-output sandwich (applied above) and ffn_norm is the pre-FFN norm.
+            bool hasFfnNorm = FindTensor(model, $"{pfx}.ffn_norm.weight") != null;
+            string ffnNormPrefix = hasFfnNorm ? $"{pfx}.ffn_norm" : $"{pfx}.post_attention_norm";
+            // Keep the residual Add UNFUSED only for the true gemma sandwich (so its wiring stays explicit).
+            bool gemmaSandwich = hasFfnNorm && FindTensor(model, $"{pfx}.post_attention_norm.weight") != null;
+            var ffnNormW = (useRMSNorm && !gemmaSandwich) ? FindTensor(model, $"{ffnNormPrefix}.weight") : null;
             if (ffnNormW != null)
             {
                 ExtractWeight(model, ffnNormW, weights);
@@ -394,7 +444,7 @@ public static class GGUFGraphBuilder
             else
             {
                 AddNode(graph, "Add", new[] { layerIn, attnResInput }, new[] { residual1 });
-                AddNorm(graph, model, weights, $"{pfx}.ffn_norm", residual1, ffnNormOut, embedDim, useRMSNorm);
+                AddNorm(graph, model, weights, ffnNormPrefix, residual1, ffnNormOut, embedDim, useRMSNorm);
             }
 
             // ── FFN: dense gate/up → activation → down, OR a Mixture-of-Experts block when the model carries
