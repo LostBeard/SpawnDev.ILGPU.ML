@@ -2,6 +2,22 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-preview.14 (2026-07-15)
+
+### 🚀 Three new GGUF LLM architectures: qwen3, LFM2, qwen3.5 (Qwen3-Next)
+
+- **qwen3** — standard transformer arch (adds the `useRMSNorm` path). Verified against the 14B on desktop.
+- **LFM2** — ShortConv hybrid + a conv-state cache for O(1) KV-decode (short-conv history carried across
+  decode-step boundaries). Token-identical full-recompute-prefill vs KV-decode on CUDA/OpenCL.
+- **qwen3.5 (Qwen3-Next, GGUF arch `qwen35`)** — Gated DeltaNet linear-attention (24 layers) + gated
+  full-attention (8 layers). The C# `GatedDeltaNet` op is **bit-exact to an independent numpy reference**;
+  the full model predicts " Paris" for "The capital of France is" with the residual stream bit-exact to
+  numpy through the first four layers on CUDA. Implemented via three delta-rule fixes (k-head→v-head map
+  `hv % num_k_heads` per `ggml_repeat`'s tile semantics; query pre-scaled by `1/sqrt(head_k_dim)`; `ssm_a`
+  used directly since the GGUF tensor is already `-exp(A_log)`), the gated full-attention wiring
+  (`attn_q` `[query|gate]` split + `× sigmoid(gate)`), and the qwen35 norm topology (`post_attention_norm`
+  is the pre-FFN norm — qwen35 has no `ffn_norm` — not a gemma attn-output sandwich).
+
 ## 4.0.0-preview.13 (2026-07-12)
 
 ### 🚀 SD-Turbo VAE decode: full-res GPU-resident (removes the .NET-tiling copies) + GPU RGBA pack
