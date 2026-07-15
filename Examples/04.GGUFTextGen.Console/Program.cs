@@ -871,7 +871,9 @@ async Task<int> RunAsync(string path, int[] ids)
         SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeInfo = new();
         // 40000 covers the widest layer-0/1 tensor (sc_bcx = 5 tokens * 3*2048 = 30720) so the LAST
         // position is captured in full for numerical diff against an external (numpy) reference.
-        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureMaxElements = 40000;
+        // GGUF_CAPTURE_MAX overrides it (qwen35 gdn_qkv = 5*8192 = 40960 needs a bigger cap).
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureMaxElements =
+            int.TryParse(Environment.GetEnvironmentVariable("GGUF_CAPTURE_MAX"), out var cmax) && cmax > 0 ? cmax : 40000;
     }
 
     sw.Restart();

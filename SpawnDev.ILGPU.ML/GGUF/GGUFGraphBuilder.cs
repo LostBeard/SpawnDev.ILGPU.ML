@@ -187,6 +187,52 @@ public static class GGUFGraphBuilder
                 AddLinear(graph, model, weights, $"{pfx}.shortconv.out_proj", convY, scOut, quantizedBytes, transposeOnUpload, lowPBytes);
                 attnResInput = scOut;
             }
+            else if (FindTensor(model, $"{pfx}.attn_qkv.weight") != null)
+            {
+                // ── Qwen3-Next Gated DeltaNet (linear-attention) mixer ── the 24 non-full-attn layers of arch
+                // qwen35. Projections are graph MatMul nodes; the GatedDeltaNet node does conv+SiLU / L2norm /
+                // delta-rule scan / gated-RMSNorm. Dims from ssm.* metadata (group_count=num_k_heads,
+                // state_size=head dim, inner_size/state_size=num_v_heads).
+                int gdnKHeads = (int)model.GetMetadataInt($"{arch}.ssm.group_count", 16);
+                int gdnHeadDim = (int)model.GetMetadataInt($"{arch}.ssm.state_size", 128);
+                int gdnInner = (int)model.GetMetadataInt($"{arch}.ssm.inner_size", 4096);
+                int gdnVHeads = gdnHeadDim > 0 ? gdnInner / gdnHeadDim : 32;
+
+                string qkv = $"{pfx}_gdn_qkv", zGate = $"{pfx}_gdn_z", aProj = $"{pfx}_gdn_a", bProj = $"{pfx}_gdn_b";
+                AddLinear(graph, model, weights, $"{pfx}.attn_qkv", normOut, qkv, quantizedBytes, transposeOnUpload, lowPBytes);
+                AddLinear(graph, model, weights, $"{pfx}.attn_gate", normOut, zGate, quantizedBytes, transposeOnUpload, lowPBytes);
+                AddLinear(graph, model, weights, $"{pfx}.ssm_alpha", normOut, aProj, quantizedBytes, transposeOnUpload, lowPBytes);
+                AddLinear(graph, model, weights, $"{pfx}.ssm_beta", normOut, bProj, quantizedBytes, transposeOnUpload, lowPBytes);
+
+                // Raw F32 side tensors (conv weight + per-head A_log/dt_bias + the gated-norm weight).
+                string RawTensor(string name)
+                {
+                    var t = FindTensor(model, name)!;
+                    if (!weights.ContainsKey(t.Name)) { ExtractWeight(model, t, weights); graph.Initializers[t.Name] = t.Shape; }
+                    return t.Name;
+                }
+                string convWName = RawTensor($"{pfx}.ssm_conv1d.weight");
+                string ssmAName = RawTensor($"{pfx}.ssm_a");
+                string ssmDtName = RawTensor($"{pfx}.ssm_dt");
+                string ssmNormName = RawTensor($"{pfx}.ssm_norm.weight");
+
+                string gdnOut = $"{pfx}_gdn_out";
+                var gdnAttrs = new Dictionary<string, JsonElement>
+                {
+                    ["num_k_heads"] = JsonSerializer.SerializeToElement((long)gdnKHeads),
+                    ["head_k_dim"] = JsonSerializer.SerializeToElement((long)gdnHeadDim),
+                    ["num_v_heads"] = JsonSerializer.SerializeToElement((long)gdnVHeads),
+                    ["head_v_dim"] = JsonSerializer.SerializeToElement((long)gdnHeadDim),
+                    ["layer"] = JsonSerializer.SerializeToElement((long)layer),
+                };
+                AddNode(graph, "GatedDeltaNet",
+                    new[] { qkv, zGate, aProj, bProj, convWName, ssmAName, ssmDtName, ssmNormName },
+                    new[] { gdnOut }, gdnAttrs);
+
+                string gdnScOut = $"{pfx}_gdn_scout";
+                AddLinear(graph, model, weights, $"{pfx}.ssm_out", gdnOut, gdnScOut, quantizedBytes, transposeOnUpload, lowPBytes);
+                attnResInput = gdnScOut;
+            }
             else
             {
             // ── Per-layer attention geometry ──
