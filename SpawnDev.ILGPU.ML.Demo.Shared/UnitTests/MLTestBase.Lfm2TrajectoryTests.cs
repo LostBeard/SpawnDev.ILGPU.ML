@@ -457,8 +457,11 @@ public abstract partial class MLTestBase
                 // (a pressure/accumulation effect, not per-step math). Go to 48. capElems drops to 256 to keep
                 // 48 snapshots x ~200 nodes in the browser heap (~10MB); a real divergence perturbs far more
                 // than the first 256 elements of a node.
-                const int steps = 48, capElems = 256;
+                const int steps = 48, capElems = 256;   // KV len 17+48=65 - the MEASURED failing depth on WebGL (47 => 64 passes)
                 SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetReclaimTrace();
+
+                // (Elide was falsified as a cause here - WebGL stayed red with ShapeInterpElideDispatch=false,
+                // byte-identical values. Left ON, as in production.)
 
                 async Task<(List<Dictionary<string, float[]>> Snaps, string Text)> RunCapturing()
                 {
