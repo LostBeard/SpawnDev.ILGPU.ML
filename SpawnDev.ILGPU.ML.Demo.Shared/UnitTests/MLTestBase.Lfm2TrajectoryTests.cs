@@ -398,6 +398,104 @@ public abstract partial class MLTestBase
         finally { await client.DisposeAsync(); }
     });
 
+    /// <summary>
+    /// The probe that covers the path the pipeline ACTUALLY runs: two identical DECODE-path prefills, bit-diffed
+    /// per node.
+    ///
+    /// `MaxNewTokens = 1` means only step 0 runs, and step 0 IS the prefill (GgufGenerator feeds the whole
+    /// prompt as stepIds at pastLen=0 and samples the first token from its logits). Unlike
+    /// Lfm2Trajectory_TwoIdenticalForwards (RunAsync / full-recompute, which never touches the state cache),
+    /// this goes through RunDecodeStepAsync + ShortConvStateCache - and it uses the PIPELINE's own KV/conv
+    /// setup, so no geometry is hand-rolled here.
+    ///
+    /// The open WebGL bug diverges at char 0 = the first generated token = exactly this step's logits. If two
+    /// of these differ on WebGL, the defect is in the decode-path prefill / conv-state update there; if they
+    /// match, the divergence is later (the decode steps) and the state carry-over is the suspect.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Lfm2DecodePrefill_TwoIdenticalRuns_AreReproducible()
+        => await Lfm2DecodePrefillRepro(maxNewTokens: 1);
+
+    /// <summary>
+    /// The SAME probe but with a real 48-token generation between the two captures - which is the scenario that
+    /// actually fails on WebGL.
+    ///
+    /// The pair is the whole point (2026-07-16): at MaxNewTokens=1 two runs are bit-identical on WebGL, at 48
+    /// they diverge at the FIRST token - yet both runs do a full prefill (P=0, guard-vetoed reuse) and prefill
+    /// at pastLen=0 never reads the conv state. The ONLY difference is that run 1 executed 47 DECODE steps
+    /// before run 2's prefill. So something the decode steps leave behind poisons the next generation's prefill
+    /// on WebGL, and this names the node. (CapturedOutputs is keyed per node, so after N steps it holds the LAST
+    /// step's values - which is exactly what we want to compare between the two runs.)
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Lfm2DecodeGeneration_TwoIdenticalRuns_AreReproducible()
+        => await Lfm2DecodePrefillRepro(maxNewTokens: 48);
+
+    private async Task Lfm2DecodePrefillRepro(int maxNewTokens) => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
+            var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
+
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+            {
+                var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
+                var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" };
+
+                async Task<Dictionary<string, float[]>> PrefillCapture()
+                {
+                    GraphExecutor.CapturedOutputs = new();
+                    GraphExecutor.CapturedNodeInfo = new();
+                    GraphExecutor.CaptureMaxElements = 40000;
+                    try
+                    {
+                        await pipe.GenerateAsync(msgs, config: cfg, ct: cts.Token);   // maxNewTokens=1 => step 0 only = the prefill
+                        await accelerator.SynchronizeAsync();
+                        return new Dictionary<string, float[]>(GraphExecutor.CapturedOutputs!);
+                    }
+                    finally
+                    {
+                        GraphExecutor.CapturedOutputs = null;
+                        GraphExecutor.CapturedNodeInfo = null;
+                        GraphExecutor.CaptureMaxElements = 1024;
+                    }
+                }
+
+                var a = await PrefillCapture();
+                var b = await PrefillCapture();
+                Console.WriteLine($"[LFM2-prefill-repro] maxNewTokens={maxNewTokens} nodes={a.Count} reusedPrefix(run B)={pipe.LastReusedPrefix}");
+
+                foreach (var key in a.Keys)
+                {
+                    if (!b.TryGetValue(key, out var vb)) throw new Exception($"[LFM2-prefill-repro] node {key} missing from run B");
+                    var va = a[key];
+                    if (va.Length != vb.Length) throw new Exception($"[LFM2-prefill-repro] node {key} length {va.Length} vs {vb.Length}");
+                    for (int i = 0; i < va.Length; i++)
+                        if (va[i] != vb[i])
+                            throw new Exception($"[{accelerator.AcceleratorType}] [LFM2-prefill-repro] two identical " +
+                                $"DECODE-PATH prefills differ - FIRST divergent node {key} at element {i}: {va[i]} vs {vb[i]} " +
+                                $"(reusedPrefix run B = {pipe.LastReusedPrefix}). This is the step that produces the first " +
+                                "token, which is where the WebGL same-prompt-twice divergence starts.");
+                }
+                Console.WriteLine($"[LFM2-prefill-repro] {accelerator.AcceleratorType}: {a.Count} nodes bit-identical across two decode-path prefills.");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"[LFM2-prefill-repro] hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
+
     [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
     public async Task Lfm2Trajectory_MatchesCudaGolden() => await RunTest(async accelerator =>
     {
