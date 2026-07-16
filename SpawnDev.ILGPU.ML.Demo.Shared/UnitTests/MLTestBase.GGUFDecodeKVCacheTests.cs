@@ -21,6 +21,93 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 public partial class MLTestBase
 {
+    /// <summary>
+    /// The KV PACK path's missing correctness gate: a sequence long enough to CROSS the pack's grow-only
+    /// capacity boundary, checked against full-recompute.
+    ///
+    /// Why this was missing (2026-07-16): `GGUFDecodeKVCache.EnsurePackCapacity`/`EnsureBf16Scratch` seed at
+    /// `Math.Min(64, maxSeqLen)` and double. Every existing decode gate uses ctx=64 with a 4-6 token sequence,
+    /// so the capacity NEVER grows and the post-growth path was untested. It matters because the pack is the
+    /// **WebGL+BF16-only** route (GraphExecutor.cs:2597 `stridedOk`) - every other backend feeds FusedAttention
+    /// the strided store and never runs this code. Measured on the real LFM2: two identical generations agree
+    /// while the pack capacity matches (both 64, both 256, both 4096) and DISAGREE when they differ (64 vs 128,
+    /// i.e. after a growth) - so the buffer's CAPACITY is leaking into the result, which it must not (the live
+    /// region is contiguous at offset 0 and PackedAsync returns SubView(0, live)).
+    ///
+    /// That evidence came from an A==B probe, which proves CONSISTENCY, not correctness - both runs can agree
+    /// and both be wrong. THIS test is the correctness oracle: full-recompute is the reference, so if the pack
+    /// path is wrong after a growth it fails here regardless of self-consistency. seqLen=70 > 64 forces exactly
+    /// one growth (64 -> 128) mid-sequence.
+    /// </summary>
+    [TestMethod(Timeout = 600000)]
+    public async Task GGUFDecodeKVCache_BF16_AcrossPackGrowth_MatchesFullRecompute() => await RunTest(async accelerator =>
+    {
+        const int embd = 256, vocab = 32, ffn = 320, ctx = 256, seqLen = 70;   // 70 > 64 => one pack growth
+        var bytes = BuildTinyQuantizedLlamaGGUF(embd, vocab, ffn, ctx, new Random(9));
+        var model = GGUFParser.Parse(bytes);
+
+        int nLayers = (int)model.BlockCount, nHeads = (int)model.AttentionHeadCount;
+        int defNKV = (int)model.AttentionHeadCountKV; if (defNKV == 0) defNKV = nHeads;
+        int defHd = embd / nHeads;
+        var kvHeadsArr = new int[nLayers]; var hdArr = new int[nLayers];
+        for (int L = 0; L < nLayers; L++)
+        { var cfg = GGUFGraphBuilder.GetLayerAttnConfig(model, L, nHeads, defNKV, defHd); kvHeadsArr[L] = cfg.NKVHeads; hdArr[L] = cfg.HeadDim; }
+
+        var rng = new Random(11);
+        var seq = new float[seqLen];
+        for (int i = 0; i < seqLen; i++) seq[i] = rng.Next(0, vocab);
+
+        // Reference: ONE full-recompute forward over the whole sequence.
+        using var session = InferenceSession.CreateFromGGUF(accelerator, bytes);
+        using var inFull = accelerator.Allocate1D(seq);
+        var outFull = await session.RunAsync(new Dictionary<string, Tensor>
+        { ["input_ids"] = new Tensor(inFull.View, new[] { 1, seqLen }, "input_ids") });
+        var logitsFullT = outFull.TryGetValue("logits", out var lf) ? lf : outFull.Values.First();
+        using var readFull = accelerator.Allocate1D<float>(seqLen * vocab);
+        await readFull.View.CopyFromAsync(logitsFullT.Data.SubView(0, seqLen * vocab));
+        await accelerator.SynchronizeAsync();
+        var logitsFull = await readFull.CopyToHostAsync<float>(0, seqLen * vocab);
+
+        // BF16 (the production store precision, and the only one that takes the WebGL pack path).
+        using var kv = new GGUFDecodeKVCache(accelerator, kvHeadsArr, hdArr, maxSeqLen: ctx, precision: KVCachePrecision.BF16);
+        session.EnableGGUFDecode(kv);
+        try
+        {
+            for (int pos = 0; pos < seqLen; pos++)
+            {
+                using var inTok = accelerator.Allocate1D(new[] { seq[pos] });
+                var outStep = await session.RunDecodeStepAsync(new Dictionary<string, Tensor>
+                { ["input_ids"] = new Tensor(inTok.View, new[] { 1, 1 }, "input_ids") });
+                var stepT = outStep.TryGetValue("logits", out var ls) ? ls : outStep.Values.First();
+                using var readStep = accelerator.Allocate1D<float>(vocab);
+                await readStep.View.CopyFromAsync(stepT.Data.SubView(0, vocab));
+                await accelerator.SynchronizeAsync();
+                var stepLogits = await readStep.CopyToHostAsync<float>(0, vocab);
+
+                int argFull = 0, argKV = 0;
+                for (int v = 1; v < vocab; v++)
+                {
+                    if (logitsFull[pos * vocab + v] > logitsFull[pos * vocab + argFull]) argFull = v;
+                    if (stepLogits[v] > stepLogits[argKV]) argKV = v;
+                }
+                if (argFull != argKV)
+                    throw new Exception($"[pack-growth] step {pos} (KV len {pos + 1}{(pos + 1 == 65 ? " - FIRST STEP PAST THE 64-TOKEN PACK SEED" : "")}): " +
+                        $"decode argmax {argKV} != full-recompute argmax {argFull}. The pack path is WRONG after its " +
+                        "grow-only capacity doubled (WebGL+BF16 is the only backend that runs it).");
+                // ARGMAX-ONLY is the gate for BF16, deliberately. My first cut also checked logits at 6% and
+                // failed at step 1 (KV len 2) on EVERY backend incl. CUDA - which cannot be the pack path, since
+                // CUDA never runs it. That was bf16 STORE rounding on a random-weight model whose logits are
+                // ~127: 0.4%/value compounds through attention past a 6% band. I had set the tolerance from an
+                // assumption instead of from the data. The existing suite says the same thing: for BF16 "argmax
+                // must still match EXACTLY (the real gate)". A capacity leak / layout bug causes GROSS
+                // divergence (the real LFM2 symptom is attention returning exactly 0), which flips argmax far
+                // outside any rounding - so argmax cannot hide one, and a tight logit band only produces noise.
+            }
+            Console.WriteLine($"[pack-growth] decode == full-recompute for all {seqLen} positions across the 64->128 pack growth.");
+        }
+        finally { session.DisableGGUFDecode(); }
+    });
+
     [TestMethod]
     public async Task GGUFDecodeKVCache_IncrementalMatchesFullRecompute() => await RunTest(async accelerator =>
     {
