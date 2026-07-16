@@ -29,6 +29,10 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 public abstract partial class MLTestBase
 {
+    /// <summary>LFM2-1.2B hidden width (lfm2.embedding_length). Used to reshape a captured [seq, hdim] node so a
+    /// divergence can be attributed per ROW (= per token).</summary>
+    private const int Lfm2Hdim = 2048;
+
     // 96 tokens: id 1 = LFM2's <|startoftext|> BOS, then a deterministic spread of valid ids. Length matters -
     // the demo prefills ~100 tokens (its system prompt alone is ~90), and a shape-dependent codegen defect is
     // invisible at seq=5. Must match the ids the golden was captured with:
@@ -417,19 +421,119 @@ public abstract partial class MLTestBase
         => await Lfm2DecodePrefillRepro(maxNewTokens: 1);
 
     /// <summary>
-    /// The SAME probe but with a real 48-token generation between the two captures - which is the scenario that
-    /// actually fails on WebGL.
+    /// PER-STEP localization: run the same greedy generation TWICE and snapshot the whole per-node trajectory
+    /// after EVERY decode step, then report the first (step, node) that differs.
     ///
-    /// The pair is the whole point (2026-07-16): at MaxNewTokens=1 two runs are bit-identical on WebGL, at 48
-    /// they diverge at the FIRST token - yet both runs do a full prefill (P=0, guard-vetoed reuse) and prefill
-    /// at pastLen=0 never reads the conv state. The ONLY difference is that run 1 executed 47 DECODE steps
-    /// before run 2's prefill. So something the decode steps leave behind poisons the next generation's prefill
-    /// on WebGL, and this names the node. (CapturedOutputs is keyed per node, so after N steps it holds the LAST
-    /// step's values - which is exactly what we want to compare between the two runs.)
+    /// Why not the cheap version (2026-07-16 - I ran it and misread it): `CapturedOutputs` is keyed per NODE, so
+    /// after N steps it holds only the LAST step's values. Comparing that between two runs at N=48 reported
+    /// "FIRST divergent node 000_Gather_embed_out, 2046/2048 elements, rows=1" - which looks like a corrupted
+    /// embedding table but is just CIRCULAR: by step 48 the two runs had already diverged, so the last step fed
+    /// a DIFFERENT TOKEN into the gather. rows=1 (not the 17-token prompt) is the tell. embed_out was downstream
+    /// of the divergence, not its cause.
+    ///
+    /// Known: prefill (MaxNewTokens=1) is bit-identical on WebGL, and at 48 the answers differ ⇒ the divergence
+    /// STARTS at some decode step k>0. This finds k and the node. If `embed_out` is identical at step k but a
+    /// later node differs, that node is the real defect (the input token was the same, so it is not circular).
     /// </summary>
-    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
-    public async Task Lfm2DecodeGeneration_TwoIdenticalRuns_AreReproducible()
-        => await Lfm2DecodePrefillRepro(maxNewTokens: 48);
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Lfm2Decode_PerStep_TwoIdenticalRuns_AreReproducible() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(20));
+            var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
+
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+            {
+                var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
+                // Depth matters and is measured, not guessed: 1 step and 12 steps are BOTH bit-identical on
+                // WebGL, while the 48-token answers differ - so the divergence needs tens of steps to appear
+                // (a pressure/accumulation effect, not per-step math). Go to 48. capElems drops to 256 to keep
+                // 48 snapshots x ~200 nodes in the browser heap (~10MB); a real divergence perturbs far more
+                // than the first 256 elements of a node.
+                const int steps = 48, capElems = 256;
+                SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetReclaimTrace();
+
+                async Task<(List<Dictionary<string, float[]>> Snaps, string Text)> RunCapturing()
+                {
+                    var snaps = new List<Dictionary<string, float[]>>();
+                    GraphExecutor.CapturedOutputs = new();
+                    GraphExecutor.CapturedNodeInfo = new();
+                    GraphExecutor.CaptureMaxElements = capElems;
+                    try
+                    {
+                        var text = await pipe.GenerateAsync(msgs,
+                            config: new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = steps, Strategy = "greedy" },
+                            onToken: (_, _) =>
+                            {
+                                // Snapshot the trajectory as it stands at the end of THIS step, then clear so the
+                                // next step's snapshot is that step's own nodes.
+                                snaps.Add(new Dictionary<string, float[]>(GraphExecutor.CapturedOutputs!));
+                                GraphExecutor.CapturedOutputs!.Clear();
+                                return Task.CompletedTask;
+                            }, ct: cts.Token);
+                        await accelerator.SynchronizeAsync();
+                        return (snaps, text);
+                    }
+                    finally
+                    {
+                        GraphExecutor.CapturedOutputs = null;
+                        GraphExecutor.CapturedNodeInfo = null;
+                        GraphExecutor.CaptureMaxElements = 1024;
+                    }
+                }
+
+                var (sa, ta) = await RunCapturing();
+                var (sb, tb) = await RunCapturing();
+                Console.WriteLine($"[LFM2-perstep] steps captured A={sa.Count} B={sb.Count} | reclaimFires=" +
+                    $"{SpawnDev.ILGPU.ML.Tensors.BufferPool.ReclaimFireCount} freed={SpawnDev.ILGPU.ML.Tensors.BufferPool.ReclaimFreedBytes}");
+                if (ta == tb)
+                {
+                    Console.WriteLine($"[LFM2-perstep] {accelerator.AcceleratorType}: both runs produced identical text; trajectories:");
+                }
+
+                for (int s = 0; s < Math.Min(sa.Count, sb.Count); s++)
+                {
+                    foreach (var key in sa[s].Keys)
+                    {
+                        if (!sb[s].TryGetValue(key, out var vb)) continue;
+                        var va = sa[s][key];
+                        if (va.Length != vb.Length) continue;
+                        int first = -1, nDiff = 0;
+                        for (int i = 0; i < va.Length; i++) if (va[i] != vb[i]) { if (first < 0) first = i; nDiff++; }
+                        if (first < 0) continue;
+                        bool embedSame = !sa[s].ContainsKey("000_Gather_embed_out")
+                            || sa[s]["000_Gather_embed_out"].SequenceEqual(sb[s]["000_Gather_embed_out"]);
+                        throw new Exception($"[{accelerator.AcceleratorType}] [LFM2-perstep] first divergence at DECODE " +
+                            $"STEP {s}, node {key}: {nDiff}/{va.Length} elements differ, first at {first} " +
+                            $"({va[first]} vs {vb[first]}).\n  embed_out identical at this step: {embedSame} " +
+                            $"(TRUE => same input token => this node is the REAL defect, not circular).\n" +
+                            $"  pool reclaim fires={SpawnDev.ILGPU.ML.Tensors.BufferPool.ReclaimFireCount} " +
+                            $"freed={SpawnDev.ILGPU.ML.Tensors.BufferPool.ReclaimFreedBytes} bytes (0 => reclaim exonerated)." +
+                            $"\n  textA='{ta.Trim()}'\n  textB='{tb.Trim()}'");
+                    }
+                }
+                if (ta != tb)
+                    throw new Exception($"[{accelerator.AcceleratorType}] [LFM2-perstep] the two runs produced DIFFERENT " +
+                        $"text but every captured node matched at every step - the divergence is in something NOT captured " +
+                        $"(sampling/argmax readback?).\n  textA='{ta.Trim()}'\n  textB='{tb.Trim()}'");
+                Console.WriteLine($"[LFM2-perstep] {accelerator.AcceleratorType}: {sa.Count} steps bit-identical across two runs.");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"[LFM2-perstep] hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
 
     private async Task Lfm2DecodePrefillRepro(int maxNewTokens) => await RunTest(async accelerator =>
     {
@@ -448,6 +552,12 @@ public abstract partial class MLTestBase
             {
                 var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
                 var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = maxNewTokens, Strategy = "greedy" };
+
+                // Under-pressure pool RECLAIM is the other candidate for a corrupted read, and it is the exact
+                // class of the 2026-07-06 SD-Turbo node-256 bug (reclaim disposed a buffer a pending dispatch
+                // still referenced). It is directly observable, so measure instead of theorising: if reclaim
+                // never fires during these runs it is exonerated; if it fires, it is the prime suspect.
+                SpawnDev.ILGPU.ML.Tensors.BufferPool.ResetReclaimTrace();
 
                 async Task<Dictionary<string, float[]>> PrefillCapture()
                 {
@@ -477,12 +587,39 @@ public abstract partial class MLTestBase
                     if (!b.TryGetValue(key, out var vb)) throw new Exception($"[LFM2-prefill-repro] node {key} missing from run B");
                     var va = a[key];
                     if (va.Length != vb.Length) throw new Exception($"[LFM2-prefill-repro] node {key} length {va.Length} vs {vb.Length}");
+
+                    int first = -1, nDiff = 0;
                     for (int i = 0; i < va.Length; i++)
-                        if (va[i] != vb[i])
-                            throw new Exception($"[{accelerator.AcceleratorType}] [LFM2-prefill-repro] two identical " +
-                                $"DECODE-PATH prefills differ - FIRST divergent node {key} at element {i}: {va[i]} vs {vb[i]} " +
-                                $"(reusedPrefix run B = {pipe.LastReusedPrefix}). This is the step that produces the first " +
-                                "token, which is where the WebGL same-prompt-twice divergence starts.");
+                        if (va[i] != vb[i]) { if (first < 0) first = i; nDiff++; }
+                    if (first < 0) continue;
+
+                    // CHARACTERIZE the divergence - the SHAPE says which input the node read wrong, which is a
+                    // different bug in each case. embed_out is [seq, hdim]:
+                    //   one whole row differs  -> that token's INDEX was wrong (input_ids read as garbage)
+                    //   every row differs      -> the WEIGHT table itself is corrupted
+                    //   scattered elements     -> partial/torn read of one of them
+                    int hdim = Lfm2Hdim;
+                    int rows = hdim > 0 ? va.Length / hdim : 0;
+                    string shape = "";
+                    if (key.EndsWith("embed_out") && rows > 0 && va.Length % hdim == 0)
+                    {
+                        var rowDiff = new int[rows];
+                        for (int r = 0; r < rows; r++)
+                            for (int c = 0; c < hdim; c++)
+                                if (va[r * hdim + c] != vb[r * hdim + c]) rowDiff[r]++;
+                        int fullRows = rowDiff.Count(d => d == hdim), partRows = rowDiff.Count(d => d > 0 && d < hdim);
+                        shape = $"\n  shape: rows={rows} hdim={hdim} | fully-different rows={fullRows} " +
+                                $"partially-different rows={partRows} | per-row diffs=[{string.Join(",", rowDiff.Take(24))}]" +
+                                $"\n  => all rows different = corrupted WEIGHT table; one/few whole rows = wrong INDEX " +
+                                $"(input_ids freed/garbage); scattered = torn read.";
+                    }
+                    throw new Exception($"[{accelerator.AcceleratorType}] [LFM2-prefill-repro] two identical DECODE-PATH " +
+                        $"runs differ - FIRST divergent node {key}: {nDiff}/{va.Length} elements differ, first at {first} " +
+                        $"({va[first]} vs {vb[first]}); reusedPrefix run B = {pipe.LastReusedPrefix}." +
+                        $"\n  pool reclaim during these runs: fires={SpawnDev.ILGPU.ML.Tensors.BufferPool.ReclaimFireCount} " +
+                        $"freed={SpawnDev.ILGPU.ML.Tensors.BufferPool.ReclaimFreedBytes} bytes " +
+                        $"(fires=0 => reclaim EXONERATED; >0 => prime suspect, same class as the SD-Turbo node-256 bug)" +
+                        $"{shape}");
                 }
                 Console.WriteLine($"[LFM2-prefill-repro] {accelerator.AcceleratorType}: {a.Count} nodes bit-identical across two decode-path prefills.");
             }
