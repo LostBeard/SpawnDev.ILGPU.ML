@@ -2,39 +2,80 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## 4.0.0-local.1 (2026-07-16)
+## 4.0.0-preview.16 (2026-07-16)
 
-### 🐛 FIX: LFM2 token soup in the browser - WebGPU decode capture/replay vs the conv-state shift register
+### FIX: LFM2 broken output - three defects around the conv-state shift register
 
-LFM2 decoded coherently on CUDA and emitted token soup on WebGPU, through the same graph. Two defects, both
-in the **WebGPU-only** decode capture/replay path (`WebGPUDecodeCapture`), which records ONE command plan and
-re-executes it per token, patching only values affine in the decode cursor. Neither could affect CUDA/OpenCL
-(capture is WebGPU-only) or qwen/gemma (no conv state) - which is why every existing gate stayed green.
+LFM2 emitted token soup in the browser while CUDA looked fine, and returned a DIFFERENT answer to the same
+question asked twice **on every backend**. One theme runs through all of it: `ShortConvStateCache` is a
+per-step SHIFT REGISTER, while every decode fast path was written assuming the KV cache's semantics.
+`GGUFDecodeKVCache` writes row `pastLen` - position-addressed, idempotent, safe to re-run or jump the cursor
+into. The conv state is none of those: it holds the history for exactly ONE cursor and advances on every call.
+Defects 1-2 are WebGPU-only (decode capture is); defect 3 hits every backend. None can affect qwen/gemma (no
+conv state), which is why every existing gate stayed green while the demo was broken.
 
-1. **`ShortConvStateCache` ping-pong swap.** The cache swapped its state buffers each step
-   (`(Active, Alt) = (Alt, Active)`). Replay re-executes a plan with FROZEN bindings and never re-runs the C#,
-   so the swap happened exactly once (at capture) and never again: every replay read the same stale buffer and
-   the conv history FROZE at the capture step. Fix: fixed `Active`/`Scratch` bindings - the update stages into
-   `Scratch` and commits back into the SAME `Active` (still never an in-place overlapping copy). Do not
-   reintroduce a swap.
-2. **Capture's probe steps corrupted the shift register.** `TryCaptureAsync` runs the decode graph six times
-   (warm/probe/capture at P0, then again at P0+1) to discover its patch points. `GGUFDecodeKVCache` is
-   idempotent under that (it writes row `pastLen`), but the conv state is a SHIFT REGISTER that advances on
-   every call - so replay began from a six-times-corrupted history (fluent but WRONG text). Fix:
-   `ShortConvStateCache.CreateSnapshot()/RestoreSnapshot()`, applied around the probes so capture's net effect
-   is exactly the one real step it reports. The restores are issued OUTSIDE the recording window - a restore
-   made while the plan is recording gets baked INTO the plan, which pins the state forever (output collapses
-   to "the the the the").
+**1. `ShortConvStateCache` ping-pong swap vs a frozen replay plan (WebGPU).** The cache swapped its state
+buffers each step (`(Active, Alt) = (Alt, Active)`). `WebGPUDecodeCapture` records ONE command plan and
+re-executes it per token, patching only values affine in the decode cursor - the C# never runs again, so the
+swap happened once (at capture) and never after: every replay read the same stale buffer and the conv history
+FROZE at the capture step. Fix: fixed `Active`/`Scratch` bindings - stage the update into `Scratch`, commit
+back into the SAME `Active` (still never an in-place overlapping copy). Do not reintroduce a swap.
 
-**New gates** (the old ones could not fail): `GGUF_WebGPU_DecodeCapture_LongContext_Lfm2` - the captured-vs-
-direct char-exact identity gate on the ShortConv arch (the existing gates only covered qwen2.5 0.5B/1.5B);
-`MLTestBase.ShortConvTests` - CPU-oracle kernel tests at real LFM2 dims (H=2048, L=3) incl. the decode state
-path and decode-vs-full-recompute on a tiny synthetic LFM2, on every backend; `MLTestBase.Lfm2TrajectoryTests`
-- a per-node cross-backend RMS golden (96-token prefill) that names the first divergent node. The new-arch E2E
-coherence gate now actually RUNS (it required >=24 words while the only prompt asked for "one short sentence",
-so it never executed) and adds a stopword-rate check; its docstring no longer claims a pass there proves the
-arch. Verified: the LFM2 identity gate is green on WebGPU (200 tokens), qwen2.5 0.5B/1.5B identity gates
-unchanged, and the SpawnDev.AI demo answers coherently in Chrome on hardware WebGPU.
+**2. Capture's probe steps advanced the shift register (WebGPU).** `TryCaptureAsync` runs the decode graph six
+times (warm/probe/capture at P0, then again at P0+1) to discover its patch points. The KV cache is idempotent
+under that; the conv state advanced six times with a throwaway token, so replay began from a corrupted history
+(fluent but WRONG text). Fix: `CreateSnapshot()`/`RestoreSnapshot()` around the probes, so capture's net effect
+is exactly the one real step it reports. The restores are issued OUTSIDE the recording window - a restore made
+while the plan is recording gets baked INTO the plan and pins the state forever (output collapses to
+"the the the the").
+
+**3. KV-prefix reuse fed the conv layers the wrong cursor's history (ALL BACKENDS).**
+`GgufGenerator.EnablePrefixCache` is true BY DEFAULT (the demo runs it) and reuses the longest common token
+prefix P, jumps the cursor to P and prefills only the suffix - bit-identical for K/V, invalid for shortconv
+unless P is exactly the position the state describes. Measured: the same prompt twice, greedy, gave different
+answers on CUDA/WebGPU/CPU and multilingual garbage on WebGL. It fires on a new conversation without a reload
+(the system-prompt prefix still matches), an edited system prompt, or a re-ask; P matches only in the plain
+append-only case, which is why single-turn testing missed it. Fix: `ShortConvStateCache.StatePos` records the
+cursor the state describes and `GgufGenerator.ConvStateAllowsReuse` vetoes reuse (full prefill, which rebuilds
+the state) unless `P == StatePos`. Only conv-state models pay it; qwen/gemma keep full reuse.
+
+**Also (hardening - did NOT fix any known symptom).** `ShortConvStateCache.Reset()` DISPOSED its GPU buffers
+from a sync path (`ResetGGUFDecode`, which runs at the start of every full prefill) where a previous
+generation's dispatch may still reference them - the "never dispose before flush" / Wasm SharedArrayBuffer
+hazard this project documents. Reset now zeroes and KEEPS the allocations (what `ResetGGUFDecode`'s contract
+already promised, and cheaper); `Ensure` rebuilds on a geometry change; `Dispose` no longer delegates to
+`Reset` (which would have leaked every layer buffer once Reset stopped freeing).
+
+**New gates** - the old ones *could not fail*. The E2E oracle was `Contains("Paris")` on a short greedy answer,
+and a broken decode emits the strong factual association BEFORE it degenerates; the trigram coherence gate
+required >=24 words while the only prompt asked for "one short sentence", so it NEVER executed; both are
+`Category=HeavyModel` = excluded from the default sweep; the capture identity gate covered only qwen (no conv
+state) and its sampled/page-config run was a PERF benchmark whose text was discarded; and no ShortConv kernel
+test with a CPU oracle existed at all.
+- `GGUF_WebGPU_DecodeCapture_LongContext_Lfm2` - captured-vs-direct char-exact identity on the ShortConv arch.
+- `MLTestBase.ShortConvTests` - CPU-oracle kernel tests at real LFM2 dims (H=2048, L=3), the decode state path,
+  and decode-vs-full-recompute on a tiny synthetic LFM2 hybrid. All backends, seconds, no download.
+- `MLTestBase.Lfm2TrajectoryTests` - per-node cross-backend RMS golden (96-token prefill, CUDA-captured) that
+  names the FIRST divergent node, plus `Lfm2_PrefixCacheReuse_SamePromptTwice_IsIdentical` and a
+  `Qwen25_...` control (no conv state) that discriminates a conv defect from a backend-wide one.
+- The new-arch E2E coherence gate now actually runs (open-ended second generation) + a stopword-rate check, and
+  its docstring no longer claims that a pass there proves the arch.
+
+**Verified** (by driving the real path, not inferring it): LFM2 captured-vs-direct identity green on WebGPU
+(200 tokens, char-exact); same-prompt-twice green on CUDA + WebGPU + OpenCL; qwen2.5 0.5B/1.5B identity gates
+unchanged; ShortConv CPU-oracle 26/26 all backends; and the SpawnDev.AI demo answers coherently in Chrome on
+hardware WebGPU.
+
+**KNOWN OPEN - WebGL + LFM2.** On WebGL, LFM2 still returns a different answer to the same prompt twice even
+with a full prefill, and its first answer already diverges from CUDA's. This is NOT a lane flake: the qwen2.5
+control (no conv state) PASSES on WebGL, so the backend is deterministic and the defect is conv-state-specific
+there. Pre-existing (it failed the same way before these fixes). WebGL is the lowest-priority backend by
+standing rule and the demo runs WebGPU, so it does not gate this release - but it is real and unfixed. Leading
+suspect: `ShortConvKernel.Forward`/`ForwardWithState` allocate a FRESH params buffer on every call and retain
+it until Dispose (~480 buffers per 48-token generation at LFM2's 10 conv layers) - on WebGL every buffer is a
+texture, and the values are identical every step, so the churn is pure waste regardless.
+Separately, the CPU lane cannot run these 1.2B gates at all (subprocess dies; ~12s/token blows PMT's console
+cap) - a lane impracticality, not a correctness result.
 
 ## 4.0.0-preview.15 (2026-07-15)
 

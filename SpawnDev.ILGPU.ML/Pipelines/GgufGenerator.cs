@@ -64,6 +64,30 @@ public sealed class GgufGenerator : IDisposable
     /// is cheap enough that the reuse bookkeeping isn't worth it.</summary>
     private const int MinReusePrefix = 16;
 
+    /// <summary>
+    /// Veto KV-prefix reuse when the model carries per-step CONV STATE that does not describe cursor P.
+    ///
+    /// K/V is POSITION-ADDRESSED (row = absolute position, RoPE recomputed from it), so reusing the first P
+    /// tokens and restarting at cursor P is bit-identical to a full prefill. `ShortConvStateCache` (LFM2 and
+    /// any short-conv/SSM mixer) is NOT: it is a shift register holding the history for exactly ONE cursor -
+    /// `StatePos`, where the last turn ended. Reusing at any other P feeds the conv layers a history that
+    /// describes DIFFERENT tokens. It is not subtle: the same prompt asked twice returned a different answer
+    /// on CUDA/WebGPU/CPU and outright multilingual garbage on WebGL (measured 2026-07-16). It fires on a new
+    /// conversation without a reload (the system-prompt prefix still matches!), an edited system prompt, or a
+    /// re-ask - and P == StatePos only in the plain append-only case, which is why single-turn testing missed it.
+    ///
+    /// Correct and cheap: fall back to a FULL prefill (P=0), which zero-pads and rebuilds the state from
+    /// scratch. Only conv-state models pay it; K/V-only archs (qwen/gemma) keep full reuse. A future
+    /// optimization could snapshot conv state per position, but correctness comes first.
+    /// </summary>
+    private int ConvStateAllowsReuse(int P)
+    {
+        if (P <= 0) return P;
+        var conv = _session.ConvStateCache;
+        if (conv == null || conv.NumLayers == 0) return P;   // no conv state (qwen/gemma): reuse is valid
+        return P == conv.StatePos ? P : 0;
+    }
+
     /// <summary>Last request's reused-prefix length P (0 = no reuse / full prefill). Diagnostic for tests.</summary>
     public int LastReusedPrefix { get; private set; }
 
@@ -183,6 +207,7 @@ public sealed class GgufGenerator : IDisposable
             int maxP = Math.Min(_cachedIds.Length, promptIds.Length - 1);
             while (P < maxP && _cachedIds[P] == promptIds[P]) P++;
             if (P < MinReusePrefix) P = 0;
+            P = ConvStateAllowsReuse(P);
         }
 
         int[] stepIds; // prefill tokens for step 0 (whole prompt, or just the new suffix on reuse)
@@ -391,6 +416,7 @@ public sealed class GgufGenerator : IDisposable
             int maxP = Math.Min(_cachedIds.Length, promptIds.Length - 1);
             while (P < maxP && _cachedIds[P] == promptIds[P]) P++;
             if (P < MinReusePrefix) P = 0;
+            P = ConvStateAllowsReuse(P);
         }
 
         int[] stepIds;

@@ -63,6 +63,10 @@ public sealed class GgufTextGenerationPipeline : IDisposable
     /// <summary>Diagnostics for the active decode capture (ops + patch counts), or null.</summary>
     public (int Ops, int Scalars, int Copies, int Slots)? DecodeCaptureInfo => _gen.DecodeCaptureInfo;
 
+    /// <summary>Length of the KV-prefix the last request reused (0 = full prefill). Diagnostic - lets a test
+    /// assert WHICH path a generation took (see Lfm2_PrefixCacheReuse_SamePromptTwice_IsIdentical).</summary>
+    public int LastReusedPrefix => _gen.LastReusedPrefix;
+
     /// <summary>Per-phase ms of the most recent patched replay step (diagnostics), or null.</summary>
     public (double Patch, double Replay, double Sync)? LastDecodeCaptureStepMs => _gen.LastDecodeCaptureStepMs;
 

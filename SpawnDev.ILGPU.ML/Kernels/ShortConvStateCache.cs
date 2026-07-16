@@ -48,10 +48,25 @@ public sealed class ShortConvStateCache : IDisposable
     /// <summary>Number of conv-layers that have populated state.</summary>
     public int NumLayers => _layers.Count;
 
+    /// <summary>
+    /// The absolute sequence position this state describes: it holds the bcx of tokens
+    /// [StatePos-(L-1) .. StatePos-1], i.e. the history a step at cursor <c>pastLen == StatePos</c> needs.
+    ///
+    /// This exists because the conv state, unlike the KV cache, is NOT position-addressed. `GGUFDecodeKVCache`
+    /// writes row `pastLen`, so a consumer may jump the cursor anywhere already computed (that is what the
+    /// KV-PREFIX CACHE does: reuse the longest common prefix P, set the cursor to P, prefill only the suffix).
+    /// This cache is a shift register holding history for exactly ONE cursor, so a jump to any other P feeds
+    /// the conv layers a history describing DIFFERENT tokens - the same prompt asked twice then returns a
+    /// different answer, and on some backends outright garbage (measured on CUDA/WebGPU/WebGL/CPU 2026-07-16).
+    /// Callers that move the cursor must check this and force a full prefill when it does not match.
+    /// </summary>
+    public int StatePos { get; private set; }
+
     /// <summary>A GPU-side copy of every layer's live conv state. See <see cref="CreateSnapshot"/>.</summary>
     public sealed class Snapshot : IDisposable
     {
         internal readonly Dictionary<int, MemoryBuffer1D<float, Stride1D.Dense>> Layers = new();
+        internal int StatePos;   // the cursor the snapshotted buffers describe - restored with them
         public void Dispose()
         {
             foreach (var b in Layers.Values) b.Dispose();
@@ -73,7 +88,7 @@ public sealed class ShortConvStateCache : IDisposable
     /// </summary>
     public Snapshot CreateSnapshot()
     {
-        var snap = new Snapshot();
+        var snap = new Snapshot { StatePos = StatePos };
         foreach (var (layer, ls) in _layers)
         {
             var buf = _accelerator.Allocate1D<float>(ls.Active.Length);
@@ -83,26 +98,41 @@ public sealed class ShortConvStateCache : IDisposable
         return snap;
     }
 
-    /// <summary>Put a <see cref="CreateSnapshot"/> state back (layers absent from the snapshot are untouched).</summary>
+    /// <summary>Put a <see cref="CreateSnapshot"/> state back (layers absent from the snapshot are untouched).
+    /// Restores <see cref="StatePos"/> too - the buffers and the cursor they describe travel together.</summary>
     public void RestoreSnapshot(Snapshot snap)
     {
         foreach (var (layer, buf) in snap.Layers)
             if (_layers.TryGetValue(layer, out var ls))
                 ls.Active.View.CopyFrom(buf.View);
+        StatePos = snap.StatePos;
     }
 
     /// <summary>Drop all state so the next call to <see cref="Forward"/> starts a fresh sequence (zero-pad).
     /// Call when reusing the cache for a new, unrelated generation.</summary>
     public void Reset()
     {
-        foreach (var ls in _layers.Values) { ls.Active.Dispose(); ls.Scratch.Dispose(); }
-        _layers.Clear();
+        // ZERO the buffers, do NOT dispose them. Reset runs from SYNC paths (ResetGGUFDecode, called at the
+        // start of every full prefill), where a dispatch from the previous generation may still be pending:
+        // disposing a buffer a pending dispatch reads corrupts it on the browser backends (see the
+        // "never dispose before flush" / Wasm SharedArrayBuffer rules in the project CLAUDE.md). It surfaced
+        // as the SECOND generation returning garbage on WebGL even after a full prefill (2026-07-16).
+        // Reusing the allocation is also what ResetGGUFDecode's contract promises, and it is cheaper.
+        foreach (var ls in _layers.Values) { ls.Active.MemSetToZero(); ls.Scratch.MemSetToZero(); }
+        StatePos = 0;
     }
 
     private LayerState Ensure(int layer, int rowWidth, int stateRows)
     {
         if (_layers.TryGetValue(layer, out var ls))
-            return ls;
+        {
+            // Reset() keeps the allocations (browser-safe), so a layer can outlive a generation. Geometry is
+            // fixed per model/session, but rebuild rather than silently reuse a wrong-sized buffer if it ever
+            // changes.
+            if (ls.RowWidth == rowWidth && ls.StateRows == stateRows) return ls;
+            ls.Active.Dispose(); ls.Scratch.Dispose();
+            _layers.Remove(layer);
+        }
         int elems = Math.Max(1, stateRows * rowWidth);
         ls = new LayerState
         {
@@ -136,6 +166,12 @@ public sealed class ShortConvStateCache : IDisposable
 
         // Conv with (or without) the prepended state. stateRows=0 → identical to the plain zero-pad Forward.
         _kernel.ForwardWithState(bcx, weight, output, ls.Active.View, seq, H, L, useState ? stateRows : 0);
+
+        // The state now describes the history a step at cursor (pastLen + seq) needs. Callers that MOVE the
+        // cursor (KV-prefix reuse) must compare against this - see the StatePos docs. Set on BOTH paths: an
+        // L==1 model keeps no history, so its (empty) state is valid at every cursor and must not be treated
+        // as stale.
+        StatePos = pastLen + seq;
 
         if (stateRows <= 0) return;   // L==1 (degenerate) needs no history
 
@@ -173,5 +209,13 @@ public sealed class ShortConvStateCache : IDisposable
         ls.Active.View.CopyFrom(ls.Scratch.View);
     }
 
-    public void Dispose() => Reset();
+    /// <summary>Release every layer's buffers. NOT Reset() - that deliberately KEEPS the allocations (it runs
+    /// from sync paths where a dispatch may still reference them); disposal only happens here, when the session
+    /// is done with the cache.</summary>
+    public void Dispose()
+    {
+        foreach (var ls in _layers.Values) { ls.Active.Dispose(); ls.Scratch.Dispose(); }
+        _layers.Clear();
+        StatePos = 0;
+    }
 }

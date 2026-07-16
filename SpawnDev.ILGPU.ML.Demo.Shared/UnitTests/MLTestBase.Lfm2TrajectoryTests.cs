@@ -239,6 +239,78 @@ public abstract partial class MLTestBase
 222_MatMul_logits=2.073971
 ";
 
+    /// <summary>
+    /// LFM2 + the KV-PREFIX CACHE: asking the SAME question twice on one pipeline must give the SAME greedy
+    /// answer. It did not.
+    ///
+    /// Prefix reuse (GgufGenerator, EnablePrefixCache=true BY DEFAULT - the demo runs it) reuses the longest
+    /// common token prefix P with the resident sequence, sets the cursor to P and prefills only the suffix.
+    /// That is valid for K/V, which is POSITION-ADDRESSED (row = absolute position, RoPE matches). It is NOT
+    /// valid for the shortconv layers: ShortConvStateCache is a SHIFT REGISTER holding the history for exactly
+    /// ONE cursor - the position the previous turn ENDED at. Any P other than that position makes the conv
+    /// layers read a history describing different tokens. Asking the same question twice is the minimal
+    /// trigger (P = promptLen-1, but the state sits at promptLen+responseLen); in the demo it fires whenever a
+    /// new conversation, an edited system prompt, or a re-ask shares only a shorter prefix.
+    ///
+    /// Backend-agnostic (unlike the capture/replay defects) - this breaks CUDA too, and no existing test caught
+    /// it because the identity gate DISABLES the prefix cache and qwen/gemma have no conv state.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Lfm2_PrefixCacheReuse_SamePromptTwice_IsIdentical()
+        => await SamePromptTwiceIsIdentical("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", "LFM2");
+
+    /// <summary>CONTROL for the LFM2 case above: qwen2.5 has NO conv state, so if IT also returns a different
+    /// answer to the same prompt twice on a backend, that backend has a generation-to-generation reset problem
+    /// of its own and the conv state is exonerated there. Keeps me from attributing a lane's pre-existing bug
+    /// to my change (and vice versa).</summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Qwen25_PrefixCacheReuse_SamePromptTwice_IsIdentical()
+        => await SamePromptTwiceIsIdentical("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf", "qwen2.5");
+
+    private async Task SamePromptTwiceIsIdentical(string repoId, string file, string tag) => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        bool prevPrefix = SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache;
+        SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = true;   // the demo's default
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
+            var model = await hub.OpenAsync(repoId, file, deselect: false, cts.Token);
+            await using (model.Stream)
+            using (var pipe = await SpawnDev.ILGPU.ML.Pipelines.GgufTextGenerationPipeline.CreateFromStreamAsync(
+                accelerator, model.Stream, maxSeqLen: 4096, ct: cts.Token))
+            {
+                var msgs = new[] { ("user", "In two sentences, what is a chicken?") };
+                var cfg = new SpawnDev.ILGPU.ML.Preprocessing.GenerationConfig { MaxNewTokens = 48, Strategy = "greedy" };
+                var first = await pipe.GenerateAsync(msgs, config: cfg, ct: cts.Token);
+                var second = await pipe.GenerateAsync(msgs, config: cfg, ct: cts.Token);   // hits prefix reuse
+                Console.WriteLine($"[{tag}-prefix] reusedPrefix={pipe.LastReusedPrefix}");
+                if (second != first)
+                {
+                    int at = 0; while (at < Math.Min(first.Length, second.Length) && first[at] == second[at]) at++;
+                    throw new Exception(
+                        $"[{tag}-prefix] SAME prompt, greedy, gave DIFFERENT answers - prefix-cache reuse (P="
+                        + $"{pipe.LastReusedPrefix}) fed the shortconv layers a conv state belonging to a different "
+                        + $"cursor. Diverges at char {at}.\n  first ='{first.Trim()}'\n  second='{second.Trim()}'");
+                }
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"[{tag}-prefix] hub/network unavailable: {ex.Message}");
+        }
+        finally
+        {
+            SpawnDev.ILGPU.ML.Pipelines.GgufGenerator.EnablePrefixCache = prevPrefix;
+            await client.DisposeAsync();
+        }
+    });
+
     [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
     public async Task Lfm2Trajectory_MatchesCudaGolden() => await RunTest(async accelerator =>
     {
