@@ -32,7 +32,17 @@ public sealed class ShortConvKernel : IDisposable
         ArrayView1D<int, Stride1D.Dense>>? _kernel;   // params [seq, H, L]
 
     private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    private int[]? _lastParams;
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
+
+    /// <summary>True when the cached params buffer already holds exactly <paramref name="p"/>, so the same
+    /// buffer can be rebound instead of allocating a new one.</summary>
+    private static bool SameParams(int[]? cached, int[] p)
+    {
+        if (cached == null || cached.Length != p.Length) return false;
+        for (int i = 0; i < p.Length; i++) if (cached[i] != p[i]) return false;
+        return true;
+    }
 
     // State-aware variant (KV-decode): reads the previous (L-1) tokens' bcx from a persistent state
     // buffer for the taps that fall before the current chunk (tt<0), instead of zero-padding.
@@ -43,6 +53,7 @@ public sealed class ShortConvKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense>,   // state [(L-1)*3H]  (prev tokens' bcx; ignored when stateRows=0)
         ArrayView1D<int, Stride1D.Dense>>? _stateKernel;   // params [seq, H, L, stateRows]
     private MemoryBuffer1D<int, Stride1D.Dense>? _stateParamsBuf;
+    private int[]? _lastStateParams;
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldStateParamsBufs = new();
 
     public ShortConvKernel(Accelerator accelerator) => _accelerator = accelerator;
@@ -61,11 +72,21 @@ public sealed class ShortConvKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ShortConvImpl);
 
+        // Reuse the params buffer when the values are unchanged - which is EVERY decode step (seq=1,H,L are
+        // fixed for the model). Allocating per call and retiring the old one into _oldParamsBufs (never freed
+        // until Dispose, because a pending dispatch may still read it) burned ~480 GPU buffers per 48-token
+        // generation at LFM2's 10 conv layers - pure waste on every backend, and on WebGL/WebGL-like backends
+        // every buffer is a texture. Rebinding the SAME buffer is safe precisely because we never mutate it:
+        // a new buffer is only taken when the values actually differ (a shape change).
         var p = new[] { seq, H, L };
-        if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-        _paramsBuf = _accelerator.Allocate1D(p);
+        if (!SameParams(_lastParams, p))
+        {
+            if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
+            _paramsBuf = _accelerator.Allocate1D(p);
+            _lastParams = p;
+        }
 
-        _kernel(seq * H, bcx, weight, y, _paramsBuf.View);
+        _kernel(seq * H, bcx, weight, y, _paramsBuf!.View);
     }
 
     /// <summary>Run the fused shortconv with a persistent conv-STATE buffer (KV-decode). For output taps
@@ -87,11 +108,18 @@ public sealed class ShortConvKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(ShortConvStateImpl);
 
+        // Same reuse as Forward - see the note there. This is the decode hot path: (seq=1,H,L,stateRows) is
+        // identical on every step, so without this each token allocated one buffer PER CONV LAYER, retained
+        // until Dispose.
         var p = new[] { seq, H, L, stateRows };
-        if (_stateParamsBuf != null) _oldStateParamsBufs.Add(_stateParamsBuf);
-        _stateParamsBuf = _accelerator.Allocate1D(p);
+        if (!SameParams(_lastStateParams, p))
+        {
+            if (_stateParamsBuf != null) _oldStateParamsBufs.Add(_stateParamsBuf);
+            _stateParamsBuf = _accelerator.Allocate1D(p);
+            _lastStateParams = p;
+        }
 
-        _stateKernel(seq * H, bcx, weight, y, state, _stateParamsBuf.View);
+        _stateKernel(seq * H, bcx, weight, y, state, _stateParamsBuf!.View);
     }
 
     private static void ShortConvStateImpl(Index1D idx,
@@ -167,6 +195,9 @@ public sealed class ShortConvKernel : IDisposable
 
     public void Dispose()
     {
+        // Clear the cached VALUES with the buffers: a stale _lastParams would make SameParams report a hit
+        // against a disposed/null buffer.
+        _lastParams = null; _lastStateParams = null;
         _paramsBuf?.Dispose(); _paramsBuf = null;
         foreach (var b in _oldParamsBufs) b.Dispose();
         _oldParamsBufs.Clear();

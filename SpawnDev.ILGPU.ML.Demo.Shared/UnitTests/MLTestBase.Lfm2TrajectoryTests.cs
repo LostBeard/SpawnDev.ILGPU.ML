@@ -311,6 +311,83 @@ public abstract partial class MLTestBase
         }
     });
 
+    /// <summary>
+    /// Is the LFM2 FORWARD itself reproducible on this backend? Runs the SAME fixed-id forward twice in one
+    /// session and diffs the per-node trajectory against ITSELF (no golden, no decode, no sampling, no conv
+    /// STATE - prefill runs at pastLen=0, where the conv zero-pads and never reads the state buffer).
+    ///
+    /// Why (2026-07-16): on WebGL, LFM2 answers the same prompt differently on a second generation and diverges
+    /// at char 0 - the FIRST generated token, which comes from the prefill's last-position logits. Both runs do
+    /// a full prefill, so no state can carry over: that points at the forward being non-reproducible, not at the
+    /// conv-state cache. The qwen2.5 control passes on WebGL, so it is not backend-wide. Two hypotheses already
+    /// died against evidence (Reset() disposing buffers; per-call params-buffer churn), so this stops guessing
+    /// and names the FIRST node whose value changes between two identical forwards.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
+    public async Task Lfm2Trajectory_TwoIdenticalForwards_AreReproducible() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        var client = new SpawnDev.WebTorrent.WebTorrentClient();
+        try
+        {
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http) { PrepareTimeout = TimeSpan.FromMinutes(8) };
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(9));
+            var model = await hub.OpenAsync("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", deselect: false, cts.Token);
+
+            await using (model.Stream)
+            using (var session = await InferenceSession.CreateFromGGUFStreamAsync(accelerator, model.Stream, ct: cts.Token))
+            {
+                async Task<Dictionary<string, float[]>> ForwardCapture()
+                {
+                    GraphExecutor.CapturedOutputs = new();
+                    GraphExecutor.CapturedNodeInfo = new();
+                    GraphExecutor.CaptureMaxElements = 40000;
+                    try
+                    {
+                        var idf = Lfm2TrajIds.Select(i => (float)i).ToArray();
+                        using var inBuf = accelerator.Allocate1D(idf);
+                        var input = new Tensor(inBuf.View, new[] { 1, Lfm2TrajIds.Length }, "input_ids");
+                        await session.RunAsync(new Dictionary<string, Tensor> { ["input_ids"] = input });
+                        await accelerator.SynchronizeAsync();
+                        return new Dictionary<string, float[]>(GraphExecutor.CapturedOutputs!);
+                    }
+                    finally
+                    {
+                        GraphExecutor.CapturedOutputs = null;
+                        GraphExecutor.CapturedNodeInfo = null;
+                        GraphExecutor.CaptureMaxElements = 1024;
+                    }
+                }
+
+                var a = await ForwardCapture();
+                var b = await ForwardCapture();
+
+                // BIT-exact is the right bar: identical inputs, identical kernels, same device, same order.
+                foreach (var key in a.Keys)
+                {
+                    if (!b.TryGetValue(key, out var vb)) throw new Exception($"[LFM2-repro] node {key} missing from run B");
+                    var va = a[key];
+                    if (va.Length != vb.Length) throw new Exception($"[LFM2-repro] node {key} length {va.Length} vs {vb.Length}");
+                    for (int i = 0; i < va.Length; i++)
+                        if (va[i] != vb[i])
+                            throw new Exception($"[{accelerator.AcceleratorType}] [LFM2-repro] the SAME forward run twice " +
+                                $"gave DIFFERENT values - FIRST divergent node {key} at element {i}: {va[i]} vs {vb[i]}. " +
+                                "No decode, no sampling, no conv state (prefill zero-pads) - the forward itself is " +
+                                "not reproducible on this backend.");
+                }
+                Console.WriteLine($"[LFM2-repro] {accelerator.AcceleratorType}: {a.Count} nodes bit-identical across two forwards.");
+            }
+        }
+        catch (UnsupportedTestException) { throw; }
+        catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+            || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException)
+        {
+            throw new UnsupportedTestException($"[LFM2-repro] hub/network unavailable: {ex.Message}");
+        }
+        finally { await client.DisposeAsync(); }
+    });
+
     [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
     public async Task Lfm2Trajectory_MatchesCudaGolden() => await RunTest(async accelerator =>
     {
