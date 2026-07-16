@@ -39,6 +39,18 @@ public partial class MLTestBase
         // workgroupUniformLoad support, then flip this to true.
         => await DecodeCaptureLongContextBody("Qwen/Qwen2.5-1.5B-Instruct-GGUF", "qwen2.5-1.5b-instruct-q4_k_m.gguf", enableGemv: false);
 
+    /// <summary>The identity-at-depth gate for LFM2 (ShortConv hybrid) - the arch this gate NEVER covered.
+    /// Capture/replay records a FIXED command plan (fixed buffer bindings) and patches only values that are
+    /// affine in the decode cursor. LFM2's conv layers carry history in <see cref="ShortConvStateCache"/>,
+    /// which PING-PONG SWAPS its state buffers every step ((Active, Alt) = (Alt, Active)) - a swap a frozen
+    /// plan's bindings cannot follow. qwen2.5/qwen3 have no shortconv, so the existing gates pass while LFM2
+    /// degenerates in the browser (Captain, 2026-07-16: coherent on CUDA where capture is off, token soup on
+    /// WebGPU where the demo turns it on by default via ModelRegistry.EnableWebGPUDecodeCapture=true).
+    /// enableGemv:false = what the AI demo runs today.</summary>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel,WasmHeavy", RetryCount = 2)]
+    public async Task<string> GGUF_WebGPU_DecodeCapture_LongContext_Lfm2()
+        => await DecodeCaptureLongContextBody("LiquidAI/LFM2-1.2B-GGUF", "LFM2-1.2B-Q4_K_M.gguf", enableGemv: false);
+
     private async Task<string> DecodeCaptureLongContextBody(string repoId, string file, bool enableGemv) => await RunTestWithResult(async accelerator =>
     {
         if (accelerator.AcceleratorType != AcceleratorType.WebGPU)

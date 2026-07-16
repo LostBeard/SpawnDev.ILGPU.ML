@@ -145,6 +145,14 @@ public abstract partial class MLTestBase
             ($"{arch}.context_length", (uint)ctx),
         };
 
+        return SerializeGGUF(tensors, metadata);
+    }
+
+    /// <summary>Serialize tensors + metadata as a GGUF v3 blob (32-byte data alignment). Shared by the tiny
+    /// synthetic model builders (llama, lfm2) so a new arch needs only its tensor/metadata list.</summary>
+    private static byte[] SerializeGGUF(List<(string Name, long[] Ne, GGMLType Type, byte[] Data)> tensors,
+        (string Key, object Value)[] metadata)
+    {
         // ── Serialize: GGUF v3, default 32-byte data alignment ──
         using var ms = new MemoryStream();
         using var bw = new BinaryWriter(ms);

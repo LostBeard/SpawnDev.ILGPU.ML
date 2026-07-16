@@ -2226,6 +2226,12 @@ public class InferenceSession : IDisposable
     /// <summary>Tokens already cached (advances per <see cref="RunDecodeStepAsync"/>; 0 before prefill).</summary>
     public int DecodePastLen { get; private set; }
 
+    /// <summary>The live conv-state cache (LFM2 / short-conv models), or null. Exposed for
+    /// <see cref="WebGPUDecodeCapture"/>, which re-runs the decode graph at one cursor several times to
+    /// discover its patch points and must snapshot/restore this SHIFT-REGISTER state around those probes -
+    /// unlike the KV cache, re-running a cursor here is NOT idempotent.</summary>
+    internal Kernels.ShortConvStateCache? ConvStateCache => _convStateCache;
+
     /// <summary>Enable incremental KV-cache decode with a caller-built full-precision cache (per-layer
     /// kvHeads/headDim matching the model's attention geometry). Turns the O(n^2) full-recompute decode
     /// into O(n): each step only computes the new token's K/V and attends it against the cached history.

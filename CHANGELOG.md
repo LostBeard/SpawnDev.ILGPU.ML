@@ -2,6 +2,40 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 4.0.0-local.1 (2026-07-16)
+
+### 🐛 FIX: LFM2 token soup in the browser - WebGPU decode capture/replay vs the conv-state shift register
+
+LFM2 decoded coherently on CUDA and emitted token soup on WebGPU, through the same graph. Two defects, both
+in the **WebGPU-only** decode capture/replay path (`WebGPUDecodeCapture`), which records ONE command plan and
+re-executes it per token, patching only values affine in the decode cursor. Neither could affect CUDA/OpenCL
+(capture is WebGPU-only) or qwen/gemma (no conv state) - which is why every existing gate stayed green.
+
+1. **`ShortConvStateCache` ping-pong swap.** The cache swapped its state buffers each step
+   (`(Active, Alt) = (Alt, Active)`). Replay re-executes a plan with FROZEN bindings and never re-runs the C#,
+   so the swap happened exactly once (at capture) and never again: every replay read the same stale buffer and
+   the conv history FROZE at the capture step. Fix: fixed `Active`/`Scratch` bindings - the update stages into
+   `Scratch` and commits back into the SAME `Active` (still never an in-place overlapping copy). Do not
+   reintroduce a swap.
+2. **Capture's probe steps corrupted the shift register.** `TryCaptureAsync` runs the decode graph six times
+   (warm/probe/capture at P0, then again at P0+1) to discover its patch points. `GGUFDecodeKVCache` is
+   idempotent under that (it writes row `pastLen`), but the conv state is a SHIFT REGISTER that advances on
+   every call - so replay began from a six-times-corrupted history (fluent but WRONG text). Fix:
+   `ShortConvStateCache.CreateSnapshot()/RestoreSnapshot()`, applied around the probes so capture's net effect
+   is exactly the one real step it reports. The restores are issued OUTSIDE the recording window - a restore
+   made while the plan is recording gets baked INTO the plan, which pins the state forever (output collapses
+   to "the the the the").
+
+**New gates** (the old ones could not fail): `GGUF_WebGPU_DecodeCapture_LongContext_Lfm2` - the captured-vs-
+direct char-exact identity gate on the ShortConv arch (the existing gates only covered qwen2.5 0.5B/1.5B);
+`MLTestBase.ShortConvTests` - CPU-oracle kernel tests at real LFM2 dims (H=2048, L=3) incl. the decode state
+path and decode-vs-full-recompute on a tiny synthetic LFM2, on every backend; `MLTestBase.Lfm2TrajectoryTests`
+- a per-node cross-backend RMS golden (96-token prefill) that names the first divergent node. The new-arch E2E
+coherence gate now actually RUNS (it required >=24 words while the only prompt asked for "one short sentence",
+so it never executed) and adds a stopword-rate check; its docstring no longer claims a pass there proves the
+arch. Verified: the LFM2 identity gate is green on WebGPU (200 tokens), qwen2.5 0.5B/1.5B identity gates
+unchanged, and the SpawnDev.AI demo answers coherently in Chrome on hardware WebGPU.
+
 ## 4.0.0-preview.15 (2026-07-15)
 
 ### 🐛 FIX: LFM2 (add_bos_token models) degenerate chat output - missing BOS on the ChatML path

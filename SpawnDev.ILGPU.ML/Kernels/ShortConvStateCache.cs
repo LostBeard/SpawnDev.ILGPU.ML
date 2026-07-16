@@ -14,9 +14,13 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// <see cref="ShortConvKernel.ForwardWithState"/> so decode-step conv sees the real history.
 ///
 /// Analogous to <see cref="GGUFDecodeKVCache"/> for attention. Prefill (pastLen==0) runs the plain zero-pad
-/// conv and snapshots the tail as the initial state; decode (pastLen&gt;0) prepends the state. Ping-pong state
-/// buffers keep the update browser-safe (the kernel reads the ACTIVE buffer while the update writes the OTHER,
-/// then they swap — never an in-place overlapping copy, never a method-local buffer feeding a pending dispatch).
+/// conv and snapshots the tail as the initial state; decode (pastLen&gt;0) prepends the state. The update is
+/// staged through a SCRATCH buffer and committed back into the SAME Active buffer: browser-safe (never an
+/// in-place overlapping copy, never a method-local buffer feeding a pending dispatch) AND binding-stable, so
+/// WebGPU decode capture/replay - which re-executes a FROZEN command plan per token and never re-runs this
+/// C# - stays correct. It was ping-pong until 2026-07-16; the swap rebound the live state every step, which a
+/// replayed plan cannot follow, so LFM2 froze its conv history at the capture step and degenerated into token
+/// soup in the browser while CUDA (capture off) was fine. Do NOT reintroduce a swap here.
 /// </summary>
 public sealed class ShortConvStateCache : IDisposable
 {
@@ -27,8 +31,10 @@ public sealed class ShortConvStateCache : IDisposable
     {
         public int RowWidth;      // 3H
         public int StateRows;     // L-1
+        // FIXED (never swapped - see the binding-stability note in Forward): Active is always the live state,
+        // Scratch always the staging buffer, so a captured WebGPU decode plan replays correctly.
         public MemoryBuffer1D<float, Stride1D.Dense> Active = null!;   // [(L-1)*3H] previous tokens' bcx
-        public MemoryBuffer1D<float, Stride1D.Dense> Alt = null!;      // ping-pong scratch for the update
+        public MemoryBuffer1D<float, Stride1D.Dense> Scratch = null!;  // staging for the update (never in-place)
     }
 
     private readonly Dictionary<int, LayerState> _layers = new();
@@ -42,11 +48,54 @@ public sealed class ShortConvStateCache : IDisposable
     /// <summary>Number of conv-layers that have populated state.</summary>
     public int NumLayers => _layers.Count;
 
+    /// <summary>A GPU-side copy of every layer's live conv state. See <see cref="CreateSnapshot"/>.</summary>
+    public sealed class Snapshot : IDisposable
+    {
+        internal readonly Dictionary<int, MemoryBuffer1D<float, Stride1D.Dense>> Layers = new();
+        public void Dispose()
+        {
+            foreach (var b in Layers.Values) b.Dispose();
+            Layers.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Copy every layer's live state so it can be put back with <see cref="RestoreSnapshot"/>.
+    ///
+    /// Why this exists: unlike <see cref="GGUFDecodeKVCache"/> - which writes row <c>pastLen</c> and is therefore
+    /// IDEMPOTENT when a step is re-run at the same cursor - this cache is a SHIFT REGISTER: every
+    /// <see cref="Forward"/> advances the history by one, regardless of pastLen. WebGPU decode capture
+    /// (<see cref="WebGPUDecodeCapture.TryCaptureAsync"/>) runs the decode graph SIX times to discover its
+    /// cursor-dependent patch points (warm/probe/capture at P0, then again at P0+1), which would shift the conv
+    /// history six times with a throwaway token and leave replay starting from a corrupted state (LFM2 then
+    /// decodes fluent but WRONG text - 2026-07-16). Capture snapshots around its probes so the net effect is
+    /// exactly the one real step it reports. Any other multi-run-at-one-cursor caller must do the same.
+    /// </summary>
+    public Snapshot CreateSnapshot()
+    {
+        var snap = new Snapshot();
+        foreach (var (layer, ls) in _layers)
+        {
+            var buf = _accelerator.Allocate1D<float>(ls.Active.Length);
+            buf.View.CopyFrom(ls.Active.View);
+            snap.Layers[layer] = buf;
+        }
+        return snap;
+    }
+
+    /// <summary>Put a <see cref="CreateSnapshot"/> state back (layers absent from the snapshot are untouched).</summary>
+    public void RestoreSnapshot(Snapshot snap)
+    {
+        foreach (var (layer, buf) in snap.Layers)
+            if (_layers.TryGetValue(layer, out var ls))
+                ls.Active.View.CopyFrom(buf.View);
+    }
+
     /// <summary>Drop all state so the next call to <see cref="Forward"/> starts a fresh sequence (zero-pad).
     /// Call when reusing the cache for a new, unrelated generation.</summary>
     public void Reset()
     {
-        foreach (var ls in _layers.Values) { ls.Active.Dispose(); ls.Alt.Dispose(); }
+        foreach (var ls in _layers.Values) { ls.Active.Dispose(); ls.Scratch.Dispose(); }
         _layers.Clear();
     }
 
@@ -60,7 +109,7 @@ public sealed class ShortConvStateCache : IDisposable
             RowWidth = rowWidth,
             StateRows = stateRows,
             Active = _accelerator.Allocate1D<float>(elems),
-            Alt = _accelerator.Allocate1D<float>(elems),
+            Scratch = _accelerator.Allocate1D<float>(elems),
         };
         ls.Active.MemSetToZero();   // fresh state = zeros (irrelevant on the pastLen==0 first call, which zero-pads)
         _layers[layer] = ls;
@@ -91,13 +140,24 @@ public sealed class ShortConvStateCache : IDisposable
         if (stateRows <= 0) return;   // L==1 (degenerate) needs no history
 
         // Update state = last stateRows rows of the virtual sequence [ (useState? prevState : nothing) ++ bcx ].
-        // Write into the ALT buffer (never in-place), then swap. Each row copy is a GPU→GPU CopyFrom (all backends).
+        // Staged through SCRATCH (never in-place: the conv dispatch above still reads Active), then COMMITTED
+        // back into the SAME Active buffer. Each copy is a GPU→GPU CopyFrom (all backends).
+        //
+        // Active/Scratch are FIXED - deliberately NOT ping-pong. A ping-pong swap rebinds which buffer is the
+        // live state each step, and WebGPU decode capture/replay (WebGPUDecodeCapture) records ONE command plan
+        // with FROZEN bindings and re-executes it per token, patching only values affine in the decode cursor.
+        // The C# here does not run on replay, so a swap would never happen again: every replay would read the
+        // capture-time Active and write the capture-time Scratch, freezing the conv history at the capture step.
+        // LFM2 then decodes coherently for a few tokens and degenerates into token soup - exactly the browser
+        // bug (2026-07-16); qwen has no conv state, so its plan is fully described by the affine patches and
+        // replayed fine, which is why only LFM2 broke. Keep the bindings stable. Cost: one extra copy of
+        // (L-1)*3H floats per conv layer per step (48KB at LFM2's H=2048, L=3).
         int prevRows = useState ? stateRows : 0;
         int totalRows = prevRows + seq;
         // Only a sequence shorter than the history window (a <L-1-token prefill) leaves leading state rows
-        // unfilled; zero the whole ALT buffer first in that rare case so those rows are zeros, not stale.
-        if (totalRows < stateRows) ls.Alt.MemSetToZero();
-        var dst = ls.Alt.View;
+        // unfilled; zero the whole SCRATCH buffer first in that rare case so those rows are zeros, not stale.
+        if (totalRows < stateRows) ls.Scratch.MemSetToZero();
+        var dst = ls.Scratch.View;
         for (int i = 0; i < stateRows; i++)
         {
             int virt = totalRows - stateRows + i;   // source row in the virtual sequence
@@ -108,7 +168,9 @@ public sealed class ShortConvStateCache : IDisposable
             else
                 dstRow.CopyFrom(bcx.SubView((long)(virt - prevRows) * rowW, rowW)); // from this step's bcx
         }
-        (ls.Active, ls.Alt) = (ls.Alt, ls.Active);   // ping-pong: ALT becomes the live state
+        // Commit: SCRATCH -> ACTIVE. Ordered after the reads above within the same queue, so the conv dispatch
+        // and the row copies both saw the OLD state before it is overwritten.
+        ls.Active.View.CopyFrom(ls.Scratch.View);
     }
 
     public void Dispose() => Reset();

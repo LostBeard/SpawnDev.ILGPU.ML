@@ -438,7 +438,13 @@ async Task<int> GenerateAsync(string path, string prompt, bool raw, int maxNew)
     // General chat template via the library dispatcher (ChatTemplates.BuildChatPrompt) — routes per-arch
     // (gemma4 / ChatML / Llama3) AND honors add_bos_token (LFM2's <|startoftext|> BOS). Dogfoods the exact
     // path the demo/server uses, so the console tests any model's real chat prompt, not just gemma4's.
-    else ids.AddRange(SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.BuildChatPrompt(gm, tok, new[] { ("user", prompt) }).PromptIds);
+    else {
+        var sysEnv = Environment.GetEnvironmentVariable("GGUF_SYS");   // optional system prompt (repro demo path)
+        var msgs = string.IsNullOrEmpty(sysEnv)
+            ? new[] { ("user", prompt) }
+            : new[] { ("system", sysEnv), ("user", prompt) };
+        ids.AddRange(SpawnDev.ILGPU.ML.Preprocessing.ChatTemplates.BuildChatPrompt(gm, tok, msgs).PromptIds);
+    }
     Console.WriteLine($"Prompt: \"{prompt}\"  (raw={raw})\nPrompt token ids ({ids.Count}): [{string.Join(",", ids)}]");
     Console.WriteLine($"control: bos={bos} turn_open={turnO} turn_close={turnC} think={think} eos={eos}\n");
 
@@ -938,7 +944,9 @@ async Task<int> RunAsync(string path, int[] ids)
                 for (int i = off; i < off + 8 && i < v.Length; i++) head.Add(v[i].ToString("F4"));
                 vals = $"\n        last-pos(w={width}) rms={lrms:F4} first8=[{string.Join(", ", head)}]";
             }
-            Console.WriteLine($"  {key,-44} rms={rms,8:F3} absMax={amax,10:F3}{cos}{vals}");
+            // F6: 3 decimals quantizes a small activation (rms=0.006) to +/-8% - too coarse to serve as the
+            // cross-backend golden reference (Lfm2Trajectory_MatchesCudaGolden). Print what we can compare.
+            Console.WriteLine($"  {key,-44} rms={rms,11:F6} absMax={amax,13:F6}{cos}{vals}");
         }
     }
 

@@ -150,10 +150,24 @@ public sealed class WebGPUDecodeCapture : IDisposable
 
         var inputBuf = acc.Allocate1D(new[] { tokenId });
         var inputDict = new Dictionary<string, Tensor> { ["input_ids"] = new Tensor(inputBuf.View, new[] { 1, 1 }, "input_ids") };
+        // Conv-state snapshots live out here so the finally can always release them (see the shift-register
+        // note below).
+        var conv = session.ConvStateCache;
+        ShortConvStateCache.Snapshot? convAtP0 = null;   // state that step P0 must see
+        ShortConvStateCache.Snapshot? convAtP1 = null;   // state after the ONE real P0 step
         try
         {
-            async Task<Dictionary<string, Tensor>> StepAt(int p, bool suppress)
+            // Conv-state (LFM2 / short-conv) is a SHIFT REGISTER: every decode step advances it, and unlike the
+            // KV cache (which writes row pastLen and so is idempotent) re-running a cursor shifts it AGAIN. The
+            // six probe/warm/capture steps below would leave replay starting from a six-times-corrupted history
+            // (LFM2 decoded fluent but WRONG text - 2026-07-16). So each run at a given cursor is preceded by a
+            // restore of the state that cursor must see, and capture exits with EXACTLY the one real step (the
+            // Plan A capture pass) applied. Null / no-op for pure-attention models.
+            convAtP0 = conv?.CreateSnapshot();
+
+            async Task<Dictionary<string, Tensor>> StepAt(int p, bool suppress, ShortConvStateCache.Snapshot? restore = null)
             {
+                if (restore != null) conv!.RestoreSnapshot(restore);
                 session.SetGGUFDecodePastLen(p);
                 if (suppress) GraphExecutor.SuppressDrains = true;
                 try { return await session.RunDecodeStepAsync(inputDict); }
@@ -162,9 +176,9 @@ public sealed class WebGPUDecodeCapture : IDisposable
 
             // ── Plan A at P0: warm A (observer probe) + warm B (suppressed) + capture (snapshots on) ──
             var probeA = new SlotProbe(); probeA.Attach();
-            await StepAt(p0, false); await acc.SynchronizeAsync();
+            await StepAt(p0, false); await acc.SynchronizeAsync();               // state entering == convAtP0
             SlotProbe.Detach();
-            await StepAt(p0, true); await acc.SynchronizeAsync();
+            await StepAt(p0, true, convAtP0); await acc.SynchronizeAsync();
 
             // Last-position logits view of a step's outputs + the argmax fold: recorded INTO the
             // plan as its final dispatch (constant params - the logits tensor is stable, vocab
@@ -179,23 +193,34 @@ public sealed class WebGPUDecodeCapture : IDisposable
             }
 
             Dictionary<string, Tensor> capOut;
+            // Restore OUTSIDE the capture window: a restore issued while the plan is recording would be baked
+            // INTO the plan, so every replay would reset the conv state to this snapshot and the history would
+            // never advance (LFM2 collapses to "the the the the" - measured 2026-07-16). The plan must contain
+            // ONLY the step's own commands.
+            if (conv != null && convAtP0 != null) { conv.RestoreSnapshot(convAtP0); await acc.SynchronizeAsync(); }
             var planA = webGpu.BeginDispatchCapture();
             planA.CaptureScalarSnapshots = true;
             try
             {
+                // THE real step at P0 (its outputs are returned to the caller): the conv-state advance this
+                // pass makes is the one the caller's cursor expects to survive capture.
                 capOut = await StepAt(p0, true);
                 if (argmax != null) { var (lv, vc) = LastLogits(capOut); argmax.DispatchPartials(lv, vc); }
             }
             catch { webGpu.EndDispatchCapture().Dispose(); throw; }
             webGpu.EndDispatchCapture();
             await acc.SynchronizeAsync();
+            convAtP1 = conv?.CreateSnapshot();   // == state after exactly one step at P0
 
             // ── Plan B at P0+1 (value probe only - discarded after the diff) ──
             var probeB = new SlotProbe(); probeB.Attach();
-            await StepAt(p0 + 1, false); await acc.SynchronizeAsync();
+            await StepAt(p0 + 1, false); await acc.SynchronizeAsync();          // state entering == convAtP1
             SlotProbe.Detach();
-            await StepAt(p0 + 1, true); await acc.SynchronizeAsync();
+            await StepAt(p0 + 1, true, convAtP1); await acc.SynchronizeAsync();
 
+            // Same rule as Plan A: restore before recording starts, so Plan A and Plan B stay structurally
+            // identical (the parity check below) and neither bakes a restore into the plan.
+            if (conv != null && convAtP1 != null) { conv.RestoreSnapshot(convAtP1); await acc.SynchronizeAsync(); }
             var planB = webGpu.BeginDispatchCapture();
             planB.CaptureScalarSnapshots = true;
             try
@@ -303,6 +328,11 @@ public sealed class WebGPUDecodeCapture : IDisposable
             // The P0+1 probe left stale slot/scalar values (for P0+1 with the SAME dummy relation) -
             // consistent with the FIRST PatchAndReplay being at pastLen P0+1, which rewrites all of
             // them anyway. Cursor: leave at P0+1 (the capture pass consumed the real token at P0).
+            //
+            // Conv-state is NOT self-correcting the way those are: it is a shift register, so the P0+1 probes
+            // advanced it past the real cursor. Put back the post-P0 state so the first replay (at P0+1) reads
+            // the true history - otherwise LFM2 decodes fluent but wrong text (2026-07-16).
+            if (conv != null && convAtP1 != null) conv.RestoreSnapshot(convAtP1);
             session.SetGGUFDecodePastLen(p0 + 1);
             var cap = new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
                 scalarPatches, copyPatches, slotPatches);
@@ -327,6 +357,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
             GraphExecutor.ShapeInterpElideDispatch = prevElide;
             GraphExecutor.ShapeInterpValidate = prevValidate;
             WebGPUBackend.EnableBindGroupCaching = prevBgCache;
+            convAtP0?.Dispose();
+            convAtP1?.Dispose();
         }
     }
 

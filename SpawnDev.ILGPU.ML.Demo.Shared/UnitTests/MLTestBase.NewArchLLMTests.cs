@@ -9,11 +9,19 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// <summary>
 /// End-to-end WebGPU (+ all-backend) gate for the NEW GGUF architectures being wired into the
 /// SpawnDev.AI demo: qwen3 (standard transformer + useRMSNorm) and LFM2 (ShortConv hybrid).
-/// Each loads a small instruct GGUF via the hub, runs a real greedy decode, and asserts the
-/// factual oracle (" Paris"). RunTest fans this across every PMT backend, so the WebGPU pass
-/// PROVES the arch (and, for LFM2, the ShortConv kernel's WGSL) works in the browser - the exact
-/// path the deployed gh-pages demo takes. (qwen3.5/GatedDeltaNet is verified separately.)
-/// Verified GREEN on WebGPU + WebGL + CUDA + OpenCL. HeavyModel (excluded from the default CI sweep;
+/// Each loads a small instruct GGUF via the hub, runs a real greedy decode, asserts the factual
+/// oracle (" Paris"), and then gates COHERENCE on a second, open-ended generation.
+///
+/// ⚠ READ BEFORE TRUSTING A PASS HERE (2026-07-16): this test being green NEVER proved the arch
+/// works. Its oracle was Contains("Paris") on a 16-64 token greedy answer - and a broken decode
+/// emits the strong factual association FIRST, then degenerates. LFM2 shipped twice on that green
+/// (a missing BOS, then a WebGPU-only defect) while the demo emitted token soup for the Captain.
+/// It is also Category=HeavyModel, i.e. EXCLUDED from the default sweep - so it usually does not
+/// even run. A pass here is NOT a substitute for the kernel-level CPU-oracle tests
+/// (MLTestBase.ShortConvTests) or the per-node cross-backend golden (MLTestBase.Lfm2TrajectoryTests),
+/// which localize a defect instead of averaging over it. Do not write "WebGPU-verified" on the
+/// strength of this file alone.
+/// HeavyModel (excluded from the default CI sweep;
 /// run manually with PMT_EXCLUDE_CATEGORIES=). The CPU-desktop lane is the unoptimized correctness
 /// REFERENCE (~12s/token) and is killed by PMT's 10-min console cap on multi-hundred-M LLM decode -
 /// an expected backend impracticality (same class as WasmHeavy), NOT a correctness gap; raise
@@ -53,22 +61,37 @@ public abstract partial class MLTestBase
                     throw new Exception($"[{tag}] produced empty output");
                 if (!answer.Contains("Paris", StringComparison.OrdinalIgnoreCase))
                     throw new Exception($"[{tag}] answer did not mention Paris (oracle): '{answer.Trim()}'");
-                // COHERENCE gate (not just "contains Paris"): a missing BOS / broken decode emits a few
-                // plausible tokens then degenerates into fragmented garbage that a Contains() check misses
-                // (this exact hole hid the LFM2 add_bos_token bug). Degenerate text collapses trigram
-                // diversity; healthy text stays well above 0.5. Only meaningful once enough words exist.
-                var words = answer.ToLowerInvariant()
+
+                // ── COHERENCE gate ── Contains("Paris") passes on TOKEN SOUP: a broken decode emits the strong
+                // factual association first, THEN degenerates. That hole shipped LFM2 twice (missing BOS, then a
+                // WebGPU-only defect) while this test was green. The previous gate was inert: it required >=24
+                // words but the ONLY prompt asked for "one short sentence" (maxTokens 48-64), so it never ran.
+                // So: ask a SECOND, open-ended question that forces a long answer, on the already-loaded model,
+                // and gate its trigram diversity. Degenerate text repeats trigrams; healthy prose stays >0.5.
+                var longAnswer = await pipe.GenerateAsync(
+                    new[] { ("user", "In one paragraph, explain what a chicken is and what it is farmed for.") },
+                    config: new GenerationConfig { MaxNewTokens = 160, Strategy = "greedy" }, ct: cts.Token);
+                Console.WriteLine($"[{tag}] longAnswer='{longAnswer.Trim()}'");
+                var words = longAnswer.ToLowerInvariant()
                     .Split(new[] { ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                if (words.Length >= 24)
-                {
-                    var tri = new List<string>();
-                    for (int i = 0; i + 2 < words.Length; i++) tri.Add($"{words[i]} {words[i + 1]} {words[i + 2]}");
-                    double uniqueRatio = (double)tri.Distinct().Count() / tri.Count;
-                    Console.WriteLine($"[{tag}] words={words.Length} uniqueTrigramRatio={uniqueRatio:F2}");
-                    if (uniqueRatio < 0.5)
-                        throw new Exception($"[{tag}] degenerate output (unique-trigram ratio {uniqueRatio:F2} < 0.5) " +
-                            $"- coherent-generation gate failed. Answer: '{answer.Trim()}'");
-                }
+                // Too short to judge = the gate could not run. Fail rather than silently skip (the old bug).
+                if (words.Length < 20)
+                    throw new Exception($"[{tag}] coherence gate could not run: open-ended prompt produced only " +
+                        $"{words.Length} words (need >=20). Answer: '{longAnswer.Trim()}'");
+                var tri = new List<string>();
+                for (int i = 0; i + 2 < words.Length; i++) tri.Add($"{words[i]} {words[i + 1]} {words[i + 2]}");
+                double uniqueRatio = (double)tri.Distinct().Count() / tri.Count;
+                // Stopword rate: token soup is mostly punctuation/fragments and loses normal English function
+                // words, which trigram diversity alone does not catch (random fragments are all "unique").
+                string[] stop = { "a", "an", "the", "is", "are", "of", "to", "and", "in", "for", "it", "that", "they" };
+                double stopRate = (double)words.Count(w => stop.Contains(w.Trim('.', ',', ':', ';', '*', '#', '(', ')'))) / words.Length;
+                Console.WriteLine($"[{tag}] words={words.Length} uniqueTrigramRatio={uniqueRatio:F2} stopwordRate={stopRate:F2}");
+                if (uniqueRatio < 0.5)
+                    throw new Exception($"[{tag}] degenerate output (unique-trigram ratio {uniqueRatio:F2} < 0.5) " +
+                        $"- coherent-generation gate failed. Answer: '{longAnswer.Trim()}'");
+                if (stopRate < 0.10)
+                    throw new Exception($"[{tag}] degenerate output (stopword rate {stopRate:F2} < 0.10 - fragmented " +
+                        $"token soup, not English) - coherent-generation gate failed. Answer: '{longAnswer.Trim()}'");
             }
         }
         catch (UnsupportedTestException) { throw; }
