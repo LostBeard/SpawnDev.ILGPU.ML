@@ -322,6 +322,16 @@ public abstract partial class MLTestBase
     /// conv-state cache. The qwen2.5 control passes on WebGL, so it is not backend-wide. Two hypotheses already
     /// died against evidence (Reset() disposing buffers; per-call params-buffer churn), so this stops guessing
     /// and names the FIRST node whose value changes between two identical forwards.
+    ///
+    /// RESULT (2026-07-16): **GREEN on every backend incl. WebGL** - the full-recompute forward IS bit-
+    /// reproducible. So the WebGL bug is NOT forward nondeterminism (third hypothesis dead).
+    /// ⚠️ MIND THE GAP this test does NOT cover: `RunAsync` is the FULL-RECOMPUTE path, which routes ShortConv
+    /// through `ShortConvOperator` and **never touches `ShortConvStateCache`**. The pipeline's prefill is
+    /// `RunDecodeStepAsync` at pastLen=0, which DOES run the state cache (zero-pads, then snapshots the tail).
+    /// So the remaining suspect is the DECODE-path prefill / state update on WebGL, not the maths. The next
+    /// probe should capture two decode-path prefills (EnableGGUFDecode + ResetGGUFDecode between) and bit-diff
+    /// them - that needs the per-layer kvHeads/headDim geometry, so build it like
+    /// `Lfm2Decode_IncrementalMatchesFullRecompute` in MLTestBase.ShortConvTests does.
     /// </summary>
     [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy,HeavyCpu", RetryCount = 1)]
     public async Task Lfm2Trajectory_TwoIdenticalForwards_AreReproducible() => await RunTest(async accelerator =>
