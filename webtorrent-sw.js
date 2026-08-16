@@ -192,7 +192,7 @@ if (typeof window !== 'undefined') {
     }
 
     // ── WebTorrent streaming ──
-    // Protocol (matches SpawnDev.BlazorJS.WebDesktop/service-worker-fs.js exactly):
+    // Protocol (matches SpawnDev.SpawnJS.WebDesktop/service-worker-fs.js exactly):
     // 1. SW posts request to client via MessageChannel port2
     // 2. Client wires up port.OnMessage, calls port.Start(), then port.PostMessage(response)
     // 3. If response.body === 'stream_pull': SW creates ReadableStream
