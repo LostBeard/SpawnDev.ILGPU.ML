@@ -1,4 +1,4 @@
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 
 namespace SpawnDev.ILGPU.ML.Hub;
 
@@ -44,7 +44,7 @@ public class ModelHub : IDisposable
     /// </summary>
     public event Action<long, long>? OnProgress;
 
-    public ModelHub(BlazorJSRuntime js)
+    public ModelHub(SpawnJSRuntime js)
     {
         _cache = new ModelCache(js);
         _cache.OnDownloadProgress += (received, total) => OnProgress?.Invoke(received, total);

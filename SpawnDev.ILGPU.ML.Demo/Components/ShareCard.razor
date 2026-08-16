@@ -1,5 +1,5 @@
-@using SpawnDev.BlazorJS
-@inject BlazorJSRuntime JS
+@using SpawnDev.SpawnJS
+@inject SpawnJSRuntime JS
 
 @if (_isVisible)
 {
@@ -84,7 +84,7 @@
 
         try
         {
-            using var navigator = JS.Get<SpawnDev.BlazorJS.JSObjects.Navigator>("navigator");
+            using var navigator = JS.Get<SpawnDev.SpawnJS.JSObjects.Navigator>("navigator");
             using var clipboard = navigator.Clipboard;
             await clipboard.WriteText(text);
             _copied = true;

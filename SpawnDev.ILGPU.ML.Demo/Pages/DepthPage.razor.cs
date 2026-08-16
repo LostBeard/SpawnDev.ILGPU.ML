@@ -1,8 +1,8 @@
 using ILGPU;
 using ILGPU.Runtime;
 using Microsoft.AspNetCore.Components;
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
@@ -16,7 +16,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 
 public partial class DepthPage : IDisposable
 {
-    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJSRuntime JS { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private InferenceSession? _session;
@@ -127,12 +127,12 @@ public partial class DepthPage : IDisposable
 
         try
         {
-            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
-                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
-            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.SpawnJS.JSObjects.Window>("window");
             using var bitmap = await window.CreateImageBitmap(blob);
             int w = (int)bitmap.Width; int h = (int)bitmap.Height;
-            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            using var canvas = new SpawnDev.SpawnJS.JSObjects.HTMLCanvasElement();
             canvas.Width = w; canvas.Height = h;
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
@@ -304,7 +304,7 @@ public partial class DepthPage : IDisposable
         if (_accelerator == null) return;
         _canvasRenderer?.Dispose();
         _canvasRenderer = CanvasRendererFactory.Create(_accelerator);
-        using var canvasEl = new HTMLCanvasElement(canvasRef);
+        using var canvasEl = canvasRef.As<HTMLCanvasElement>();
         _canvasRenderer.AttachCanvas(canvasEl);
         _afterCanvasRef = canvasRef;
         _canvasReady = true;
@@ -338,10 +338,10 @@ public partial class DepthPage : IDisposable
         if (_afterCanvasRef == null) return;
         try
         {
-            using var canvasEl = new HTMLCanvasElement(_afterCanvasRef.Value);
+            using var canvasEl = _afterCanvasRef?.As<HTMLCanvasElement>();
             var pngUrl = canvasEl.ToDataURL("image/png");
-            using var document = JS.Get<SpawnDev.BlazorJS.JSObjects.Document>("document");
-            using var link = document.CreateElement<SpawnDev.BlazorJS.JSObjects.HTMLAnchorElement>("a");
+            using var document = JS.Get<SpawnDev.SpawnJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.SpawnJS.JSObjects.HTMLAnchorElement>("a");
             link.Href = pngUrl;
             link.Download = $"depth-{_colorPalette}.png";
             using var body = document.Body!;

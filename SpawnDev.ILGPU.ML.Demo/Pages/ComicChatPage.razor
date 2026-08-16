@@ -229,7 +229,7 @@
     private bool _isModelLoading;
     private int _nextCharId = 3;
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
     private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;

@@ -1,5 +1,5 @@
 @page "/explain"
-@using SpawnDev.BlazorJS
+@using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @implements IDisposable
 
@@ -176,7 +176,7 @@
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -229,12 +229,12 @@
         try
         {
             // Decode image
-            using var blob = new SpawnDev.BlazorJS.JSObjects.Blob(
-                new[] { imageBytes }, new SpawnDev.BlazorJS.JSObjects.BlobOptions { Type = "image/jpeg" });
-            using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+            using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.SpawnJS.JSObjects.Window>("window");
             using var bitmap = await window.CreateImageBitmap(blob);
             int w = (int)bitmap.Width; int h = (int)bitmap.Height;
-            using var canvas = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement();
+            using var canvas = new SpawnDev.SpawnJS.JSObjects.HTMLCanvasElement();
             canvas.Width = w; canvas.Height = h;
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);

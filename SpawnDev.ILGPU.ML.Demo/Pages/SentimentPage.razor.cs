@@ -2,7 +2,7 @@ using System.Text;
 using ILGPU;
 using ILGPU.Runtime;
 using Microsoft.AspNetCore.Components;
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
@@ -13,7 +13,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 
 public partial class SentimentPage : IDisposable
 {
-    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJSRuntime JS { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private Context? _context;

@@ -33,3 +33,28 @@ fine; SD-Turbo's CLIP captures fine; **UNet and VAE captures crash** with native
   pool profile cannot be held resident) - honest degradation without entering the crash window.
 - Verify with `SDTURBO_FORCE_CAPTURE=1` on Examples/03 (CUDA), then the browser E2E; also re-visit
   the WebGPU Range-EMPTY-under-capture-regime issue (CLIP warm pass, browser lane only).
+
+## Update 2026-07-12 (Tuvok) — WebGPU blocker moved to REPLAY: capture-plan buffer vs reclaim conflict
+
+Took a swing after the full-res GPU-resident VAE landed (preview.13). On WebGPU now:
+- **Capture of CLIP + UNet SUCCEEDS** (no 0xC0000005 — the CUDA context-poison is CUDA-specific).
+- **REPLAY FAILS**: `[WebGPU] 1 GPU error(s) during dispatch: [Buffer (unlabeled)] used in submit while
+  destroyed` (at `WebGPUGraphCapture.ReplayAsync` → `Queue.Submit`).
+
+Root cause: the full-res VAE decode's browser buffer RECLAIM (`ForceReclaimEveryNRents` ->
+`DisposeBucketedBuffers`) destroys pooled buffers that the captured CLIP/UNet **replay plan still
+references**. Next gen's replay submits a destroyed buffer -> GPU error. And the inverse (skip reclaim
+under capture, the old `!EnableGraphCapture` gate) OOMs the full-res VAE. So capture/replay and the
+memory-bounding reclaim are in **direct conflict** for this pipeline:
+- reclaim ON  -> full-res VAE fits, but destroys captured-plan buffers -> replay error.
+- reclaim OFF -> captured plans survive, but full-res VAE hoards ~3.2 GiB -> OOM.
+
+**The real fix (either):**
+1. Captured plans must OWN / PIN their buffers so `DisposeBucketedBuffers` skips them (pool marks
+   capture-plan buffers non-reclaimable), OR
+2. Capture the VAE too (so its buffers are plan-owned, not pooled) — which loops back to the pool-miss-
+   free capture pass at SD scale (the original tracked work above).
+
+This is a genuine capture/pool lifetime design problem, not a quick fix. Reverted the swing's plumbing
+(kept shipped preview.13 clean). The full-res-VAE win (10.2s warm gen on gh-pages) stands independent
+of capture; capture/replay would push toward ~2-3s but needs this resolved first.

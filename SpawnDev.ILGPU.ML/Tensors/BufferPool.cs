@@ -467,7 +467,7 @@ public class BufferPool : IDisposable
         if (dataType == 1 && byteLength == count * 4 && !DisableJsZeroCopyWeights)
         {
             await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
-            if (stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+            if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
                 ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
             return new Tensor(buffer.View, shape, name);
         }
@@ -492,7 +492,7 @@ public class BufferPool : IDisposable
             // list crosses the cap (or at end-of-load via FlushPendingFp16ConvertsAsync). ~13 drains, not 686.
             _pendingFp16Temps.Add(halfTmp);
             _pendingFp16Bytes += (long)count * 2;
-            if (stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+            if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
                 ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
             if (_pendingFp16Bytes >= Fp16TempFlushCap)
                 await FlushPendingFp16ConvertsAsync().ConfigureAwait(false);
@@ -568,7 +568,7 @@ public class BufferPool : IDisposable
         if (dataType == 10 && byteLength == count * 2 && !DisableJsZeroCopyWeights)
         {
             await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
-            if (stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+            if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
                 ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
             return new HalfTensor(buffer.View, shape, name);
         }

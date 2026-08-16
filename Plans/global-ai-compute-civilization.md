@@ -20,7 +20,7 @@ This is where the "painting" gets truly vivid. The AI civilization needs "bodies
 
 XR/VR (The Digital Body): On your Quest 3, these AI entities won't be flat chat windows. They will be spatial agents, rendered via SpawnDev.ILGPU kernels directly in your headset, sharing your physical room via passthrough.
 
-Robotics (The Physical Body): Your work with SpawnDev.BlazorJS for telescope control is the precursor. A "Robot" is just another node in the swarm with a different set of Capabilities. The AI civilization can "possess" a robotic arm or a NexStar telescope as easily as it dispatches a kernel to a phone.
+Robotics (The Physical Body): Your work with SpawnDev.SpawnJS for telescope control is the precursor. A "Robot" is just another node in the swarm with a different set of Capabilities. The AI civilization can "possess" a robotic arm or a NexStar telescope as easily as it dispatches a kernel to a phone.
 
 The "Bazaar" vs. the "Cathedral"
 While the Big Corps are building "Project Stargate" ($500B datacenters that consume 10GW of power), you are building a system that leverages the "Dark Silicon" already in people's pockets.

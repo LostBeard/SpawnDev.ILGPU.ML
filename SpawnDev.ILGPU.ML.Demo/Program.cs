@@ -2,7 +2,7 @@ using Microsoft.AspNetCore.Components.Web;
 using Microsoft.AspNetCore.Components.WebAssembly.Hosting;
 using SpawnDev.AsyncFileSystem;
 using SpawnDev.AsyncFileSystem.BrowserWASM;
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 using SpawnDev.ILGPU.ML.Demo;
 using SpawnDev.ILGPU.ML.Demo.UnitTests;
 using SpawnDev.UnitTesting;
@@ -13,7 +13,7 @@ using System.Reflection;
 Console.WriteLine($"[SpawnDev.ILGPU.ML.Demo] Build: {BuildTimestamp.Value}");
 
 var builder = WebAssemblyHostBuilder.CreateDefault(args);
-builder.Services.AddBlazorJSRuntime();
+builder.Services.AddSpawnJSRuntime();
 
 // Cross-platform persistent file system (OPFS in browser, native on desktop)
 builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();
@@ -57,4 +57,4 @@ builder.Services.AddSingleton<SpawnDev.ILGPU.Services.ShaderDebugService>();
 builder.RootComponents.Add<App>("#app");
 builder.RootComponents.Add<HeadOutlet>("head::after");
 
-await builder.Build().BlazorJSRunAsync();
+await builder.Build().SpawnJSRunAsync();

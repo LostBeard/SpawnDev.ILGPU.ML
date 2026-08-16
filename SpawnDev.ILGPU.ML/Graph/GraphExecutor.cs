@@ -1807,7 +1807,7 @@ public class GraphExecutor : IDisposable
                     }
                     Console.WriteLine(_sb.ToString());
                     // Browser: PMT captures console.error → browser_console.log. JS is null on desktop.
-                    SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(_sb.ToString());
+                    SpawnDev.SpawnJS.SpawnJSRuntime.Instance?.LogError(_sb.ToString());
                 }
                 // DISPATCH-ELIDE: a CPU-resolved shape op (value now in runtimeConstants) need not dispatch to the
                 // GPU — that removes its per-node orchestration (dispatch/sync/alloc), the ~1200ms CUDA residual. A

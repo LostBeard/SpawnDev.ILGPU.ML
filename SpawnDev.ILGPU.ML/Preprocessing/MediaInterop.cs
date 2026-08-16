@@ -1,5 +1,5 @@
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Preprocessing;
 
@@ -8,13 +8,13 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// Provides the fastest path from JavaScript image/video/audio sources
 /// to float tensors ready for GPU inference — minimizing copies and allocations.
 ///
-/// IMPORTANT: These methods use SpawnDev.BlazorJS typed wrappers.
+/// IMPORTANT: These methods use SpawnDev.SpawnJS typed wrappers.
 /// Never go through data URLs (base64 encode/decode) for pixel data —
 /// it's 3-4x slower than direct typed array access.
 /// </summary>
 public class MediaInterop
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
 
     // Reusable offscreen canvas to avoid allocation per frame
     private HTMLCanvasElement? _scratchCanvas;
@@ -22,7 +22,7 @@ public class MediaInterop
     private int _scratchWidth;
     private int _scratchHeight;
 
-    public MediaInterop(BlazorJSRuntime js)
+    public MediaInterop(SpawnJSRuntime js)
     {
         _js = js;
     }

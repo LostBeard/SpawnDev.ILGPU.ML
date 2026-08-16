@@ -14,7 +14,7 @@ namespace SpawnDev.ILGPU.ML;
 /// input shape - the browser twin of <see cref="CudaGraphCapture"/>.
 ///
 /// A warm WebGPU forward pays ~2,500 per-node .NET-&gt;JS dispatch encodings plus per-node drains - the
-/// dominant cost of the DAv3 77s-vs-ORT-Web-73ms gap (measured: BlazorJS interop is 14-64us/call and each
+/// dominant cost of the DAv3 77s-vs-ORT-Web-73ms gap (measured: SpawnJS interop is 14-64us/call and each
 /// dispatch spends ~100 calls' worth of crossings + payloads). Recording the dispatches ONCE into a
 /// <see cref="WebGPUDispatchPlan"/> (Dawn has no graph API, but the command encoder IS the graph recorder)
 /// and replaying them with a SINGLE interop crossing removes that entire term: per-forward cost becomes

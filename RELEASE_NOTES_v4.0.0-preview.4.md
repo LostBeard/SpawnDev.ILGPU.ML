@@ -96,7 +96,7 @@ Full changelog: [CHANGELOG.md](CHANGELOG.md)
 
 This library exists because **one person and a small team** have spent months hand-writing native C# GPU kernels, six-backend transpilers, and ML pipelines while running on a **$20/month** budget.
 
-When the budget allows it, peak output looks like **410 commits in a single day** across SpawnDev.ILGPU, SpawnDev.ILGPU.ML, SpawnDev.BlazorJS, SpawnDev.RTC, SpawnDev.WebTorrent, and the rest of the SpawnDev stack. When it doesn't, work slows to whatever individual evenings can spare.
+When the budget allows it, peak output looks like **410 commits in a single day** across SpawnDev.ILGPU, SpawnDev.ILGPU.ML, SpawnDev.SpawnJS, SpawnDev.RTC, SpawnDev.WebTorrent, and the rest of the SpawnDev stack. When it doesn't, work slows to whatever individual evenings can spare.
 
 **We're asking for $200/month total in GitHub Sponsorships to put the full crew back on the ship.** That's the gap between this preview and the next ten - every remaining operator family migrated to the new Tensor API, every pipeline verified end-to-end on every backend, FP16 attention, Flash Attention on WebGPU, Llama and Phi-4 LLM inference, full text-to-image diffusion through SD-Turbo, P2P distributed compute through SpawnDev.WebTorrent. It's all in flight; the bottleneck is hours, not ideas.
 

@@ -1,13 +1,14 @@
 @page "/ai-chat"
-@using global::ILGPU.Runtime
 @using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
 @using SpawnDev.ILGPU.ML.Preprocessing
-@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.SpawnJS
+@using SpawnDev.SpawnJS.JSObjects
 @using SpawnDev.WebTorrent
-@using SpawnDev.BlazorJS
+@using global::ILGPU.Runtime
 @implements IAsyncDisposable
-@inject BlazorJSRuntime JS
+@inject SpawnJSRuntime JS
 @inject WebTorrentClient WebTorrent
 @inject HttpClient Http
 
@@ -348,7 +349,7 @@ string answer = await pipe.GenerateAsync(convo,
 
     async Task ScrollToBottom()
     {
-        try { using var el = new SpawnDev.BlazorJS.JSObjects.HTMLElement(_transcriptRef); el.ScrollTop = el.ScrollHeight; }
+        try { using var el = _transcriptRef.As<HTMLElement>(); el.ScrollTop = el.ScrollHeight; }
         catch { /* transcript not mounted yet */ }
     }
 

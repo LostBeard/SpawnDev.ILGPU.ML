@@ -12,7 +12,7 @@ public static partial class OnnxParser
     /// Parse an ONNX model from raw bytes - the WHOLE model must already be in the managed heap.
     /// <para>
     /// In Blazor WASM prefer <see cref="ParseFromStreamAsync"/> over a seekable JS-backed stream (an
-    /// <see cref="SpawnDev.BlazorJS.Toolbox.IJSReadStream"/> - WebTorrent piece stream / <c>HttpRangeStream</c> /
+    /// <see cref="SpawnDev.SpawnJS.Toolbox.IJSReadStream"/> - WebTorrent piece stream / <c>HttpRangeStream</c> /
     /// <c>BlobStream</c>): it records each large weight's stream offset instead of materializing it, so the
     /// loader uploads weights JS-side to the GPU (zero JS&lt;-&gt;.NET copy) and inspection seeks past them.
     /// This byte[] overload is retained as the SYNC path and as the FALLBACK for the few model encodings the

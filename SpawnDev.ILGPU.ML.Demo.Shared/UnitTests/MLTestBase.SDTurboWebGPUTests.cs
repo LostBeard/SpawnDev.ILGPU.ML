@@ -461,7 +461,7 @@ public abstract partial class MLTestBase
                 // JS.LogError => console.error, which PMT captures (dumps the text) WITHOUT tripping
                 // #blazor-error-ui (info-level Console.WriteLine is summarized-away by PMT). Same pattern as
                 // SDTurboProfile. Does not fail the test.
-                SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError("[SDTurbo-PerStep] " + report);
+                SpawnDev.SpawnJS.SpawnJSRuntime.Instance?.LogError("[SDTurbo-PerStep] " + report);
                 return report;
             }
         }

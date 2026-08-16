@@ -295,8 +295,8 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("hub/browser path gate runs once, on the WebGPU lane");
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
-        var js = SpawnDev.BlazorJS.BlazorJSRuntime.JS;
-        if (js == null) throw new UnsupportedTestException("BlazorJSRuntime not available (not a browser lane)");
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (!js.IsBrowser) throw new UnsupportedTestException("SpawnJSRuntime not available (not a browser lane)");
 
         var httpBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");

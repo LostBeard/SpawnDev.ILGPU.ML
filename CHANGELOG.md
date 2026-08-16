@@ -127,13 +127,13 @@ The final image is packed to RGBA by a **GPU kernel** (`ElementWiseKernels.NchwD
 Whisper (`AudioPipelines`) and GPT-2 greedy (`TextGenerationPipeline`) decode read the **entire ~50K-float vocab to the host every token** then argmaxed on the CPU. Greedy now selects **on the GPU** via `GpuArgMax` — reads back one index, tie-break lowest-index, **bit-exact vs the DistilGPT-2==ORT greedy reference** (`TextGen_ReadbackCache_MatchesReference`). GPT-2 sampling (which genuinely needs the host distribution) now **reuses one readback buffer** across tokens + a native `CopyFrom`, instead of a per-token GPU allocation + a `Scale` temp-dispatch.
 
 ### ⬆️ Dependencies
-**SpawnDev.ILGPU 4.17.6** + **SpawnDev.BlazorJS 3.5.25** — heap-view **re-attach** replaces priming (a `memory.grow`-detached view is re-created on revive; `HeapView.UsePrimer` defaults false) + a cross-origin-`Window` `_in` `SecurityError` fix. Also retained: a `GraphExecutor` break-stranded-buffer reclaim for the **opt-in** tiled decode path (the earlier per-gen GPU-process leak fix, now off the default path). Carries preview.11's dispatch-elide default-on (~1.9x SD-Turbo WebGPU).
+**SpawnDev.ILGPU 4.17.6** + **SpawnDev.SpawnJS 3.5.25** — heap-view **re-attach** replaces priming (a `memory.grow`-detached view is re-created on revive; `HeapView.UsePrimer` defaults false) + a cross-origin-`Window` `_in` `SecurityError` fix. Also retained: a `GraphExecutor` break-stranded-buffer reclaim for the **opt-in** tiled decode path (the earlier per-gen GPU-process leak fix, now off the default path). Carries preview.11's dispatch-elide default-on (~1.9x SD-Turbo WebGPU).
 
 ## 4.0.0-preview.12 (2026-07-11)
 
 ### 🐛 SD-Turbo WebGPU image-gen "external Instance reference no longer exists" crash FIXED (dependency: SpawnDev.ILGPU 4.17.5)
 
-The live SD-Turbo WebGPU image-gen (`/v1/images/generations`) crashed with **"A valid external Instance reference no longer exists"** under real managed-heap pressure (a co-resident LLM worker + the elide path's transient `float[]` allocations). Root cause was in SpawnDev.ILGPU: the browser backends' zero-copy `CopyFrom` upload paths viewed the WASM heap through the unprimed `HeapView.GetHeapBuffer()`, so a `memory.grow` (triggered by managed allocation) could **detach** the heap view mid-upload. Fixed in **SpawnDev.ILGPU 4.17.5** (wrap via `HeapViewPtr`, which primes the heap) + **SpawnDev.BlazorJS 3.5.21** (prime once per grow-epoch, not per view — so hot upload loops don't pay a forced GC each). No ML code change; this is a dependency bump (ILGPU 4.17.4→4.17.5, BlazorJS 3.5.20→3.5.21). Carries all of preview.11 (dispatch-elide default-on, ~1.9x SD-Turbo).
+The live SD-Turbo WebGPU image-gen (`/v1/images/generations`) crashed with **"A valid external Instance reference no longer exists"** under real managed-heap pressure (a co-resident LLM worker + the elide path's transient `float[]` allocations). Root cause was in SpawnDev.ILGPU: the browser backends' zero-copy `CopyFrom` upload paths viewed the WASM heap through the unprimed `HeapView.GetHeapBuffer()`, so a `memory.grow` (triggered by managed allocation) could **detach** the heap view mid-upload. Fixed in **SpawnDev.ILGPU 4.17.5** (wrap via `HeapViewPtr`, which primes the heap) + **SpawnDev.SpawnJS 3.5.21** (prime once per grow-epoch, not per view — so hot upload loops don't pay a forced GC each). No ML code change; this is a dependency bump (ILGPU 4.17.4→4.17.5, SpawnJS 3.5.20→3.5.21). Carries all of preview.11 (dispatch-elide default-on, ~1.9x SD-Turbo).
 
 ## 4.0.0-preview.11 (2026-07-11)
 
@@ -185,9 +185,9 @@ Two independent WebGPU wins for the SD-Turbo image pipeline, measured on an RTX 
 
 ## 4.0.0-preview.7 (2026-07-04)
 
-### 🔧 Storage-quota browser-download runaway fixed via dependency bump — WebTorrent 3.2.12 + BlazorJS 3.5.15 (Tuvok)
+### 🔧 Storage-quota browser-download runaway fixed via dependency bump — WebTorrent 3.2.12 + SpawnJS 3.5.15 (Tuvok)
 
-Bumps `SpawnDev.WebTorrent` 3.2.11 → **3.2.12** and `SpawnDev.BlazorJS` 3.5.14 → **3.5.15** to pull in the OPFS storage-quota runaway fix. Previously, a browser model download whose OPFS piece store failed (the origin out of space) would re-request the same piece forever - 169 identical range GETs observed live on the 1.5B model - because the failing write leaked an OPFS swap file per attempt (BlazorJS) and the picker re-requested the unflagged piece (WebTorrent). Now the write aborts-on-throw (no swap leak) and the torrent classifies the failure and pauses with an `OnError` event instead of hot-looping. The successful download/decode path is byte-identical - this only changes the out-of-space failure behavior. No ML API change.
+Bumps `SpawnDev.WebTorrent` 3.2.11 → **3.2.12** and `SpawnDev.SpawnJS` 3.5.14 → **3.5.15** to pull in the OPFS storage-quota runaway fix. Previously, a browser model download whose OPFS piece store failed (the origin out of space) would re-request the same piece forever - 169 identical range GETs observed live on the 1.5B model - because the failing write leaked an OPFS swap file per attempt (SpawnJS) and the picker re-requested the unflagged piece (WebTorrent). Now the write aborts-on-throw (no swap leak) and the torrent classifies the failure and pauses with an `OnError` event instead of hot-looping. The successful download/decode path is byte-identical - this only changes the out-of-space failure behavior. No ML API change.
 
 ### 🔧 DA2 content-free depth FIXED: FuseAttention double-scaled Q-pre-scaled ViT attention (Seven)
 
@@ -1475,5 +1475,5 @@ The SpawnDev Crew:
 - **LostBeard** (Todd Tanner) — captain, library author, vision.
 - **Data** — operations officer, ML library lead.
 - **Geordi** — chief engineer, ILGPU internals and GPU kernels.
-- **Riker** — first officer, WebRTC / WebTorrent / BlazorJS plumbing.
+- **Riker** — first officer, WebRTC / WebTorrent / SpawnJS plumbing.
 - **Tuvok** — security/research officer, codecs, design review.

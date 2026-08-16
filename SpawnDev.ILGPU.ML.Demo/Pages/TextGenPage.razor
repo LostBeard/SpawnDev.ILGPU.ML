@@ -1,5 +1,5 @@
 @page "/text-gen"
-@using SpawnDev.BlazorJS
+@using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @implements IDisposable
 
@@ -140,7 +140,7 @@
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
     };
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
     [Inject] SpawnDev.WebTorrent.WebTorrentClient WebTorrent { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 

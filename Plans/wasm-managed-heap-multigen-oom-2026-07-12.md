@@ -5,7 +5,7 @@ Status: **OPEN / tracked** (deferred, NOT gating preview.13). Opened 2026-07-12 
 ## What is observed (evidence, not hypothesis)
 
 Running `WebGPUTests.SDTurbo_WebGPU_ElideAB` (a 2-generation A/B: elide-on vs elide-off,
-held simultaneously for a pixel-diff compare) on the RTX 4070 under BlazorJS 3.5.25 +
+held simultaneously for a pixel-diff compare) on the RTX 4070 under SpawnJS 3.5.25 +
 ILGPU 4.17.6 + ML preview.13 fails:
 
 ```

@@ -258,7 +258,7 @@ public abstract partial class MLTestBase
             }
             if (shown == 0) sb.Append(" (none)");
             var report = sb.ToString();
-            SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(report);
+            SpawnDev.SpawnJS.SpawnJSRuntime.Instance?.LogError(report);
             Console.WriteLine(report);
             // REGRESSION GUARD: the CPU shape interpreter MUST match the GPU for every resolved shape op, or
             // eliding it corrupts the result. mm>0 = a shape-interp op diverges from GPU truth (the integer

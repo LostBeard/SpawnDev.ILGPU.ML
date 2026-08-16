@@ -1,5 +1,5 @@
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 using SpawnDev.ILGPU.ML.Preprocessing;
 
 namespace SpawnDev.ILGPU.ML.Demo.UI.Services;
@@ -7,14 +7,14 @@ namespace SpawnDev.ILGPU.ML.Demo.UI.Services;
 /// <summary>
 /// Reliable image decoding for ML inference.
 /// Handles JPEG/PNG/WebP → RGBA int[] with validation.
-/// Uses browser-native decoding via canvas (SpawnDev.BlazorJS),
+/// Uses browser-native decoding via canvas (SpawnDev.SpawnJS),
 /// with fallback to our PNG decoder for PNG files.
 /// </summary>
 public class ImageDecodeHelper
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
 
-    public ImageDecodeHelper(BlazorJSRuntime js) => _js = js;
+    public ImageDecodeHelper(SpawnJSRuntime js) => _js = js;
 
     /// <summary>
     /// Decode image file bytes (JPEG/PNG/WebP) to RGBA int[] pixels.
@@ -56,7 +56,7 @@ public class ImageDecodeHelper
 
     /// <summary>
     /// Decode via browser canvas (JPEG, WebP, and complex PNGs).
-    /// Uses SpawnDev.BlazorJS — no raw JavaScript.
+    /// Uses SpawnDev.SpawnJS — no raw JavaScript.
     /// </summary>
     private async Task<(int[] Pixels, int Width, int Height)> DecodeViaCanvasAsync(byte[] imageFileBytes)
     {

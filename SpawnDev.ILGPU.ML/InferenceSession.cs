@@ -1136,7 +1136,7 @@ public class InferenceSession : IDisposable
         // source is a browser zero-copy stream (IJSReadStream = the hub in production) — where zero-copy IS
         // available so a bulk CopyFromCPU is a genuine regression. A plain .NET stream (MemoryStream in
         // equivalence tests, or desktop) legitimately CopyFromCPUs (no zero-copy source), so don't guard it.
-        bool _guardHostCopy = stream is SpawnDev.BlazorJS.Toolbox.IJSReadStream;
+        bool _guardHostCopy = stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream;
         if (_guardHostCopy) SpawnDev.ILGPU.BrowserBufferPolicy.StrictHostCopyMaxBytes = 65536;
         try
         {

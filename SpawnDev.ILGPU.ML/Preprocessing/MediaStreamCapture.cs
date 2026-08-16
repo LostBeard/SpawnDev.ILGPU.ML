@@ -1,5 +1,5 @@
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Preprocessing;
 
@@ -17,7 +17,7 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// </summary>
 public class MediaStreamCapture : IDisposable
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
     private readonly MediaInterop _interop;
     private MediaStream? _stream;
     private HTMLVideoElement? _video;
@@ -50,7 +50,7 @@ public class MediaStreamCapture : IDisposable
     /// <summary>Skip frames with motion below this threshold. 0 = never skip.</summary>
     public float MotionThreshold { get; set; }
 
-    public MediaStreamCapture(BlazorJSRuntime js)
+    public MediaStreamCapture(SpawnJSRuntime js)
     {
         _js = js;
         _interop = new MediaInterop(js);

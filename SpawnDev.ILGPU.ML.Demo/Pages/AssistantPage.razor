@@ -268,7 +268,7 @@
     private double _totalInferenceMs;
     private List<ChatMessage> _messages = new();
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
     private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;

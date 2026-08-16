@@ -1,6 +1,6 @@
-@using SpawnDev.BlazorJS
-@using SpawnDev.BlazorJS.JSObjects
-@inject BlazorJSRuntime JS
+@using SpawnDev.SpawnJS
+@using SpawnDev.SpawnJS.JSObjects
+@inject SpawnJSRuntime JS
 @implements IAsyncDisposable
 
 <div class="webcam-container">
@@ -57,7 +57,7 @@
             });
 
             // Attach stream to video element
-            using var videoEl = new HTMLVideoElement(_videoRef);
+            using var videoEl = _videoRef.As<HTMLVideoElement>();
             videoEl.SrcObject = _stream;
 
             _isStreaming = true;
@@ -77,7 +77,7 @@
         _isStreaming = false;
         if (_stream != null)
         {
-            var tracks = _stream.GetTracks();
+            var tracks = _stream.GetTracks().ToArray();
             foreach (var track in tracks)
             {
                 track.Stop();
@@ -94,7 +94,7 @@
 
         try
         {
-            using var videoEl = new HTMLVideoElement(_videoRef);
+            using var videoEl = _videoRef.As<HTMLVideoElement>();
             int w = (int)videoEl.VideoWidth;
             int h = (int)videoEl.VideoHeight;
             if (w == 0 || h == 0) return;

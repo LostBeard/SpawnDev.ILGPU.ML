@@ -1,7 +1,7 @@
 using System.Reflection;
 using System.Text.Json;
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Demo;
 
@@ -13,7 +13,7 @@ internal static class BuildChangeTracker
 {
     private const string StorageKey = "spawndev_ilgpu_ml_build_state";
 
-    public static void PrintDiff(BlazorJSRuntime js)
+    public static void PrintDiff(SpawnJSRuntime js)
     {
         try
         {
@@ -83,7 +83,7 @@ internal static class BuildChangeTracker
         return state;
     }
 
-    private static string? ReadFromStorage(BlazorJSRuntime js)
+    private static string? ReadFromStorage(SpawnJSRuntime js)
     {
         try
         {
@@ -94,7 +94,7 @@ internal static class BuildChangeTracker
         catch { return null; }
     }
 
-    private static void WriteToStorage(BlazorJSRuntime js, string json)
+    private static void WriteToStorage(SpawnJSRuntime js, string json)
     {
         try
         {

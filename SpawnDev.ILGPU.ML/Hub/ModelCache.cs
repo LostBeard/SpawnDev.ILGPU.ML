@@ -1,5 +1,5 @@
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Hub;
 
@@ -14,7 +14,7 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// </summary>
 public class ModelCache : IDisposable
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
     private FileSystemDirectoryHandle? _cacheDir;
     private bool _initialized;
 
@@ -27,7 +27,7 @@ public class ModelCache : IDisposable
     /// </summary>
     public event Action<long, long>? OnDownloadProgress;
 
-    public ModelCache(BlazorJSRuntime js)
+    public ModelCache(SpawnJSRuntime js)
     {
         _js = js;
     }

@@ -24,7 +24,7 @@ public static class OnnxLoader
     /// <para>
     /// MATERIALIZES THE WHOLE MODEL in the managed heap (parses every weight to <c>float[]</c>). In Blazor
     /// WASM prefer the streaming load path - <see cref="InferenceSession.CreateFromOnnxStreamAsync"/> over a
-    /// seekable JS-backed <see cref="System.IO.Stream"/> (an <see cref="SpawnDev.BlazorJS.Toolbox.IJSReadStream"/>
+    /// seekable JS-backed <see cref="System.IO.Stream"/> (an <see cref="SpawnDev.SpawnJS.Toolbox.IJSReadStream"/>
     /// such as a WebTorrent piece stream / <c>HttpRangeStream</c> / <c>BlobStream</c>) - which streams each
     /// weight JS-side straight to the GPU via <c>CopyFromJS</c> without ever entering the .NET heap.
     /// </para>

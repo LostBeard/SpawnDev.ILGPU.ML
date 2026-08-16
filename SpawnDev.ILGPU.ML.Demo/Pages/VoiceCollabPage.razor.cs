@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Components;
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 using System.Net.Http.Json;
 using System.Text.Json;
 
@@ -8,7 +8,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 
 public partial class VoiceCollabPage : IDisposable
 {
-    [Inject] BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJSRuntime JS { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     // State

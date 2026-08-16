@@ -1,4 +1,4 @@
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 using SpawnDev.ILGPU.ML.Demo.UI.Services;
 using SpawnDev.ILGPU.ML.Preprocessing;
 
@@ -13,10 +13,10 @@ namespace SpawnDev.ILGPU.ML.Demo.UI.Pages;
 /// </summary>
 public class SuperResPageHelper
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
     private readonly ImageDecodeHelper _decoder;
 
-    public SuperResPageHelper(BlazorJSRuntime js)
+    public SuperResPageHelper(SpawnJSRuntime js)
     {
         _js = js;
         _decoder = new ImageDecodeHelper(js);

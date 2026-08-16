@@ -1,5 +1,5 @@
 @page "/face"
-@using SpawnDev.BlazorJS
+@using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
@@ -123,7 +123,7 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;

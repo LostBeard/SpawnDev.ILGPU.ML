@@ -1,4 +1,4 @@
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 using SpawnDev.ILGPU.ML.Demo.UI.Services;
 using SpawnDev.ILGPU.ML.Preprocessing;
 
@@ -14,12 +14,12 @@ namespace SpawnDev.ILGPU.ML.Demo.UI.Pages;
 /// </summary>
 public class StylePageHelper
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
     private readonly ImageDecodeHelper _decoder;
 
     public static readonly string[] AvailableStyles = { "mosaic", "candy", "rain-princess", "udnie", "pointilism" };
 
-    public StylePageHelper(BlazorJSRuntime js)
+    public StylePageHelper(SpawnJSRuntime js)
     {
         _js = js;
         _decoder = new ImageDecodeHelper(js);

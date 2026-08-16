@@ -147,7 +147,7 @@ public class Tensor
     /// Stream this tensor's raw fp32 GPU bytes OUT to <paramref name="target"/> in bounded chunks (default
     /// 16 MiB) — the SAVE mirror of the streaming-load path (<c>BufferPool.AllocatePermanentFromStreamAsync</c> /
     /// <c>CopyFromStreamAsync</c>). On the browser backends, when <paramref name="target"/> implements
-    /// <c>SpawnDev.BlazorJS.Toolbox.IJSWriteStream</c> (e.g. an OPFS <c>FileSystemHandleWritableStream</c>), each
+    /// <c>SpawnDev.SpawnJS.Toolbox.IJSWriteStream</c> (e.g. an OPFS <c>FileSystemHandleWritableStream</c>), each
     /// chunk goes GPU→JS <c>Uint8Array</c>→stream WITHOUT entering the .NET/WASM managed heap — so a large tensor
     /// (e.g. a 588&#160;MB scene buffer) exports with one 16&#160;MiB chunk resident, never the whole buffer (no
     /// OOM). Desktop backends stream via a managed chunk buffer. Writes <c>ElementCount * 4</c> bytes.

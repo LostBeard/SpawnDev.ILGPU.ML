@@ -131,10 +131,11 @@
     }
 </style>
 
-@using SpawnDev.BlazorJS
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.SpawnJS
+@using SpawnDev.SpawnJS.JSObjects
 @implements IDisposable
 
 @code {
@@ -168,7 +169,7 @@ await renderer.PresentAsync(depthBuffer);
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
     };
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -255,7 +256,7 @@ await renderer.PresentAsync(depthBuffer);
             if (_canvasRenderer == null)
             {
                 _canvasRenderer = SpawnDev.ILGPU.Rendering.CanvasRendererFactory.Create(_accelerator);
-                using var canvasEl = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_depthCanvas);
+                using var canvasEl = _depthCanvas.As<HTMLCanvasElement>();
                 _canvasRenderer.AttachCanvas(canvasEl);
             }
 

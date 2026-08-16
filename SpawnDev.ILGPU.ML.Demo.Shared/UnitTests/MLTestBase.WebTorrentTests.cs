@@ -244,7 +244,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("buffer is not IBrowserMemoryBuffer (CopyFromJS unavailable)");
 
         // A: zero-copy JS -> GPU (the new fp16 path)
-        using (var u8 = new SpawnDev.BlazorJS.JSObjects.Uint8Array(srcBytes))
+        using (var u8 = new SpawnDev.SpawnJS.JSObjects.Uint8Array(srcBytes))
             ibm.CopyFromJS(u8);
         var gotJs = await bufJs.CopyToHostAsync();
 

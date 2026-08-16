@@ -1,4 +1,6 @@
 @page "/style"
+@using SpawnDev.SpawnJS
+@using SpawnDev.SpawnJS.JSObjects
 
 <PageTitle>Style Transfer — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -255,7 +257,7 @@ const out = await pipe(imageUrl);
             if (_canvasRenderer == null)
             {
                 _canvasRenderer = SpawnDev.ILGPU.Rendering.CanvasRendererFactory.Create(_accelerator);
-                using var canvasEl = new SpawnDev.BlazorJS.JSObjects.HTMLCanvasElement(_outputCanvas);
+                using var canvasEl = _outputCanvas.As<HTMLCanvasElement>();
                 _canvasRenderer.AttachCanvas(canvasEl);
             }
 

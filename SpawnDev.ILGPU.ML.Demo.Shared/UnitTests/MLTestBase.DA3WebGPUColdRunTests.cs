@@ -1,6 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 using SpawnDev.UnitTesting;
 using System.Diagnostics;
 
@@ -181,16 +181,16 @@ public abstract partial class MLTestBase
     {
         if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
             throw new UnsupportedTestException($"{accelerator.AcceleratorType}: WebGPU-only adapter probe");
-        var JS = SpawnDev.BlazorJS.BlazorJSRuntime.JS;
-        using var gpu = JS.Get<SpawnDev.BlazorJS.JSObject>("navigator.gpu");
+        var JS = SpawnJSRuntime.Instance;
+        using var gpu = JS.Get<SpawnJSObject>("navigator.gpu");
         if (gpu == null) throw new Exception("navigator.gpu missing");
-        using var adapter = await gpu.JSRef!.CallAsync<SpawnDev.BlazorJS.JSObject>("requestAdapter");
+        using var adapter = await gpu.JSRef!.CallAsync<SpawnJSObject>("requestAdapter");
         if (adapter == null) throw new Exception("requestAdapter returned null");
         string vendor = "?", arch = "?", device = "?", desc = "?";
         bool fallback = false;
         try
         {
-            using var info = adapter.JSRef!.Get<SpawnDev.BlazorJS.JSObject?>("info");
+            using var info = adapter.JSRef!.Get<SpawnJSObject?>("info");
             if (info != null)
             {
                 vendor = info.JSRef!.Get<string?>("vendor") ?? "?";

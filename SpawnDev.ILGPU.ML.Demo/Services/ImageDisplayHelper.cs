@@ -1,5 +1,5 @@
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Demo.Services;
 
@@ -13,7 +13,7 @@ public static class ImageDisplayHelper
     /// Convert RGBA int[] to a base64 PNG data URL.
     /// Each int is packed as R | (G << 8) | (B << 16) | (A << 24).
     /// </summary>
-    public static string ToDataUrl(BlazorJSRuntime js, int[] rgbaPixels, int width, int height)
+    public static string ToDataUrl(SpawnJSRuntime js, int[] rgbaPixels, int width, int height)
     {
         using var canvas = new HTMLCanvasElement();
         canvas.Width = width;
@@ -44,7 +44,7 @@ public static class ImageDisplayHelper
     /// Convert RGBA byte[] to a base64 PNG data URL.
     /// Byte layout: [R, G, B, A, R, G, B, A, ...] — 4 bytes per pixel.
     /// </summary>
-    public static string ToDataUrl(BlazorJSRuntime js, byte[] rgbaBytes, int width, int height)
+    public static string ToDataUrl(SpawnJSRuntime js, byte[] rgbaBytes, int width, int height)
     {
         using var canvas = new HTMLCanvasElement();
         canvas.Width = width;

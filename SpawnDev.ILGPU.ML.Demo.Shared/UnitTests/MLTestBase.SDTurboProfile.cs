@@ -74,7 +74,7 @@ public abstract partial class MLTestBase
                 // JS.LogError writes console.error (PMT captures the text) WITHOUT tripping #blazor-error-ui,
                 // so the test stays green (Console.Error would redden it). Normal Console.WriteLine isn't
                 // surfaced in PMT's summarized console output, hence the explicit LogError.
-                SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError("[SDTURBO-PROFILE] " + report);
+                SpawnDev.SpawnJS.SpawnJSRuntime.Instance?.LogError("[SDTURBO-PROFILE] " + report);
                 return report;
             }
         }
@@ -151,7 +151,7 @@ public abstract partial class MLTestBase
                     sb.Append($"{k}={ordered[i].Value:F0}ms/{cntType[k]}n/{ordered[i].Value / cntType[k]:F2}avg({100 * ordered[i].Value / tot:F1}%); ");
                 }
                 var report = sb.ToString();
-                SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(report);
+                SpawnDev.SpawnJS.SpawnJSRuntime.Instance.LogError(report);
                 return report;
             }
         }
@@ -228,7 +228,7 @@ public abstract partial class MLTestBase
                 double mean = sum / px, std = Math.Sqrt(Math.Max(0, sumSq / px - mean * mean));
                 double aMs = swA.Elapsed.TotalMilliseconds, bMs = swB.Elapsed.TotalMilliseconds;
                 var report = $"[SDTURBO-ELIDE-AB] elideOFF={aMs:F0}ms/{dispA}disp -> elideON={bMs:F0}ms/{dispB}disp = {(bMs > 0 ? aMs / bMs : 0):F2}x faster ({dispA - dispB} fewer dispatches); elideON image std={std:F1} nz={nz}/{px}; A-vs-B pixel-diff={diffPx:F0}/{px} ({(px > 0 ? 100.0 * diffPx / px : 0):F2}%)";
-                SpawnDev.BlazorJS.BlazorJSRuntime.JS?.LogError(report);
+                SpawnDev.SpawnJS.SpawnJSRuntime.Instance?.LogError(report);
                 if (std < 5.0) throw new Exception($"elide-ON image degenerate (std={std:F1}) - elide broke SD-Turbo. {report}");
                 // Elide is a PURE orchestration no-op (CPU-resolve shape ops instead of dispatching them) - it must
                 // NOT change any FEATURE math, so the elide-ON image must be bit-identical to elide-OFF. The CLIP

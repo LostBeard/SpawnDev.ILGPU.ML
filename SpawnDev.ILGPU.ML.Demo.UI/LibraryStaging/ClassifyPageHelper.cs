@@ -1,5 +1,5 @@
 using Microsoft.AspNetCore.Components;
-using SpawnDev.BlazorJS;
+using SpawnDev.SpawnJS;
 using SpawnDev.ILGPU.ML.Demo.UI.Services;
 using SpawnDev.ILGPU.ML.Preprocessing;
 
@@ -12,11 +12,11 @@ namespace SpawnDev.ILGPU.ML.Demo.UI.Pages;
 /// </summary>
 public class ClassifyPageHelper
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
     private readonly HttpClient _http;
     private readonly ImageDecodeHelper _decoder;
 
-    public ClassifyPageHelper(BlazorJSRuntime js, HttpClient http)
+    public ClassifyPageHelper(SpawnJSRuntime js, HttpClient http)
     {
         _js = js;
         _http = http;

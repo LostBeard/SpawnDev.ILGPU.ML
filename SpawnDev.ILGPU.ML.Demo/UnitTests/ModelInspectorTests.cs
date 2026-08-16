@@ -1,6 +1,6 @@
 using System.Text;
-using SpawnDev.BlazorJS.Toolbox;
-using Blob = SpawnDev.BlazorJS.JSObjects.Blob; // alias to avoid JSObjects.Array vs System.Array collision
+using SpawnDev.SpawnJS.Toolbox;
+using Blob = SpawnDev.SpawnJS.JSObjects.Blob; // alias to avoid JSObjects.Array vs System.Array collision
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Onnx;
 using SpawnDev.UnitTesting;
@@ -547,7 +547,7 @@ public class ModelInspectorTests
 
     /// <summary>
     /// GOLD-STANDARD end-to-end proof of the InspectorPage path: wrap a REAL JS <see cref="Blob"/>
-    /// (what a dropped File is) in the REAL <c>SpawnDev.BlazorJS.Toolbox.BlobStream</c> and inspect it —
+    /// (what a dropped File is) in the REAL <c>SpawnDev.SpawnJS.Toolbox.BlobStream</c> and inspect it —
     /// exactly what <c>InspectorPage.FileInput_OnChange</c> does. BlobStream is async-only (sync Read
     /// throws) and seekable (Seek is pointer math), backed by HeapView for zero-copy throughput. If the
     /// inspector did any synchronous source read, this throws NotSupportedException. The result must match
@@ -752,7 +752,7 @@ file sealed class CountingSeekableStream : Stream
 }
 
 /// <summary>
-/// Seekable stream over a byte[] that mirrors <c>SpawnDev.BlazorJS.Toolbox.BlobStream</c>'s contract:
+/// Seekable stream over a byte[] that mirrors <c>SpawnDev.SpawnJS.Toolbox.BlobStream</c>'s contract:
 /// CanSeek is true and Seek is pure pointer math (no I/O), synchronous <see cref="Read(byte[],int,int)"/>
 /// THROWS, only <see cref="ReadAsync(byte[],int,int,CancellationToken)"/> works, and the
 /// <c>Memory&lt;byte&gt;</c> overload is intentionally NOT overridden — so the base class routes it to the

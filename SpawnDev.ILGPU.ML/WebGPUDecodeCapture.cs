@@ -6,6 +6,7 @@ using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML;
 
@@ -46,17 +47,17 @@ public sealed class WebGPUDecodeCapture : IDisposable
     // library root-cause tracked separately) and made the first patched replay 456ms/tok.
     private readonly List<(int SnapIdx, int ByteOfs, int ValAtP0, int Slope)> _scalarPatches;
     private readonly List<(int EntryIdx, double DstAtP0, double Slope)> _copyPatches;
-    private sealed record SlotPatch(SpawnDev.BlazorJS.JSObjects.GPUBuffer Buf, long ByteOfs,
+    private sealed record SlotPatch(SpawnDev.SpawnJS.JSObjects.GPUBuffer Buf, long ByteOfs,
         System.Array Template, int[] Indices, long[] Slopes, bool IsFloat, byte[] Scratch);
     private readonly List<SlotPatch> _slotPatches;
     private readonly int[] _copyEntryIdx;
     private readonly double[] _copyOfsScratch;
-    private readonly SpawnDev.BlazorJS.JSObjects.GPUQueue _queue;
-    private readonly SpawnDev.BlazorJS.JSObjects.GPUBuffer _inputRawBuf;
+    private readonly SpawnDev.SpawnJS.JSObjects.GPUQueue _queue;
+    private readonly SpawnDev.SpawnJS.JSObjects.GPUBuffer _inputRawBuf;
     private readonly long _inputRawOfs;
 
     /// <summary>Raw (GPUBuffer, byteOffset) of a contiguous WebGPU view - the fast-write handle.</summary>
-    private static (SpawnDev.BlazorJS.JSObjects.GPUBuffer Buf, long ByteOfs) RawOf(IContiguousArrayView view)
+    private static (SpawnDev.SpawnJS.JSObjects.GPUBuffer Buf, long ByteOfs) RawOf(IContiguousArrayView view)
     {
         var mb = view.Buffer as WebGPUMemoryBuffer
             ?? throw new InvalidOperationException("view is not backed by a WebGPU buffer");
@@ -440,8 +441,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
             _logitsHost = new float[_vocab];
         }
         using (var u8 = await _logitsMb.CopyToHostUint8ArrayAsync(_logitsByteOfs, (long)_vocab * 4))   // the ONLY per-token fence
-        using (var hv = new SpawnDev.BlazorJS.Toolbox.HeapView<float>(_logitsHost!))
-        using (var pinned = hv.As<SpawnDev.BlazorJS.JSObjects.Uint8Array>())
+        using (var hv = new HeapView<float>(_logitsHost!))
+        using (var pinned = hv.As<SpawnDev.SpawnJS.JSObjects.Uint8Array>())
             pinned.Set(u8);
         var logits = _logitsHost!;
         var t3 = System.Diagnostics.Stopwatch.GetTimestamp();

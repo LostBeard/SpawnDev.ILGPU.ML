@@ -126,7 +126,7 @@
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
 </style>
 
-@using SpawnDev.BlazorJS
+@using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
@@ -177,7 +177,7 @@ const similarity = cos_sim(a.data, b.data);
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
     };
 
-    [Inject] BlazorJS.BlazorJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;

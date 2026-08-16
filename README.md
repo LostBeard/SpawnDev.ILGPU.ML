@@ -466,7 +466,7 @@ Most demo pages run real models on your GPU in your browser — but not all are 
 - **Pipeline Composer** — a visual node editor for building/training pipelines without code. *Design only — there is no Pipeline Composer page yet.*
 - **Progressive Enhancement story page** — an animated Wasm→WebGL→WebGPU speedup walkthrough. *No dedicated page yet.*
 - **Offline Mode toggle** — "toggle airplane mode, inference still runs." *Not wired as a global toggle yet.*
-- **Collaborative Canvas** — Multiple users on different devices, all running the same model, real-time via WebRTC (using SpawnDev.BlazorJS). Multi-device ML collaboration, all in-browser.
+- **Collaborative Canvas** — Multiple users on different devices, all running the same model, real-time via WebRTC (using SpawnDev.SpawnJS). Multi-device ML collaboration, all in-browser.
 - **Model-to-Model Pipeline** — Photo → depth estimation → 3D point cloud → style transfer on the texture → render. Three ML models + 3D rendering, all on GPU, no server, one C# codebase. The ultimate SpawnDev ecosystem demo.
 - **Real-Time Audio + Video Fusion** — Webcam (pose + face landmarks) + microphone (speech + emotion) simultaneously: "Person speaking with happy expression, arms raised." Multi-modal real-time inference from two input streams.
 - **Screenshot Sharing** — One-click capture of demo result + timing as a shareable image card, pre-formatted for X/Twitter.
@@ -498,17 +498,6 @@ Weights are extracted automatically from any supported format:
 
 All weight types are converted to F32 on GPU upload. Pre-extracted FP16 uses 256-byte alignment for WebGPU buffer binding requirements.
 
-## Blazor WebAssembly Configuration
-
-Requires [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) for browser interop:
-
-```xml
-<PropertyGroup>
-  <!-- ILGPU requires IL reflection at runtime -->
-  <PublishTrimmed>false</PublishTrimmed>
-  <RunAOTCompilation>false</RunAOTCompilation>
-</PropertyGroup>
-```
 
 ## Recent Breakthroughs
 
@@ -573,7 +562,7 @@ SpawnDev.ILGPU.ML would not be possible without:
 
 - **[ILGPU](https://github.com/m4rs-mt/ILGPU)** — The GPU compiler that makes C# GPU kernels possible. Created by [Marcel Koester](https://github.com/m4rs-mt) and [contributors](https://github.com/m4rs-mt/ILGPU/graphs/contributors).
 - **[SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU)** — Extends ILGPU with three browser backends (WebGPU, WebGL, Wasm), bringing GPU compute to Blazor WebAssembly.
-- **[SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS)** — Full JS interop for Blazor WebAssembly. Typed C# wrappers for all browser APIs.
+- **[SpawnDev.SpawnJS](https://github.com/LostBeard/SpawnDev.SpawnJS)** — Full JS interop for Blazor WebAssembly. Typed C# wrappers for all browser APIs.
 
 ### AI Development Team
 
@@ -596,7 +585,7 @@ These AI agents coordinate through a shared DevComms system, with defined roles 
 ## Resources
 
 - [SpawnDev.ILGPU](https://github.com/LostBeard/SpawnDev.ILGPU) — Cross-platform GPU compute for .NET (6 backends)
-- [SpawnDev.BlazorJS](https://github.com/LostBeard/SpawnDev.BlazorJS) — Full JS interop for Blazor WebAssembly
+- [SpawnDev.SpawnJS](https://github.com/LostBeard/SpawnDev.SpawnJS) — Full JS interop for Blazor WebAssembly
 - [ILGPU](https://github.com/m4rs-mt/ILGPU) — The GPU compiler
 - [ILGPU Documentation](https://ilgpu.net/)
 - [Plans/full-inference-engine-plan.md](Plans/full-inference-engine-plan.md) — Detailed roadmap
@@ -621,7 +610,7 @@ This is massive AI power brought into the home by utilizing every device you own
 
 This library exists because one person — [@LostBeard](https://github.com/LostBeard) — and a small team have spent months hand-writing native C# GPU kernels, six-backend transpilers, and ML pipelines while running on a **$20/month** budget.
 
-When the budget allows it, peak output looks like **410 commits in a single day** across SpawnDev.ILGPU, SpawnDev.ILGPU.ML, SpawnDev.BlazorJS, SpawnDev.RTC, SpawnDev.WebTorrent, and the rest of the SpawnDev stack. When the budget doesn't, work slows to whatever individual evenings can spare.
+When the budget allows it, peak output looks like **410 commits in a single day** across SpawnDev.ILGPU, SpawnDev.ILGPU.ML, SpawnDev.SpawnJS, SpawnDev.RTC, SpawnDev.WebTorrent, and the rest of the SpawnDev stack. When the budget doesn't, work slows to whatever individual evenings can spare.
 
 **We're asking for $200/month total in GitHub Sponsorships to put the full crew back on the ship.** That's the difference between this preview release and the next ten — every operator family migrated to the new Tensor API, the remaining pipelines verified end-to-end on every backend, FP16 attention, Flash Attention on WebGPU, Llama and Phi-4 LLM inference, full text-to-image diffusion, voice-driven 3D generation, P2P distributed compute through SpawnDev.WebTorrent. It's all in flight; the bottleneck is hours, not ideas.
 

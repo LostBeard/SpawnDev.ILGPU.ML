@@ -1,5 +1,5 @@
-@using SpawnDev.BlazorJS
-@inject BlazorJSRuntime JS
+@using SpawnDev.SpawnJS
+@inject SpawnJSRuntime JS
 
 @if (_isVisible)
 {
@@ -30,7 +30,7 @@
         {
             try
             {
-                using var window = JS.Get<SpawnDev.BlazorJS.JSObjects.Window>("window");
+                using var window = JS.Get<SpawnDev.SpawnJS.JSObjects.Window>("window");
                 using var storage = window.LocalStorage;
                 var welcomed = storage.GetItem(StorageKey);
                 if (string.IsNullOrEmpty(welcomed))

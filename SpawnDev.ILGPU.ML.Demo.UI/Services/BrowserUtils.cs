@@ -1,16 +1,16 @@
-using SpawnDev.BlazorJS;
-using SpawnDev.BlazorJS.JSObjects;
+using SpawnDev.SpawnJS;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Demo.UI.Services;
 
 /// <summary>
-/// Browser utility methods using SpawnDev.BlazorJS for all JS interop.
+/// Browser utility methods using SpawnDev.SpawnJS for all JS interop.
 /// </summary>
 public class BrowserUtils
 {
-    private readonly BlazorJSRuntime _js;
+    private readonly SpawnJSRuntime _js;
 
-    public BrowserUtils(BlazorJSRuntime js)
+    public BrowserUtils(SpawnJSRuntime js)
     {
         _js = js;
     }

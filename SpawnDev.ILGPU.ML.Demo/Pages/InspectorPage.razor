@@ -1,7 +1,7 @@
 @page "/inspector"
-@using SpawnDev.BlazorJS
-@using SpawnDev.BlazorJS.JSObjects
-@using SpawnDev.BlazorJS.Toolbox
+@using SpawnDev.SpawnJS
+@using SpawnDev.SpawnJS.JSObjects
+@using SpawnDev.SpawnJS.Toolbox
 @using SpawnDev.ILGPU.ML.Onnx
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.WebTorrent
@@ -9,7 +9,7 @@
 @implements IDisposable
 @inject WebTorrentClient WtClient
 @inject HttpClient Http
-@inject BlazorJSRuntime JS
+@inject SpawnJSRuntime JS
 
 <PageTitle>Model Inspector — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -226,7 +226,7 @@
         if (!_beenInit)
         {
             _beenInit = true;
-            _fileInput = new HTMLInputElement(_fileInputRef);
+            _fileInput = _fileInputRef.As<HTMLInputElement>();
             _fileInput.OnChange += FileInput_OnChange;
         }
     }

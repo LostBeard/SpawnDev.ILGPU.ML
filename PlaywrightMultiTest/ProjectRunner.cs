@@ -621,7 +621,7 @@ namespace PlaywrightMultiTest
             var coordUrl = $"{baseUrl}/compute?testId={Uri.EscapeDataString(coordTestId)}&autoCreate=true";
             await coordPage.GotoAsync(coordUrl);
 
-            // PublishToHarness writes the state as a JSON STRING via SpawnDev.BlazorJS's
+            // PublishToHarness writes the state as a JSON STRING via SpawnDev.SpawnJS's
             // serializing JS.Set, so we parse on read. Helper isolates the parse.
             const string parseStateJs = "(k) => { var v = globalThis[k]; return typeof v === 'string' ? JSON.parse(v) : v; }";
 
