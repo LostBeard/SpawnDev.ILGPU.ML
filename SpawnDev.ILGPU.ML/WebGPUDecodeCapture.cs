@@ -441,9 +441,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
             _logitsHost = new float[_vocab];
         }
         using (var u8 = await _logitsMb.CopyToHostUint8ArrayAsync(_logitsByteOfs, (long)_vocab * 4))   // the ONLY per-token fence
-        using (var hv = new HeapView<float>(_logitsHost!))
-        using (var pinned = hv.As<SpawnDev.SpawnJS.JSObjects.Uint8Array>())
-            pinned.Set(u8);
+        using (var hv = new HeapView<float, Uint8Array>(_logitsHost!))
+            hv.View.Set(u8);
         var logits = _logitsHost!;
         var t3 = System.Diagnostics.Stopwatch.GetTimestamp();
         LastReplayMs = System.Diagnostics.Stopwatch.GetElapsedTime(t1, t2).TotalMilliseconds;
