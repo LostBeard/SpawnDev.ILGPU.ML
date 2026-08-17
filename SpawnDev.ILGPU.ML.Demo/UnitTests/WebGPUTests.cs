@@ -49,4 +49,44 @@ public class WebGPUTests : MLTestBase
         return (context, accelerator);
     }
 
+    /// <summary>
+    /// DIAGNOSTIC/REGRESSION: the WebGPU device must be created with the ADAPTER'S maxStorageBufferBindingSize,
+    /// not the 128 MiB spec default. Models with a &gt;128 MiB storage binding (DA3 depth, the transformer
+    /// Gather in TextGen - and SpawnDev.AI's chat model) fail at dispatch with
+    /// "Binding size (N) is larger than the maximum storage buffer binding size (134217728)" when the device
+    /// falls back to the default. WebGPUNativeAccelerator.CreateAsync requests requiredLimits from the adapter;
+    /// this proves the request actually took effect on the live device. No model download - just device probe.
+    /// </summary>
+    [TestMethod(Timeout = 60000)]
+    public async Task WebGPU_DeviceStorageBufferLimit_MatchesAdapter() => await RunTest(async accelerator =>
+    {
+        var prevVerbose = WebGPUBackend.VerboseLogging;
+        WebGPUBackend.VerboseLogging = true;
+        try
+        {
+            var acc = ((WebGPUAccelerator)accelerator).NativeAccelerator;
+
+            long? adapterMax = null;
+            try { using var al = acc.Device?.Adapter?.Limits; adapterMax = al?.MaxStorageBufferBindingSize; } catch { }
+
+            long? deviceMax = null;
+            try { using var dl = acc.NativeDevice?.Limits; deviceMax = dl?.MaxStorageBufferBindingSize; } catch { }
+
+            Console.WriteLine($"[LIMITPROBE] adapter.maxStorageBufferBindingSize={adapterMax}  device.maxStorageBufferBindingSize={deviceMax}  (spec default=134217728)");
+
+            if (deviceMax is null)
+                throw new Exception("could not read device.limits.maxStorageBufferBindingSize");
+
+            // The device must have been granted the adapter's higher limit. The bug (2026-08-16 GH-Pages run):
+            // device stuck at the 134217728 default while the adapter advertised ~2 GiB.
+            if (adapterMax is > 134217728 && deviceMax <= 134217728)
+                throw new Exception(
+                    $"DEVICE DID NOT GET ADAPTER LIMIT: adapter allows {adapterMax} but device was created with only " +
+                    $"{deviceMax} - a >128 MiB storage binding will fail at dispatch. requiredLimits was not applied.");
+
+            Console.WriteLine($"[LIMITPROBE] PASS - device granted {deviceMax} storage-buffer binding");
+        }
+        finally { WebGPUBackend.VerboseLogging = prevVerbose; }
+    });
+
 }

@@ -643,6 +643,48 @@ public class GraphExecutor : IDisposable
                     runtimeOutputShapes = new[] { resolved };
                 }
             }
+            // Runtime Conv output sizing: an upstream dynamic op (e.g. a Resize whose size tensor is only
+            // known at runtime) can grow a conv's input beyond its COMPILED shape, leaving the compiled output
+            // shape stale and its rented buffer too small for what the kernel actually writes. DAv3-v3's depth
+            // head hits this: the final /head Resize resolves 8x16 -> 224x16 at runtime, so /head/output_conv2's
+            // output (compiled [.,32,8,16]) is 28x too small for the [.,32,224,16] the kernel produces. Recompute
+            // the output spatial dims from the RUNTIME input using the SAME formula ForwardPadded uses, and
+            // override ONLY when the result differs from the compiled shape — so every conv whose compiled shape
+            // was already correct (compiled input == runtime input) is left untouched (zero regression risk).
+            if (node.OpType == "Conv"
+                && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null
+                && nodeInputs[0]!.Shape.Length == 4 && nodeInputs[1]!.Shape.Length == 4
+                && runtimeOutputShapes.Length > 0 && runtimeOutputShapes[0].Length == 4)
+            {
+                var xShapeC = nodeInputs[0]!.Shape;
+                var wShapeC = nodeInputs[1]!.Shape;
+                var convCtx = new OnnxOpContext
+                {
+                    Inputs = nodeInputs,
+                    Outputs = System.Array.Empty<Tensor>(),
+                    Attributes = node.Attributes,
+                    Pool = _pool,
+                    Format = Format,
+                    InputNames = node.InputNames,
+                };
+                var (strideC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
+                    SpawnDev.ILGPU.ML.Operators.ConvOperator.ResolveConv2DSpatialParams(convCtx, xShapeC, wShapeC, Format);
+                var (_, _, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
+                var (outCC, _, kHC, kWC) = LayoutHelper.GetWeightDims(wShapeC, Format);
+                int effKHC = dilationHC * (kHC - 1) + 1;
+                int effKWC = dilationWC * (kWC - 1) + 1;
+                int outHC = (inHC + padTopC + padBottomC - effKHC) / strideC + 1;
+                int outWC = (inWC + padLeftC + padRightC - effKWC) / strideC + 1;
+                if (outHC > 0 && outWC > 0)
+                {
+                    var resolvedC = (int[])xShapeC.Clone();   // rank 4; batch (axis 0) passes through
+                    resolvedC[LayoutHelper.ChannelAxis(Format)] = outCC;
+                    resolvedC[LayoutHelper.HeightAxis(Format)] = outHC;
+                    resolvedC[LayoutHelper.WidthAxis(Format)] = outWC;
+                    if (!resolvedC.SequenceEqual(runtimeOutputShapes[0]))
+                        runtimeOutputShapes = new[] { resolvedC };
+                }
+            }
             // Runtime Pad: opset >= 11 has pads as input[1] tensor, not as attribute.
             // PadOperator.InferOutputShapes can't read the tensor value at compile time
             // and returns inputs[0] unchanged — output buffer would be sized to INPUT,
@@ -2048,6 +2090,48 @@ public class GraphExecutor : IDisposable
                     for (int j = 0; j < inShape.Length; j++)
                         resolved[j] = j < scales.Length ? (int)MathF.Floor(inShape[j] * scales[j]) : inShape[j];
                     runtimeOutputShapes = new[] { resolved };
+                }
+            }
+            // Runtime Conv output sizing: an upstream dynamic op (e.g. a Resize whose size tensor is only
+            // known at runtime) can grow a conv's input beyond its COMPILED shape, leaving the compiled output
+            // shape stale and its rented buffer too small for what the kernel actually writes. DAv3-v3's depth
+            // head hits this: the final /head Resize resolves 8x16 -> 224x16 at runtime, so /head/output_conv2's
+            // output (compiled [.,32,8,16]) is 28x too small for the [.,32,224,16] the kernel produces. Recompute
+            // the output spatial dims from the RUNTIME input using the SAME formula ForwardPadded uses, and
+            // override ONLY when the result differs from the compiled shape — so every conv whose compiled shape
+            // was already correct (compiled input == runtime input) is left untouched (zero regression risk).
+            if (node.OpType == "Conv"
+                && nodeInputs.Length >= 2 && nodeInputs[0] != null && nodeInputs[1] != null
+                && nodeInputs[0]!.Shape.Length == 4 && nodeInputs[1]!.Shape.Length == 4
+                && runtimeOutputShapes.Length > 0 && runtimeOutputShapes[0].Length == 4)
+            {
+                var xShapeC = nodeInputs[0]!.Shape;
+                var wShapeC = nodeInputs[1]!.Shape;
+                var convCtx = new OnnxOpContext
+                {
+                    Inputs = nodeInputs,
+                    Outputs = System.Array.Empty<Tensor>(),
+                    Attributes = node.Attributes,
+                    Pool = _pool,
+                    Format = Format,
+                    InputNames = node.InputNames,
+                };
+                var (strideC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
+                    SpawnDev.ILGPU.ML.Operators.ConvOperator.ResolveConv2DSpatialParams(convCtx, xShapeC, wShapeC, Format);
+                var (_, _, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
+                var (outCC, _, kHC, kWC) = LayoutHelper.GetWeightDims(wShapeC, Format);
+                int effKHC = dilationHC * (kHC - 1) + 1;
+                int effKWC = dilationWC * (kWC - 1) + 1;
+                int outHC = (inHC + padTopC + padBottomC - effKHC) / strideC + 1;
+                int outWC = (inWC + padLeftC + padRightC - effKWC) / strideC + 1;
+                if (outHC > 0 && outWC > 0)
+                {
+                    var resolvedC = (int[])xShapeC.Clone();   // rank 4; batch (axis 0) passes through
+                    resolvedC[LayoutHelper.ChannelAxis(Format)] = outCC;
+                    resolvedC[LayoutHelper.HeightAxis(Format)] = outHC;
+                    resolvedC[LayoutHelper.WidthAxis(Format)] = outWC;
+                    if (!resolvedC.SequenceEqual(runtimeOutputShapes[0]))
+                        runtimeOutputShapes = new[] { resolvedC };
                 }
             }
             // Runtime Pad: opset >= 11 has pads as input[1] tensor, not as attribute.

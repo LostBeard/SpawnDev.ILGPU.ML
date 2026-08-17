@@ -209,6 +209,21 @@ public abstract partial class MLTestBase
         if (elems < 100)
             throw new Exception($"DA3 output too small: {elems} elements (shape=[{string.Join(",", output.Shape)}])");
 
+        // Shape gate (2026-08-16): predicted_depth must be a single [.,H,W] map — batch=1 and, for the square
+        // 224x224 input, a square H==W. Without this, the weak non-NaN/non-zero checks below would FALSELY pass
+        // on the wrong-shaped output the DA3-v3 head currently produces: [2304,224,16] (batch=2304, W=16). The
+        // storage-buffer (SpawnJS long? marshaller) + Conv-buffer-sizing fixes let this model RUN end-to-end, but
+        // a deeper head reassemble/symbolic-shape bug (LayerNorm→[3,1,768], reassemble Reshape→[2304,1,1,1])
+        // still mis-shapes it. Tracked follow-up: DA3-v3 head shape inference. Do NOT weaken this gate to go green.
+        var depthShape = output.Shape;
+        long depthBatch = 1;
+        for (int i = 0; i < depthShape.Length - 2; i++) depthBatch *= depthShape[i];
+        int depthH = depthShape[depthShape.Length - 2], depthW = depthShape[depthShape.Length - 1];
+        if (depthBatch != 1 || depthH != depthW)
+            throw new Exception(
+                $"DA3 predicted_depth wrong shape [{string.Join(",", depthShape)}]: expected batch=1 and a square H==W map " +
+                "for the square input. Known DA3-v3 head reassemble/symbolic-shape bug (produces batch=2304, W=16); tracked follow-up.");
+
         // GPU-side finite check + reduction. Only 3 floats read back on
         // atomics-capable backends; no per-element CPU loop. Per project CLAUDE.md:
         // "Tests must not waste resources. Use GPU-side verification when it exists."
