@@ -2,6 +2,40 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.1.2-local.11 (2026-08-19)
+
+### ADD: O(n) Whisper decode via the with-past decoder (KV cache)
+
+`SpeechRecognitionPipeline` re-fed the WHOLE token sequence to the decoder on every step and threw away all
+but the last position, recomputing every previous token's K/V each time. Besides being quadratic, it
+materialised full-sequence logits (`[1, seq, 51865]` ~ 13 MB) on every single step.
+
+New optional constructor parameter `decoderWithPastSession` (`decoder_with_past_model.onnx`). When supplied:
+
+- **Prefill** runs the prompt once on the plain decoder, which emits `present.{L}.decoder.*` AND
+  `present.{L}.encoder.*`.
+- **Every later step** feeds ONE token to the with-past decoder together with
+  `past_key_values.{L}.{decoder,encoder}.*`. Cross-attention K/V depend only on the encoder output, so they
+  are computed once at prefill and passed through unchanged - that graph takes no `encoder_hidden_states`
+  at all, which is exactly why the encoder entries must be carried across steps rather than recomputed.
+
+Each step's output tensors become the next step's inputs **by reference** - GPU-resident throughout, no
+readback and no host copy. Only the winning token index crosses the boundary, via `GpuArgMax`, same as
+before. Per-step logits drop from ~13 MB to ~0.2 MB, so this is a memory win as well as a speed one.
+
+Omitting the parameter keeps the previous behaviour exactly, so existing callers are unaffected.
+`UsesKVCache` reports which path is active.
+
+Measured (OpenCL, RTX 4070, Harvard-sentence fixture, ~70 tokens): 4400ms -> 3970ms end to end, with a
+byte-identical transcript. The modest desktop gain is expected - there the single 30s encoder pass
+dominates and the decode is a small slice. The quadratic decode is what made the browser/WebGPU run take
+84s per utterance, which is the case this targets.
+
+`tools/whisper-harness` loads `decoder_with_past_model.onnx` when present and prints `kvcache : ON/off`;
+`WHISPER_NO_KVCACHE=1` forces the old path, so the same harness A/Bs both and a transcript diff between
+them is a real regression signal.
+
+
 ## 5.1.2-local.10 (2026-08-18)
 
 ### FIX: attention fusion double-scaled Q when the pre-scale sat behind a Reshape (whisper)

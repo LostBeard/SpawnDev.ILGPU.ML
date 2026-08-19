@@ -22,6 +22,8 @@ public class SpeechRecognitionPipeline : IDisposable
     private readonly Accelerator _accelerator;
     private readonly InferenceSession _encoderSession;
     private readonly InferenceSession _decoderSession;
+    /// <summary>Optional `decoder_with_past_model.onnx` session; null = the O(n^2) full-recompute path.</summary>
+    private readonly InferenceSession? _decoderWithPastSession;
     private BPETokenizer? _tokenizer;
 
     // Whisper special tokens, as verified against the model's own tokenizer.json (Xenova/whisper-tiny).
@@ -51,13 +53,25 @@ public class SpeechRecognitionPipeline : IDisposable
     public int MaxTokens { get; set; } = 224;
     public string Language { get; set; } = "en";
 
+    /// <summary>True when a with-past decoder was supplied, so decoding is O(n) rather than O(n^2).</summary>
+    public bool UsesKVCache => _decoderWithPastSession != null;
+
+    /// <param name="decoderWithPastSession">
+    /// Optional `decoder_with_past_model.onnx`. Without it every step re-feeds the WHOLE token sequence and
+    /// recomputes every previous position's K/V - quadratic, and it also allocates full-sequence logits
+    /// ([1, seq, 51865] ~ 13 MB) every step. With it, step 0 prefills on the plain decoder and every later
+    /// step feeds ONE token plus the previous step's `present.*` tensors straight back as
+    /// `past_key_values.*`, GPU-resident throughout (Rule 4: no readback, no host copy).
+    /// </param>
     public SpeechRecognitionPipeline(
         InferenceSession encoderSession,
         InferenceSession decoderSession,
-        Accelerator accelerator)
+        Accelerator accelerator,
+        InferenceSession? decoderWithPastSession = null)
     {
         _encoderSession = encoderSession;
         _decoderSession = decoderSession;
+        _decoderWithPastSession = decoderWithPastSession;
         _accelerator = accelerator;
     }
 
@@ -100,6 +114,12 @@ public class SpeechRecognitionPipeline : IDisposable
 
         // Greedy next-token selection stays GPU-side: read back one index per token, not the whole vocab.
         using var argmax = new GpuArgMax(_accelerator);
+
+        if (_decoderWithPastSession != null)
+        {
+            await DecodeWithKVCacheAsync(tokens, encoderHidden, argmax);
+        }
+        else
         for (int step = 0; step < MaxTokens; step++)
         {
             // Create input_ids tensor
@@ -146,6 +166,83 @@ public class SpeechRecognitionPipeline : IDisposable
         };
     }
 
+    /// <summary>
+    /// O(n) greedy decode: prefill the prompt once, then feed ONE token per step with the previous step's
+    /// K/V handed straight back as `past_key_values.*`.
+    /// </summary>
+    /// <remarks>
+    /// Whisper's exported decoder splits into two graphs. `decoder_model.onnx` takes the whole prompt plus
+    /// `encoder_hidden_states` and emits `present.{L}.decoder.*` AND `present.{L}.encoder.*`.
+    /// `decoder_with_past_model.onnx` takes ONE token plus `past_key_values.{L}.{decoder,encoder}.*` and
+    /// emits only the DECODER `present.*` - the cross-attention K/V are a function of the encoder output
+    /// alone, so they are computed once during prefill and then passed through unchanged forever. It takes
+    /// no `encoder_hidden_states` at all, which is exactly why the encoder entries have to be carried
+    /// across every step rather than recomputed.
+    ///
+    /// Every tensor here stays on the GPU: a step's outputs become the next step's inputs by reference, so
+    /// there is no readback and no host copy (Rule 4). Only the winning token index crosses the boundary,
+    /// via GpuArgMax, the same as the non-cached path.
+    ///
+    /// This is also a large MEMORY win, not just a speed one: the quadratic path materialises full-sequence
+    /// logits ([1, seq, 51865] ~ 13 MB) on every single step, where this materialises one position (~0.2 MB).
+    /// </remarks>
+    private async Task DecodeWithKVCacheAsync(List<int> tokens, Tensor encoderHidden, GpuArgMax argmax)
+    {
+        var withPast = _decoderWithPastSession!;
+
+        // ── Prefill: the whole prompt, once, on the plain decoder. ──
+        var promptIds = tokens.Select(t => (float)t).ToArray();
+        using var promptBuf = _accelerator.Allocate1D(promptIds);
+        var prefill = await _decoderSession.RunAsync(new Dictionary<string, Tensor>
+        {
+            [_decoderSession.InputNames[0]] = new Tensor(promptBuf.View, new[] { 1, tokens.Count }),
+            [_decoderSession.InputNames[1]] = encoderHidden,
+        });
+
+        var logits = prefill[_decoderSession.OutputNames[0]];
+        int vocabSize = logits.Shape.Length >= 3 ? logits.Shape[^1] : 51865;
+        int nextToken = await argmax.ArgMaxAsync(
+            logits.Data.SubView((tokens.Count - 1) * vocabSize, vocabSize), vocabSize);
+        OnTokenGenerated?.Invoke(0, nextToken);
+        if (nextToken == EOT) return;
+        tokens.Add(nextToken);
+
+        // present.X -> past_key_values.X, for both the decoder and the encoder families. Built from the
+        // graph's own output names so a differently-sized model (more layers) needs no changes here.
+        var past = new Dictionary<string, Tensor>();
+        foreach (var name in _decoderSession.OutputNames)
+            if (name.StartsWith("present.", StringComparison.Ordinal))
+                past["past_key_values." + name.Substring("present.".Length)] = prefill[name];
+
+        // ── Steps 1..n: one token at a time. ──
+        for (int step = 1; step < MaxTokens; step++)
+        {
+            var stepIds = new[] { (float)nextToken };
+            using var idsBuf = _accelerator.Allocate1D(stepIds);
+            var inputs = new Dictionary<string, Tensor>();
+            foreach (var name in withPast.InputNames)
+            {
+                if (past.TryGetValue(name, out var t)) inputs[name] = t;
+                else inputs[name] = new Tensor(idsBuf.View, new[] { 1, 1 });   // input_ids
+            }
+
+            var outputs = await withPast.RunAsync(inputs);
+            var stepLogits = outputs[withPast.OutputNames[0]];
+
+            // One position in, one position out - the winning logits start at offset 0.
+            nextToken = await argmax.ArgMaxAsync(stepLogits.Data.SubView(0, vocabSize), vocabSize);
+            OnTokenGenerated?.Invoke(step, nextToken);
+            if (nextToken == EOT) break;
+            tokens.Add(nextToken);
+
+            // Roll the DECODER entries forward. The encoder entries are deliberately left untouched: this
+            // graph does not re-emit them, and they never change.
+            foreach (var name in withPast.OutputNames)
+                if (name.StartsWith("present.", StringComparison.Ordinal))
+                    past["past_key_values." + name.Substring("present.".Length)] = outputs[name];
+        }
+    }
+
     public async Task<TranscriptionResult> RunAsync(float[] audioSamples) =>
         await TranscribeAsync(audioSamples);
 
@@ -153,6 +250,7 @@ public class SpeechRecognitionPipeline : IDisposable
     {
         _encoderSession?.Dispose();
         _decoderSession?.Dispose();
+        _decoderWithPastSession?.Dispose();
     }
 }
 
