@@ -995,9 +995,14 @@ public class GraphExecutor : IDisposable
                 {
                     int tv = dd - (rank - tgt.Length) >= 0 ? tgt[dd - (rank - tgt.Length)] : 1;
                     int iv = dd - (rank - inS.Length) >= 0 ? inS[dd - (rank - inS.Length)] : 1;
-                    resolved[dd] = Math.Max(tv, iv);
+                    // Broadcast, not max: a size-1 dimension takes the OTHER side's size, including ZERO.
+                    // Expanding to a target dim of 0 must produce an EMPTY tensor, and max() produces a
+                    // one-element one instead - which then rides through a Concat as a phantom frame.
+                    resolved[dd] = iv == 1 ? tv : tv == 1 ? iv : Math.Max(tv, iv);
                 }
-                if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+                // >= 0, not > 0: an empty result is a legitimate shape here, and rejecting it would fall
+                // back to the compiled shape and reintroduce the phantom element.
+                if (resolved.All(d => d >= 0)) runtimeOutputShapes = new[] { resolved };
             }
 
             // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
@@ -2584,9 +2589,14 @@ public class GraphExecutor : IDisposable
                 {
                     int tv = dd - (rank - tgt.Length) >= 0 ? tgt[dd - (rank - tgt.Length)] : 1;
                     int iv = dd - (rank - inS.Length) >= 0 ? inS[dd - (rank - inS.Length)] : 1;
-                    resolved[dd] = Math.Max(tv, iv);
+                    // Broadcast, not max: a size-1 dimension takes the OTHER side's size, including ZERO.
+                    // Expanding to a target dim of 0 must produce an EMPTY tensor, and max() produces a
+                    // one-element one instead - which then rides through a Concat as a phantom frame.
+                    resolved[dd] = iv == 1 ? tv : tv == 1 ? iv : Math.Max(tv, iv);
                 }
-                if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
+                // >= 0, not > 0: an empty result is a legitimate shape here, and rejecting it would fall
+                // back to the compiled shape and reintroduce the phantom element.
+                if (resolved.All(d => d >= 0)) runtimeOutputShapes = new[] { resolved };
             }
 
             // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).

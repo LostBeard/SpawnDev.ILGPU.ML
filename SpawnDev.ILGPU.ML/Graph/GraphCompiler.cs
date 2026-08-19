@@ -849,7 +849,11 @@ public class GraphCompiler
                     {
                         int inDim = j < outRank - inShape.Length ? 1 : inShape[j - (outRank - inShape.Length)];
                         int tgtDim = j < outRank - targetDims.Length ? 1 : targetDims[j - (outRank - targetDims.Length)];
-                        outShape[j] = Math.Max(inDim, tgtDim);
+                        // Broadcast, not max. A size-1 dimension takes the OTHER side's size, and that
+                        // includes ZERO: expanding [1,1,512] to a target of [0,1,512] must give an EMPTY
+                        // tensor. Taking the maximum turns it into a one-element one, which then survives a
+                        // Concat as a phantom extra frame and breaks the next Reshape's element count.
+                        outShape[j] = inDim == 1 ? tgtDim : tgtDim == 1 ? inDim : Math.Max(inDim, tgtDim);
                     }
                     outputShapes = new[] { outShape };
                 }
