@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ZipVoiceOracle</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <!--
+      sherpa-onnx is the INDEPENDENT implementation of ZipVoice - the one already proven on Rose. It is
+      here to answer two questions our own code cannot answer about itself: what token ids does the
+      espeak-ng front end actually produce for a given sentence, and what does a correct clone of this
+      reference clip sound like. Nothing in the shipping library depends on this package.
+    -->
+    <PackageReference Include="org.k2fsa.sherpa.onnx" Version="1.13.4" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-x64" Version="1.13.4" />
+  </ItemGroup>
+</Project>

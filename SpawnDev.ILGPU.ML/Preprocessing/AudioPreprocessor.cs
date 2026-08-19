@@ -5,7 +5,7 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// Handles waveform manipulation, resampling, and spectrogram generation.
 /// Designed for models like Whisper, wav2vec2, and audio classifiers.
 /// </summary>
-public static class AudioPreprocessor
+public static partial class AudioPreprocessor
 {
     /// <summary>
     /// Whisper model sample rate (16kHz).
@@ -145,7 +145,12 @@ public static class AudioPreprocessor
     /// 3000 the model's input shape demands once centred (3001 frames, last one dropped by the caller).
     /// Left off by default so a plain STFT keeps its existing framing.
     /// </param>
-    public static float[,] ComputeSTFT(float[] samples, int fftSize, int hopSize, bool center = false)
+    /// <param name="periodicWindow">
+    /// Use a PERIODIC Hann window (torch/librosa default) instead of the symmetric one. Whisper wants
+    /// symmetric, so this stays off by default; the vocoder models need periodic for analysis and
+    /// synthesis to be inverses of each other.
+    /// </param>
+    public static float[,] ComputeSTFT(float[] samples, int fftSize, int hopSize, bool center = false, bool periodicWindow = false)
     {
         if (center)
         {
@@ -161,7 +166,7 @@ public static class AudioPreprocessor
             samples = padded;
         }
 
-        var window = GenerateHannWindow(fftSize);
+        var window = GenerateHannWindow(fftSize, periodicWindow);
         int numFrames = (samples.Length - fftSize) / hopSize + 1;
         int freqBins = fftSize / 2 + 1;
         var stft = new float[numFrames, freqBins];

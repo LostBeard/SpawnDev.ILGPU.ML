@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Ground-truth ZipVoice token ids, captured from sherpa-onnx - the independent implementation - with",
+    "model debug on. English reaches this model through espeak-ng grapheme-to-phoneme, and the shipped",
+    "lexicon.txt is Chinese-only, so there is no table these ids can be read out of. They were observed,",
+    "not derived, which is what makes them a valid target for our own phonemizer to reproduce.",
+    "",
+    "Regenerate with:",
+    "  dotnet run --project tools/zipvoice-oracle -c Release -- \"Paint the sockets in the wall dull green.\" out.wav 2> debug.log",
+    "  grep 'new sentence' debug.log",
+    "The prompt text spans two sentences (the comma splits it); its token list is their concatenation,",
+    "which is what sherpa feeds the encoder."
+  ],
+  "text": "Paint the sockets in the wall dull green.",
+  "promptText": "Some call me nature, others call me mother nature.",
+  "promptWav": "prompt.wav",
+  "tokens": [28, 120, 18, 74, 26, 32, 3, 41, 59, 3, 31, 120, 51, 122, 23, 74, 32, 31, 3, 120, 74, 26, 3, 41, 59, 3, 35, 120, 54, 122, 24, 3, 17, 120, 102, 24, 3, 66, 88, 120, 21, 122, 26, 3, 10],
+  "promptTokens": [31, 121, 102, 25, 3, 23, 120, 54, 122, 24, 3, 25, 120, 21, 122, 3, 26, 120, 18, 74, 32, 96, 60, 3, 8, 120, 102, 41, 60, 38, 3, 23, 120, 54, 122, 24, 3, 25, 120, 21, 122, 3, 25, 120, 102, 41, 60, 3, 26, 120, 18, 74, 32, 96, 60, 3, 10]
+}

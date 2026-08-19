@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ZipVoiceHarness</AssemblyName>
+    <!-- SpawnJS is browser-annotated; this harness only touches the CPU/CUDA paths of ILGPU.ML. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The REAL library, not a copy - this harness is the TTS gate. -->
+    <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+    <!--
+      onnxruntime is the INDEPENDENT engine here, not a dependency of the port. It runs the same three
+      graphs so a wrong result can be attributed: identical output on both engines means the algorithm
+      around the graphs is wrong; differing output means our engine is. Without a second engine those
+      two are indistinguishable, which is exactly how the Whisper port lost hours.
+    -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.26.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Fixtures travel with the harness so a gate run needs nothing outside the repo. -->
+    <None Include="fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
