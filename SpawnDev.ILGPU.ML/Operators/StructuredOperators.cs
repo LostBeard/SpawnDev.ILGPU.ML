@@ -1654,16 +1654,29 @@ public class PadOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "Pad";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
-        // Try to get pads from attributes (opset < 11)
-        if (attrs.TryGetValue("pads", out var padsObj) && padsObj is long[] padsLong)
+        // Pads come from an attribute (opset < 11) or an input tensor (opset >= 11). For the input form
+        // the compiler folds the amounts and injects them as _resolved_pads, because inference is only
+        // handed SHAPES and would otherwise have to return the input unchanged - which silently erases
+        // the padding from every shape computed downstream, and only surfaces much later as a buffer
+        // sized for the wrong length.
+        var pads = attrs.TryGetValue("pads", out var padsObj) && padsObj is long[] padsAttr ? padsAttr
+                 : attrs.TryGetValue("_resolved_pads", out var resolvedObj) && resolvedObj is long[] resolvedPads ? resolvedPads
+                 : null;
+
+        if (pads != null)
         {
             var shape = (int[])inputs[0].Clone();
             int rank = shape.Length;
-            for (int i = 0; i < rank; i++)
-                shape[i] += (int)padsLong[i] + (int)padsLong[rank + i];
-            return new[] { shape };
+            // ONNX requires 2 * rank entries (all the befores, then all the afters). A different length
+            // means the amounts were not resolved correctly, and padding by them would be a guess.
+            if (pads.Length == 2 * rank)
+            {
+                for (int i = 0; i < rank; i++)
+                    shape[i] += (int)pads[i] + (int)pads[rank + i];
+                return new[] { shape };
+            }
         }
-        // For opset >= 11, pads come from input[1] — resolved at runtime
+
         return new[] { inputs[0] };
     }
     public void Execute(OnnxOpContext ctx)

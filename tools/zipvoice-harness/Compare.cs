@@ -77,8 +77,11 @@ public static class Compare
             }
             else
             {
-                failures += Report("encoder", ortEncoding.TextCondition, ourEncoding.TextCondition, 1e-3f);
-                encoderOk = true;
+                int encoderFailures = Report("encoder", ortEncoding.TextCondition, ourEncoding.TextCondition, 1e-3f);
+                failures += encoderFailures;
+                // Only a numeric match counts. Reporting "matches" for a stage that merely produced the
+                // right SHAPE is exactly the kind of self-congratulation that hides a wrong answer.
+                encoderOk = encoderFailures == 0;
             }
         }
         catch (Exception ex)

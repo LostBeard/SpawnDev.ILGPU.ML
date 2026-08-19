@@ -110,6 +110,11 @@ public class GraphCompiler
                 graphOutputShapes[output.Name] = output.Shape;
         }
 
+        // Constant names known to hold INTEGER (int64) values, seeded from Shape/Size - which ONNX
+        // defines as int64 - and carried through the value-preserving folds. Used to pick integer
+        // arithmetic (truncating Div) over float arithmetic when folding.
+        var integerConstNames = new HashSet<string>();
+
         // Optional shape tracing, see the SHAPE_TRACE line below.
         var _traceShapes = Environment.GetEnvironmentVariable("ML_TRACE_SHAPES");
         if (string.IsNullOrEmpty(_traceShapes)) _traceShapes = null;
@@ -171,6 +176,23 @@ public class GraphCompiler
                 attrs["_resolved_shape"] = cosDims;
             }
 
+            // Unsqueeze/Squeeze moved `axes` from an attribute to an INPUT in opset 13, and shape inference
+            // is handed only shapes - so it silently returned the input rank unchanged and the inserted
+            // axis disappeared. Supplying the folded axes under the attribute name the operator already
+            // reads restores the pre-13 behaviour exactly. Left unfixed, an index tensor meant to broadcast
+            // to [412,103] stays [412], and the mismatch only surfaces in an Add several nodes later.
+            if ((node.OpType == "Unsqueeze" || node.OpType == "Squeeze")
+                && !attrs.ContainsKey("axes")
+                && node.Inputs.Count >= 2 && !string.IsNullOrEmpty(node.Inputs[1])
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var axesVals)
+                && axesVals.Length > 0)
+            {
+                var axesLongs = new long[axesVals.Length];
+                for (int d = 0; d < axesVals.Length; d++) axesLongs[d] = axesVals[d];
+                attrs["axes"] = axesLongs;
+            }
+
             // Infer output shapes
             int[][] outputShapes;
             try
@@ -209,7 +231,28 @@ public class GraphCompiler
                 {
                     graph.ConstantData[node.Outputs[0]] = shapeValues;
                     graph.FloatConstantData![node.Outputs[0]] = shapeValues.Select(v => (float)v).ToArray();
+                    integerConstNames.Add(node.Outputs[0]);   // Shape is int64 by definition
                 }
+            }
+
+            // Size, like Shape, is int64 by definition.
+            if (node.OpType == "Size" && node.Outputs.Count > 0) integerConstNames.Add(node.Outputs[0]);
+
+            // Integer-ness rides along value-preserving folds; a Cast to a floating type ends it.
+            if (node.Outputs.Count > 0 && node.Inputs.Count > 0 && !string.IsNullOrEmpty(node.Inputs[0])
+                && integerConstNames.Contains(node.Inputs[0]))
+            {
+                bool carries = node.OpType switch
+                {
+                    "Gather" or "Concat" or "Unsqueeze" or "Squeeze" or "Reshape" or "Transpose"
+                        or "Slice" or "Identity" or "Tile" or "Expand" or "Where"
+                        or "Min" or "Max" or "Mod" or "Floor" or "Ceil" or "Neg" or "Abs" => true,
+                    // 1 = float, 10 = float16, 11 = double: casting to one of those makes it float.
+                    "Cast" => !(attrs.TryGetValue("to", out var castTo) && castTo is long castToType
+                                && (castToType == 1 || castToType == 10 || castToType == 11)),
+                    _ => false,
+                };
+                if (carries) integerConstNames.Add(node.Outputs[0]);
             }
 
             // Compile-time evaluation of Gather on known constant data
@@ -267,6 +310,160 @@ public class GraphCompiler
                 }
             }
 
+            // Range on known bounds. Its length is a function of the VALUES, so inference (which only sees
+            // shapes) has to answer [1] and everything sized from it - Expand, Tile, and the GatherElements
+            // that consumes them as indices - collapses to a single element. The executor resolves Range
+            // itself at runtime, but that fixes only Range's own buffer, not the ops shaped from it.
+            if (node.OpType == "Range" && node.Inputs.Count >= 3
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var rangeStartVals) && rangeStartVals.Length > 0
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var rangeLimitVals) && rangeLimitVals.Length > 0
+                && graph.ConstantData.TryGetValue(node.Inputs[2], out var rangeDeltaVals) && rangeDeltaVals.Length > 0
+                && rangeDeltaVals[0] != 0)
+            {
+                int rangeStart = rangeStartVals[0], rangeLimit = rangeLimitVals[0], rangeDelta = rangeDeltaVals[0];
+                long rangeCount = (long)Math.Ceiling((rangeLimit - rangeStart) / (double)rangeDelta);
+                if (rangeCount < 0) rangeCount = 0;
+
+                // Bounded: this is shape arithmetic, not a place to materialise a large tensor.
+                if (rangeCount <= 65536)
+                {
+                    var rangeVals = new int[rangeCount];
+                    for (int d = 0; d < rangeVals.Length; d++) rangeVals[d] = rangeStart + d * rangeDelta;
+                    outputShapes = new[] { new[] { (int)rangeCount } };
+                    if (node.Outputs.Count > 0)
+                    {
+                        graph.ConstantData[node.Outputs[0]] = rangeVals;
+                        if (graph.FloatConstantData != null)
+                            graph.FloatConstantData[node.Outputs[0]] = rangeVals.Select(v => (float)v).ToArray();
+                        integerConstNames.Add(node.Outputs[0]);
+                    }
+                }
+            }
+
+            // ConstantOfShape on a known shape: a buffer of that many entries, all the value attribute.
+            // Its SHAPE being right is not enough - the chain that consumes it needs the VALUES, and
+            // without them the very next Concat has an unknown input and the whole fold stops there.
+            if (node.OpType == "ConstantOfShape" && node.Inputs.Count >= 1 && !string.IsNullOrEmpty(node.Inputs[0])
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var cosShapeVals)
+                && cosShapeVals.Length > 0)
+            {
+                long cosCount = 1;
+                foreach (var d in cosShapeVals) cosCount *= d;
+
+                // Bounded: this is for shape arithmetic, not for materialising a large tensor at compile time.
+                if (cosCount > 0 && cosCount <= 4096)
+                {
+                    int cosFill = 0;
+                    bool cosKnown = true;
+                    if (attrs.TryGetValue("value", out var cosValueObj))
+                    {
+                        switch (cosValueObj)
+                        {
+                            case long[] cosLongs when cosLongs.Length > 0: cosFill = (int)cosLongs[0]; break;
+                            case int[] cosInts when cosInts.Length > 0: cosFill = cosInts[0]; break;
+                            case float[] cosFloats when cosFloats.Length > 0: cosFill = (int)cosFloats[0]; break;
+                            case long cosLong: cosFill = (int)cosLong; break;
+                            case int cosInt: cosFill = cosInt; break;
+                            case double cosDouble: cosFill = (int)cosDouble; break;
+                            case null: cosFill = 0; break;   // ONNX default
+                            default: cosKnown = false; break;   // unknown representation - do not guess
+                        }
+                    }
+
+                    if (cosKnown && node.Outputs.Count > 0)
+                    {
+                        var cosOut = new int[cosCount];
+                        for (int d = 0; d < cosOut.Length; d++) cosOut[d] = cosFill;
+                        graph.ConstantData[node.Outputs[0]] = cosOut;
+                    }
+                }
+            }
+
+            // Reshape on known constants: only the RANK changes, so the flat value list passes through.
+            // Without this the pad-amount chain torch's F.pad export builds (concat -> reshape into pairs
+            // -> reverse -> transpose -> flatten) stops being foldable at its first Reshape, and the Pad
+            // consuming it cannot know its own output size at compile time - which leaves every tensor
+            // after the Pad sized as if no padding had happened.
+            if (node.OpType == "Reshape" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var reshapeConstData))
+            {
+                if (node.Outputs.Count > 0)
+                {
+                    graph.ConstantData[node.Outputs[0]] = reshapeConstData;
+                    if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fReshape))
+                        graph.FloatConstantData[node.Outputs[0]] = fReshape;
+                }
+            }
+
+            // Transpose on known constants. Unlike Reshape this REORDERS values, so it needs the input's
+            // shape and the permutation, not just the flat list.
+            if (node.OpType == "Transpose" && node.Inputs.Count >= 1
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var transposeConstData)
+                && inputShapes.Length > 0 && inputShapes[0].Length > 1)
+            {
+                var tShape = inputShapes[0];
+                long tTotal = 1;
+                foreach (var d in tShape) tTotal *= d;
+                long[]? tPerm = attrs.TryGetValue("perm", out var tPermObj) && tPermObj is long[] tPermArr ? tPermArr : null;
+
+                if (tTotal == transposeConstData.Length)
+                {
+                    var tAxes = new int[tShape.Length];
+                    bool tValid = true;
+                    for (int d = 0; d < tShape.Length && tValid; d++)
+                    {
+                        // ONNX default permutation is the reverse of the axes.
+                        int axis = tPerm != null && tPerm.Length == tShape.Length ? (int)tPerm[d] : tShape.Length - 1 - d;
+                        if (axis < 0) axis += tShape.Length;
+                        if (axis < 0 || axis >= tShape.Length) { tValid = false; break; }
+                        tAxes[d] = axis;
+                    }
+
+                    if (tValid)
+                    {
+                        var tOutShape = new int[tShape.Length];
+                        for (int d = 0; d < tShape.Length; d++) tOutShape[d] = tShape[tAxes[d]];
+
+                        var tStrides = new int[tShape.Length];
+                        tStrides[tShape.Length - 1] = 1;
+                        for (int d = tShape.Length - 2; d >= 0; d--) tStrides[d] = tStrides[d + 1] * tShape[d + 1];
+
+                        var tResult = new int[transposeConstData.Length];
+                        var tIndex = new int[tShape.Length];
+                        for (int flat = 0; flat < tResult.Length; flat++)
+                        {
+                            int src = 0;
+                            for (int d = 0; d < tShape.Length; d++) src += tIndex[d] * tStrides[tAxes[d]];
+                            tResult[flat] = transposeConstData[src];
+                            for (int d = tShape.Length - 1; d >= 0; d--)
+                            {
+                                if (++tIndex[d] < tOutShape[d]) break;
+                                tIndex[d] = 0;
+                            }
+                        }
+
+                        if (node.Outputs.Count > 0) graph.ConstantData[node.Outputs[0]] = tResult;
+                    }
+                }
+            }
+
+            // Pad's amounts are an INPUT for opset >= 11, and its shape inference only sees shapes - so it
+            // returned the input shape unchanged and the padding vanished from every shape downstream.
+            // Hand it the folded amounts when they are known.
+            if (node.OpType == "Pad" && node.Inputs.Count >= 2 && !string.IsNullOrEmpty(node.Inputs[1])
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[1], out var padAmountVals)
+                && padAmountVals.Length > 0)
+            {
+                var padAmounts = new long[padAmountVals.Length];
+                for (int d = 0; d < padAmountVals.Length; d++) padAmounts[d] = padAmountVals[d];
+                attrs["_resolved_pads"] = padAmounts;
+            }
+
             // Compile-time Slice on known constants: Slice(data, starts, ends[, axes, steps])
             // Handles both opset >= 11 (starts/ends as tensor inputs) and opset < 11 (as attributes)
             if (node.OpType == "Slice" && graph.ConstantData != null)
@@ -286,20 +483,72 @@ public class GraphCompiler
                     && graph.ConstantData.TryGetValue(node.Inputs[2], out var sliceEnds)
                     && sliceData.Length > 0 && sliceStarts.Length > 0 && sliceEnds.Length > 0)
                 {
-                    int start = sliceStarts[0];
-                    int end = sliceEnds[0];
-                    if (start < 0) start += sliceData.Length;
-                    if (end < 0) end += sliceData.Length;
-                    end = Math.Min(end, sliceData.Length);
-                    if (start >= 0 && end > start)
+                    // Axis and step both matter. This used to assume axis 0 of a FLAT list walked forwards,
+                    // which mis-slices a 2-D constant (axis 0 selects ROWS, not elements) and cannot express
+                    // the reversal torch emits when it builds a pad list. Only the single-axis-0 case is
+                    // folded; anything else is left to execute normally.
+                    var sliceAxes = node.Inputs.Count > 3 && graph.ConstantData.TryGetValue(node.Inputs[3], out var sliceAxesVals) ? sliceAxesVals : null;
+                    var sliceSteps = node.Inputs.Count > 4 && graph.ConstantData.TryGetValue(node.Inputs[4], out var sliceStepVals) ? sliceStepVals : null;
+                    int sliceAxis = sliceAxes != null && sliceAxes.Length > 0 ? sliceAxes[0] : 0;
+                    long sliceStep = sliceSteps != null && sliceSteps.Length > 0 ? sliceSteps[0] : 1;
+
+                    var dataShape = inputShapes.Length > 0 && inputShapes[0].Length > 0
+                        ? inputShapes[0]
+                        : new[] { sliceData.Length };
+                    if (sliceAxis < 0) sliceAxis += dataShape.Length;
+
+                    long dataTotal = 1;
+                    foreach (var d in dataShape) dataTotal *= d;
+
+                    int foldRowSize = 1;
+                    for (int d = 1; d < dataShape.Length; d++) foldRowSize *= dataShape[d];
+
+                    // A shape we cannot reconcile with the value count means one of them is already wrong;
+                    // folding on it would turn a detectable problem into a plausible wrong answer.
+                    if (sliceStarts.Length == 1 && sliceStep != 0 && sliceAxis == 0
+                        && dataTotal == sliceData.Length && foldRowSize > 0
+                        && sliceData.Length % foldRowSize == 0 && sliceData.Length / foldRowSize > 0)
                     {
-                        var sliced = sliceData.Skip(start).Take(end - start).ToArray();
-                        outputShapes = new[] { new[] { sliced.Length } };
+                        int dim0 = sliceData.Length / foldRowSize;
+                        long start = sliceStarts[0];
+                        long end = sliceEnds[0];
+                        if (start < 0) start += dim0;
+                        if (end < 0) end += dim0;
+
+                        var rows = new List<int>();
+                        if (sliceStep > 0)
+                        {
+                            start = Math.Clamp(start, 0, dim0);
+                            end = Math.Clamp(end, 0, dim0);
+                            for (long i = start; i < end; i += sliceStep) rows.Add((int)i);
+                        }
+                        else
+                        {
+                            // A negative step may legitimately end one BEFORE index 0 - that is what the
+                            // INT64_MIN sentinel means - so the end floor is -1, not 0.
+                            start = Math.Clamp(start, 0, dim0 - 1);
+                            end = Math.Clamp(end, -1, dim0 - 1);
+                            for (long i = start; i > end; i += sliceStep) rows.Add((int)i);
+                        }
+
+                        var sliced = new int[rows.Count * foldRowSize];
+                        for (int r = 0; r < rows.Count; r++)
+                            Array.Copy(sliceData, rows[r] * foldRowSize, sliced, r * foldRowSize, foldRowSize);
+
+                        var slicedShape = (int[])dataShape.Clone();
+                        slicedShape[0] = rows.Count;
+                        outputShapes = new[] { slicedShape };
                         if (node.Outputs.Count > 0)
                         {
                             graph.ConstantData[node.Outputs[0]] = sliced;
-                            if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fSlice))
-                                graph.FloatConstantData[node.Outputs[0]] = fSlice.Skip(start).Take(end - start).ToArray();
+                            if (graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fSlice)
+                                && fSlice.Length == sliceData.Length)
+                            {
+                                var fOut = new float[sliced.Length];
+                                for (int r = 0; r < rows.Count; r++)
+                                    Array.Copy(fSlice, rows[r] * foldRowSize, fOut, r * foldRowSize, foldRowSize);
+                                graph.FloatConstantData[node.Outputs[0]] = fOut;
+                            }
                         }
                     }
                 }
@@ -387,7 +636,20 @@ public class GraphCompiler
             // Compile-time scalar/element-wise arithmetic on known constants.
             // Uses FloatConstantData for precise arithmetic (0.5 * dim must not truncate to 0).
             // Falls back to int ConstantData if float not available.
+            // ONNX arithmetic follows the operand DTYPE, and Div on an integer dtype truncates rather
+            // than producing a fraction. Shape and Size are int64 by definition, and ONNX requires both
+            // operands of a binary op to share a dtype - so if either side is Shape-derived, this is
+            // integer arithmetic and the float path must not be used. Otherwise a chain like
+            // (432 + 2) / 3 keeps 144.667 instead of 144, and the *next* multiply lands on 289 instead
+            // of 288 - which moves a slice boundary and mismatches two tensors by one element, far from
+            // where the mistake was made. The float path stays for genuinely float shape math (0.5 * dim
+            // must not truncate to 0), which is never Shape-derived.
+            bool arithIsInteger = node.Inputs.Count >= 2
+                && ((!string.IsNullOrEmpty(node.Inputs[0]) && integerConstNames.Contains(node.Inputs[0]))
+                    || (!string.IsNullOrEmpty(node.Inputs[1]) && integerConstNames.Contains(node.Inputs[1])));
+
             if (node.OpType is "Mul" or "Add" or "Sub" or "Div"
+                && !arithIsInteger
                 && node.Inputs.Count >= 2 && graph.FloatConstantData != null
                 && graph.FloatConstantData.TryGetValue(node.Inputs[0], out var fArithA)
                 && graph.FloatConstantData.TryGetValue(node.Inputs[1], out var fArithB))
@@ -440,7 +702,14 @@ public class GraphCompiler
                 }
                 outputShapes = new[] { arithA.Length >= arithB.Length ? inputShapes[0] : inputShapes[1] };
                 if (node.Outputs.Count > 0)
+                {
                     graph.ConstantData[node.Outputs[0]] = result;
+                    // Keep the float copy in step with the integer one. Leaving a stale (or fractional)
+                    // float behind is what let the truncation be undone by the very next operation.
+                    if (graph.FloatConstantData != null)
+                        graph.FloatConstantData[node.Outputs[0]] = result.Select(v => (float)v).ToArray();
+                    if (arithIsInteger) integerConstNames.Add(node.Outputs[0]);
+                }
             }
 
             // Compile-time Cast on known constants
@@ -798,9 +1067,20 @@ public class GraphCompiler
                 // so being able to watch the shape as it is decided is the difference between reading
                 // the answer and guessing at it.
                 if (_traceShapes != null && outName.Contains(_traceShapes, StringComparison.Ordinal))
-                    Console.WriteLine($"[SHAPE_TRACE] {node.OpType,-16} {outName,-46} -> [{string.Join(",", outputShapes[i])}]"
+                {
+                    // Show the folded VALUE too when it is small. Shape arithmetic goes wrong through the
+                    // values (an off-by-one in one folded scalar moves every slice boundary after it), and a
+                    // shape alone cannot show that.
+                    var folded = "";
+                    if (graph.ConstantData != null && graph.ConstantData.TryGetValue(outName, out var traceInts) && traceInts.Length <= 8)
+                        folded = $" = [{string.Join(",", traceInts)}]";
+                    else if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(outName, out var traceFloats) && traceFloats.Length <= 8)
+                        folded = $" = [{string.Join(",", traceFloats)}]f";
+
+                    Console.WriteLine($"[SHAPE_TRACE] {node.OpType,-16} {outName,-46} -> [{string.Join(",", outputShapes[i])}]{folded}"
                         + $"  from [{string.Join("; ", inputShapes.Select(sh => "[" + string.Join(",", sh) + "]"))}]"
                         + $"  inputs=[{string.Join(",", node.Inputs)}]");
+                }
             }
 
             // COMPILE-TIME READBACK ELIMINATION (2026-07-01): the inline evaluators above (Shape/Gather/Concat/
