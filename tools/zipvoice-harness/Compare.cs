@@ -43,6 +43,22 @@ public static class Compare
 
         // The reference features are computed once and handed to both engines, so a difference in the mel
         // can never be mistaken for a difference in the graphs.
+        // Shrinking the case is the cheapest way into a numeric divergence: with a few tokens and a
+        // short reference the tensors are small enough to read, and a difference that survives the
+        // shrink is a LOCAL computation rather than an accumulation over depth.
+        if (int.TryParse(Environment.GetEnvironmentVariable("ZIPVOICE_MAX_REF_MS"), out int maxRefMs) && maxRefMs > 0)
+        {
+            int keep = Math.Min(reference.Length, maxRefMs * referenceRate / 1000);
+            if (keep > 0) reference = reference[..keep];
+        }
+        if (int.TryParse(Environment.GetEnvironmentVariable("ZIPVOICE_MAX_TOKENS"), out int maxTokens) && maxTokens > 0)
+        {
+            if (fixture.Tokens.Length > maxTokens) fixture = fixture.WithTokens(fixture.Tokens[..maxTokens], fixture.PromptTokens);
+            if (fixture.PromptTokens.Length > maxTokens) fixture = fixture.WithTokens(fixture.Tokens, fixture.PromptTokens[..maxTokens]);
+        }
+        Console.WriteLine($"inputs   : {fixture.Tokens.Length} text tokens, {fixture.PromptTokens.Length} prompt tokens, "
+                        + $"{reference.Length / (double)referenceRate:F2}s reference");
+
         var promptFeatures = ZipVoiceFeatures.ComputePromptFeatures(reference, referenceRate, config, out int promptFrames);
         Console.WriteLine($"prompt   : {promptFrames} mel frames");
 

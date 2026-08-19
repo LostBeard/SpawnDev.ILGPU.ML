@@ -20,6 +20,13 @@ public sealed class ZipVoiceFixture
     public long[] Tokens { get; init; } = Array.Empty<long>();
     public long[] PromptTokens { get; init; } = Array.Empty<long>();
 
+    /// <summary>A copy with different token lists, for shrinking a case down to a readable size.</summary>
+    public ZipVoiceFixture WithTokens(long[] tokens, long[] promptTokens) => new()
+    {
+        Text = Text, PromptText = PromptText, PromptWav = PromptWav,
+        Tokens = tokens, PromptTokens = promptTokens,
+    };
+
     public static ZipVoiceFixture Load(string path)
     {
         using var document = JsonDocument.Parse(File.ReadAllText(path));
