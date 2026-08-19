@@ -27,12 +27,13 @@ return command switch
     "roundtrip" => RoundTrip(args.Length > 1 ? args[1] : Path.Combine(modelDir, "prompt.wav")),
     "synth" => Synth(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json",
                      args.Length > 2 ? args[2] : null),
+    "compare" => CompareEngines(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json"),
     _ => Usage(command),
 };
 
 int Usage(string bad)
 {
-    Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav]");
+    Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav] | compare [fixture.json]");
     return 2;
 }
 
@@ -82,7 +83,7 @@ int Synth(string fixturePath, string? outPath)
     };
     Console.WriteLine($"tailPad  : {pipeline.ReferenceTailSilenceSeconds}s");
 
-    var result = pipeline.Synthesize(fixture.Tokens, fixture.PromptTokens, reference, referenceRate);
+    var result = pipeline.SynthesizeAsync(fixture.Tokens, fixture.PromptTokens, reference, referenceRate).GetAwaiter().GetResult();
 
     Console.WriteLine($"timing   : encoder {result.EncoderMs:F0}ms, decoder {result.DecoderMs:F0}ms " +
                       $"({config.NumSteps} steps), vocoder {result.VocoderMs:F0}ms, total {result.TotalMs:F0}ms");
@@ -98,6 +99,32 @@ int Synth(string fixturePath, string? outPath)
     bool pass = result.DurationSeconds > 0.5 && Rms(result.Audio) > 0.005 && Rms(result.Audio) < 0.5;
     Console.WriteLine(pass ? "RESULT   : PASS (level plausible - grade the audio by transcribing it)" : "RESULT   : FAIL");
     return pass ? 0 : 1;
+}
+
+// Every graph on BOTH engines with identical inputs, stage by stage.
+// The orchestration is shared and the inputs are pinned, so any difference reported here is our engine.
+int CompareEngines(string fixturePath)
+{
+    if (!Directory.Exists(modelDir)) { Console.WriteLine($"no model dir at {modelDir}"); return 2; }
+
+    var resolved = ResolveFixture(fixturePath);
+    if (resolved == null) { Console.WriteLine($"no fixture at {fixturePath}"); return 2; }
+
+    var fixture = ZipVoiceFixture.Load(resolved);
+    var promptWav = Path.IsPathRooted(fixture.PromptWav) ? fixture.PromptWav : Path.Combine(modelDir, fixture.PromptWav);
+    if (!File.Exists(promptWav)) { Console.WriteLine($"no prompt wav at {promptWav}"); return 2; }
+
+    var (reference, referenceRate, _) = ReadWav(File.ReadAllBytes(promptWav));
+    return Compare.RunAsync(modelDir, fixture, reference, referenceRate).GetAwaiter().GetResult();
+}
+
+string? ResolveFixture(string fixturePath)
+{
+    if (Path.IsPathRooted(fixturePath)) return File.Exists(fixturePath) ? fixturePath : null;
+    var candidate = Path.Combine(AppContext.BaseDirectory, fixturePath);
+    if (File.Exists(candidate)) return candidate;
+    candidate = Path.Combine(Environment.CurrentDirectory, fixturePath);
+    return File.Exists(candidate) ? candidate : null;
 }
 
 // Reference audio -> our mel -> the real vocoder -> our inverse STFT -> audio.
@@ -134,7 +161,7 @@ int RoundTrip(string wavPath)
     using var graphs = new OrtZipVoiceGraphs(graphDir, int8);
     Console.WriteLine($"graphs   : {(int8 ? "int8" : "fp32")}");
     var started = System.Diagnostics.Stopwatch.StartNew();
-    var spectrum = graphs.RunVocoder(melChannelsFirst, config.NumMels, frames);
+    var spectrum = graphs.RunVocoderAsync(melChannelsFirst, config.NumMels, frames).GetAwaiter().GetResult();
     var audio = ZipVoicePipeline.Vocode(spectrum, config);
     started.Stop();
 

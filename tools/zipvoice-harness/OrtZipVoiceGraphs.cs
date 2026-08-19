@@ -54,9 +54,8 @@ public sealed class OrtZipVoiceGraphs : IZipVoiceGraphs
             ? modelDir.Replace("-int8-", "-", StringComparison.OrdinalIgnoreCase)
             : modelDir.Replace("zipvoice-distill-", "zipvoice-distill-int8-", StringComparison.OrdinalIgnoreCase);
 
-    public float[] RunEncoder(
-        long[] tokens, long[] promptTokens, long promptFeatureFrames, float speed,
-        out int numFrames, out int featDim)
+    public Task<ZipVoiceEncoding> RunEncoderAsync(
+        long[] tokens, long[] promptTokens, long promptFeatureFrames, float speed)
     {
         var inputs = new List<NamedOnnxValue>
         {
@@ -69,12 +68,11 @@ public sealed class OrtZipVoiceGraphs : IZipVoiceGraphs
 
         using var results = _encoder.Run(inputs);
         var output = results.First().AsTensor<float>();
-        numFrames = output.Dimensions[1];
-        featDim = output.Dimensions[2];
-        return output.ToArray();
+        return Task.FromResult(new ZipVoiceEncoding(
+            output.ToArray(), output.Dimensions[1], output.Dimensions[2]));
     }
 
-    public float[] RunDecoder(
+    public Task<float[]> RunDecoderAsync(
         float t, float[] x, float[] textCondition, float[] speechCondition,
         float guidanceScale, int numFrames, int featDim)
     {
@@ -89,10 +87,10 @@ public sealed class OrtZipVoiceGraphs : IZipVoiceGraphs
         };
 
         using var results = _decoder.Run(inputs);
-        return results.First().AsTensor<float>().ToArray();
+        return Task.FromResult(results.First().AsTensor<float>().ToArray());
     }
 
-    public ZipVoiceSpectrum RunVocoder(float[] melChannelsFirst, int channels, int frames)
+    public Task<ZipVoiceSpectrum> RunVocoderAsync(float[] melChannelsFirst, int channels, int frames)
     {
         var inputs = new List<NamedOnnxValue>
         {
@@ -105,9 +103,9 @@ public sealed class OrtZipVoiceGraphs : IZipVoiceGraphs
         var cos = byName["x"];
         var sin = byName["y"];
 
-        return new ZipVoiceSpectrum(
+        return Task.FromResult(new ZipVoiceSpectrum(
             magnitude.ToArray(), cos.ToArray(), sin.ToArray(),
-            Bins: magnitude.Dimensions[1], Frames: magnitude.Dimensions[2]);
+            Bins: magnitude.Dimensions[1], Frames: magnitude.Dimensions[2]));
     }
 
     public void Dispose()

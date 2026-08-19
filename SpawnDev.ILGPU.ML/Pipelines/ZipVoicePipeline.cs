@@ -4,11 +4,14 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 
 /// <summary>The three ONNX graphs ZipVoice is made of, behind one interface.</summary>
 /// <remarks>
-/// The orchestration around these graphs - mel features, the flow-matching loop, the inverse STFT -
-/// is where a port goes wrong, and it is identical whichever engine runs the graphs. Keeping the
-/// engine behind an interface means that orchestration is written ONCE and can be run on a reference
-/// engine and on ours, so a wrong output can be attributed: same result on both engines means the
-/// algorithm is wrong, different results means the engine is.
+/// The orchestration around these graphs - mel features, the flow-matching loop, the inverse STFT - is
+/// where a port goes wrong, and it is identical whichever engine runs the graphs. Keeping the engine
+/// behind an interface means that orchestration is written ONCE and can be run on a reference engine and
+/// on ours, so a wrong output can be attributed: same result on both engines means the algorithm is
+/// wrong, different results means the engine is.
+///
+/// Asynchronous because the browser backends are: reading a WebGPU buffer back is a mapAsync, and a
+/// synchronous interface would either deadlock there or quietly restrict this pipeline to the desktop.
 /// </remarks>
 public interface IZipVoiceGraphs : IDisposable
 {
@@ -24,37 +27,39 @@ public interface IZipVoiceGraphs : IDisposable
     /// <param name="promptTokens">Token ids of the reference clip's transcript.</param>
     /// <param name="promptFeatureFrames">Number of mel frames in the reference clip.</param>
     /// <param name="speed">Speaking rate multiplier.</param>
-    /// <param name="numFrames">Total frames to generate, reference frames included.</param>
-    /// <param name="featDim">Feature dimension, 100.</param>
-    float[] RunEncoder(
-        long[] tokens, long[] promptTokens, long promptFeatureFrames, float speed,
-        out int numFrames, out int featDim);
+    Task<ZipVoiceEncoding> RunEncoderAsync(
+        long[] tokens, long[] promptTokens, long promptFeatureFrames, float speed);
 
     /// <summary>
     /// Flow-matching decoder: the velocity field of the ODE, evaluated at one timestep.
     /// </summary>
     /// <remarks>
-    /// Classifier-free guidance is applied INSIDE this graph - it takes the guidance scale as an
-    /// input rather than requiring two passes and a blend outside.
+    /// Classifier-free guidance is applied INSIDE this graph - it takes the guidance scale as an input
+    /// rather than requiring two passes and a blend outside.
     /// </remarks>
-    float[] RunDecoder(
+    Task<float[]> RunDecoderAsync(
         float t, float[] x, float[] textCondition, float[] speechCondition,
         float guidanceScale, int numFrames, int featDim);
 
     /// <summary>
-    /// Vocos vocoder: mel to a complex spectrogram, expressed as a magnitude and the cosine and sine
-    /// of the phase.
+    /// Vocos vocoder: mel to a complex spectrogram, expressed as a magnitude and the cosine and sine of
+    /// the phase.
     /// </summary>
     /// <param name="melChannelsFirst">Log-mel, [channels, frames] row-major, WITHOUT the feature scale.</param>
-    ZipVoiceSpectrum RunVocoder(float[] melChannelsFirst, int channels, int frames);
+    /// <param name="channels">Mel channels.</param>
+    /// <param name="frames">Mel frames.</param>
+    Task<ZipVoiceSpectrum> RunVocoderAsync(float[] melChannelsFirst, int channels, int frames);
 }
+
+/// <summary>The encoder's conditioning output and the generated length it implies.</summary>
+public readonly record struct ZipVoiceEncoding(float[] TextCondition, int NumFrames, int FeatDim);
 
 /// <summary>
 /// The vocoder's output: a complex spectrogram in polar-ish form, [bins, frames] row-major each.
 /// </summary>
 /// <remarks>
-/// Vocos deliberately stops one step short of a waveform. Predicting magnitude and phase and letting
-/// a plain inverse STFT do the resynthesis is what makes it fast - there is no autoregressive sample
+/// Vocos deliberately stops one step short of a waveform. Predicting magnitude and phase and letting a
+/// plain inverse STFT do the resynthesis is what makes it fast - there is no autoregressive sample
 /// generation anywhere in it.
 /// </remarks>
 public readonly record struct ZipVoiceSpectrum(float[] Magnitude, float[] Cos, float[] Sin, int Bins, int Frames);
@@ -72,9 +77,9 @@ public record ZipVoiceResult(
 /// ZipVoice zero-shot voice cloning: speaks new text in the voice of a short reference clip.
 /// </summary>
 /// <remarks>
-/// The pipeline is: encode text + reference transcript to a per-frame conditioning; start from
-/// gaussian noise; integrate the flow-matching ODE for a handful of Euler steps to turn that noise
-/// into a mel; drop the reference frames off the front; vocode the rest.
+/// The pipeline is: encode text + reference transcript to a per-frame conditioning; start from gaussian
+/// noise; integrate the flow-matching ODE for a handful of Euler steps to turn that noise into a mel;
+/// drop the reference frames off the front; vocode the rest.
 /// <para>
 /// This class takes TOKEN IDS, not text. Turning English text into tokens needs an espeak-ng
 /// grapheme-to-phoneme pass, which is a separate piece - the shipped lexicon covers Chinese only.
@@ -97,6 +102,17 @@ public sealed class ZipVoicePipeline : IDisposable
     /// </remarks>
     public int? NoiseSeed { get; set; }
 
+    /// <summary>
+    /// Silence appended to the reference clip before analysis, in seconds.
+    /// </summary>
+    /// <remarks>
+    /// Without it the model carries the last word of the reference into the start of the line it
+    /// generates - the reference audio ends mid-breath, so the continuation it is asked to write begins
+    /// inside that word. A quarter second of silence gives it somewhere to finish. Set to 0 to compare
+    /// against implementations that do not pad.
+    /// </remarks>
+    public float ReferenceTailSilenceSeconds { get; set; } = 0.25f;
+
     public ZipVoicePipeline(IZipVoiceGraphs graphs, ZipVoiceConfig? config = null)
     {
         _graphs = graphs ?? throw new ArgumentNullException(nameof(graphs));
@@ -110,43 +126,23 @@ public sealed class ZipVoicePipeline : IDisposable
     /// <param name="promptTokens">Token ids of the reference clip's exact transcript.</param>
     /// <param name="referenceAudio">Reference clip, mono, in [-1, 1].</param>
     /// <param name="referenceSampleRate">Sample rate of the reference clip.</param>
-    public ZipVoiceResult Synthesize(
+    public Task<ZipVoiceResult> SynthesizeAsync(
         long[] tokens, long[] promptTokens, float[] referenceAudio, int referenceSampleRate)
     {
         var promptFeatures = ZipVoiceFeatures.ComputePromptFeatures(
             PadReferenceTail(referenceAudio, referenceSampleRate),
             referenceSampleRate, Config, out int promptFrames);
-        return SynthesizeFromFeatures(tokens, promptTokens, promptFeatures, promptFrames);
-    }
-
-    /// <summary>
-    /// Silence appended to the reference clip before analysis, in seconds.
-    /// </summary>
-    /// <remarks>
-    /// Without it the model carries the last word of the reference into the start of the line it
-    /// generates - the reference audio ends mid-breath, so the continuation it is asked to write begins
-    /// inside that word. A quarter second of silence gives it somewhere to finish. Set to 0 to compare
-    /// against implementations that do not pad.
-    /// </remarks>
-    public float ReferenceTailSilenceSeconds { get; set; } = 0.25f;
-
-    private float[] PadReferenceTail(float[] referenceAudio, int referenceSampleRate)
-    {
-        int silence = (int)(ReferenceTailSilenceSeconds * referenceSampleRate);
-        if (silence <= 0) return referenceAudio;
-        var padded = new float[referenceAudio.Length + silence];
-        Array.Copy(referenceAudio, padded, referenceAudio.Length);
-        return padded;
+        return SynthesizeFromFeaturesAsync(tokens, promptTokens, promptFeatures, promptFrames);
     }
 
     /// <summary>
     /// Speak <paramref name="tokens"/> from reference features that have already been computed.
     /// </summary>
     /// <remarks>
-    /// Worth having separately: the reference features are the expensive, unchanging part of a voice,
-    /// so a speaking robot computes them once per voice rather than once per sentence.
+    /// Worth having separately: the reference features are the expensive, unchanging part of a voice, so
+    /// a speaking robot computes them once per voice rather than once per sentence.
     /// </remarks>
-    public ZipVoiceResult SynthesizeFromFeatures(
+    public async Task<ZipVoiceResult> SynthesizeFromFeaturesAsync(
         long[] tokens, long[] promptTokens, float[] promptFeatures, int promptFrames)
     {
         if (tokens.Length == 0) throw new ArgumentException("No tokens to speak.", nameof(tokens));
@@ -155,10 +151,10 @@ public sealed class ZipVoicePipeline : IDisposable
         var total = System.Diagnostics.Stopwatch.StartNew();
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var textCondition = _graphs.RunEncoder(
-            tokens, promptTokens, promptFrames, Config.Speed, out int numFrames, out int featDim);
+        var encoding = await _graphs.RunEncoderAsync(tokens, promptTokens, promptFrames, Config.Speed);
         double encoderMs = sw.Elapsed.TotalMilliseconds;
 
+        int numFrames = encoding.NumFrames, featDim = encoding.FeatDim;
         if (numFrames <= promptFrames)
             throw new InvalidOperationException(
                 $"The encoder asked for {numFrames} frames but the reference alone is {promptFrames}; " +
@@ -170,8 +166,8 @@ public sealed class ZipVoicePipeline : IDisposable
         // through the conditioning, not through the starting point.
         var x = GaussianNoise(count, NoiseSeed);
 
-        // The reference mel occupies the front of the conditioning and zeros fill the rest: the model
-        // is completing a spectrogram whose beginning it has been given.
+        // The reference mel occupies the front of the conditioning and zeros fill the rest: the model is
+        // completing a spectrogram whose beginning it has been given.
         var speechCondition = new float[count];
         Array.Copy(promptFeatures, speechCondition, Math.Min(promptFeatures.Length, promptFrames * featDim));
 
@@ -182,7 +178,8 @@ public sealed class ZipVoicePipeline : IDisposable
         {
             float t = timesteps[step];
             float dt = timesteps[step + 1] - timesteps[step];
-            var v = _graphs.RunDecoder(t, x, textCondition, speechCondition, Config.GuidanceScale, numFrames, featDim);
+            var v = await _graphs.RunDecoderAsync(
+                t, x, encoding.TextCondition, speechCondition, Config.GuidanceScale, numFrames, featDim);
             for (int i = 0; i < count; i++) x[i] += v[i] * dt;
         }
         double decoderMs = sw.Elapsed.TotalMilliseconds;
@@ -191,8 +188,8 @@ public sealed class ZipVoicePipeline : IDisposable
         // not the text we asked for.
         int keptFrames = numFrames - promptFrames;
 
-        // Vocos wants [channels, frames] and unscaled log-mels, so transpose and undo the feature scale
-        // in one pass.
+        // Vocos wants [channels, frames] and unscaled log-mels, so transpose and undo the feature scale in
+        // one pass.
         float invFeatScale = 1f / Config.FeatScale;
         var mel = new float[featDim * keptFrames];
         for (int f = 0; f < keptFrames; f++)
@@ -203,7 +200,7 @@ public sealed class ZipVoicePipeline : IDisposable
         }
 
         sw.Restart();
-        var spectrum = _graphs.RunVocoder(mel, featDim, keptFrames);
+        var spectrum = await _graphs.RunVocoderAsync(mel, featDim, keptFrames);
         var audio = Vocode(spectrum, Config);
         double vocoderMs = sw.Elapsed.TotalMilliseconds;
 
@@ -217,8 +214,8 @@ public sealed class ZipVoicePipeline : IDisposable
     /// </summary>
     /// <remarks>
     /// The magnitude and the unit vector (cos, sin) multiply back into a rectangular complex
-    /// spectrogram, which the inverse STFT resynthesises. The transpose is not incidental: the
-    /// vocoder emits [bins, frames] and the inverse STFT reads frames as rows.
+    /// spectrogram, which the inverse STFT resynthesises. The transpose is not incidental: the vocoder
+    /// emits [bins, frames] and the inverse STFT reads frames as rows.
     /// </remarks>
     public static float[] Vocode(ZipVoiceSpectrum spectrum, ZipVoiceConfig config)
     {
@@ -243,8 +240,8 @@ public sealed class ZipVoicePipeline : IDisposable
 
     /// <summary>Standard normal noise, optionally from a fixed seed.</summary>
     /// <remarks>
-    /// Box-Muller rather than a sum-of-uniforms approximation: the tails are the part that matters
-    /// here, and an approximation would quietly narrow them.
+    /// Box-Muller rather than a sum-of-uniforms approximation: the tails are the part that matters here,
+    /// and an approximation would quietly narrow them.
     /// </remarks>
     public static float[] GaussianNoise(int count, int? seed = null)
     {
@@ -260,6 +257,15 @@ public sealed class ZipVoicePipeline : IDisposable
             if (i + 1 < count) values[i + 1] = (float)(radius * Math.Sin(angle));
         }
         return values;
+    }
+
+    private float[] PadReferenceTail(float[] referenceAudio, int referenceSampleRate)
+    {
+        int silence = (int)(ReferenceTailSilenceSeconds * referenceSampleRate);
+        if (silence <= 0) return referenceAudio;
+        var padded = new float[referenceAudio.Length + silence];
+        Array.Copy(referenceAudio, padded, referenceAudio.Length);
+        return padded;
     }
 
     public void Dispose() => _graphs.Dispose();

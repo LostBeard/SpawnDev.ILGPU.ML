@@ -110,6 +110,11 @@ public class GraphCompiler
                 graphOutputShapes[output.Name] = output.Shape;
         }
 
+        // Optional shape tracing, see the SHAPE_TRACE line below.
+        var _traceShapes = Environment.GetEnvironmentVariable("ML_TRACE_SHAPES");
+        if (string.IsNullOrEmpty(_traceShapes)) _traceShapes = null;
+        if (_traceShapes != null) Console.WriteLine($"[SHAPE_TRACE] enabled, matching '{_traceShapes}', {sorted.Count} nodes");
+
         // Compile each node
         var compiledNodes = new List<CompiledNode>();
         int nodeCompileIdx = 0;
@@ -147,6 +152,23 @@ public class GraphCompiler
                 }
                 if (!attrs.ContainsKey("num_outputs"))
                     attrs["num_outputs"] = (long)node.Outputs.Count;
+            }
+
+            // ConstantOfShape's output SHAPE is its input tensor's VALUES, not that tensor's shape - a
+            // 1-element input holding [2] means "produce 2 elements". InferOutputShapes is only handed
+            // shapes, so it cannot know that; hand it the values when they are foldable. Without this the
+            // output collapses to one element per input ENTRY, and every shape computed downstream of it
+            // is short - which is how ZipVoice's encoder ended up building a 2-entry pad list for a
+            // rank-2 tensor that needs 4, and crashing inside the Pad kernel.
+            if (node.OpType == "ConstantOfShape"
+                && node.Inputs.Count >= 1 && !string.IsNullOrEmpty(node.Inputs[0])
+                && graph.ConstantData != null
+                && graph.ConstantData.TryGetValue(node.Inputs[0], out var cosDimVals)
+                && cosDimVals.Length > 0)
+            {
+                var cosDims = new long[cosDimVals.Length];
+                for (int i = 0; i < cosDimVals.Length; i++) cosDims[i] = (long)cosDimVals[i];
+                attrs["_resolved_shape"] = cosDims;
             }
 
             // Infer output shapes
@@ -297,13 +319,35 @@ public class GraphCompiler
                     {
                         int ax = shapeAxes[si] < 0 ? shapeAxes[si] + outShape.Length : shapeAxes[si];
                         if (ax < 0 || ax >= outShape.Length) { sliceValid = false; break; }
-                        int s = shapeStarts[si]; int e = shapeEnds[si]; int step = Math.Abs(shapeSteps[si]);
+                        // Long arithmetic throughout: the "to the beginning" sentinel is INT64_MIN, and
+                        // adding the dimension to it in int would overflow into a positive number.
+                        long s = shapeStarts[si]; long e = shapeEnds[si];
+                        long step = shapeSteps[si];
                         if (step == 0) step = 1;
-                        if (s < 0) s += outShape[ax];
-                        if (e < 0) e += outShape[ax];
-                        s = Math.Clamp(s, 0, outShape[ax]);
-                        e = Math.Clamp(e, 0, outShape[ax]);
-                        outShape[ax] = Math.Max(0, (e - s + step - 1) / step);
+                        long dim = outShape[ax];
+                        if (s < 0) s += dim;
+                        if (e < 0) e += dim;
+
+                        long sliceLength;
+                        if (step > 0)
+                        {
+                            s = Math.Clamp(s, 0, dim);
+                            e = Math.Clamp(e, 0, dim);
+                            sliceLength = e > s ? (e - s + step - 1) / step : 0;
+                        }
+                        else
+                        {
+                            // A negative step walks BACKWARDS, and its bounds are not the forward ones: the
+                            // start may sit on the last element, and the end may legitimately fall one before
+                            // index 0 - which is exactly what the INT64_MIN sentinel means in the reversal
+                            // that torch emits when it builds a pad list. Taking Math.Abs of the step and
+                            // clamping the end up to 0, as this did, turns "reverse the whole axis" into an
+                            // EMPTY slice, and every shape downstream collapses with it.
+                            s = Math.Clamp(s, 0, dim - 1);
+                            e = Math.Clamp(e, -1, dim - 1);
+                            sliceLength = s > e ? (s - e - 1) / (-step) + 1 : 0;
+                        }
+                        outShape[ax] = (int)Math.Max(0, sliceLength);
                     }
                     if (sliceValid)
                         outputShapes = new[] { outShape };
@@ -731,7 +775,32 @@ public class GraphCompiler
                             .Zip(outputShapes[i], (dec, inf) => dec > 0 ? dec : inf).ToArray();
                     // else: dynamic declaration with a rank mismatch - trust the inference.
                 }
+                // A Constant node's shape comes from its own value, but attributes reach the operator as
+                // plain numbers with the tensor's dims stripped, so inference can only answer [1]. When the
+                // folded value is longer than that, its LENGTH is the shape - these constants are 1-D. Left
+                // wrong, a 2-entry pad list is called one element and every shape derived from it collapses,
+                // which is what broke ZipVoice's encoder several nodes later inside Pad.
+                if (node.OpType == "Constant" && outputShapes[i].Length <= 1)
+                {
+                    int foldedLength = 0;
+                    if (graph.ConstantData != null && graph.ConstantData.TryGetValue(outName, out var foldedInts))
+                        foldedLength = foldedInts.Length;
+                    else if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(outName, out var foldedFloats))
+                        foldedLength = foldedFloats.Length;
+                    if (foldedLength > 1) outputShapes[i] = new[] { foldedLength };
+                }
+
                 knownShapes[outName] = outputShapes[i];
+
+                // Trace how one tensor's compiled shape was arrived at. Set ML_TRACE_SHAPES to a
+                // substring of the tensor names you care about. A collapsed shape here is invisible at
+                // runtime - the graph just crashes somewhere downstream with a size nothing explains -
+                // so being able to watch the shape as it is decided is the difference between reading
+                // the answer and guessing at it.
+                if (_traceShapes != null && outName.Contains(_traceShapes, StringComparison.Ordinal))
+                    Console.WriteLine($"[SHAPE_TRACE] {node.OpType,-16} {outName,-46} -> [{string.Join(",", outputShapes[i])}]"
+                        + $"  from [{string.Join("; ", inputShapes.Select(sh => "[" + string.Join(",", sh) + "]"))}]"
+                        + $"  inputs=[{string.Join(",", node.Inputs)}]");
             }
 
             // COMPILE-TIME READBACK ELIMINATION (2026-07-01): the inline evaluators above (Shape/Gather/Concat/

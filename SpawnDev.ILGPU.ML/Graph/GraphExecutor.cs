@@ -678,14 +678,41 @@ public class GraphExecutor : IDisposable
                         if (ax < 0) ax += resolved.Length;
                         if (ax >= 0 && ax < resolved.Length)
                         {
-                            int s = SatFloatToInt(starts[si]); if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
-                            int e = SatFloatToInt(ends[si]); if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
-                            int st = steps != null && si < steps.Length ? SatFloatToInt(steps[si]) : 1;
+                            // Long arithmetic: the "to the beginning" sentinel is INT64_MIN, and adding the
+                            // dimension to it in int would wrap into a positive number.
+                            long sStart = SatFloatToInt(starts[si]);
+                            long sEnd = SatFloatToInt(ends[si]);
+                            long sStep = steps != null && si < steps.Length ? SatFloatToInt(steps[si]) : 1;
+                            if (sStep == 0) sStep = 1;
+                            long axDim = resolved[ax];
+                            if (sStart < 0) sStart += axDim;
+                            if (sEnd < 0) sEnd += axDim;
+
+                            long sliceLen;
+                            if (axDim <= 0)
+                            {
+                                sliceLen = 0;
+                            }
+                            else if (sStep > 0)
+                            {
+                                sStart = Math.Clamp(sStart, 0, axDim);
+                                sEnd = Math.Clamp(sEnd, 0, axDim);
+                                sliceLen = sEnd > sStart ? (sEnd - sStart + sStep - 1) / sStep : 0;
+                            }
+                            else
+                            {
+                                // A negative step walks backwards and may legitimately end one BEFORE index 0,
+                                // which is what the INT64_MIN sentinel means. The forward clamp (end floored at
+                                // 0, step taken as its magnitude) turns "reverse this axis" into an empty slice.
+                                sStart = Math.Clamp(sStart, 0, axDim - 1);
+                                sEnd = Math.Clamp(sEnd, -1, axDim - 1);
+                                sliceLen = sStart > sEnd ? (sStart - sEnd - 1) / (-sStep) + 1 : 0;
+                            }
                             // Empty slices ARE valid (e<=s → 0): DAv3's extrinsics builds an EMPTY [.,.,0,4] row
                             // (Slice [3:3] on a size-3 axis, ORT value_info [?,?,0,4]) that a later Concat treats
                             // as a no-op. Rejecting the 0-dim here collapsed the whole shape to the compile-time
                             // rank-2 [1,4] → the extrinsics Concat then crashed on a rank/inner mismatch.
-                            resolved[ax] = Math.Max(0, (e - s + st - 1) / st);
+                            resolved[ax] = (int)Math.Max(0, sliceLen);
                         }
                     }
                     if (resolved.All(d => d >= 0))
@@ -1418,7 +1445,7 @@ public class GraphExecutor : IDisposable
         "Slice" or "Unsqueeze" or "Squeeze" or "Identity" or "Cast" or "Reshape"
             or "Mul" or "Add" or "Sub" or "Div" or "Where" or "Equal" or "Greater" or "Less"
             or "Floor" or "Ceil" or "Neg" or "Abs" or "Mod" or "Min" or "Max"
-            or "ConstantOfShape" or "Expand" => true,
+            or "ConstantOfShape" or "Expand" or "Transpose" => true,
         _ => false,
     };
 
@@ -1502,6 +1529,23 @@ public class GraphExecutor : IDisposable
             if (halfTensors.TryGetValue(name!, out var h)) return h.Shape;
             return null;
         }
+        long[]? AttrLongArray(string key)
+        {
+            if (node.Attributes == null || !node.Attributes.TryGetValue(key, out var o) || o == null) return null;
+            switch (o)
+            {
+                case long[] la: return la;
+                case int[] ia:
+                {
+                    var converted = new long[ia.Length];
+                    for (int i = 0; i < ia.Length; i++) converted[i] = ia[i];
+                    return converted;
+                }
+                case long l: return new[] { l };
+                case int i2: return new long[] { i2 };
+                default: return null;
+            }
+        }
         long AttrLong(string key, long dflt)
         {
             if (node.Attributes == null || !node.Attributes.TryGetValue(key, out var o) || o == null) return dflt;
@@ -1572,7 +1616,8 @@ public class GraphExecutor : IDisposable
                 var axesV = Vals(ins.Length > 3 ? ins[3] : null);
                 var stepsV = Vals(ins.Length > 4 ? ins[4] : null);
                 if ((axesV != null && axesV.Length > 0 && (long)axesV[0] != 0)) return false;
-                if (stepsV != null && stepsV.Length > 0 && (long)stepsV[0] != 1) return false;
+                long sliceStep = stepsV != null && stepsV.Length > 0 ? (long)stepsV[0] : 1;
+                if (sliceStep == 0) return false;
                 // SATURATE float->int (NOT a plain (int) cast): the ONNX "to the end" sentinel is INT64_MAX
                 // (9223372036854775807), stored here as a float ≈9.223372E+18. A plain (int)9.2e18f OVERFLOWS
                 // to int.MinValue → after `en += data.Length` + clamp it collapses the slice to EMPTY. This is
@@ -1580,14 +1625,43 @@ public class GraphExecutor : IDisposable
                 // yield the last element [77], but the overflow produced [] → Squeeze→Cast→Range(limit=EMPTY)
                 // threw under elide. Mirrors the compiler-resolved Slice path (SatFloatToInt, line ~1275) + the
                 // SliceOperator. Verified: SatFloatToInt(9.2e18f)=int.MaxValue → en=clamp(MaxValue,0,2)=2 → [77].
-                int st = SatFloatToInt(starts[0]), en = SatFloatToInt(ends[0]);
-                if (st < 0) st += data.Length;
-                if (en < 0) en += data.Length;
-                st = System.Math.Clamp(st, 0, data.Length);
-                en = System.Math.Clamp(en, 0, data.Length);
-                if (en < st) en = st;
-                var outv = new float[en - st];
-                for (int i = 0; i < outv.Length; i++) outv[i] = data[st + i];
+                // Axis 0 is a ROW when the value is not a flat vector, so the unit of movement is a row.
+                // Reversing a [2,2] row-wise gives [row1, row0]; reversing the flat list would give the
+                // elements backwards, which is a different tensor. Torch's pad-list export does exactly
+                // this reversal, so getting it wrong silently mis-orders the pad amounts.
+                int rowSize = 1, dim0 = data.Length;
+                var sliceShape = ShapeOf(ins.Length > 0 ? ins[0] : null);
+                if (sliceShape != null && sliceShape.Length > 1)
+                {
+                    for (int d = 1; d < sliceShape.Length; d++) rowSize *= sliceShape[d];
+                    if (rowSize <= 0 || data.Length % rowSize != 0) return false;
+                    dim0 = data.Length / rowSize;
+                }
+
+                long st = SatFloatToInt(starts[0]), en = SatFloatToInt(ends[0]);
+                if (st < 0) st += dim0;
+                if (en < 0) en += dim0;
+
+                var picked = new System.Collections.Generic.List<int>();
+                if (sliceStep > 0)
+                {
+                    st = System.Math.Clamp(st, 0, dim0);
+                    en = System.Math.Clamp(en, 0, dim0);
+                    for (long i = st; i < en; i += sliceStep) picked.Add((int)i);
+                }
+                else
+                {
+                    // A negative step ends one BEFORE index 0 when it runs off the front, which is what the
+                    // INT64_MIN sentinel encodes. Clamping the end up to 0 like the forward case would drop
+                    // the first row.
+                    st = System.Math.Clamp(st, 0, dim0 - 1);
+                    en = System.Math.Clamp(en, -1, dim0 - 1);
+                    for (long i = st; i > en; i += sliceStep) picked.Add((int)i);
+                }
+
+                var outv = new float[picked.Count * rowSize];
+                for (int r = 0; r < picked.Count; r++)
+                    System.Array.Copy(data, picked[r] * rowSize, outv, r * rowSize, rowSize);
                 result = outv; return true;
             }
             case "Mul": case "Add": case "Sub": case "Div":
@@ -1671,6 +1745,61 @@ public class GraphExecutor : IDisposable
                     outv[i] = node.OpType switch { "Mod" => bv != 0 ? av - bv * (float)System.Math.Floor(av / bv) : 0, "Min" => System.Math.Min(av, bv), "Max" => System.Math.Max(av, bv), _ => av };
                 }
                 result = outv; return true;
+            }
+            case "Transpose":
+            {
+                // Needed by the standard torch F.pad export, which builds its pad list by reshaping the
+                // amounts into pairs, reversing them, TRANSPOSING, and flattening. Without this the chain
+                // breaks here and the pad amounts fall back to a placeholder - which is not a silent
+                // wrong answer but a hard crash, because the fallback is the wrong LENGTH for the rank.
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                var shape = ShapeOf(ins.Length > 0 ? ins[0] : null);
+                if (shape == null || shape.Length == 0) return false;
+
+                long total = 1;
+                foreach (var d in shape) total *= d;
+                // If our shape and the value vector disagree, one of them is already wrong; guessing which
+                // would turn a detectable failure into a plausible wrong answer.
+                if (total != v.Length) return false;
+
+                var perm = AttrLongArray("perm");
+                if (perm == null || perm.Length == 0)
+                {
+                    perm = new long[shape.Length];
+                    for (int i = 0; i < shape.Length; i++) perm[i] = shape.Length - 1 - i;   // ONNX default: reverse
+                }
+                if (perm.Length != shape.Length) return false;
+
+                var axes = new int[shape.Length];
+                var outShape = new int[shape.Length];
+                for (int i = 0; i < shape.Length; i++)
+                {
+                    int axis = (int)perm[i];
+                    if (axis < 0) axis += shape.Length;
+                    if (axis < 0 || axis >= shape.Length) return false;
+                    axes[i] = axis;
+                    outShape[i] = shape[axis];
+                }
+
+                var inStrides = new int[shape.Length];
+                inStrides[shape.Length - 1] = 1;
+                for (int i = shape.Length - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * shape[i + 1];
+
+                var transposed = new float[v.Length];
+                var index = new int[shape.Length];
+                for (int flat = 0; flat < transposed.Length; flat++)
+                {
+                    int src = 0;
+                    for (int i = 0; i < shape.Length; i++) src += index[i] * inStrides[axes[i]];
+                    transposed[flat] = v[src];
+                    for (int i = shape.Length - 1; i >= 0; i--)
+                    {
+                        if (++index[i] < outShape[i]) break;
+                        index[i] = 0;
+                    }
+                }
+                result = transposed; return true;
             }
             case "ConstantOfShape":
             {
@@ -2136,14 +2265,41 @@ public class GraphExecutor : IDisposable
                         if (ax < 0) ax += resolved.Length;
                         if (ax >= 0 && ax < resolved.Length)
                         {
-                            int s = SatFloatToInt(starts[si]); if (s < 0) s += resolved[ax]; if (s > resolved[ax]) s = resolved[ax]; if (s < 0) s = 0;
-                            int e = SatFloatToInt(ends[si]); if (e < 0) e += resolved[ax]; if (e > resolved[ax]) e = resolved[ax];
-                            int st = steps != null && si < steps.Length ? SatFloatToInt(steps[si]) : 1;
+                            // Long arithmetic: the "to the beginning" sentinel is INT64_MIN, and adding the
+                            // dimension to it in int would wrap into a positive number.
+                            long sStart = SatFloatToInt(starts[si]);
+                            long sEnd = SatFloatToInt(ends[si]);
+                            long sStep = steps != null && si < steps.Length ? SatFloatToInt(steps[si]) : 1;
+                            if (sStep == 0) sStep = 1;
+                            long axDim = resolved[ax];
+                            if (sStart < 0) sStart += axDim;
+                            if (sEnd < 0) sEnd += axDim;
+
+                            long sliceLen;
+                            if (axDim <= 0)
+                            {
+                                sliceLen = 0;
+                            }
+                            else if (sStep > 0)
+                            {
+                                sStart = Math.Clamp(sStart, 0, axDim);
+                                sEnd = Math.Clamp(sEnd, 0, axDim);
+                                sliceLen = sEnd > sStart ? (sEnd - sStart + sStep - 1) / sStep : 0;
+                            }
+                            else
+                            {
+                                // A negative step walks backwards and may legitimately end one BEFORE index 0,
+                                // which is what the INT64_MIN sentinel means. The forward clamp (end floored at
+                                // 0, step taken as its magnitude) turns "reverse this axis" into an empty slice.
+                                sStart = Math.Clamp(sStart, 0, axDim - 1);
+                                sEnd = Math.Clamp(sEnd, -1, axDim - 1);
+                                sliceLen = sStart > sEnd ? (sStart - sEnd - 1) / (-sStep) + 1 : 0;
+                            }
                             // Empty slices ARE valid (e<=s → 0): DAv3's extrinsics builds an EMPTY [.,.,0,4] row
                             // (Slice [3:3] on a size-3 axis, ORT value_info [?,?,0,4]) that a later Concat treats
                             // as a no-op. Rejecting the 0-dim here collapsed the whole shape to the compile-time
                             // rank-2 [1,4] → the extrinsics Concat then crashed on a rank/inner mismatch.
-                            resolved[ax] = Math.Max(0, (e - s + st - 1) / st);
+                            resolved[ax] = (int)Math.Max(0, sliceLen);
                         }
                     }
                     if (resolved.All(d => d >= 0))

@@ -315,6 +315,20 @@ public class ClipOperator(OperatorRegistry reg) : IOnnxOperator
 
 // ── Binary element-wise ──
 
+/// <summary>
+/// Last dimension of a tensor, or 0 for a rank-0 (scalar) one.
+/// </summary>
+/// <remarks>
+/// The broadcast branches below compare an operand's element count against the other's last dimension.
+/// Written as <c>Shape[^1]</c> that throws on a scalar, whose shape array is empty - and a scalar is a
+/// perfectly legal operand, so the guard has to answer "no last dimension" instead of failing. Returning
+/// 0 makes those comparisons false, which routes scalars to their own branches.
+/// </remarks>
+internal static class BroadcastShapeHelpers
+{
+    public static int LastDim(Tensor t) => t.Shape.Length > 0 ? t.Shape[^1] : 0;
+}
+
 public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareOperator
 {
     public string OpType => "Add";
@@ -340,7 +354,23 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
             reg.ElementWise.AddInPlace(output.Data, b.Data, a.ElementCount);
         }
-        else if (b.ElementCount == a.Shape[^1] && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
+        else if (b.ElementCount == 1 && a.ElementCount == output.ElementCount)
+        {
+            // Scalar broadcast. This has to come BEFORE any branch that reads a last dimension: a rank-0
+            // tensor has no last dimension, and Shape[^1] on an empty shape throws rather than returning
+            // anything. Not an edge case here - the flow-matching decoder feeds its timestep in as a true
+            // 0-d tensor and adds it to a [1,384] embedding, which crashed the whole graph.
+            reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
+            reg.ElementWise.AddBias(output.Data, b.Data, a.ElementCount, 1);
+        }
+        else if (a.ElementCount == 1 && b.ElementCount == output.ElementCount)
+        {
+            // Same case with the operands the other way round; addition commutes, so the scalar is
+            // applied to a copy of b.
+            reg.ElementWise.Scale(b.Data, output.Data, b.ElementCount, 1f);
+            reg.ElementWise.AddBias(output.Data, a.Data, b.ElementCount, 1);
+        }
+        else if (b.ElementCount == BroadcastShapeHelpers.LastDim(a) && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
         {
             // Last-dim broadcast: copy a → output, then AddBias in-place. The second guard (all of b's
             // elements in its LAST dim) keeps a per-channel bias shaped [C,1,1] — which also satisfies
@@ -408,7 +438,18 @@ public class MulOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             reg.ElementWise.Mul(a.Data, bb.Data, ctx.Outputs[0].Data, a.ElementCount);
             if (rented != null) ctx.Pool.Return(rented);
         }
-        else if (b.ElementCount == a.Shape[^1] && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
+        else if (b.ElementCount == 1 && a.ElementCount == ctx.Outputs[0].ElementCount)
+        {
+            // Scalar broadcast, before any last-dim branch - see AddOperator for why a rank-0 operand
+            // cannot be allowed to reach Shape[^1].
+            reg.ElementWise.BroadcastMul(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount, 1);
+        }
+        else if (a.ElementCount == 1 && b.ElementCount == ctx.Outputs[0].ElementCount)
+        {
+            // Multiplication commutes, so the scalar operand can be the broadcast one.
+            reg.ElementWise.BroadcastMul(b.Data, a.Data, ctx.Outputs[0].Data, b.ElementCount, 1);
+        }
+        else if (b.ElementCount == BroadcastShapeHelpers.LastDim(a) && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
         {
             // Last-dim broadcast: a[..., C] * b[C]. The second guard (all of b's elements in its LAST dim)
             // is essential: a per-channel weight shaped [C,1,1] also has ElementCount==a.Shape[^1] when C==W
@@ -507,7 +548,14 @@ public class DivOperator(OperatorRegistry reg) : IOnnxOperator
             reg.ElementWise.BroadcastMul(a.Data, recip.Data, ctx.Outputs[0].Data, a.ElementCount, 1);
             ctx.Pool.Return(recip);
         }
-        else if (b.ElementCount == a.Shape[^1])
+        else if (a.ElementCount == 1 && b.ElementCount > 1)
+        {
+            // Scalar NUMERATOR. Division does not commute, so this cannot reuse the reciprocal trick
+            // above; it goes through the general broadcast. Placed before the last-dim branch because a
+            // rank-0 numerator has no last dimension to read.
+            BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x / y : 0f, BroadcastOp.Div);
+        }
+        else if (b.ElementCount == BroadcastShapeHelpers.LastDim(a))
         {
             // Last-dim broadcast: a / b where b is [C]. Compute reciprocal then BroadcastMul
             var recip = ctx.Pool.Rent(b.Shape, "div_recip_bc");
@@ -654,7 +702,18 @@ public class ConstantOfShapeOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "ConstantOfShape";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] }; // Shape comes from input tensor
+    {
+        // The output shape is the input tensor's VALUES. The compiler injects them as _resolved_shape
+        // whenever it can fold them; without that, the best available guess is the input's own shape,
+        // which is right only by coincidence.
+        if (attrs.TryGetValue("_resolved_shape", out var resolved) && resolved is long[] dims && dims.Length > 0)
+        {
+            var shape = new int[dims.Length];
+            for (int k = 0; k < dims.Length; k++) shape[k] = (int)dims[k];
+            return new[] { shape };
+        }
+        return new[] { inputs[0] };
+    }
     public void Execute(OnnxOpContext ctx)
     {
         // ONNX spec: value attribute is a scalar tensor (default 0.0)
