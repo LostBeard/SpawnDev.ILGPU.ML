@@ -1003,6 +1003,11 @@ public class GraphExecutor : IDisposable
                 // >= 0, not > 0: an empty result is a legitimate shape here, and rejecting it would fall
                 // back to the compiled shape and reintroduce the phantom element.
                 if (resolved.All(d => d >= 0)) runtimeOutputShapes = new[] { resolved };
+
+                if (_dumpMatch is { } expandMatch && node.OutputNames.Length > 0
+                    && node.OutputNames[0].Contains(expandMatch, StringComparison.OrdinalIgnoreCase))
+                    DumpLine($"[dump] Expand resolve {node.OutputNames[0]} target=[{string.Join(",", tgt)}] "
+                           + $"input=[{string.Join(",", inS)}] -> [{string.Join(",", resolved)}]");
             }
 
             // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
@@ -1204,12 +1209,19 @@ public class GraphExecutor : IDisposable
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
-                var shape = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
-                // Replace zero/negative dimensions with 1 — zero-sized buffers are always
-                // a compile-time inference error. The runtime operator will produce correct
-                // data within the allocated buffer.
+                // Copy before touching it. These arrays are the COMPILED shapes; the clamp below used to
+                // write straight through them, so one node's repair became a permanent edit to the graph.
+                var source = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
+                var shape = (int[])source.Clone();
+
+                // A zero dimension from COMPILE-TIME inference is still treated as an inference error and
+                // rounded up, as it always was. But a shape RESOLVED at runtime from actual values is
+                // believed, zeros included: an empty tensor is legal in ONNX and is how a graph expresses
+                // "no padding needed here". Rounding that up to one element made ZipVoice's decoder carry a
+                // phantom frame into the next Concat, and the mismatch only appeared three nodes later.
+                bool resolvedAtRuntime = !ReferenceEquals(runtimeOutputShapes, node.OutputShapes);
                 for (int d = 0; d < shape.Length; d++)
-                    if (shape[d] <= 0) shape[d] = 1;
+                    if (shape[d] < 0 || (shape[d] == 0 && !resolvedAtRuntime)) shape[d] = 1;
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 nodeOutputs[i] = _pool.Rent(shape, name);
             }
@@ -1229,7 +1241,10 @@ public class GraphExecutor : IDisposable
                 IntegerTensorNames = _integerTensorNames,
             };
             var nodeSw = VerboseLogging ? System.Diagnostics.Stopwatch.StartNew() : null;
-            node.Operator.Execute(ctx);
+            // An operator whose outputs are ALL empty has nothing to compute, and running it anyway means
+            // dispatching over a zero extent - which is where Expand divided by its own output count.
+            // Skipping is not a shortcut here: an empty tensor carries no data by definition.
+            if (!AllOutputsEmpty(nodeOutputs)) node.Operator.Execute(ctx);
             if (VerboseLogging && nodeSw != null)
             {
                 _accelerator.Flush();   // submit (4.12.0: Synchronize() throws on browser)
@@ -2597,6 +2612,11 @@ public class GraphExecutor : IDisposable
                 // >= 0, not > 0: an empty result is a legitimate shape here, and rejecting it would fall
                 // back to the compiled shape and reintroduce the phantom element.
                 if (resolved.All(d => d >= 0)) runtimeOutputShapes = new[] { resolved };
+
+                if (_dumpMatch is { } expandMatch && node.OutputNames.Length > 0
+                    && node.OutputNames[0].Contains(expandMatch, StringComparison.OrdinalIgnoreCase))
+                    DumpLine($"[dump] Expand resolve {node.OutputNames[0]} target=[{string.Join(",", tgt)}] "
+                           + $"input=[{string.Join(",", inS)}] -> [{string.Join(",", resolved)}]");
             }
 
             // Runtime Shape: output = [input rank] at runtime (compile-time buffer can be too small).
@@ -2928,12 +2948,19 @@ public class GraphExecutor : IDisposable
             var nodeOutputs = new Tensor[node.OutputShapes.Length];
             for (int i = 0; i < node.OutputShapes.Length; i++)
             {
-                var shape = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
-                // Replace zero/negative dimensions with 1 — zero-sized buffers are always
-                // a compile-time inference error. The runtime operator will produce correct
-                // data within the allocated buffer.
+                // Copy before touching it. These arrays are the COMPILED shapes; the clamp below used to
+                // write straight through them, so one node's repair became a permanent edit to the graph.
+                var source = i < runtimeOutputShapes.Length ? runtimeOutputShapes[i] : node.OutputShapes[i];
+                var shape = (int[])source.Clone();
+
+                // A zero dimension from COMPILE-TIME inference is still treated as an inference error and
+                // rounded up, as it always was. But a shape RESOLVED at runtime from actual values is
+                // believed, zeros included: an empty tensor is legal in ONNX and is how a graph expresses
+                // "no padding needed here". Rounding that up to one element made ZipVoice's decoder carry a
+                // phantom frame into the next Concat, and the mismatch only appeared three nodes later.
+                bool resolvedAtRuntime = !ReferenceEquals(runtimeOutputShapes, node.OutputShapes);
                 for (int d = 0; d < shape.Length; d++)
-                    if (shape[d] <= 0) shape[d] = 1;
+                    if (shape[d] < 0 || (shape[d] == 0 && !resolvedAtRuntime)) shape[d] = 1;
                 var name = i < node.OutputNames.Length ? node.OutputNames[i] : $"_anon_{i}";
                 // Shape-cache hit: bind the retained buffer instead of renting a fresh one.
                 nodeOutputs[i] = shapeCacheHit && i == 0 ? cachedShapeBuf! : _pool.Rent(shape, name);
@@ -3047,7 +3074,8 @@ public class GraphExecutor : IDisposable
                 // shapeCacheHit: buffer already holds the correct dims from a prior step — skip.
                 // convStateHandled: ShortConv already ran through the conv-state cache above — skip.
                 if (CaptureTraceFile != null && !shapeCacheHit) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> DISPATCH\n"); } catch { } }
-                if (!shapeCacheHit && !convStateHandled) await node.Operator.ExecuteAsync(ctx);
+                if (!shapeCacheHit && !convStateHandled && !AllOutputsEmpty(nodeOutputs))
+                    await node.Operator.ExecuteAsync(ctx);
                 // PerOpSync: opt-in diagnostic flag (off by default). Forces a flush + wait
                 // after every Execute so async-backend kernel traps (Wasm worker errors,
                 // WebGPU command-encoder errors) surface AT the failing node instead of
@@ -3599,6 +3627,20 @@ public class GraphExecutor : IDisposable
     /// drives <see cref="OnnxOpContext.AllInputsAreInteger"/> at execute time,
     /// which DivOperator uses to apply ONNX-spec truncation toward zero.
     /// </summary>
+    /// <summary>True when every one of a node's outputs is an EMPTY tensor.</summary>
+    /// <remarks>
+    /// An empty tensor is a legal ONNX shape - it is how a graph says "nothing to add here", such as a
+    /// padding of length zero. There is no data to produce for one, and dispatching a kernel over a zero
+    /// extent is at best wasted and at worst a divide-by-zero inside the operator.
+    /// </remarks>
+    private static bool AllOutputsEmpty(Tensor[] outputs)
+    {
+        if (outputs.Length == 0) return false;
+        foreach (var t in outputs)
+            if (t == null || t.ElementCount > 0) return false;
+        return true;
+    }
+
     private static HashSet<string> BuildIntegerTensorNames(CompiledGraph graph)
     {
         var intNames = new HashSet<string>();
