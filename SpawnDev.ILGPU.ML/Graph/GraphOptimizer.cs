@@ -335,6 +335,47 @@ public static class GraphOptimizer
             if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var d) && d.Length >= 1) return d[0];
             return null;
         }
+        // True if `name` is produced - possibly through pure data-movement ops - by a multiply or divide by a
+        // scalar. That is the graph having ALREADY applied attention's 1/sqrt(head_dim) to Q, which means the
+        // fused kernel must not apply its default on top.
+        //
+        // The reshape walk is the whole point. Whisper (onnx-community export) scales Q on the flat
+        // [B, S, H*D] tensor and only THEN reshapes and transposes it into [B, H, S, D], so the scores
+        // MatMul's Q input is a Transpose, not the Mul - a one-node lookback sees no pre-scale, leaves
+        // scale at 0, and the kernel's 1/sqrt(64) lands on already-scaled scores. Scores shrink 8x, the
+        // softmax over 1500 keys goes near-uniform, every position attends to everything equally, and the
+        // decoder emits ONE token forever ("[ [ [ [ ..."). Reshape/Transpose/Squeeze/Unsqueeze/Identity
+        // only move elements, and a scalar multiply commutes with all of them, so the pre-scale is just as
+        // real on the other side of them.
+        bool HasScalarPreScale(string name, int depth)
+        {
+            if (depth > 6) return false;
+            int p = Prod(name);
+            if (p < 0) return false;
+            var n = nodes[p];
+            switch (n.OpType)
+            {
+                // Mul is commutative, so a scalar on EITHER side is a scale. Div is not: only a scalar
+                // DENOMINATOR scales the tensor. `c / X` is a reciprocal, which does not commute with the
+                // reshapes below and is not a pre-scale at all - accepting it would suppress the kernel's
+                // own 1/sqrt(head_dim) on a graph that never applied one.
+                case "Mul":
+                    return n.Inputs.Count == 2
+                        && (IsProvablyScalar(n.Inputs[0], 0) || IsProvablyScalar(n.Inputs[1], 0));
+                case "Div":
+                    return n.Inputs.Count == 2 && IsProvablyScalar(n.Inputs[1], 0);
+                case "Reshape":
+                case "Transpose":
+                case "Squeeze":
+                case "Unsqueeze":
+                case "Identity":
+                case "Flatten":
+                    return n.Inputs.Count >= 1 && HasScalarPreScale(n.Inputs[0], depth + 1);
+                default:
+                    return false;
+            }
+        }
+
         // Walk back through Mul/Div/Cast from `name`; true if it reaches a MatMul of two activations (the scores
         // branch) rather than a ConstantOfShape (the zero-bias branch).
         bool ReachesScoresMatMul(string name, int depth)
@@ -513,13 +554,8 @@ public static class GraphOptimizer
             // goes near-uniform, and the model emits plausible-range but CONTENT-FREE outputs (the
             // DepthAnythingV2 blank-depth bug hid exactly this way for 6 weeks; found by bisect +
             // ORT ground-truth diff 2026-07-03). Q's Mul stays in the graph as a normal producer.
-            if (scale == 0f && !kPreScaled)
-            {
-                int pQ = Prod(qName);
-                if (pQ >= 0 && nodes[pQ].OpType == "Mul" && nodes[pQ].Inputs.Count == 2
-                    && (IsProvablyScalar(nodes[pQ].Inputs[0], 0) || IsProvablyScalar(nodes[pQ].Inputs[1], 0)))
-                    scale = 1f;
-            }
+            if (scale == 0f && !kPreScaled && HasScalarPreScale(qName, 0))
+                scale = 1f;
 
             // Forward: softmax → [Cast] → MatMul(probs, V).
             string probs = softmax.Outputs[0];

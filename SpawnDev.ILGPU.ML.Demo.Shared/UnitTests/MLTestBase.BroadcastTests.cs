@@ -357,6 +357,107 @@ public abstract partial class MLTestBase
     //  HELPER — runs any binary operator and verifies output
     // ═══════════════════════════════════════════════════════════
 
+    // ═══════════════════════════════════════════════════════════
+    //  GPU-PATH TESTS FOR THE "SILENTLY ADDED" OPERATOR FAMILY
+    //
+    //  BroadcastHelper.BroadcastBinaryOp used to declare `BroadcastOp gpuOp = BroadcastOp.Add`. Every call
+    //  site that omitted the selector got ADDITION on the two GPU branches while the both-inputs-constant
+    //  branch quietly used the correct CPU lambda - so the defect was invisible to any test whose operands
+    //  were foldable. It cost a day through And/Or/Xor on whisper's causal mask, and NINE more operators
+    //  were still shipping it: Min, Max, PRelu, Mod, BitwiseAnd/Or/Xor and both BitShift directions.
+    //
+    //  The default is now gone (omitting the selector is a compile error). These tests are the behavioural
+    //  half of that guarantee: every expected vector below differs from a + b, so a regression to the Add
+    //  fallback fails them rather than passing quietly.
+    // ═══════════════════════════════════════════════════════════
+
+    [TestMethod]
+    public async Task Broadcast_Min_GpuPath() => await RunTest(async accelerator =>
+    {
+        // [2,3] min [3]; a + b would be [5,12,7,14,9,16], so Add cannot masquerade as Min here.
+        await VerifyBinaryOpGpuPath(accelerator, "Min",
+            new float[] { 1, 8, 3, 10, 5, 12 }, new[] { 2, 3 },
+            new float[] { 4, 4, 4 }, new[] { 3 },
+            new float[] { 1, 4, 3, 4, 4, 4 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_Max_GpuPath() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "Max",
+            new float[] { 1, 8, 3, 10, 5, 12 }, new[] { 2, 3 },
+            new float[] { 4, 4, 4 }, new[] { 3 },
+            new float[] { 4, 8, 4, 10, 5, 12 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_PRelu_GpuPath() => await RunTest(async accelerator =>
+    {
+        // PRelu(x, slope) = x >= 0 ? x : slope * x. Operand order matters, so a wrong-way-round
+        // implementation fails this too, not just the Add fallback.
+        await VerifyBinaryOpGpuPath(accelerator, "PRelu",
+            new float[] { -2, -1, 0, 1, 2, 3 }, new[] { 2, 3 },
+            new float[] { 0.5f, 0.5f, 0.5f }, new[] { 3 },
+            new float[] { -1, -0.5f, 0, 1, 2, 3 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_Mod_GpuPath() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "Mod",
+            new float[] { 7, 8, 9, 10, 11, 12 }, new[] { 2, 3 },
+            new float[] { 3, 4, 5 }, new[] { 3 },
+            new float[] { 1, 0, 4, 1, 3, 2 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_BitwiseAnd_GpuPath() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "BitwiseAnd",
+            new float[] { 12, 10, 7, 15, 9, 6 }, new[] { 2, 3 },
+            new float[] { 10, 6, 3 }, new[] { 3 },
+            new float[] { 8, 2, 3, 10, 0, 2 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_BitwiseOr_GpuPath() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "BitwiseOr",
+            new float[] { 12, 10, 7, 15, 9, 6 }, new[] { 2, 3 },
+            new float[] { 10, 6, 3 }, new[] { 3 },
+            new float[] { 14, 14, 7, 15, 15, 7 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_BitwiseXor_GpuPath() => await RunTest(async accelerator =>
+    {
+        await VerifyBinaryOpGpuPath(accelerator, "BitwiseXor",
+            new float[] { 12, 10, 7, 15, 9, 6 }, new[] { 2, 3 },
+            new float[] { 10, 6, 3 }, new[] { 3 },
+            new float[] { 6, 12, 4, 5, 15, 5 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_BitShiftLeft_GpuPath() => await RunTest(async accelerator =>
+    {
+        // direction defaults to LEFT when the attribute is absent.
+        await VerifyBinaryOpGpuPath(accelerator, "BitShift",
+            new float[] { 1, 2, 3, 4, 5, 6 }, new[] { 2, 3 },
+            new float[] { 1, 2, 3 }, new[] { 3 },
+            new float[] { 2, 8, 24, 8, 20, 48 }, new[] { 2, 3 });
+    });
+
+    [TestMethod]
+    public async Task Broadcast_BitShiftRight_GpuPath() => await RunTest(async accelerator =>
+    {
+        // The RIGHT branch is a SEPARATE call site from LEFT, so it needs its own coverage.
+        await VerifyBinaryOpGpuPath(accelerator, "BitShift",
+            new float[] { 16, 32, 64, 8, 40, 96 }, new[] { 2, 3 },
+            new float[] { 1, 2, 3 }, new[] { 3 },
+            new float[] { 8, 8, 8, 4, 10, 12 }, new[] { 2, 3 },
+            new Dictionary<string, object> { ["direction"] = "RIGHT" });
+    });
+
     private async Task VerifyBinaryOp(Accelerator accelerator, string opType,
         float[] aData, int[] aShape, float[] bData, int[] bShape,
         float[] expected, int[] outShape)
@@ -407,7 +508,7 @@ public abstract partial class MLTestBase
     /// </summary>
     private async Task VerifyBinaryOpGpuPath(Accelerator accelerator, string opType,
         float[] aData, int[] aShape, float[] bData, int[] bShape,
-        float[] expected, int[] outShape)
+        float[] expected, int[] outShape, Dictionary<string, object>? attributes = null)
     {
         using var aBuf = accelerator.Allocate1D(aData);
         using var bBuf = accelerator.Allocate1D(bData);
@@ -420,7 +521,7 @@ public abstract partial class MLTestBase
         {
             Inputs = new[] { new Tensor(aBuf.View, aShape), new Tensor(bBuf.View, bShape) },
             Outputs = new[] { new Tensor(outBuf.View, outShape) },
-            Attributes = new Dictionary<string, object>(),
+            Attributes = attributes ?? new Dictionary<string, object>(),
             Pool = new BufferPool(accelerator),
             InputNames = new[] { "a", "b" },
             ConstantValues = new Dictionary<string, float[]>(), // empty → no CPU fold → GPU kernel path

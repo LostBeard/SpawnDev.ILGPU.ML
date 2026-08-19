@@ -12,10 +12,32 @@ namespace SpawnDev.ILGPU.ML.Operators;
 /// </summary>
 internal static class BroadcastHelper
 {
+    // NO DEFAULT on gpuOp, deliberately. It used to default to BroadcastOp.Add, and every call site that
+    // omitted it silently performed ADDITION on the two GPU branches below while the CPU-constant branch
+    // used the correct `op` lambda - so the defect only appeared once the operands stopped being
+    // CPU-resolvable. It cost a day through And/Or/Xor and was still live in Min, Max and PRelu. A required
+    // parameter turns "I forgot the GPU op" from a wrong answer into a compile error.
     public static void BroadcastBinaryOp(OnnxOpContext ctx, OperatorRegistry reg, Func<float, float, float> op,
-        BroadcastOp gpuOp = BroadcastOp.Add)
+        BroadcastOp gpuOp)
     {
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
+
+        // The output was sized by shape inference at COMPILE time. In a graph whose shapes are only known
+        // at runtime (whisper's decoder builds its causal mask from the live sequence length), the inputs
+        // were placeholders then, so the output can be far too small - [1] where the real broadcast of
+        // [1,1,4,1] against [1,1,1,4] is [1,1,4,4]. Writing into it anyway produces a tensor of the wrong
+        // shape holding a few correct values, which is how whisper's causal mask came out as "row 0 only"
+        // and every decoder position could see the future. Recompute from the REAL input shapes.
+        var trueShape = Tensors.TensorHelpers.BroadcastShape(a.Shape, b.Shape);
+        int trueCount = Tensors.TensorHelpers.ElementCount(trueShape);
+        if (trueCount != ctx.Outputs[0].ElementCount)
+        {
+            if (ctx.Outputs[0].Data.Length >= trueCount)
+                ctx.Outputs[0].Shape = trueShape;      // buffer is big enough; correct the metadata
+            else
+                ctx.Outputs[0] = ctx.Pool.Rent(trueShape, "_broadcast_out");   // executor reads ctx.Outputs after Execute
+        }
+
         var outShape = ctx.Outputs[0].Shape;
         int outCount = ctx.Outputs[0].ElementCount;
 
@@ -1030,7 +1052,7 @@ public class OrOperator(OperatorRegistry reg) : IOnnxOperator
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         // Or is always a boolean op — use broadcast path for correctness
         // (handles both equal and unequal shapes, with proper abs+threshold)
-        BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f || y != 0f) ? 1f : 0f);
+        BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f || y != 0f) ? 1f : 0f, BroadcastOp.Or);
     }
 }
 
@@ -1041,7 +1063,7 @@ public class XorOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx)
     {
-        BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f) != (y != 0f) ? 1f : 0f);
+        BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f) != (y != 0f) ? 1f : 0f, BroadcastOp.Xor);
     }
 }
 
@@ -1060,7 +1082,7 @@ public class AndOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f && y != 0f) ? 1f : 0f);
+            BroadcastBinaryOp(ctx, reg, (x, y) => (x != 0f && y != 0f) ? 1f : 0f, BroadcastOp.And);
         }
     }
 }
@@ -1420,7 +1442,7 @@ public class PReluOperator(OperatorRegistry reg) : IOnnxOperator
         // Use broadcast binary op: PRelu(x, slope) = max(0, x) + slope * min(0, x)
         // Simplified: use Where(x >= 0, x, slope * x) via broadcast
         BroadcastHelper.BroadcastBinaryOp(ctx, reg,
-            (a, b) => a >= 0f ? a : a * b);
+            (a, b) => a >= 0f ? a : a * b, BroadcastOp.PRelu);
     }
 }
 

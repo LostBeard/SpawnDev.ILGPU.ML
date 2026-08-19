@@ -2,6 +2,129 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.1.2-local.10 (2026-08-18)
+
+### FIX: attention fusion double-scaled Q when the pre-scale sat behind a Reshape (whisper)
+
+`whisper-tiny` (the `onnx-community` export, which is what `ModelHub` serves) transcribed as one token
+repeated forever - `"[ [ [ [ ..."` - on every backend. The transcript was perfect from the same model with
+`ML_NO_ATTN_FUSION=1`, which located it in the fusion pass rather than the kernel or a backend.
+
+`GraphOptimizer`'s self-attention fusion has to know whether the graph already applied `1/sqrt(head_dim)`;
+if it decides not, the `FusedAttention` kernel applies its own default. That check looked exactly ONE node
+back from the scores-MatMul's Q input for a scalar `Mul`. whisper scales Q on the flat `[B, S, H*D]` tensor
+and only then reshapes and transposes it into `[B, H, S, D]`, so the MatMul's Q input is a `Reshape` and the
+`Mul` is three data-movement nodes upstream. The pre-scale went unseen, `scale` stayed 0, and 0.125 was
+applied twice: scores shrank 8x, the softmax over 1500 keys flattened toward uniform, every position
+attended to everything equally, and the decoder had nothing to condition on.
+
+The lookback now walks back through `Reshape`/`Transpose`/`Squeeze`/`Unsqueeze`/`Identity`/`Flatten` - a
+scalar multiply commutes with all of them, so the pre-scale is just as real on the other side. This is the
+third instance of this defect class (DepthAnythingV2's blank depth, the DAv3 pre-scaled-QK form).
+
+Gated by `AttentionFusion_PreScaledQ_ThroughReshape_WhisperForm_FusedMatchesCpu_AllBackends`, which builds
+whisper's exact shape plumbing (flat pre-scale → Reshape → Transpose → Reshape → scores MatMul), asserts the
+fused node carries `scale=1.0`, and compares the executed fused graph against the CPU reference.
+
+### FIX: NINE more operators were silently performing ADDITION on the GPU
+
+`BroadcastHelper.BroadcastBinaryOp` declared `BroadcastOp gpuOp = BroadcastOp.Add`. It has three branches:
+the both-inputs-constant branch evaluates the correct CPU lambda handed in at the call site, but the two GPU
+branches dispatch `BroadcastBinaryOpND` with that enum. So any call site that omitted the selector computed
+the right answer whenever its operands were constant-foldable and **added** whenever they were not.
+
+`And`/`Or`/`Xor` were fixed in `local.1...local.9` as three individual symptoms. The default itself was left
+in place, and these were still riding it:
+
+`Min`, `Max`, `PRelu`, `Mod`, `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `BitShift` (LEFT), `BitShift` (RIGHT).
+
+**The default is now gone.** `gpuOp` is a required parameter, so omitting it is a compile error rather than
+a wrong answer - which immediately surfaced six of the nine call sites that no one had thought to look at.
+Each op gained a real broadcast kernel (`BroadcastMinOp`, `BroadcastMaxOp`, `BroadcastPReluOp`,
+`BroadcastModOp`, `BroadcastBitwiseAndOp`/`OrOp`/`XorOp`, `BroadcastBitShiftLeftOp`/`RightOp`).
+
+Gated by nine new `Broadcast_*_GpuPath` tests built on `VerifyBinaryOpGpuPath`, which supplies no
+`ConstantValues` so the constant-fold branch cannot be taken. Every expected vector in them differs from
+`a + b`, so a regression to the Add fallback fails the test instead of passing quietly. There had been **no**
+broadcast coverage for any of the nine.
+
+⚠️ **Consumer impact:** any graph using these ops with BROADCASTING operands that were not compile-time
+constants produced sums. Same-shape operands are unaffected (`Min`/`Max` take a separate equal-count fast
+path), and constant-folded operands were always correct.
+
+### ADD: `GraphExecutor` tensor dump works on the browser backends
+
+`DumpNodeOutputs` read tensors with the sync `CopyToCPU`, which throws on WebGPU/WebGL/Wasm - so the
+diagnostic was unusable on exactly the backends where a suspected backend bug would live. Added an async
+variant (`CopyToHostAsync`) used by the async execution path, plus `DumpMaxLines`/`ResetDumpBudget`: a
+generative pipeline re-runs its decoder per token, and an op-type filter without a budget costs a readback
+per matching node per token.
+
+
+## 5.1.2-local.1 ... local.9 (2026-08-18)
+
+### FIX: Whisper speech-to-text could not work at all - seven defects
+
+Whisper was listed among the "validated" models, but the CPU preprocessing path threw on its own defaults
+and the decoder produced an empty transcript. Validation had gone through the GPU `AudioKernels` path, and
+the repo's own reference generator (`tools/gen_nlp_audio_references.py`) shared the code's wrong assumptions,
+so `references/whisper-tiny/tone_mel.bin` was never real Whisper preprocessing. A reference that shares the
+assumptions of the code under test cannot catch a wrong assumption.
+
+1. **Radix-2 FFT called at a non-power-of-two length.** Whisper's `n_fft` is 400, so `(int)MathF.Log2(400)`
+   truncated to 8 and the butterflies indexed 511 of a 400-element array - `ComputeLogMelSpectrogram` threw
+   `IndexOutOfRangeException` on its own defaults. Now decimates in time while even and finishes with a
+   direct DFT once odd (400 = 2^4 x 25). Note: zero-padding 400 to 512 is NOT a fix - it changes the bin
+   spacing and hands the filterbank a spectrum Whisper was not trained on.
+2. **Uncentred framing.** 30s at 16 kHz gave 2998 frames where the encoder input is fixed at `[1,80,3000]`.
+   Whisper frames centred (`torch.stft(center: true)`, reflect-pad `n_fft/2` both ends) giving 3001, then
+   drops the last. Added an opt-in `center` parameter to `ComputeSTFT`, default false so a plain STFT is
+   unchanged.
+3. **Wrong decoder control tokens.** `TRANSCRIBE` was 50360 (`<|startoflm|>`) and `NO_TIMESTAMPS` 50364 (a
+   timestamp token); the real ids are 50359 and 50363, verified against the model's own `tokenizer.json`.
+4. **HTK mel filterbank instead of librosa/slaney.** Whisper ships precomputed slaney filters
+   (`librosa.filters.mel` defaults to `htk=False`). Added `GenerateMelFilterbankSlaney`: slaney scale,
+   triangles evaluated on exact FFT bin frequencies rather than floor-rounded bin indices (at `n_fft=400`
+   the bins are 40 Hz apart and rounding destroys the low bands), plus slaney area normalisation
+   `2/(hz[m+2]-hz[m])`. An HTK filterbank does not throw - it just recognises nothing.
+5. **`Tile` had no shape inference,** so its output buffer was allocated at the INPUT's size and `Execute`
+   hit its own "no tiling needed" fast path: the tile silently never happened. Any graph building a causal
+   mask with `Tile` got a broken mask. `GraphCompiler` now resolves a constant `repeats` and publishes
+   `_resolved_repeats`; `Execute` recomputes the true shape at runtime and rents a correct buffer when the
+   statically-sized one is too small. The old "copy the flat buffer N times" fast path is now gated on the
+   repeat being on the outermost axis - it was silently wrong for any inner-axis tile.
+6. **Broadcast binary ops sized their output from COMPILE-time shapes,** so in a dynamic graph
+   `LessOrEqual([1,1,4,1],[1,1,1,4])` wrote into a `[1]` buffer. `BroadcastHelper.BroadcastBinaryOp` now
+   recomputes the broadcast shape from the real input shapes.
+7. **`And`/`Or`/`Xor` were missing from the `BroadcastOp` enum,** so all three fell through to the default
+   and performed ADDITION on the GPU - the causal mask came back holding 1s and 2s instead of 0s and 1s. It
+   only bit once the operands stopped being CPU-resolvable, so short sequences used the correct CPU lambda
+   and long ones did not: transcripts started perfectly and then degenerated into a repeating loop. Only
+   the three symptoms were fixed here; the defaulted selector that caused them survived to `local.10`.
+
+Result: `tools/whisper-harness` transcribes the Harvard-sentence fixture token-for-token identically to ONNX
+Runtime, `causality drift 0.00`.
+
+### ADD: oracles and diagnostics that made the above findable
+
+- `tools/stft-oracle/` compiles the real source and compares it against an independent naive O(n^2) DFT that
+  shares no code with it. 12/12 across 400/512/64/401/375/202. For a numeric routine, crash-free is not the
+  bar; an oracle sharing no code is.
+- `tools/whisper-harness/` project-references the real library and runs on CUDA/OpenCL, collapsing a
+  multi-minute human-in-the-loop browser cycle into a ~2 second desktop command. It asserts position-0 logit
+  invariance, which is what exposed defect 7 as a causality failure rather than "bad audio".
+- `GraphExecutor.DumpTensorsMatching` / `ML_DUMP_TENSORS=<substr>` prints shape/min/max/mean/head for every
+  matching node output as the graph runs. A wrong VALUE mid-graph is otherwise invisible: the run completes,
+  every shape is right, only the answer is wrong.
+- `ML_NO_ATTN_FUSION=1` bisects fusion-pass defects away from kernels and backends in one run.
+
+### KNOWN LIMITATION
+
+`SpeechRecognitionPipeline`'s decode loop re-feeds the whole token sequence every step - there is no KV
+cache - so decode cost is quadratic. The repo already ships a `KVCache` with a Whisper config; wiring it in
+is the fix.
+
+
 ## 4.0.0-preview.16 (2026-07-16)
 
 ### FIX: LFM2 broken output - three defects around the conv-state shift register

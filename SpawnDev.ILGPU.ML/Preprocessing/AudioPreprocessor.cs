@@ -138,8 +138,29 @@ public static class AudioPreprocessor
     /// <param name="fftSize">FFT window size (e.g., 400 for Whisper)</param>
     /// <param name="hopSize">Hop between frames (e.g., 160 for Whisper)</param>
     /// <returns>STFT magnitudes [numFrames, fftSize/2 + 1]</returns>
-    public static float[,] ComputeSTFT(float[] samples, int fftSize, int hopSize)
+    /// <param name="center">
+    /// Frame the signal the way <c>torch.stft(center: true)</c> does - reflect-pad by <c>fftSize/2</c> at both
+    /// ends so frame <c>t</c> is CENTRED on sample <c>t * hopSize</c>. Whisper's reference preprocessing
+    /// relies on this, and the frame COUNT depends on it: 30s at 16 kHz gives 2998 frames uncentred but the
+    /// 3000 the model's input shape demands once centred (3001 frames, last one dropped by the caller).
+    /// Left off by default so a plain STFT keeps its existing framing.
+    /// </param>
+    public static float[,] ComputeSTFT(float[] samples, int fftSize, int hopSize, bool center = false)
     {
+        if (center)
+        {
+            // Reflect padding, matching numpy/torch 'reflect': mirror WITHOUT repeating the edge sample.
+            int pad = fftSize / 2;
+            var padded = new float[samples.Length + 2 * pad];
+            Array.Copy(samples, 0, padded, pad, samples.Length);
+            for (int i = 0; i < pad; i++)
+            {
+                padded[pad - 1 - i] = samples[Math.Min(i + 1, samples.Length - 1)];
+                padded[pad + samples.Length + i] = samples[Math.Max(samples.Length - 2 - i, 0)];
+            }
+            samples = padded;
+        }
+
         var window = GenerateHannWindow(fftSize);
         int numFrames = (samples.Length - fftSize) / hopSize + 1;
         int freqBins = fftSize / 2 + 1;
@@ -148,6 +169,10 @@ public static class AudioPreprocessor
         var frame = new float[fftSize];
         var real = new float[fftSize];
         var imag = new float[fftSize];
+        // Allocated once for the whole STFT: a non-power-of-two length needs an out-of-place pass, and
+        // Whisper's 30s window is ~3000 frames.
+        var scratchRe = new float[fftSize];
+        var scratchIm = new float[fftSize];
 
         for (int f = 0; f < numFrames; f++)
         {
@@ -163,7 +188,7 @@ public static class AudioPreprocessor
             // DFT (real-valued input)
             Array.Copy(frame, real, fftSize);
             Array.Clear(imag, 0, fftSize);
-            FFT(real, imag, fftSize);
+            FFT(real, imag, fftSize, scratchRe, scratchIm);
 
             // Compute magnitude
             for (int k = 0; k < freqBins; k++)
@@ -188,9 +213,12 @@ public static class AudioPreprocessor
         // Pad to 30 seconds for Whisper
         samples = PadOrTrim(samples, WhisperMaxSamples);
 
-        // Compute STFT
-        var stft = ComputeSTFT(samples, fftSize, hopSize);
-        int numFrames = stft.GetLength(0);
+        // Whisper frames the signal CENTRED (torch.stft's default) and then discards the final frame, which
+        // is what makes 30 seconds come out as exactly 3000 frames - the length the model's input shape is
+        // fixed at. Framed uncentred this produced 2998, and the pipeline threw building a [1,80,3000]
+        // tensor over 239,840 values.
+        var stft = ComputeSTFT(samples, fftSize, hopSize, center: true);
+        int numFrames = Math.Max(0, stft.GetLength(0) - 1);
         int freqBins = stft.GetLength(1);
 
         // Compute power spectrum
@@ -200,7 +228,8 @@ public static class AudioPreprocessor
                 power[f, k] = stft[f, k] * stft[f, k];
 
         // Generate mel filterbank
-        var melFilters = GenerateMelFilterbank(nMels, freqBins, 16000, fftSize);
+        // Whisper is trained on librosa/slaney filters, not HTK - see GenerateMelFilterbankSlaney.
+        var melFilters = GenerateMelFilterbankSlaney(nMels, freqBins, 16000);
 
         // Apply mel filterbank: [nMels, numFrames]
         var melSpec = new float[nMels * numFrames];
@@ -232,9 +261,81 @@ public static class AudioPreprocessor
         return melSpec;
     }
 
+    /// <summary>Hz to mel on the SLANEY scale - linear below 1 kHz, logarithmic above.</summary>
+    /// <remarks>
+    /// This, not <see cref="HzToMel"/>'s HTK formula, is what Whisper is trained against: OpenAI ships a
+    /// precomputed <c>mel_filters.npz</c> produced by <c>librosa.filters.mel(...)</c>, whose default is
+    /// <c>htk=False</c>. The two scales place the 80 band edges in visibly different places, so an HTK
+    /// filterbank hands the encoder a spectrum it has never seen - which does not throw, it just fails to
+    /// recognise anything.
+    /// </remarks>
+    public static float HzToMelSlaney(float hz)
+    {
+        const float fSp = 200f / 3f;          // 66.67 Hz per mel below the break
+        const float minLogHz = 1000f;
+        const float minLogMel = minLogHz / fSp;   // 15.0
+        float logStep = MathF.Log(6.4f) / 27f;
+        return hz < minLogHz ? hz / fSp : minLogMel + MathF.Log(hz / minLogHz) / logStep;
+    }
+
+    /// <summary>Mel to Hz on the SLANEY scale. Inverse of <see cref="HzToMelSlaney"/>.</summary>
+    public static float MelToHzSlaney(float mel)
+    {
+        const float fSp = 200f / 3f;
+        const float minLogHz = 1000f;
+        const float minLogMel = minLogHz / fSp;
+        float logStep = MathF.Log(6.4f) / 27f;
+        return mel < minLogMel ? fSp * mel : minLogHz * MathF.Exp(logStep * (mel - minLogMel));
+    }
+
     /// <summary>
-    /// Generate a mel-scale filterbank matrix [nMels, freqBins].
+    /// Slaney-scale, area-normalised triangular mel filterbank - the librosa construction Whisper's
+    /// shipped filters come from.
     /// </summary>
+    /// <remarks>
+    /// Two things differ from the simpler <see cref="GenerateMelFilterbank"/> beyond the scale itself, and
+    /// both matter: the triangles are evaluated against the EXACT FFT bin frequencies rather than
+    /// floor-rounded bin indices (rounding quantises every band edge, and at n_fft=400 the bins are 40 Hz
+    /// apart, so the low bands lose most of their shape), and each filter is scaled by
+    /// <c>2 / (hz[m+2] - hz[m])</c> so it integrates to a constant regardless of bandwidth. Without that
+    /// normalisation the high, wide bands dominate the low, narrow ones.
+    /// </remarks>
+    public static float[,] GenerateMelFilterbankSlaney(int nMels, int freqBins, int sampleRate)
+    {
+        // Exact FFT bin centre frequencies: linspace(0, sr/2, freqBins).
+        var fftFreqs = new float[freqBins];
+        for (int k = 0; k < freqBins; k++) fftFreqs[k] = sampleRate / 2f * k / (freqBins - 1);
+
+        float melMin = HzToMelSlaney(0f);
+        float melMax = HzToMelSlaney(sampleRate / 2f);
+        var hzPoints = new float[nMels + 2];
+        for (int i = 0; i < nMels + 2; i++)
+            hzPoints[i] = MelToHzSlaney(melMin + (melMax - melMin) * i / (nMels + 1));
+
+        var filters = new float[nMels, freqBins];
+        for (int m = 0; m < nMels; m++)
+        {
+            float left = hzPoints[m], center = hzPoints[m + 1], right = hzPoints[m + 2];
+            float leftWidth = center - left, rightWidth = right - center;
+            float enorm = 2f / (right - left);      // Slaney normalisation
+            for (int k = 0; k < freqBins; k++)
+            {
+                float f = fftFreqs[k];
+                float lower = leftWidth > 0 ? (f - left) / leftWidth : 0f;
+                float upper = rightWidth > 0 ? (right - f) / rightWidth : 0f;
+                float w = MathF.Min(lower, upper);
+                if (w > 0) filters[m, k] = w * enorm;
+            }
+        }
+        return filters;
+    }
+
+    /// <summary>
+    /// Generate an HTK-scale mel filterbank matrix [nMels, freqBins].
+    /// </summary>
+    /// <remarks>
+    /// Kept for callers that want the HTK scale. Whisper needs <see cref="GenerateMelFilterbankSlaney"/>.
+    /// </remarks>
     private static float[,] GenerateMelFilterbank(int nMels, int freqBins, int sampleRate, int fftSize)
     {
         float melMin = HzToMel(0);
@@ -289,10 +390,39 @@ public static class AudioPreprocessor
     public static float MelToHz(float mel) => 700f * (MathF.Pow(10f, mel / 2595f) - 1f);
 
     /// <summary>
-    /// In-place Cooley-Tukey radix-2 FFT. Input arrays are modified.
+    /// In-place FFT for ANY transform length. Input arrays are modified.
     /// </summary>
-    private static void FFT(float[] real, float[] imag, int n)
+    /// <remarks>
+    /// A radix-2 FFT alone is not enough here: Whisper's <c>n_fft</c> is <b>400</b>, which is not a power of
+    /// two, and the radix-2 butterflies then run off the end of the array (with n=400 the last stage
+    /// addresses index 511 of a 400-element array, and the bit-reversal only permutes 0..255 because
+    /// <c>(int)Log2(400)</c> truncates to 8). That made <see cref="ComputeLogMelSpectrogram"/> throw
+    /// <see cref="IndexOutOfRangeException"/> on its OWN default parameters, so the entire CPU Whisper
+    /// preprocessing path was unusable.
+    /// <para>
+    /// Power-of-two lengths keep the original iterative radix-2 path. Everything else is decimated in time
+    /// while the length is even and finished with a direct DFT once it turns odd - 400 = 2^4 x 25, so it
+    /// costs four splits and a 25-point DFT rather than a 400-point one. This is exact, not an
+    /// approximation: zero-padding a 400-point frame to 512 would change the bin spacing and hand the mel
+    /// filterbank a different spectrum than Whisper was trained on.
+    /// </para>
+    /// </remarks>
+    /// <param name="scratchRe">Caller-owned scratch of at least <paramref name="n"/> floats. Supplied by the
+    /// caller because the STFT calls this once per frame - thousands of times - and allocating inside would
+    /// churn the heap for nothing. Ignored on the power-of-two path, which is in-place.</param>
+    /// <param name="scratchIm">Second scratch buffer, same size.</param>
+    private static void FFT(float[] real, float[] imag, int n, float[]? scratchRe = null, float[]? scratchIm = null)
     {
+        if ((n & (n - 1)) != 0)
+        {
+            var outRe = scratchRe is { } sr && sr.Length >= n ? sr : new float[n];
+            var outIm = scratchIm is { } si && si.Length >= n ? si : new float[n];
+            FFTAny(real, imag, 0, 1, outRe, outIm, 0, n);
+            Array.Copy(outRe, real, n);
+            Array.Copy(outIm, imag, n);
+            return;
+        }
+
         // Bit-reversal permutation
         int bits = (int)MathF.Log2(n);
         for (int i = 0; i < n; i++)
@@ -330,6 +460,61 @@ public static class AudioPreprocessor
                     imag[even] += ti;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Out-of-place Cooley-Tukey for an arbitrary length: split while even, direct DFT once odd.
+    /// Reads the input with a stride so the even/odd interleave costs no copying.
+    /// </summary>
+    private static void FFTAny(float[] inRe, float[] inIm, int inOff, int stride,
+                               float[] outRe, float[] outIm, int outOff, int n)
+    {
+        if (n == 1)
+        {
+            outRe[outOff] = inRe[inOff];
+            outIm[outOff] = inIm[inOff];
+            return;
+        }
+        if ((n & 1) != 0) { DFT(inRe, inIm, inOff, stride, outRe, outIm, outOff, n); return; }
+
+        int half = n / 2;
+        // Even-indexed samples land in the first half of the output, odd-indexed in the second.
+        FFTAny(inRe, inIm, inOff, stride * 2, outRe, outIm, outOff, half);
+        FFTAny(inRe, inIm, inOff + stride, stride * 2, outRe, outIm, outOff + half, half);
+
+        for (int k = 0; k < half; k++)
+        {
+            float angle = -2f * MathF.PI * k / n;
+            float cos = MathF.Cos(angle), sin = MathF.Sin(angle);
+            float er = outRe[outOff + k], ei = outIm[outOff + k];
+            float or_ = outRe[outOff + half + k], oi = outIm[outOff + half + k];
+            float tr = or_ * cos - oi * sin;
+            float ti = or_ * sin + oi * cos;
+            outRe[outOff + k] = er + tr;
+            outIm[outOff + k] = ei + ti;
+            outRe[outOff + half + k] = er - tr;
+            outIm[outOff + half + k] = ei - ti;
+        }
+    }
+
+    /// <summary>Direct O(n^2) DFT - the base case for an odd length (25 for Whisper's 400).</summary>
+    private static void DFT(float[] inRe, float[] inIm, int inOff, int stride,
+                            float[] outRe, float[] outIm, int outOff, int n)
+    {
+        for (int k = 0; k < n; k++)
+        {
+            float sumRe = 0f, sumIm = 0f;
+            for (int t = 0; t < n; t++)
+            {
+                float angle = -2f * MathF.PI * k * t / n;
+                float cos = MathF.Cos(angle), sin = MathF.Sin(angle);
+                float xr = inRe[inOff + t * stride], xi = inIm[inOff + t * stride];
+                sumRe += xr * cos - xi * sin;
+                sumIm += xr * sin + xi * cos;
+            }
+            outRe[outOff + k] = sumRe;
+            outIm[outOff + k] = sumIm;
         }
     }
 

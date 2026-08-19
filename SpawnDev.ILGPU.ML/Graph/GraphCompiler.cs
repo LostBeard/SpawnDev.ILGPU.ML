@@ -547,6 +547,37 @@ public class GraphCompiler
                 }
             }
 
+            // Special-case: Tile needs the repeats tensor to compute its output shape - out[i] = in[i]*repeats[i].
+            // Without this the node reported its INPUT shape as its output, so the executor allocated an
+            // output the size of the input and TileOperator's own "inCount == outCount -> just copy" fast path
+            // fired: the tile silently never happened. That is not a cosmetic shape error - whisper-tiny's
+            // decoder builds its causal mask through a Tile, so the mask arrived as a single zero, every
+            // position could see every other, and the model emitted end-of-text as its first token. Resolved
+            // here (and re-published as `_resolved_repeats`) rather than in the operator because the buffer is
+            // ALLOCATED from this shape; by the time Execute runs, an undersized output is already fixed.
+            if (node.OpType == "Tile" && node.Inputs.Count >= 2 && graph.ConstantData != null)
+            {
+                var repeatsName = node.Inputs[1];
+                if (graph.ConstantData.TryGetValue(repeatsName, out var repeats))
+                {
+                    var inShape = inputShapes[0];
+                    // ONNX: repeats is 1-D with one entry per input dimension.
+                    var outShape = (int[])inShape.Clone();
+                    for (int j = 0; j < outShape.Length; j++)
+                    {
+                        int r = j < repeats.Length ? repeats[j] : 1;
+                        outShape[j] = inShape[j] * Math.Max(0, r);
+                    }
+                    outputShapes = new[] { outShape };
+                    attrs["_resolved_repeats"] = repeats.Select(v => (long)v).ToArray();
+                }
+                else if (InferenceSession.VerboseLogging)
+                {
+                    var outName = node.Outputs.Count > 0 ? node.Outputs[0] : "?";
+                    Console.WriteLine($"[SHAPE_WARN] Tile '{outName}': repeats '{repeatsName}' not in ConstantData — output shape unresolved");
+                }
+            }
+
             // Special-case: Upsample/Resize need scales or sizes to compute output shape.
             // Scales tensor is the second input for Upsample, or third/fourth for Resize.
             if (node.OpType is "Upsample" or "Resize" && graph.ConstantData != null)

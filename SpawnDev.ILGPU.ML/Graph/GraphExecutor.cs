@@ -178,6 +178,125 @@ public class GraphExecutor : IDisposable
     public static string? CaptureTraceFile { get; set; }
 
     /// <summary>
+    /// DIAGNOSTIC: dump shape/min/max/mean/head for every node output whose NAME or OP TYPE contains this
+    /// substring, as the graph runs. Set directly or via the <c>ML_DUMP_TENSORS</c> environment variable.
+    /// </summary>
+    /// <remarks>
+    /// For a wrong VALUE mid-graph there is otherwise nothing to look at: the run completes, every shape is
+    /// right, and only the final answer is quietly wrong. Used to find why Whisper's decoder produced
+    /// uniform logits - `ML_DUMP_TENSORS=Where` shows what the causal mask actually contains.
+    /// </remarks>
+    public static string? DumpTensorsMatching { get; set; }
+
+    /// <summary>
+    /// Where dump lines go when set. Defaults to the console.
+    /// </summary>
+    /// <remarks>
+    /// In a browser extension the graph runs in the content script, whose console is not reachable from the
+    /// page-world tooling that drives the tests - so a console-only diagnostic is invisible exactly where
+    /// backend-specific bugs live. A sink lets the caller collect the lines and return them with its result.
+    /// </remarks>
+    public static Action<string>? DumpSink { get; set; }
+
+    /// <summary>
+    /// Stop dumping after this many lines. Defaults to unlimited.
+    /// </summary>
+    /// <remarks>
+    /// A generative pipeline re-runs its decoder once per token, so an op-type filter that matches ten nodes
+    /// costs ten readbacks per token - and on the browser backends, where each readback is an async buffer
+    /// map, that turns a 90-second self-test into something that does not finish. The first N lines are the
+    /// prefill/encoder pass, which is what a divergence hunt wants anyway.
+    /// </remarks>
+    public static int DumpMaxLines { get; set; } = int.MaxValue;
+    private static int _dumpCount;
+
+    /// <summary>Resets the <see cref="DumpMaxLines"/> budget, so each run gets a full one.</summary>
+    public static void ResetDumpBudget() => _dumpCount = 0;
+
+    private static bool DumpBudgetExhausted => Volatile.Read(ref _dumpCount) >= DumpMaxLines;
+
+    private static void DumpLine(string line)
+    {
+        if (Interlocked.Increment(ref _dumpCount) > DumpMaxLines) return;
+        if (DumpSink is { } sink) sink(line);
+        else Console.WriteLine(line);
+    }
+    private static readonly string? _dumpMatchEnv = Environment.GetEnvironmentVariable("ML_DUMP_TENSORS");
+    private static string? _dumpMatch => DumpTensorsMatching ?? (string.IsNullOrEmpty(_dumpMatchEnv) ? null : _dumpMatchEnv);
+
+    /// <summary>
+    /// Async-readback version of <see cref="DumpNodeOutputs"/>, for the browser backends.
+    /// </summary>
+    /// <remarks>
+    /// The sync <c>CopyToCPU</c> the other overload uses THROWS on WebGPU/WebGL/Wasm - so on exactly the
+    /// backends where a backend-specific bug lives, the diagnostic was unusable. <c>CopyToHostAsync</c> is
+    /// the supported readback there (it drains on its own). Only called from the async execution path.
+    /// </remarks>
+    private static async Task DumpNodeOutputsAsync(int nodeIdx, CompiledNode node, Tensor[] nodeOutputs)
+    {
+        var match = _dumpMatch;
+        if (match == null || DumpBudgetExhausted) return;   // skip the readback, not just the line
+        for (int i = 0; i < node.OutputNames.Length && i < nodeOutputs.Length; i++)
+        {
+            var name = node.OutputNames[i];
+            if (!name.Contains(match, StringComparison.OrdinalIgnoreCase)
+                && !node.OpType.Contains(match, StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                var t = nodeOutputs[i];
+                if (t == null) { DumpLine($"[dump] {nodeIdx,4} {node.OpType,-16} {name} = null"); continue; }
+                int take = (int)Math.Min(t.Data.Length, 4096);
+                var host = await t.Data.BaseView.SubView(0, take).CopyToHostAsync();
+                float mn = float.MaxValue, mx = float.MinValue; double mean = 0; int finite = 0;
+                foreach (var v in host)
+                {
+                    if (float.IsNaN(v) || float.IsInfinity(v)) continue;
+                    finite++; mn = MathF.Min(mn, v); mx = MathF.Max(mx, v); mean += v;
+                }
+                mean = finite > 0 ? mean / finite : 0;
+                var head = string.Join(" ", host.Take(8).Select(v => v.ToString("G4")));
+                DumpLine($"[dump] {nodeIdx,4} {node.OpType,-16} {name,-46} "
+                    + $"shape=[{string.Join(",", t.Shape)}] min={mn:G4} max={mx:G4} mean={mean:G4} "
+                    + $"nonfinite={host.Length - finite} head=[{head}]");
+            }
+            catch (Exception ex) { DumpLine($"[dump] {name}: {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>Print stats for any of this node's outputs matching <see cref="DumpTensorsMatching"/>.</summary>
+    private static void DumpNodeOutputs(int nodeIdx, CompiledNode node, Tensor[] nodeOutputs)
+    {
+        var match = _dumpMatch;
+        if (match == null || DumpBudgetExhausted) return;   // skip the readback, not just the line
+        for (int i = 0; i < node.OutputNames.Length && i < nodeOutputs.Length; i++)
+        {
+            var name = node.OutputNames[i];
+            if (!name.Contains(match, StringComparison.OrdinalIgnoreCase)
+                && !node.OpType.Contains(match, StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                var t = nodeOutputs[i];
+                if (t == null) { DumpLine($"[dump] {nodeIdx,4} {node.OpType,-16} {name} = null"); continue; }
+                var host = new float[Math.Min(t.Data.Length, 1 << 16)];
+                t.Data.BaseView.SubView(0, host.Length).CopyToCPU(host);
+                float mn = float.MaxValue, mx = float.MinValue; double mean = 0; int finite = 0;
+                foreach (var v in host)
+                {
+                    if (float.IsNaN(v) || float.IsInfinity(v)) continue;
+                    finite++; mn = MathF.Min(mn, v); mx = MathF.Max(mx, v); mean += v;
+                }
+                mean = finite > 0 ? mean / finite : 0;
+                var head = string.Join(" ", host.Take(8).Select(v => v.ToString("G4")));
+                DumpLine($"[dump] {nodeIdx,4} {node.OpType,-16} {name,-46} "
+                    + $"shape=[{string.Join(",", t.Shape)}] min={mn:G4} max={mx:G4} mean={mean:G4} "
+                    + $"nonfinite={host.Length - finite} head=[{head}]"
+                    + $" <- [{string.Join(", ", node.InputNames)}]");
+            }
+            catch (Exception ex) { DumpLine($"[dump] {name}: {ex.GetType().Name}: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
     /// DIAGNOSTIC: captures the OpType + node index of every operator run in
     /// the most recent RunAsync invocation. Cleared at the start of each call.
     /// </summary>
@@ -1097,6 +1216,8 @@ public class GraphExecutor : IDisposable
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
 
+            DumpNodeOutputs(nodeIdx, node, nodeOutputs);
+
             // Capture small intermediate outputs as runtime constants.
             // Shape tensors, scalars, and small 1D vectors (≤64 elements) are read back
             // to CPU so downstream operators (Slice, Reshape, Gather, Expand) can resolve
@@ -1834,6 +1955,16 @@ public class GraphExecutor : IDisposable
                 runtimeConstants[node.OutputNames[0]] = cpuShapeVal;
                 shapeInterpVals[node.OutputNames[0]] = cpuShapeVal;
                 LastRunShapeInterpResolved++;
+                // A CPU-interpreted shape value never dispatches, so the tensor dump below cannot see it -
+                // yet these values decide every dynamic shape in the graph. Report them under the same filter,
+                // or a wrong one is invisible twice over.
+                if (_dumpMatch != null
+                    && (node.OutputNames[0].Contains(_dumpMatch, StringComparison.OrdinalIgnoreCase)
+                        || node.OpType.Contains(_dumpMatch, StringComparison.OrdinalIgnoreCase)))
+                    DumpLine($"[interp] {nodeIdx,4} {node.OpType,-16} {node.OutputNames[0],-46} "
+                        + $"= [{string.Join(",", cpuShapeVal.Take(8).Select(v => v.ToString("G6")))}]"
+                        + $"{(cpuShapeVal.Length > 8 ? $" (+{cpuShapeVal.Length - 8})" : "")}"
+                        + $" <- [{string.Join(", ", node.InputNames)}]");
                 if (LogEmptyShapeInterp && cpuShapeVal.Length == 0)
                 {
                     var _sb = new System.Text.StringBuilder();
@@ -2778,6 +2909,8 @@ public class GraphExecutor : IDisposable
 
             for (int i = 0; i < node.OutputNames.Length; i++)
                 tensors[node.OutputNames[i]] = nodeOutputs[i];
+
+            if (_dumpMatch != null) await DumpNodeOutputsAsync(nodeIdx, node, nodeOutputs);
 
             // First step (or shape changed): retain this Shape output buffer so later steps reuse it.
             // refCounts=MaxValue keeps it out of the pool's return path for the rest of this run AND

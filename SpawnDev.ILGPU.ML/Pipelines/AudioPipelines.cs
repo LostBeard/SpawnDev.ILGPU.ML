@@ -24,12 +24,27 @@ public class SpeechRecognitionPipeline : IDisposable
     private readonly InferenceSession _decoderSession;
     private BPETokenizer? _tokenizer;
 
-    // Whisper special tokens
-    private const int SOT = 50258;
-    private const int LANG_EN = 50259;
-    private const int TRANSCRIBE = 50360;
-    private const int NO_TIMESTAMPS = 50364;
-    private const int EOT = 50257;
+    // Whisper special tokens, as verified against the model's own tokenizer.json (Xenova/whisper-tiny).
+    // TRANSCRIBE and NO_TIMESTAMPS were each one too high: 50360 is <|startoflm|> and 50364 is a timestamp
+    // token, so the decoder was primed with a prompt Whisper never emits and returned nothing at all - for
+    // clean, speech-level audio. The language block runs 50259..50357, which is what puts <|translate|> at
+    // 50358 and <|transcribe|> at 50359; an off-by-one lands inside that block and looks plausible.
+    private const int SOT = 50258;           // <|startoftranscript|>
+    private const int LANG_EN = 50259;       // <|en|>
+    private const int TRANSCRIBE = 50359;    // <|transcribe|>
+    private const int NO_TIMESTAMPS = 50363; // <|notimestamps|>
+    private const int EOT = 50257;           // <|endoftext|>
+
+    /// <summary>
+    /// Raised for each greedy step with (stepIndex, tokenId) as decoding proceeds.
+    /// </summary>
+    /// <remarks>
+    /// Decoding is the one stage whose failure is invisible from the outside: a wrong encoder output or a
+    /// wrong prompt does not throw, it just makes the model emit end-of-text immediately and return an
+    /// empty string, which is indistinguishable from silent audio. Watching the token stream separates
+    /// "stopped instantly" from "looped on one token" from "produced words" without a debugger.
+    /// </remarks>
+    public event Action<int, int>? OnTokenGenerated;
 
     public bool IsReady => true;
     public string ModelName { get; init; } = "Whisper Tiny";
@@ -109,6 +124,7 @@ public class SpeechRecognitionPipeline : IDisposable
             // token (Rule 4: no unnecessary copies). GpuArgMax tie-breaks lowest-index, identical to the old CPU
             // first-max-wins scan; its partial buffers are reused, so there is no per-token allocation.
             int nextToken = await argmax.ArgMaxAsync(logits.Data.SubView(lastPosOffset, vocabSize), vocabSize);
+            OnTokenGenerated?.Invoke(step, nextToken);
 
             if (nextToken == EOT) break;
             tokens.Add(nextToken);

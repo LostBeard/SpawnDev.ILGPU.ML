@@ -267,7 +267,7 @@ public class MinOperator(OperatorRegistry reg) : IOnnxOperator
         if (a.ElementCount == b.ElementCount)
             reg.ElementWise.Min(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
-            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Min(x, y));
+            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Min(x, y), BroadcastOp.Min);
     }
 }
 
@@ -282,7 +282,7 @@ public class MaxOnnxOperator(OperatorRegistry reg) : IOnnxOperator
         if (a.ElementCount == b.ElementCount)
             reg.ElementWise.Max(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
         else
-            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Max(x, y));
+            BroadcastBinaryOp(ctx, reg, (x, y) => MathF.Max(x, y), BroadcastOp.Max);
     }
 }
 
@@ -363,83 +363,128 @@ public class FlattenOperator(OperatorRegistry reg) : IOnnxOperator
 public class TileOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Tile";
+
+    /// <summary>ONNX Tile: <c>out[i] = in[i] * repeats[i]</c>.</summary>
+    /// <remarks>
+    /// The compiler resolves this properly in <c>GraphCompiler</c> (it needs the repeats VALUES, which are a
+    /// tensor input, and the output buffer is allocated from the shape it computes). This override only has
+    /// the shapes, so it can still do the right thing when the repeats were folded into an attribute; the
+    /// input shape is the last-resort answer, NOT a silent "no tiling" as it used to be.
+    /// </remarks>
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
-        => new[] { inputs[0] }; // Dynamic — depends on repeats tensor
+    {
+        if (attrs.TryGetValue("_resolved_repeats", out var rObj) && rObj is long[] reps && inputs.Length > 0)
+        {
+            var shape = (int[])inputs[0].Clone();
+            for (int i = 0; i < shape.Length; i++)
+                shape[i] *= (int)Math.Max(0, i < reps.Length ? reps[i] : 1);
+            return new[] { shape };
+        }
+        return new[] { inputs[0] };
+    }
+
     public void Execute(OnnxOpContext ctx)
     {
         var input = ctx.Inputs[0];
         var output = ctx.Outputs[0];
         int inCount = input.ElementCount;
         int outCount = output.ElementCount;
+        var inShape = input.Shape;
+        var outShape = output.Shape;
 
-        // Get repeat counts from runtime constants
-        var repeats = ctx.TryGetInputValues(1);
+        // Repeats, in the same precedence order Slice uses for its params: compiler-resolved attribute
+        // first (most reliable - it is what the output buffer was SIZED from), then the runtime constant.
+        int[]? repeats = null;
+        var resolved = ctx.GetInts("_resolved_repeats");
+        if (resolved.Length > 0) repeats = resolved;
+        else if (ctx.TryGetInputValues(1) is float[] rf) repeats = rf.Select(v => (int)v).ToArray();
 
+        // Whisper's decoder gets its repeats from a Concat of runtime dims, so the COMPILER cannot resolve
+        // them and the output was sized from whatever shape the graph happened to be compiled for. Recompute
+        // the true shape here from the runtime repeats and publish it - Tensor.Shape is settable for exactly
+        // this. Anything else means writing the right values into a tensor that still claims the wrong shape,
+        // and every downstream node reads Shape.
+        if (repeats != null && inShape.Length > 0)
+        {
+            var trueShape = (int[])inShape.Clone();
+            for (int d = 0; d < trueShape.Length; d++)
+                trueShape[d] = inShape[d] * Math.Max(0, d < repeats.Length ? repeats[d] : 1);
+            int trueCount = 1;
+            foreach (var d in trueShape) trueCount *= d;
+
+            if (trueCount != outCount)
+            {
+                if (output.Data.Length >= trueCount)
+                {
+                    output.Shape = trueShape;      // buffer is big enough; just correct the metadata
+                }
+                else
+                {
+                    // The whole mask subgraph is dynamic (repeats come from a Concat of runtime dims), so
+                    // static inference sized this output from a placeholder - here, 1 element for a [1,4]
+                    // tile. Rent the real thing and hand it back: the executor registers ctx.Outputs AFTER
+                    // Execute, so replacing the entry is how a dynamically-sized op publishes its result.
+                    output = ctx.Pool.Rent(trueShape, "tile_out");
+                    ctx.Outputs[0] = output;
+                }
+                outShape = trueShape;
+                outCount = trueCount;
+            }
+        }
+
+        // Nothing to do when the output is the same size as the input: repeats are all 1 (or absent).
         if (inCount == outCount)
         {
-            // No tiling needed — just copy
             reg.ElementWise.Scale(input.Data.SubView(0, inCount), output.Data.SubView(0, outCount), inCount, 1f);
             return;
         }
 
+        // Tiling ONLY on the outermost axis is a straight run of copies of the whole flat buffer, which
+        // stays on the GPU. Any inner-axis repeat is NOT: [1,1,4,1] tiled by [1,1,1,4] must become
+        // 0,0,0,0, 1,1,1,1, ... and a block copy would produce 0,1,2,3, 0,1,2,3 - the old code took this
+        // path for ANY outCount % inCount == 0 and quietly produced that wrong answer.
+        bool outerAxisOnly = true;
         if (repeats != null)
-        {
-            // CPU-side tiling for small tensors or when repeats are known
-            var inShape = input.Shape;
-            var outShape = new int[inShape.Length];
-            for (int i = 0; i < inShape.Length; i++)
-                outShape[i] = inShape[i] * (i < repeats.Length ? (int)repeats[i] : 1);
+            for (int d = 1; d < inShape.Length && d < repeats.Length; d++)
+                if (repeats[d] != 1) { outerAxisOnly = false; break; }
 
-            // Simple tiling: if output is an exact multiple of input, tile
-            if (outCount > 0 && outCount % inCount == 0)
-            {
-                int tiles = outCount / inCount;
-                for (int t = 0; t < tiles; t++)
-                    reg.ElementWise.Scale(input.Data.SubView(0, inCount),
-                        output.Data.SubView(t * inCount, inCount), inCount, 1f);
-            }
-            else
-            {
-                // General N-D tiling via index mapping
-                var inVals = ctx.TryGetInputValues(0);
-                if (inVals != null)
-                {
-                    var result = new float[outCount];
-                    var inStrides = BroadcastHelper.ComputeStrides(inShape, inShape);
-                    for (int i = 0; i < outCount; i++)
-                    {
-                        // Map output index to input index via modulo per dimension
-                        int remaining = i;
-                        int inIdx = 0;
-                        for (int d = inShape.Length - 1; d >= 0; d--)
-                        {
-                            int outDim = outShape[d];
-                            int coord = remaining % outDim;
-                            remaining /= outDim;
-                            int inCoord = coord % inShape[d];
-                            inIdx += inCoord * inStrides[d];
-                        }
-                        result[i] = inIdx < inVals.Length ? inVals[inIdx] : 0f;
-                    }
-                    // Direct CPU->GPU upload (was AllocatePermanent + Scale leak).
-                    output.Data.SubView(0, outCount).CopyFromCPU(result);
-                }
-                else
-                {
-                    // Fallback: copy what we can
-                    int copyCount = Math.Min(inCount, outCount);
-                    reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
-                        output.Data.SubView(0, copyCount), copyCount, 1f);
-                }
-            }
-        }
-        else
+        if (outerAxisOnly && inCount > 0 && outCount % inCount == 0)
         {
-            // No repeat info — copy input to output
-            int copyCount = Math.Min(inCount, outCount);
-            reg.ElementWise.Scale(input.Data.SubView(0, copyCount),
-                output.Data.SubView(0, copyCount), copyCount, 1f);
+            int tiles = outCount / inCount;
+            for (int t = 0; t < tiles; t++)
+                reg.ElementWise.Scale(input.Data.SubView(0, inCount),
+                    output.Data.SubView((long)t * inCount, inCount), inCount, 1f);
+            return;
         }
+
+        // General N-D tile: map each output coordinate back to the input by modulo per dimension.
+        var inVals = ctx.TryGetInputValues(0);
+        if (inVals != null && inShape.Length > 0 && outShape.Length == inShape.Length)
+        {
+            var result = new float[outCount];
+            var inStrides = BroadcastHelper.ComputeStrides(inShape, inShape);
+            for (int i = 0; i < outCount; i++)
+            {
+                int remaining = i, inIdx = 0;
+                for (int d = outShape.Length - 1; d >= 0; d--)
+                {
+                    int coord = remaining % outShape[d];
+                    remaining /= outShape[d];
+                    inIdx += (coord % inShape[d]) * inStrides[d];
+                }
+                result[i] = inIdx < inVals.Length ? inVals[inIdx] : 0f;
+            }
+            output.Data.SubView(0, outCount).CopyFromCPU(result);
+            return;
+        }
+
+        // Refuse rather than emit a partial copy. A wrong Tile does not throw downstream - it produces a
+        // plausible tensor of the right shape and the model quietly returns nonsense, which is exactly how
+        // this operator hid a broken causal mask. Failing here names the node instead.
+        throw new InvalidOperationException(
+            $"Tile cannot produce [{string.Join(",", outShape)}] from [{string.Join(",", inShape)}]: "
+            + $"repeats={(repeats == null ? "unresolved" : string.Join(",", repeats))}, and the input values are "
+            + "not available on the CPU for a general N-D tile. A partial copy here would silently corrupt the graph.");
     }
 }
 
@@ -593,7 +638,7 @@ public class ModOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x % y : 0f);
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (x, y) => y != 0 ? x % y : 0f, BroadcastOp.Mod);
         }
     }
 }
@@ -610,7 +655,7 @@ public class BitwiseAndOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx) =>
-        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a & (int)b));
+        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a & (int)b), BroadcastOp.BitwiseAnd);
 }
 
 public class BitwiseOrOperator(OperatorRegistry reg) : IOnnxOperator
@@ -619,7 +664,7 @@ public class BitwiseOrOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx) =>
-        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a | (int)b));
+        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a | (int)b), BroadcastOp.BitwiseOr);
 }
 
 public class BitwiseXorOperator(OperatorRegistry reg) : IOnnxOperator
@@ -628,7 +673,7 @@ public class BitwiseXorOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
         => new[] { Tensors.TensorHelpers.BroadcastShape(inputs[0], inputs[1]) };
     public void Execute(OnnxOpContext ctx) =>
-        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a ^ (int)b));
+        BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a ^ (int)b), BroadcastOp.BitwiseXor);
 }
 
 public class BitwiseNotOperator(OperatorRegistry reg) : IOnnxOperator
@@ -653,9 +698,9 @@ public class BitShiftOperator(OperatorRegistry reg) : IOnnxOperator
     {
         string direction = ctx.GetString("direction", "LEFT");
         if (direction == "LEFT")
-            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a << (int)b));
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a << (int)b), BroadcastOp.BitShiftLeft);
         else
-            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a >> (int)b));
+            BroadcastHelper.BroadcastBinaryOp(ctx, reg, (a, b) => (float)((int)a >> (int)b), BroadcastOp.BitShiftRight);
     }
 }
 

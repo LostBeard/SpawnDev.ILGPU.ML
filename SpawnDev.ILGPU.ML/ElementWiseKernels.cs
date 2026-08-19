@@ -4,7 +4,7 @@ using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML;
 
 /// <summary>Binary operations for GPU broadcast kernels.</summary>
-public enum BroadcastOp { Add, Sub, Mul, Div, Pow, Less, Greater, Equal, LessOrEqual, GreaterOrEqual }
+public enum BroadcastOp { Add, Sub, Mul, Div, Pow, Less, Greater, Equal, LessOrEqual, GreaterOrEqual, And, Or, Xor, Min, Max, PRelu, Mod, BitwiseAnd, BitwiseOr, BitwiseXor, BitShiftLeft, BitShiftRight }
 
 /// <summary>
 /// Element-wise neural network operations: GELU, ReLU, Add, Mul, AddBias.
@@ -199,6 +199,48 @@ public class ElementWiseKernels : IDisposable
     static float BroadcastEqualOp(float a, float b) => a == b ? 1f : 0f;
     static float BroadcastLessOrEqualOp(float a, float b) => a <= b ? 1f : 0f;
     static float BroadcastGreaterOrEqualOp(float a, float b) => a >= b ? 1f : 0f;
+    // Logical ops on ONNX bool tensors (carried here as 0f/1f). These were MISSING from BroadcastOp, so
+    // And/Or/Xor fell through to BroadcastBinaryOp's `gpuOp = BroadcastOp.Add` DEFAULT and silently performed
+    // ADDITION on the GPU path. Whisper's causal mask then came back holding 1s and 2s instead of 0s and 1s -
+    // but only once the operands stopped being CPU-resolvable, so short sequences took the correct CPU lambda
+    // and long ones did not: the transcript started correctly and then degenerated into a repeating loop.
+    // Written WITHOUT `&&`/`||`: these bodies are transpiled to GPU shaders (WGSL/GLSL/Wasm), and a
+    // short-circuiting boolean operator is a control-flow construct there, not an arithmetic one. Reducing
+    // each to a 0/1 indicator and combining with min/max/add keeps them pure arithmetic, which every
+    // backend lowers identically.
+    static float BroadcastAndOp(float a, float b)
+    {
+        float ia = a != 0f ? 1f : 0f, ib = b != 0f ? 1f : 0f;
+        return ia * ib;
+    }
+    static float BroadcastOrOp(float a, float b)
+    {
+        float ia = a != 0f ? 1f : 0f, ib = b != 0f ? 1f : 0f;
+        return ia + ib > 0f ? 1f : 0f;
+    }
+    static float BroadcastXorOp(float a, float b)
+    {
+        float ia = a != 0f ? 1f : 0f, ib = b != 0f ? 1f : 0f;
+        return ia + ib == 1f ? 1f : 0f;
+    }
+    // Min/Max/PRelu had NO BroadcastOp member, so their broadcasting call sites fell through the same
+    // `gpuOp = BroadcastOp.Add` default that made And/Or/Xor perform ADDITION on the GPU. The CPU lambda
+    // handed to BroadcastBinaryOp is correct, and the both-inputs-constant branch uses it - so a small test
+    // passes while the two GPU branches quietly add. That is why the selector no longer has a default:
+    // omitting it is now a compile error rather than a wrong answer.
+    static float BroadcastMinOp(float a, float b) => MathF.Min(a, b);
+    static float BroadcastMaxOp(float a, float b) => MathF.Max(a, b);
+    // PRelu(x, slope) = x >= 0 ? x : slope * x. Operand order matters: a is x, b is the slope.
+    static float BroadcastPReluOp(float a, float b) => a >= 0f ? a : a * b;
+    // Mod and the bitwise/shift family were in the same silently-adding group. ONNX carries integer tensors
+    // through this float path, so each converts, operates, and converts back - the same expression the CPU
+    // lambda at the call site uses, so the two paths cannot drift.
+    static float BroadcastModOp(float a, float b) => b != 0f ? a % b : 0f;
+    static float BroadcastBitwiseAndOp(float a, float b) => (float)((int)a & (int)b);
+    static float BroadcastBitwiseOrOp(float a, float b) => (float)((int)a | (int)b);
+    static float BroadcastBitwiseXorOp(float a, float b) => (float)((int)a ^ (int)b);
+    static float BroadcastBitShiftLeftOp(float a, float b) => (float)((int)a << (int)b);
+    static float BroadcastBitShiftRightOp(float a, float b) => (float)((int)a >> (int)b);
 
     /// <summary>
     /// Unified broadcast binary kernel: output[i] = op(a[mapA(i)], b[mapB(i)]).
@@ -635,6 +677,18 @@ public class ElementWiseKernels : IDisposable
             BroadcastOp.Equal => new DelegateSpecialization<Func<float, float, float>>(BroadcastEqualOp),
             BroadcastOp.LessOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastLessOrEqualOp),
             BroadcastOp.GreaterOrEqual => new DelegateSpecialization<Func<float, float, float>>(BroadcastGreaterOrEqualOp),
+            BroadcastOp.And => new DelegateSpecialization<Func<float, float, float>>(BroadcastAndOp),
+            BroadcastOp.Or => new DelegateSpecialization<Func<float, float, float>>(BroadcastOrOp),
+            BroadcastOp.Xor => new DelegateSpecialization<Func<float, float, float>>(BroadcastXorOp),
+            BroadcastOp.Min => new DelegateSpecialization<Func<float, float, float>>(BroadcastMinOp),
+            BroadcastOp.Max => new DelegateSpecialization<Func<float, float, float>>(BroadcastMaxOp),
+            BroadcastOp.PRelu => new DelegateSpecialization<Func<float, float, float>>(BroadcastPReluOp),
+            BroadcastOp.Mod => new DelegateSpecialization<Func<float, float, float>>(BroadcastModOp),
+            BroadcastOp.BitwiseAnd => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseAndOp),
+            BroadcastOp.BitwiseOr => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseOrOp),
+            BroadcastOp.BitwiseXor => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitwiseXorOp),
+            BroadcastOp.BitShiftLeft => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitShiftLeftOp),
+            BroadcastOp.BitShiftRight => new DelegateSpecialization<Func<float, float, float>>(BroadcastBitShiftRightOp),
             _ => throw new ArgumentException($"Unsupported broadcast op: {op}")
         };
         _broadcastBinaryKernel!(outCount, a, b, output, paramsView, opSpec);
