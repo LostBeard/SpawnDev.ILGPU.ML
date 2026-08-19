@@ -50,7 +50,29 @@ public class SpeechRecognitionPipeline : IDisposable
 
     public bool IsReady => true;
     public string ModelName { get; init; } = "Whisper Tiny";
-    public int MaxTokens { get; set; } = 224;
+
+    /// <summary>
+    /// Maximum tokens to GENERATE. Defaults to the model's real ceiling: <see cref="MaxTargetPositions"/>
+    /// minus the 4-token prompt.
+    /// </summary>
+    /// <remarks>
+    /// This used to default to 224, which silently truncated long transcripts - 30s of dense speech can run
+    /// past that, and the loop simply stopped mid-sentence with no error. It is a generation bound, not a
+    /// safety valve: the hard limit is <see cref="MaxTargetPositions"/> and it is enforced separately, so
+    /// raising this cannot walk off the end of the positional embeddings.
+    /// </remarks>
+    public int MaxTokens { get; set; } = 444;
+
+    /// <summary>
+    /// The decoder's learned positional-embedding count (`max_target_positions`, 448 for every Whisper
+    /// size). Generation stops once prompt + generated reaches it.
+    /// </summary>
+    /// <remarks>
+    /// This is a CORRECTNESS limit, not a preference: position N is a lookup into an embedding table with
+    /// exactly this many rows, so going past it reads off the end. Enforced in both decode paths.
+    /// </remarks>
+    public int MaxTargetPositions { get; set; } = 448;
+
     public string Language { get; set; } = "en";
 
     /// <summary>True when a with-past decoder was supplied, so decoding is O(n) rather than O(n^2).</summary>
@@ -148,6 +170,8 @@ public class SpeechRecognitionPipeline : IDisposable
 
             if (nextToken == EOT) break;
             tokens.Add(nextToken);
+            // Hard stop at the positional-embedding count - past it the decoder indexes off the end.
+            if (tokens.Count >= MaxTargetPositions) break;
         }
 
         sw.Stop();
@@ -234,6 +258,8 @@ public class SpeechRecognitionPipeline : IDisposable
             OnTokenGenerated?.Invoke(step, nextToken);
             if (nextToken == EOT) break;
             tokens.Add(nextToken);
+            // Hard stop at the positional-embedding count - past it the decoder indexes off the end.
+            if (tokens.Count >= MaxTargetPositions) break;
 
             // Roll the DECODER entries forward. The encoder entries are deliberately left untouched: this
             // graph does not re-emit them, and they never change.

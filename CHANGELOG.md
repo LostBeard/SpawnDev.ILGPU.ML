@@ -2,6 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.1.2-local.12 (2026-08-19)
+
+### FIX: `MaxTokens` default of 224 silently truncated long transcripts
+
+`SpeechRecognitionPipeline.MaxTokens` defaulted to 224. Whisper's decoder holds `max_target_positions` 448
+learned positional embeddings, so 224 was not the model's limit - it was an arbitrary bound that stopped
+generation mid-sentence with no error and no signal. 30s of dense speech runs well past it.
+
+- `MaxTokens` now defaults to **444** - the model's real ceiling (448 positions minus the 4-token
+  `<|startoftranscript|><|en|><|transcribe|><|notimestamps|>` prompt).
+- New `MaxTargetPositions` (default 448) is enforced in BOTH decode paths. That one is a correctness limit,
+  not a preference: position N indexes a table with exactly that many rows, so running past it reads off the
+  end. Raising `MaxTokens` therefore cannot walk off the embeddings.
+
+Normal generation still ends at `<|endoftext|>` long before either bound; these only govern the worst case.
+Verified unchanged on the Harvard-sentence fixture: 57 words, byte-identical transcript.
+
 ## 5.1.2-local.11 (2026-08-19)
 
 ### ADD: O(n) Whisper decode via the with-past decoder (KV cache)

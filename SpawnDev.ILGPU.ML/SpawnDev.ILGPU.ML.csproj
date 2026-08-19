@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.1.2-local.11</Version>
+		<Version>5.1.2-local.12</Version>
 		<PackageReleaseNotes>v5.1.1 - Dependency update</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
