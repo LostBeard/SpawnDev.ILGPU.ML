@@ -181,7 +181,14 @@ public class GraphCompiler
             // axis disappeared. Supplying the folded axes under the attribute name the operator already
             // reads restores the pre-13 behaviour exactly. Left unfixed, an index tensor meant to broadcast
             // to [412,103] stays [412], and the mismatch only surfaces in an Add several nodes later.
-            if ((node.OpType == "Unsqueeze" || node.OpType == "Squeeze")
+            // The Reduce family moved `axes` the same way (ReduceSum at opset 13, the rest at 18), and the
+            // consequence is worse than a missing dimension: inference falls back to reducing the LAST axis,
+            // so summing [303,4,2,512] over axis 2 produced [303,4,2] instead of [303,4,512] - a plausible
+            // shape carrying the wrong data. Execute already resolves the input form; only inference was blind.
+            if ((node.OpType == "Unsqueeze" || node.OpType == "Squeeze"
+                    || node.OpType is "ReduceSum" or "ReduceMean" or "ReduceMax" or "ReduceMin"
+                        or "ReduceProd" or "ReduceL1" or "ReduceL2" or "ReduceLogSum"
+                        or "ReduceLogSumExp" or "ReduceSumSquare")
                 && !attrs.ContainsKey("axes")
                 && node.Inputs.Count >= 2 && !string.IsNullOrEmpty(node.Inputs[1])
                 && graph.ConstantData != null
