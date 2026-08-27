@@ -1,0 +1,15 @@
+# Phase 1 sentence set for the phonemizer sensitivity measurement.
+# Chosen so every espeak feature under test appears in SEVERAL sentences: the alveolar flap
+# (water, letter, little, butter, sitting), the barred-i reduced vowel (roses, photographs),
+# turned-a (about), r-coloured schwa (mother, brother, better, counter), secondary stress
+# (understand, seventeen, photographs) and length marks (all over).
+# Everyday vocabulary on purpose: a phonemizer that only works on lab sentences is not a phonemizer.
+About the roses, understand that my mother would rather water the better city garden.
+My daughter waited by the water for a letter from her brother.
+The little kitten sat under the ladder in the middle of the city.
+Understanding the problem is better than pretending it never happened.
+Seventeen photographs were sitting in a bottle on the kitchen counter.
+The birch canoe slid on the smooth planks.
+Rice is often served in round bowls with a little butter.
+The waitresses collected the boxes and watched the horses.
+About a hundred packages arrived at the address about noon.

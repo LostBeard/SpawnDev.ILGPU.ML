@@ -48,20 +48,32 @@ int RunSensitivity(string fixturePath, string? outDir)
 {
     if (!Directory.Exists(modelDir)) { Console.WriteLine($"no model dir at {modelDir}"); return 2; }
 
-    var resolved = Path.IsPathRooted(fixturePath)
-        ? fixturePath
-        : Path.Combine(AppContext.BaseDirectory, fixturePath);
-    if (!File.Exists(resolved)) resolved = Path.Combine(Environment.CurrentDirectory, fixturePath);
-    if (!File.Exists(resolved)) { Console.WriteLine($"no fixture at {fixturePath}"); return 2; }
+    // A directory means "every fixture in it". Replication across sentences is what separates a
+    // measurement from an anecdote, so the many-fixture case is the normal one.
+    var candidates = new[]
+    {
+        Path.IsPathRooted(fixturePath) ? fixturePath : Path.Combine(AppContext.BaseDirectory, fixturePath),
+        Path.Combine(Environment.CurrentDirectory, fixturePath),
+    };
+    var resolved = candidates.FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
+    if (resolved == null) { Console.WriteLine($"no fixture or fixture dir at {fixturePath}"); return 2; }
 
-    var fixture = ZipVoiceFixture.Load(resolved);
-    var promptWav = Path.IsPathRooted(fixture.PromptWav)
-        ? fixture.PromptWav
-        : Path.Combine(modelDir, fixture.PromptWav);
-    if (!File.Exists(promptWav)) { Console.WriteLine($"no prompt wav at {promptWav}"); return 2; }
+    var paths = Directory.Exists(resolved)
+        ? Directory.GetFiles(resolved, "*.json").OrderBy(p => p).ToArray()
+        : new[] { resolved };
+    if (paths.Length == 0) { Console.WriteLine($"no *.json fixtures in {resolved}"); return 2; }
+
+    var fixtures = new List<(string Path, ZipVoiceFixture Fixture)>();
+    foreach (var p in paths)
+    {
+        var fixture = ZipVoiceFixture.Load(p);
+        var promptWav = Sensitivity.ResolvePromptWav(modelDir, fixture);
+        if (!File.Exists(promptWav)) { Console.WriteLine($"no prompt wav at {promptWav} (for {Path.GetFileName(p)})"); return 2; }
+        fixtures.Add((p, fixture));
+    }
 
     outDir ??= Path.Combine(Path.GetTempPath(), "zipvoice-sensitivity");
-    return Sensitivity.RunAsync(modelDir, fixture, promptWav, outDir, ReadWav, WriteWav)
+    return Sensitivity.RunAsync(modelDir, fixtures, outDir, ReadWav, WriteWav)
                       .GetAwaiter().GetResult();
 }
 
