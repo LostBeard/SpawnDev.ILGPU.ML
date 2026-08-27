@@ -87,8 +87,32 @@ public class BPETokenizer : ITokenizer
             merges = mergesArray.Select(e => e.GetString()!).ToArray();
         }
 
+        // Special tokens live in added_tokens, NOT in model.vocab, and skipping them meant a tokenizer
+        // loaded from tokenizer.json had no idea what <|endoftext|> or <|startoftranscript|> were. Every
+        // caller then had to hard-code their ids, which is how SpeechRecognitionPipeline ended up unable to
+        // run any English-only Whisper model: the .en vocabulary is one token smaller, so every special id
+        // shifts by one and the hard-coded multilingual set primes the decoder with tokens that model never
+        // emits. They are BPE-unreachable (no merge rule produces them), so adding them cannot change how
+        // ordinary text encodes - it only makes them addressable.
+        if (doc.RootElement.TryGetProperty("added_tokens", out var added))
+        {
+            foreach (var tok in added.EnumerateArray())
+            {
+                if (!tok.TryGetProperty("content", out var content) || !tok.TryGetProperty("id", out var id)) continue;
+                var name = content.GetString();
+                if (name != null) vocab[name] = id.GetInt32();
+            }
+        }
+
         return new BPETokenizer(vocab, merges);
     }
+
+    /// <summary>Look up the id of an exact token, such as a special token like <c>&lt;|endoftext|&gt;</c>.</summary>
+    /// <remarks>
+    /// Exists so callers can resolve special tokens from the model's OWN tokenizer instead of hard-coding
+    /// ids that are only correct for one variant of one model.
+    /// </remarks>
+    public bool TryGetTokenId(string token, out int id) => _encoder.TryGetValue(token, out id);
 
     /// <summary>
     /// Encode text to token IDs.

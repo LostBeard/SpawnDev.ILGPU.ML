@@ -314,12 +314,20 @@ public static class Sensitivity
                 return got;
             }
 
+            int distanceDone = 0;
             foreach (var r in needDistance)
             {
                 var c = byKey[(r.Fixture, r.Seed, "control")];
                 if (!File.Exists(r.Wav) || !File.Exists(c.Wav)) continue;
                 var x = Audio(r.Wav); var y = Audio(c.Wav);
                 r.MelDistance = AcousticDistance.Between(x.Samples, x.Rate, y.Samples, y.Rate);
+                // Checkpointed, like grading. This stage takes long enough that losing all of it to an
+                // interruption once was one time too many.
+                if (++distanceDone % 25 == 0)
+                {
+                    File.WriteAllText(resultsPath, JsonSerializer.Serialize(rows, new JsonSerializerOptions { WriteIndented = true }));
+                    Console.WriteLine($"  distances {distanceDone}/{needDistance.Count}");
+                }
             }
 
             // The null model: the same tokens rendered from a DIFFERENT noise draw.
@@ -354,6 +362,25 @@ public static class Sensitivity
         var badControls = controls.Values.Where(c => c.InfixWer > 0.15).ToList();
         Console.WriteLine($"  mean {controls.Values.Average(c => c.InfixWer):P1} over {controls.Count} renders"
                         + (badControls.Count > 0 ? $", {badControls.Count} above 15%" : ""));
+
+        // ---- Exclude cells whose BASELINE failed --------------------------------------------------
+        // Flow matching starts from fresh noise and occasionally produces a degenerate render: one control
+        // here transcribed as "I'm not a human, I'm a human." That is the TTS failing, not the grader and
+        // not the perturbation - but every perturbed row in that cell is scored against it, so the whole
+        // cell is measuring noise. Cells are dropped on the CONTROL's own score alone, never on how the
+        // perturbations in them turned out, so this cannot bias the result toward any conclusion.
+        double cellCut = double.TryParse(Environment.GetEnvironmentVariable("SENSITIVITY_CELL_CUTOFF"), out var cc) ? cc : 0.30;
+        var dropped = controls.Values.Where(c => c.InfixWer > cellCut).ToList();
+        foreach (var c in dropped) controls.Remove((c.Fixture, c.Seed));
+        if (dropped.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"  EXCLUDED {dropped.Count} of {dropped.Count + controls.Count} cells whose control "
+                            + $"itself scored above {cellCut:P0} - a broken baseline cannot measure anything:");
+            foreach (var c in dropped.OrderByDescending(c => c.InfixWer))
+                Console.WriteLine($"    {c.Fixture,-46} s{c.Seed,-8} {c.InfixWer,4:P0}  \"{Trim(c.Transcript, 64)}\"");
+        }
+        if (controls.Count == 0) { Console.WriteLine("  every cell was excluded - nothing to report."); return 1; }
 
         // Paired: each perturbation minus the control of the SAME sentence and seed.
         Console.WriteLine();
@@ -391,11 +418,13 @@ public static class Sensitivity
                             + (double.IsNaN(sound) ? "      -" : $"{sound,6:F2}x"));
         }
         Console.WriteLine();
-        Console.WriteLine("  WER+ is infix WER above the paired control. 'sound' is acoustic distance from that same");
-        Console.WriteLine("  control, as a multiple of the noise floor: two renders of the SAME tokens at different");
-        Console.WriteLine($"  seeds sit {noiseFloor:F2} apart, which is 1.00x. Near 1x means the perturbation changed");
-        Console.WriteLine("  nothing audible; well above 1x with a low WER means it sounds different but stays");
-        Console.WriteLine("  intelligible - which WER alone cannot see, and which Whisper tends to hide.");
+        Console.WriteLine("  WER+ is infix WER above the paired control - what a transcriber LOST.");
+        Console.WriteLine("  'sound' is acoustic distance from that same control, scaled so that 1.00 is the distance");
+        Console.WriteLine($"  between two renders of the SAME phonemes at different noise seeds ({noiseFloor:F2} raw) - i.e.");
+        Console.WriteLine("  as different as a completely independent take. 0.00 would be bit-identical audio. So it is");
+        Console.WriteLine("  a RELATIVE scale: 0.20 barely moved the audio, 0.60 moved it three times as far. A low WER");
+        Console.WriteLine("  with a high 'sound' is the case WER cannot see - it still says the words, but it no longer");
+        Console.WriteLine("  says them the same way, and Whisper's language model hides exactly that.");
 
         // ---- Is the result readable at all? ---------------------------------------------------------
         Console.WriteLine();
@@ -579,6 +608,8 @@ public static class Sensitivity
 
     public static string Render(long[] tokens, Dictionary<long, string> idToSym)
         => string.Concat(tokens.Select(t => idToSym.TryGetValue(t, out var s) ? s : "?"));
+
+    private static string Trim(string s, int n) => s.Length <= n ? s : s[..n] + "...";
 
     private static string[] Words(string text)
     {

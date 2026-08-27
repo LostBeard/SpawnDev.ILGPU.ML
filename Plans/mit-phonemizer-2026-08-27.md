@@ -142,7 +142,7 @@ character. Both port to C# with no licensing question.
 
 ## Phases
 
-### Phase 1 - Measure the model's sensitivity BEFORE building anything `[x]` (replication still owed)
+### Phase 1 - Measure the model's sensitivity BEFORE building anything `[x]` REPLICATED
 
 Perturb the oracle's own correct token stream in exactly the ways a CMUdict-based mapping will get it
 wrong, synthesise each, and grade. Establishes how precise the mapping has to be, per error class.
@@ -162,53 +162,92 @@ Perturbations (each applied to the ground-truth sequence, one at a time):
 Grade each by Whisper transcript against the known text, plus a listen. Deliverable is a table of
 error class against damage.
 
-#### RESULT, 2026-08-27
+#### RESULT (replicated), 2026-08-27
 
-Run it with:
+Nine sentences x three noise seeds x sixteen variants = 432 renders, graded by **whisper-base.en** and
+by acoustic distance. Superseded the first single-sentence run, which is kept below only as a lesson.
+
 ```
-dotnet run --project tools/zipvoice-harness -c Release -- sensitivity
-SENSITIVITY_REUSE_WAVS=1   # grade audio already rendered, for iterating on the grader
-SENSITIVITY_ONLY=<variant> # render one variant plus the control, for probing the rig
-ZIPVOICE_TAIL_PAD=<sec>    # reference tail silence
+dotnet run --project tools/zipvoice-harness -c Release -- sensitivity fixtures/phase1 <outDir>
+SENSITIVITY_SEEDS=1234,20260827,31337   WHISPER_MODEL_DIR=<...>/whisper-base.en
 ```
 
-Fixture `fixtures/loaded-classes.json`, prompt `prompt.wav`, noise seed 1234, fp32 graphs on
-onnxruntime, graded by whisper-tiny. `infix` is WER with free skips at the head and tail of the
-transcript; the plain column is charged for those. **The control scores 0% infix, so the rig is sound.**
+Control floor **8.6% mean** over 27 clean renders. **One cell excluded** by a rule declared in advance -
+`about-a-hundred-packages` seed 31337, whose control transcribed as *"I'm not a human, I'm a human."*
+That is the TTS drawing bad noise, not the grader and not the perturbation; a cell whose baseline is
+broken cannot measure anything. Cells are dropped on the CONTROL's own score alone, never on how the
+perturbations inside them turned out, so the exclusion cannot bend the result.
 
-| variant | token edits | WER | infix WER | reading |
+**The yardstick: the positive control - one word deliberately mispronounced - cost 13.5%.** Read every
+row against that, not against zero.
+
+| variant | WER+ | hurt | sound | verdict |
 |---|---|---|---|---|
-| control | 0 | 29% | **0%** | rig is valid |
-| flap-to-t | 3 | 29% | **0%** | no damage |
-| barred-i-to-small-i | 1 | 29% | **0%** | no damage |
-| r-schwa-split | 10 | 29% | **0%** | no damage |
-| no-secondary-stress | 1 | 29% | **0%** | no damage |
-| flap-to-d | 3 | 29% | 7% | one inserted word |
-| turned-a-to-schwa | 1 | 36% | 7% | one inserted word |
-| no-length-marks | 2 | 43% | **14%** | damage |
-| no-stress-at-all | 13 | 79% | **29%** | damage |
-| stress-moved-later | 20 | 100% | **100%** | catastrophic: output collapsed to "It's a little bit of a problem." |
+| stress-moved-later | **34.3%** | 21/26 | 0.57 | worse than mispronouncing a word outright |
+| no-stress-at-all | **19.6%** | 17/26 | 0.59 | worse than a wrong word |
+| **stress-added-function-words** | **18.2%** | 15/26 | 0.52 | worse than a wrong word |
+| *(positive control: one word wrong)* | *13.5%* | *21/26* | *0.26* | *the calibration* |
+| turned-a-to-schwa | 5.9% | 3/8 | 0.19 | below the yardstick, n=8 |
+| no-length-marks | 5.6% | 10/23 | 0.41 | below on words, MOVES THE SOUND |
+| glottal-and-syllabic-to-plain | 5.1% | 1/3 | 0.18 | n=3, says nothing |
+| barred-i-to-schwa | 4.6% | 5/11 | 0.25 | below |
+| r-schwa-split | 4.3% | 6/20 | 0.40 | below on words, MOVES THE SOUND |
+| open-o-to-open-a | 4.2% | 7/18 | 0.27 | below |
+| no-secondary-stress | 0.9% | 2/9 | 0.37 | below on words, MOVES THE SOUND |
+| flap-to-d | 0.8% | 3/18 | 0.21 | free |
+| flap-to-t | 0.4% | 2/18 | 0.18 | free |
+| barred-i-to-small-i | 0.3% | 3/11 | 0.20 | free |
+| article-a-to-schwa | -0.6% | 4/11 | 0.22 | free |
 
-**The model is tolerant of segmental detail and brittle about prosody.** Every allophonic difference a
-CMUdict frontend will produce - flaps, the reduced vowels, splitting the r-coloured vowel into schwa
-plus r - cost nothing. What the model cares about is stress, and after that length.
+#### What the frontend must do, in priority order
 
-That is the favourable branch, because **CMUdict carries lexical stress** (0/1/2 per vowel), which is
-exactly the information the model is most sensitive to. Length is deterministic from vowel identity in
-en-us, so the mapping table can emit it by rule rather than having to model it.
+1. **Get stress right.** All three stress failures cost MORE than mispronouncing a word outright. This
+   is the whole ballgame.
+2. **Destress function words.** 18.2%, and it is what CMUdict will hand us on every `the`, `at`, `in`,
+   `and` unless we stop it. Closed word list, so the rule is simple - but it is not optional.
+3. **Emit length marks, keep r-coloured vowels whole, keep secondary stress.** These cost almost nothing
+   in *words* (0.9% to 5.6%) but move the AUDIO as much as 0.41 against a segmental baseline of ~0.20.
+   That is the "still intelligible, no longer sounds the same" band the acoustic axis was built to
+   expose, and for a voice Aubs will listen to, naturalness is the product.
+4. **Spend nothing on flaps, the reduced vowels, or the bare article.** Measured free on both axes.
 
-**Consequences for the frontend:**
-- Stress placement is the top priority, and homograph resolution matters mostly because it moves stress
-  (record the noun against record the verb). Phase 5 is not optional polish.
-- The ARPAbet-to-IPA table MUST emit length marks; dropping them is measurable damage.
-- Do NOT spend effort chasing espeak's flapping or its choice of reduced vowel symbol. Free.
+#### Corrections this run forced on the earlier one
 
-**Caveats, stated so a later session does not over-read this:**
-- ONE sentence, ONE reference voice, ONE noise seed. Replication across sentences, prompts and seeds is
-  owed before this is treated as settled. The two 7% rows are single-word insertions well inside the
-  range a different noise draw might produce on its own.
-- whisper-tiny is a coarse grader: 0% means the words are recoverable, NOT that it sounds native. The
-  wavs are in the out dir and still want a listen.
+- **RETRACTED: "length marks are damaging at 14%".** That came from one sentence and one seed. Across
+  nine sentences it is 5.6% on words - below the positive control. It survives in the list above only
+  for its acoustic effect, which is a different and weaker claim.
+- **The first grader was not fit for purpose.** whisper-tiny averaged 16.2% WER on UNDAMAGED audio and
+  produced negative paired deltas (perturbed clips scoring better than clean ones), which is noise, not
+  signal. whisper-base.en halved that floor. Using it required fixing a real library defect first - see
+  below.
+- **My own reporting of the acoustic scale was wrong** in the first pass: same-seed comparisons are
+  bounded well below the seed-to-seed noise floor by construction, so "near 1x means nothing happened"
+  was nonsense. It now reads as a relative scale where 1.00 is "as different as an independent take".
+
+#### Library defects found and fixed on the way
+
+`SpeechRecognitionPipeline` could not run ANY English-only Whisper checkpoint - it returned an empty
+string with no error, indistinguishable from silent audio. Two causes:
+
+1. `BPETokenizer.LoadFromTokenizerJson` ignored the tokenizer's `added_tokens` block, where every
+   Whisper special token lives, so callers had to hard-code ids. Now parsed, plus `TryGetTokenId`.
+2. The pipeline hard-coded the MULTILINGUAL ids and a fixed four-token prompt. The `.en` checkpoints
+   carry a byte-level BPE vocabulary one entry smaller, so every special id shifts down by one. Special
+   ids now resolve from the model's own tokenizer, and the prompt adapts to the family
+   (`IsEnglishOnlyModel`, detected from the end-of-text id).
+
+Guarded by `MLTestBase.WhisperTokenizerTests` - both families, the detection signal, and proof that
+adding special tokens does not change how ordinary text encodes (which would have silently corrupted
+GPT-2 and CLIP).
+
+Also fixed: `ZipVoicePipeline.Dispose()` disposed the graphs it was HANDED, so a second pipeline over the
+same graphs threw a NullReferenceException from inside onnxruntime.
+
+#### The FIRST run, kept as a lesson
+
+One sentence, one seed, ten variants, graded by whisper-tiny. It got the headline right (stress matters,
+segmental detail does not) and got a detail wrong (length marks), had no positive control, and no idea
+its grader was failing 16% of the time on clean audio. **A single-condition result is a hypothesis.**
 
 #### Artifact discovered while building the rig, worth not rediscovering
 
@@ -382,7 +421,13 @@ Names, brands, coinages. "Aubriella" is not in CMUdict.
 
 ## Session log
 
-- **2026-08-27 (Tuvok)**: Phase 1 RUN and answered - the model is tolerant of segmental error and
+- **2026-08-27 (Tuvok)**: Phase 1 REPLICATED at 432 renders with a stronger grader, a positive control
+  and an acoustic second axis. Stress is everything: all three stress failures cost more than
+  mispronouncing a word outright, and function-word destressing (the class the probe found) is confirmed
+  at 18.2%. Retracted the earlier "length marks are damaging" claim. Fixed two library defects that made
+  every English-only Whisper model decode to an empty string, with tests. Phase 1c measured CMUdict
+  coverage: 99.5% of the top 1,000 words, and the misses are abbreviations, which promotes Phase 3.
+- **2026-08-27 (Tuvok)**: Phase 1 first run - the model is tolerant of segmental error and
   brittle about stress, which is the branch that favours CMUdict. Built `tools/zipvoice-harness
   sensitivity` (`Sensitivity.cs`) and `fixtures/loaded-classes.json`. Fixed a real defect found on the
   way: `ZipVoicePipeline.Dispose()` disposed the graphs it was HANDED, so a second pipeline over the

@@ -31,11 +31,24 @@ public class SpeechRecognitionPipeline : IDisposable
     // token, so the decoder was primed with a prompt Whisper never emits and returned nothing at all - for
     // clean, speech-level audio. The language block runs 50259..50357, which is what puts <|translate|> at
     // 50358 and <|transcribe|> at 50359; an off-by-one lands inside that block and looks plausible.
-    private const int SOT = 50258;           // <|startoftranscript|>
-    private const int LANG_EN = 50259;       // <|en|>
-    private const int TRANSCRIBE = 50359;    // <|transcribe|>
-    private const int NO_TIMESTAMPS = 50363; // <|notimestamps|>
-    private const int EOT = 50257;           // <|endoftext|>
+    // These are the MULTILINGUAL ids, used as defaults and then replaced by whatever the loaded
+    // tokenizer actually says - see LoadTokenizer. Hard-coding them meant this pipeline could only ever
+    // run multilingual Whisper: the English-only (.en) checkpoints have a BPE vocabulary one token
+    // smaller, so every special id shifts down by one, and priming an .en decoder with the multilingual
+    // set produced an EMPTY transcript with no error - indistinguishable from silent audio.
+    private int SOT = 50258;           // <|startoftranscript|>
+    private int LANG_EN = 50259;       // <|en|>
+    private int TRANSCRIBE = 50359;    // <|transcribe|>
+    private int NO_TIMESTAMPS = 50363; // <|notimestamps|>
+    private int EOT = 50257;           // <|endoftext|>
+
+    /// <summary>True when the loaded model is an English-only (.en) Whisper checkpoint.</summary>
+    /// <remarks>
+    /// English-only models were trained WITHOUT the language and task tokens, so their prompt is
+    /// [startoftranscript, notimestamps] rather than the four-token multilingual prompt. Detected from
+    /// the tokenizer rather than configured, because getting it wrong fails silently.
+    /// </remarks>
+    public bool IsEnglishOnlyModel { get; private set; }
 
     /// <summary>
     /// Raised for each greedy step with (stepIndex, tokenId) as decoding proceeds.
@@ -98,9 +111,27 @@ public class SpeechRecognitionPipeline : IDisposable
     }
 
     /// <summary>Load tokenizer from HuggingFace tokenizer.json.</summary>
+    /// <remarks>
+    /// Also resolves the decoder's special tokens FROM THAT TOKENIZER. The ids differ between the
+    /// multilingual and English-only checkpoints, and a wrong prompt does not throw - the model simply
+    /// emits end-of-text immediately and returns "". Reading them from the model's own tokenizer is the
+    /// only way to be right for both without asking the caller to know which one they have.
+    /// </remarks>
     public void LoadTokenizer(string tokenizerJson)
     {
         _tokenizer = BPETokenizer.LoadFromTokenizerJson(tokenizerJson);
+
+        if (_tokenizer.TryGetTokenId("<|startoftranscript|>", out var sot)) SOT = sot;
+        if (_tokenizer.TryGetTokenId("<|endoftext|>", out var eot)) EOT = eot;
+        if (_tokenizer.TryGetTokenId("<|transcribe|>", out var transcribe)) TRANSCRIBE = transcribe;
+        if (_tokenizer.TryGetTokenId("<|notimestamps|>", out var noTs)) NO_TIMESTAMPS = noTs;
+        if (_tokenizer.TryGetTokenId("<|en|>", out var langEn)) LANG_EN = langEn;
+
+        // The English-only checkpoints drop one entry from the byte-level BPE vocabulary, which lands
+        // their end-of-text at 50256 instead of 50257. That one-token difference is the whole signal:
+        // both tokenizers list the language tokens, but only the multilingual MODEL was trained to be
+        // prompted with them.
+        IsEnglishOnlyModel = EOT == 50256;
     }
 
     /// <summary>
@@ -132,7 +163,10 @@ public class SpeechRecognitionPipeline : IDisposable
         var encoderHidden = encoderOutputs[_encoderSession.OutputNames[0]];
 
         // 5. Autoregressive decoder
-        var tokens = new List<int> { SOT, LANG_EN, TRANSCRIBE, NO_TIMESTAMPS };
+        var tokens = IsEnglishOnlyModel
+            ? new List<int> { SOT, NO_TIMESTAMPS }
+            : new List<int> { SOT, LANG_EN, TRANSCRIBE, NO_TIMESTAMPS };
+        int promptLength = tokens.Count;
 
         // Greedy next-token selection stays GPU-side: read back one index per token, not the whole vocab.
         using var argmax = new GpuArgMax(_accelerator);
@@ -177,7 +211,9 @@ public class SpeechRecognitionPipeline : IDisposable
         sw.Stop();
 
         // 6. Decode tokens to text
-        var contentTokens = tokens.Skip(4).ToArray(); // skip SOT, LANG, TRANSCRIBE, NO_TIMESTAMPS
+        // Skip the prompt - whose LENGTH now varies by model family - and drop any special token that
+        // slipped through, so a stray timestamp or task token cannot appear as literal text.
+        var contentTokens = tokens.Skip(promptLength).Where(id => id < EOT).ToArray();
         string text = _tokenizer != null
             ? _tokenizer.Decode(contentTokens)
             : string.Join(" ", contentTokens.Select(t => $"[{t}]"));
