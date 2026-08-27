@@ -389,3 +389,4 @@ pmt_*.pid
 
 # DA3 divergence-hunt reference capture (offline-generated artifact, ~2-7MB)
 SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/
+SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-base.en/
