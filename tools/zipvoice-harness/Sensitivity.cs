@@ -447,6 +447,32 @@ public static class Sensitivity
                             + $"({string.Join(", ", badControls.Select(c => $"{c.Fixture} s{c.Seed} {c.InfixWer:P0}"))}). "
                             + "Those sentences are hard for the grader; their rows carry less weight.");
 
+        // ---- Stutters -------------------------------------------------------------------------------
+        // TJ listened to a CONTROL render and heard "my mother wou-would rather" - a repeated half-word.
+        // Nothing here had noticed: Whisper is trained on real speech, so it tidies disfluencies away,
+        // and the acoustic distance compares a clip to its control rather than to itself. An immediately
+        // repeated word in a transcript is the one signal that survives - it UNDER-reports (the render he
+        // caught transcribed cleanly), so treat this as a floor on how often the model stutters.
+        //
+        // A mel self-similarity detector was written for this and DELETED: over these renders it scored
+        // stuttering clips at median 0.402 and clean ones at 0.413, which is no separation at all. An
+        // instrument that cannot tell the two apart does not belong in the repo.
+        var stuttered = rows.Where(r => HasRepeatedWord(r.Transcript)).ToList();
+        if (stuttered.Count > 0)
+        {
+            double withStutter = stuttered.Average(r => r.InfixWer);
+            var fluent = rows.Where(r => !HasRepeatedWord(r.Transcript)).ToList();
+            double withoutStutter = fluent.Count > 0 ? fluent.Average(r => r.InfixWer) : 0;
+            Console.WriteLine();
+            Console.WriteLine($"STUTTERS: {stuttered.Count} of {rows.Count} renders ({stuttered.Count / (double)rows.Count:P1}) "
+                            + "repeat a word - a floor, not a count, since the grader hides disfluencies.");
+            Console.WriteLine($"  they cost {withStutter - withoutStutter:P1} of WER on their own "
+                            + $"({withStutter:P1} against {withoutStutter:P1}), spread across variants rather than");
+            Console.WriteLine("  concentrated in one, so they widen every row's error bar without favouring a conclusion.");
+            Console.WriteLine("  NOT introduced by our pipeline: sherpa-onnx mangles the same region of the same");
+            Console.WriteLine("  sentence worse than we do.");
+        }
+
         var real = summary.Where(s => s.Name != "wrong-vowel-last-word").ToList();
         var damaging = real.Where(s => s.Mean > 0.05).OrderByDescending(s => s.Mean).ToList();
         var clean = real.Where(s => s.Mean <= 0.05).OrderBy(s => s.Mean).ToList();
@@ -608,6 +634,14 @@ public static class Sensitivity
 
     public static string Render(long[] tokens, Dictionary<long, string> idToSym)
         => string.Concat(tokens.Select(t => idToSym.TryGetValue(t, out var s) ? s : "?"));
+
+    /// <summary>True when a transcript repeats a word immediately, which is what a stutter looks like.</summary>
+    private static bool HasRepeatedWord(string transcript)
+    {
+        var w = Words(transcript);
+        for (int i = 1; i < w.Length; i++) if (w[i] == w[i - 1]) return true;
+        return false;
+    }
 
     private static string Trim(string s, int n) => s.Length <= n ? s : s[..n] + "...";
 

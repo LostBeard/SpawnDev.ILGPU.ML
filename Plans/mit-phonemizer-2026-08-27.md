@@ -124,6 +124,9 @@ character. Both port to C# with no licensing question.
   table has never been tested.
 - **One voice.** All renders use the same reference clip. Voice-dependent effects would not show up.
 - **WER is word-level.** It cannot see an accent, an odd rhythm, or a mechanical delivery.
+- **The graders cannot see disfluency at all.** Whisper tidies stutters away and the acoustic metric is
+  relative to a control that may itself stutter. Confirmed by ear, then measured at a floor of 3.2% of
+  renders. A human listening pass is not optional at any phase.
 
 ### Instruments that already exist in the repo
 
@@ -248,6 +251,38 @@ same graphs threw a NullReferenceException from inside onnxruntime.
 One sentence, one seed, ten variants, graded by whisper-tiny. It got the headline right (stress matters,
 segmental detail does not) and got a detail wrong (length marks), had no positive control, and no idea
 its grader was failing 16% of the time on clean audio. **A single-condition result is a hypothesis.**
+
+#### A HUMAN EAR FOUND WHAT THREE INSTRUMENTS MISSED
+
+TJ played the CONTROL clip - the undamaged baseline everything else is measured against - and heard
+*"my mother wou-would rather"*. A repeated half-word. Nothing in the rig had reported it:
+
+- **Whisper hid it.** It is a language model trained on real speech, and real speech is full of
+  disfluencies, so it transcribes "would" once and moves on. Every stutter in this study was invisible
+  to the grader by design.
+- **The acoustic distance could not see it.** That metric compares a clip to its own control. When the
+  CONTROL is the thing that stutters, the perturbed clips merely look "different" for a reason that has
+  nothing to do with the perturbation.
+- **A mel self-similarity detector written to catch it FAILED VALIDATION and was deleted.** Over these
+  renders it scored stuttering clips at median 0.402 and clean ones at 0.413 - no separation whatsoever.
+  It is recorded here so nobody rebuilds it believing it works.
+
+What does work: an immediately repeated word in the transcript. **14 of 432 renders (3.2%)**, costing
+**7.2% of WER** where they occur (20.3% against 13.1%). That is a FLOOR, not a count - the render TJ
+caught by ear transcribed perfectly cleanly, so the true rate is higher.
+
+**Does it change the conclusions? No.** The stutters are spread across variants (1-3 each out of 27)
+rather than concentrated, so they widen every error bar without favouring any row, and the effect being
+measured - 34%, 20% and 18% for the stress classes against 6% or less for everything segmental - is far
+larger than a 7% noise source that lands on 3% of renders.
+
+**Is it ours? No.** sherpa-onnx rendering the same sentence with the same prompt produced
+*"understand that make me more their wood, rather water the better city garden"* - the same region,
+mangled worse than ours. Same attribution as the prompt bleed below.
+
+**The lesson for the rest of this project:** the automatic graders measure whether the words survive.
+They do not measure whether it sounds like a person. Keep a human listening to the audio at every phase;
+`tools/zipvoice-listen` exists for exactly that, and it earned its cost the first time it was used.
 
 #### Artifact discovered while building the rig, worth not rediscovering
 
