@@ -71,6 +71,10 @@ var generation = new OfflineTtsGenerationConfig
     Sid = 0,
 };
 
+// MEASURED, so nobody tries it again: aborting generation from the progress callback (returning 0) does
+// NOT let this tool skip synthesis when only the token ids are wanted. ZipVoice does not stream - the
+// callback fires once, after the audio already exists - so the "abort early" trick saves nothing here:
+// 2076ms without it against 2192ms with it, on the same sentence.
 var started = System.Diagnostics.Stopwatch.StartNew();
 var audio = tts.GenerateWithConfig(text, generation, null!);
 started.Stop();

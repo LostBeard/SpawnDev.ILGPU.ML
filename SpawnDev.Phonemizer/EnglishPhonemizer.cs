@@ -43,6 +43,16 @@ public sealed class EnglishPhonemizer
     /// </remarks>
     public bool DestressFunctionWords { get; set; } = true;
 
+    /// <summary>
+    /// Turns written forms into spoken ones before lookup - numbers, money, abbreviations.
+    /// </summary>
+    /// <remarks>
+    /// Set to null to phonemize text that has already been normalized. Leaving it on is almost always
+    /// right: a dictionary cannot look up "1999", and what the reader hears if you skip this is either
+    /// nothing at all or a string of digits read one by one.
+    /// </remarks>
+    public EnglishTextNormalizer? Normalizer { get; set; } = new();
+
     /// <summary>Words the dictionary did not contain, in encounter order, from the last call.</summary>
     /// <remarks>
     /// Surfaced rather than swallowed: an unknown word is the one failure a caller genuinely needs to
@@ -57,6 +67,8 @@ public sealed class EnglishPhonemizer
         _unknown.Clear();
         var output = new List<string>();
         if (string.IsNullOrWhiteSpace(text)) return output;
+
+        if (Normalizer != null) text = Normalizer.Normalize(text);
 
         foreach (var token in Tokenize(text))
         {
