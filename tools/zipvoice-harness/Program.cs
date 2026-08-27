@@ -28,13 +28,41 @@ return command switch
     "synth" => Synth(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json",
                      args.Length > 2 ? args[2] : null),
     "compare" => CompareEngines(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json"),
+    "sensitivity" => RunSensitivity(args.Length > 1 ? args[1] : "fixtures/loaded-classes.json",
+                                    args.Length > 2 ? args[2] : null),
     _ => Usage(command),
 };
 
 int Usage(string bad)
 {
-    Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav] | compare [fixture.json]");
+    Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav] "
+                    + "| compare [fixture.json] | sensitivity [fixture.json] [outDir]");
     return 2;
+}
+
+// How much phonemizer error this model actually tolerates - see Sensitivity.cs and
+// Plans/mit-phonemizer-2026-08-27.md. Damages the ground-truth tokens the way a CMUdict-based
+// frontend will and grades the resulting audio, so the frontend's precision target is measured
+// rather than assumed.
+int RunSensitivity(string fixturePath, string? outDir)
+{
+    if (!Directory.Exists(modelDir)) { Console.WriteLine($"no model dir at {modelDir}"); return 2; }
+
+    var resolved = Path.IsPathRooted(fixturePath)
+        ? fixturePath
+        : Path.Combine(AppContext.BaseDirectory, fixturePath);
+    if (!File.Exists(resolved)) resolved = Path.Combine(Environment.CurrentDirectory, fixturePath);
+    if (!File.Exists(resolved)) { Console.WriteLine($"no fixture at {fixturePath}"); return 2; }
+
+    var fixture = ZipVoiceFixture.Load(resolved);
+    var promptWav = Path.IsPathRooted(fixture.PromptWav)
+        ? fixture.PromptWav
+        : Path.Combine(modelDir, fixture.PromptWav);
+    if (!File.Exists(promptWav)) { Console.WriteLine($"no prompt wav at {promptWav}"); return 2; }
+
+    outDir ??= Path.Combine(Path.GetTempPath(), "zipvoice-sensitivity");
+    return Sensitivity.RunAsync(modelDir, fixture, promptWav, outDir, ReadWav, WriteWav)
+                      .GetAwaiter().GetResult();
 }
 
 // Full cloning path on the reference engine: ground-truth tokens in, cloned speech out.

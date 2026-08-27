@@ -268,5 +268,17 @@ public sealed class ZipVoicePipeline : IDisposable
         return padded;
     }
 
-    public void Dispose() => _graphs.Dispose();
+    /// <summary>Releases this pipeline's own resources. The graphs are NOT disposed.</summary>
+    /// <remarks>
+    /// The graphs are handed in by the caller and belong to the caller, exactly as the accelerator does
+    /// elsewhere in this library: whoever created it decides when it dies. This used to call
+    /// <c>_graphs.Dispose()</c>, which made a pipeline lethal to the object it was given - constructing a
+    /// second pipeline over the same graphs threw a NullReferenceException from inside onnxruntime on the
+    /// first call, because the sessions had already been torn down by the first pipeline's disposal. That
+    /// is not a hypothetical: it is the shape a caller takes when it renders the same graphs repeatedly
+    /// with different tokens, which is what the phonemizer sensitivity gate does.
+    /// The pipeline currently owns nothing else, so this body is empty rather than absent - it stays
+    /// IDisposable so that acquiring scratch buffers later does not become a breaking API change.
+    /// </remarks>
+    public void Dispose() { }
 }
