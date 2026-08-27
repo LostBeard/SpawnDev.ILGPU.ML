@@ -1,21 +1,18 @@
-// Measures the REAL gap between CMUdict and the token ids this model was trained on.
+// Measures the REAL gap between our MIT phonemizer and the token ids the model was trained on.
 //
-//   dotnet run --project tools/zipvoice-g2p-probe -c Release -- [fixtureDir] [--dict path] [--flap]
+//   dotnet run --project tools/zipvoice-g2p-probe -c Release -- [fixtureDir] [--dict path] [--no-flap] [--no-destress]
 //
-// WHY THIS EXISTS: the sensitivity experiment damages the oracle's tokens in ways I PREDICTED a CMUdict
-// frontend would get wrong. That prediction could be incomplete, and an error class nobody thought of is
-// exactly the kind of thing that surfaces late and expensively. This closes the loop: build the sequence
-// CMUdict actually produces, align it against the ids espeak actually produced, and CLASSIFY every
-// difference. Classes that show up here and are absent from the sensitivity table have never been tested.
+// WHY THIS EXISTS: the sensitivity experiment damages the reference tokens in ways I PREDICTED a
+// dictionary frontend would get wrong. A prediction can be incomplete, and an error class nobody thought
+// of is exactly what surfaces late and expensively. This closes the loop: run the REAL phonemizer, align
+// its output against the ids espeak actually produced, and CLASSIFY every difference. Anything reported
+// as UNTESTED-* has no perturbation measuring it, and is therefore an unmeasured risk.
 //
-// It is deliberately a PROBE and not the phonemizer. The mapping below is a first cut whose only job is
-// to make the differences enumerable; freezing a design before the measurement is what this whole plan
-// exists to avoid. No flapping, no reduced-vowel context rules, no homograph handling - so the classes it
-// reports are an UPPER bound on what a naive mapping gets wrong, which is the number worth knowing.
+// It also doubles as the phonemizer's own gate. Every rule added to SpawnDev.Phonemizer should move the
+// total difference count, and the switches below make each rule's contribution separately measurable.
 //
-// CMUdict is BSD-2-Clause. It is read from disk here, not vendored, until Phase 7 decides its shipped form
-// and adds the required copyright notice to THIRD-PARTY-NOTICES.md.
-using System.Text;
+// CMUdict is BSD-2-Clause and is read from disk, not vendored, until packaging decides its shipped form.
+using SpawnDev.Phonemizer;
 using System.Text.Json;
 
 var fixtureDir = args.Length > 0 && !args[0].StartsWith("--")
@@ -25,11 +22,12 @@ var fixtureDir = args.Length > 0 && !args[0].StartsWith("--")
 var dictPath = @"D:\users\tj\Projects\_ref\cmudict\cmudict.dict";
 var modelDir = Environment.GetEnvironmentVariable("ZIPVOICE_MODEL_DIR")
     ?? @"D:\users\tj\Projects\SpawnDev.Reachy\SpawnDev.Reachy\models\sherpa-onnx-zipvoice-distill-zh-en-emilia";
-bool applyFlap = false;
+bool flapping = true, destress = true;
 for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--dict" && i + 1 < args.Length) dictPath = args[++i];
-    if (args[i] == "--flap") applyFlap = true;
+    if (args[i] == "--no-flap") flapping = false;
+    if (args[i] == "--no-destress") destress = false;
 }
 
 if (!File.Exists(dictPath)) { Console.WriteLine($"no cmudict at {dictPath} (pass --dict)"); return 2; }
@@ -37,7 +35,6 @@ if (!Directory.Exists(fixtureDir)) { Console.WriteLine($"no fixtures at {fixture
 
 // ---- The model's symbol table -----------------------------------------------------------------------
 var idToSym = new Dictionary<long, string>();
-var symToId = new Dictionary<string, long>();
 foreach (var raw in File.ReadAllLines(Path.Combine(modelDir, "tokens.txt")))
 {
     var line = raw.TrimEnd('\r', '\n');
@@ -45,108 +42,50 @@ foreach (var raw in File.ReadAllLines(Path.Combine(modelDir, "tokens.txt")))
     int cut = line.LastIndexOf('\t');
     if (cut < 0 || !long.TryParse(line[(cut + 1)..], out var id)) continue;
     idToSym[id] = line[..cut];
-    symToId.TryAdd(line[..cut], id);
 }
 
-// ---- CMUdict ----------------------------------------------------------------------------------------
-// Format: "word  P1 P2 P3", with "word(2)" for alternate pronunciations. The first listed pronunciation
-// is taken; CHOOSING among alternates is Phase 5's problem and pretending otherwise here would hide it.
-var dict = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
-int alternates = 0;
-foreach (var line in File.ReadLines(dictPath))
-{
-    var body = line.Split('#')[0].Trim();
-    if (body.Length == 0) continue;
-    var parts = body.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-    if (parts.Length < 2) continue;
-    var word = parts[0];
-    if (word.EndsWith(')')) { alternates++; continue; }        // word(2), word(3), ...
-    dict.TryAdd(word, parts[1..]);
-}
-Console.WriteLine($"cmudict  : {dict.Count} headwords ({alternates} alternate pronunciations skipped)");
-
-// ---- ARPAbet to the espeak symbols this model uses ---------------------------------------------------
-// Correspondences read off real espeak output for real words (about, better, water, roses, understand,
-// garden, served, canoe), not from memory.
-var consonants = new Dictionary<string, string[]>
-{
-    ["B"] = ["b"], ["CH"] = ["t", "ʃ"], ["D"] = ["d"], ["DH"] = ["ð"], ["F"] = ["f"], ["G"] = ["ɡ"],
-    ["HH"] = ["h"], ["JH"] = ["d", "ʒ"], ["K"] = ["k"], ["L"] = ["l"], ["M"] = ["m"], ["N"] = ["n"],
-    ["NG"] = ["ŋ"], ["P"] = ["p"], ["R"] = ["ɹ"], ["S"] = ["s"], ["SH"] = ["ʃ"], ["T"] = ["t"],
-    ["TH"] = ["θ"], ["V"] = ["v"], ["W"] = ["w"], ["Y"] = ["j"], ["Z"] = ["z"], ["ZH"] = ["ʒ"],
-};
-// Vowels, by base symbol. Stressed and unstressed forms differ for AH and ER, which is why they are split.
-string[] Vowel(string v, int stress) => (v, stress) switch
-{
-    ("AA", _) => ["ɑ", "ː"],
-    ("AE", _) => ["æ"],
-    ("AH", 0) => ["ə"],
-    ("AH", _) => ["ʌ"],
-    ("AO", _) => ["ɔ", "ː"],
-    ("AW", _) => ["a", "ʊ"],
-    ("AY", _) => ["a", "ɪ"],
-    ("EH", _) => ["ɛ"],
-    ("ER", 0) => ["ɚ"],
-    ("ER", _) => ["ɜ", "ː"],
-    ("EY", _) => ["e", "ɪ"],
-    ("IH", _) => ["ɪ"],
-    ("IY", 0) => ["i"],
-    ("IY", _) => ["i", "ː"],
-    ("OW", _) => ["o", "ʊ"],
-    ("OY", _) => ["ɔ", "ɪ"],
-    ("UH", _) => ["ʊ"],
-    ("UW", _) => ["u", "ː"],
-    _ => [],
-};
+var dictionary = PronunciationDictionary.Load(dictPath);
+var phonemizer = new EnglishPhonemizer(dictionary) { Flapping = flapping, DestressFunctionWords = destress };
+Console.WriteLine($"cmudict  : {dictionary.Count} headwords");
+Console.WriteLine($"rules    : flapping={flapping}, destress-function-words={destress}");
 
 // ---- Walk the fixtures -------------------------------------------------------------------------------
 var classCounts = new Dictionary<string, int>();
 var classExamples = new Dictionary<string, List<string>>();
-int totalOracle = 0, totalOurs = 0, totalDiffs = 0, oov = 0, oovTotal = 0;
+int totalOracle = 0, totalDiffs = 0, oov = 0, oovTotal = 0;
 
 foreach (var path in Directory.GetFiles(fixtureDir, "*.json").OrderBy(p => p))
 {
     using var doc = JsonDocument.Parse(File.ReadAllText(path));
     var text = doc.RootElement.GetProperty("text").GetString()!;
-    var oracleIds = doc.RootElement.GetProperty("tokens").EnumerateArray().Select(e => e.GetInt64()).ToArray();
-    var oracle = oracleIds.Select(id => idToSym.TryGetValue(id, out var s) ? s : "?").ToArray();
+    var oracle = doc.RootElement.GetProperty("tokens").EnumerateArray()
+        .Select(e => idToSym.TryGetValue(e.GetInt64(), out var s) ? s : "?").ToArray();
 
-    var ours = new List<string>();
-    foreach (var rawWord in text.Split(' ', StringSplitOptions.RemoveEmptyEntries))
-    {
-        var word = new string(rawWord.Where(c => char.IsLetter(c) || c == '\'').ToArray());
-        var trailing = rawWord.Where(c => ".,;:!?".Contains(c)).ToArray();
-        oovTotal++;
-        if (word.Length > 0 && dict.TryGetValue(word, out var arpa))
-            ours.AddRange(MapWord(arpa));
-        else if (word.Length > 0) { oov++; ours.Add("«" + word + "»"); }
-        foreach (var c in trailing) { ours.Add(" "); ours.Add(c.ToString()); }
-        if (trailing.Length == 0) ours.Add(" ");
-    }
-    if (ours.Count > 0 && ours[^1] == " ") ours.RemoveAt(ours.Count - 1);
+    var ours = phonemizer.ToSymbols(text).ToArray();
+    oovTotal += text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+    oov += phonemizer.LastUnknownWords.Count;
 
-    // Aligned WORD BY WORD rather than across the whole sentence: a difference is only actionable if you
-    // know which word produced it, and a single sentence-wide alignment happily pairs symbols from
-    // different words when the lengths drift.
+    // Aligned WORD BY WORD: a difference is only actionable if you know which word produced it, and a
+    // single sentence-wide alignment happily pairs symbols from different words when lengths drift.
     var oracleWords = SplitWords(oracle);
-    var ourWords = SplitWords(ours.ToArray());
+    var ourWords = SplitWords(ours);
     var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
     int sentenceDiffs = 0;
+
     if (oracleWords.Count != ourWords.Count)
-        Console.WriteLine($"    NOTE: {oracleWords.Count} espeak words vs {ourWords.Count} ours - "
+        Console.WriteLine($"    NOTE: {oracleWords.Count} reference words vs {ourWords.Count} ours - "
                         + "falling back to a whole-sentence alignment, so word labels are approximate.");
 
     var pairs = oracleWords.Count == ourWords.Count
-        ? Enumerable.Range(0, oracleWords.Count).Select(i => (O: oracleWords[i], U: ourWords[i],
-              W: i < words.Length ? words[i] : "?")).ToList()
-        : new List<(string[] O, string[] U, string W)> { (oracle, ours.ToArray(), "(sentence)") };
+        ? Enumerable.Range(0, oracleWords.Count)
+                    .Select(i => (O: oracleWords[i], U: ourWords[i], W: i < words.Length ? words[i] : "?")).ToList()
+        : new List<(string[] O, string[] U, string W)> { (oracle, ours, "(sentence)") };
 
     foreach (var (o, u, w) in pairs)
     {
-        var wordDiffs = Align(o, u);
-        sentenceDiffs += wordDiffs.Count;
-        foreach (var d in wordDiffs)
+        foreach (var d in Align(o, u))
         {
+            sentenceDiffs++;
             var cls = Classify(d.Expected, d.Got);
             classCounts[cls] = classCounts.GetValueOrDefault(cls) + 1;
             if (!classExamples.TryGetValue(cls, out var ex)) classExamples[cls] = ex = new List<string>();
@@ -154,102 +93,61 @@ foreach (var path in Directory.GetFiles(fixtureDir, "*.json").OrderBy(p => p))
             if (!ex.Contains(label) && ex.Count < 6) ex.Add(label);
         }
     }
-    totalOracle += oracle.Length; totalOurs += ours.Count; totalDiffs += sentenceDiffs;
+    totalOracle += oracle.Length;
+    totalDiffs += sentenceDiffs;
 
     Console.WriteLine();
     Console.WriteLine($"--- {Path.GetFileNameWithoutExtension(path)}");
     Console.WriteLine($"    espeak : {string.Concat(oracle)}");
     Console.WriteLine($"    ours   : {string.Concat(ours)}");
-    Console.WriteLine($"    {sentenceDiffs} differences over {oracle.Length} espeak symbols "
+    Console.WriteLine($"    {sentenceDiffs} differences over {oracle.Length} reference symbols "
                     + $"({sentenceDiffs / (double)oracle.Length:P0})");
 }
 
 // ---- The answer --------------------------------------------------------------------------------------
 Console.WriteLine();
 Console.WriteLine("=====================================================================================");
-Console.WriteLine($"TOTAL: {totalDiffs} differences over {totalOracle} espeak symbols "
-                + $"({totalDiffs / (double)totalOracle:P1}); {oov}/{oovTotal} words not in CMUdict");
-Console.WriteLine($"flapping applied: {applyFlap}");
+Console.WriteLine($"TOTAL: {totalDiffs} differences over {totalOracle} reference symbols "
+                + $"({totalDiffs / (double)totalOracle:P1}); {oov}/{oovTotal} words not in the dictionary");
 Console.WriteLine();
-Console.WriteLine($"{"difference class",-34} {"count",6}  {"share",7}  examples");
-Console.WriteLine(new string('-', 100));
+Console.WriteLine($"{"difference class",-40} {"count",6}  {"share",7}  examples");
+Console.WriteLine(new string('-', 108));
 foreach (var kv in classCounts.OrderByDescending(k => k.Value))
-    Console.WriteLine($"{kv.Key,-34} {kv.Value,6}  {kv.Value / (double)Math.Max(1, totalDiffs),6:P1}  "
+    Console.WriteLine($"{kv.Key,-40} {kv.Value,6}  {kv.Value / (double)Math.Max(1, totalDiffs),6:P1}  "
                     + string.Join("  ", classExamples[kv.Key].Take(3)));
 
 Console.WriteLine();
-Console.WriteLine("Classes named UNTESTED-* have no row in the sensitivity table and are unmeasured. Every");
-Console.WriteLine("one of them needs a perturbation adding before the phonemizer's accuracy can be trusted.");
+Console.WriteLine("Classes named UNTESTED-* have no row in the sensitivity table and are unmeasured. Each one");
+Console.WriteLine("needs a perturbation adding before the phonemizer's accuracy can be trusted.");
 return 0;
 
 // ------------------------------------------------------------------------------------------------------
 
-string[] MapWord(string[] arpa)
-{
-    var outSyms = new List<string>();
-    foreach (var raw in arpa)
-    {
-        var stressDigit = raw.Length > 0 && char.IsDigit(raw[^1]) ? raw[^1] - '0' : -1;
-        var bare = stressDigit >= 0 ? raw[..^1] : raw;
-        if (stressDigit >= 0)
-        {
-            // espeak writes the stress mark immediately before the VOWEL, not before the syllable onset:
-            // better is bˈɛɾɚ, understand is ˌʌndɚstˈænd. Verified against real oracle output.
-            if (stressDigit == 1) outSyms.Add("ˈ");
-            else if (stressDigit == 2) outSyms.Add("ˌ");
-            outSyms.AddRange(Vowel(bare, stressDigit));
-        }
-        else if (consonants.TryGetValue(bare, out var c)) outSyms.AddRange(c);
-        else outSyms.Add("«" + raw + "»");
-    }
-    if (applyFlap) Flap(outSyms);
-    return outSyms.ToArray();
-}
-
-// espeak taps a T or D that sits between vowels when what follows is unstressed: water, better, city.
-void Flap(List<string> syms)
-{
-    var vowels = new HashSet<string>("aeiouæɐɑɒɔəɚɘɛɜɞɤɨɪɯʉʊʌʏɵɶøœᵻ".Select(c => c.ToString()));
-    for (int i = 1; i < syms.Count - 1; i++)
-    {
-        if (syms[i] != "t" && syms[i] != "d") continue;
-        var before = syms[i - 1];
-        if (!vowels.Contains(before) && before != "ː" && before != "ɹ") continue;
-        // Look ahead past a length mark to the next real symbol.
-        int j = i + 1;
-        while (j < syms.Count && syms[j] == "ː") j++;
-        if (j >= syms.Count || !vowels.Contains(syms[j])) continue;
-        if (j > 0 && (syms[j - 1] == "ˈ" || syms[j - 1] == "ˌ")) continue;   // following vowel is stressed
-        syms[i] = "ɾ";
-    }
-}
-
-// Classify one difference into a bucket named for the DECISION it forces on the frontend.
+// Classify one difference into a bucket named for the DECISION it forces on the frontend, and for what
+// the sensitivity experiment already established about it.
 static string Classify(string expected, string got)
 {
-    if (got.StartsWith('«')) return "UNTESTED-out-of-vocabulary";
-    if (expected == "ɾ" && (got == "t" || got == "d")) return "flap (TESTED: harmless)";
-    if (expected == "ᵻ" && got == "ɪ") return "reduced-vowel barred-i (TESTED: harmless)";
-    if (expected == "ɐ" && (got == "ə" || got == "ʌ")) return "reduced-vowel turned-a (TESTED: harmless)";
-    if (expected == "ɚ" || got == "ɚ") return "r-coloured vowel (TESTED: harmless)";
-    if (expected == "ː" || got == "ː") return "length mark (TESTED: DAMAGING)";
-    // Direction matters. Dropping a mark, inventing one, and swapping primary for secondary are three
-    // different defects with three different fixes, and lumping them hides the biggest one.
-    if (expected.Length == 0 && got is "ˈ" or "ˌ") return "UNTESTED-stress-ADDED (citation-form function word)";
-    if (got.Length == 0 && expected is "ˈ" or "ˌ") return "stress DROPPED (TESTED: DAMAGING)";
-    if (expected is "ˈ" or "ˌ" && got is "ˈ" or "ˌ") return "stress primary/secondary swapped (TESTED: DAMAGING)";
-    if (expected is "ˈ" or "ˌ" || got is "ˈ" or "ˌ") return "stress vs a phoneme (TESTED: DAMAGING)";
-    if (expected == "ʔ" || got == "ʔ") return "UNTESTED-glottal-stop";
-    if (expected == "̩" || got == "̩") return "UNTESTED-syllabic-consonant";
+    if (expected == "ɾ" && (got == "t" || got == "d")) return "flap (MEASURED: harmless)";
+    if (expected == "ᵻ" && got == "ɪ") return "reduced barred-i vs small-i (MEASURED: harmless)";
+    if (expected == "ᵻ" && got == "ə") return "reduced barred-i vs schwa (MEASURED: harmless)";
+    if (expected == "ɐ" && (got == "ə" || got == "ʌ")) return "reduced turned-a (MEASURED: harmless)";
+    if (expected == "ɚ" || got == "ɚ") return "r-coloured vowel (MEASURED: harmless on words)";
+    if (expected == "ː" || got == "ː") return "length mark (MEASURED: moves the sound)";
+    if (expected.Length == 0 && got is "ˈ" or "ˌ") return "stress ADDED (MEASURED: 18.2%, WORST REAL CLASS)";
+    if (got.Length == 0 && expected is "ˈ" or "ˌ") return "stress DROPPED (MEASURED: damaging)";
+    if (expected is "ˈ" or "ˌ" && got is "ˈ" or "ˌ") return "stress primary/secondary swapped (MEASURED: damaging)";
+    if (expected is "ˈ" or "ˌ" || got is "ˈ" or "ˌ") return "stress vs a phoneme (MEASURED: damaging)";
+    if (expected == "ʔ" || got == "ʔ") return "glottal stop (MEASURED: n=3, inconclusive)";
+    if (expected == "̩" || got == "̩") return "syllabic consonant (MEASURED with the glottal stop)";
+    if (expected == "a" && got == "ə") return "the article a (MEASURED: harmless)";
     if (expected == " " || got == " ") return "UNTESTED-word-boundary";
-    if (expected == "-" || got == "-") return "UNTESTED-missing-symbol";
     return $"UNTESTED-other ({Show(expected)} vs {Show(got)})";
 }
 
 static string Show(string s) => s.Length == 0 ? "∅" : s == " " ? "␣" : s;
 
-// Levenshtein alignment, so a difference is reported against the symbol it actually corresponds to
-// rather than against whatever happens to sit at the same index.
+// Levenshtein alignment, so a difference is reported against the symbol it corresponds to rather than
+// against whatever happens to sit at the same index.
 static List<(string Expected, string Got)> Align(string[] a, string[] b)
 {
     int n = a.Length, m = b.Length;

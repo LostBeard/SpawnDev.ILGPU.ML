@@ -400,7 +400,42 @@ out-of-vocabulary path**. That is the requirement Phase 6 has to meet, stated co
 - [ ] Unit tests per category. This is the part users notice first and it has no licensing question,
       so it can proceed in parallel with anything else.
 
-### Phase 4 - Dictionary lookup and ARPAbet to espeak-IPA mapping `[ ]`
+### Phase 4 - Dictionary lookup and ARPAbet to espeak-IPA mapping `[~]` STARTED
+
+`SpawnDev.Phonemizer` exists: MIT, **zero dependencies**, browser-capable, no reference to ILGPU or ML.
+`Arpabet` (symbol mapping), `FunctionWords` (the destressing list), `PronunciationDictionary` (CMUdict
+loader), `EnglishPhonemizer` (the rules).
+
+**Gate: `tools/zipvoice-g2p-probe`, which now runs the REAL library.** Symbol disagreement against
+captured reference output over the nine Phase 1 sentences:
+
+| state | differences | rate |
+|---|---|---|
+| throwaway inline table (Phase 1b) | 62 | 10.5% |
+| library, first run | 66 | 11.1% |
+| + punctuation written the reference's way, narrowed weak-form list | 50 | 8.4% |
+| + tap T only (never D), drop that/my/would, add with | 42 | 7.1% |
+| + stressless content words get their stress | **39** | **6.6%** |
+
+**Every stress-ADDED and stress-DROPPED difference is now gone.** The two stress differences left are
+primary/secondary swaps in "address" and "Seventeen" - genuine dictionary disagreements, and "address"
+is a homograph, so both belong to Phase 5. Of the 39 remaining, 14 fall in classes the sensitivity
+experiment measured as HARMLESS (the bare article, the two reduced vowels).
+
+Rules implemented, in the order the measurement said they matter:
+- [x] Stress mark placed before the VOWEL, not the syllable onset.
+- [x] **Function-word destressing** - the 18.2% class. Narrow weak-form list; `in`, `on`, `about` and
+      the polysyllabic prepositions deliberately excluded because the reference stresses them.
+- [x] A content word with no stressed vowel in the dictionary (`in` is `IH0 N`) gets primary stress.
+- [x] Length marks, secondary stress, r-coloured vowels preserved (the naturalness band).
+- [x] Flapping, T only.
+- [ ] Reduced barred-i in -es/-ed suffixes (measured harmless; would close 7 of the 39).
+- [ ] Score against a LARGE word list, not nine sentences - see Phase 2. **The weak-form list was tuned
+      against nine sentences and could be overfitted to them; that is the next thing to check.**
+
+Guarded by `MLTestBase.PhonemizerTests` - 44/44 across cpu, cuda, opencl, WebGPU, WebGL and Wasm.
+
+### Phase 4 (original scope) `[ ]`
 
 - [ ] Ingest CMUdict into a compact lookup (browser-friendly; the raw file is a few MB of text).
 - [ ] ARPAbet plus stress digit to the `tokens.txt` symbol set.

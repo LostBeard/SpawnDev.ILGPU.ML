@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <!--
+      NO dependencies, deliberately. This is the piece the open TTS ecosystem is missing: every model
+      worth running (ZipVoice, Piper, Kokoro) phonemizes through espeak-ng, which is GPL-3, and that one
+      dependency is why there is no permissively licensed English TTS frontend for .NET. It must stay
+      loadable in a browser, so it takes nothing from ILGPU, nothing from ML, and nothing from the BCL
+      beyond what WASM already carries.
+    -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+</Project>

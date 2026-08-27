@@ -16,4 +16,7 @@
 		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
 	</ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
+  </ItemGroup>
 </Project>

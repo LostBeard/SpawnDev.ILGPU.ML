@@ -6,4 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ZipVoiceG2pProbe</AssemblyName>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- The REAL phonemizer, not a copy: this tool is its accuracy gate. -->
+    <ProjectReference Include="..\..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
+  </ItemGroup>
 </Project>
