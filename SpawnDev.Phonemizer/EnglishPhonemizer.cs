@@ -37,9 +37,10 @@ public sealed class EnglishPhonemizer
     /// Strip stress from words that carry it only in their citation form.
     /// </summary>
     /// <remarks>
-    /// Leave this on. Turning it off reproduces the single worst realistic frontend defect: 18.2% word
-    /// error, worse than mispronouncing a whole word. It exists as a switch only so the measurement that
-    /// established that can be repeated.
+    /// Leave this on: it is correct English, it costs nothing, and it changes the audio substantially
+    /// even where the words survive. The switch exists so the measurement can be repeated - which is how
+    /// its cost was revised DOWN, from 18.2% word error to 2.8%, once the reference clip that inflated
+    /// the first study was replaced with one whose transcript was right.
     /// </remarks>
     public bool DestressFunctionWords { get; set; } = true;
 

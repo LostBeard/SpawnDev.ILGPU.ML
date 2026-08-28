@@ -11,10 +11,12 @@ namespace SpawnDev.Phonemizer;
 /// lean on their neighbours and lose their stress entirely.
 /// </para>
 /// <para>
-/// Getting this wrong is not cosmetic. Measured against ZipVoice over 432 renders, adding stress to
-/// function words cost 18.2% word error - MORE than deliberately mispronouncing a whole word, which cost
-/// 13.5%. It was also 19.4% of every real difference between the dictionary and the reference frontend.
-/// Full method and numbers in Plans/mit-phonemizer-2026-08-27.md.
+/// It is 19.4% of every real difference between the dictionary and the reference frontend, so the rule
+/// applies constantly. Its measured COST is smaller than it first appeared: an early study put it at
+/// 18.2% word error, but that ran through a reference clip paired with the wrong transcript, and on a
+/// properly paired one it is 2.8% - below the study's own positive control. It still moves the AUDIO a
+/// long way (0.75 where segmental changes sit at 0.29-0.50), so it earns its place on naturalness rather
+/// than intelligibility. Both numbers and the method are in Plans/mit-phonemizer-2026-08-27.md.
 /// </para>
 /// <para>
 /// Words are listed only where the unstressed form is the ordinary one. Anything that is normally

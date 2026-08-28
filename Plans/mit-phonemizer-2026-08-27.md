@@ -204,12 +204,45 @@ row against that, not against zero.
 | barred-i-to-small-i | 0.3% | 3/11 | 0.20 | free |
 | article-a-to-schwa | -0.6% | 4/11 | 0.22 | free |
 
+#### 🔴 RE-MEASURED ON A PROPERLY PAIRED REFERENCE CLIP - one headline claim does not survive
+
+Everything above ran through the mispaired `prompt.wav`, worth ~6 points of word error on its own.
+Repeated on a clip whose transcript is right (10 sentences x 2 seeds, positive control 12.6%):
+
+| perturbation | mispaired clip | **properly paired clip** | sound |
+|---|---|---|---|
+| stress-moved-later | 34.3% | **17.1%** | 0.89 |
+| *(positive control: one word mispronounced)* | *13.5%* | *12.6%* | *0.51* |
+| no-length-marks | 5.6% | 7.8% | 0.75 |
+| open-o-to-open-a | 4.2% | 7.1% | 0.51 |
+| no-stress-at-all | 19.6% | **5.2%** | 0.95 |
+| **stress-added-function-words** | **18.2%** | **2.8%** | 0.75 |
+| flap, r-schwa, secondary stress, the article | ~0% | ~0% | 0.29-0.50 |
+
+**What survives:** stress on the WRONG SYLLABLE is still the worst failure by a clear margin, still the
+only one above the positive control, and the stress classes still move the AUDIO furthest (0.89-0.95
+against 0.29-0.51 for anything segmental). Spending the frontend's effort on stress remains right.
+
+**What does NOT survive: "adding stress to function words costs 18.2%, worse than mispronouncing a
+word".** On a clean prompt it costs **2.8%**, well below the positive control. That number was inflated
+by the broken reference clip - the model was already struggling and the extra stress compounded it.
+
+The rule stays, on narrower grounds: it is correct English, it costs nothing, and it still moves the
+audio a long way (0.75) even where the words survive - the naturalness band rather than the
+intelligibility one. But it is no longer the headline, and the README and the library's XML docs are
+corrected rather than left overstating it.
+
+**The wider lesson, twice over now:** a measurement is only as good as its rig. The mispaired prompt
+inflated every absolute number by six points AND warped the ranking of the effects being studied.
+
 #### What the frontend must do, in priority order
 
-1. **Get stress right.** All three stress failures cost MORE than mispronouncing a word outright. This
-   is the whole ballgame.
-2. **Destress function words.** 18.2%, and it is what CMUdict will hand us on every `the`, `at`, `in`,
-   `and` unless we stop it. Closed word list, so the rule is simple - but it is not optional.
+1. **Get stress right.** Stress on the wrong syllable is the only failure costing more than
+   mispronouncing a word outright, on both the mispaired and the properly paired clip. This is the
+   whole ballgame.
+2. **Destress function words.** Cheap, correct English, and it moves the audio (0.75) even where the
+   words survive. ⚠️ The 18.2% that once justified this was an artifact of the broken reference clip;
+   on a clean one it is 2.8%. Worth doing, not worth overclaiming.
 3. **Emit length marks, keep r-coloured vowels whole, keep secondary stress.** These cost almost nothing
    in *words* (0.9% to 5.6%) but move the AUDIO as much as 0.41 against a segmental baseline of ~0.20.
    That is the "still intelligible, no longer sounds the same" band the acoustic axis was built to

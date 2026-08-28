@@ -104,17 +104,22 @@ dependency can be removed without the audio getting worse.
 
 Not by intuition. 432 renders through ZipVoice measured what the model actually punishes:
 
-| error | cost in word error rate |
-|---|---|
-| stress on the wrong syllable | 34.3% |
-| no stress at all | 19.6% |
-| **stress added to function words** | **18.2%** |
-| *(a word deliberately mispronounced, for calibration)* | *13.5%* |
-| flaps, reduced vowels, the bare article | ~0% |
+| error | word error added | how far it moved the audio |
+|---|---|---|
+| stress on the wrong syllable | **17.1%** | 0.89 |
+| *(a word deliberately mispronounced, for calibration)* | *12.6%* | *0.51* |
+| length marks dropped | 7.8% | 0.75 |
+| no stress at all | 5.2% | 0.95 |
+| stress added to function words | 2.8% | 0.75 |
+| flaps, reduced vowels, the bare article | ~0% | 0.29-0.50 |
 
-All three stress failures cost **more than mispronouncing a word outright**. So this library spends its
-effort on stress and gives fine phonetic detail only what is cheap - and function-word destressing, which
-a dictionary gets wrong on every "the" and "at", is a core rule rather than a refinement.
+Stress on the wrong syllable is the only failure that costs more than mispronouncing a word outright, and
+the stress classes move the AUDIO furthest even where the words survive. So this library spends its
+effort on stress and gives fine phonetic detail only what is cheap.
+
+⚠️ An earlier run of this study, through a reference clip whose transcript was wrong, put function-word
+stress at 18.2% and made it the headline. On a properly paired clip it is 2.8%. The rule is still applied
+- it is correct English and free - but the number is corrected here rather than left overstating it.
 
 ## The SpawnDev Crew
 
