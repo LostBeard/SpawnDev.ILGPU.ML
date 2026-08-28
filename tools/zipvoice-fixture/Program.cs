@@ -24,6 +24,7 @@ var sentences = new List<string>();
 string outDir = Path.Combine(AppContext.BaseDirectory, "fixtures");
 string promptFrom = "";
 string? oracleExe = null;
+string? promptWavOverride = null, promptTextOverride = null;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -40,6 +41,8 @@ for (int i = 0; i < args.Length; i++)
         case "--out": if (++i >= args.Length) return Fail("--out needs a path"); outDir = args[i]; break;
         case "--prompt-from": if (++i >= args.Length) return Fail("--prompt-from needs a path"); promptFrom = args[i]; break;
         case "--oracle": if (++i >= args.Length) return Fail("--oracle needs a path"); oracleExe = args[i]; break;
+        case "--prompt-wav": if (++i >= args.Length) return Fail("--prompt-wav needs a path"); promptWavOverride = args[i]; break;
+        case "--prompt-text": if (++i >= args.Length) return Fail("--prompt-text needs text"); promptTextOverride = args[i]; break;
         default: sentences.Add(args[i]); break;
     }
 }
@@ -52,23 +55,53 @@ if (sentences.Count == 0)
 
 // The repo copy is the source of truth for both the prompt ids and the prompt's transcript, so a fixture
 // generated today pairs with the same reference clip as the ones generated before it.
-if (promptFrom.Length == 0)
-    promptFrom = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "fixtures", "loaded-classes.json"));
-if (!File.Exists(promptFrom)) return Fail($"no reference fixture at {promptFrom} (pass --prompt-from)");
-
-using var refDoc = JsonDocument.Parse(File.ReadAllText(promptFrom));
-var promptTokens = refDoc.RootElement.GetProperty("promptTokens").EnumerateArray().Select(e => e.GetInt64()).ToArray();
-var promptText = refDoc.RootElement.GetProperty("promptText").GetString() ?? "";
-var promptWav = refDoc.RootElement.TryGetProperty("promptWav", out var pw) ? pw.GetString() ?? "prompt.wav" : "prompt.wav";
+if (promptWavOverride == null || promptTextOverride == null)
+{
+    if (promptFrom.Length == 0)
+        promptFrom = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "fixtures", "loaded-classes.json"));
+    if (!File.Exists(promptFrom)) return Fail($"no reference fixture at {promptFrom} (pass --prompt-from)");
+}
 
 oracleExe ??= Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..",
                                             "zipvoice-oracle", "bin", "Release", "net10.0", "ZipVoiceOracle.exe"));
 if (!File.Exists(oracleExe))
     return Fail($"no oracle at {oracleExe}\nbuild it first: dotnet build tools/zipvoice-oracle -c Release");
 
+
+long[] promptTokens;
+string promptText, promptWav;
+
+if (promptWavOverride != null && promptTextOverride != null)
+{
+    // A DIFFERENT reference voice. Its token ids are not in any fixture yet, so they are DERIVED: run
+    // two different sentences and take the common prefix, which is exactly the prompt and nothing else.
+    // Counting debug lines instead would be wrong - the frontend splits on commas as well as full stops,
+    // so how many lines a prompt occupies depends on its punctuation.
+    promptWav = promptWavOverride;
+    promptText = promptTextOverride;
+    if (!File.Exists(promptWav)) return Fail($"no prompt wav at {promptWav}");
+
+    Console.WriteLine($"prompt   : deriving ids for {Path.GetFileName(promptWav)} from two probe runs");
+    var probeA = RunOracle(oracleExe, "The birch canoe slid on the smooth planks.", out _, promptWav, promptText);
+    var probeB = RunOracle(oracleExe, "Rice is often served in round bowls.", out _, promptWav, promptText);
+    var flatA = probeA.SelectMany(x => x).ToArray();
+    var flatB = probeB.SelectMany(x => x).ToArray();
+    int shared = 0;
+    while (shared < Math.Min(flatA.Length, flatB.Length) && flatA[shared] == flatB[shared]) shared++;
+    if (shared == 0) return Fail("the two probe runs share no prefix - the oracle did not print token ids");
+    promptTokens = flatA[..shared];
+}
+else
+{
+    using var refDoc = JsonDocument.Parse(File.ReadAllText(promptFrom));
+    promptTokens = refDoc.RootElement.GetProperty("promptTokens").EnumerateArray().Select(e => e.GetInt64()).ToArray();
+    promptText = refDoc.RootElement.GetProperty("promptText").GetString() ?? "";
+    promptWav = refDoc.RootElement.TryGetProperty("promptWav", out var pw) ? pw.GetString() ?? "prompt.wav" : "prompt.wav";
+}
+
 Directory.CreateDirectory(outDir);
 Console.WriteLine($"oracle   : {oracleExe}");
-Console.WriteLine($"prompt   : {promptTokens.Length} ids from {Path.GetFileName(promptFrom)}");
+Console.WriteLine($"prompt   : {promptTokens.Length} ids, {Path.GetFileName(promptWav)}");
 Console.WriteLine($"outDir   : {outDir}");
 Console.WriteLine();
 
@@ -79,7 +112,7 @@ foreach (var sentence in sentences)
     var path = Path.Combine(outDir, slug + ".json");
     Console.WriteLine($"--- {sentence}");
 
-    var captured = RunOracle(oracleExe, sentence, out var stderrText);
+    var captured = RunOracle(oracleExe, sentence, out var stderrText, promptWavOverride, promptTextOverride);
     if (captured.Count == 0)
     {
         Console.WriteLine("    FAILED: the oracle printed no token ids. Its stderr:");
@@ -133,7 +166,8 @@ return failures == 0 ? 0 : 1;
 static int Fail(string message) { Console.WriteLine(message); return 2; }
 
 // Runs the oracle for one sentence and returns every "new sentence: [...]" id list it printed, in order.
-static List<long[]> RunOracle(string exe, string sentence, out string stderrText)
+static List<long[]> RunOracle(string exe, string sentence, out string stderrText,
+                              string? promptWav = null, string? promptText = null)
 {
     var wav = Path.Combine(Path.GetTempPath(), "zipvoice-fixture-scratch.wav");
     var psi = new ProcessStartInfo(exe) { RedirectStandardError = true, RedirectStandardOutput = true };
@@ -143,6 +177,8 @@ static List<long[]> RunOracle(string exe, string sentence, out string stderrText
     // parse below silently misses lines.
     psi.StandardErrorEncoding = Encoding.UTF8;
     psi.StandardOutputEncoding = Encoding.UTF8;
+    if (promptWav != null) psi.Environment["ZIPVOICE_PROMPT_WAV"] = promptWav;
+    if (promptText != null) psi.Environment["ZIPVOICE_PROMPT_TEXT"] = promptText;
 
     using var proc = Process.Start(psi) ?? throw new InvalidOperationException($"could not start {exe}");
     var err = new StringBuilder();

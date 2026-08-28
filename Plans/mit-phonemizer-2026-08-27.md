@@ -299,6 +299,45 @@ FOR WHAT IT MEASURES - and these two artifacts are what it does not measure.
 They do not measure whether it sounds like a person. Keep a human listening to the audio at every phase;
 `tools/zipvoice-listen` exists for exactly that, and it earned its cost the first time it was used.
 
+#### 🔴 THE PROMPT BLEED IS THE REFERENCE CLIP, NOT THE MODEL - and it was inflating every number
+
+The preamble on nearly every render - "Others call me Mother Nature" before the sentence - is caused by
+the packaged `prompt.wav` being paired with a transcript that is not what it says.
+
+```
+whisper-base.en on prompt.wav : "(speaking in foreign language)"
+whisper-tiny (multilingual)   : "Today, I'm so happy. So, today is the first day."
+every fixture claims          : "Some call me nature, others call me mother nature."
+```
+
+ZipVoice is told the clip says words it does not contain, so it speaks them - at the start of the region
+it generates. That is the bleed. Correcting the transcript to Whisper's English guess did NOT fix it,
+which fits the English-only recogniser refusing the clip as non-English: no English transcript can match.
+
+**Proof, by using a reference clip whose transcript is known to be right** - a 3.9s cut of a real
+Harvard-sentence recording, transcribed and checked:
+
+| | packaged clip, mismatched transcript | properly paired clip |
+|---|---|---|
+| reference frontend (espeak-ng) | 9.1% | **3.1%** |
+| our phonemizer | 7.2% | **2.3%** |
+| ours clearly worse | 7/120 | **0/60** |
+| bleed at trim 0 | ~2.3 seconds | **none at all** |
+
+**Roughly six points of the error in every earlier measurement was the reference clip.** The comparisons
+stay valid - both frontends used the same prompt, so the parity conclusion is untouched - but the
+ABSOLUTE quality of this stack is far better than those numbers suggested.
+
+**What this means for anything that speaks:** give ZipVoice a reference clip you have an accurate
+transcript for. That single change takes word error from ~7-9% to ~2-3% and removes the preamble
+entirely. `tools/zipvoice-fixture --prompt-wav <wav> --prompt-text "<exact transcript>"` builds fixtures
+against a new voice, deriving the prompt's ids as the common prefix of two probe runs rather than
+assuming how many debug lines it occupies.
+
+**`TrimGeneratedStartFrames` is therefore NOT the fix and stays at 0.** The sweep found ~220 frames
+(2.3s) optimal for the mispaired clip and 0 for the correct one - trimming was treating the symptom, and
+on a good prompt it only ever eats the sentence.
+
 #### Artifact discovered while building the rig, worth not rediscovering
 
 ZipVoice regenerates the reference clip's own speech ahead of the line it is asked to speak, and the cut

@@ -71,6 +71,12 @@ difference is the phonemizer and nothing else.
 |---|---|---|
 | 120 sentences, one noise seed | 9.1% | **7.2%** |
 | 40 sentences, three noise seeds | 10.8% | **7.3%** |
+| 30 sentences, **properly paired reference clip** | 3.1% | **2.3%** |
+
+That last row is the one to look at for absolute quality. The packaged sample clip is paired with a
+transcript that is not what it says, so the model speaks those words at the start of every render - worth
+about six points of word error to BOTH frontends. Give ZipVoice a reference clip you have an accurate
+transcript for.
 
 Worse on 7 of 120 sentences, indistinguishable on 93, better on 20.
 
