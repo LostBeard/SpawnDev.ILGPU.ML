@@ -53,6 +53,16 @@ public sealed class EnglishPhonemizer
     /// </remarks>
     public EnglishTextNormalizer? Normalizer { get; set; } = new();
 
+    /// <summary>
+    /// Pronounces words the dictionary does not contain, from their spelling.
+    /// </summary>
+    /// <remarks>
+    /// Optional, and the phonemizer is honest either way: without it an unknown word is reported through
+    /// <see cref="LastUnknownWords"/> and SKIPPED rather than guessed. With it, the word gets spoken -
+    /// which for a name is the whole point, since a voice that silently drops "Aubriella" is not finished.
+    /// </remarks>
+    public LetterToSound? LetterToSound { get; set; }
+
     /// <summary>Words the dictionary did not contain, in encounter order, from the last call.</summary>
     /// <remarks>
     /// Surfaced rather than swallowed: an unknown word is the one failure a caller genuinely needs to
@@ -79,9 +89,17 @@ public sealed class EnglishPhonemizer
                 // clause it opens rather than trailing the one it closes.
                 if (output.Count > 0 && output[^1] != " " && !IsPunctuation(output[^1])) output.Add(" ");
                 if (_dictionary.TryLookup(token.Text, out var phones))
+                {
                     output.AddRange(Word(phones, token.Text));
+                }
                 else
+                {
+                    // Recorded even when it can be sounded out, because "the dictionary did not have this"
+                    // is worth knowing: it is the difference between a pronunciation and a guess.
                     _unknown.Add(token.Text);
+                    var guessed = LetterToSound?.Predict(token.Text);
+                    if (guessed is { Length: > 0 }) output.AddRange(Word(guessed, token.Text));
+                }
             }
             else
             {

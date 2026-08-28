@@ -495,7 +495,46 @@ read the book"; record, bass, live, wind, lead, tear, close, use, minute.
 - [ ] A part-of-speech signal: a rule-based tagger, or a small model on our own ONNX engine.
 - [ ] Test set of sentences containing both readings of each homograph.
 
-### Phase 6 - Out-of-vocabulary letter to sound `[ ]`
+### Phase 6 - Out-of-vocabulary letter to sound `[~]` WORKING BASELINE
+
+`tools/lts-train` learns letter-to-sound FROM CMUdict and measures itself on 5,000 words held out
+before training. Learned rather than hand-written because a hand-written ruleset encodes one person's
+recollection of English spelling and can never honestly claim an accuracy figure.
+
+`dotnet run --project tools/lts-train -c Release -- --out SpawnDev.Phonemizer/lts-model.txt`
+
+**Held out: 43.7% of words exactly right, 16.0% phoneme error rate.** Three designs were measured on the
+same 5,000 words, and the intuitive one lost:
+
+| design | words exactly right |
+|---|---|
+| stress digits baked into the sound emissions | 39.5% |
+| word-level stress model (word ending + syllable count) | 37.2% |
+| **separate sound and stress models over letter context** | 42.6% |
+| **+ exactly one primary stress per word** | **43.7%** |
+
+Stress genuinely IS a property of the word rather than of a letter, and modelling it that way still
+lost - letter context carries more of the signal than a word ending does. Keeping stress out of the
+SOUND emissions was worth it regardless: stress-blind accuracy rose 50.7% -> 52.1% by making that model
+less sparse. Stress-only errors fell 14.8% -> 8.4%.
+
+**It says the name:** "Aubriella" -> `ˈɔːbɹiɛlə`. Also sounded out: Tuvok, Geordi, Blazor, Anthropic.
+
+⚠️ **Honest limits.** 43.7% means most unknown words come out with something wrong somewhere, and 16%
+of phonemes are wrong. Published systems reach higher. This is a working baseline that unblocks names,
+not a finished component:
+- [ ] "Aubs" comes out with a doubled vowel (`ˈɔːaʊbz`) - the "au" digraph emits two vowels.
+- [ ] Stress placement on "Aubriella" is first-syllable; a speaker would say aw-bree-EL-uh.
+- [ ] The model file is **1.4 MB**, which is heavy for a browser. Pruning is packaging work (Phase 7).
+- [ ] 23% of dictionary entries are a known stem plus a common ending, so trying morphological
+      decomposition BEFORE letter-to-sound would likely beat the model on those words.
+
+A silent-failure guard is locked by `MLTestBase.LetterToSoundTests`: when the runtime skipped the stress
+model, every vowel came back with no stress digit, all of them were then discarded downstream as
+unrecognised phones, and "Aubriella" was pronounced **"bɹl"** - the consonants alone, with no error
+raised anywhere. The tests assert the output contract, not the accuracy.
+
+### Phase 6 (original scope) `[ ]`
 
 Names, brands, coinages. "Aubriella" is not in CMUdict.
 
