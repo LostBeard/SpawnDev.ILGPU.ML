@@ -65,7 +65,7 @@ public abstract partial class MLTestBase
         // English words have one primary stress. The per-letter model can mark several - "Tuvok" came
         // back with two - and stress is what the downstream model punishes hardest, so emitting two is
         // worse than picking the wrong one. Adding this constraint raised held-out accuracy from 42.6%
-        // to 43.7%.
+        // from 42.6% to 43.7%. Both figures predate the +/-5 model; the constraint itself is unchanged.
         var lts = LetterToSound.Parse(TinyLtsModel.Split('\n'));
         var phones = lts.Predict("catcat");           // two a's, both marked stressed by the rule above
 

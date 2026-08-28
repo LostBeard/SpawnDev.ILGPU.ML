@@ -657,15 +657,56 @@ recollection of English spelling and can never honestly claim an accuracy figure
 
 `dotnet run --project tools/lts-train -c Release -- --out SpawnDev.Phonemizer/lts-model.txt`
 
-**Held out: 43.7% of words exactly right guessing alone, 49.5% with decomposition first, 16.0% phoneme error rate.** Three designs were measured on the
-same 5,000 words, and the intuitive one lost:
+**Held out: 49.8% of words exactly right guessing alone, 53.0% with decomposition first, 13.7% phoneme error rate.** Designs measured on the
+same 5,000 words, and two intuitive ones lost:
 
 | design | words exactly right |
 |---|---|
 | stress digits baked into the sound emissions | 39.5% |
 | word-level stress model (word ending + syllable count) | 37.2% |
 | **separate sound and stress models over letter context** | 42.6% |
-| **+ exactly one primary stress per word** | **43.7%** |
+| **+ exactly one primary stress per word** | 43.7% |
+| ...as actually SHIPPED, once singletons were pruned out of the file | **40.9%** |
+| **+ stop pruning** (context width beats evidence - see below) | 43.7% |
+| **+ context widened +/-2 -> +/-5** | **49.8%** |
+
+🔴 **The header lied, and it was the tool's own fault.** Accuracy was computed on the unpruned tables and
+then a PRUNED file was written, so `43.7%` described a model that was never shipped - the real artifact
+was **40.9%**. The trainer now flattens to the rules it will write BEFORE measuring anything, so measuring
+one model and shipping another is structurally impossible. Same class of defect as the mispaired
+reference clip: the rig, not the model.
+
+🔴 **"A context seen once is noise" was WRONG, and cost 2.8 points.** `--analyze` scores per-letter
+accuracy by the width that answered: the THINNEST three-letter rule (support 2) is right **83.3%** of the
+time, while the BEST-supported one-letter rule (support 100+) manages **77.6%**. Context width dominates
+evidence, so dropping a thin wide rule does not fall back to something better - it falls back to something
+worse. Pruning is off by default and loses again at +/-5 (49.8% -> 44.7% at min-count 2 -> 40.9% at 3).
+
+**Wider context is what this model class had left to give.** 26.6% of wrong words were wrong by a SINGLE
+phone and 88% of substitutions were vowels - a model that is nearly right, not one with a wrong idea.
+Every width trained and scored on the same held-out words:
+
+| context | exactly right | gzipped |
+|---|---|---|
+| +/-2 | 43.7% | 191 KB |
+| +/-3 | 47.1% | 354 KB |
+| +/-4 | 48.8% | 437 KB |
+| **+/-5 (shipped)** | **49.8%** | **482 KB** |
+| +/-6 | 50.1% | ~500 KB - +0.3 for another 20 KB, so this is the knee |
+
+Paid for by writing **only rules that CHANGE something**: a wide rule whose answer the narrower widths
+would have given anyway is redundant, because the runtime reaches the same phone by backing off. 2.48M
+rules learned, 136K shipped. The OLD model compresses 1374 KB -> 318 KB by the same trick, so the file
+grows only 340 -> 482 KB gzipped for +8.9 points. The runtime reads the widths out of the model file
+rather than hardcoding them, so a retrained model can carry more context than the code it loads into.
+
+⛔ **TRIED AND REVERTED: a specificity stress tie-break.** When the model marks two primaries, keeping the
+one whose context rule was most SPECIFIC rather than the earliest syllable is the better-looking argument
+- position is not evidence - and it MEASURES WORSE. Of the 193 held-out words where the two policies
+disagree, earliest is right 24 times and most-specific 13. `--analyze` reprints that comparison; re-run it
+before touching that line. It also exposed a real interaction: once the tie-break reads which width
+answered, the redundancy compression is no longer neutral, because dropping a redundant +/-5 rule changes
+which width responds. The trainer's own drift check caught that on the first run.
 
 Stress genuinely IS a property of the word rather than of a letter, and modelling it that way still
 lost - letter context carries more of the signal than a word ending does. Keeping stress out of the
@@ -674,12 +715,21 @@ less sparse. Stress-only errors fell 14.8% -> 8.4%.
 
 **It says the name:** "Aubriella" -> `ˈɔːbɹiɛlə`. Also sounded out: Tuvok, Geordi, Blazor, Anthropic.
 
-⚠️ **Honest limits.** 43.7% means most unknown words come out with something wrong somewhere, and 16%
-of phonemes are wrong. Published systems reach higher. This is a working baseline that unblocks names,
-not a finished component:
+⚠️ **Honest limits.** 49.8% means half of unknown words still come out with something wrong somewhere,
+and 13.7% of phonemes are wrong. Published systems reach higher. This is a working baseline that unblocks
+names, not a finished component:
 - [ ] "Aubs" comes out with a doubled vowel (`ˈɔːaʊbz`) - the "au" digraph emits two vowels.
-- [ ] Stress placement on "Aubriella" is first-syllable; a speaker would say aw-bree-EL-uh.
-- [ ] The model file is **1.4 MB**, which is heavy for a browser. Pruning is packaging work (Phase 7).
+- [ ] Stress placement on "Aubriella" is first-syllable; a speaker would say aw-bree-EL-uh. **Now
+      diagnosed, and it is not the tie-break.** Every "-ella" name in CMUdict stresses the ELL
+      (`gabriella` G AA2 B R IY0 **EH1** L AA2, isabella, daniella, ariella) and this model gets
+      **`briella` right on its own** - `B R IY0 EH1 L AH0`. For "aubriella" the word-initial "au" rule
+      marks a primary FIRST and wins on position. Changing the tie-break to prefer the more specific rule
+      fixes this word and loses overall (24 vs 13 - see above), so the fix is **pronunciation by analogy**:
+      back off to the longest dictionary word sharing this word's ending and borrow its stress pattern.
+      That mechanism would also cover the whole "-ella"/"-etta"/"-ino" name family at once.
+- [ ] ⛔ The model file is **1.8 MB raw / 482 KB gzipped**. Pruning is NOT the lever - it is measured
+      harmful (see above). Redundancy compression is, and it is already applied; the remaining lever is a
+      binary or prefix-shared format, since 136K keys share enormous prefixes.
 - [x] **DONE and measured: decompose before guessing.** `WordDecomposer` builds an unknown word from a
       known stem plus its ending, with the allomorphy English actually demands - the -s of "cats" is an
       S, of "dogs" a Z, of "boxes" a whole syllable; the -ed of "walked" a T, of "wanted" a syllable.
@@ -690,8 +740,8 @@ not a finished component:
       |---|---|
       | fires on | 26.4% of them |
       | right when it fires | **77.2%** |
-      | letter-to-sound alone, on those same words | 54.9% |
-      | **overall, decompose-then-guess** | **49.5%** against 43.7% guessing alone |
+      | letter-to-sound alone, on those same words | 64.9% |
+      | **overall, decompose-then-guess** | **53.0%** against 49.8% guessing alone |
 
       It declines rather than inventing: "aubriella" is not anything plus an ending, so it hands the
       word to letter-to-sound, which can at least try.
@@ -856,7 +906,7 @@ identically has nothing for an ear to arbitrate.
 The MIT phonemizer is **built, measured and at parity with GPL espeak-ng**. Nothing is half-finished; the
 list below is what would make it better, in the order I would take it.
 
-1. **Letter-to-sound is the weakest component.** 43.7% of unknown words exactly right (49.5% with
+1. **Letter-to-sound is the weakest component.** 49.8% of unknown words exactly right (53.0% with
    decomposition). Published systems do better. The trained model is a plain context lookup with backoff
    - a better model class is the obvious next step, and `tools/lts-train` already reports held-out
    accuracy so any replacement can be compared honestly.
