@@ -873,6 +873,11 @@ list below is what would make it better, in the order I would take it.
 
 ## Session log
 
+- **2026-08-28 EOD (Tuvok)**: Wrapped for the night. Tree clean, everything pushed, no processes
+  left running. Tests green across cpu/cuda/opencl/WebGPU/WebGL/Wasm - 62 phonemizer, 44 normalizer,
+  32 homograph, 32 decomposer, 32 spoken-text-check, 26 letter-to-sound, 20 tokenizer, 8
+  override-validation - plus Operator 97/97 to confirm the new SpawnDev.Phonemizer project reference
+  did not disturb the ML library. Start from the "Where to pick up" section above.
 - **2026-08-28 (Tuvok)**: Found the prompt bleed's real cause - the packaged `prompt.wav` is paired with a
   transcript that is not what it says, worth ~6 points of word error to BOTH frontends. Replaced it with
   a Creative Commons Public Domain Mark clip from LibriVox whose transcript is standardized and therefore
