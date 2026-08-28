@@ -54,6 +54,15 @@ public sealed class EnglishPhonemizer
     public EnglishTextNormalizer? Normalizer { get; set; } = new();
 
     /// <summary>
+    /// Use the small table of very common words where the dictionary and the trained models disagree.
+    /// </summary>
+    /// <remarks>
+    /// Off only for measuring what it is worth. On, it closes a disproportionate share of the remaining
+    /// difference, because the words in it - "on", "was", "and", "a" - are in almost every sentence.
+    /// </remarks>
+    public bool UseReferenceOverrides { get; set; } = true;
+
+    /// <summary>
     /// Read a stress-shifting homograph from its context: "the record" against "to record".
     /// </summary>
     /// <remarks>
@@ -107,7 +116,14 @@ public sealed class EnglishPhonemizer
                 // the reference frontend writes "roses ,understand", with the pause mark leading the
                 // clause it opens rather than trailing the one it closes.
                 if (output.Count > 0 && output[^1] != " " && !IsPunctuation(output[^1])) output.Add(" ");
-                if (_dictionary.TryLookup(token.Text, out var phones))
+                // A few very common words are simply different between the dictionary and what these
+                // models were trained on, and no rule derives the difference - see ReferenceOverrides.
+                if (UseReferenceOverrides && ReferenceOverrides.TryGet(token.Text, out var overridden))
+                {
+                    output.AddRange(overridden);
+                    previousWord = token.Text;
+                }
+                else if (_dictionary.TryLookup(token.Text, out var phones))
                 {
                     output.AddRange(Word(phones, token.Text, previousWord));
                     previousWord = token.Text;

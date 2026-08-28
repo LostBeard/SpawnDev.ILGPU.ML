@@ -34,20 +34,20 @@ public static class FunctionWords
         // The monosyllabic prepositions and conjunctions that have true WEAK FORMS - a reduced vowel in
         // running speech. Deliberately NOT here: in, on, up, out, off, and every polysyllabic preposition
         // (about, after, over, under, between). Those keep their stress, and stripping it is the mirror
-        // image of the defect this list exists to prevent. Also absent, on evidence rather than theory:
-        // "that", "my" and "would" are marked STRESSED by the reference frontend in ordinary sentences,
-        // so destressing them would be inventing a defect.
+        // image of the defect this list exists to prevent. Also absent, on EVIDENCE rather than theory -
+        // the reference marks all of these with full primary stress in ordinary sentences, so destressing
+        // them would be inventing a defect: "that", "my", "would", "could", "his", "will", "be".
         "and", "as", "at", "for", "from", "nor", "of", "or", "to", "with",
 
         // Pronouns and possessives
-        "he", "her", "hers", "him", "his", "it", "its", "me", "our", "ours", "she",
+        "he", "her", "hers", "him", "it", "its", "me", "our", "ours", "she",
         "their", "theirs", "them", "they", "us", "we", "you", "your", "yours",
 
         // Auxiliaries and copulas. These reduce as helpers ("he WAS going") but carry stress as main
         // verbs and in short answers ("yes he WAS") - a distinction that needs sentence context, which
         // belongs with homograph resolution rather than in a flat list.
-        "am", "are", "be", "been", "can", "did", "do", "does", "had", "has",
-        "have", "is", "must", "shall", "should", "was", "were", "will",
+        "am", "are", "been", "can", "did", "do", "does", "had", "has",
+        "have", "is", "must", "shall", "should", "was", "were",
     };
 
     /// <summary>
@@ -61,7 +61,7 @@ public static class FunctionWords
     /// </remarks>
     public static readonly IReadOnlySet<string> Secondary = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "some", "but", "such", "than", "that",
+        "some", "but", "such", "any", "when", "where", "while", "than",
     };
 
     /// <summary>True when this word keeps a light beat instead of losing its stress.</summary>
