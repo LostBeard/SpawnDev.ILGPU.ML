@@ -901,6 +901,54 @@ identically has nothing for an ear to arbitrate.
       LinearResample). Pre-existing, unrelated to g2p, still open, matters when the reference clip is
       not already 24 kHz.
 
+## The out-of-vocabulary audio gate (built 2026-08-28)
+
+**Why it had to exist:** every other fixture set is BLIND to letter-to-sound. The probe reports `0/940`
+fixture words outside CMUdict, so the guessing path never runs in `phase1`/`phase2` - their numbers read
+identically whether that model is improved, broken, or deleted. The ±5 rebuild landed with no way to hear
+the result.
+
+`tools/zipvoice-harness/fixtures/oov` - 20 sentences each carrying a word CMUdict lacks: real, current
+names in RUNNING SPEECH, plus questions (the shape this plan lists as never measured). Words are chosen to
+be out of the dictionary AND spellable by the grader, because a wholly invented name comes back mangled
+however well it is pronounced, which measures nothing. `endtoend` prints how many sentences contain an
+unknown word and **declares the run VOID on this set if that reaches zero** - a gate that has stopped
+testing what it exists to test must fail, not pass.
+
+**Headline, 60 paired renders (20 sentences x 3 noise seeds, same voice and seed on both sides):**
+
+| | mean word error |
+|---|---|
+| reference frontend (GPL espeak-ng) | 11.30% |
+| **ours (MIT)** | **9.69%** |
+
+First audio measurement this component has ever had, and we beat the tool we exist to replace, on names.
+
+🔴 **But the ±5 rebuild did not move the audio.** new **9.69%** vs old **9.68%** - identical transcripts on
+**56 of 60** renders. **+8.9 points of held-out symbol accuracy bought 0.00% of word error.** A single
+noise seed had shown 9.2% against 10.3%, which looked like a clear win and was noise; flow matching starts
+from fresh noise every call, so one render is a sample, not a measurement. This is the proxy-versus-goal
+trap this plan already warns about, caught by a gate rather than by a listener months later. The rebuild
+is still correct - better symbols, an honest header, a smaller file per rule - it is simply **not shown to
+matter as audio**, and must be described that way.
+
+⭐ `endtoend` therefore gained a **VARIANTS** block: render a second configuration with `PHONEMIZER_TAG`
+and it pairs the two against EACH OTHER, not merely each against the reference, and says plainly when they
+are indistinguishable. Comparing both to the reference cannot answer "did my change do anything".
+
+```
+CMUDICT=<dict> LTS_MODEL=<old-model.txt> PHONEMIZER_TAG=old SENSITIVITY_SEEDS=1234,555,90210 \
+  dotnet run --project tools/zipvoice-harness -c Release -- endtoend fixtures/oov <outDir>
+```
+
+**The four renders where they differ are the interesting ones.** New FIXES Makayla ("Mecaela" -> "Makayla")
+and Jaxon ("Juxene" -> "Jackson"). New LOSES Anthropic: it says an-THROP-ik, which is CORRECT, and Whisper
+hears "entropic", while the old model's AN-thruh-pik transcribes clean. **A more correct pronunciation
+scoring worse** is precisely why a human ear stays in the loop.
+
+⚠️ **Known limit of the gate:** 4 differing renders out of 60 is not much resolution. A change has to be
+large to show here. Before trusting a future "no difference", grow the set or state its sensitivity.
+
 ## Where to pick up (read this first)
 
 The MIT phonemizer is **built, measured and at parity with GPL espeak-ng**. Nothing is half-finished; the
@@ -922,6 +970,17 @@ list below is what would make it better, in the order I would take it.
    names in running speech. Every number here comes from read-aloud declaratives.
 
 ## Session log
+
+- **2026-08-28 (Tuvok, later)**: Took pickup item 1. Letter-to-sound **40.9% -> 49.8%** held out, after
+  finding the header had never described the shipped model (measured unpruned, wrote pruned) and that
+  "prune singletons" was backwards - context WIDTH beats evidence, 83.3% vs 77.6%. Context ±2 -> ±5, paid
+  for by writing only rules that change the backoff answer. Then built the **OOV audio gate**, because
+  nothing could see the component: **espeak 11.30% vs ours 9.69%** over 60 paired renders - we beat the
+  GPL tool on names - but the rebuild itself moved the audio **0.00%** (56/60 transcripts identical), and
+  a 1-seed "win" of 9.2 vs 10.3 was noise. Added a VARIANTS comparison so a configuration change is paired
+  against the previous one rather than only against the reference. Found a truncation defect
+  (`nevaeh` -> `N AH1 V`): with no matching context rule, the bare fallback for `e`/`h` is SILENT, so a run
+  of letters vanishes. Not fixed; kept out of the OOV fixtures so it would not confound them.
 
 - **2026-08-28 EOD (Tuvok)**: Wrapped for the night. Tree clean, everything pushed, no processes
   left running. Tests green across cpu/cuda/opencl/WebGPU/WebGL/Wasm - 62 phonemizer, 44 normalizer,
