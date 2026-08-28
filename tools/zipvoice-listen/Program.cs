@@ -28,15 +28,20 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--seed" && i + 1 < args.Length) wantSeed = int.Parse(args[++i]);
 }
 
-var resultsPath = Path.Combine(resultsDir, "results.json");
-if (!File.Exists(resultsPath)) { Console.WriteLine($"no results.json in {resultsDir}"); return 2; }
+// Two kinds of run produce a page. A sensitivity run damages the reference phonemes on purpose;
+// an end-to-end run speaks the same sentence from the reference frontend's phonemes and from ours.
+// The second is the one that answers "is our phonemizer good enough", and it is the one worth an ear.
+var endToEndPath = Path.Combine(resultsDir, "endtoend.json");
+bool endToEnd = File.Exists(endToEndPath);
+var resultsPath = endToEnd ? endToEndPath : Path.Combine(resultsDir, "results.json");
+if (!File.Exists(resultsPath)) { Console.WriteLine($"no results.json or endtoend.json in {resultsDir}"); return 2; }
 
 using var doc = JsonDocument.Parse(File.ReadAllText(resultsPath));
 var rows = doc.RootElement.EnumerateArray().Select(e => new Row(
     e.GetProperty("Fixture").GetString()!,
     e.GetProperty("Seed").GetInt32(),
-    e.GetProperty("Variant").GetString()!,
-    e.GetProperty("Edits").GetInt32(),
+    e.GetProperty(endToEnd ? "Source" : "Variant").GetString()!,
+    endToEnd ? 1 : e.GetProperty("Edits").GetInt32(),
     e.GetProperty("Wav").GetString()!,
     e.GetProperty("Transcript").GetString() ?? "",
     e.GetProperty("InfixWer").GetDouble(),
@@ -44,12 +49,28 @@ var rows = doc.RootElement.EnumerateArray().Select(e => new Row(
     e.TryGetProperty("SeedBaseline", out var sb) && sb.ValueKind == JsonValueKind.Number ? sb.GetDouble() : null
 )).ToList();
 
+// For an end-to-end page, show the sentences where the two frontends differ MOST by transcript - a pair
+// that transcribed identically has nothing for an ear to arbitrate.
+if (endToEnd)
+{
+    var byFixture = rows.GroupBy(r => (r.Fixture, r.Seed))
+        .Where(g => g.Any(r => r.Variant == "ours") && g.Any(r => r.Variant == "reference"))
+        .OrderByDescending(g => Math.Abs(g.First(r => r.Variant == "ours").InfixWer
+                                       - g.First(r => r.Variant == "reference").InfixWer))
+        .Take(6).ToList();
+    rows = byFixture.SelectMany(g => g).ToList();
+}
+
 // Default to the sentence that exercises the most error classes, which is the one worth an ear.
 wantFixture ??= rows.GroupBy(r => r.Fixture).OrderByDescending(g => g.Count(r => r.Edits > 0)).First().Key;
 wantSeed ??= rows.Where(r => r.Fixture == wantFixture).Select(r => r.Seed).First();
 
-var picked = rows.Where(r => r.Fixture == wantFixture && r.Seed == wantSeed)
-                 .Where(r => r.Variant == "control" || r.Edits > 0).ToList();
+// An end-to-end page shows SEVERAL sentences, each as a pair, because the comparison is between two
+// frontends rather than between variants of one sentence.
+var picked = endToEnd
+    ? rows.ToList()
+    : rows.Where(r => r.Fixture == wantFixture && r.Seed == wantSeed)
+          .Where(r => r.Variant == "control" || r.Edits > 0).ToList();
 if (picked.Count == 0) { Console.WriteLine($"nothing to show for {wantFixture} seed {wantSeed}"); return 2; }
 
 var control = picked.FirstOrDefault(r => r.Variant == "control");
@@ -59,6 +80,10 @@ double noiseFloor = rows.Where(r => r.Variant == "control" && r.SeedBaseline is 
 // What a listener should actually attend to, per variant. Written for someone who has never met the IPA.
 var guide = new Dictionary<string, (string Change, string Listen)>
 {
+    ["reference"] = ("Nothing was changed. This is the sentence spoken from the REFERENCE frontend's phonemes - the GPL one we are replacing.",
+        "This is the standard to beat, or rather to match. Play it first. It opens with a few words of the voice-clone reference clip before the sentence starts; that happens whichever frontend is used and is not what we are testing."),
+    ["ours"] = ("The same sentence, same voice, same random starting noise - but the phonemes came from OUR MIT phonemizer instead.",
+        "The only question on this page: can you tell which is which? If ours sounds as natural as the reference, the replacement works. Listen for wrong stress, an odd rhythm, or a word that comes out mangled."),
     ["control"] = ("Nothing. This is the reference rendering, and every other clip is a copy of it with one thing altered.",
         "Play this first and get used to it. Note that it opens with a few words of the voice-clone reference clip before the sentence starts. That happens in the reference implementation too, it is not what we are testing, and it is why the automatic scoring ignores anything before the sentence begins."),
     ["flap-to-t"] = ("The quick D-like tap that American English uses in the middle of water and better was replaced by a hard T.",
@@ -91,11 +116,14 @@ var guide = new Dictionary<string, (string Change, string Listen)>
         "You SHOULD clearly hear one word come out wrong. This clip exists to prove the test can detect damage at all - if you cannot hear anything wrong here, then none of the clean results above mean anything."),
 };
 
-var order = new[] { "control", "wrong-vowel-last-word", "stress-added-function-words", "stress-moved-later",
+var order = new[] { "reference", "ours", "control", "wrong-vowel-last-word", "stress-added-function-words", "stress-moved-later",
                     "no-stress-at-all", "no-length-marks", "no-secondary-stress", "glottal-and-syllabic-to-plain",
                     "r-schwa-split", "open-o-to-open-a", "flap-to-t", "flap-to-d",
                     "article-a-to-schwa", "barred-i-to-small-i", "barred-i-to-schwa", "turned-a-to-schwa" };
-picked = picked.OrderBy(r => Array.IndexOf(order, r.Variant) is var i && i >= 0 ? i : 99).ToList();
+picked = endToEnd
+    ? picked.GroupBy(r => (r.Fixture, r.Seed))
+            .SelectMany(g => g.OrderBy(r => r.Variant == "reference" ? 0 : 1)).ToList()
+    : picked.OrderBy(r => Array.IndexOf(order, r.Variant) is var i && i >= 0 ? i : 99).ToList();
 
 var sentence = SentenceOf(wantFixture);
 var sb = new StringBuilder();
@@ -178,16 +206,25 @@ sb.AppendLine("""
 sb.AppendLine("<div class=\"wrap\">");
 sb.AppendLine("<header>");
 sb.AppendLine("  <p class=\"eyebrow\">MIT phonemizer &middot; phase 1</p>");
-sb.AppendLine("  <h1>Does the model notice?</h1>");
-sb.AppendLine("  <p class=\"lede\">Every clip below speaks the same sentence, in the same cloned voice, from the "
-            + "same random starting noise. The only thing that differs is how the words were spelled out in "
-            + "phonemes. If a change is inaudible, our phonemizer does not need to get it right.</p>");
+sb.AppendLine(endToEnd
+    ? "  <h1>Can you hear the difference?</h1>"
+    : "  <h1>Does the model notice?</h1>");
+sb.AppendLine("  <p class=\"lede\">" + (endToEnd
+    ? "Each sentence below is spoken twice, in the same cloned voice from the same random starting noise. "
+    + "One rendering used the phonemes of the GPL frontend we are replacing; the other used our MIT one. "
+    + "Nothing else differs, so any difference you hear is the phonemizer."
+    : "Every clip below speaks the same sentence, in the same cloned voice, from the same random starting "
+    + "noise. The only thing that differs is how the words were spelled out in phonemes. If a change is "
+    + "inaudible, our phonemizer does not need to get it right.") + "</p>");
 sb.AppendLine("</header>");
 
-sb.AppendLine("<section class=\"sentence\">");
-sb.AppendLine("  <p class=\"eyebrow\">The sentence being spoken</p>");
-sb.AppendLine($"  <p>{Escape(sentence)}</p>");
-sb.AppendLine("</section>");
+if (!endToEnd)
+{
+    sb.AppendLine("<section class=\"sentence\">");
+    sb.AppendLine("  <p class=\"eyebrow\">The sentence being spoken</p>");
+    sb.AppendLine($"  <p>{Escape(sentence)}</p>");
+    sb.AppendLine("</section>");
+}
 
 sb.AppendLine("<section class=\"legend\">");
 sb.AppendLine("  <p class=\"eyebrow\">How to read the two numbers</p>");
@@ -216,7 +253,10 @@ foreach (var row in picked)
     if (row.Variant == "stress-added-function-words") sb.AppendLine("    <span class=\"chip\">biggest real difference</span>");
     sb.AppendLine($"    <span class=\"chip quiet\">{row.Edits} phoneme{(row.Edits == 1 ? "" : "s")} changed</span>");
     sb.AppendLine("  </div>");
-    sb.AppendLine($"  <h2>{Escape(Pretty(row.Variant))}</h2>");
+    sb.AppendLine($"  <h2>{Escape(endToEnd ? (row.Variant == "ours" ? "our phonemizer" : "reference frontend") : Pretty(row.Variant))}</h2>");
+    if (endToEnd)
+        sb.AppendLine($"  <div class=\"field\"><span class=\"eyebrow\">Sentence</span>"
+                    + $"<p class=\"val\">{Escape(SentenceOf(row.Fixture))}</p></div>");
     sb.AppendLine($"  <div class=\"field\"><span class=\"eyebrow\">What changed</span><p>{Escape(g.Change)}</p></div>");
     sb.AppendLine($"  <div class=\"field\"><span class=\"eyebrow\">What to listen for</span><p>{Escape(g.Listen)}</p></div>");
     if (File.Exists(row.Wav))

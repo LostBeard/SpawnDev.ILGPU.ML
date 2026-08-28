@@ -132,6 +132,26 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Phonemizer_LoadsItsOwnDataInTheBrowser() => await RunTest(_ =>
+    {
+        // The library claims to be browser-capable, and its data is embedded gzipped in the assembly.
+        // That path - manifest resource plus GZipStream - had only ever run on the desktop. This test
+        // runs on the Wasm, WebGL and WebGPU lanes too, which is the only way that claim is worth making.
+        var phonemizer = EmbeddedData.CreatePhonemizer();
+
+        var ipa = phonemizer.ToIpa("She waited for 2 more minutes.");
+        if (!ipa.Contains('ˈ')) throw new Exception($"no stress in \"{ipa}\" - the data did not load");
+        if (!ipa.Contains("ɾ")) throw new Exception($"no tap in \"{ipa}\" - the rules did not run");
+        if (!ipa.Contains("tˈuː")) throw new Exception($"\"2\" was not read as a word: \"{ipa}\"");
+
+        // A name the dictionary does not have must still come out, which needs the embedded
+        // letter-to-sound rules and not just the dictionary.
+        var name = phonemizer.ToIpa("Aubriella");
+        if (name.Length == 0) throw new Exception("the embedded letter-to-sound model did not load");
+        return Task.CompletedTask;
+    });
+
     private static void Expect(string actual, string expected)
     {
         if (actual != expected) throw new Exception($"expected \"{expected}\", got \"{actual}\"");

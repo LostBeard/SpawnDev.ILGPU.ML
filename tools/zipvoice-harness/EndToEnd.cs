@@ -52,11 +52,21 @@ public static class EndToEnd
         var ltsPath = Environment.GetEnvironmentVariable("LTS_MODEL")
             ?? Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..",
                                              "SpawnDev.Phonemizer", "lts-model.txt"));
-        if (!File.Exists(dictPath)) { Console.WriteLine($"no dictionary at {dictPath} (set CMUDICT)"); return 2; }
-
-        var phonemizer = new EnglishPhonemizer(PronunciationDictionary.Load(dictPath));
-        if (File.Exists(ltsPath)) phonemizer.LetterToSound = LetterToSound.Load(ltsPath);
-        else Console.WriteLine($"NOTE: no letter-to-sound model at {ltsPath}; unknown words will be skipped.");
+        // The SHIPPED path by default - the data embedded in the assembly, exactly what a consumer gets -
+        // so this gate measures the product rather than a development configuration of it. The env vars
+        // exist to test a candidate dictionary or a freshly trained model before it is embedded.
+        EnglishPhonemizer phonemizer;
+        if (Environment.GetEnvironmentVariable("CMUDICT") is { Length: > 0 } && File.Exists(dictPath))
+        {
+            phonemizer = new EnglishPhonemizer(PronunciationDictionary.Load(dictPath));
+            if (File.Exists(ltsPath)) phonemizer.LetterToSound = LetterToSound.Load(ltsPath);
+            Console.WriteLine($"phonemizer: files ({dictPath})");
+        }
+        else
+        {
+            phonemizer = EmbeddedData.CreatePhonemizer();
+            Console.WriteLine("phonemizer: embedded in the assembly (the shipped path)");
+        }
 
         var seeds = (Environment.GetEnvironmentVariable("SENSITIVITY_SEEDS") ?? "1234")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

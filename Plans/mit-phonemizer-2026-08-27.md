@@ -556,7 +556,48 @@ Names, brands, coinages. "Aubriella" is not in CMUdict.
       desktop, which would leave the phonemizer with no dependency outside our own stack.
 - [ ] Score OOV accuracy against the oracle on a held-out word list.
 
-### Phase 7 - Packaging `[ ]`
+### Phase 7 - Packaging `[x]`
+
+- [x] `THIRD-PARTY-NOTICES.md` carries CMUdict's BSD-2-Clause notice verbatim, plus a note on the Harvard
+      test sentences (public domain) and an explicit statement that espeak-ng was used only as a measuring
+      instrument, never as a source.
+- [x] `README.md` with the measured numbers, the honest list of what it does not do yet, and crew credits.
+- [x] **Self-contained.** The dictionary and the letter-to-sound rules are embedded gzipped in the
+      assembly - 915 KB and 340 KB - and expanded on first use in 241ms.
+      `EmbeddedData.CreatePhonemizer()` is the entire setup. `System.IO.Compression` is in the BCL and
+      works under WebAssembly, so this adds no package reference.
+- [x] Tests live in the repo's PMT suite and run on every backend.
+
+### Phase 8 - Wire it into ZipVoice `[x]`
+
+`ZipVoiceTokenizer` joins the phonemizer to the model, and `ZipVoicePipeline.SpeakAsync(text,
+referenceText, referenceAudio, rate, tokenizer)` is the overload a consumer actually wants: text and a
+reference clip in, cloned speech out.
+
+`SpawnDev.ILGPU.ML` now references `SpawnDev.Phonemizer`. Deliberate: ZipVoice cannot speak English
+without a phonemizer, the reference implementation reaches for espeak-ng at exactly this point, and the
+MIT replacement is dependency-free so it costs nothing to carry.
+
+A phoneme the model has no token for **throws**, naming the symbol and the text. Skipping it would
+render audio quietly missing a sound with nothing able to point at the cause - the failure mode that ate
+several hours of this session more than once.
+
+### Phase 9 - End to end, as audio `[x]`
+
+`tools/zipvoice-harness endtoend` speaks each sentence twice through ZipVoice from the same voice and the
+same noise seed - once from the reference frontend's token ids, once from ours - and transcribes both.
+The two renders differ ONLY in the phonemes, so any difference in what a listener recovers is the
+phonemizer and nothing else. This is the measurement every symbol-level number was a proxy for.
+
+`dotnet run --project tools/zipvoice-harness -c Release -- endtoend fixtures/phase2 <outDir>`
+
+RESULT_PLACEHOLDER
+
+`tools/zipvoice-listen` renders an end-to-end run as a listening page too - pairs of the same sentence,
+reference against ours, ordered by where the transcripts disagreed most, since a pair that transcribed
+identically has nothing for an ear to arbitrate.
+
+### Phase 7 (original scope) `[ ]`
 
 - [ ] `THIRD-PARTY-NOTICES.md` with the CMUdict notice and disclaimer verbatim.
 - [ ] Unit tests in the repo's test project, so this is covered by PMT and not by a private script.
