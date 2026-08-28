@@ -62,6 +62,27 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task ReferenceOverrides_AreSingleSymbolsTheModelCanTokenize() => await RunTest(_ =>
+    {
+        // An override is hand-written IPA, and a two-character entry like "uː" LOOKS right while being
+        // TWO tokens to the model. One such entry made a whole sentence unrenderable - the tokenizer
+        // refused it rather than speaking it wrong, which is the correct behaviour but an expensive way
+        // to find a typo. Every symbol must be one the ordinary mapping could also have produced.
+        var legal = new HashSet<string>(StringComparer.Ordinal)
+        {
+            Arpabet.PrimaryStress, Arpabet.SecondaryStress, Arpabet.Length, Arpabet.Flap,
+        };
+        foreach (var vowel in Arpabet.Vowels) legal.Add(vowel);
+        foreach (var consonant in "bdfhjklmnpstvwzðŋɡɹʃʒθʔ") legal.Add(consonant.ToString());
+
+        foreach (var symbol in ReferenceOverrides.Symbols)
+            if (!legal.Contains(symbol))
+                throw new Exception($"override symbol \"{symbol}\" is not a single known IPA symbol - "
+                                  + "a multi-character entry is more than one token to the model");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task ZipVoiceTokenizer_ReportsWordsTheDictionaryLacked() => await RunTest(_ =>
     {
         // Worth surfacing all the way up: a name that was sounded out rather than looked up is the

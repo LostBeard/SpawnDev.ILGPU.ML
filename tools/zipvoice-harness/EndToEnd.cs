@@ -68,6 +68,20 @@ public static class EndToEnd
             Console.WriteLine("phonemizer: embedded in the assembly (the shipped path)");
         }
 
+        // Switches for ISOLATING a rule's effect on the AUDIO. Symbol agreement with the reference is a
+        // proxy; this gate is the thing it is a proxy for, and the two have already disagreed once - a
+        // change that halved symbol disagreement left the audio no better.
+        if (Environment.GetEnvironmentVariable("PHONEMIZER_NO_OVERRIDES") == "1")
+        {
+            phonemizer.UseReferenceOverrides = false;
+            Console.WriteLine("rules    : reference overrides OFF");
+        }
+        if (Environment.GetEnvironmentVariable("PHONEMIZER_NO_HOMOGRAPHS") == "1")
+        {
+            phonemizer.ResolveHomographs = false;
+            Console.WriteLine("rules    : homograph resolution OFF");
+        }
+
         var seeds = (Environment.GetEnvironmentVariable("SENSITIVITY_SEEDS") ?? "1234")
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(int.Parse).ToArray();
@@ -107,8 +121,9 @@ public static class EndToEnd
             {
                 jobs.Add((fixName, fixture, seed, "reference", fixture.Tokens,
                           Path.Combine(outDir, $"{fixName}__reference__s{seed}.wav"), 0));
-                jobs.Add((fixName, fixture, seed, "ours", ours.ToArray(),
-                          Path.Combine(outDir, $"{fixName}__ours__s{seed}.wav"), unknownWords));
+                var tag = Environment.GetEnvironmentVariable("PHONEMIZER_TAG") is { Length: > 0 } t ? "-" + t : "";
+                jobs.Add((fixName, fixture, seed, "ours" + tag, ours.ToArray(),
+                          Path.Combine(outDir, $"{fixName}__ours{tag}__s{seed}.wav"), unknownWords));
             }
         }
         if (untranslatable > 0) Console.WriteLine($"WARNING  : {untranslatable} sentence(s) produced a symbol the model has no token for");
@@ -180,7 +195,8 @@ public static class EndToEnd
     private static int Report(List<Row> rows, string outDir)
     {
         var reference = rows.Where(r => r.Source == "reference").ToDictionary(r => (r.Fixture, r.Seed));
-        var ours = rows.Where(r => r.Source == "ours").ToList();
+        var wanted = "ours" + (Environment.GetEnvironmentVariable("PHONEMIZER_TAG") is { Length: > 0 } t ? "-" + t : "");
+        var ours = rows.Where(r => r.Source == wanted).ToList();
         var paired = ours.Where(o => reference.ContainsKey((o.Fixture, o.Seed)))
                          .Select(o => (Ours: o, Reference: reference[(o.Fixture, o.Seed)])).ToList();
         if (paired.Count == 0) { Console.WriteLine("nothing paired to compare"); return 1; }

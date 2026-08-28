@@ -28,7 +28,8 @@ public static class ReferenceOverrides
         {
             // Reference: "ˈɔn" - the open-o, no length mark. CMUdict stores AA1, giving "ɑː".
             ["on"] = ["ˈ", "ɔ", "n"],
-            ["onto"] = ["ˈ", "ɔ", "n", "t", "uː"],
+            // One symbol per entry: the length mark is its own token, so "uː" is "u" then "ː".
+            ["onto"] = ["ˈ", "ɔ", "n", "t", "u", "ː"],
 
             // Reference: "wʌz" - unstressed, with the wedge. CMUdict stores AA1, giving "wˈɑːz".
             ["was"] = ["w", "ʌ", "z"],
@@ -51,6 +52,14 @@ public static class ReferenceOverrides
     /// point in different directions the goal wins.
     /// </remarks>
     public const string DeliberateDivergence = "sentence-initial capital A is read as an article, not a letter";
+
+    /// <summary>Every distinct symbol these overrides can emit, for callers that validate them.</summary>
+    /// <remarks>
+    /// Worth exposing: an override is hand-written IPA, and a two-character entry like "uː" LOOKS right
+    /// while being two tokens to the model. The tokenizer refuses such a sentence outright rather than
+    /// speaking it wrong, which is how that mistake was caught - but catching it earlier is cheaper.
+    /// </remarks>
+    public static IEnumerable<string> Symbols => Words.Values.SelectMany(v => v).Distinct();
 
     /// <summary>Look up an override, if this word has one.</summary>
     public static bool TryGet(string word, out string[] symbols) => Words.TryGetValue(word, out symbols!);
