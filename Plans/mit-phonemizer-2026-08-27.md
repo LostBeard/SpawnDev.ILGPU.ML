@@ -701,8 +701,24 @@ Consequences:
   but not to attribute a per-sentence failure to anything.
 - **Before blaming the phonemizer for a bad render, re-render it at another seed.** Two of the six
   sentences TJ graded by ear were this, not us.
-- **For production this is a real defect with a real mitigation**: the stack already contains a speech
-  recogniser, so a synthesised line can be transcribed and re-rolled when it does not match the text.
+- **For production this is a real defect with a real mitigation, now BUILT and MEASURED.**
+  `ZipVoicePipeline.SpeakVerifiedAsync` speaks the line, transcribes it with the recogniser already in
+  the stack, and re-rolls the noise when the words that come back are not the words asked for. The best
+  attempt is returned even if none passes, because silence is worse than a flawed line.
+  `zipvoice-harness verify` runs it on real models with real audio:
+
+  ```
+  soap-can-wash-most-dirt-away            0% ->   0%   already fine
+  sweet-words-work-better-than-fierce   100% ->   0%   RESCUED
+  take-two-shares-as-a-fair-profit        0% ->   0%   already fine
+  the-lawyer-tried-to-lose-his-case       0% ->   0%   already fine
+  the-slush-lay-deep-along-the-street    29% ->   0%   RESCUED
+  RESULT: 3 already fine, 2 RESCUED by re-rolling, 0 still bad
+  ```
+
+  **Both sentences TJ singled out by ear as bad are recoverable this way**, without touching the
+  phonemizer. It costs a synthesis and a transcription per retry and only pays on the renders that
+  needed one, which is why it is opt-in rather than the default path.
 
 `tools/zipvoice-listen` renders an end-to-end run as a listening page too - pairs of the same sentence,
 reference against ours, ordered by where the transcripts disagreed most, since a pair that transcribed

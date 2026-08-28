@@ -32,14 +32,27 @@ return command switch
                                     args.Length > 2 ? args[2] : null),
     "endtoend" => RunEndToEnd(args.Length > 1 ? args[1] : "fixtures/phase1",
                               args.Length > 2 ? args[2] : null),
+    "verify" => RunVerify(args.Length > 1 ? args[1] : "fixtures/phase1",
+                          args.Length > 2 ? args[2] : null),
     _ => Usage(command),
 };
 
 int Usage(string bad)
 {
     Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav] "
-                    + "| compare [fixture.json] | sensitivity [dir] [outDir] | endtoend [dir] [outDir]");
+                    + "| compare [fixture.json] | sensitivity [dir] [outDir] | endtoend [dir] [outDir] | verify [dir] [outDir]");
     return 2;
+}
+
+// Does listening to your own output rescue a garbled render? See VerifyRun.cs. ZipVoice produces garbage
+// on some noise draws - both frontends - and the only way to see it from inside the stack is to transcribe
+// the result with the recogniser already present and re-roll when the words come back wrong.
+int RunVerify(string fixturePath, string? outDir)
+{
+    var loaded = LoadFixtures(fixturePath);
+    if (loaded == null) return 2;
+    outDir ??= Path.Combine(Path.GetTempPath(), "zipvoice-verify");
+    return VerifyRun.RunAsync(modelDir, loaded, outDir, ReadWav, WriteWav).GetAwaiter().GetResult();
 }
 
 // Does OUR phonemizer sound as good as the reference frontend? See EndToEnd.cs. Speaks each sentence

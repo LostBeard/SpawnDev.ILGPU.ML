@@ -73,6 +73,14 @@ public record ZipVoiceResult(
     public double DurationSeconds => SampleRate > 0 ? (double)Audio.Length / SampleRate : 0;
 }
 
+/// <summary>Speech that was checked against the text it was meant to say.</summary>
+/// <param name="Speech">The best attempt, returned even when none passed - silence is worse.</param>
+/// <param name="Transcript">What the recogniser heard in that attempt.</param>
+/// <param name="WordErrorRate">How far the transcript was from the text, 0 to 1.</param>
+/// <param name="Passed">Whether it came in under the caller's tolerance.</param>
+public sealed record VerifiedSpeechResult(
+    ZipVoiceResult Speech, string Transcript, double WordErrorRate, bool Passed);
+
 /// <summary>
 /// ZipVoice zero-shot voice cloning: speaks new text in the voice of a short reference clip.
 /// </summary>
@@ -81,8 +89,9 @@ public record ZipVoiceResult(
 /// noise; integrate the flow-matching ODE for a handful of Euler steps to turn that noise into a mel;
 /// drop the reference frames off the front; vocode the rest.
 /// <para>
-/// This class takes TOKEN IDS, not text. Turning English text into tokens needs an espeak-ng
-/// grapheme-to-phoneme pass, which is a separate piece - the shipped lexicon covers Chinese only.
+/// <see cref="SpeakAsync"/> takes TEXT; the lower overloads take token ids for callers that phonemize
+/// themselves. English text needs a phonemizer because the shipped lexicon covers Chinese only -
+/// SpawnDev.Phonemizer is the MIT one, wired up by <see cref="ZipVoiceTokenizer"/>.
 /// </para>
 /// </remarks>
 public sealed class ZipVoicePipeline : IDisposable
@@ -120,13 +129,6 @@ public sealed class ZipVoicePipeline : IDisposable
     }
 
     /// <summary>
-    /// Speak <paramref name="tokens"/> in the voice of a reference clip.
-    /// </summary>
-    /// <param name="tokens">Token ids of the text to speak.</param>
-    /// <param name="promptTokens">Token ids of the reference clip's exact transcript.</param>
-    /// <param name="referenceAudio">Reference clip, mono, in [-1, 1].</param>
-    /// <param name="referenceSampleRate">Sample rate of the reference clip.</param>
-    /// <summary>
     /// Speak English TEXT in the voice of a reference clip.
     /// </summary>
     /// <remarks>
@@ -148,6 +150,67 @@ public sealed class ZipVoicePipeline : IDisposable
         return SynthesizeAsync(tokens, promptTokens, referenceAudio, referenceSampleRate);
     }
 
+    /// <summary>
+    /// Speak text, CHECK what came out, and re-roll the noise if the model garbled it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Flow matching starts from fresh noise, and on some draws this model produces speech that is not
+    /// the sentence at all. Measured: rendering one sentence at four seeds gave three clean results and
+    /// one that transcribed as "Loner's call, Nanawa, Nenfer", and the same happens to the reference
+    /// implementation - at one seed a clean sentence came back as "I'm not sure if I'm going to be here".
+    /// It is a property of the model, not of the phonemes it was given.
+    /// </para>
+    /// <para>
+    /// There is no way to see that from inside the synthesiser, but there IS a recogniser in this stack.
+    /// So: speak it, listen to it, and if the words that come back are not the words asked for, draw
+    /// different noise and try again. The best attempt is returned even if none passes, because silence
+    /// is worse than a flawed line.
+    /// </para>
+    /// </remarks>
+    /// <param name="transcribe">Turns synthesised audio back into text - a speech recogniser.</param>
+    /// <param name="tolerance">Word error rate to accept. 0.2 allows a word in five to be misheard.</param>
+    /// <param name="attempts">How many noise draws to try before returning the best one.</param>
+    public async Task<VerifiedSpeechResult> SpeakVerifiedAsync(
+        string text, string referenceText, float[] referenceAudio, int referenceSampleRate,
+        ZipVoiceTokenizer tokenizer, Func<float[], int, Task<string>> transcribe,
+        double tolerance = 0.2, int attempts = 3)
+    {
+        ArgumentNullException.ThrowIfNull(tokenizer);
+        ArgumentNullException.ThrowIfNull(transcribe);
+        if (attempts < 1) throw new ArgumentOutOfRangeException(nameof(attempts), "at least one attempt");
+
+        var tokens = tokenizer.Encode(text);
+        var promptTokens = tokenizer.Encode(referenceText);
+
+        ZipVoiceResult? best = null;
+        string bestTranscript = "";
+        double bestError = double.MaxValue;
+        int? originalSeed = NoiseSeed;
+
+        for (int attempt = 0; attempt < attempts; attempt++)
+        {
+            // Each attempt needs a DIFFERENT draw, including when the caller pinned a seed for
+            // reproducibility - re-rolling the same noise would reproduce the same garbage.
+            if (originalSeed.HasValue) NoiseSeed = originalSeed.Value + attempt;
+
+            var result = await SynthesizeAsync(tokens, promptTokens, referenceAudio, referenceSampleRate);
+            var heard = await transcribe(result.Audio, result.SampleRate);
+            double error = SpokenTextCheck.WordErrorRate(text, heard);
+
+            if (error < bestError) { best = result; bestTranscript = heard; bestError = error; }
+            if (error <= tolerance) break;
+        }
+
+        NoiseSeed = originalSeed;
+        return new VerifiedSpeechResult(best!, bestTranscript, bestError, bestError <= tolerance);
+    }
+
+    /// <summary>Speak token ids directly, for callers that phonemize themselves.</summary>
+    /// <param name="tokens">Token ids of the text to speak.</param>
+    /// <param name="promptTokens">Token ids of the reference clip's exact transcript.</param>
+    /// <param name="referenceAudio">Reference clip, mono, in [-1, 1].</param>
+    /// <param name="referenceSampleRate">Sample rate of the reference clip.</param>
     public Task<ZipVoiceResult> SynthesizeAsync(
         long[] tokens, long[] promptTokens, float[] referenceAudio, int referenceSampleRate)
     {
