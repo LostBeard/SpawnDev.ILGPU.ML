@@ -122,7 +122,12 @@ public sealed class LetterToSound
         // "au". Every "-ella" name in the dictionary stresses the ELL (gabriella, isabella, daniella,
         // ariella) and this model gets "briella" right on its own - but for "aubriella" the word-initial
         // rule marks a primary first and wins on position. That is a real defect in the name this
-        // component exists to say; the fix is pronunciation by analogy, not a different tie-break.
+        // component exists to say, and NOBODY HAS A FIX FOR IT YET. The obvious candidate - borrow the
+        // ending, and its stress, from the rhyming dictionary word - was built and measured across 30
+        // configurations (`tools/lts-train --analogy`): it buys at most +0.6 points, and at its best
+        // setting it does not fire on this word at all, because "briella" is carried by a single training
+        // word and for analogy singletons measure WORSE. Do not re-propose either that or a specificity
+        // tie-break without reading those two tables first.
         bool seenPrimary = false;
         for (int i = 0; i < output.Count; i++)
         {
