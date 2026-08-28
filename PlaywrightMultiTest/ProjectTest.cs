@@ -16,6 +16,28 @@ public class ProjectTest
     /// <summary>Category from [TestMethod(Category="...")], scraped from the row's
     /// data-test-category attribute. Used to skip slow categories in routine runs.</summary>
     public string Category { get; set; } = "";
+
+    /// <summary>
+    /// The page's .NET WASM runtime died during this test, so the page is unusable for every test after it.
+    /// </summary>
+    /// <remarks>
+    /// An unhandled exception on a runtime callback (an async continuation, a finalizer, a JS interop
+    /// resolve) does not fail one test - it EXITS THE WASM RUNTIME. Every later interop call then logs
+    /// "Assert failed: .NET runtime already exited with N", the row never reaches Done, and the done-wait
+    /// below burns its full timeout. At 600s per test over a 1,500-test browser lane that is a run which
+    /// looks frozen for hours at near-zero CPU while it politely polls a corpse.
+    ///
+    /// It has to be OBSERVED rather than inferred, because a dead page is indistinguishable from a slow one
+    /// through the DOM alone - both simply never reach Done. The console says so explicitly, and this method
+    /// is already listening to it.
+    ///
+    /// The runner reads this and replaces the page, so one unhandled exception costs one test instead of
+    /// the rest of the sweep. See ProjectRunner.RunLaneSequentialAsync.
+    /// </remarks>
+    public bool PageRuntimeDied { get; private set; }
+
+    /// <summary>Console text proving the runtime exited - quoted verbatim into the failure message.</summary>
+    private const string RuntimeExitedMarker = ".NET runtime already exited";
     public Func<IPage, Task> TestFunc { get; set; }
     public ProjectTest(TestableProject testableProject, string name)
     {
@@ -96,6 +118,10 @@ public class ProjectTest
             var consoleWarnings = new List<string>();
             void OnConsole(object? sender, IConsoleMessage msg)
             {
+                // The runtime announces its own death. Catch it here rather than waiting out the
+                // done-timeout on a page that can no longer run anything - see PageRuntimeDied.
+                if (msg.Type == "error" && msg.Text != null && msg.Text.Contains(RuntimeExitedMarker, StringComparison.Ordinal))
+                    PageRuntimeDied = true;
                 if (msg.Type == "error")
                     consoleErrors.Add(msg.Text);
                 else if (msg.Type == "warning")
@@ -142,6 +168,10 @@ public class ProjectTest
             int doneTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("PMT_BROWSER_DONE_TIMEOUT_MS"), out var dt) && dt > 0 ? dt : 600_000;
             await page.WaitForConditionAsync(async () =>
             {
+                // A dead runtime can never reach Done, so stop waiting the moment it says so. Without this
+                // the catch below - correctly, for a BUSY page - reads every failure as "not yet" and the
+                // wait runs its full 600s against a page that will never answer.
+                if (PageRuntimeDied) return true;
                 try
                 {
                     return await page.EvaluateAsync<bool>(
@@ -156,6 +186,34 @@ public class ProjectTest
 
             // Stop capturing console
             page.Console -= OnConsole;
+
+            // If the runtime died, decide honestly whether this test actually finished first. A test that
+            // reached Done and then killed the runtime on its way out still has a real result worth
+            // recording; one that never got there failed BECAUSE of it, and says so by name instead of
+            // reporting a ten-minute timeout whose cause nobody can see.
+            if (PageRuntimeDied)
+            {
+                bool reachedDone = false;
+                try
+                {
+                    reachedDone = await page.EvaluateAsync<bool>(
+                        "sel => { const el = document.querySelector(sel); return el != null && el.classList.contains('test-state-done'); }",
+                        rowSelector);
+                }
+                catch { }
+
+                if (!reachedDone)
+                {
+                    Result = TestResult.Error;
+                    var firstFatal = consoleErrors.FirstOrDefault(e => e.Contains(RuntimeExitedMarker, StringComparison.Ordinal));
+                    ResultMessage = "the page's .NET WASM runtime EXITED during this test, so it could never "
+                                  + "report a result. An unhandled exception on a runtime callback (async "
+                                  + "continuation, finalizer, or JS interop resolve) kills the runtime - look "
+                                  + "for the FIRST 'Unhandled Exception' in the browser console, above the "
+                                  + "flood of 'already exited' asserts. " + (firstFatal ?? "");
+                    throw new Exception(ResultMessage);
+                }
+            }
 
             // Only flag a Blazor error if it appeared NEW during this test (wasn't already there)
             string? blazorError = null;

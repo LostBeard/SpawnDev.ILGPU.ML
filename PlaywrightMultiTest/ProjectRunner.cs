@@ -1299,6 +1299,25 @@ namespace PlaywrightMultiTest
             string? lastType = null;
             foreach (var t in tests)
             {
+                // A previous test killed the page's WASM runtime. Nothing on this page can run again, so
+                // replace it before the next test rather than letting all 1,500 remaining rows each burn
+                // their done-timeout against a corpse. See ProjectTest.PageRuntimeDied.
+                if (_pageRuntimeDied)
+                {
+                    _pageRuntimeDied = false;
+                    if (!string.IsNullOrEmpty(t.TestPageUrl) && page.Context != null)
+                    {
+                        LogStatus("The .NET WASM runtime exited on the test page - replacing the page so the "
+                                + "lane can continue. The test that killed it is recorded as failed.");
+                        var recovered = TestableProjects.OfType<TestableBlazorWasm>().FirstOrDefault();
+                        if (recovered != null)
+                            page = await RecreateTestPageAsync(recovered, t.TestPageUrl).ConfigureAwait(false);
+                        else
+                            await ReloadTestPageAsync(page, t.TestPageUrl).ConfigureAwait(false);
+                        lastType = null;
+                    }
+                }
+
                 // WebGPU leaves browser GPU state that breaks subsequent WebGL rows on the
                 // same page (TensorView_Half_RoundTrip: Wasm/WebGL pass in isolation).
                 if (lastType == "WebGPUTests"
@@ -1397,6 +1416,13 @@ namespace PlaywrightMultiTest
         /// desktop = spawn subprocess) and records the outcome. Mirrors the verdict logic
         /// in UnitTest1.RunTest so cached + live paths agree.
         /// </summary>
+        /// <summary>
+        /// Set when a browser test observed the page's .NET WASM runtime exit. The sequential lane reads it
+        /// and replaces the page before the next test, so one unhandled exception costs one test rather than
+        /// every test after it. See ProjectTest.PageRuntimeDied.
+        /// </summary>
+        private bool _pageRuntimeDied;
+
         private async Task ExecuteAndCaptureAsync(ProjectTest test, IPage? page)
         {
             var sw = Stopwatch.StartNew();
@@ -1411,6 +1437,12 @@ namespace PlaywrightMultiTest
             {
                 sw.Stop();
                 _outcomes[test.Name] = new ScheduledOutcome("Fail", ex.Message, sw.Elapsed.TotalMilliseconds);
+            }
+            finally
+            {
+                // Read it even when the test PASSED: a test can finish and still leave the runtime dead on
+                // its way out, and the page is just as unusable for the next one either way.
+                if (test.PageRuntimeDied) _pageRuntimeDied = true;
             }
         }
 
