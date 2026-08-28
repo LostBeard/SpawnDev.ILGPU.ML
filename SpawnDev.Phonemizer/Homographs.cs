@@ -55,6 +55,35 @@ public static class Homographs
     };
 
     /// <summary>
+    /// Homographs whose readings differ by a VOWEL rather than by stress, with the phone that tells
+    /// them apart: the default reading first, then the one a verb cue selects.
+    /// </summary>
+    /// <remarks>
+    /// These are the classic English traps - "the WIND blows" against "WIND the clock" - and the
+    /// dictionary lists both with no way to choose. Worse, its FIRST entry is often the rarer reading:
+    /// "wind" is stored as the verb, so untouched, "no doubt about the way the wind blows" came out as
+    /// "the way the WINED blows" and the transcriber heard exactly that.
+    ///
+    /// Where the two readings are separated by meaning rather than by part of speech - "bass" the fish
+    /// against "bass" the register, "tear" the eye against "tear" the rip - no cue this shallow can
+    /// help, so only the DEFAULT is set and the verb column is left null. Guessing there would be worse
+    /// than the ambiguity.
+    /// </remarks>
+    private static readonly Dictionary<string, (string Default, string? Verb)> VowelReadings =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["wind"] = ("IH", "AY"),      // the wind blows / wind the clock
+            ["live"] = ("IH", "IH"),      // to live, live wires are rarer in ordinary text
+            ["close"] = ("S", "Z"),       // close by / to close it
+            ["use"] = ("S", "Z"),         // the use of it / to use it
+            ["lead"] = ("IY", "IY"),      // to lead; the metal is the rarer reading
+            ["read"] = ("IY", "IY"),      // present tense reads more often than past
+            ["minute"] = ("IH", null),    // the time, overwhelmingly
+            ["bass"] = ("EY", null),      // the register, in ordinary text
+            ["wound"] = ("UW", null),     // the injury
+        };
+
+    /// <summary>
     /// Pick the pronunciation the sentence calls for, or return <paramref name="fallback"/> unchanged.
     /// </summary>
     /// <remarks>
@@ -65,14 +94,28 @@ public static class Homographs
     public static string[] Choose(string word, string? previousWord,
                                   PronunciationDictionary dictionary, string[] fallback)
     {
+        if (!dictionary.TryLookupAll(word, out var all) || all.Count < 2) return fallback;
+
+        // Vowel homographs first: they change the WORD, not just which syllable carries the beat.
+        if (VowelReadings.TryGetValue(word, out var reading))
+        {
+            bool isVerb = previousWord != null && VerbCues.Contains(previousWord);
+            var wantedPhone = isVerb ? reading.Verb ?? reading.Default : reading.Default;
+            foreach (var candidate in all)
+                if (candidate.Any(phone => Bare(phone) == wantedPhone)) return candidate;
+            return fallback;
+        }
+
         int wanted = StressedSyllable(word, previousWord);
         if (wanted < 0) return fallback;
-        if (!dictionary.TryLookupAll(word, out var all) || all.Count < 2) return fallback;
 
         foreach (var candidate in all)
             if (PrimarySyllable(candidate) == wanted) return candidate;
         return fallback;
     }
+
+    private static string Bare(string phone)
+        => phone.Length > 0 && char.IsDigit(phone[^1]) ? phone[..^1] : phone;
 
     /// <summary>Which vowel carries the primary stress, counting from the start, or -1 if none does.</summary>
     private static int PrimarySyllable(string[] phones)

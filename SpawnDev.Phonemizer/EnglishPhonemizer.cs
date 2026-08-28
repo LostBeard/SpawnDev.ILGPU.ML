@@ -158,6 +158,7 @@ public sealed class EnglishPhonemizer
     private List<string> Word(string[] phones, string spelling, string? previousWord = null)
     {
         bool destress = DestressFunctionWords && FunctionWords.IsUnstressed(spelling);
+        bool lighten = DestressFunctionWords && !destress && FunctionWords.TakesSecondaryStress(spelling);
         var symbols = new List<string>(phones.Length + 4);
         int suffixVowel = SuffixVowelIndex(phones, spelling);
 
@@ -185,7 +186,8 @@ public sealed class EnglishPhonemizer
                 // b-STRESS-E, not STRESS-b-E. Verified against captured reference output.
                 if (!destress)
                 {
-                    if (stress == 1) symbols.Add(Arpabet.PrimaryStress);
+                    // A weak word that keeps a light beat takes the secondary mark, never the primary.
+                    if (stress == 1) symbols.Add(lighten ? Arpabet.SecondaryStress : Arpabet.PrimaryStress);
                     else if (stress == 2) symbols.Add(Arpabet.SecondaryStress);
                 }
                 // Destressing removes the MARK, not the vowel. Reducing the quality as well turned "of"
@@ -221,6 +223,7 @@ public sealed class EnglishPhonemizer
             if (firstVowel >= 0) symbols.Insert(firstVowel, Arpabet.PrimaryStress);
         }
 
+        LinkR(symbols);
         if (Flapping) Flap(symbols);
         return symbols;
     }
@@ -276,6 +279,30 @@ public sealed class EnglishPhonemizer
         bool isSuffix = _dictionary.TryLookup(word[..^1], out _)
                      || (word.Length > 4 && _dictionary.TryLookup(word[..^2], out _));
         return isSuffix ? phones.Length - 2 : -1;
+    }
+
+    /// <summary>
+    /// An r-coloured vowel before another vowel also needs a consonant r.
+    /// </summary>
+    /// <remarks>
+    /// The reference writes "around" as ɚɹˈaʊnd and "arrived" as ɐɹˈaɪvd: the r both colours the first
+    /// vowel and starts the next syllable, so it appears twice over. Emitting only the coloured vowel
+    /// left a real hole - in an end-to-end render, "stretched for miles around" transcribed as "miles
+    /// round".
+    /// </remarks>
+    private static void LinkR(List<string> symbols)
+    {
+        for (int i = 0; i < symbols.Count - 1; i++)
+        {
+            if (symbols[i] != "ɚ") continue;
+            var next = symbols[i + 1];
+            // Skip a stress mark to see what really follows.
+            if (next == Arpabet.PrimaryStress || next == Arpabet.SecondaryStress)
+                next = i + 2 < symbols.Count ? symbols[i + 2] : "";
+            if (!Arpabet.Vowels.Contains(next)) continue;
+            symbols.Insert(i + 1, "ɹ");
+            i++;
+        }
     }
 
     /// <summary>

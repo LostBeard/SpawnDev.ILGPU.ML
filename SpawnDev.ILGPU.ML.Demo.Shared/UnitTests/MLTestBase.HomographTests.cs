@@ -27,6 +27,12 @@ public abstract partial class MLTestBase
         "i AY1",
         "want W AA1 N T",
         "played P L EY1 D",
+        "wind W AY1 N D",
+        "wind(2) W IH1 N D",
+        "use Y UW1 S",
+        "use(2) Y UW1 Z",
+        "must M AH1 S T",
+        "clock K L AA1 K",
     }))
     { Normalizer = null };
 
@@ -52,6 +58,25 @@ public abstract partial class MLTestBase
         // entry would give "ɹˈʌkɔːɹd" - right beat, wrong word - which is what the first attempt did.
         var noun = HomographPhonemizer().ToIpa("the record");
         if (noun.Contains("ʌk")) throw new Exception($"stress was moved instead of choosing an entry: \"{noun}\"");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Homograph_ReadsVowelHomographsToo() => await RunTest(_ =>
+    {
+        // Not every homograph is a stress shift. "The WIND blows" and "WIND the clock" differ by a
+        // VOWEL, and the dictionary's FIRST entry is the rarer verb - so left alone, "the way the wind
+        // blows" rendered as "the way the WINED blows", and the transcriber heard exactly that.
+        var p = HomographPhonemizer();
+        var noun = p.ToIpa("the wind");
+        if (!noun.EndsWith("wˈɪnd")) throw new Exception($"expected the noun reading, got \"{noun}\"");
+
+        var verb = p.ToIpa("must wind the clock");
+        if (!verb.Contains("wˈaɪnd")) throw new Exception($"expected the verb reading, got \"{verb}\"");
+
+        // Same mechanism, a consonant this time: the USE of it against to USE it.
+        if (!p.ToIpa("the use").EndsWith("jˈuːs")) throw new Exception("noun 'use' should end voiceless");
+        if (!p.ToIpa("to use").EndsWith("jˈuːz")) throw new Exception("verb 'use' should end voiced");
         return Task.CompletedTask;
     });
 

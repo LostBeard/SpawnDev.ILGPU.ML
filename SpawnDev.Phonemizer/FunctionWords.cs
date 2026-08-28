@@ -29,7 +29,7 @@ public static class FunctionWords
     public static readonly IReadOnlySet<string> Unstressed = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         // Articles and determiners
-        "a", "an", "the", "some", "such",
+        "a", "an", "the",
 
         // The monosyllabic prepositions and conjunctions that have true WEAK FORMS - a reduced vowel in
         // running speech. Deliberately NOT here: in, on, up, out, off, and every polysyllabic preposition
@@ -37,7 +37,7 @@ public static class FunctionWords
         // image of the defect this list exists to prevent. Also absent, on evidence rather than theory:
         // "that", "my" and "would" are marked STRESSED by the reference frontend in ordinary sentences,
         // so destressing them would be inventing a defect.
-        "and", "as", "at", "but", "for", "from", "nor", "of", "or", "than", "to", "with",
+        "and", "as", "at", "for", "from", "nor", "of", "or", "to", "with",
 
         // Pronouns and possessives
         "he", "her", "hers", "him", "his", "it", "its", "me", "our", "ours", "she",
@@ -46,22 +46,41 @@ public static class FunctionWords
         // Auxiliaries and copulas. These reduce as helpers ("he WAS going") but carry stress as main
         // verbs and in short answers ("yes he WAS") - a distinction that needs sentence context, which
         // belongs with homograph resolution rather than in a flat list.
-        "am", "are", "be", "been", "can", "could", "did", "do", "does", "had", "has",
+        "am", "are", "be", "been", "can", "did", "do", "does", "had", "has",
         "have", "is", "must", "shall", "should", "was", "were", "will",
     };
+
+    /// <summary>
+    /// Weak words that keep a LIGHT beat rather than losing stress entirely.
+    /// </summary>
+    /// <remarks>
+    /// Evidence, not theory: the reference frontend writes "some" as sˌʌm, "but" as bˌʌt and "such" as
+    /// sˌʌtʃ - a secondary mark, not nothing. Stripping it outright cost real intelligibility; in one
+    /// end-to-end render "some flower seeds" came back transcribed as "and flower seeds".
+    /// "could" is absent from BOTH lists because the reference gives it full primary stress.
+    /// </remarks>
+    public static readonly IReadOnlySet<string> Secondary = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "some", "but", "such", "than", "that",
+    };
+
+    /// <summary>True when this word keeps a light beat instead of losing its stress.</summary>
+    public static bool TakesSecondaryStress(string word) => Secondary.Contains(Letters(word));
 
     /// <summary>True when this word is normally spoken without stress.</summary>
     /// <remarks>
     /// Apostrophes are stripped before lookup so "don't" and "dont" both match, and a possessive or
     /// contracted form written either way behaves the same.
     /// </remarks>
-    public static bool IsUnstressed(string word)
+    public static bool IsUnstressed(string word) => Unstressed.Contains(Letters(word));
+
+    private static string Letters(string word)
     {
-        if (string.IsNullOrEmpty(word)) return false;
+        if (string.IsNullOrEmpty(word)) return "";
         Span<char> buffer = word.Length <= 32 ? stackalloc char[word.Length] : new char[word.Length];
         int n = 0;
         foreach (var c in word)
             if (char.IsLetter(c)) buffer[n++] = char.ToLowerInvariant(c);
-        return n > 0 && Unstressed.Contains(new string(buffer[..n]));
+        return new string(buffer[..n]);
     }
 }
