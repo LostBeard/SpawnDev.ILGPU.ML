@@ -28,6 +28,10 @@ public abstract partial class MLTestBase
         "in IH0 N",
         "my M AY1",
         "mother M AH1 DH ER0",
+        "rose R OW1 Z",
+        "waited W EY1 T IH0 D",
+        "wait W EY1 T",
+        "hundred HH AH1 N D R AH0 D",
     }));
 
     [TestMethod]
@@ -92,7 +96,7 @@ public abstract partial class MLTestBase
         // leads the clause it opens. Getting this backwards desynchronised every word-level comparison
         // against the reference until it was fixed.
         var ipa = MakePhonemizer().ToIpa("roses, understand");
-        Expect(ipa, "ɹˈoʊzɪz ,ˌʌndɚstˈænd");
+        Expect(ipa, "ɹˈoʊzᵻz ,ˌʌndɚstˈænd");
         return Task.CompletedTask;
     });
 
@@ -111,6 +115,20 @@ public abstract partial class MLTestBase
         p.ToIpa("my mother");
         if (p.LastUnknownWords.Count != 0)
             throw new Exception("the unknown list must reset per call");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Phonemizer_ReducesPluralAndPastEndingsButOnlyRealOnes() => await RunTest(_ =>
+    {
+        // "roses" and "waited" take the reduced ending vowel. "hundred" looks identical to the phone
+        // rule - unstressed vowel, then D, spelled -ed - and must NOT take it, because there is no word
+        // "hundr" for it to be the past tense of. That is why the rule checks the STEM in the dictionary
+        // rather than trusting the spelling.
+        var p = MakePhonemizer();
+        Expect(p.ToIpa("roses"), "ɹˈoʊzᵻz");
+        Expect(p.ToIpa("waited"), "wˈeɪɾᵻd");
+        Expect(p.ToIpa("hundred"), "hˈʌndɹəd");
         return Task.CompletedTask;
     });
 

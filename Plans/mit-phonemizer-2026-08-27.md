@@ -379,7 +379,32 @@ So Rose can say "Todd" and "Nikki" straight from the dictionary and **cannot say
 out-of-vocabulary path**. That is the requirement Phase 6 has to meet, stated concretely.
 **Still owed:** a real name-coverage number against a census surname list rather than a spot check.
 
-### Phase 2 - Batch word-level oracle `[ ]`
+### Phase 2 - Validate against sentences the rules were NOT tuned on `[x]`
+
+The Phase 4 rules were tuned against nine sentences, which is few enough to overfit. **120 Harvard
+sentences** (IEEE Recommended Practice for Speech Quality Measurements, 1969 - public domain,
+phonetically balanced, everyday vocabulary, every sixth sentence of the standard lists so the sample
+spans all 72) were run through the oracle and used as a held-out set.
+
+`dotnet run --project tools/zipvoice-fixture -c Release -- --file tools/zipvoice-fixture/sentences-phase2.txt --out tools/zipvoice-harness/fixtures/phase2`
+`dotnet run --project tools/zipvoice-g2p-probe -c Release -- tools/zipvoice-harness/fixtures/phase2`
+
+**Result: 4.5% symbol disagreement on the 120 unseen sentences against 4.2% on the nine that were tuned
+against. The rules generalise; they are not overfitted.** And **0 of 940 words** fell outside CMUdict,
+which is a stronger coverage result than the frequency-list estimate suggested.
+
+The scale also exposed a systematic bug the nine sentences could not: **destressing was reducing the
+VOWEL as well as removing the mark**, turning "of" into "uhv" and "and" into "uhnd" where the reference
+keeps the fuller vowel and simply leaves it unmarked. That was 17% of all remaining differences.
+Fixing it took the held-out set from 5.7% to 4.6%.
+
+The original word-level batch oracle idea is superseded: sentences are a better instrument than isolated
+words, because the function-word rule only exists in connected speech. Two of its sub-tasks are answered:
+- [x] Words per run: 120 sentences in one command via `zipvoice-fixture`.
+- [x] Abort synthesis early - **NOT POSSIBLE, measured.** ZipVoice does not stream, so sherpa's progress
+      callback fires once after the audio already exists: 2076ms without the trick, 2192ms with it.
+
+### Phase 2b - Batch word-level oracle (superseded, kept for reference) `[ ]`
 
 - [ ] Extend `zipvoice-oracle` with a batch mode: feed many words in one run, capture the per-word
       token ids from the debug stream, emit a JSON word to ids map.
@@ -415,7 +440,17 @@ captured reference output over the nine Phase 1 sentences:
 | library, first run | 66 | 11.1% |
 | + punctuation written the reference's way, narrowed weak-form list | 50 | 8.4% |
 | + tap T only (never D), drop that/my/would, add with | 42 | 7.1% |
-| + stressless content words get their stress | **39** | **6.6%** |
+| + stressless content words get their stress | 39 | 6.6% |
+| + reduced vowel in real -es/-ed endings (stem checked in the dictionary) | 32 | 5.4% |
+| + destressing removes the MARK only, not the vowel quality | 26 | 4.4% |
+| + the LOT-CLOTH split (short o before a voiceless fricative) | **25** | **4.2%** |
+
+Held-out check on 120 sentences the rules were never tuned against: **4.5%**, against 4.2% on the tuned
+nine. It generalises.
+
+**Tried and REVERTED, recorded so it is not retried:** closing a stressed AO to o before R. Right for
+"boards" and "port", wrong for "quart", "or" and "for", which keep the opener vowel under stress too -
+twenty new differences against four fixed. A rule that looks clean is not always a rule that measures.
 
 **Every stress-ADDED and stress-DROPPED difference is now gone.** The two stress differences left are
 primary/secondary swaps in "address" and "Seventeen" - genuine dictionary disagreements, and "address"
@@ -429,9 +464,18 @@ Rules implemented, in the order the measurement said they matter:
 - [x] A content word with no stressed vowel in the dictionary (`in` is `IH0 N`) gets primary stress.
 - [x] Length marks, secondary stress, r-coloured vowels preserved (the naturalness band).
 - [x] Flapping, T only.
-- [ ] Reduced barred-i in -es/-ed suffixes (measured harmless; would close 7 of the 39).
-- [ ] Score against a LARGE word list, not nine sentences - see Phase 2. **The weak-form list was tuned
-      against nine sentences and could be overfitted to them; that is the next thing to check.**
+- [x] Reduced barred-i in real -es/-ed endings, with the stem checked in the dictionary so "hundred"
+      (which is not "hundr" + ed) is correctly excluded.
+- [x] Destressing removes the mark only, never the vowel quality.
+- [x] The LOT-CLOTH split.
+- [x] **Validated on 120 held-out sentences: 4.5% against 4.2% tuned. NOT overfitted.**
+- [ ] Remaining top classes, in order: length marks on "on/onto/logs" (41), stress dropped from "A",
+      "will", "such" where the reference keeps or downgrades it (33), the article "a" (21, measured
+      harmless), unstressed IH vs AH in "jacket"/"acid" (18), "and" (12, the dictionary stores the weak
+      form where the reference uses the strong one).
+- [ ] The reference gives some weak words SECONDARY stress rather than none ("but" is bˌʌt, "such" is
+      sˌʌtʃ) - a two-tier list would close part of the 33, but secondary stress measured nearly harmless
+      so this is polish, not priority.
 
 Guarded by `MLTestBase.PhonemizerTests` - 44/44 across cpu, cuda, opencl, WebGPU, WebGL and Wasm.
 

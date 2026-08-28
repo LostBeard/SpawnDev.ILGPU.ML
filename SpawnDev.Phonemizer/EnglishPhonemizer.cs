@@ -104,10 +104,21 @@ public sealed class EnglishPhonemizer
     {
         bool destress = DestressFunctionWords && FunctionWords.IsUnstressed(spelling);
         var symbols = new List<string>(phones.Length + 4);
+        int suffixVowel = SuffixVowelIndex(phones, spelling);
 
-        foreach (var raw in phones)
+        for (int index = 0; index < phones.Length; index++)
         {
+            var raw = phones[index];
             var (phone, stress) = Arpabet.SplitStress(raw);
+            if (index == suffixVowel)
+            {
+                // The reduced vowel of a plural or past-tense ending: roses, waited, boxes, collected.
+                // The reference frontend writes a distinct centralised vowel here rather than a plain
+                // small-capital I. Measured as costing nothing, so this is about matching the training
+                // distribution rather than about intelligibility.
+                symbols.Add("ᵻ");
+                continue;
+            }
             if (stress >= 0)
             {
                 // The mark goes immediately before the vowel, not before the syllable onset: "better" is
@@ -117,7 +128,10 @@ public sealed class EnglishPhonemizer
                     if (stress == 1) symbols.Add(Arpabet.PrimaryStress);
                     else if (stress == 2) symbols.Add(Arpabet.SecondaryStress);
                 }
-                symbols.AddRange(Arpabet.Vowel(phone, destress ? 0 : stress));
+                // Destressing removes the MARK, not the vowel. Reducing the quality as well turned "of"
+                // into "uhv" and "and" into "uhnd", where the reference keeps the fuller vowel and simply
+                // does not mark it - which was 17% of all remaining differences over 120 sentences.
+                symbols.AddRange(ContextualVowel(phone, stress, phones, index));
             }
             else if (Arpabet.TryConsonant(phone, out var consonant))
             {
@@ -137,6 +151,59 @@ public sealed class EnglishPhonemizer
 
         if (Flapping) Flap(symbols);
         return symbols;
+    }
+
+    /// <summary>
+    /// Pick a vowel's realisation from what surrounds it, where American English demands it.
+    /// </summary>
+    /// <remarks>
+    /// Two contexts, both ordinary English phonology rather than quirks of one implementation:
+    /// <list type="bullet">
+    /// <item>The LOT-CLOTH split. Before a voiceless fricative the back vowel is short and rounded:
+    /// "cost" is kost and "cloth" is kloth, not "caast" and "clawth". The dictionary writes the two
+    /// classes inconsistently - "cost" is AA while "cloth" is AO - and both come out the same way.</item>
+    /// </list>
+    /// TRIED AND REVERTED: closing a stressed AO to o before R. It is right for "boards" and "port" and
+    /// wrong for "quart", "or" and "for", which keep the opener vowel under stress too - twenty new
+    /// differences against four fixed. The rule that looks clean is not always the rule that measures.
+    /// </remarks>
+    private static string[] ContextualVowel(string phone, int stress, string[] phones, int index)
+    {
+        if (phone is not ("AA" or "AO")) return Arpabet.Vowel(phone, stress);
+
+        var next = index + 1 < phones.Length ? Arpabet.SplitStress(phones[index + 1]).Phone : "";
+        if (next is "S" or "TH" or "F" or "SH") return ["ɔ"];                  // cost, cloth, off
+        return Arpabet.Vowel(phone, stress);
+    }
+
+    /// <summary>
+    /// Index of the vowel belonging to a plural or past-tense ending, or -1 when there is none.
+    /// </summary>
+    /// <remarks>
+    /// This has to be MORPHOLOGICAL, not just phonetic. "roses", "waited" and "boxes" all end in an
+    /// unstressed vowel followed by Z or D and all take the reduced vowel - but so does "hundred", which
+    /// does not, because there is no word "hundr" for it to be a past tense of. The stem is therefore
+    /// looked up in the dictionary: no stem, no suffix, no rule.
+    /// </remarks>
+    private int SuffixVowelIndex(string[] phones, string spelling)
+    {
+        if (phones.Length < 3) return -1;
+
+        var last = Arpabet.SplitStress(phones[^1]).Phone;
+        if (last != "Z" && last != "D") return -1;
+
+        var (vowel, stress) = Arpabet.SplitStress(phones[^2]);
+        if (stress != 0 || (vowel != "IH" && vowel != "AH")) return -1;
+
+        var word = spelling.ToLowerInvariant();
+        if (word.Length < 4) return -1;
+        var final = word[^1];
+        if (final != 's' && final != 'd') return -1;
+
+        // "roses" -> "rose", "boxes" -> "box", "waited" -> "wait", "collected" -> "collect".
+        bool isSuffix = _dictionary.TryLookup(word[..^1], out _)
+                     || (word.Length > 4 && _dictionary.TryLookup(word[..^2], out _));
+        return isSuffix ? phones.Length - 2 : -1;
     }
 
     /// <summary>
