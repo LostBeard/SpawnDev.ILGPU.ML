@@ -16,11 +16,8 @@ hand-written. espeak-ng was used only as a measuring instrument, the way a compi
 ## Using it
 
 ```csharp
-var dictionary = PronunciationDictionary.Load("cmudict.dict");
-var phonemizer = new EnglishPhonemizer(dictionary)
-{
-    LetterToSound = LetterToSound.Load("lts-model.txt"),   // optional: pronounce unknown words
-};
+// Everything is embedded in the assembly - no files to fetch, host or version.
+var phonemizer = EmbeddedData.CreatePhonemizer();
 
 phonemizer.ToIpa("She waited for 2 more minutes.");
 // ʃiː wˈeɪɾᵻd fɔːɹ tˈuː mˈɔːɹ mˈɪnəts .
@@ -29,13 +26,14 @@ phonemizer.ToSymbols("...");        // one IPA symbol per entry, ready to map to
 phonemizer.LastUnknownWords;        // words the dictionary did not have, whether or not they were sounded out
 ```
 
-Text goes through four stages, and each can be inspected or replaced:
+Text goes through five stages, and each can be inspected or replaced:
 
 | stage | what it does |
 |---|---|
 | `EnglishTextNormalizer` | "1999" to "nineteen ninety-nine", "$1.50" to "one dollar, fifty cents", "Dr." to "doctor" |
 | `PronunciationDictionary` | 126k word lookup |
 | `EnglishPhonemizer` rules | stress placement, function-word destressing, tapping, the LOT-CLOTH split, reduced endings |
+| `Homographs` | "the record" against "to record", "the wind blows" against "wind the clock" |
 | `WordDecomposer` then `LetterToSound` | unknown words: derive from a known stem, or sound out from spelling |
 
 ## How good is it
@@ -48,7 +46,7 @@ from intuition. The method and the full numbers are in `Plans/mit-phonemizer-202
 | | disagreement |
 |---|---|
 | the sentences the rules were tuned on | 4.2% |
-| **120 sentences never tuned on** | **4.5%** |
+| **120 sentences never tuned on** | **4.4%** |
 
 It generalises: the held-out number tracks the tuned one.
 
@@ -64,10 +62,21 @@ It generalises: the held-out number tracks the tuned one.
 noise seed - once from the reference frontend's phonemes, once from ours - and both transcribed. Any
 difference is the phonemizer and nothing else.
 
+| over 120 sentences never tuned on | mean word error |
+|---|---|
+| the reference frontend (espeak-ng, GPL) | 9.1% |
+| **this library** | **7.2%** |
+
+The claim is PARITY - the small edge could be noise at that sample size. What matters is that the GPL
+dependency can be removed without the audio getting worse.
+
 ## What it does not do yet
 
-- **Homographs.** "Record" the noun and "record" the verb are stressed differently; this always picks the
-  dictionary's first pronunciation. That matters because stress is what TTS models punish hardest.
+- **Homographs are handled shallowly.** "The record" against "to record", and "the wind blows" against
+  "wind the clock", are read from the PREVIOUS WORD only. That covers the common cases. It cannot help
+  where the two readings differ by MEANING rather than part of speech - "bass" the fish against the
+  register, "tear" the eye against the rip, "read" present against past - and for those a single default
+  is chosen and documented rather than guessed at per sentence.
 - **Letter-to-sound is a baseline.** 43.7% is a working number, not a good one. Published systems reach
   higher.
 - **English only.**

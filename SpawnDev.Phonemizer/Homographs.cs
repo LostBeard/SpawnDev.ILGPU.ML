@@ -73,13 +73,13 @@ public static class Homographs
         new(StringComparer.OrdinalIgnoreCase)
         {
             ["wind"] = ("IH", "AY"),      // the wind blows / wind the clock
-            ["live"] = ("IH", "IH"),      // to live, live wires are rarer in ordinary text
+            ["live"] = ("IH", "IH"),      // the verb; "live wire" would need a cue we do not have
             ["close"] = ("S", "Z"),       // close by / to close it
             ["use"] = ("S", "Z"),         // the use of it / to use it
-            ["lead"] = ("IY", "IY"),      // to lead; the metal is the rarer reading
-            ["read"] = ("IY", "IY"),      // present tense reads more often than past
+            ["lead"] = ("IY", "IY"),      // the verb; the metal would need a cue we do not have
+            ["read"] = ("IY", "IY"),      // present tense; the past ("he read it") needs a cue we do not have
             ["minute"] = ("IH", null),    // the time, overwhelmingly
-            ["bass"] = ("EY", null),      // the register, in ordinary text
+            ["bass"] = ("EY", null),      // the register - a coin flip against the fish, chosen not measured
             ["wound"] = ("UW", null),     // the injury
         };
 
