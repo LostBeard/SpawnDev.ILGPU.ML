@@ -851,7 +851,37 @@ identically has nothing for an ear to arbitrate.
       LinearResample). Pre-existing, unrelated to g2p, still open, matters when the reference clip is
       not already 24 kHz.
 
+## Where to pick up (read this first)
+
+The MIT phonemizer is **built, measured and at parity with GPL espeak-ng**. Nothing is half-finished; the
+list below is what would make it better, in the order I would take it.
+
+1. **Letter-to-sound is the weakest component.** 43.7% of unknown words exactly right (49.5% with
+   decomposition). Published systems do better. The trained model is a plain context lookup with backoff
+   - a better model class is the obvious next step, and `tools/lts-train` already reports held-out
+   accuracy so any replacement can be compared honestly.
+2. **The remaining 4.0% symbol disagreement** is dominated by classes the sensitivity study measured as
+   harmless or cosmetic. ⚠️ Read the proxy-versus-goal section before optimising this number: it has
+   already been improved once at the cost of the audio.
+3. **A cleaner public-domain reference voice.** The LibriVox clip works and has no bleed, but it is an
+   amateur recording with room tone and measures 4.7% where a studio clip measured 2.3% on the same
+   sentences. Swapping it is a one-command change now.
+4. **`SpeakVerifiedAsync` is built but not wired into anything that speaks.** Rose would benefit
+   immediately: it rescued both of the sentences TJ singled out by ear.
+5. **Never measured**: how any of this behaves on non-Harvard text - conversational sentences, questions,
+   names in running speech. Every number here comes from read-aloud declaratives.
+
 ## Session log
+
+- **2026-08-28 (Tuvok)**: Found the prompt bleed's real cause - the packaged `prompt.wav` is paired with a
+  transcript that is not what it says, worth ~6 points of word error to BOTH frontends. Replaced it with
+  a Creative Commons Public Domain Mark clip from LibriVox whose transcript is standardized and therefore
+  known; all 131 fixtures repointed. Re-ran the sensitivity study clean and **retracted a headline**:
+  "function-word stress costs 18.2%" is 2.8% on a good clip, and the claim was corrected in the plan, the
+  README and the library's own XML docs. Built `SpeakVerifiedAsync` (the synthesiser listens to itself and
+  re-rolls) after measuring that ZipVoice garbles some noise draws for both frontends - it rescued 2 of 2
+  known-bad sentences. Also: `trimsweep` proved trimming was treating a symptom, and was left at 0.
+
 
 - **2026-08-27 (Tuvok)**: Phase 1 REPLICATED at 432 renders with a stronger grader, a positive control
   and an acoustic second axis. Stress is everything: all three stress failures cost more than
