@@ -681,6 +681,29 @@ before the sentence - which is the model, not either frontend, and is why the sc
 the head. The 11 sentences where ours lost are listed by the tool, worst first, and are the place to
 look next: "miles around" came out "miles round", "some flower seeds" came out "and flower seeds".
 
+#### 🔴 THE MODEL IS UNSTABLE ACROSS NOISE DRAWS - and it was being scored as phonemizer quality
+
+The two sentences where the shipping build lost badly to the reference turned out not to be phonemizer
+failures at all. Their symbol differences are TWO SYMBOLS each (5%), yet the audio collapsed completely -
+including the PROMPT region, which is identical input for both. Rendering the same tokens at other seeds
+settled it:
+
+```
+the-lawyer, OURS:       s7 0%    s99 0%    s20260828 0%    s1234 57%
+the-slush, REFERENCE:   s7 0%    s1234 0%  s99 100%        s20260828 86%
+```
+
+**ZipVoice produces garbage on some (tokens, seed) pairs, and it hits BOTH frontends.** A single seed per
+sentence therefore measures model instability alongside phonemizer quality, and cannot tell them apart.
+
+Consequences:
+- **The end-to-end gate should use several seeds per sentence.** One seed was enough to establish parity
+  but not to attribute a per-sentence failure to anything.
+- **Before blaming the phonemizer for a bad render, re-render it at another seed.** Two of the six
+  sentences TJ graded by ear were this, not us.
+- **For production this is a real defect with a real mitigation**: the stack already contains a speech
+  recogniser, so a synthesised line can be transcribed and re-rolled when it does not match the text.
+
 `tools/zipvoice-listen` renders an end-to-end run as a listening page too - pairs of the same sentence,
 reference against ours, ordered by where the transcripts disagreed most, since a pair that transcribed
 identically has nothing for an ear to arbitrate.
