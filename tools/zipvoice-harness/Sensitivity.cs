@@ -612,8 +612,29 @@ public static class Sensitivity
 
     // ---- Helpers --------------------------------------------------------------------------------------
 
+    /// <summary>Find a fixture's reference clip, wherever it lives.</summary>
+    /// <remarks>
+    /// A relative path used to resolve against the MODEL directory only, which meant a fixture could only
+    /// ever point at a clip shipped with the model. The repo now carries its own public-domain reference
+    /// clip, so the search also covers the fixtures folder that travels with this harness - and a fixture
+    /// can name it portably instead of embedding one machine's absolute path.
+    /// </remarks>
     public static string ResolvePromptWav(string modelDir, ZipVoiceFixture fixture)
-        => Path.IsPathRooted(fixture.PromptWav) ? fixture.PromptWav : Path.Combine(modelDir, fixture.PromptWav);
+    {
+        if (Path.IsPathRooted(fixture.PromptWav)) return fixture.PromptWav;
+        foreach (var root in new[]
+        {
+            modelDir,
+            Path.Combine(AppContext.BaseDirectory, "fixtures"),
+            AppContext.BaseDirectory,
+            Environment.CurrentDirectory,
+        })
+        {
+            var candidate = Path.Combine(root, fixture.PromptWav);
+            if (File.Exists(candidate)) return candidate;
+        }
+        return Path.Combine(modelDir, fixture.PromptWav);   // unchanged behaviour, so the error names it
+    }
 
     private static (Dictionary<long, string> IdToSym, Dictionary<string, long> SymToId) LoadTokens(string path)
     {
