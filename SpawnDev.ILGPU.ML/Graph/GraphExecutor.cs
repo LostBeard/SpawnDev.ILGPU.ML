@@ -815,8 +815,25 @@ public class GraphExecutor : IDisposable
                 };
                 var (strideC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
                     SpawnDev.ILGPU.ML.Operators.ConvOperator.ResolveConv2DSpatialParams(convCtx, xShapeC, wShapeC, Format);
-                var (_, _, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
+                var (_, inCC, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
                 var (outCC, _, kHC, kWC) = LayoutHelper.GetWeightDims(wShapeC, Format);
+
+                // DEPTHWISE: w[0] is NOT the output channel count. A depthwise weight is [1,kH,kW,C] in NHWC
+                // (and [C,1,kH,kW] with group==C in NCHW), so GetWeightDims reports outC=1 and the channel
+                // axis below would be set to 1 - an inC-times-too-small buffer the depthwise kernel overruns.
+                // ConvOperator.InferOutputShapes already resolves this; this override has to AGREE with it,
+                // or it replaces a correct compiled shape with a wrong one.
+                //
+                // Not hypothetical: the recomputed channel count differs from the compiled one on every
+                // depthwise conv, so this fired on all of them and corrupted each - EfficientNetLite0 and
+                // BlazeFace failed on ALL SIX backends with "DepthwiseConv2D NHWC output buffer too small:
+                // output.Length=12544 ... will write 401408". The "only override when it differs, so zero
+                // regression risk" reasoning holds for standard convs and inverts here: for depthwise,
+                // differing is the SYMPTOM, not the trigger.
+                int groupC = convCtx.GetInt("group", 1);
+                if (groupC == -1) groupC = inCC;                       // TFLite depthwise sentinel
+                if (groupC > 1 && groupC == inCC && (outCC == 1 || outCC == groupC))
+                    outCC = inCC;
                 int effKHC = dilationHC * (kHC - 1) + 1;
                 int effKWC = dilationWC * (kWC - 1) + 1;
                 int outHC = (inHC + padTopC + padBottomC - effKHC) / strideC + 1;
@@ -2425,8 +2442,25 @@ public class GraphExecutor : IDisposable
                 };
                 var (strideC, padTopC, padLeftC, padBottomC, padRightC, dilationHC, dilationWC) =
                     SpawnDev.ILGPU.ML.Operators.ConvOperator.ResolveConv2DSpatialParams(convCtx, xShapeC, wShapeC, Format);
-                var (_, _, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
+                var (_, inCC, inHC, inWC) = LayoutHelper.GetDims(xShapeC, Format);
                 var (outCC, _, kHC, kWC) = LayoutHelper.GetWeightDims(wShapeC, Format);
+
+                // DEPTHWISE: w[0] is NOT the output channel count. A depthwise weight is [1,kH,kW,C] in NHWC
+                // (and [C,1,kH,kW] with group==C in NCHW), so GetWeightDims reports outC=1 and the channel
+                // axis below would be set to 1 - an inC-times-too-small buffer the depthwise kernel overruns.
+                // ConvOperator.InferOutputShapes already resolves this; this override has to AGREE with it,
+                // or it replaces a correct compiled shape with a wrong one.
+                //
+                // Not hypothetical: the recomputed channel count differs from the compiled one on every
+                // depthwise conv, so this fired on all of them and corrupted each - EfficientNetLite0 and
+                // BlazeFace failed on ALL SIX backends with "DepthwiseConv2D NHWC output buffer too small:
+                // output.Length=12544 ... will write 401408". The "only override when it differs, so zero
+                // regression risk" reasoning holds for standard convs and inverts here: for depthwise,
+                // differing is the SYMPTOM, not the trigger.
+                int groupC = convCtx.GetInt("group", 1);
+                if (groupC == -1) groupC = inCC;                       // TFLite depthwise sentinel
+                if (groupC > 1 && groupC == inCC && (outCC == 1 || outCC == groupC))
+                    outCC = inCC;
                 int effKHC = dilationHC * (kHC - 1) + 1;
                 int effKWC = dilationWC * (kWC - 1) + 1;
                 int outHC = (inHC + padTopC + padBottomC - effKHC) / strideC + 1;
