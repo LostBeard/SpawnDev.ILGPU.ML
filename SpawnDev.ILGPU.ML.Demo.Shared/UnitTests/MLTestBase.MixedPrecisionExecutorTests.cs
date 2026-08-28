@@ -10,7 +10,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// <summary>
 /// CONTROLLED de-risk for the mixed-precision-activation executor cut
 /// (Plans/fp16-bf16-mixed-precision-activations-2026-06-16.md): run a small real graph (Conv→Relu→Conv with
-/// 32×32 feature maps ≥4096 elems, so the eligibility floor fires) through <see cref="GraphExecutor"/> with
+/// 64×64 feature maps ≥4096 elems, so the eligibility floor fires) through <see cref="GraphExecutor"/> with
 /// <see cref="ActivationPrecision.F32"/> then <see cref="ActivationPrecision.F16"/>, and confirm the F16 run
 /// (intermediates stored fp16, operators still fp32, convert at boundaries) PRODUCES A CORRECT result close
 /// to F32 — not garbage — on EVERY backend. This de-risks the executor wiring on a 3-node graph BEFORE the
@@ -73,7 +73,13 @@ public abstract partial class MLTestBase
             using var ex = new GraphExecutor(accelerator, compiled, weights) { ActivationDtype = prec };
             using var inBuf = accelerator.Allocate1D(inData);
             using var hostBuf = accelerator.Allocate1D<float>(outN);
-            var outs = await ex.RunAsync(new Dictionary<string, Tensor> { ["input"] = new Tensor(inBuf.View, new[] { 1, 3, 32, 32 }) });
+            // The shape here MUST match the graph's declared input and the data actually allocated above
+            // (both [1,3,64,64]). It said [1,3,32,32] - a leftover from when this test used 32x32 maps -
+            // which describes 3,072 elements over a 12,288-element buffer. The executor believed the tensor,
+            // the Conv indexed past its extent, and an ILGPU bounds assert fired on an async continuation.
+            // On desktop that failed the test; in the browser it EXITED THE WASM RUNTIME, which cost the
+            // whole browser lane (see ProjectTest.PageRuntimeDied).
+            var outs = await ex.RunAsync(new Dictionary<string, Tensor> { ["input"] = new Tensor(inBuf.View, new[] { 1, 3, 64, 64 }) });
             var o = outs["output"];
             await hostBuf.View.CopyFromAsync(o.Data.SubView(0, outN)); // GPU→GPU off the executor pool (ordered, all backends) before ex disposes
             await accelerator.SynchronizeAsync();
