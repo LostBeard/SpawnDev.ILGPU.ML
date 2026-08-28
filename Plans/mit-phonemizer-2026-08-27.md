@@ -124,6 +124,8 @@ character. Both port to C# with no licensing question.
   table has never been tested.
 - **One voice.** All renders use the same reference clip. Voice-dependent effects would not show up.
 - **WER is word-level.** It cannot see an accent, an odd rhythm, or a mechanical delivery.
+- **The graders cannot see non-speech artifacts at all** - stutters, and audible breaths. A render with a
+  loud double exhale in the middle scored 0% word error, because a breath is not a word.
 - **The graders cannot see disfluency at all.** Whisper tidies stutters away and the acoustic metric is
   relative to a control that may itself stutter. Confirmed by ear, then measured at a floor of 3.2% of
   renders. A human listening pass is not optional at any phase.
@@ -279,6 +281,19 @@ larger than a 7% noise source that lands on 3% of renders.
 **Is it ours? No.** sherpa-onnx rendering the same sentence with the same prompt produced
 *"understand that make me more their wood, rather water the better city garden"* - the same region,
 mangled worse than ours. Same attribution as the prompt bleed below.
+
+#### A SECOND artifact the grader is blind to, found the same way
+
+TJ listened to the end-to-end pairs and reported, on "the little tales they tell are false", a
+"monotone/breathy ha ha - not like a laugh, more like someone breathing out loudly twice quickly". The
+transcriber does not report it: it is not a word, so it costs nothing in word error, and that clip scored
+**0%**. Same family as the stutter, same blind spot, found the same way - by a person listening.
+
+His other calls all matched the transcriber exactly, including two sentences where OURS sounds better
+than the reference ("soap can wash most dirt away", "the little tales they tell are false") and two where
+both frontends produce garbage ("sweet words work better than fierce", "the slush lay deep along the
+street"). When the transcript and a careful ear agree this closely, the automatic number is trustworthy
+FOR WHAT IT MEASURES - and these two artifacts are what it does not measure.
 
 **The lesson for the rest of this project:** the automatic graders measure whether the words survive.
 They do not measure whether it sounds like a person. Keep a human listening to the audio at every phase;

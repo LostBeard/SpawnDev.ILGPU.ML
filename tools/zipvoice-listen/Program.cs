@@ -53,8 +53,18 @@ var rows = doc.RootElement.EnumerateArray().Select(e => new Row(
 // that transcribed identically has nothing for an ear to arbitrate.
 if (endToEnd)
 {
-    // A results file can hold several configurations of "ours" from isolation runs. The page compares
-    // the shipping one against the reference; anything else would just be confusing to listen to.
+    // A results file can hold several configurations of "ours" from isolation runs, and silently picking
+    // one is how a listener ends up grading a build that was measured and REJECTED - which happened, and
+    // cost TJ an evening of careful listening to the wrong audio. Refuse instead.
+    var sources = rows.Select(r => r.Variant).Where(v => v.StartsWith("ours", StringComparison.Ordinal))
+                      .Distinct().OrderBy(v => v).ToList();
+    if (sources.Count > 1)
+    {
+        Console.WriteLine($"this run holds {sources.Count} configurations of ours: {string.Join(", ", sources)}");
+        Console.WriteLine("Which one ships? Re-run the gate so that only the shipping configuration is present,");
+        Console.WriteLine("or delete the others' rows. A page that quietly picks one is worse than no page.");
+        return 2;
+    }
     rows = rows.Where(r => r.Variant is "reference" or "ours").ToList();
     var byFixture = rows.GroupBy(r => (r.Fixture, r.Seed))
         .Where(g => g.Any(r => r.Variant == "ours") && g.Any(r => r.Variant == "reference"))
