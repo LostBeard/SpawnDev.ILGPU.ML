@@ -34,14 +34,27 @@ return command switch
                               args.Length > 2 ? args[2] : null),
     "verify" => RunVerify(args.Length > 1 ? args[1] : "fixtures/phase1",
                           args.Length > 2 ? args[2] : null),
+    "trimsweep" => RunTrimSweep(args.Length > 1 ? args[1] : "fixtures/phase1",
+                                args.Length > 2 ? args[2] : null),
     _ => Usage(command),
 };
 
 int Usage(string bad)
 {
     Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav] "
-                    + "| compare [fixture.json] | sensitivity [dir] [outDir] | endtoend [dir] [outDir] | verify [dir] [outDir]");
+                    + "| compare [fixture.json] | sensitivity [dir] [outDir] | endtoend [dir] [outDir] | verify [dir] [outDir] | trimsweep [dir] [outDir]");
     return 2;
+}
+
+// Where should the generated audio be cut away from the reference the model regenerates ahead of it?
+// See TrimSweep.cs. Nearly every render opens with a few words of the cloned voice, and the fix is a cut
+// point that has to be measured: too little leaves the preamble, too much eats the first word.
+int RunTrimSweep(string fixturePath, string? outDir)
+{
+    var loaded = LoadFixtures(fixturePath);
+    if (loaded == null) return 2;
+    outDir ??= Path.Combine(Path.GetTempPath(), "zipvoice-trimsweep");
+    return TrimSweep.RunAsync(modelDir, loaded, outDir, ReadWav, WriteWav).GetAwaiter().GetResult();
 }
 
 // Does listening to your own output rescue a garbled render? See VerifyRun.cs. ZipVoice produces garbage

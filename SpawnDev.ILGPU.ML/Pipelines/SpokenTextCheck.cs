@@ -41,6 +41,34 @@ public static class SpokenTextCheck
         return previous.Min() / (double)truth.Length;
     }
 
+    /// <summary>
+    /// Word error rate that charges for EVERYTHING, including words before and after the sentence.
+    /// </summary>
+    /// <remarks>
+    /// The strict counterpart of <see cref="WordErrorRate"/>. Use it when the leading words are the thing
+    /// being measured rather than an artifact to see past - as when tuning where the generated audio is
+    /// cut away from the reference clip the model regenerates ahead of it.
+    /// </remarks>
+    public static double WordErrorRateStrict(string expected, string heard)
+    {
+        var truth = Words(expected);
+        var hypothesis = Words(heard);
+        if (truth.Length == 0) return hypothesis.Length == 0 ? 0 : 1;
+
+        var previous = new int[hypothesis.Length + 1];
+        var current = new int[hypothesis.Length + 1];
+        for (int j = 0; j <= hypothesis.Length; j++) previous[j] = j;
+        for (int i = 1; i <= truth.Length; i++)
+        {
+            current[0] = i;
+            for (int j = 1; j <= hypothesis.Length; j++)
+                current[j] = Math.Min(Math.Min(previous[j] + 1, current[j - 1] + 1),
+                                      previous[j - 1] + (truth[i - 1] == hypothesis[j - 1] ? 0 : 1));
+            (previous, current) = (current, previous);
+        }
+        return previous[hypothesis.Length] / (double)truth.Length;
+    }
+
     private static string[] Words(string text)
     {
         if (string.IsNullOrEmpty(text)) return [];

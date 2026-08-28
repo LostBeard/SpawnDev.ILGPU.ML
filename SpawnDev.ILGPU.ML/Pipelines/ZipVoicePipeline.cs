@@ -122,6 +122,18 @@ public sealed class ZipVoicePipeline : IDisposable
     /// </remarks>
     public float ReferenceTailSilenceSeconds { get; set; } = 0.25f;
 
+    /// <summary>
+    /// Extra mel frames discarded from the START of the generated audio, beyond the reference itself.
+    /// </summary>
+    /// <remarks>
+    /// Renders routinely open with a few words of the reference clip's speech, as though the model
+    /// finished the prompt before starting the line. This trims further into the generated region. One
+    /// frame is <see cref="ZipVoiceConfig.HopLength"/> samples - about 10.7ms at 24 kHz - so a second of
+    /// bleed is roughly 94 frames. Default 0: cutting into speech that is wanted is worse than leaving a
+    /// preamble, so this only moves on evidence.
+    /// </remarks>
+    public int TrimGeneratedStartFrames { get; set; }
+
     public ZipVoicePipeline(IZipVoiceGraphs graphs, ZipVoiceConfig? config = null)
     {
         _graphs = graphs ?? throw new ArgumentNullException(nameof(graphs));
@@ -271,7 +283,16 @@ public sealed class ZipVoicePipeline : IDisposable
 
         // Drop the reference frames - the model regenerated them, but they are the voice we were GIVEN,
         // not the text we asked for.
-        int keptFrames = numFrames - promptFrames;
+        //
+        // TrimGeneratedStartFrames cuts further, because the boundary is not clean: renders routinely open
+        // with a few words of the reference clip's own speech. That is not this port - the reference
+        // implementation does it too, and worse - so the extra trim is exposed as a knob to be MEASURED
+        // rather than guessed at. One frame is HopLength samples: ~10.7ms at 24 kHz.
+        int keptFrames = numFrames - promptFrames - Math.Max(0, TrimGeneratedStartFrames);
+        if (keptFrames <= 0)
+            throw new InvalidOperationException(
+                $"TrimGeneratedStartFrames={TrimGeneratedStartFrames} would leave nothing to speak "
+              + $"({numFrames} frames generated, {promptFrames} of them the reference).");
 
         // Vocos wants [channels, frames] and unscaled log-mels, so transpose and undo the feature scale in
         // one pass.
@@ -279,7 +300,7 @@ public sealed class ZipVoicePipeline : IDisposable
         var mel = new float[featDim * keptFrames];
         for (int f = 0; f < keptFrames; f++)
         {
-            int src = (promptFrames + f) * featDim;
+            int src = (promptFrames + Math.Max(0, TrimGeneratedStartFrames) + f) * featDim;
             for (int c = 0; c < featDim; c++)
                 mel[c * keptFrames + f] = x[src + c] * invFeatScale;
         }
