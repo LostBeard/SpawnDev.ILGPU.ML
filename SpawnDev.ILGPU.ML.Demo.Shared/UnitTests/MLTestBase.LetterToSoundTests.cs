@@ -88,6 +88,47 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task LetterToSound_NeverReturnsAWordWithNoVowelAtAll() => await RunTest(_ =>
+    {
+        // The failure this guards is the one that turned "Aubriella" into "bɹl" - a word spelled with
+        // vowels coming back as bare consonants. It is unambiguous, because no English word is all
+        // consonants, and it is catastrophic rather than merely wrong: the word becomes unsayable.
+        //
+        // Here every vowel rule says SILENT, which is what a real model does when it has never seen a
+        // spelling. The ! rules are the last resort, used only when the result would otherwise have no
+        // vowel - a narrow trigger, chosen because three wider ones each measured WORSE (see
+        // tools/lts-train --analyze).
+        var lts = LetterToSound.Parse(new[]
+        {
+            "[b]\tB", "[l]\tL", "[r]\tR",
+            "[a]\t-", "[e]\t-",          // every vowel silent, so the word would come back as consonants
+            "![a]\tAH", "![e]\tEH",      // ...unless the last resort speaks up
+        });
+
+        var phones = lts.Predict("bralea");
+        if (!phones.Any(p => p.StartsWith("AH") || p.StartsWith("EH")))
+            throw new Exception("a word spelled with vowels came back with none: " + string.Join(" ", phones));
+        if (!phones.Any(p => p.EndsWith('1')))
+            throw new Exception("the rescued word still has no stressed syllable: " + string.Join(" ", phones));
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task LetterToSound_LastResortDoesNotFireOnAWordThatAlreadySpeaks() => await RunTest(_ =>
+    {
+        // The narrowness IS the feature. Letting the fallback fire whenever a letter came back silent
+        // cost 19.5 points on held-out words, because a silent letter is usually CORRECT - English is
+        // full of them. "cate" must still lose its final e even though a ! rule exists for it.
+        var lts = LetterToSound.Parse(new[] { "[c]\tK", "[a]\tAE", "[t]\tT", "[e]\t-", "![e]\tEH" });
+
+        var withSilent = lts.Predict("cate");
+        var without = lts.Predict("cat");
+        if (!withSilent.SequenceEqual(without))
+            throw new Exception($"the last resort fired on a word that already spoke: {string.Join(" ", withSilent)}");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Phonemizer_SoundsOutWordsTheDictionaryLacks() => await RunTest(_ =>
     {
         // The whole point: an unknown word still gets spoken, and is still REPORTED as unknown, because

@@ -62,7 +62,7 @@ int holdout = 5000, iterations = 6, minCount = 1;
 // Going wider is what a letter-to-sound model of this class has left to give: the errors are single
 // phones in nearly-right words, not a wrong idea about the word.
 int[] windows = [5, 4, 3, 2, 1, 0];
-bool analyze = false;
+bool analyze = false, analogyProbe = false;
 for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--dict" && i + 1 < args.Length) dictPath = args[++i];
@@ -73,6 +73,7 @@ for (int i = 0; i < args.Length; i++)
     if (args[i] == "--windows" && i + 1 < args.Length)
         windows = args[++i].Split(',').Select(int.Parse).OrderByDescending(w => w).ToArray();
     if (args[i] == "--analyze") analyze = true;
+    if (args[i] == "--analogy") analogyProbe = true;
 }
 if (!File.Exists(dictPath)) { Console.WriteLine($"no cmudict at {dictPath}"); return 2; }
 if (windows.Length == 0 || windows[^1] != 0)
@@ -208,6 +209,26 @@ if (minCount > 1)
 // means.
 var flatSounds = Compress(sound);
 var flatStress = Compress(stress);
+
+// ---- A vowel letter must never be silent as a LAST RESORT ------------------------------------------------
+// The single-letter rules are the backstop, and for "e" the majority answer is SILENT - correctly, since
+// word-final silent e is everywhere in English. But that backstop only answers when NO context rule matched
+// at any width, which means the model has never seen this spelling and has no idea. Answering "no sound at
+// all" there is the worst available guess: a run of unmatched letters emits nothing and the word comes back
+// with fewer syllables than it has vowels. "nevaeh" became "N AH1 V" - not a mispronunciation, a different
+// and shorter word - because a, e and h each fell to a silent backstop in a row.
+//
+// So each vowel letter also carries its best NON-SILENT single-letter emission, used only when the backstop
+// itself is what answered. Six extra rules; the file does not otherwise change, because every context rule
+// that legitimately says "silent" still says it.
+var vowelFallback = new Dictionary<char, string>();
+foreach (var vowel in "aeiouy")
+{
+    if (!sound[0].TryGetValue($"[{vowel}]", out var inner)) continue;
+    var loudest = inner.Where(kv => kv.Key.Length > 0).OrderByDescending(kv => kv.Value).ToList();
+    if (loudest.Count > 0) vowelFallback[vowel] = loudest[0].Key;
+}
+Console.WriteLine($"fallback : {string.Join(", ", vowelFallback.Select(kv => $"{kv.Key}->{kv.Value}"))}");
 Console.WriteLine($"rules    : {flatSounds.Count} sound + {flatStress.Count} stress kept of "
                 + $"{windows.Sum(w => sound[w].Count + stress[w].Count)} learned");
 
@@ -328,6 +349,22 @@ if (analyze)
         Console.WriteLine($"           of those {differ}: earliest-syllable right {firstRight}, "
                         + $"most-specific-rule right {widestRight}, neither {bothWrong}");
 
+    // ---- Catastrophic failures, which word-accuracy cannot see --------------------------------------
+    // "49.8% exactly right" treats a word that is one stress digit off and a word that lost half its
+    // syllables as the same failure. They are not: "nevaeh" comes back as "N AH1 V", which is not a
+    // mispronunciation but a different, shorter word. Those are the failures a listener notices, so they
+    // get counted separately.
+    int truncated = 0, voiceless = 0;
+    foreach (var (word, phones) in test)
+    {
+        var predicted = Predict(word);
+        if (phones.Length >= 4 && predicted.Length * 2 <= phones.Length) truncated++;
+        if (phones.Any(IsVowel) && !predicted.Any(IsVowel)) voiceless++;
+    }
+    Console.WriteLine();
+    Console.WriteLine($"           CATASTROPHIC: {truncated} words lost half their phones or more, "
+                    + $"{voiceless} came back with no vowel at all");
+
     Console.WriteLine();
     Console.WriteLine($"           substitutions: {vowelSubs} on vowels, {consonantSubs} on consonants; "
                     + $"{tooMany} phones too many, {tooFew} too few");
@@ -368,6 +405,116 @@ if (fired > 0)
 Console.WriteLine($"           decompose-then-guess overall: {combined / (double)test.Count:P1} against "
                 + $"{exact / (double)test.Count:P1} for guessing alone");
 
+// ---- Would pronunciation by ANALOGY help? (--analogy) ---------------------------------------------------
+// The idea: an unknown word that RHYMES with a dictionary word should borrow that word's ending outright
+// rather than guess it letter by letter. "aubriella" is not in CMUdict, but "gabriella" is, and they share
+// seven letters - so the ending, INCLUDING WHERE THE STRESS FALLS, is already known and observed rather
+// than predicted.
+//
+// This probe measures the ceiling BEFORE any of it is built into the library. It answers three things the
+// design depends on and none of which I want to assume:
+//   1. COVERAGE - how often does a held-out word even share a long-enough ending with a training word?
+//   2. Is analogy RIGHT when it fires, and is it right more often than guessing the same word?
+//   3. Which suffix length and how much support - long and rare, or short and well-attested?
+//
+// The suffix table is built from TRAINING words only, so a held-out word is as unknown to it as it would
+// be at runtime. Phones carry their stress digits, because borrowing the stress is the whole point.
+if (analogyProbe)
+{
+    const int minLen = 3, maxLen = 8;
+    var analogy = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+    foreach (var (word, phones) in train)
+    {
+        var path = Align(word, phones.Select(Bare).ToArray());
+        if (path == null) continue;
+
+        var per = new int[word.Length];
+        for (int i = 0; i < word.Length; i++) per[i] = path[i].Length == 0 ? 0 : path[i].Split(' ').Length;
+        if (per.Sum() != phones.Length) continue;      // the alignment must account for every phone
+
+        for (int k = minLen; k <= maxLen && word.Length > k; k++)
+        {
+            int consumed = per.Take(word.Length - k).Sum();
+            if (consumed >= phones.Length) continue;   // the ending carries no phones at all
+            Record(analogy, word[^k..], string.Join(' ', phones.Skip(consumed)));
+        }
+    }
+    Console.WriteLine();
+    Console.WriteLine($"ANALOGY  : {analogy.Count} distinct endings of {minLen}-{maxLen} letters, from training words only");
+
+    // Firing on nearly every word is the failure mode to watch for: a 3-letter ending matches SOMETHING
+    // almost always, which is not a rhyme, and it overrides a correct guess as often as it fixes a wrong
+    // one. The question is therefore not "does analogy work" but "how long and how well-attested does the
+    // shared ending have to be before borrowing it beats guessing".
+    Console.WriteLine("  shortest  support  fires on         right when it fires   guessing on those   OVERALL");
+    (double Best, int Len, int Sup) best = (exact / (double)test.Count, 0, 0);
+    foreach (var shortest in new[] { 4, 5, 6, 7, 8 })
+        foreach (var support in new[] { 1, 2, 4, 8 })
+        {
+            int hits = 0, right = 0, guessRightOnSame = 0, combinedRight = 0;
+            foreach (var (word, phones) in test)
+            {
+                var truth = phones.ToArray();
+                var byAnalogy = PredictByAnalogy(word, analogy, support, shortest, maxLen);
+                if (byAnalogy != null)
+                {
+                    hits++;
+                    if (byAnalogy.SequenceEqual(truth)) { right++; combinedRight++; }
+                    if (Predict(word).SequenceEqual(truth)) guessRightOnSame++;
+                }
+                else if (Predict(word).SequenceEqual(truth)) combinedRight++;
+            }
+            double overall = combinedRight / (double)test.Count;
+            if (overall > best.Best) best = (overall, shortest, support);
+            Console.WriteLine($"  {shortest,-9} {support,-8} {hits,5} ({hits / (double)test.Count,5:P1})   "
+                            + $"{right,5} ({right / (double)Math.Max(hits, 1),5:P1})        "
+                            + $"{guessRightOnSame,5} ({guessRightOnSame / (double)Math.Max(hits, 1),5:P1})     "
+                            + $"{overall:P1}{(overall > exact / (double)test.Count ? "  <-- beats guessing" : "")}");
+        }
+    // A CHEAPER VARIANT worth measuring before any of this ships. Borrowing whole phones replaces work the
+    // letter-to-sound model already does well - its errors are single phones in nearly-right words. What it
+    // is genuinely bad at is STRESS (7.5% of words have every sound right and the wrong stress, and stress
+    // is what the downstream model punishes hardest). So: keep the guessed phones, and borrow only the
+    // stress DIGITS from the rhyming word. Applied only when the borrowed ending has the same number of
+    // phones the guess produced for those letters, since otherwise the digits do not line up.
+    Console.WriteLine();
+    Console.WriteLine("  STRESS-ONLY borrowing (keep the guessed phones, take only the ending's stress):");
+    foreach (var shortest in new[] { 4, 5, 6 })
+        foreach (var support in new[] { 1, 2, 4 })
+        {
+            int hits = 0, combinedRight = 0;
+            foreach (var (word, phones) in test)
+            {
+                var truth = phones.ToArray();
+                var restressed = RestressByAnalogy(word, analogy, support, shortest, maxLen);
+                if (restressed != null) hits++;
+                if ((restressed ?? Predict(word)).SequenceEqual(truth)) combinedRight++;
+            }
+            double overall = combinedRight / (double)test.Count;
+            Console.WriteLine($"  {shortest,-9} {support,-8} {hits,5} ({hits / (double)test.Count,5:P1}) "
+                            + $"restressed                                {overall:P1}"
+                            + (overall > exact / (double)test.Count ? "  <-- beats guessing" : ""));
+        }
+
+    Console.WriteLine();
+    Console.WriteLine($"  guessing alone: {exact / (double)test.Count:P1}. Best analogy setting: "
+                    + (best.Len == 0 ? "NONE - analogy does not beat guessing at any setting tried."
+                                     : $"shortest {best.Len}, support {best.Sup} -> {best.Best:P1}"));
+
+    // The word this whole component exists for, and its dictionary family.
+    Console.WriteLine();
+    // The spot check runs at the setting the sweep chose, not at the loosest one - a name it mangles at
+    // "any 3-letter ending" says nothing about the configuration that would actually ship.
+    Console.WriteLine($"  (at the best setting: shortest {Math.Max(best.Len, minLen)}, support {Math.Max(best.Sup, 2)})");
+    foreach (var probe in new[] { "aubriella", "briella", "nevaeh", "kayleigh", "makayla", "elowen", "jaxon",
+                                  "anthropic", "blazor", "ryleigh", "tuvok" })
+    {
+        var byAnalogy = PredictByAnalogy(probe, analogy, Math.Max(best.Sup, 2), Math.Max(best.Len, minLen), maxLen);
+        Console.WriteLine($"  {probe,-12} analogy: {(byAnalogy == null ? "(no ending matched)" : string.Join(' ', byAnalogy)),-34}"
+                        + $"  guessing: {string.Join(' ', Predict(probe))}");
+    }
+}
+
 // ---- Write the model -----------------------------------------------------------------------------------
 // Plain text, so it can be read, diffed and corrected by hand. The rules were flattened above, before
 // anything was measured, so what is written here is exactly what was scored.
@@ -388,6 +535,9 @@ sb.AppendLine("# A context states its own width by its shape: [a] is the letter 
 sb.AppendLine("# either side, ^c[a]t$ is two. Lookup takes the WIDEST context present, so the widths in");
 sb.AppendLine("# this file need no declaring and can change without a code change.");
 sb.AppendLine("# Only rules that differ from what a narrower context would answer are kept.");
+sb.AppendLine("# Last-resort rules: !context TAB phones - used ONLY when the single-letter backstop answered");
+sb.AppendLine("# and said the letter is silent. A vowel that no context rule recognises must still make a");
+sb.AppendLine("# sound, or a run of unknown letters vanishes and the word loses syllables.");
 sb.AppendLine($"# Held out: {exact / (double)test.Count:P1} of words exactly right, "
             + $"{phoneErrors / (double)phoneTotal:P1} phoneme error rate, on {test.Count} words never trained on.");
 
@@ -395,6 +545,8 @@ foreach (var rule in flatSounds.OrderBy(kv => kv.Key.Length).ThenBy(kv => kv.Key
     sb.Append(rule.Key).Append('\t').AppendLine(rule.Value.Length == 0 ? "-" : rule.Value);
 foreach (var rule in flatStress.OrderBy(kv => kv.Key.Length).ThenBy(kv => kv.Key, StringComparer.Ordinal))
     sb.Append('*').Append(rule.Key).Append('\t').AppendLine(rule.Value);
+foreach (var rule in vowelFallback.OrderBy(kv => kv.Key))
+    sb.Append('!').Append('[').Append(rule.Key).Append(']').Append('\t').AppendLine(rule.Value);
 
 File.WriteAllText(outPath, sb.ToString());
 Console.WriteLine();
@@ -462,9 +614,161 @@ string[]? Align(string word, string[] phones)
 
 // THE model: the flat rules that get written, read exactly the way the runtime reads them. Everything is
 // scored through this, so training cannot measure one model and ship another.
-string[] Predict(string word) => Assemble(word,
-    i => LookupFlat(flatSounds, word, i).Emission,
-    i => LookupFlat(flatStress, word, i));
+string[] Predict(string word)
+{
+    var spoken = Assemble(word, i => SoundAt(word, i, repair: false),
+                                i => LookupFlat(flatStress, word, i));
+
+    // A last-resort repair for a word that came back UNSAYABLE: spelled with vowels, pronounced with none.
+    // That is not a mispronunciation, it is the failure that once turned "Aubriella" into the consonants
+    // "bɹl", and it is unambiguous - no English word is all consonants.
+    //
+    // FOUR triggers were measured on the same held-out 5,000 words, and only this one pays:
+    //
+    //   trigger                             exactly right   words with no vowel at all
+    //   none (leave it broken)                    49.8%            11
+    //   whenever the backstop answered            30.3%             6
+    //   fewer vowels than vowel groups            46.7%             1
+    //   three-plus silent letters in a row        49.5%            11
+    //   NO VOWEL AT ALL (this one)                49.9%             1
+    //
+    // The obvious one - fire whenever the single-letter backstop answered - is the WORST, and the reason
+    // matters: under the redundancy compression, resolving at width 0 is the NORMAL case, not a sign the
+    // model has no idea, because wide rules that agreed with it were dropped precisely BECAUSE they agreed.
+    // The compressed file cannot tell "no evidence" from "the evidence agreed", so the trigger has to be
+    // the OUTCOME rather than how the answer was reached. Counting vowel GROUPS looks principled and
+    // over-fires: English really does spell more of them than it says ("business" has u, i, e against two
+    // vowel sounds), so it cost 3.1 points to fix ten words.
+    if (!spoken.Any(IsVowel) && word.Any(c => "aeiouy".Contains(c)))
+        spoken = Assemble(word, i => SoundAt(word, i, repair: true),
+                                i => LookupFlat(flatStress, word, i));
+    return spoken;
+}
+
+// The sound for one letter. In repair mode a vowel letter that came back silent is given its best
+// non-silent single-letter emission instead.
+string SoundAt(string word, int i, bool repair)
+{
+    var emission = LookupFlat(flatSounds, word, i).Emission;
+    if (repair && emission.Length == 0 && vowelFallback.TryGetValue(word[i], out var loud)) return loud;
+    return emission;
+}
+
+// Pronunciation by analogy: take the LONGEST ending this word shares with a dictionary word and use that
+// word's phones for it, spelling out only what comes before by context rules. Null when no ending matches,
+// which is the caller's signal to fall back to guessing the whole word.
+//
+// Stress is the reason this is worth doing, and it needs a rule. A borrowed ending carries stress OBSERVED
+// in a real word, which is far better evidence than a per-letter model - so when the ending brings a
+// primary, any primary the prefix predicted is demoted to SECONDARY rather than dropped. That is what the
+// dictionary itself does with this shape: gabriella is G AA2 B R IY0 EH1 L AA2, isabella IH2 Z AH0 B EH1 L
+// AH0 - secondary on the opening syllable, primary on the borrowed ending. When the ending brings no
+// primary ("napster" -> S T ER0), the prefix keeps its own.
+string[]? PredictByAnalogy(string word, Dictionary<string, Dictionary<string, int>> analogy,
+                           int minSupport, int minLen, int maxLen)
+{
+    for (int k = Math.Min(maxLen, word.Length - 1); k >= minLen; k--)
+    {
+        if (!analogy.TryGetValue(word[^k..], out var inner)) continue;
+        var best = inner.OrderByDescending(v => v.Value).First();
+        if (best.Value < minSupport) continue;
+
+        // The prefix is spelled out in the context of the WHOLE word - the letters of the ending are still
+        // its right-hand context, which is what makes "aubr" in "aubriella" behave like "gabr" in
+        // "gabriella" rather than like a word ending in "aubr".
+        var output = new List<string>();
+        for (int i = 0; i < word.Length - k; i++)
+        {
+            var emission = LookupFlat(flatSounds, word, i).Emission;
+            if (emission.Length == 0) continue;
+            var digits = LookupFlat(flatStress, word, i).Emission;
+            var phones = emission.Split(' ');
+            for (int p = 0; p < phones.Length; p++)
+                output.Add(IsVowel(phones[p])
+                    ? phones[p] + (p < digits.Length && char.IsDigit(digits[p]) ? digits[p] : '0')
+                    : phones[p]);
+        }
+
+        var borrowed = best.Key.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        bool borrowedCarriesPrimary = borrowed.Any(p => p.EndsWith('1'));
+        if (borrowedCarriesPrimary)
+            for (int i = 0; i < output.Count; i++)
+                if (output[i].EndsWith('1')) output[i] = Bare(output[i]) + "2";
+
+        output.AddRange(borrowed);
+
+        // Exactly one primary, same contract as everywhere else.
+        bool seen = false;
+        for (int i = 0; i < output.Count; i++)
+        {
+            if (!output[i].EndsWith('1')) continue;
+            if (!seen) { seen = true; continue; }
+            output[i] = Bare(output[i]) + "0";
+        }
+        if (output.Any(IsVowel) && !output.Any(x => x.EndsWith('1')))
+        {
+            int first = output.FindIndex(IsVowel);
+            output[first] = Bare(output[first]) + "1";
+        }
+        return output.ToArray();
+    }
+    return null;
+}
+
+// Keep the guessed phones; take only the STRESS DIGITS from the rhyming word. Null when no ending matches
+// or when the borrowed ending covers a different number of phones than the guess produced for those same
+// letters - in that case the digits cannot be lined up, and inventing an alignment would be worse than
+// leaving the guess alone.
+string[]? RestressByAnalogy(string word, Dictionary<string, Dictionary<string, int>> analogy,
+                            int minSupport, int minLen, int maxLen)
+{
+    for (int k = Math.Min(maxLen, word.Length - 1); k >= minLen; k--)
+    {
+        if (!analogy.TryGetValue(word[^k..], out var inner)) continue;
+        var pick = inner.OrderByDescending(v => v.Value).First();
+        if (pick.Value < minSupport) continue;
+
+        var guess = Predict(word);
+        var borrowed = pick.Key.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        // How many phones did the guess produce for the ending's letters?
+        int prefixPhones = 0;
+        for (int i = 0; i < word.Length - k; i++)
+        {
+            var emission = LookupFlat(flatSounds, word, i).Emission;
+            if (emission.Length > 0) prefixPhones += emission.Split(' ').Length;
+        }
+        if (guess.Length - prefixPhones != borrowed.Length) continue;
+
+        var output = guess.ToArray();
+        for (int i = 0; i < borrowed.Length; i++)
+        {
+            int at = prefixPhones + i;
+            if (!IsVowel(output[at]) || !IsVowel(borrowed[i])) continue;
+            output[at] = Bare(output[at]) + (char.IsDigit(borrowed[i][^1]) ? borrowed[i][^1] : '0');
+        }
+
+        // The borrowed ending decides where the primary is when it carries one.
+        if (borrowed.Any(p => p.EndsWith('1')))
+            for (int i = 0; i < prefixPhones; i++)
+                if (output[i].EndsWith('1')) output[i] = Bare(output[i]) + "2";
+
+        bool seen = false;
+        for (int i = 0; i < output.Length; i++)
+        {
+            if (!output[i].EndsWith('1')) continue;
+            if (!seen) { seen = true; continue; }
+            output[i] = Bare(output[i]) + "0";
+        }
+        if (output.Any(IsVowel) && !output.Any(x => x.EndsWith('1')))
+        {
+            int first = Array.FindIndex(output, IsVowel);
+            output[first] = Bare(output[first]) + "1";
+        }
+        return output;
+    }
+    return null;
+}
 
 // The uncompressed tables, kept only to report what the compression costs or gains.
 string[] PredictCounted(string word) => Assemble(word,

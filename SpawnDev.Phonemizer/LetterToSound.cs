@@ -35,12 +35,15 @@ public sealed class LetterToSound
 {
     private readonly Dictionary<string, string> _sounds;
     private readonly Dictionary<string, string> _stress;
+    private readonly Dictionary<char, string> _loudest;
     private readonly int _widest;
 
-    private LetterToSound(Dictionary<string, string> sounds, Dictionary<string, string> stress, int widest)
+    private LetterToSound(Dictionary<string, string> sounds, Dictionary<string, string> stress,
+                          Dictionary<char, string> loudest, int widest)
     {
         _sounds = sounds;
         _stress = stress;
+        _loudest = loudest;
         _widest = widest;
     }
 
@@ -52,6 +55,7 @@ public sealed class LetterToSound
     {
         var sounds = new Dictionary<string, string>(StringComparer.Ordinal);
         var stress = new Dictionary<string, string>(StringComparer.Ordinal);
+        var loudest = new Dictionary<char, string>();
         int widest = 0;
         foreach (var line in lines)
         {
@@ -60,17 +64,19 @@ public sealed class LetterToSound
             if (tab <= 0) continue;
             var emission = line[(tab + 1)..].Trim();
 
-            // Stress rules are prefixed with * so a single file carries both models.
-            var context = line[0] == '*' ? line[1..tab] : line[..tab];
+            // Stress rules are prefixed with *, last-resort rules with !, so one file carries all three.
+            var context = line[0] is '*' or '!' ? line[1..tab] : line[..tab];
             if (line[0] == '*') stress[context] = emission;
+            else if (line[0] == '!') { if (context.Length == 3) loudest[context[1]] = emission; }
             else sounds[context] = emission == "-" ? "" : emission;
+            if (line[0] == '!') continue;
 
             // A context is the letter in brackets plus the same number of letters either side, so its
             // length states its width. Reading it from the data is what lets a wider model load into
             // code that predates it.
             widest = Math.Max(widest, (context.Length - 3) / 2);
         }
-        return new LetterToSound(sounds, stress, widest);
+        return new LetterToSound(sounds, stress, loudest, widest);
     }
 
     /// <summary>Load a model from disk.</summary>
@@ -87,24 +93,19 @@ public sealed class LetterToSound
     {
         if (string.IsNullOrEmpty(word)) return [];
         var letters = word.ToLowerInvariant();
-        var output = new List<string>(letters.Length + 2);
+        var output = Spell(letters, lastResort: false);
 
-        for (int i = 0; i < letters.Length; i++)
-        {
-            if (letters[i] is < 'a' or > 'z') continue;
-            var emission = Widest(_sounds, letters, i);
-            if (string.IsNullOrEmpty(emission)) continue;
-
-            // Stress comes from its own model over the same contexts. Every vowel MUST come back carrying
-            // a digit: a vowel without one is not valid ARPAbet, and downstream it would be discarded as
-            // an unknown phone - which is how an entire name once came out as its consonants alone.
-            var phones = emission.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            var digits = Widest(_stress, letters, i) ?? "";
-            for (int k = 0; k < phones.Length; k++)
-                output.Add(IsVowel(phones[k])
-                    ? phones[k] + (k < digits.Length && char.IsDigit(digits[k]) ? digits[k] : '0')
-                    : phones[k]);
-        }
+        // A last-resort repair, for a word that came back UNSAYABLE: spelled with vowels and pronounced
+        // with none. That is not a mispronunciation, it is the failure that once turned "Aubriella" into
+        // the consonants "bɹl", and it is unambiguous because no English word is all consonants.
+        //
+        // The trigger is deliberately this narrow. Three wider ones were tried and measured on 5,000
+        // held-out words, and every one of them LOST: applying the fallback whenever the single-letter
+        // backstop answered cost 19.5 points, counting vowel groups cost 3.1, and a run of three silent
+        // letters cost 0.3. This one gains 0.1 while turning 11 unsayable words into 1. See
+        // <c>tools/lts-train --analyze</c>, which prints that table.
+        if (!output.Any(IsVowel) && letters.Any(c => "aeiouy".Contains(c)))
+            output = Spell(letters, lastResort: true);
 
         // Exactly ONE primary stress per word. The per-letter model can mark several, which is not
         // English - "Tuvok" came back with two - and stress is what the downstream model punishes
@@ -138,6 +139,37 @@ public sealed class LetterToSound
             output[first] = output[first][..^1] + "1";
         }
         return output.ToArray();
+    }
+
+    /// <summary>Sound out every letter, before any word-level stress rule is applied.</summary>
+    /// <param name="lastResort">
+    /// When true, a vowel letter the rules make silent is given its loudest single-letter sound instead.
+    /// Only ever used to rescue a word that came back with no vowel at all - see <see cref="Predict"/>.
+    /// </param>
+    private List<string> Spell(string letters, bool lastResort)
+    {
+        var output = new List<string>(letters.Length + 2);
+        for (int i = 0; i < letters.Length; i++)
+        {
+            if (letters[i] is < 'a' or > 'z') continue;
+            var emission = Widest(_sounds, letters, i);
+            if (string.IsNullOrEmpty(emission))
+            {
+                if (!lastResort || !_loudest.TryGetValue(letters[i], out var loud)) continue;
+                emission = loud;
+            }
+
+            // Stress comes from its own model over the same contexts. Every vowel MUST come back carrying
+            // a digit: a vowel without one is not valid ARPAbet, and downstream it would be discarded as
+            // an unknown phone - which is how an entire name once came out as its consonants alone.
+            var phones = emission.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            var digits = Widest(_stress, letters, i) ?? "";
+            for (int k = 0; k < phones.Length; k++)
+                output.Add(IsVowel(phones[k])
+                    ? phones[k] + (k < digits.Length && char.IsDigit(digits[k]) ? digits[k] : '0')
+                    : phones[k]);
+        }
+        return output;
     }
 
     /// <summary>A vowel phone, in ARPAbet, is one of these fifteen.</summary>
