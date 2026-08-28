@@ -23,14 +23,63 @@ var dictPath = @"D:\users\tj\Projects\_ref\cmudict\cmudict.dict";
 var modelDir = Environment.GetEnvironmentVariable("ZIPVOICE_MODEL_DIR")
     ?? @"D:\users\tj\Projects\SpawnDev.Reachy\SpawnDev.Reachy\models\sherpa-onnx-zipvoice-distill-zh-en-emilia";
 bool flapping = true, destress = true;
+string? wordList = null;
 for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--dict" && i + 1 < args.Length) dictPath = args[++i];
     if (args[i] == "--no-flap") flapping = false;
     if (args[i] == "--no-destress") destress = false;
+    if (args[i] == "--words" && i + 1 < args.Length) wordList = args[++i];
 }
 
 if (!File.Exists(dictPath)) { Console.WriteLine($"no cmudict at {dictPath} (pass --dict)"); return 2; }
+
+// ---- Pronounce words given on the command line (--words "aubriella tuvok ...") ------------------------
+// WHY THIS MODE EXISTS: the headline number below is STRUCTURALLY BLIND to letter-to-sound. Every one of
+// the 940 words in the fixtures is in CMUdict, so the guessing path never runs, and the probe would
+// report an unchanged 4.0% whether that model were improved, broken, or deleted outright. An unmeasured
+// component with a confident-looking number over it is the worst of both.
+//
+// So this mode takes words directly and says WHICH of the three paths answered. "The dictionary had it",
+// "it was derived from a word the dictionary had" and "we guessed it from the spelling" deserve very
+// different amounts of trust, and a bare string of phonemes hides which one you got.
+if (wordList != null)
+{
+    var dict = PronunciationDictionary.Load(dictPath);
+    var lts = EmbeddedData.LoadLetterToSound();
+    var speaker = new EnglishPhonemizer(dict)
+    {
+        LetterToSound = lts,
+        Flapping = flapping,
+        DestressFunctionWords = destress,
+    };
+    Console.WriteLine($"cmudict  : {dict.Count} headwords");
+    Console.WriteLine($"lts      : {lts.Count} context rules (the EMBEDDED model, so this tests what ships)");
+    Console.WriteLine();
+    Console.WriteLine($"{"word",-16} {"answered by",-16} {"ARPAbet",-40} IPA");
+    Console.WriteLine(new string('-', 100));
+    foreach (var word in wordList.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+    {
+        string source, arpabet;
+        if (dict.TryLookup(word, out var known))
+        {
+            source = "dictionary";
+            arpabet = string.Join(' ', known);
+        }
+        else if (WordDecomposer.TryDecompose(word, dict, out var derived))
+        {
+            source = "decomposed";
+            arpabet = string.Join(' ', derived);
+        }
+        else
+        {
+            source = "letter-to-sound";
+            arpabet = string.Join(' ', lts.Predict(word));
+        }
+        Console.WriteLine($"{word,-16} {source,-16} {arpabet,-40} {speaker.ToIpa(word)}");
+    }
+    return 0;
+}
 if (!Directory.Exists(fixtureDir)) { Console.WriteLine($"no fixtures at {fixtureDir}"); return 2; }
 
 // ---- The model's symbol table -----------------------------------------------------------------------
