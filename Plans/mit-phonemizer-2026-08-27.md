@@ -610,7 +610,27 @@ phonemizer and nothing else. This is the measurement every symbol-level number w
 
 `dotnet run --project tools/zipvoice-harness -c Release -- endtoend fixtures/phase2 <outDir>`
 
-RESULT_PLACEHOLDER
+**RESULT, 120 sentences the phonemizer was never tuned on, one seed each, 240 renders:**
+
+| | mean word error |
+|---|---|
+| the reference frontend (espeak-ng, GPL) | 9.1% |
+| **our MIT phonemizer** | **7.2%** |
+
+| | |
+|---|---|
+| ours clearly worse | 11/120 |
+| indistinguishable | 88/120 |
+| ours better | 21/120 |
+
+**The claim is parity, and parity is what the replacement needed.** The 2-point edge is small, could be
+noise at this sample size, and is not worth defending; what matters is that a GPL dependency can be
+removed without the audio getting worse.
+
+⚠️ Both columns carry the prompt bleed - both transcripts open with "Others call me Mother Nature"
+before the sentence - which is the model, not either frontend, and is why the scoring skips freely at
+the head. The 11 sentences where ours lost are listed by the tool, worst first, and are the place to
+look next: "miles around" came out "miles round", "some flower seeds" came out "and flower seeds".
 
 `tools/zipvoice-listen` renders an end-to-end run as a listening page too - pairs of the same sentence,
 reference against ours, ordered by where the transcripts disagreed most, since a pair that transcribed
