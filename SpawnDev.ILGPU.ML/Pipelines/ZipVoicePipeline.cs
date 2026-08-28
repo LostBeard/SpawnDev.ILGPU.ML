@@ -126,6 +126,28 @@ public sealed class ZipVoicePipeline : IDisposable
     /// <param name="promptTokens">Token ids of the reference clip's exact transcript.</param>
     /// <param name="referenceAudio">Reference clip, mono, in [-1, 1].</param>
     /// <param name="referenceSampleRate">Sample rate of the reference clip.</param>
+    /// <summary>
+    /// Speak English TEXT in the voice of a reference clip.
+    /// </summary>
+    /// <remarks>
+    /// The overload most callers want: text in, cloned speech out, with no phoneme handling of their own.
+    /// Both the line to speak and the reference clip's transcript go through the same tokenizer, because
+    /// the model compares them - a transcript phonemized differently from the line would make the clone
+    /// worse for reasons nobody could see.
+    /// </remarks>
+    /// <param name="text">What to say.</param>
+    /// <param name="referenceText">The reference clip's EXACT transcript. Anything present in the audio
+    /// and missing here bleeds into the start of the generated line.</param>
+    public Task<ZipVoiceResult> SpeakAsync(
+        string text, string referenceText, float[] referenceAudio, int referenceSampleRate,
+        ZipVoiceTokenizer tokenizer)
+    {
+        ArgumentNullException.ThrowIfNull(tokenizer);
+        var tokens = tokenizer.Encode(text);
+        var promptTokens = tokenizer.Encode(referenceText);
+        return SynthesizeAsync(tokens, promptTokens, referenceAudio, referenceSampleRate);
+    }
+
     public Task<ZipVoiceResult> SynthesizeAsync(
         long[] tokens, long[] promptTokens, float[] referenceAudio, int referenceSampleRate)
     {

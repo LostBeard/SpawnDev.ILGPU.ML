@@ -50,4 +50,12 @@
 		<EmbeddedResource Include="Data\imagenet_classes.txt" />
 	</ItemGroup>
 
+  <ItemGroup>
+    <!--
+      The MIT English frontend. ZipVoice cannot speak English without a phonemizer - its shipped lexicon
+      is Chinese-only - and the reference implementation reaches for espeak-ng (GPL-3) at that point.
+      This is dependency-free and browser-capable, so it costs nothing to carry.
+    -->
+    <ProjectReference Include="..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
+  </ItemGroup>
 </Project>
