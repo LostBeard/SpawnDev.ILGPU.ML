@@ -448,6 +448,22 @@ captured reference output over the nine Phase 1 sentences:
 Held-out check on 120 sentences the rules were never tuned against: **4.5%**, against 4.2% on the tuned
 nine. It generalises.
 
+**Later corrections, all from CAPTURED EVIDENCE rather than more theory** (4.4% -> 2.6% held out):
+one sentence built from the words the probe kept flagging, run through the oracle, settled three
+assumptions at once - `ˈeɪ kˈæt wʌz ˈɔn ðə mˈæt ænd hˈɪz hˈæt ,ɪf ˌɛni wˈɪl bˈiː ðˈɛɹ wˌɛn ˈaɪ ɡˈoʊ .`
+- "his", "will", "be" carry FULL primary stress; they were wrongly in the destress list.
+- "any", "when", "where", "while" take SECONDARY stress; they were getting none.
+- "on", "was", "and" differ LEXICALLY between the two dictionaries, by no derivable rule -
+  `ReferenceOverrides` carries those plus the bare article, and stays tiny on purpose.
+- The linking r: "around" is ɚɹˈaʊnd, not ɚˈaʊnd. Emitting only the coloured vowel made an
+  end-to-end render transcribe "miles around" as "miles round".
+- Vowel homographs: "the WIND blows" against "WIND the clock". CMUdict's FIRST entry for "wind" is
+  the rarer verb, so untouched it rendered as "the way the WINED blows".
+
+**Deliberately NOT copied:** the reference reads a sentence-initial capital "A" as the LETTER NAME
+("AY cat sat"). That is 16 of the remaining differences and trivial to match, and matching it would make
+the speech worse for a listener. Agreement with the reference is the proxy; sounding right is the goal.
+
 **Tried and REVERTED, recorded so it is not retried:** closing a stressed AO to o before R. Right for
 "boards" and "port", wrong for "quart", "or" and "for", which keep the opener vowel under stress too -
 twenty new differences against four fixed. A rule that looks clean is not always a rule that measures.
