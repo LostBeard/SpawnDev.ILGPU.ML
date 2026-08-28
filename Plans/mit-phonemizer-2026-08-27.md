@@ -361,6 +361,20 @@ Harvard-sentence recording, transcribed and checked:
 stay valid - both frontends used the same prompt, so the parity conclusion is untouched - but the
 ABSOLUTE quality of this stack is far better than those numbers suggested.
 
+**RESOLVED, 2026-08-28.** The repo now carries its own reference clip:
+`tools/zipvoice-harness/fixtures/reference/librivox-public-domain.wav` - 4.0s from a LibriVox recording
+bearing the **Creative Commons Public Domain Mark 1.0**, saying LibriVox's standardized preamble ("All
+LibriVox recordings are in the public domain"), which is why its transcript is KNOWN rather than guessed.
+All 131 fixtures point at it by a relative path. Rejected on licensing: the Open Speech Repository
+recordings, whose site says only "freely usable" - which is not a licence. Provenance, processing and the
+criteria for choosing another are in `fixtures/reference/PROVENANCE.md`.
+
+| | packaged clip | public-domain clip |
+|---|---|---|
+| reference frontend | 9.1% | 6.7% |
+| our phonemizer | 7.2% | 4.7% |
+| preamble | ~2.3 seconds | none |
+
 **What this means for anything that speaks:** give ZipVoice a reference clip you have an accurate
 transcript for. That single change takes word error from ~7-9% to ~2-3% and removes the preamble
 entirely. `tools/zipvoice-fixture --prompt-wav <wav> --prompt-text "<exact transcript>"` builds fixtures
