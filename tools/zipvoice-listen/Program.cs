@@ -53,6 +53,9 @@ var rows = doc.RootElement.EnumerateArray().Select(e => new Row(
 // that transcribed identically has nothing for an ear to arbitrate.
 if (endToEnd)
 {
+    // A results file can hold several configurations of "ours" from isolation runs. The page compares
+    // the shipping one against the reference; anything else would just be confusing to listen to.
+    rows = rows.Where(r => r.Variant is "reference" or "ours").ToList();
     var byFixture = rows.GroupBy(r => (r.Fixture, r.Seed))
         .Where(g => g.Any(r => r.Variant == "ours") && g.Any(r => r.Variant == "reference"))
         .OrderByDescending(g => Math.Abs(g.First(r => r.Variant == "ours").InfixWer
