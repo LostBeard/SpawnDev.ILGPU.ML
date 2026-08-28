@@ -657,7 +657,7 @@ recollection of English spelling and can never honestly claim an accuracy figure
 
 `dotnet run --project tools/lts-train -c Release -- --out SpawnDev.Phonemizer/lts-model.txt`
 
-**Held out: 49.8% of words exactly right guessing alone, 53.0% with decomposition first, 13.7% phoneme error rate.** Designs measured on the
+**Held out: 49.9% of words exactly right guessing alone, 53.1% with decomposition first, 13.8% phoneme error rate.** Designs measured on the
 same 5,000 words, and two intuitive ones lost:
 
 | design | words exactly right |
@@ -715,7 +715,7 @@ less sparse. Stress-only errors fell 14.8% -> 8.4%.
 
 **It says the name:** "Aubriella" -> `ˈɔːbɹiɛlə`. Also sounded out: Tuvok, Geordi, Blazor, Anthropic.
 
-⚠️ **Honest limits.** 49.8% means half of unknown words still come out with something wrong somewhere,
+⚠️ **Honest limits.** 49.9% means half of unknown words still come out with something wrong somewhere,
 and 13.7% of phonemes are wrong. Published systems reach higher. This is a working baseline that unblocks
 names, not a finished component:
 - [ ] "Aubs" comes out with a doubled vowel (`ˈɔːaʊbz`) - the "au" digraph emits two vowels.
@@ -741,7 +741,7 @@ names, not a finished component:
       | fires on | 26.4% of them |
       | right when it fires | **77.2%** |
       | letter-to-sound alone, on those same words | 64.9% |
-      | **overall, decompose-then-guess** | **53.0%** against 49.8% guessing alone |
+      | **overall, decompose-then-guess** | **53.1%** against 49.9% guessing alone |
 
       It declines rather than inventing: "aubriella" is not anything plus an ending, so it hands the
       word to letter-to-sound, which can at least try.
@@ -949,12 +949,78 @@ scoring worse** is precisely why a human ear stays in the loop.
 ⚠️ **Known limit of the gate:** 4 differing renders out of 60 is not much resolution. A change has to be
 large to show here. Before trusting a future "no difference", grow the set or state its sensitivity.
 
+## Two levers measured and CLOSED (2026-08-28) - read before proposing either again
+
+### ⛔ Pronunciation by analogy - REJECTED on measurement
+
+The idea: an unknown word that rhymes with a dictionary word should borrow that word's ending outright,
+stress included. "aubriella" is not in CMUdict but "gabriella" is, and they share seven letters. It is the
+obvious next lever and it was this plan's own recommendation. **It does not pay.**
+
+`tools/lts-train --analogy` builds the suffix table from TRAINING words only and sweeps ending length
+against how many words must share it. Across 30 configurations the best is **+0.6 points** (50.4% against
+49.8%), and most settings LOSE:
+
+| shortest ending | support 1 | support 2 | support 4 | support 8 |
+|---|---|---|---|---|
+| 4 | 48.5% | 50.1% | 49.5% | 49.3% |
+| 5 | 48.7% | 50.3% | 50.0% | 50.3% |
+| 6 | 49.4% | **50.4%** | **50.4%** | 50.3% |
+| 7 | 49.8% | 50.2% | 50.2% | 50.1% |
+| 8 | 49.7% | 49.9% | 49.9% | 49.9% |
+
+Two things kill it:
+
+1. **At the best setting it does not fire on a single one of the names it was proposed to fix** - not
+   aubriella, kayleigh, makayla, elowen, jaxon, blazor or anthropic. The analogy that fixes "aubriella" is
+   "briella", which only ONE training word carries, and **for analogy singletons measure WORSE** (support 1
+   is the losing column above). That is the OPPOSITE of the context-width result, so the intuition carried
+   over from that finding is wrong here.
+2. **+0.6 symbol points is far below what can be heard.** The OOV audio gate measured +8.9 symbol points as
+   **0.00%** word error. There is no reason to believe +0.6 does anything at all.
+
+Borrowing only the STRESS pattern and keeping the guessed phones was also measured - it tops out at +0.5.
+Neither variant ships. The probe stays in the tool so this is reproducible rather than re-argued.
+
+⚠️ **Aubriella's first-syllable stress therefore remains OPEN**, and the fix is no longer known. Analogy
+was the candidate and it has been eliminated.
+
+### ✅ A word spelled with vowels must never come back as bare consonants - SHIPPED
+
+The failure that turned "Aubriella" into `bɹl`. Word accuracy cannot see it, so `--analyze` counts it
+separately; the baseline was **11 unsayable words per 5,000**. Each vowel letter now carries its loudest
+single-letter sound as a LAST RESORT (`!` rules, six lines in the model file), used only when the word
+would otherwise have no vowel at all.
+
+The trigger is narrow because three wider ones were measured and every one lost:
+
+| trigger | exactly right | words with no vowel at all |
+|---|---|---|
+| none (leave it broken) | 49.8% | 11 |
+| whenever the single-letter backstop answered | **30.3%** | 6 |
+| fewer vowel sounds than vowel groups | 46.7% | 1 |
+| three or more silent letters in a row | 49.5% | 11 |
+| **no vowel at all (shipped)** | **49.9%** | **1** |
+
+🔴 **The obvious trigger is the WORST, and the reason generalises:** under the redundancy compression,
+resolving at the single-letter width is the NORMAL case, not a sign the model has no idea - wide rules that
+agreed with it were dropped precisely BECAUSE they agreed. **The compressed file cannot tell "no evidence"
+from "the evidence agreed."** So the trigger has to be the OUTCOME, never how the answer was reached.
+
+⚠️ **General truncation is NOT fixed:** `nevaeh` is still `N AH1 V` and `huawei` `HH W AO1`. Both keep one
+vowel, so the guard does not fire. Cause is traced - with no context rule matching, the bare fallback for
+`e` and `h` is silent, so a run of letters vanishes - but no trigger tried so far separates that from
+English's real silent letters without costing more than it saves.
+
 ## Where to pick up (read this first)
 
 The MIT phonemizer is **built, measured and at parity with GPL espeak-ng**. Nothing is half-finished; the
 list below is what would make it better, in the order I would take it.
 
-1. **Letter-to-sound is the weakest component.** 49.8% of unknown words exactly right (53.0% with
+0. ⛔ **NOT pronunciation by analogy, and NOT a stress tie-break.** Both were measured and rejected today -
+   see the section above. Proposing either again costs a day; the numbers are in `--analogy` and
+   `--analyze`.
+1. **Letter-to-sound is the weakest component.** 49.9% of unknown words exactly right (53.1% with
    decomposition). Published systems do better. The trained model is a plain context lookup with backoff
    - a better model class is the obvious next step, and `tools/lts-train` already reports held-out
    accuracy so any replacement can be compared honestly.
@@ -971,7 +1037,8 @@ list below is what would make it better, in the order I would take it.
 
 ## Session log
 
-- **2026-08-28 (Tuvok, later)**: Took pickup item 1. Letter-to-sound **40.9% -> 49.8%** held out, after
+- **2026-08-28 (Tuvok, latest)**: Closed two levers by measuring them. Pronunciation by ANALOGY REJECTED - best of 30 configurations is +0.6 points, and at that setting it fires on none of the names it was meant to fix ("briella" is a singleton, and for analogy singletons measure WORSE - the opposite of the context-width result). Shipped instead a narrow guard: a word spelled with vowels can never come back as bare consonants (the `bɹl` failure), +0.1 and 11 unsayable words down to 1, with three wider triggers measured and rejected - the obvious one costs 19.5 points because under compression, resolving at the single-letter width is NORMAL, not ignorance. Held out 49.9%/13.8%/53.1%. General truncation (`nevaeh`, `huawei`) still open.
+- **2026-08-28 (Tuvok, earlier)**: Took pickup item 1. Letter-to-sound **40.9% -> 49.8%** held out, after
   finding the header had never described the shipped model (measured unpruned, wrote pruned) and that
   "prune singletons" was backwards - context WIDTH beats evidence, 83.3% vs 77.6%. Context ±2 -> ±5, paid
   for by writing only rules that change the backoff answer. Then built the **OOV audio gate**, because

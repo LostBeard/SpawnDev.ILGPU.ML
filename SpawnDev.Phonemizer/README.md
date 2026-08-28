@@ -60,8 +60,8 @@ goal; sounding right is, and the end-to-end test below is the one that decides.
 | | |
 |---|---|
 | decomposition fires on | 26.4% of them, and is right 77.2% of the time |
-| letter-to-sound alone | 49.8% of words exactly right, 13.7% phoneme error |
-| **together** | **53.0%** |
+| letter-to-sound alone | 49.9% of words exactly right, 13.8% phoneme error |
+| **together** | **53.1%** |
 
 **End to end, as audio.** The same sentence spoken twice by ZipVoice from the same voice and the same
 noise seed - once from the reference frontend's phonemes, once from ours - and both transcribed. Any
@@ -96,7 +96,7 @@ dependency can be removed without the audio getting worse.
   where the two readings differ by MEANING rather than part of speech - "bass" the fish against the
   register, "tear" the eye against the rip, "read" present against past - and for those a single default
   is chosen and documented rather than guessed at per sentence.
-- **Letter-to-sound is a baseline.** 49.8% is a working number, not a good one. Published systems reach
+- **Letter-to-sound is a baseline.** 49.9% is a working number, not a good one. Published systems reach
   higher.
 - **English only.**
 
