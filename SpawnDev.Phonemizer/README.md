@@ -67,10 +67,10 @@ goal; sounding right is, and the end-to-end test below is the one that decides.
 noise seed - once from the reference frontend's phonemes, once from ours - and both transcribed. Any
 difference is the phonemizer and nothing else.
 
-| over 120 sentences never tuned on | mean word error |
-|---|---|
-| the reference frontend (espeak-ng, GPL) | 9.1% |
-| **this library** | **7.2%** |
+| sentences never tuned on | reference (espeak-ng, GPL) | **this library** |
+|---|---|---|
+| 120 sentences, one noise seed | 9.1% | **7.2%** |
+| 40 sentences, three noise seeds | 10.8% | **7.3%** |
 
 Worse on 7 of 120 sentences, indistinguishable on 93, better on 20.
 

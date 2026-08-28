@@ -672,6 +672,18 @@ phonemizer and nothing else. This is the measurement every symbol-level number w
 | indistinguishable | 88/120 |
 | ours better | 21/120 |
 
+**Confirmed with the instability averaged out.** A second sampling - 40 sentences at THREE seeds each,
+120 paired renders - agrees:
+
+| | mean word error |
+|---|---|
+| reference frontend, 3 seeds | 10.8% |
+| **ours, 3 seeds** | **7.3%** |
+
+ours worse on 7/120, indistinguishable on 85, better on 28. Two independent samplings, one broad and
+single-seed, one narrower and multi-seed, both put ours at or slightly ahead of the reference. Note the
+REFERENCE got worse with more seeds (9.1% to 10.8%), which is the model instability landing on it too.
+
 **The claim is parity, and parity is what the replacement needed.** The 2-point edge is small, could be
 noise at this sample size, and is not worth defending; what matters is that a GPL dependency can be
 removed without the audio getting worse.
