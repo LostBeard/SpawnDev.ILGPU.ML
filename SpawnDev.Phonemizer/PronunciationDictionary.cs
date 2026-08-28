@@ -19,23 +19,23 @@ namespace SpawnDev.Phonemizer;
 /// </remarks>
 public sealed class PronunciationDictionary
 {
-    private readonly Dictionary<string, string[]> _entries;
+    private readonly Dictionary<string, List<string[]>> _entries;
 
-    private PronunciationDictionary(Dictionary<string, string[]> entries) => _entries = entries;
+    private PronunciationDictionary(Dictionary<string, List<string[]>> entries) => _entries = entries;
 
     /// <summary>Number of headwords loaded.</summary>
     public int Count => _entries.Count;
 
     /// <summary>Parse the CMUdict text format: one entry per line, "word  P1 P2 P3".</summary>
     /// <remarks>
-    /// Alternate pronunciations are written "word(2)" and are SKIPPED here rather than silently preferred
-    /// or merged. Choosing between them needs sentence context - "read" and "record" are different words
-    /// depending on their part of speech - and that is a separate problem which pretending to solve here
-    /// would only hide.
+    /// Alternate pronunciations are written "word(2)" and are KEPT, in the order the file lists them.
+    /// <see cref="TryLookup"/> returns the first, which is the right default; choosing between them needs
+    /// sentence context, and <see cref="Homographs"/> does that for the words where the choice changes
+    /// which syllable is stressed - "the RECord" against "to reCORD".
     /// </remarks>
     public static PronunciationDictionary Parse(IEnumerable<string> lines)
     {
-        var entries = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        var entries = new Dictionary<string, List<string[]>>(StringComparer.OrdinalIgnoreCase);
         foreach (var line in lines)
         {
             var body = line;
@@ -46,8 +46,14 @@ public sealed class PronunciationDictionary
 
             var parts = body.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 2) continue;
-            if (parts[0].EndsWith(')')) continue;                 // word(2), word(3), ...
-            entries.TryAdd(parts[0], parts[1..]);
+
+            // "word(2)" is another pronunciation of "word", not another word.
+            var headword = parts[0];
+            int paren = headword.IndexOf('(');
+            if (paren > 0) headword = headword[..paren];
+
+            if (!entries.TryGetValue(headword, out var all)) entries[headword] = all = new List<string[]>();
+            all.Add(parts[1..]);
         }
         return new PronunciationDictionary(entries);
     }
@@ -55,6 +61,24 @@ public sealed class PronunciationDictionary
     /// <summary>Load from a CMUdict file on disk.</summary>
     public static PronunciationDictionary Load(string path) => Parse(File.ReadLines(path));
 
-    /// <summary>Look up a word's ARPAbet phones. Case-insensitive.</summary>
-    public bool TryLookup(string word, out string[] phones) => _entries.TryGetValue(word, out phones!);
+    /// <summary>Look up a word's first ARPAbet pronunciation. Case-insensitive.</summary>
+    public bool TryLookup(string word, out string[] phones)
+    {
+        if (_entries.TryGetValue(word, out var all) && all.Count > 0) { phones = all[0]; return true; }
+        phones = [];
+        return false;
+    }
+
+    /// <summary>Look up EVERY pronunciation the dictionary lists, in file order.</summary>
+    /// <remarks>
+    /// The alternates are what make a homograph solvable: "record" is stored twice, once stressed on the
+    /// first syllable and once on the second, with different vowels in each - so re-stressing one of them
+    /// is not the same as choosing the other, and would produce a word nobody says.
+    /// </remarks>
+    public bool TryLookupAll(string word, out IReadOnlyList<string[]> pronunciations)
+    {
+        if (_entries.TryGetValue(word, out var all)) { pronunciations = all; return true; }
+        pronunciations = [];
+        return false;
+    }
 }

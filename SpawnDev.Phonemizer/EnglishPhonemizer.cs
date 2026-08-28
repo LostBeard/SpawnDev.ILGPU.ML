@@ -54,6 +54,15 @@ public sealed class EnglishPhonemizer
     public EnglishTextNormalizer? Normalizer { get; set; } = new();
 
     /// <summary>
+    /// Read a stress-shifting homograph from its context: "the record" against "to record".
+    /// </summary>
+    /// <remarks>
+    /// About 1% of words in ordinary text, but every miss is a STRESS error, and stress on the wrong
+    /// syllable was measured at 34.3% word error against roughly nothing for any segmental slip.
+    /// </remarks>
+    public bool ResolveHomographs { get; set; } = true;
+
+    /// <summary>
     /// Build an unknown word out of a known stem and its ending, before resorting to guesswork.
     /// </summary>
     /// <remarks>
@@ -89,6 +98,7 @@ public sealed class EnglishPhonemizer
 
         if (Normalizer != null) text = Normalizer.Normalize(text);
 
+        string? previousWord = null;
         foreach (var token in Tokenize(text))
         {
             if (token.IsWord)
@@ -99,7 +109,8 @@ public sealed class EnglishPhonemizer
                 if (output.Count > 0 && output[^1] != " " && !IsPunctuation(output[^1])) output.Add(" ");
                 if (_dictionary.TryLookup(token.Text, out var phones))
                 {
-                    output.AddRange(Word(phones, token.Text));
+                    output.AddRange(Word(phones, token.Text, previousWord));
+                    previousWord = token.Text;
                 }
                 else
                 {
@@ -112,13 +123,14 @@ public sealed class EnglishPhonemizer
                     // derived from a known word should never be guessed at.
                     if (Decompose && WordDecomposer.TryDecompose(token.Text, _dictionary, out var derived))
                     {
-                        output.AddRange(Word(derived, token.Text));
+                        output.AddRange(Word(derived, token.Text, previousWord));
                     }
                     else
                     {
                         var guessed = LetterToSound?.Predict(token.Text);
-                        if (guessed is { Length: > 0 }) output.AddRange(Word(guessed, token.Text));
+                        if (guessed is { Length: > 0 }) output.AddRange(Word(guessed, token.Text, previousWord));
                     }
+                    previousWord = token.Text;
                 }
             }
             else
@@ -127,6 +139,7 @@ public sealed class EnglishPhonemizer
                 // written with a space BEFORE it, attached to what follows.
                 if (output.Count > 0 && output[^1] != " ") output.Add(" ");
                 output.Add(token.Text);
+                previousWord = null;      // a pause ends the phrase whose cue we were carrying
             }
         }
 
@@ -138,11 +151,20 @@ public sealed class EnglishPhonemizer
     public string ToIpa(string text) => string.Concat(ToSymbols(text));
 
     /// <summary>Map one word's ARPAbet phones to IPA symbols, applying the rules.</summary>
-    private List<string> Word(string[] phones, string spelling)
+    /// <param name="previousWord">
+    /// The word before this one, or null at the start of a phrase. Used only to read a homograph:
+    /// "the record" is a noun, "to record" is a verb, and they are stressed on different syllables.
+    /// </param>
+    private List<string> Word(string[] phones, string spelling, string? previousWord = null)
     {
         bool destress = DestressFunctionWords && FunctionWords.IsUnstressed(spelling);
         var symbols = new List<string>(phones.Length + 4);
         int suffixVowel = SuffixVowelIndex(phones, spelling);
+
+        // A stress-shifting homograph picks a DIFFERENT dictionary entry, chosen from context, before
+        // mapping - so every later rule sees the reading the sentence actually calls for.
+        if (ResolveHomographs && !destress)
+            phones = Homographs.Choose(spelling, previousWord, _dictionary, phones);
 
         for (int index = 0; index < phones.Length; index++)
         {
