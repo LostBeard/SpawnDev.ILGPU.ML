@@ -486,7 +486,26 @@ Guarded by `MLTestBase.PhonemizerTests` - 44/44 across cpu, cuda, opencl, WebGPU
 - [ ] Context rules for the classes Phase 1 says the model actually cares about.
 - [ ] Score exact-sequence agreement against the Phase 2 oracle. **This number is the go/no-go.**
 
-### Phase 5 - Homograph resolution `[ ]`
+### Phase 5 - Homograph resolution `[x]` (shallow, deliberately)
+
+`Homographs` picks between CMUdict's OWN alternate entries from context. "the record" is `ɹˈɛkɚd`,
+"to record" is `ɹəkˈɔːɹd`.
+
+**The first implementation was wrong in a way worth not repeating.** It moved the primary stress mark
+onto the other syllable, giving `ɹˈʌkɔːɹd` - right beat, wrong word. English does not shift stress
+within one pronunciation here: the noun is REK-erd and the verb is ri-KORD, **different vowels**, and
+CMUdict stores them as two separate entries. The real fix was to stop discarding alternates -
+`PronunciationDictionary` had been keeping only the first pronunciation of every word - and to CHOOSE.
+
+Part of speech is guessed from the previous word only ("the/his/of" -> noun, "to/will/they" -> verb, no
+cue -> noun). Deliberately shallow; a real tagger is a model in its own right. A pause clears the cue.
+
+Size of the effect, measured before building it: of 573 distinct words across the 129 test sentences, 35
+look like stress-homographs but nearly all are function words the destressing rule already handles. The
+genuine ones (`address`, `contest`) are about **1%** of words - which is why this came last, and why the
+accuracy gate did not move when it landed.
+
+### Phase 5 (original scope) `[ ]`
 
 CMUdict lists multiple pronunciations and gives no way to choose. "I read the book" against "I will
 read the book"; record, bass, live, wind, lead, tear, close, use, minute.
