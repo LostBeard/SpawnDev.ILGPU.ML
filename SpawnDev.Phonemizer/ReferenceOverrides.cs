@@ -11,7 +11,15 @@ namespace SpawnDev.Phonemizer;
 /// the open-a and spoken with the wedge.
 /// </para>
 /// <para>
-/// These are worth overriding precisely BECAUSE they are frequent: "on", "was", "and" and "a" appear in
+/// <b>MEASURED AND OFF BY DEFAULT.</b> Applying these halves symbol disagreement with the reference
+/// frontend (4.4% to 2.6%) and makes the AUDIO WORSE - 7.2% word error becomes 9.0% over 120 sentences
+/// through ZipVoice, with fewer sentences beating the reference and more losing to it. Matching espeak
+/// more closely is a proxy for sounding right, and here the two point in opposite directions. Kept
+/// because the evidence is worth preserving, and because a model trained on a different frontend may
+/// want it: <c>EnglishPhonemizer.UseReferenceOverrides</c>.
+/// </para>
+/// <para>
+/// The reasoning that produced them was sound and still lost, which is the point: "on", "was", "and" and "a" appear in
 /// almost every sentence, so a handful of entries closes a disproportionate share of the remaining
 /// difference. Each was READ OFF captured reference output, not reasoned about.
 /// </para>

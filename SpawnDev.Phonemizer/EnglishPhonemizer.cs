@@ -54,13 +54,26 @@ public sealed class EnglishPhonemizer
     public EnglishTextNormalizer? Normalizer { get; set; } = new();
 
     /// <summary>
-    /// Use the small table of very common words where the dictionary and the trained models disagree.
+    /// Use the small table of very common words where the dictionary and the reference frontend disagree.
     /// </summary>
     /// <remarks>
-    /// Off only for measuring what it is worth. On, it closes a disproportionate share of the remaining
-    /// difference, because the words in it - "on", "was", "and", "a" - are in almost every sentence.
+    /// <para>
+    /// <b>OFF by default, because it was measured and it lost.</b> Turning it on halves symbol
+    /// disagreement with the reference frontend - 4.4% to 2.6% - and makes the AUDIO worse:
+    /// </para>
+    /// <code>
+    /// 120 sentences, same voice, same noise seed, transcribed:
+    ///   overrides OFF : 7.2% word error   (7 sentences worse than the reference, 20 better)
+    ///   overrides ON  : 9.0%              (10 worse, 11 better)
+    /// </code>
+    /// <para>
+    /// That is the whole lesson of this library in one switch. Agreeing with espeak is a PROXY for
+    /// sounding right, and here the two point in opposite directions - so the proxy loses. The table and
+    /// this switch are kept because the evidence is worth preserving and a different model, trained on a
+    /// different frontend, may well want it on.
+    /// </para>
     /// </remarks>
-    public bool UseReferenceOverrides { get; set; } = true;
+    public bool UseReferenceOverrides { get; set; } = false;
 
     /// <summary>
     /// Read a stress-shifting homograph from its context: "the record" against "to record".

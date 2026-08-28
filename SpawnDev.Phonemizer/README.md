@@ -45,10 +45,15 @@ from intuition. The method and the full numbers are in `Plans/mit-phonemizer-202
 
 | | disagreement |
 |---|---|
-| the sentences the rules were tuned on | 4.2% |
-| **120 sentences never tuned on** | **4.4%** |
+| the sentences the rules were tuned on | 4.1% |
+| **120 sentences never tuned on** | **4.0%** |
 
 It generalises: the held-out number tracks the tuned one.
+
+⚠️ **This number is a PROXY, and it has already been wrong once.** A change that took it from 4.4% to
+2.6% - matching the reference frontend on a handful of very frequent words - made the AUDIO measurably
+worse, 7.2% word error becoming 9.0%. It was reverted to off by default. Agreeing with espeak is not the
+goal; sounding right is, and the end-to-end test below is the one that decides.
 
 **Words the dictionary does not have**, measured on 5,000 words held out before training:
 
@@ -66,6 +71,8 @@ difference is the phonemizer and nothing else.
 |---|---|
 | the reference frontend (espeak-ng, GPL) | 9.1% |
 | **this library** | **7.2%** |
+
+Worse on 7 of 120 sentences, indistinguishable on 93, better on 20.
 
 The claim is PARITY - the small edge could be noise at that sample size. What matters is that the GPL
 dependency can be removed without the audio getting worse.

@@ -448,13 +448,31 @@ captured reference output over the nine Phase 1 sentences:
 Held-out check on 120 sentences the rules were never tuned against: **4.5%**, against 4.2% on the tuned
 nine. It generalises.
 
-**Later corrections, all from CAPTURED EVIDENCE rather than more theory** (4.4% -> 2.6% held out):
+#### 🔴 THE PROXY AND THE GOAL DISAGREED - the most important result in this plan
+
+Symbol agreement with the reference frontend is what almost every number above measures. It is a PROXY.
+Late in the work it was optimised hard - matching the reference on a handful of very frequent words
+("on", "was", "and", the bare article) took held-out symbol disagreement from **4.4% to 2.6%** - and the
+same change was then put through the end-to-end audio gate:
+
+| configuration | word error, 120 sentences | worse than reference | better |
+|---|---|---|---|
+| reference overrides OFF | **7.2%** | 7/120 | 20/120 |
+| reference overrides ON | 9.0% | 10/119 | 11/119 |
+
+**Halving symbol disagreement made the audio worse.** The overrides are off by default and the switch
+(`EnglishPhonemizer.UseReferenceOverrides`) is kept only so the evidence survives.
+
+Anyone continuing this work should read that twice before optimising the probe number. espeak is the
+INSTRUMENT, not the target; when the two point in different directions, the audio wins.
+
+**Later corrections, all from CAPTURED EVIDENCE rather than more theory** (4.5% -> 4.0% held out):
 one sentence built from the words the probe kept flagging, run through the oracle, settled three
 assumptions at once - `ˈeɪ kˈæt wʌz ˈɔn ðə mˈæt ænd hˈɪz hˈæt ,ɪf ˌɛni wˈɪl bˈiː ðˈɛɹ wˌɛn ˈaɪ ɡˈoʊ .`
 - "his", "will", "be" carry FULL primary stress; they were wrongly in the destress list.
 - "any", "when", "where", "while" take SECONDARY stress; they were getting none.
-- "on", "was", "and" differ LEXICALLY between the two dictionaries, by no derivable rule -
-  `ReferenceOverrides` carries those plus the bare article, and stays tiny on purpose.
+- "on", "was", "and" differ LEXICALLY between the two dictionaries - `ReferenceOverrides` carries those
+  plus the bare article, and is **off by default because it measured worse on audio**, see above.
 - The linking r: "around" is ɚɹˈaʊnd, not ɚˈaʊnd. Emitting only the coloured vowel made an
   end-to-end render transcribe "miles around" as "miles round".
 - Vowel homographs: "the WIND blows" against "WIND the clock". CMUdict's FIRST entry for "wind" is
