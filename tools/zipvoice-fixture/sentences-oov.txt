@@ -1,0 +1,45 @@
+# Sentence set for the OUT-OF-VOCABULARY audio gate.
+#
+# WHY THIS SET EXISTS: every other fixture set in this repo is blind to letter-to-sound. The probe
+# reports 0 of 940 fixture words outside CMUdict, so the guessing path NEVER RUNS in `phase1`/`phase2` -
+# their numbers read identically whether that model is improved, broken, or deleted. A component with no
+# measurement over it is exactly how a confident wrong number survives, and this project has already paid
+# for that once.
+#
+# So: every line here contains at least one word CMUdict does NOT have, and the harness declares the run
+# VOID if that stops being true (see EndToEnd.cs). Letter-to-sound is what speaks those words, so this is
+# the only fixture set whose audio can say whether that model is any good.
+#
+# CHOOSING THE WORDS. They must be out of the dictionary AND spellable by the grader - a wholly invented
+# name comes back mangled from Whisper no matter how well it is pronounced, which measures nothing. These
+# are real, current names and products: absent from CMUdict (verified with
+# `zipvoice-g2p-probe --words`), familiar to a transcriber. Deliberately EXCLUDED: nevaeh, huawei, xiaomi
+# and airbnb, where our own model truncates the word or emits an unpronounceable cluster - a separate
+# defect that would confound this measurement rather than inform it.
+#
+# It also covers the shape the plan lists as never measured at all: names in RUNNING SPEECH, and
+# questions, rather than read-aloud declaratives.
+#
+# Regenerate the fixtures with:
+#   dotnet run --project tools/zipvoice-fixture -c Release -- --file tools/zipvoice-fixture/sentences-oov.txt --out tools/zipvoice-harness/fixtures/oov
+
+Aubriella wants to build her own video game this summer.
+Have you asked Kayleigh whether she is coming to dinner?
+Jaxon left his bike leaning against the fence again.
+Makayla said the meeting starts at half past two.
+Ryleigh and her brother walked the dog before breakfast.
+Elowen keeps a notebook of every bird she sees.
+The team at Anthropic published a paper about the model.
+Blazor runs the whole application inside the browser.
+She rebuilt the dashboard in Figma over the weekend.
+My daughter plays Roblox with her cousins on Saturdays.
+Kubernetes restarted the container before anyone noticed.
+TensorFlow was the first framework he ever learned.
+Did Aubriella remember to feed the cat this morning?
+Kayleigh thinks the concert tickets are sold out already.
+Jaxon and Makayla are arguing about the last slice.
+Ask Ryleigh where she put the spare keys.
+Elowen would rather read a book than watch anything at all.
+Aubriella and Kayleigh are staying up far too late.
+The Anthropic office is quieter than she expected.
+Jaxon wondered whether Blazor could handle the whole thing.

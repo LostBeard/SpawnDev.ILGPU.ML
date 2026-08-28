@@ -145,7 +145,12 @@ foreach (var sentence in sentences)
         },
         text = sentence,
         promptText,
-        promptWav,
+        // Stored PORTABLY, not as the path that happened to be typed on the command line. The harness
+        // resolves a relative promptWav against a fixed set of roots (model dir, the harness's own
+        // fixtures dir, cwd), so a fixture carrying "tools/zipvoice-harness/fixtures/reference/x.wav"
+        // resolves nowhere and every render dies on a missing prompt. Keep the path from the
+        // "reference/" segment on, which is the convention every fixture in the tree already uses.
+        promptWav = PortablePromptPath(promptWav),
         tokens = textTokens,
         promptTokens,
     };
@@ -209,4 +214,15 @@ static string Slug(string sentence)
     }
     var slug = sb.ToString().Trim('-');
     return slug.Length <= 48 ? slug : slug[..48].TrimEnd('-');
+}
+
+// A fixture must name its prompt clip the way the harness can find it again. The harness resolves a
+// relative promptWav against the model dir, its own fixtures dir and the working directory - never
+// against the fixture's own location - so anything more specific than the "reference/..." convention
+// resolves nowhere and every render fails on a missing prompt.
+static string PortablePromptPath(string path)
+{
+    var normalized = path.Replace(Path.DirectorySeparatorChar, '/').Replace(Path.AltDirectorySeparatorChar, '/');
+    int cut = normalized.LastIndexOf("reference/", StringComparison.OrdinalIgnoreCase);
+    return cut >= 0 ? normalized[cut..] : Path.GetFileName(normalized);
 }

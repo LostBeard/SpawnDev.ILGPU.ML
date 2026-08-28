@@ -98,12 +98,13 @@ public static class EndToEnd
 
         // ---- Turn each sentence into OUR token ids ---------------------------------------------------
         var jobs = new List<(string FixName, ZipVoiceFixture Fix, int Seed, string Source, long[] Tokens, string Wav, int Unknown)>();
-        int untranslatable = 0;
+        int untranslatable = 0, oovFixtures = 0;
         foreach (var (path, fixture) in fixtures)
         {
             var fixName = Path.GetFileNameWithoutExtension(path);
             var symbols = phonemizer.ToSymbols(fixture.Text);
             int unknownWords = phonemizer.LastUnknownWords.Count;
+            if (unknownWords > 0) oovFixtures++;
 
             var ours = new List<long>(symbols.Count);
             bool translatable = true;
@@ -127,6 +128,30 @@ public static class EndToEnd
             }
         }
         if (untranslatable > 0) Console.WriteLine($"WARNING  : {untranslatable} sentence(s) produced a symbol the model has no token for");
+
+        // ---- Is this run able to see letter-to-sound at all? -----------------------------------------
+        // The default fixture sets contain ZERO words outside CMUdict, so the guessing path never runs and
+        // this gate is structurally blind to it: the numbers come back identical whether that model is
+        // improved or deleted. That reads as "no regression" and means "no measurement".
+        //
+        // So the run SAYS which it is. On an out-of-vocabulary set it also refuses to proceed if the
+        // dictionary has quietly grown to cover the words - a gate that has stopped testing the thing it
+        // was built to test must fail, not pass. Same rule as the sensitivity harness's positive control.
+        bool oovRun = fixtures.Count > 0
+            && string.Equals(new DirectoryInfo(Path.GetDirectoryName(fixtures[0].Path)!).Name, "oov",
+                             StringComparison.OrdinalIgnoreCase);
+        Console.WriteLine($"coverage : {oovFixtures}/{fixtures.Count} sentences contain a word CMUdict lacks");
+        if (oovFixtures == 0)
+            Console.WriteLine("           => letter-to-sound NEVER RUNS here. This gate cannot see it, and any "
+                            + "number below is silent about it.");
+        if (oovRun && oovFixtures < fixtures.Count)
+        {
+            Console.WriteLine($"VOID     : this is the out-of-vocabulary set, and {fixtures.Count - oovFixtures} "
+                            + "sentence(s) no longer contain an unknown word - the set has stopped measuring "
+                            + "what it exists to measure. Fix the sentences or the guard, do not read the result.");
+            return 3;
+        }
+
         Console.WriteLine($"planned  : {jobs.Count} renders");
 
         // ---- Render ----------------------------------------------------------------------------------
@@ -192,6 +217,60 @@ public static class EndToEnd
         return Report(rows, outDir);
     }
 
+    /// <summary>
+    /// Compare two of OUR phonemizer configurations against EACH OTHER, on the same sentence and the same
+    /// noise seed.
+    /// </summary>
+    /// <remarks>
+    /// The comparison above measures a variant against the REFERENCE, which answers "are we as good as
+    /// espeak". It does NOT answer "did my change do anything", and the two are easy to confuse: both
+    /// variants can sit the same distance from the reference while differing on the sentences that matter,
+    /// or - the case this was written for - be genuinely identical while a run-to-run difference looks
+    /// like progress.
+    ///
+    /// Rendering a second variant with PHONEMIZER_TAG puts both in the same results file, so this fires
+    /// automatically. It exists because a single noise seed once showed a letter-to-sound change as 9.2%
+    /// against 10.3% - and at three seeds the same two models came out at 9.69% and 9.68%, differing on 4
+    /// renders out of 60. Flow matching starts from fresh noise every call, so one render is a sample, not
+    /// a measurement, and a variant comparison needs the pairing spelled out or it reports noise as a win.
+    /// </remarks>
+    private static void ReportVariants(List<Row> rows)
+    {
+        var variants = rows.Select(r => r.Source).Where(s => s.StartsWith("ours")).Distinct().OrderBy(s => s).ToList();
+        if (variants.Count < 2) return;
+
+        Console.WriteLine();
+        Console.WriteLine($"VARIANTS, paired against each other on the same sentence and seed");
+        for (int a = 0; a < variants.Count; a++)
+            for (int b = a + 1; b < variants.Count; b++)
+            {
+                var left = rows.Where(r => r.Source == variants[a]).ToDictionary(r => (r.Fixture, r.Seed));
+                var right = rows.Where(r => r.Source == variants[b]).ToDictionary(r => (r.Fixture, r.Seed));
+                var keys = left.Keys.Where(right.ContainsKey).ToList();
+                if (keys.Count == 0) continue;
+
+                double dl = keys.Average(k => left[k].InfixWer), dr = keys.Average(k => right[k].InfixWer);
+                int lb = keys.Count(k => left[k].InfixWer < right[k].InfixWer - 1e-9);
+                int rb = keys.Count(k => right[k].InfixWer < left[k].InfixWer - 1e-9);
+                Console.WriteLine($"  {variants[a]} {dl:P2} vs {variants[b]} {dr:P2} over {keys.Count} pairs "
+                                + $"({dl - dr:+0.00%;-0.00%;0.00%})");
+                Console.WriteLine($"    {variants[a]} better on {lb}, {variants[b]} better on {rb}, "
+                                + $"IDENTICAL on {keys.Count - lb - rb}");
+                if (lb + rb == 0)
+                    Console.WriteLine("    => these two configurations are indistinguishable on this set. A change "
+                                    + "that moves a symbol metric and not this one has not been shown to matter.");
+                foreach (var k in keys.Where(k => Math.Abs(left[k].InfixWer - right[k].InfixWer) > 1e-9)
+                                      .OrderBy(k => left[k].InfixWer - right[k].InfixWer))
+                {
+                    Console.WriteLine($"    {k.Fixture} s{k.Seed}  {variants[a]} {left[k].InfixWer:P0} vs "
+                                    + $"{variants[b]} {right[k].InfixWer:P0}");
+                    Console.WriteLine($"      want: {left[k].Text}");
+                    Console.WriteLine($"      {variants[a],-9}: {left[k].Transcript}");
+                    Console.WriteLine($"      {variants[b],-9}: {right[k].Transcript}");
+                }
+            }
+    }
+
     private static int Report(List<Row> rows, string outDir)
     {
         var reference = rows.Where(r => r.Source == "reference").ToDictionary(r => (r.Fixture, r.Seed));
@@ -206,6 +285,8 @@ public static class EndToEnd
         int worse = paired.Count(p => p.Ours.InfixWer > p.Reference.InfixWer + 0.05);
         int better = paired.Count(p => p.Reference.InfixWer > p.Ours.InfixWer + 0.05);
         int same = paired.Count - worse - better;
+
+        ReportVariants(rows);
 
         Console.WriteLine();
         Console.WriteLine($"PAIRED, {paired.Count} sentence renders, same voice and same noise seed for both");
