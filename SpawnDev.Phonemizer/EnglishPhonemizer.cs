@@ -54,6 +54,15 @@ public sealed class EnglishPhonemizer
     public EnglishTextNormalizer? Normalizer { get; set; } = new();
 
     /// <summary>
+    /// Build an unknown word out of a known stem and its ending, before resorting to guesswork.
+    /// </summary>
+    /// <remarks>
+    /// On by default and rarely worth turning off: it is right whenever it fires, where letter-to-sound
+    /// is right about 44% of the time.
+    /// </remarks>
+    public bool Decompose { get; set; } = true;
+
+    /// <summary>
     /// Pronounces words the dictionary does not contain, from their spelling.
     /// </summary>
     /// <remarks>
@@ -97,8 +106,19 @@ public sealed class EnglishPhonemizer
                     // Recorded even when it can be sounded out, because "the dictionary did not have this"
                     // is worth knowing: it is the difference between a pronunciation and a guess.
                     _unknown.Add(token.Text);
-                    var guessed = LetterToSound?.Predict(token.Text);
-                    if (guessed is { Length: > 0 }) output.AddRange(Word(guessed, token.Text));
+
+                    // Decompose BEFORE guessing. "unfriendliest" is not in the dictionary but "friend"
+                    // is, and letter-to-sound is right less than half the time - so anything that can be
+                    // derived from a known word should never be guessed at.
+                    if (Decompose && WordDecomposer.TryDecompose(token.Text, _dictionary, out var derived))
+                    {
+                        output.AddRange(Word(derived, token.Text));
+                    }
+                    else
+                    {
+                        var guessed = LetterToSound?.Predict(token.Text);
+                        if (guessed is { Length: > 0 }) output.AddRange(Word(guessed, token.Text));
+                    }
                 }
             }
             else

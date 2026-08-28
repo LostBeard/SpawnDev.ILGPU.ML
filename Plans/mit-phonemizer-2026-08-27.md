@@ -503,7 +503,7 @@ recollection of English spelling and can never honestly claim an accuracy figure
 
 `dotnet run --project tools/lts-train -c Release -- --out SpawnDev.Phonemizer/lts-model.txt`
 
-**Held out: 43.7% of words exactly right, 16.0% phoneme error rate.** Three designs were measured on the
+**Held out: 43.7% of words exactly right guessing alone, 49.5% with decomposition first, 16.0% phoneme error rate.** Three designs were measured on the
 same 5,000 words, and the intuitive one lost:
 
 | design | words exactly right |
@@ -526,8 +526,21 @@ not a finished component:
 - [ ] "Aubs" comes out with a doubled vowel (`ˈɔːaʊbz`) - the "au" digraph emits two vowels.
 - [ ] Stress placement on "Aubriella" is first-syllable; a speaker would say aw-bree-EL-uh.
 - [ ] The model file is **1.4 MB**, which is heavy for a browser. Pruning is packaging work (Phase 7).
-- [ ] 23% of dictionary entries are a known stem plus a common ending, so trying morphological
-      decomposition BEFORE letter-to-sound would likely beat the model on those words.
+- [x] **DONE and measured: decompose before guessing.** `WordDecomposer` builds an unknown word from a
+      known stem plus its ending, with the allomorphy English actually demands - the -s of "cats" is an
+      S, of "dogs" a Z, of "boxes" a whole syllable; the -ed of "walked" a T, of "wanted" a syllable.
+      It also finds stems English spelling hides: "hoped" is hope+d with the e swallowed, "running" is
+      run+ing with the n doubled.
+
+      | on the same 5,000 held-out words | |
+      |---|---|
+      | fires on | 26.4% of them |
+      | right when it fires | **77.2%** |
+      | letter-to-sound alone, on those same words | 54.9% |
+      | **overall, decompose-then-guess** | **49.5%** against 43.7% guessing alone |
+
+      It declines rather than inventing: "aubriella" is not anything plus an ending, so it hands the
+      word to letter-to-sound, which can at least try.
 
 A silent-failure guard is locked by `MLTestBase.LetterToSoundTests`: when the runtime skipped the stress
 model, every vowel came back with no stress digit, all of them were then discarded downstream as

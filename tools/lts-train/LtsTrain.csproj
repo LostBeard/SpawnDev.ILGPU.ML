@@ -7,4 +7,8 @@
     <AssemblyName>LtsTrain</AssemblyName>
     <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- The REAL decomposer, so this measures the runtime path rather than a copy of it. -->
+    <ProjectReference Include="..\..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
+  </ItemGroup>
 </Project>

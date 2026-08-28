@@ -168,6 +168,38 @@ Console.WriteLine($"HELD OUT : {exact}/{test.Count} words exactly right ({exact 
 Console.WriteLine($"           phoneme error rate {phoneErrors / (double)phoneTotal:P1}");
 Console.WriteLine($"           {exactIgnoringStress / (double)test.Count:P1} exactly right if stress is IGNORED");
 Console.WriteLine($"           {stressOnly / (double)test.Count:P1} had every sound right and the WRONG STRESS");
+// ---- Does decomposing beat guessing? -------------------------------------------------------------------
+// Held-out words that are a known stem plus an ending should be DERIVED, never guessed. This measures
+// that claim rather than assuming it: the dictionary handed to the decomposer contains only TRAINING
+// words, so a held-out word is as unknown to it as it would be at runtime.
+var trainDictionary = SpawnDev.Phonemizer.PronunciationDictionary.Parse(
+    train.Select(e => e.Word + " " + string.Join(' ', e.Phones)));
+
+int fired = 0, firedRight = 0, guessedRightOnSame = 0, combined = 0;
+foreach (var (word, phones) in test)
+{
+    var truth = phones.ToArray();
+    if (SpawnDev.Phonemizer.WordDecomposer.TryDecompose(word, trainDictionary, out var derived))
+    {
+        fired++;
+        if (derived.SequenceEqual(truth)) firedRight++;
+        if (Predict(word).SequenceEqual(truth)) guessedRightOnSame++;
+        if (derived.SequenceEqual(truth)) combined++;
+    }
+    else if (Predict(word).SequenceEqual(truth)) combined++;
+}
+
+Console.WriteLine();
+Console.WriteLine($"DECOMPOSE: fires on {fired}/{test.Count} held-out words ({fired / (double)test.Count:P1})");
+if (fired > 0)
+{
+    Console.WriteLine($"           right {firedRight}/{fired} of those ({firedRight / (double)fired:P1})");
+    Console.WriteLine($"           letter-to-sound alone was right {guessedRightOnSame}/{fired} of the same words "
+                    + $"({guessedRightOnSame / (double)fired:P1})");
+}
+Console.WriteLine($"           decompose-then-guess overall: {combined / (double)test.Count:P1} against "
+                + $"{exact / (double)test.Count:P1} for guessing alone");
+
 Console.WriteLine();
 Console.WriteLine("The gap between those two is the cost of the stress model alone. A word-level model keyed");
 Console.WriteLine("on the word ENDING and syllable count was tried and measured WORSE - 37.2% against 39.5%.");
