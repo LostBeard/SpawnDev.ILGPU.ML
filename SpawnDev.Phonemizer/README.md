@@ -74,6 +74,12 @@ difference is the phonemizer and nothing else.
 
 Worse on 7 of 120 sentences, indistinguishable on 93, better on 20.
 
+⚠️ **Read per-sentence failures carefully.** ZipVoice produces garbage on some noise draws, and it does
+it to both frontends - one sentence rendered at four seeds gave three clean results and one that
+transcribed as "Loner's call, Nanawa, Nenfer". A single seed measures model instability alongside
+phonemizer quality. Re-render at another seed before blaming the phonemes, and see
+`ZipVoicePipeline.SpeakVerifiedAsync` for the production answer.
+
 The claim is PARITY - the small edge could be noise at that sample size. What matters is that the GPL
 dependency can be removed without the audio getting worse.
 
