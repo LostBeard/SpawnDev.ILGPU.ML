@@ -30,47 +30,67 @@ return command switch
     "compare" => CompareEngines(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json"),
     "sensitivity" => RunSensitivity(args.Length > 1 ? args[1] : "fixtures/loaded-classes.json",
                                     args.Length > 2 ? args[2] : null),
+    "endtoend" => RunEndToEnd(args.Length > 1 ? args[1] : "fixtures/phase1",
+                              args.Length > 2 ? args[2] : null),
     _ => Usage(command),
 };
 
 int Usage(string bad)
 {
     Console.WriteLine($"unknown command '{bad}'. commands: roundtrip [wav] | synth [fixture.json] [out.wav] "
-                    + "| compare [fixture.json] | sensitivity [fixture.json] [outDir]");
+                    + "| compare [fixture.json] | sensitivity [dir] [outDir] | endtoend [dir] [outDir]");
     return 2;
+}
+
+// Does OUR phonemizer sound as good as the reference frontend? See EndToEnd.cs. Speaks each sentence
+// twice from the same voice and the same noise seed - once from the reference token ids, once from ours -
+// and transcribes both, so any difference is the phonemizer and nothing else.
+int RunEndToEnd(string fixturePath, string? outDir)
+{
+    var loaded = LoadFixtures(fixturePath);
+    if (loaded == null) return 2;
+    outDir ??= Path.Combine(Path.GetTempPath(), "zipvoice-endtoend");
+    return EndToEnd.RunAsync(modelDir, loaded, outDir, ReadWav, WriteWav).GetAwaiter().GetResult();
 }
 
 // How much phonemizer error this model actually tolerates - see Sensitivity.cs and
 // Plans/mit-phonemizer-2026-08-27.md. Damages the ground-truth tokens the way a CMUdict-based
 // frontend will and grades the resulting audio, so the frontend's precision target is measured
 // rather than assumed.
-int RunSensitivity(string fixturePath, string? outDir)
+// A directory means "every fixture in it". Replication across sentences is what separates a measurement
+// from an anecdote, so the many-fixture case is the normal one.
+List<(string Path, ZipVoiceFixture Fixture)>? LoadFixtures(string fixturePath)
 {
-    if (!Directory.Exists(modelDir)) { Console.WriteLine($"no model dir at {modelDir}"); return 2; }
+    if (!Directory.Exists(modelDir)) { Console.WriteLine($"no model dir at {modelDir}"); return null; }
 
-    // A directory means "every fixture in it". Replication across sentences is what separates a
-    // measurement from an anecdote, so the many-fixture case is the normal one.
     var candidates = new[]
     {
         Path.IsPathRooted(fixturePath) ? fixturePath : Path.Combine(AppContext.BaseDirectory, fixturePath),
         Path.Combine(Environment.CurrentDirectory, fixturePath),
     };
     var resolved = candidates.FirstOrDefault(p => File.Exists(p) || Directory.Exists(p));
-    if (resolved == null) { Console.WriteLine($"no fixture or fixture dir at {fixturePath}"); return 2; }
+    if (resolved == null) { Console.WriteLine($"no fixture or fixture dir at {fixturePath}"); return null; }
 
     var paths = Directory.Exists(resolved)
         ? Directory.GetFiles(resolved, "*.json").OrderBy(p => p).ToArray()
         : new[] { resolved };
-    if (paths.Length == 0) { Console.WriteLine($"no *.json fixtures in {resolved}"); return 2; }
+    if (paths.Length == 0) { Console.WriteLine($"no *.json fixtures in {resolved}"); return null; }
 
-    var fixtures = new List<(string Path, ZipVoiceFixture Fixture)>();
+    var loaded = new List<(string Path, ZipVoiceFixture Fixture)>();
     foreach (var p in paths)
     {
         var fixture = ZipVoiceFixture.Load(p);
         var promptWav = Sensitivity.ResolvePromptWav(modelDir, fixture);
-        if (!File.Exists(promptWav)) { Console.WriteLine($"no prompt wav at {promptWav} (for {Path.GetFileName(p)})"); return 2; }
-        fixtures.Add((p, fixture));
+        if (!File.Exists(promptWav)) { Console.WriteLine($"no prompt wav at {promptWav} (for {Path.GetFileName(p)})"); return null; }
+        loaded.Add((p, fixture));
     }
+    return loaded;
+}
+
+int RunSensitivity(string fixturePath, string? outDir)
+{
+    var fixtures = LoadFixtures(fixturePath);
+    if (fixtures == null) return 2;
 
     outDir ??= Path.Combine(Path.GetTempPath(), "zipvoice-sensitivity");
     return Sensitivity.RunAsync(modelDir, fixtures, outDir, ReadWav, WriteWav)

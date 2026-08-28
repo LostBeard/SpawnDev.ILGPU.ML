@@ -669,6 +669,9 @@ public static class Sensitivity
     /// every substitution, deletion and insertion INSIDE the sentence, which is where a mispronunciation
     /// shows up. The plain WER is recorded alongside it so nothing is hidden.
     /// </remarks>
+    /// <summary>Infix WER between a reference SENTENCE and a transcript, for other tools to reuse.</summary>
+    public static double InfixWerOf(string text, string transcript) => InfixWer(Words(text), Words(transcript));
+
     private static double InfixWer(string[] truth, string[] hyp)
     {
         if (truth.Length == 0) return hyp.Length == 0 ? 0 : 1;

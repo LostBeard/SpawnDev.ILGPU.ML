@@ -177,6 +177,18 @@ public sealed class EnglishPhonemizer
             }
         }
 
+        // One PRIMARY stress per word. The dictionary marks both syllables of "nineteen" and "seventeen"
+        // as primary; a speaker leans on the first and gives the second a lighter beat, which is what the
+        // reference frontend writes (seventeen is SECONDARY-less first, then a secondary mark on -teen).
+        // Two primaries in one word is not English, and stress is what the model punishes hardest.
+        bool seenPrimary = false;
+        for (int i = 0; i < symbols.Count; i++)
+        {
+            if (symbols[i] != Arpabet.PrimaryStress) continue;
+            if (!seenPrimary) { seenPrimary = true; continue; }
+            symbols[i] = Arpabet.SecondaryStress;
+        }
+
         // A word that is not a weak form must carry a stress somewhere. The dictionary stores some
         // monosyllables with no stressed vowel at all - "in" is IH0 N - and emitting them unstressed
         // leaves the sentence with a hole where a beat should be. Stress is the axis this model is most

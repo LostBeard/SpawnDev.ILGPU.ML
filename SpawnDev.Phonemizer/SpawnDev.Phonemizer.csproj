@@ -13,4 +13,15 @@
     -->
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
+  <ItemGroup>
+    <!--
+      The data travels INSIDE the assembly, gzipped. A phonemizer that needs files fetched from
+      somewhere is not really dependency-free, and in a browser it is one more thing to host and
+      version. 915 KB and 340 KB, against models measured in hundreds of megabytes elsewhere here.
+    -->
+    <EmbeddedResource Include="cmudict.dict.gz" />
+    <EmbeddedResource Include="lts-model.txt.gz" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 </Project>

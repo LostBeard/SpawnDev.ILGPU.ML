@@ -20,6 +20,10 @@
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.26.0" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The REAL phonemizer: this harness is its end-to-end audio gate. -->
+    <ProjectReference Include="..\..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
+  </ItemGroup>
+  <ItemGroup>
     <!-- Fixtures travel with the harness so a gate run needs nothing outside the repo. -->
     <None Include="fixtures\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

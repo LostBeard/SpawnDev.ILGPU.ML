@@ -74,8 +74,12 @@ public abstract partial class MLTestBase
     {
         // Whole-word and case-insensitive, longest first so "drs" is not eaten by "dr".
         var n = new EnglishTextNormalizer();
-        ExpectText(n.Normalize("Dr. Tanner"), "doctor. Tanner");
-        ExpectText(n.Normalize("Mrs. Tanner"), "missus. Tanner");
+        // A title's full stop is an abbreviation mark, not a pause. Left in, "Dr. Tanner" phonemizes with
+        // a sentence break in the middle of a person's name, and the model renders it as an audible stop.
+        ExpectText(n.Normalize("Dr. Tanner"), "doctor Tanner");
+        ExpectText(n.Normalize("Mr. and Mrs. Tanner"), "mister and missus Tanner");
+        // A sentence that genuinely ENDS after an abbreviation keeps its stop.
+        ExpectText(n.Normalize("ask Dr."), "ask doctor.");
         ExpectText(n.Normalize("etc."), "et cetera.");
         // A word that merely CONTAINS an abbreviation must survive intact.
         ExpectText(n.Normalize("street drama"), "street drama");

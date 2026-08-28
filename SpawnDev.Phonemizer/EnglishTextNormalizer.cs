@@ -50,12 +50,21 @@ public sealed class EnglishTextNormalizer
 
     private static Regex Word(string word) => new($@"\b{word}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    // A title's full stop is an abbreviation mark, NOT a pause. Left in, "Dr. Tanner" phonemizes as
+    // "doctor", a sentence break, then "Tanner" - and the model renders that break as an audible stop in
+    // the middle of a person's name. Only stripped when something follows, so a sentence that genuinely
+    // ends on an abbreviation keeps its stop.
+    private static readonly Regex TitleStop =
+        new(@"\b(mr|mrs|ms|dr|drs|st|jr|sr|col|sgt|capt|lt|gen|maj|rev|hon|esq|prof)\.(?=\s)",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     /// <summary>Normalize a stretch of text for speech.</summary>
     public string Normalize(string text)
     {
         if (string.IsNullOrEmpty(text)) return string.Empty;
 
         text = MapPunctuation(text);
+        text = TitleStop.Replace(text, "$1");     // before expansion, while the abbreviation is still short
         text = ExpandAbbreviations(text);
         text = NormalizeNumbers(text);
         return Whitespace.Replace(text, " ").Trim();
