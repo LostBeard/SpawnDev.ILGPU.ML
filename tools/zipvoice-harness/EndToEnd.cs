@@ -256,9 +256,16 @@ public static class EndToEnd
                                 + $"({dl - dr:+0.00%;-0.00%;0.00%})");
                 Console.WriteLine($"    {variants[a]} better on {lb}, {variants[b]} better on {rb}, "
                                 + $"IDENTICAL on {keys.Count - lb - rb}");
-                if (lb + rb == 0)
-                    Console.WriteLine("    => these two configurations are indistinguishable on this set. A change "
-                                    + "that moves a symbol metric and not this one has not been shown to matter.");
+
+                // What this comparison could have SEEN. Without it, "0.00%" is unreadable: it means the
+                // same thing whether the change did nothing or the set is too small to notice.
+                var (_, sd, detectable) = PairedPower(keys.Select(k => left[k].InfixWer - right[k].InfixWer).ToList());
+                Console.WriteLine($"    resolution: this set can detect a difference of about "
+                                + $"{detectable:P2} at 95% confidence (paired sd {sd:P2} over {keys.Count} renders)");
+                if (Math.Abs(dl - dr) < detectable)
+                    Console.WriteLine($"    => the observed {Math.Abs(dl - dr):P2} is BELOW that, so this set cannot "
+                                    + "tell these two apart. Not evidence they are the same - evidence the set is "
+                                    + "too small to say. Add sentences or seeds (resolution improves as sqrt(n)).");
                 foreach (var k in keys.Where(k => Math.Abs(left[k].InfixWer - right[k].InfixWer) > 1e-9)
                                       .OrderBy(k => left[k].InfixWer - right[k].InfixWer))
                 {
@@ -269,6 +276,29 @@ public static class EndToEnd
                     Console.WriteLine($"      {variants[b],-9}: {right[k].Transcript}");
                 }
             }
+    }
+
+    /// <summary>
+    /// What difference this comparison could actually have DETECTED, given how much the paired
+    /// differences scatter. Reported next to every result so "no difference" can be read honestly.
+    /// </summary>
+    /// <remarks>
+    /// A gate that cannot resolve the effect you are looking for reports "no change" for a real
+    /// improvement and for a no-op alike, and the two are indistinguishable from the output. That already
+    /// bit this project once: a letter-to-sound change worth +8.9 points of symbol accuracy moved this
+    /// gate 0.00%, which is a genuine finding ONLY if the gate could have seen a smaller move.
+    ///
+    /// Paired differences cancel sentence difficulty and the noise draw, so the spread here is the
+    /// residual - and the 95% detectable difference is ~1.96 * sd / sqrt(n). Widening the set (more
+    /// sentences, more seeds) shrinks it as sqrt(n), which is the honest way to buy resolution.
+    /// </remarks>
+    private static (double Mean, double Sd, double Detectable) PairedPower(IReadOnlyList<double> diffs)
+    {
+        int n = diffs.Count;
+        if (n < 2) return (0, 0, double.PositiveInfinity);
+        double mean = diffs.Average();
+        double sd = Math.Sqrt(diffs.Sum(d => (d - mean) * (d - mean)) / (n - 1));
+        return (mean, sd, 1.96 * sd / Math.Sqrt(n));
     }
 
     private static int Report(List<Row> rows, string outDir)
@@ -293,6 +323,13 @@ public static class EndToEnd
         Console.WriteLine($"  reference frontend : {refMean:P1} mean word error");
         Console.WriteLine($"  OUR phonemizer     : {oursMean:P1}");
         Console.WriteLine($"  difference         : {oursMean - refMean:+0.0%;-0.0%;0.0%}");
+
+        var (_, refSd, refDetectable) = PairedPower(paired.Select(p => p.Ours.InfixWer - p.Reference.InfixWer).ToList());
+        Console.WriteLine($"  resolution         : detects ~{refDetectable:P2} at 95% confidence "
+                        + $"(paired sd {refSd:P2} over {paired.Count} renders)"
+                        + (Math.Abs(oursMean - refMean) < refDetectable
+                            ? " - the difference above is BELOW that, i.e. not resolvable by this set"
+                            : ""));
         Console.WriteLine();
         Console.WriteLine($"  ours clearly worse : {worse}/{paired.Count}");
         Console.WriteLine($"  indistinguishable  : {same}/{paired.Count}");

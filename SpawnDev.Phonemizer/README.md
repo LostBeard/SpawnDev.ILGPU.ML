@@ -72,6 +72,17 @@ difference is the phonemizer and nothing else.
 | 120 sentences, one noise seed | 9.1% | **7.2%** |
 | 40 sentences, three noise seeds | 10.8% | **7.3%** |
 | 30 sentences, **properly paired reference clip** | 3.1% | **2.3%** |
+| **40 sentences x 3 seeds, all carrying a NAME the dictionary lacks** | 13.5% | **12.1%** |
+
+That last row is the one that exercises this library's hardest path - letter-to-sound, on words no
+dictionary contains - and it is the only row whose difference has been shown to be **larger than the
+measurement could have produced by chance**: over its 120 paired renders the paired standard deviation is
+7.1%, so the set resolves about 1.3% at 95% confidence, and the gap is 1.4%. It also replicated: the first
+20 of those sentences gave -1.6%, the 20 added afterwards held it at -1.4%.
+
+⚠️ Read the other rows as point estimates. They are real measurements on real audio, but a difference
+smaller than a set can resolve is not evidence of a difference - `tools/zipvoice-harness endtoend` now
+prints its own resolution beside every result so this is visible rather than assumed.
 
 That last row is the one to look at for absolute quality. The packaged sample clip is paired with a
 transcript that is not what it says, so the model speaks those words at the start of every render - worth

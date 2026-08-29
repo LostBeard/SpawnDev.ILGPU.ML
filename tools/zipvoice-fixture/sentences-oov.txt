@@ -43,3 +43,30 @@ Elowen would rather read a book than watch anything at all.
 Aubriella and Kayleigh are staying up far too late.
 The Anthropic office is quieter than she expected.
 Jaxon wondered whether Blazor could handle the whole thing.
+
+# --- Second block, added 2026-08-28 to give the gate enough RESOLUTION -------------------------------
+# At 20 sentences x 3 seeds the paired standard deviation of ours-vs-reference is 7.59%, so the set could
+# only resolve a ~1.92% difference at 95% confidence - and the difference we care about is ~1.6%. It could
+# not tell "we beat espeak" from "no difference". Resolution improves as sqrt(n), so this doubles the
+# sentence count. Same rules as above: every line carries a word CMUdict lacks, chosen to be spellable by
+# the grader, and no word whose own pronunciation our model truncates.
+Kayleigh and Jaxon are building something in the garage.
+The Anthropic paper explains how the model was trained.
+Makayla asked whether Ryleigh had finished her homework.
+Elowen borrowed my notes and never gave them back.
+Aubriella wants a bigger tank for her fish.
+Did Jaxon say when the Roblox server goes down?
+Figma keeps crashing whenever I open that file.
+Kubernetes moved the workload to another machine overnight.
+Ryleigh thinks TensorFlow is easier than she expected.
+Blazor lets her write the whole page in one language.
+Kayleigh left her coat at Makayla's house again.
+Elowen and Aubriella are planning the whole afternoon.
+The team at Anthropic answered every question we sent.
+Jaxon put the Figma link in the wrong channel.
+Makayla says Roblox is better on the bigger screen.
+Ryleigh and Elowen walked home the long way.
+Aubriella counted every star she could find.
+Would Kayleigh rather have the window or the aisle?
+TensorFlow and Blazor solve completely different problems.
+Jaxon reckons Kubernetes is overkill for a blog.

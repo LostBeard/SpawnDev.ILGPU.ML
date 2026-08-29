@@ -32,9 +32,18 @@ English TTS frontend. This is that frontend.
 | CMUdict coverage | 99.5% of the top 1,000 English words |
 
 **End to end as AUDIO**, which is the number that actually matters: rendered through ZipVoice from the same
-voice and the same noise seed, ours measures **9.69% word error against espeak-ng's 11.30%** on sentences
-carrying names - and **4.7% against 6.7%** on read-aloud declaratives. Parity or better with the GPL tool
-it replaces, which is what removing that dependency required.
+voice and the same noise seed, ours measures **9.7% word error against espeak-ng's 11.3%** on sentences
+carrying names, and **4.7% against 6.7%** on read-aloud declaratives.
+
+On the out-of-vocabulary set - every sentence carrying a name the dictionary lacks, which is this library's
+hardest path - **12.1% against espeak-ng's 13.5%** over 120 paired renders.
+
+That one is established rather than merely observed. At the original 60 renders the paired standard
+deviation was 7.6%, so the set resolved only ~1.9% at 95% confidence and a 1.6% gap could not be told from
+no difference at all. Doubling the sentences took the resolution to **1.3%** against a **1.4%** gap, and
+the effect **replicated** on the 20 fresh sentences (-1.6% -> -1.4%). `tools/zipvoice-harness endtoend` now
+prints its own resolution beside every result, so a difference smaller than the set can see is visible as
+such instead of being read as a win.
 
 ### Deliberately
 

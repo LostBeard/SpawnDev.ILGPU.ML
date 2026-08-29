@@ -946,8 +946,35 @@ and Jaxon ("Juxene" -> "Jackson"). New LOSES Anthropic: it says an-THROP-ik, whi
 hears "entropic", while the old model's AN-thruh-pik transcribes clean. **A more correct pronunciation
 scoring worse** is precisely why a human ear stays in the loop.
 
-⚠️ **Known limit of the gate:** 4 differing renders out of 60 is not much resolution. A change has to be
-large to show here. Before trusting a future "no difference", grow the set or state its sensitivity.
+## ✅ The gate now STATES ITS OWN RESOLUTION, and the headline claim was re-established (2026-08-29)
+
+The limit flagged above was real, and worse than "not much resolution" - it made the headline claim
+unsupported. `endtoend` now computes the paired standard deviation and prints what the set could actually
+have detected (`PairedPower`, 95% confidence, ~1.96·sd/√n) beside every result.
+
+At the original **60** renders: paired sd **7.59%** → resolves **~1.92%**, against a **1.6%** gap. **Below
+its own resolution** - it could not tell "we beat espeak" from "no difference", and I had reported it as a
+win.
+
+Doubling the set to **40 sentences × 3 seeds = 120 paired renders** settles it:
+
+| | mean word error |
+|---|---|
+| reference (GPL espeak-ng) | **13.5%** |
+| **ours (MIT)** | **12.1%** |
+| difference | **−1.4%**, against a **1.27%** resolution (paired sd 7.07%) |
+
+The gap now exceeds what the set can produce by chance, so **better than espeak-ng on names is
+established**. It also **replicated**: the first 20 sentences gave −1.6%, the 20 added afterwards −1.4%.
+Better on 18/120, worse on 8/120. Absolute numbers rose because the second block is harder - the GAP is the
+stable quantity, which is what pairing is for.
+
+⚠️ The VARIANT comparison keeps its much finer resolution (0.74%, sd 2.92%) because 56 of 60 renders there
+are identical, so "the ±5 rebuild moved the audio 0.00%" stands - read precisely as "no effect ≥0.74%".
+
+⚠️ **Rebuild the harness after adding fixtures** - they are copied into the output directory, so
+`--no-build` silently runs the OLD set. It reported `fixtures : 20` while 40 existed and cost a full render
+cycle before I noticed.
 
 ## Two levers measured and CLOSED (2026-08-28) - read before proposing either again
 
