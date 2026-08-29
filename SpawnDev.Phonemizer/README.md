@@ -26,6 +26,28 @@ phonemizer.ToSymbols("...");        // one IPA symbol per entry, ready to map to
 phonemizer.LastUnknownWords;        // words the dictionary did not have, whether or not they were sounded out
 ```
 
+### What it handles before you have to
+
+Real text is not a list of dictionary words, so the frontend reads the things around them rather than
+handing them to the guesser or dropping them.
+
+```csharp
+phonemizer.ToIpa("Mr. & Mrs. Vance live at 123 Main St.");   // "and", and a STREET, not a saint
+phonemizer.ToIpa("I have 1,234 of them");                    // "one thousand, two hundred thirty-four"
+phonemizer.ToIpa("Meet me at 3:30");                         // "three thirty", not "three colon thirty"
+phonemizer.ToIpa("It is 6 ft tall and 5 km away");           // "feet", "kilometers" - not "fort", not "km"
+phonemizer.ToIpa("Read the RSS feed");                       // R-S-S, spelled out, not sounded out
+phonemizer.ToIpa("Aubriella's turn");                        // the STEM is resolved, then the ending
+```
+
+- **Acronyms are spelled out, not guessed.** Only when the dictionary lacks the word - so "NASA", which is
+  in there, is still said as a word, and the exception list maintains itself.
+- **Possessives resolve their stem**, so a word you taught with `Define` stays taught in the possessive.
+- **Numbers, times, money, units, arithmetic and ordinals** are expanded. Units only expand when a number
+  precedes them, which is what keeps "I live in Ohio" from finding an "in".
+- ⚠️ A ROUND grouped number keeps its year-style reading, because that is what English says: "fifteen
+  hundred apples", never "one thousand five hundred apples".
+
 ### Teaching it a word
 
 The words an application says most often are exactly the ones a general dictionary lacks - character
