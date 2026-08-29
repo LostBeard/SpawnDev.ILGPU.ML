@@ -26,6 +26,18 @@
   and names a symbol the model has no token for, rather than dropping a sound and leaving nothing to
   explain the gap; `TryEncode` is there for callers that would rather decide.
 
+- **Acronyms are spelled out instead of guessed at.** The dictionary's own notes said its misses are
+  "almost entirely abbreviations and acronyms... which want expanding or spelling out rather than
+  guessing" - and nothing did it, so "RSS" went to letter-to-sound and came back as an invented word. An
+  ALL-CAPS token the dictionary does not have is now read out as its letters.
+  - The filter does the work: only a word the DICTIONARY LACKS is spelled. That leaves "NASA" alone
+    (it is in there as a word), and the exception list maintains itself.
+  - Letter names come from the dictionary rather than a new table - it already holds them ("r" is AA1 R,
+    "w" is D AH1 B AH0 L Y UW0). ⚠️ Except "a", whose first entry is the ARTICLE; its letter name is the
+    alternate.
+  - Stress follows CMUdict's own treatment of the acronyms it DOES hold - secondary on every letter but
+    the last - which is verified against five of them (html, url, api, dvd, pdf, cpu).
+
 ### Fixed
 
 - **A grouped number was read as a year.** "I have 1,234 of them" came out as "twelve thirty-four": the

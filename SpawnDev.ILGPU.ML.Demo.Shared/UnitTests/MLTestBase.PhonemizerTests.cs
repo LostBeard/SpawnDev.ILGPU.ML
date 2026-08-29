@@ -220,6 +220,51 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Phonemizer_SpellsOutAcronymsInsteadOfGuessingThem() => await RunTest(_ =>
+    {
+        // The dictionary's own notes say its misses at the common end are "almost entirely abbreviations
+        // and acronyms... which want expanding or spelling out rather than guessing", and nothing did it.
+        // "RSS" is not a word, so letter-to-sound invents one.
+        //
+        // ⭐ The stress rule is not invented either. CMUdict holds a few acronyms already spelled out, and
+        // they all put SECONDARY on every letter but the last. Those entries are the oracle: spelling
+        // "HTML" by this rule has to reproduce the html entry exactly.
+        var dictionary = PronunciationDictionary.Parse(new[]
+        {
+            "a AH0", "a(2) EY1",          // the article first, the LETTER NAME second - the one exception
+            "h EY1 CH", "t T IY1", "m EH1 M", "l EH1 L",
+            "u Y UW1", "r AA1 R", "s EH1 S",
+            "nasa N AE1 S AH0",           // an acronym English says as a WORD
+        });
+        var phonemizer = new EnglishPhonemizer(dictionary) { LetterToSound = null, Flapping = false };
+
+        // CMUdict: html = EY2 CH T IY2 EH2 M EH1 L. Every letter secondary, the last primary.
+        Expect(phonemizer.ToIpa("HTML"), "ˌeɪtʃ tˌiː ˌɛm ˈɛl".Replace(" ", ""));
+
+        // CMUdict: url = Y UW2 AA2 R EH1 L.
+        Expect(phonemizer.ToIpa("URL"), "jˌuː ˌɑːɹ ˈɛl".Replace(" ", ""));
+
+        // ⚠️ "A" must use the LETTER name (EY1), not the article (AH0) - the only letter where the
+        // dictionary's first entry is not the letter's name.
+        //
+        // Asserted on "AR" rather than "AS": "as" is a FUNCTION WORD, so the destresser strips its marks
+        // and the assertion would be about the wrong thing. That cannot happen for real - every function
+        // word is in CMUdict, so it is answered there and never reaches the speller - it is an artifact
+        // of this test's deliberately tiny dictionary.
+        var spelledA = phonemizer.ToIpa("AR");
+        if (!spelledA.Contains("eɪ")) throw new Exception($"\"AR\" used the article for A: {spelledA}");
+        if (spelledA.StartsWith('ə')) throw new Exception($"\"AR\" opened with the article schwa: {spelledA}");
+
+        // The filter is what protects the ones English says as words: NASA is in the dictionary, so it
+        // never reaches the speller and keeps its own pronunciation.
+        Expect(phonemizer.ToIpa("NASA"), "nˈæsə");
+
+        // A single letter is not an acronym, and lower case is not either.
+        if (phonemizer.SpellOutAcronyms != true) throw new Exception("expected spell-out on by default");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Vocabulary_MapsSymbolsToTokenIdsAndBack() => await RunTest(_ =>
     {
         // ⚠️ The third line is a SPACE as a symbol, which a real ZipVoice vocabulary genuinely lists.

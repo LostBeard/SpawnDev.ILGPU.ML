@@ -163,10 +163,16 @@ public sealed class EnglishPhonemizer
                     // is worth knowing: it is the difference between a pronunciation and a guess.
                     _unknown.Add(token.Text);
 
+                    // An acronym is SPELLED OUT, never sounded out. "RSS" is not a word and guessing at
+                    // it produces one; the letters are the pronunciation.
+                    if (SpellOutAcronyms && TrySpellOut(token.Text, out var spelled))
+                    {
+                        output.AddRange(Word(spelled, token.Text, previousWord));
+                    }
                     // Decompose BEFORE guessing. "unfriendliest" is not in the dictionary but "friend"
                     // is, and letter-to-sound is right less than half the time - so anything that can be
                     // derived from a known word should never be guessed at.
-                    if (Decompose && WordDecomposer.TryDecompose(token.Text, _dictionary, out var derived))
+                    else if (Decompose && WordDecomposer.TryDecompose(token.Text, _dictionary, out var derived))
                     {
                         output.AddRange(Word(derived, token.Text, previousWord));
                     }
@@ -194,6 +200,65 @@ public sealed class EnglishPhonemizer
 
     /// <summary>Phonemize into a single IPA string.</summary>
     public string ToIpa(string text) => string.Concat(ToSymbols(text));
+
+    /// <summary>
+    /// Read an unknown ALL-CAPS word out as its letters rather than guessing at it.
+    /// </summary>
+    /// <remarks>
+    /// The dictionary's own notes say what it misses at the common end is "almost entirely abbreviations
+    /// and acronyms (rss, faq, apr, ny, gmt), which want expanding or spelling out rather than guessing" -
+    /// and until now nothing did it. "RSS" is not a word, so letter-to-sound invents one.
+    ///
+    /// The filter is doing the work: only a word the DICTIONARY DOES NOT HAVE is spelled out. That is
+    /// what keeps the acronyms English says as words intact - "NASA" is in the dictionary as N AE1 S AH0
+    /// and never reaches here - and it means the list of exceptions maintains itself.
+    /// </remarks>
+    public bool SpellOutAcronyms { get; set; } = true;
+
+    /// <summary>Whether a token reads as an acronym: two or more letters, all upper case, no digits.</summary>
+    private static bool LooksLikeAcronym(string token)
+    {
+        if (token.Length < 2) return false;
+        foreach (var c in token)
+            if (!char.IsLetter(c) || !char.IsUpper(c)) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// The phones for a spelled-out acronym, or false if any letter cannot be named.
+    /// </summary>
+    /// <remarks>
+    /// The letter NAMES come from the dictionary itself rather than a table written here - it already
+    /// holds them ("r" is AA1 R, "w" is D AH1 B AH0 L Y UW0). ⚠️ Except "a", whose first entry is the
+    /// ARTICLE (AH0); its letter name is the alternate (EY1). That is the one place the two disagree.
+    ///
+    /// Stress follows the dictionary's own treatment of the acronyms it DOES hold: every letter but the
+    /// last is secondary, the last carries the primary. Checked against them - spelling "HTML" this way
+    /// reproduces CMUdict's html entry exactly (EY2 CH T IY2 EH2 M EH1 L), and "URL" reproduces url
+    /// (Y UW2 AA2 R EH1 L). Those two are the oracle for this method.
+    /// </remarks>
+    private bool TrySpellOut(string token, out string[] phones)
+    {
+        phones = [];
+        if (!LooksLikeAcronym(token)) return false;
+
+        var spelled = new List<string>(token.Length * 3);
+        for (var i = 0; i < token.Length; i++)
+        {
+            var letter = char.ToLowerInvariant(token[i]).ToString();
+            if (!_dictionary.TryLookupAll(letter, out var readings) || readings.Count == 0) return false;
+
+            // "a" is the article first and the letter name second; every other letter names itself.
+            var chosen = letter == "a" && readings.Count > 1 ? readings[1] : readings[0];
+
+            var last = i == token.Length - 1;
+            foreach (var phone in chosen)
+                spelled.Add(last || !phone.EndsWith('1') ? phone : phone[..^1] + "2");
+        }
+
+        phones = [.. spelled];
+        return true;
+    }
 
     /// <summary>Map one word's ARPAbet phones to IPA symbols, applying the rules.</summary>
     /// <param name="phones">The word's ARPAbet phones, vowels carrying their stress digit.</param>
