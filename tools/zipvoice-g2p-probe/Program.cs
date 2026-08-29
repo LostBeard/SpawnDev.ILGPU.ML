@@ -83,15 +83,8 @@ if (wordList != null)
 if (!Directory.Exists(fixtureDir)) { Console.WriteLine($"no fixtures at {fixtureDir}"); return 2; }
 
 // ---- The model's symbol table -----------------------------------------------------------------------
-var idToSym = new Dictionary<long, string>();
-foreach (var raw in File.ReadAllLines(Path.Combine(modelDir, "tokens.txt")))
-{
-    var line = raw.TrimEnd('\r', '\n');
-    if (line.Length == 0) continue;
-    int cut = line.LastIndexOf('\t');
-    if (cut < 0 || !long.TryParse(line[(cut + 1)..], out var id)) continue;
-    idToSym[id] = line[..cut];
-}
+// The library owns tokens.txt parsing now, including the detail that a symbol can be whitespace.
+var vocabulary = PhonemeVocabulary.Load(Path.Combine(modelDir, "tokens.txt"));
 
 var dictionary = PronunciationDictionary.Load(dictPath);
 var phonemizer = new EnglishPhonemizer(dictionary) { Flapping = flapping, DestressFunctionWords = destress };
@@ -108,7 +101,7 @@ foreach (var path in Directory.GetFiles(fixtureDir, "*.json").OrderBy(p => p))
     using var doc = JsonDocument.Parse(File.ReadAllText(path));
     var text = doc.RootElement.GetProperty("text").GetString()!;
     var oracle = doc.RootElement.GetProperty("tokens").EnumerateArray()
-        .Select(e => idToSym.TryGetValue(e.GetInt64(), out var s) ? s : "?").ToArray();
+        .Select(e => vocabulary.TryGetSymbol(e.GetInt64(), out var s) ? s : "?").ToArray();
 
     var ours = phonemizer.ToSymbols(text).ToArray();
     oovTotal += text.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;

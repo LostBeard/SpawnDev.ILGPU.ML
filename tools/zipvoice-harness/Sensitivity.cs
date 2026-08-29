@@ -26,6 +26,7 @@ using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
+using SpawnDev.Phonemizer;
 using System.Text.Json;
 
 namespace ZipVoiceHarness;
@@ -64,9 +65,10 @@ public static class Sensitivity
     {
         var tokensPath = Path.Combine(modelDir, "tokens.txt");
         if (!File.Exists(tokensPath)) { Console.WriteLine($"no tokens.txt at {tokensPath}"); return 2; }
-        var (idToSym, symToId) = LoadTokens(tokensPath);
+        // Shared with every other tool now - see PhonemeVocabulary for why the LAST tab matters.
+        var vocabulary = PhonemeVocabulary.Load(tokensPath);
 
-        long Id(string sym) => symToId.TryGetValue(sym, out var id)
+        long Id(string sym) => vocabulary.TryGetId(sym, out var id)
             ? id
             : throw new InvalidOperationException($"symbol '{sym}' is not in {tokensPath}");
 
@@ -83,7 +85,7 @@ public static class Sensitivity
         // Every vowel in the espeak inventory this model uses. Needed to move or replace a stress-bearing
         // vowel, because stress attaches to the vowel that follows the mark.
         var vowels = new HashSet<long>("aeiouæɐɑɒɔəɚɘɛɜɞɤɨɪɯʉʊʌʏɵɶøœᵻ"
-            .Select(c => symToId.TryGetValue(c.ToString(), out var v) ? v : -1).Where(v => v >= 0));
+            .Select(c => vocabulary.TryGetId(c.ToString(), out var v) ? v : -1).Where(v => v >= 0));
 
         var variants = new List<Variant>
         {
@@ -636,25 +638,9 @@ public static class Sensitivity
         return Path.Combine(modelDir, fixture.PromptWav);   // unchanged behaviour, so the error names it
     }
 
-    private static (Dictionary<long, string> IdToSym, Dictionary<string, long> SymToId) LoadTokens(string path)
-    {
-        var idToSym = new Dictionary<long, string>();
-        var symToId = new Dictionary<string, long>();
-        foreach (var raw in File.ReadAllLines(path))
-        {
-            var line = raw.TrimEnd('\r', '\n');
-            if (line.Length == 0) continue;
-            // The symbol itself can be a space, so split on the LAST tab.
-            int cut = line.LastIndexOf('\t');
-            if (cut < 0 || !long.TryParse(line[(cut + 1)..], out var id)) continue;
-            idToSym[id] = line[..cut];
-            symToId.TryAdd(line[..cut], id);
-        }
-        return (idToSym, symToId);
-    }
-
-    public static string Render(long[] tokens, Dictionary<long, string> idToSym)
-        => string.Concat(tokens.Select(t => idToSym.TryGetValue(t, out var s) ? s : "?"));
+    // LoadTokens and Render lived here and are gone: PhonemeVocabulary does both, and the "split on the
+    // LAST tab because the symbol can be a space" note that used to sit on this method is now stated once,
+    // in the library, where every consumer gets it.
 
     /// <summary>True when a transcript repeats a word immediately, which is what a stutter looks like.</summary>
     private static bool HasRepeatedWord(string transcript)
