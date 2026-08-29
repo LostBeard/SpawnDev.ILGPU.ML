@@ -1044,7 +1044,18 @@ English's real silent letters without costing more than it saves.
 The MIT phonemizer is **built, measured and at parity with GPL espeak-ng**. Nothing is half-finished; the
 list below is what would make it better, in the order I would take it.
 
-0. ⛔ **NOT pronunciation by analogy, and NOT a stress tie-break.** Both were measured and rejected today -
+0. ⭐ **NEXT (Captain's call, 2026-08-29): port the verified-speech loop to Rose.**
+   `ZipVoicePipeline.SpeakVerifiedAsync` speaks, transcribes with the recogniser already in the stack, and
+   re-rolls a garbled render - it rescued 2 of 2 known-bad sentences and is wired into nothing that speaks.
+   ⚠️ **It is NOT a drop-in, which is why this is a port and not a wiring job:** Rose runs ZipVoice through
+   **sherpa-onnx** (GPU, ~1.2s cold / <1s warm - see `reference-sherpa-onnx-gpu-cuda-recipe`), NOT through
+   our `ZipVoicePipeline`, so the METHOD cannot be called. The ALGORITHM transfers, and Rose already has
+   both halves it needs: `RoseVoice.SpeakAsync` for output and `RoseEars` (Silero VAD + Whisper base.en via
+   sherpa-onnx) for the recogniser. Read `SpawnDev.Reachy`'s own CLAUDE.md and
+   `project-EOD-2026-07-19-rose-reachy-mini-companion` first.
+   ✅ Testable without the robot: render + transcribe + compare + re-roll is all desktop compute; only the
+   speaker needs the hardware.
+0b. ⛔ **NOT pronunciation by analogy, and NOT a stress tie-break.** Both were measured and rejected -
    see the section above. Proposing either again costs a day; the numbers are in `--analogy` and
    `--analyze`.
 1. **Letter-to-sound is the weakest component.** 49.9% of unknown words exactly right (53.1% with
@@ -1063,6 +1074,16 @@ list below is what would make it better, in the order I would take it.
    names in running speech. Every number here comes from read-aloud declaratives.
 
 ## Session log
+
+- **2026-08-28/29 EOD (Tuvok)**: **SHIPPED `SpawnDev.Phonemizer` 1.0.0 to nuget.org** (first release), with
+  `SpawnDev.ILGPU.ML` 5.1.4 alongside it. Letter-to-sound went **40.9% -> 49.9%** held out (the header had
+  never described the shipped model), an **OOV audio gate** now exists and the headline claim is
+  established rather than observed: **espeak-ng 13.5% vs ours 12.1%** over 120 paired renders, difference
+  -1.4% against a 1.27% resolution, replicated on 20 fresh sentences. Two levers CLOSED by measurement -
+  pronunciation by analogy (30 configurations, best +0.6, does not fire on the target names) and the
+  specificity stress tie-break (loses 24-13). Shipped a narrow guard so a word spelled with vowels can
+  never come back as bare consonants. Tree clean, everything pushed, nothing running.
+  ⚠️ **Start tomorrow on the ROSE PORT** - see "Where to pick up".
 
 - **2026-08-28 (Tuvok, latest)**: Closed two levers by measuring them. Pronunciation by ANALOGY REJECTED - best of 30 configurations is +0.6 points, and at that setting it fires on none of the names it was meant to fix ("briella" is a singleton, and for analogy singletons measure WORSE - the opposite of the context-width result). Shipped instead a narrow guard: a word spelled with vowels can never come back as bare consonants (the `bɹl` failure), +0.1 and 11 unsayable words down to 1, with three wider triggers measured and rejected - the obvious one costs 19.5 points because under compression, resolving at the single-letter width is NORMAL, not ignorance. Held out 49.9%/13.8%/53.1%. General truncation (`nevaeh`, `huawei`) still open.
 - **2026-08-28 (Tuvok, earlier)**: Took pickup item 1. Letter-to-sound **40.9% -> 49.8%** held out, after
