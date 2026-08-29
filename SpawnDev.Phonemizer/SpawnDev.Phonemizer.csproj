@@ -26,7 +26,7 @@
       needs for text-to-phonemes would be the wrong shape.
     -->
     <Version>1.1.0</Version>
-    <PackageReleaseNotes>v1.0.0 - First release. MIT English grapheme-to-phoneme: CMUdict lookup, morphological decomposition, and learned letter-to-sound for unknown words. Replaces GPL-3 espeak-ng as a TTS frontend.</PackageReleaseNotes>
+    <PackageReleaseNotes>v1.1.0 - Define/Remove a pronunciation at runtime, so a name you know is told rather than guessed. New PhonemeVocabulary maps symbols to a model token ids and back. Acronyms are spelled out and possessives resolve their stem instead of being guessed. Text fixes: grouped numbers no longer read as years, clock times lose their colon, street St. is no longer saint, ampersand and number sign are no longer silent, co-op is no longer COMPANY op, units and arithmetic are spoken. Behaviour is unchanged for anyone who defines nothing.</PackageReleaseNotes>
     <IsPackable>true</IsPackable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <EmbedAllSources>true</EmbedAllSources>

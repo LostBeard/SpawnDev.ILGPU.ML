@@ -7,7 +7,7 @@
 - **`Define` / `Remove` on `PronunciationDictionary`, and `Define` on `EnglishPhonemizer`** - teach it how
   a word is said at runtime, without rebuilding the embedded data. The words an application says most are
   the ones CMUdict lacks (names, brands, jargon), and letter-to-sound is right about half the time on
-  those; a word you KNOW should never be guessed at. Aubriella goes from `ˈɔːbɹiɛlə` to `ˌɔːbɹiˈɛlə`,
+  those; a word you KNOW should never be guessed at. Aubriella goes from `ËÉËbÉ¹iÉlÉ` to `ËÉËbÉ¹iËÉlÉ`,
   which is where every other "-ella" name in the dictionary puts its stress.
   - Replaces rather than appends, so a definition is authoritative: `Homographs` only chooses between
     alternates when two or more exist, and leaving the originals would let context pick one of them.
@@ -25,6 +25,9 @@
   its LAST tab. Splitting the obvious way silently drops the token that separates words. `Encode` throws
   and names a symbol the model has no token for, rather than dropping a sound and leaving nothing to
   explain the gap; `TryEncode` is there for callers that would rather decide.
+  ℹ `ZipVoiceTokenizer.LoadSymbolTable` is NOT yet collapsed onto this - it is the correct copy the type
+  was extracted FROM, and rewriting library code after the release sweep had started would have meant
+  shipping something the gate never ran. It is behaviourally identical; folding it in is the next change.
 
 - **Acronyms are spelled out instead of guessed at.** The dictionary's own notes said its misses are
   "almost entirely abbreviations and acronyms... which want expanding or spelling out rather than
@@ -33,7 +36,7 @@
   - The filter does the work: only a word the DICTIONARY LACKS is spelled. That leaves "NASA" alone
     (it is in there as a word), and the exception list maintains itself.
   - Letter names come from the dictionary rather than a new table - it already holds them ("r" is AA1 R,
-    "w" is D AH1 B AH0 L Y UW0). ⚠️ Except "a", whose first entry is the ARTICLE; its letter name is the
+    "w" is D AH1 B AH0 L Y UW0). â ï¸ Except "a", whose first entry is the ARTICLE; its letter name is the
     alternate.
   - Stress follows CMUdict's own treatment of the acronyms it DOES hold - secondary on every letter but
     the last - which is verified against five of them (html, url, api, dvd, pdf, cpu).
@@ -44,14 +47,14 @@
   guessed. The stem now goes back through the same order (dictionary, acronym, decomposition, guessing)
   and the ending is the regular English rule: a reduced vowel plus /z/ after a sibilant, /s/ after a
   voiceless consonant, /z/ otherwise. A plural possessive ("the dogs' bowls") adds an apostrophe on the
-  page and no sound. 🔴 This also removed an embarrassment: "FAQ's" was being guessed as an obscenity.
+  page and no sound. ð´ This also removed an embarrassment: "FAQ's" was being guessed as an obscenity.
 
 ### Fixed
 
 - **A grouped number was read as a year.** "I have 1,234 of them" came out as "twelve thirty-four": the
   commas were stripped before the year heuristic ran, so a quantity arrived indistinguishable from a
   year - and the comma, the one thing that tells them apart, was what got discarded. Grouped numbers are
-  now expanded where the grouping is still visible. ⚠️ Round ones keep the year-style reading, because
+  now expanded where the grouping is still visible. â ï¸ Round ones keep the year-style reading, because
   that is what English says: "fifteen hundred apples", never "one thousand five hundred apples".
   Roundness is the discriminator, not the comma - reading every grouped number as a cardinal broke that,
   and the existing test caught it.
@@ -85,9 +88,9 @@
 URLs are not spoken ("www.example.com"), and an attributive unit keeps its plural ("a 500 mb file" reads
 "megabytes file").
 
-⛔ **Joining hyphenated words was measured and rejected.** "re-read" reads as "ray read" because CMUdict's
+â **Joining hyphenated words was measured and rejected.** "re-read" reads as "ray read" because CMUdict's
 entry for "re" is the musical note, and the joined form "reread" is correct - but the same rule turns
-"co-op" into "kuːp", a chicken coop. Every part of all 15 hyphenated words tested is already IN the
+"co-op" into "kuËp", a chicken coop. Every part of all 15 hyphenated words tested is already IN the
 dictionary, so this is not a guessing failure at all: it is one prefix whose dictionary entry is the wrong
 sense, the same shape as "a" being the article rather than the letter name. A blanket join loses more than
 it wins.
