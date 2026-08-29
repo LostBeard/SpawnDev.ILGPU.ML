@@ -59,12 +59,14 @@ public sealed class GGUFDecodeKVCache : IDisposable
         public int PackCapacityTokens;
         // bf16 path: a CONTIGUOUS bf16 conversion scratch so the f32↔bf16 convert kernel writes at its own
         // index (WebGL-safe), and the strided store↔contiguous moves are CopyFrom (also WebGL-safe). Grow-only.
-        public MemoryBuffer1D<BFloat16, Stride1D.Dense>? Bf16Scratch;
-        public int Bf16ScratchTokens;
     }
 
     private readonly LayerCache[] _layers;
     private readonly List<IDisposable> _retired = new();
+
+    // ONE bf16 conversion scratch for the whole cache - allocated once, never resized, shared by every
+    // layer. See Bf16Scratch() for why resizing it produced wrong tokens on WebGL.
+    private MemoryBuffer1D<BFloat16, Stride1D.Dense>? _bf16Scratch;
 
     // bf16 path (ONE path, all backends): a CONTIGUOUS element-wise convert kernel (write-index == thread-index
     // — WebGL-safe, no Transform-Feedback scatter), then a queue/work-stream-ordered sync CopyFrom (via
@@ -159,8 +161,7 @@ public sealed class GGUFDecodeKVCache : IDisposable
         {
             // Convert f32→bf16 into a CONTIGUOUS scratch (kernel writes its OWN index — WebGL-safe), then one
             // CopyFromAsync scratch → store per K/V. K and V share the scratch, so V waits for K's copy.
-            EnsureBf16Scratch(lc, nTokens);
-            var scratch = lc.Bf16Scratch!.View;
+            var scratch = Bf16Scratch();
             _f32ToBf16 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<float, Stride1D.Dense>, ArrayView1D<BFloat16, Stride1D.Dense>>(F32ToBf16Impl);
             _f32ToBf16((int)count, k, scratch);
@@ -201,12 +202,18 @@ public sealed class GGUFDecodeKVCache : IDisposable
             // sub-word kernel read of the store mis-addresses (the ILGPU limitation this whole fallback exists for).
             // Seq-major makes the live region contiguous, so it's ONE copy (was a per-head strided gather).
             var store = (isKey ? lc.Kb : lc.Vb)!.View;
-            EnsureBf16Scratch(lc, totalLen);
-            var scratch = lc.Bf16Scratch!.View;
+            var scratch = Bf16Scratch();
             await CaptureSafeCopy(scratch.SubView(0, live), store.SubView(0, live)).ConfigureAwait(false);
             _bf16ToF32 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                 ArrayView1D<BFloat16, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Bf16ToF32Impl);
-            _bf16ToF32(kvHeads * totalLen * hd, scratch.SubView(0, live), pack);
+            // BOTH views sliced to the LIVE region. Passing the full-capacity `pack` here was the
+            // across-pack-growth bug: the pack is grow-only, so after its capacity doubles (64 -> 128)
+            // dst.Length is the CAPACITY while src is only `live` long, and the kernel's bounds guard -
+            // which tests dst.Length - stops excluding the padded threads an auto-grouped launch adds
+            // beyond the extent. Those threads then read src OUT OF BOUNDS. While capacity happened to
+            // equal live (every step up to 64) the guard was accidentally right, which is exactly why
+            // this only broke after the first doubling.
+            _bf16ToF32(kvHeads * totalLen * hd, scratch.SubView(0, live), pack.SubView(0, live));
         }
         else
         {
@@ -230,15 +237,42 @@ public sealed class GGUFDecodeKVCache : IDisposable
         lc.PackCapacityTokens = cap;
     }
 
-    /// <summary>Grow-only contiguous bf16 conversion scratch, sized to hold <paramref name="tokens"/> tokens.</summary>
-    private void EnsureBf16Scratch(LayerCache lc, int tokens)
+    /// <summary>
+    /// The contiguous bf16 conversion scratch: allocated ONCE, at full size, and SHARED by every layer.
+    /// </summary>
+    /// <remarks>
+    /// It used to be per-layer and grow-only (64 tokens, doubling). That produced wrong tokens on WebGL,
+    /// and the growth was the trigger - ISOLATED by disabling each growth independently:
+    ///
+    ///   pack growth OFF, scratch growth ON  -> still fails, same step
+    ///   pack growth ON,  scratch growth OFF -> PASSES
+    ///
+    /// So this buffer, not the pack, is what `GGUFDecodeKVCache_BF16_AcrossPackGrowth_MatchesFullRecompute`
+    /// was catching - the test name and the earlier "the pack CAPACITY is leaking into the result" reading
+    /// both blamed the wrong buffer. (The pack's capacity genuinely does differ from its live length, and
+    /// pinning it changed nothing.)
+    ///
+    /// WHY resizing breaks it: this is the one BFloat16 buffer a kernel reads directly, and sub-word access
+    /// is exactly where the WebGL backend is weak - the whole reason this scratch exists is that the kernel
+    /// cannot read the bf16 STORE (see PackedAsync). Reallocating it at a different length changes the
+    /// backing texture's layout, and the copy into it then mis-addresses. Never resizing it removes the
+    /// class of bug rather than dodging one instance.
+    ///
+    /// Allocating once at maxSeqLen also uses LESS memory than the grow-only version it replaces, not more:
+    /// the old one was PER LAYER, so at long context it converged on nLayers full-size buffers. This is one.
+    /// It is safe to share because the scratch is transient within a single PackedAsync call - layers run
+    /// sequentially, and K then V within a layer, which is the same ordering the per-layer buffer already
+    /// relied on when K and V shared it.
+    /// </remarks>
+    private ArrayView1D<BFloat16, Stride1D.Dense> Bf16Scratch()
     {
-        if (lc.Bf16Scratch != null && tokens <= lc.Bf16ScratchTokens) return;
-        int cap = Math.Max(tokens, lc.Bf16ScratchTokens == 0 ? Math.Min(64, _maxSeqLen) : lc.Bf16ScratchTokens * 2);
-        cap = Math.Min(cap, _maxSeqLen);
-        if (lc.Bf16Scratch != null) _retired.Add(lc.Bf16Scratch);
-        lc.Bf16Scratch = _accelerator.Allocate1D<BFloat16>((long)lc.KvHeads * cap * lc.HeadDim);
-        lc.Bf16ScratchTokens = cap;
+        if (_bf16Scratch == null)
+        {
+            long elems = 0;
+            foreach (var l in _layers) elems = Math.Max(elems, (long)l.KvHeads * _maxSeqLen * l.HeadDim);
+            _bf16Scratch = _accelerator.Allocate1D<BFloat16>(elems);
+        }
+        return _bf16Scratch.View;
     }
 
     // ── contiguous element-wise converts: one store per thread at its OWN index (WebGL-safe). The strided
@@ -251,7 +285,12 @@ public sealed class GGUFDecodeKVCache : IDisposable
 
     private static void Bf16ToF32Impl(Index1D idx, ArrayView1D<BFloat16, Stride1D.Dense> src, ArrayView1D<float, Stride1D.Dense> dst)
     {
-        if (idx >= dst.Length) return;
+        // Guard BOTH views. An auto-grouped launch rounds the thread count up to the group size, so idx runs
+        // past the extent; guarding only the destination silently permits an out-of-bounds READ whenever the
+        // destination is longer than the source - which is the normal state of a GROW-ONLY buffer, and was the
+        // across-pack-growth corruption. A guard that is only correct while two lengths happen to be equal is
+        // not a guard.
+        if (idx >= src.Length || idx >= dst.Length) return;
         dst[idx] = (float)src[idx];
     }
 
@@ -287,8 +326,8 @@ public sealed class GGUFDecodeKVCache : IDisposable
             lc.Kf?.Dispose(); lc.Vf?.Dispose();
             lc.Kb?.Dispose(); lc.Vb?.Dispose();
             lc.PackK?.Dispose(); lc.PackV?.Dispose();
-            lc.Bf16Scratch?.Dispose();
         }
+        _bf16Scratch?.Dispose();
         foreach (var r in _retired) r.Dispose();
         _retired.Clear();
     }
