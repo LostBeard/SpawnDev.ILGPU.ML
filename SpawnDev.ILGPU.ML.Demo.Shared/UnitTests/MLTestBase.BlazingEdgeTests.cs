@@ -59,7 +59,7 @@ public abstract partial class MLTestBase
     //  RoPE Tests
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task BlazingEdge_RoPE_Reference_Loaded()
     {
         var http = GetHttpClient();

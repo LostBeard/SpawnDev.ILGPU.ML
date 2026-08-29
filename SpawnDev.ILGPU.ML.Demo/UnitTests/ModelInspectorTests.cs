@@ -76,7 +76,7 @@ public class ModelInspectorTests
     /// is the exact path the demo runs when a user drops a large model. I/O-bound (large transfer), so a
     /// generous timeout, not the 30s compute default.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task ModelInspector_Onnx_Transformers_Inspect()
     {
         foreach (var path in new[] { "models/gpt2/model.onnx", "models/distilbert-sst2/model.onnx" })
@@ -140,7 +140,7 @@ public class ModelInspectorTests
     /// Compatibility check is meaningful for ONNX: ops are partitioned into supported/unsupported,
     /// the counts are self-consistent, and a fully-supported model reports IsFullySupported.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task ModelInspector_Compatibility_Onnx_Meaningful()
     {
         // SqueezeNet uses only supported ops → fully compatible. Streamed (CheckCompatibilityAsync reads
@@ -226,7 +226,7 @@ public class ModelInspectorTests
     /// covered separately (see <see cref="ModelInspector_Onnx_Transformers_Inspect"/>) and skipped here so
     /// this stays a fast, reliable format-breadth check rather than a ~1GB transfer stress test.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task ModelInspector_Inspect_AllDemoModels_NoThrow()
     {
         var failures = new List<string>();
@@ -498,7 +498,7 @@ public class ModelInspectorTests
     /// inspection path does a synchronous Read on the source, this test throws exactly where it happens.
     /// Runs on the CPU lane (inspection is pure CPU) so it needs no browser.
     /// </summary>
-    [TestMethod(Timeout = 120000)]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task ModelInspector_AsyncOnlyStream_AllFormats_NoSyncRead()
     {
         // One representative of each format the demo accepts. ONNX is the one TJ hits with large models
@@ -621,7 +621,7 @@ public class ModelInspectorTests
     /// architecture parsed, and (b) the torrent did NOT download the whole file. This is the production
     /// inspect-by-URL path the demo exposes; requires internet (cold hub cache → generous timeout).
     /// </summary>
-    [TestMethod(Timeout = 240000, RetryCount = 2)]
+    [TestMethod(Timeout = 240000, RetryCount = 2, Category = "HeavyCpu")]
     public async Task ModelInspector_Hub_InspectByUrl_StructureOnly()
     {
         const string repoId = "onnx-community/mobilenetv3_small_100.lamb_in1k";

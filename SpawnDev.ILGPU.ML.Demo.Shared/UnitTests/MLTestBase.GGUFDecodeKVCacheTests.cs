@@ -108,7 +108,7 @@ public partial class MLTestBase
         finally { session.DisableGGUFDecode(); }
     });
 
-    [TestMethod]
+    [TestMethod(Timeout = 120000, Category = "HeavyCpu")]
     public async Task GGUFDecodeKVCache_IncrementalMatchesFullRecompute() => await RunTest(async accelerator =>
     {
         const int embd = 256, vocab = 32, ffn = 320, ctx = 64;
