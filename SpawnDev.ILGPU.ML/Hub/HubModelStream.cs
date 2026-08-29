@@ -134,6 +134,28 @@ public class HubModelStream
         return await OpenTorrentAsync(hfUrl, repoId, filePath, deselect, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Open a SEEKABLE stream over the hub's <c>/hf</c> web seed using plain HTTP range requests - no
+    /// WebTorrent, no magnet, no swarm.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="OpenAsync"/> is the right default: it makes the model a persistent torrent that caches to
+    /// OPFS and restores across reloads. This is the SIMPLE path, and it exists because the two have very
+    /// different failure surfaces. <see cref="OpenAsync"/> depends on torrent metadata, lazy-hash and peer
+    /// discovery; this depends on one thing - our hub answering a range request. When a structure-only
+    /// inspection is the whole job and the file is read once, that smaller surface is worth having, and it is
+    /// what makes a HUB test a test of the HUB rather than of the swarm.
+    ///
+    /// The stream reports <see cref="HttpRangeStream.BytesFetched"/>, so a caller can verify it really did
+    /// skip the weights.
+    /// </remarks>
+    public async Task<HttpRangeStream> OpenWebSeedAsync(string repoId, string filePath, CancellationToken ct = default)
+    {
+        var url = $"{HubBaseUrl.TrimEnd('/')}/hf/{repoId.Trim('/')}/{filePath.TrimStart('/')}";
+        long size = await ProbeSizeAsync(url, ct).ConfigureAwait(false);
+        return new HttpRangeStream(_http, url, size);
+    }
+
     /// <summary>Fetch a SMALL hub file fully into a byte[] via a plain HTTP GET of the /hf web seed. Use for a
     /// KB-scale structure file (e.g. an external-data model's <c>model.onnx</c>, which holds only the graph — the
     /// weights live in <c>model.onnx_data</c>). Streaming that big weights file stays on the zero-copy torrent

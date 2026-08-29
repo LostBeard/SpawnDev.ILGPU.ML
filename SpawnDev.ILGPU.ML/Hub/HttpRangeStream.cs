@@ -14,12 +14,21 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// would deadlock — it throws. The ONNX stream reader (and the inspector) read via <c>ReadAsync</c>, which is
 /// the supported path.
 /// </summary>
-internal sealed class HttpRangeStream : Stream
+public sealed class HttpRangeStream : Stream
 {
     private readonly HttpClient _http;
     private readonly string _url;
     private readonly long _length;
     private long _position;
+
+    /// <summary>
+    /// Total bytes actually pulled over the wire, as opposed to <see cref="Length"/>, which is the size of
+    /// the resource. Their RATIO is what "structure only" means: an inspector seeks past every weight blob,
+    /// so a correct structure-only pass over a 10 MB checkpoint fetches a few hundred KB. Exposed so that
+    /// can be ASSERTED rather than assumed - a regression that quietly starts reading weights still returns
+    /// the right structure, and would otherwise pass unnoticed.
+    /// </summary>
+    public long BytesFetched { get; private set; }
 
     public HttpRangeStream(HttpClient http, string url, long length)
     {
@@ -58,6 +67,7 @@ internal sealed class HttpRangeStream : Stream
         int n = Math.Min(bytes.Length, buffer.Length);
         bytes.AsSpan(0, n).CopyTo(buffer.Span);
         _position += n;
+        BytesFetched += n;
         return n;
     }
 

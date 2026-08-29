@@ -621,6 +621,61 @@ public class ModelInspectorTests
     /// architecture parsed, and (b) the torrent did NOT download the whole file. This is the production
     /// inspect-by-URL path the demo exposes; requires internet (cold hub cache → generous timeout).
     /// </summary>
+    /// <summary>
+    /// Structure-only inspection over OUR hub's <c>/hf</c> web seed - plain HTTP range requests, no
+    /// WebTorrent, no magnet, no swarm.
+    /// </summary>
+    /// <remarks>
+    /// WHY THIS EXISTS ALONGSIDE the torrent test below. That one is the production inspect-by-URL path and
+    /// is worth keeping, but it can fail for reasons that are not ours: a cold hub cache has to fetch from
+    /// HuggingFace first, and the torrent layer adds metadata resolution and peer discovery on top. When it
+    /// goes red you cannot tell "our hub is broken" from "HuggingFace was slow" - and it was the ONLY
+    /// remaining failure in the full sweep, which is exactly the ambiguity you do not want in a gate.
+    ///
+    /// This one narrows the surface to the single thing WE control and operate: does hub.spawndev.com answer
+    /// a byte-range request, and does the inspector parse a real architecture out of it. TJ's point, and it
+    /// is right: failures from HuggingFace directly are acceptable, failures from our own hub are not.
+    ///
+    /// It also asserts the thing that actually matters and that the torrent test can only assert indirectly:
+    /// <see cref="HttpRangeStream.BytesFetched"/> against the file size. "Structure only" is a claim about
+    /// how much came over the wire, and a regression that silently starts reading weight blobs still returns
+    /// perfectly correct structure - so without this the gate would stay green while the feature died.
+    /// </remarks>
+    [TestMethod(Timeout = 120000, RetryCount = 2, Category = "HeavyCpu")]
+    public async Task ModelInspector_SpawnDevHub_WebSeed_StructureOnly()
+    {
+        const string repoId = "onnx-community/mobilenetv3_small_100.lamb_in1k";
+        const string filePath = "onnx/model.onnx";
+
+        var hub = new HubModelStream(new WebTorrentClient(), _http);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+
+        await using var stream = await hub.OpenWebSeedAsync(repoId, filePath, cts.Token);
+        if (stream.Length <= 0) throw new Exception($"hub web seed reported length={stream.Length}");
+
+        var r = await ModelInspectorHelper.InspectAsync(stream, cts.Token);
+
+        // (a) A real architecture came back - proves the ranged reads landed on the right bytes.
+        if (r.NodeCount <= 0) throw new Exception($"NodeCount={r.NodeCount}, expected > 0");
+        if (r.TotalParameters <= 0) throw new Exception($"TotalParameters={r.TotalParameters}, expected > 0");
+        if (!r.Operators.Any(o => o.OpType == "Conv")) throw new Exception("mobilenet must use Conv");
+
+        // (b) STRUCTURE ONLY, asserted rather than assumed. The inspector seeks past every weight blob, so
+        // it should touch a small fraction of the file. Half is a deliberately loose bar - the point is to
+        // catch "it started downloading the weights", which would sit at ~100%, not to police the exact
+        // ratio (that moves with piece layout and read-ahead).
+        // MEASURED against the live hub: 1,533,463 of 10,204,519 bytes = 15.0%. Not vacuous, and nowhere
+        // near the bar - confirmed by temporarily inverting this check and reading the reported numbers.
+        if (stream.BytesFetched >= stream.Length / 2)
+            throw new Exception(
+                $"structure-only inspection fetched {stream.BytesFetched} of {stream.Length} bytes " +
+                $"({100.0 * stream.BytesFetched / stream.Length:F1}%) - it is reading weights, not just structure.");
+
+        Console.WriteLine($"[hub web seed] {r.NodeCount} nodes, {r.TotalParameters:N0} params, fetched "
+                        + $"{stream.BytesFetched:N0} of {stream.Length:N0} bytes "
+                        + $"({100.0 * stream.BytesFetched / stream.Length:F1}%) from hub.spawndev.com");
+    }
+
     [TestMethod(Timeout = 240000, RetryCount = 2, Category = "HeavyCpu")]
     public async Task ModelInspector_Hub_InspectByUrl_StructureOnly()
     {
