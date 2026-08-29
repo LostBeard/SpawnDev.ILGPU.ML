@@ -709,11 +709,38 @@ public class ModelInspectorTests
             // the P2P/torrent path, which CAN over-fetch if deselect/seek-past-weights isn't effective.
             if (model.Torrent != null)
             {
+                // Whether "did not pull the whole file" is even EXPRESSIBLE depends on the piece geometry, and
+                // this assertion used to ignore that. A Lazy-Hash torrent's piece length comes from
+                // Torrent.LazyPieceLength, which floors at a 4 MiB web-seed minimum - so THIS 10.2 MB model is
+                // THREE pieces. Structure inspection reads the protobuf header and seeks through the graph
+                // metadata, which touches every one of those three, and three pieces IS the whole file. The old
+                // check therefore reported a deselect failure for what is ordinary piece granularity, and it
+                // went red on a healthy library. (Over-fetch at piece boundaries is inherent to torrents; the
+                // library documents it, and at >= 2 GB - the multi-GB checkpoints this feature exists for - the
+                // floor is a no-op and the saving is real.)
+                //
+                // So: derive the claim from the geometry, and REFUSE to assert rather than fail or pass
+                // vacuously when the geometry cannot carry it.
+                long pieceLen = model.Torrent.PieceLength;
+                if (pieceLen <= 0) throw new Exception($"torrent reported PieceLength={pieceLen}");
+                long pieceCount = (model.Length + pieceLen - 1) / pieceLen;
+
+                // Below this, a structure read touching a few scattered pieces is indistinguishable from
+                // reading everything, so there is no saving to measure.
+                const long MinPiecesForAMeaningfulSaving = 8;
+                if (pieceCount < MinPiecesForAMeaningfulSaving)
+                    throw new UnsupportedTestException(
+                        $"piece geometry cannot express the claim: pieceLength={pieceLen} over {model.Length} bytes " +
+                        $"is only {pieceCount} piece(s), so structure inspection touching a few scattered pieces is " +
+                        "already the whole file. This is piece granularity, NOT a deselect failure. To cover the " +
+                        "claim here, point this test at a model large enough to be many pieces.");
+
                 long downloaded = model.Torrent.Downloaded;
                 if (downloaded >= model.Length)
                     throw new Exception(
-                        $"inspect-by-URL downloaded {downloaded} of {model.Length} bytes (the whole file) — " +
-                        "deselect / seek-past-weights was not effective; weights were pulled");
+                        $"inspect-by-URL downloaded {downloaded} of {model.Length} bytes (the whole file) across " +
+                        $"{pieceCount} pieces of {pieceLen} — deselect / seek-past-weights was not effective; " +
+                        "weights were pulled");
             }
         }
         finally
