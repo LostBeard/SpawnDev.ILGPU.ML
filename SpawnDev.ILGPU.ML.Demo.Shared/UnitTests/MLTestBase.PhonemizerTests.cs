@@ -219,6 +219,49 @@ public abstract partial class MLTestBase
         }
     });
 
+    [TestMethod]
+    public async Task Vocabulary_MapsSymbolsToTokenIdsAndBack() => await RunTest(_ =>
+    {
+        // ⚠️ The third line is a SPACE as a symbol, which a real ZipVoice vocabulary genuinely lists.
+        // Splitting on whitespace loses it, and it is the token that separates words - so the file must
+        // be split on its LAST tab. That subtlety was duplicated across four tools before this existed.
+        var vocab = PhonemeVocabulary.Parse(
+        [
+            "_\t0",
+            "ˈ\t1",
+            " \t2",
+            "b\t3",
+            "ɛ\t4",
+            "",              // blank lines are skipped
+            "junk-no-id",    // so are malformed ones
+        ]);
+
+        if (vocab.Count != 5) throw new Exception($"expected 5 symbols, got {vocab.Count}");
+        if (!vocab.TryGetId(" ", out var space) || space != 2)
+            throw new Exception("the space symbol was lost - the file was split on whitespace");
+
+        var ids = vocab.Encode(["b", " ", "ɛ"]);
+        if (!ids.SequenceEqual(new long[] { 3, 2, 4 })) throw new Exception($"wrong ids: {string.Join(",", ids)}");
+
+        // Round trip.
+        if (!vocab.Decode(ids).SequenceEqual(new[] { "b", " ", "ɛ" })) throw new Exception("decode did not round trip");
+
+        // A symbol with no token cannot be spoken, so it must be LOUD rather than dropped - a silently
+        // shorter sentence gives nobody anything to trace back.
+        // Named rather than a discard: this lambda's own parameter is called "_", so "out _" binds to it.
+        if (!vocab.TryEncode(["b", "ʒ"], out var partial, out var missing) && missing != "ʒ")
+            throw new Exception($"expected the unmappable symbol to be named, got '{missing}'");
+        if (partial.Length != 0) throw new Exception("a failed encode must not return partial ids");
+        try
+        {
+            vocab.Encode(["b", "ʒ"]);
+            throw new Exception("Encode silently accepted a symbol with no token");
+        }
+        catch (ArgumentException) { }
+
+        return Task.CompletedTask;
+    });
+
     private static void Expect(string actual, string expected)
     {
         if (actual != expected) throw new Exception($"expected \"{expected}\", got \"{actual}\"");

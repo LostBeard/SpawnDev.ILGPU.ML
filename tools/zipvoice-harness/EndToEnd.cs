@@ -37,14 +37,10 @@ public static class EndToEnd
         var tokensPath = Path.Combine(modelDir, "tokens.txt");
         if (!File.Exists(tokensPath)) { Console.WriteLine($"no tokens.txt at {tokensPath}"); return 2; }
 
-        var symToId = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var raw in File.ReadAllLines(tokensPath))
-        {
-            var line = raw.TrimEnd('\r', '\n');
-            int cut = line.LastIndexOf('\t');
-            if (cut < 0 || !long.TryParse(line[(cut + 1)..], out var id)) continue;
-            symToId.TryAdd(line[..cut], id);
-        }
+        // The library owns this now. The same loop had been written out in four of these tools, and each
+        // copy is a chance to split on whitespace and silently lose the SPACE token - the one that
+        // separates words.
+        var vocabulary = PhonemeVocabulary.Load(tokensPath);
 
         // ---- Our phonemizer, configured exactly as a consumer would ---------------------------------
         var dictPath = Environment.GetEnvironmentVariable("CMUDICT")
@@ -110,7 +106,7 @@ public static class EndToEnd
             bool translatable = true;
             foreach (var symbol in symbols)
             {
-                if (symToId.TryGetValue(symbol, out var id)) { ours.Add(id); continue; }
+                if (vocabulary.TryGetId(symbol, out var id)) { ours.Add(id); continue; }
                 // A symbol the model has no token for cannot be spoken at all. Loud, not skipped.
                 Console.WriteLine($"  {fixName}: no token for symbol '{symbol}' - this sentence cannot be rendered");
                 translatable = false;

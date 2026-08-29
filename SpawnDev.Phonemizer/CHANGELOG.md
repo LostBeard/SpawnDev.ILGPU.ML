@@ -18,6 +18,14 @@
 - Behaviour is unchanged for anyone who defines nothing: the accuracy probe reads an identical
   24 differences over 592 reference symbols (4.1%) before and after.
 
+- **`PhonemeVocabulary`** - maps phoneme symbols to a model's token ids and back, the last mile between
+  `ToSymbols` and a neural input tensor. The same parsing loop had been written out in four of this
+  repository's own tools, and every copy is a chance to get the same detail wrong: **a symbol can be
+  whitespace** (a ZipVoice vocabulary really does list a space as a token), so the file must be split on
+  its LAST tab. Splitting the obvious way silently drops the token that separates words. `Encode` throws
+  and names a symbol the model has no token for, rather than dropping a sound and leaving nothing to
+  explain the gap; `TryEncode` is there for callers that would rather decide.
+
 ### Fixed
 
 - **A grouped number was read as a year.** "I have 1,234 of them" came out as "twelve thirty-four": the
