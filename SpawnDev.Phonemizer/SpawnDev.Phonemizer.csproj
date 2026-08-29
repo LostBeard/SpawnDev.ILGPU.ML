@@ -25,7 +25,7 @@
       which is GPL-3. Zero dependencies, browser-capable, data embedded. Tying it to an ML runtime nobody
       needs for text-to-phonemes would be the wrong shape.
     -->
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <PackageReleaseNotes>v1.0.0 - First release. MIT English grapheme-to-phoneme: CMUdict lookup, morphological decomposition, and learned letter-to-sound for unknown words. Replaces GPL-3 espeak-ng as a TTS frontend.</PackageReleaseNotes>
     <IsPackable>true</IsPackable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>

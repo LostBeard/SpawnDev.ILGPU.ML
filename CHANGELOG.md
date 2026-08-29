@@ -2,6 +2,24 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.1.5 (2026-08-29)
+
+No change to this library's own code. The version exists so the SpawnDev.Phonemizer 1.1.0 fixes reach
+consumers: this package ProjectReferences it, so `pack` pins the version it was built against, and
+without a bump here a consumer of SpawnDev.ILGPU.ML would keep resolving Phonemizer 1.0.0 transitively
+however good the newer one is.
+
+What that pulls in - the full list is in SpawnDev.Phonemizer/CHANGELOG.md:
+
+- You can now TELL it how a word is said (`Define`), instead of letting letter-to-sound guess a name.
+- Acronyms are spelled out rather than guessed at ("RSS", "FAQ", "GMT").
+- Possessives resolve their stem, so a defined name survives "'s" - and "FAQ's" is no longer guessed as
+  an obscenity.
+- `PhonemeVocabulary` maps symbols to a model's token ids, which four of this repo's own tools were each
+  doing by hand.
+- Text normalization fixes: grouped numbers read as quantities not years, clock times, "St." as a street,
+  units, `&`, `#`, arithmetic, and abbreviations that are also ordinary words needing their period.
+
 ## 5.1.4 (2026-08-28)
 
 ### FIX: the runtime Conv output-resize gave every DEPTHWISE conv a 1-channel output buffer
