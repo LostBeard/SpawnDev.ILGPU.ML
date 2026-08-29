@@ -51,12 +51,79 @@ public sealed class EnglishTextNormalizer
     private static readonly Regex CommaNumber =
         new(@"\b([0-9]{1,3}(?:,[0-9]{3})+)\b", RegexOptions.Compiled);
 
+    /// <summary>
+    /// Unit abbreviations, as (singular, plural), expanded only when a number precedes them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The number is what makes this safe. "5 kg" is a weight; a bare "kg" in running text might be
+    /// anything, and "in", "m" and "s" are ordinary English words - so single letters are deliberately
+    /// absent from this table. That is the whole ambiguity people warn about, and the fix is not to
+    /// guess but to require the evidence.
+    /// </para>
+    /// <para>
+    /// "ft" is here for a second reason: the abbreviation table below maps it to "fort", so "6 ft tall"
+    /// was read as "six fort tall". Same fault as "St." meaning saint.
+    /// </para>
+    /// <para>
+    /// Spellings are American because the dictionary is: every word here was checked against it, and
+    /// only "gigahertz" was missing - so it is not offered. Expanding to a word the dictionary lacks
+    /// only moves the problem to letter-to-sound.
+    /// </para>
+    /// </remarks>
+    private static readonly Dictionary<string, (string One, string Many)> Units =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["km"] = ("kilometer", "kilometers"), ["kg"] = ("kilogram", "kilograms"),
+            ["cm"] = ("centimeter", "centimeters"), ["mm"] = ("millimeter", "millimeters"),
+            ["ml"] = ("milliliter", "milliliters"), ["mg"] = ("milligram", "milligrams"),
+            ["kb"] = ("kilobyte", "kilobytes"), ["mb"] = ("megabyte", "megabytes"),
+            ["gb"] = ("gigabyte", "gigabytes"), ["tb"] = ("terabyte", "terabytes"),
+            ["mph"] = ("mile per hour", "miles per hour"),
+            ["kph"] = ("kilometer per hour", "kilometers per hour"),
+            ["lb"] = ("pound", "pounds"), ["lbs"] = ("pound", "pounds"),
+            ["oz"] = ("ounce", "ounces"), ["ft"] = ("foot", "feet"),
+            ["hr"] = ("hour", "hours"), ["hrs"] = ("hour", "hours"),
+            ["min"] = ("minute", "minutes"), ["mins"] = ("minute", "minutes"),
+            ["sec"] = ("second", "seconds"), ["secs"] = ("second", "seconds"),
+        };
+
+    /// <summary>A number followed by a unit abbreviation, "5km" or "10 kg".</summary>
+    private static readonly Regex NumberWithUnit =
+        new(@"\b([0-9]+(?:\.[0-9]+)?)\s*(km|kg|cm|mm|ml|mg|kb|mb|gb|tb|mph|kph|lbs|lb|oz|ft|hrs|hr|mins|min|secs|sec)\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     /// <summary>A clock time, "3:30" or "9:05".</summary>
     private static readonly Regex ClockTime =
         new(@"\b([0-9]{1,2}):([0-5][0-9])\b", RegexOptions.Compiled);
 
     /// <summary>An ampersand standing in for "and".</summary>
     private static readonly Regex Ampersand = new(@"\s*&\s*", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Arithmetic written between numbers, "5 + 3 = 8".
+    /// </summary>
+    /// <remarks>
+    /// Only BETWEEN numbers. A bare "+" or "-" in prose is punctuation or a dash, and reading every one
+    /// of them as a word would be worse than leaving them silent - which is why the minus below is
+    /// restricted to a value that clearly is one.
+    /// </remarks>
+    private static readonly Regex Arithmetic =
+        new(@"(?<=[0-9]\s?)([+*=])(?=\s?[0-9])", RegexOptions.Compiled);
+
+    /// <summary>A negative value: a minus attached to a number, at a boundary rather than inside a range.</summary>
+    private static readonly Regex NegativeNumber =
+        new(@"(?<![0-9A-Za-z])-([0-9]+(?:\.[0-9]+)?)", RegexOptions.Compiled);
+
+    /// <summary>
+    /// A hyphen joining a word to a number, as in "COVID-19" or "3-D".
+    /// </summary>
+    /// <remarks>
+    /// The hyphen survives into the output as punctuation, so "COVID-19" is spoken with a pause in the
+    /// middle of a single word. Replacing it with a space lets both halves be read normally.
+    /// </remarks>
+    private static readonly Regex WordNumberHyphen =
+        new(@"(?<=\p{L})-(?=[0-9])|(?<=[0-9])-(?=\p{L})", RegexOptions.Compiled);
 
     /// <summary>A hash used as "number", as in "#1".</summary>
     private static readonly Regex NumberSign = new(@"#\s*(?=[0-9])", RegexOptions.Compiled);
@@ -97,6 +164,8 @@ public sealed class EnglishTextNormalizer
 
         text = MapPunctuation(text);
         text = TitleStop.Replace(text, "$1");     // before expansion, while the abbreviation is still short
+        // Before the abbreviation table, which would otherwise read "6 ft" as "six fort".
+        text = NumberWithUnit.Replace(text, ExpandUnit);
         text = ExpandAbbreviations(text);
         text = NormalizeNumbers(text);
         return Whitespace.Replace(text, " ").Trim();
@@ -132,6 +201,14 @@ public sealed class EnglishTextNormalizer
         // spoken as a pause or not at all - "Mr. & Mrs." loses the "and" entirely.
         text = Ampersand.Replace(text, " and ");
         text = NumberSign.Replace(text, "number ");
+        text = WordNumberHyphen.Replace(text, " ");
+        text = Arithmetic.Replace(text, m => m.Value switch
+        {
+            "+" => " plus ",
+            "*" => " times ",
+            _ => " equals ",
+        });
+        text = NegativeNumber.Replace(text, " minus $1");
 
         // Before the table below, which would otherwise turn every "st" into "saint".
         text = StreetSuffix.Replace(text, "street");
@@ -208,6 +285,20 @@ public sealed class EnglishTextNormalizer
         if (denominator == 2) return $" {NumberToWords.Cardinal(numerator)} halves ";
         if (denominator == 4) return $" {NumberToWords.Cardinal(numerator)} quarters ";
         return $" {NumberToWords.Cardinal(numerator)} {NumberToWords.Ordinal(denominator)}s ";
+    }
+
+    /// <summary>
+    /// Spell out a unit abbreviation, agreeing in number with the value in front of it.
+    /// </summary>
+    /// <remarks>
+    /// Only "1" takes the singular. "1.5 km" is plural in English ("one point five kilometers"), and so
+    /// is "0 kg" - the singular is the special case, not the default.
+    /// </remarks>
+    private static string ExpandUnit(Match match)
+    {
+        if (!Units.TryGetValue(match.Groups[2].Value, out var unit)) return match.Value;
+        var value = match.Groups[1].Value;
+        return $"{value} {(value == "1" ? unit.One : unit.Many)}";
     }
 
     /// <summary>

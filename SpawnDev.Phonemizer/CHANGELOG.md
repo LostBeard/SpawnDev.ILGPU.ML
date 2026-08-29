@@ -36,11 +36,21 @@
   the "and". Now "and" and "number".
 - Three missing XML `param` tags (CS1573). The package builds with zero warnings.
 
+- **Units were left as letters, and "ft" was read as "fort".** "5km" was spoken "five km"; "6 ft tall"
+  came out "six fort tall" because the abbreviation table owns "ft". Units now expand when a NUMBER
+  precedes them, agreeing in number ("1 km" singular, "1.5 km" plural). Requiring the number is what
+  makes it safe: single letters that are ordinary English words ("in", "m", "s") are deliberately not
+  units at all, so "I live in Ohio" is untouched. Every expansion was checked against the dictionary
+  first - only "gigahertz" was missing, so it is not offered.
+- **Arithmetic, a leading minus, and word/number hyphens.** "5 + 3 = 8" reads "plus"/"equals" (only
+  BETWEEN numbers - elsewhere they are punctuation), "-5" reads "minus five", and "COVID-19" no longer
+  carries a pause through the middle of one word. An ordinary hyphenated word and a dash between
+  clauses are untouched.
+
 ### Known gaps (measured, not fixed)
 
-Units are not expanded ("5km" stays "km"), nor are operators (`+`, `=`), URLs, a leading minus, or
-hyphenated forms like "COVID-19" and "3-D". Units especially need a decision rather than a patch: "m" is
-metres, minutes or miles depending on context.
+URLs are not spoken ("www.example.com"), and an attributive unit keeps its plural ("a 500 mb file" reads
+"megabytes file").
 
 ## 1.0.0 (2026-08-28)
 

@@ -169,6 +169,51 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Normalizer_SpellsOutUnitsAfterANumber() => await RunTest(_ =>
+    {
+        // Units were left as letters - "5km" was spoken as "five km" - and "6 ft" was worse, because
+        // the abbreviation table read it as "six FORT".
+        var n = new EnglishTextNormalizer();
+
+        Contains(n.Normalize("It's 5km away."), "five kilometers");
+        Contains(n.Normalize("About 10 kg."), "ten kilograms");
+        Contains(n.Normalize("He's 6 ft tall."), "six feet");
+        Contains(n.Normalize("It weighs 3 lbs."), "three pounds");
+        Contains(n.Normalize("Doing 60 mph."), "sixty miles per hour");
+
+        // Only "1" is singular - "1.5 km" is plural in English, so the singular is the special case.
+        Contains(n.Normalize("Just 1 km to go."), "one kilometer ");
+        Contains(n.Normalize("A 1.5 km run."), "kilometers");
+
+        // A NUMBER is what makes this safe. Single letters that are ordinary words are deliberately
+        // not units at all, so these must be untouched.
+        Contains(n.Normalize("I live in Ohio."), "in Ohio");
+        Contains(n.Normalize("Sit in the chair."), "in the chair");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Normalizer_ReadsArithmeticAndHyphenatedForms() => await RunTest(_ =>
+    {
+        var n = new EnglishTextNormalizer();
+
+        // Operators between numbers are words; anywhere else they are punctuation and stay silent.
+        Contains(n.Normalize("5 + 3 = 8"), "plus");
+        Contains(n.Normalize("5 + 3 = 8"), "equals");
+        Contains(n.Normalize("It's -5 degrees."), "minus five");
+
+        // A hyphen inside a word/number pair reaches the phonemizer as punctuation, so "COVID-19" was
+        // spoken with a pause in the middle of one word.
+        Contains(n.Normalize("COVID-19 was here."), "COVID nineteen");
+        Contains(n.Normalize("A 3-D printer."), "three D");
+
+        // An ordinary hyphenated word and a dash between clauses must both survive.
+        Contains(n.Normalize("A well-known fact."), "well-known");
+        Contains(n.Normalize("Come in - it's open."), " - ");
+        return Task.CompletedTask;
+    });
+
     private static void Contains(string actual, string expected)
     {
         if (!actual.Contains(expected, StringComparison.Ordinal))
