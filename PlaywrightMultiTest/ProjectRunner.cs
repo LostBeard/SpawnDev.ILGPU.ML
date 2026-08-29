@@ -1124,7 +1124,28 @@ namespace PlaywrightMultiTest
         // avoid OOM/contention with the browser WebGPU lane sharing the same card.
         private static int CapFor(string lane) => lane switch
         {
-            "cpu" => EnvInt("PMT_CPU_PARALLELISM", 4),
+            // 1, not 4 — MEASURED, and the parallelism was costing failures while buying nothing.
+            //
+            // The ILGPU CPU accelerator saturates every core inside ONE process, so four console tests at
+            // once is pure oversubscription (the HeavyCpu split below already says as much). What that
+            // starves is not only the tests: the static file server is Kestrel hosted IN THIS PROCESS, and
+            // most of these tests fetch their reference data over HTTP from it. Starve its thread pool and
+            // a test that computes for 60ms sits waiting on a 2 KB file until it trips its timeout - which
+            // is why the failures were always "passes in isolation", always timeouts, and a DIFFERENT test
+            // each run (BlazingEdge_RoPE x3 one sweep, BlazingEdge_GroupNorm x3 the next).
+            //
+            // Full 4,488-test sweeps, same machine, same commit:
+            //
+            //   cap=4   35.5 min, 4 failures      cap=1   35.0 min, 1 failure
+            //   cap=4   37.1 min, 6 failures
+            //
+            // Serialized is not slower - it is marginally FASTER, because the browser lane owns the
+            // critical path and oversubscription never added throughput. The one remaining failure is a
+            // live HuggingFace-hub download, i.e. genuinely external.
+            //
+            // Raise it with PMT_CPU_PARALLELISM if a future machine actually benefits - but measure the
+            // failure count alongside the clock, because that is what the old default was trading away.
+            "cpu" => EnvInt("PMT_CPU_PARALLELISM", 1),
             "cuda" => EnvInt("PMT_CUDA_PARALLELISM", 1),
             "opencl" => EnvInt("PMT_OPENCL_PARALLELISM", 1),
             _ => EnvInt("PMT_DESKTOP_PARALLELISM", 4),
