@@ -214,6 +214,28 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Normalizer_AbbreviationsThatAreAlsoWordsNeedTheirPeriod() => await RunTest(_ =>
+    {
+        // These matched on a word boundary alone, and a hyphen is a word boundary - so "co-op" was read
+        // as "COMPANY op". The same route turns "rev the engine" into "reverend the engine".
+        var n = new EnglishTextNormalizer();
+
+        // With the period they are abbreviations...
+        Contains(n.Normalize("Smith & Co. is closed"), "company");
+        Contains(n.Normalize("Rev. Green spoke"), "reverend");
+        Contains(n.Normalize("Gen. Lee arrived"), "general");
+        Contains(n.Normalize("Hon. Judge Smith"), "honorable");
+
+        // ...and without it they are ordinary words, which must survive untouched.
+        Missing(n.Normalize("co-op"), "company");
+        Missing(n.Normalize("a co-worker"), "company");
+        Missing(n.Normalize("rev the engine"), "reverend");
+        Missing(n.Normalize("gen z loves it"), "general");
+        Missing(n.Normalize("hon, come here"), "honorable");
+        return Task.CompletedTask;
+    });
+
     private static void Contains(string actual, string expected)
     {
         if (!actual.Contains(expected, StringComparison.Ordinal))

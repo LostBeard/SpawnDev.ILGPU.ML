@@ -163,9 +163,15 @@ public sealed class EnglishPhonemizer
                     // is worth knowing: it is the difference between a pronunciation and a guess.
                     _unknown.Add(token.Text);
 
+                    // A possessive is its stem plus an ending, and the stem is the part worth resolving:
+                    // "Aubriella's" is unknown as a whole even when "Aubriella" has been DEFINED.
+                    if (TryPossessive(token.Text, out var possessive))
+                    {
+                        output.AddRange(Word(possessive, token.Text, previousWord));
+                    }
                     // An acronym is SPELLED OUT, never sounded out. "RSS" is not a word and guessing at
                     // it produces one; the letters are the pronunciation.
-                    if (SpellOutAcronyms && TrySpellOut(token.Text, out var spelled))
+                    else if (SpellOutAcronyms && TrySpellOut(token.Text, out var spelled))
                     {
                         output.AddRange(Word(spelled, token.Text, previousWord));
                     }
@@ -214,6 +220,71 @@ public sealed class EnglishPhonemizer
     /// and never reaches here - and it means the list of exceptions maintains itself.
     /// </remarks>
     public bool SpellOutAcronyms { get; set; } = true;
+
+    /// <summary>
+    /// Pronounce a possessive by resolving its STEM and adding the ending.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// "Aubriella's" is a different string from "Aubriella", so the dictionary misses it and it goes to
+    /// letter-to-sound as one long unknown word. That defeats <see cref="PronunciationDictionary.Define(string, string)"/>
+    /// outright - you can teach it a name and still have the possessive guessed - and it produces worse
+    /// than guesses elsewhere: "FAQ's" came back as an obscenity.
+    /// </para>
+    /// <para>
+    /// The stem goes back through the same order the caller uses - dictionary, then acronym, then
+    /// decomposition, then guessing - so a defined name, a spelled-out acronym and an ordinary derived
+    /// word all keep working when something belongs to them.
+    /// </para>
+    /// <para>
+    /// The ending is the regular English rule, not a lookup: /ɪz/ after a sibilant ("Alex's"), /s/ after
+    /// a voiceless consonant ("Jax's"), /z/ otherwise ("Aubriella's").
+    /// </para>
+    /// </remarks>
+    private bool TryPossessive(string token, out string[] phones)
+    {
+        phones = [];
+
+        // Both the straight quote and the typographic one, and "dogs'" as well as "dog's".
+        var apostrophe = token.LastIndexOfAny(['\'', '’']);
+        if (apostrophe <= 0) return false;
+
+        var tail = token[(apostrophe + 1)..];
+        if (!(tail.Length == 0 || tail.Equals("s", StringComparison.OrdinalIgnoreCase))) return false;
+
+        var stem = token[..apostrophe];
+        if (stem.Length == 0 || !TryResolve(stem, out var stemPhones) || stemPhones.Length == 0) return false;
+
+        // A plural possessive ("the dogs' bowls") is already pronounced by the stem - there is no extra
+        // sound to add, only an apostrophe on the page.
+        if (tail.Length == 0) { phones = stemPhones; return true; }
+
+        var last = stemPhones[^1];
+        var bare = Arpabet.SplitStress(last).Phone;
+        var ending = bare switch
+        {
+            "S" or "Z" or "SH" or "ZH" or "CH" or "JH" => new[] { "IH0", "Z" },
+            "P" or "T" or "K" or "F" or "TH" => ["S"],
+            _ => ["Z"],
+        };
+
+        phones = [.. stemPhones, .. ending];
+        return true;
+    }
+
+    /// <summary>
+    /// Pronounce one word by the same order <see cref="ToSymbols"/> uses, for callers that need a part of
+    /// a larger token resolved.
+    /// </summary>
+    private bool TryResolve(string word, out string[] phones)
+    {
+        if (_dictionary.TryLookup(word, out phones!)) return true;
+        if (SpellOutAcronyms && TrySpellOut(word, out phones)) return true;
+        if (Decompose && WordDecomposer.TryDecompose(word, _dictionary, out phones!)) return true;
+
+        phones = LetterToSound?.Predict(word) ?? [];
+        return phones.Length > 0;
+    }
 
     /// <summary>Whether a token reads as an acronym: two or more letters, all upper case, no digits.</summary>
     private static bool LooksLikeAcronym(string token)

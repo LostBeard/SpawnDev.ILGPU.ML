@@ -38,6 +38,14 @@
   - Stress follows CMUdict's own treatment of the acronyms it DOES hold - secondary on every letter but
     the last - which is verified against five of them (html, url, api, dvd, pdf, cpu).
 
+- **Possessives resolve their STEM instead of being guessed whole.** "Aubriella's" is a different string
+  from "Aubriella", so it missed the dictionary and went to letter-to-sound as one long unknown word -
+  which defeated `Define` outright, since you could teach it a name and still have the possessive
+  guessed. The stem now goes back through the same order (dictionary, acronym, decomposition, guessing)
+  and the ending is the regular English rule: a reduced vowel plus /z/ after a sibilant, /s/ after a
+  voiceless consonant, /z/ otherwise. A plural possessive ("the dogs' bowls") adds an apostrophe on the
+  page and no sound. 🔴 This also removed an embarrassment: "FAQ's" was being guessed as an obscenity.
+
 ### Fixed
 
 - **A grouped number was read as a year.** "I have 1,234 of them" came out as "twelve thirty-four": the
@@ -54,7 +62,12 @@
   is preserved, since the phonemizer reads punctuation as prosody.
 - **`&` and `#` were silent.** They reached the phonemizer as punctuation, so "Mr. & Mrs." simply lost
   the "and". Now "and" and "number".
-- Three missing XML `param` tags (CS1573). The package builds with zero warnings.
+- **An abbreviation that is also an ordinary word no longer fires without its period.** "co-op" was read
+  as "COMPANY op" - a hyphen is a word boundary, and `co` was matched on a boundary alone. The same route
+  turns "rev the engine" into "reverend the engine", and "gen"/"hon" are a generation and a term of
+  endearment as often as a general and an honorable. Those four now require their full stop, and are
+  expanded BEFORE the step that strips it.
+- Three missing XML `param` tags (CS1573), and an ambiguous `cref`. The package builds with zero warnings.
 
 - **Units were left as letters, and "ft" was read as "fort".** "5km" was spoken "five km"; "6 ft tall"
   came out "six fort tall" because the abbreviation table owns "ft". Units now expand when a NUMBER

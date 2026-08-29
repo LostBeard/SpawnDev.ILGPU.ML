@@ -31,9 +31,9 @@ public sealed class EnglishTextNormalizer
     private static readonly (Regex Pattern, string Replacement)[] Abbreviations =
     [
         (Word("mrs"), "missus"), (Word("drs"), "doctors"), (Word("mr"), "mister"), (Word("dr"), "doctor"),
-        (Word("st"), "saint"), (Word("co"), "company"), (Word("jr"), "junior"), (Word("maj"), "major"),
-        (Word("gen"), "general"), (Word("rev"), "reverend"), (Word("lt"), "lieutenant"),
-        (Word("hon"), "honorable"), (Word("sgt"), "sergeant"), (Word("capt"), "captain"),
+        (Word("st"), "saint"), (Word("jr"), "junior"), (Word("maj"), "major"),
+        (Word("lt"), "lieutenant"),
+        (Word("sgt"), "sergeant"), (Word("capt"), "captain"),
         (Word("esq"), "esquire"), (Word("ltd"), "limited"), (Word("col"), "colonel"),
         (Word("ft"), "fort"), (Word("etc"), "et cetera"), (Word("btw"), "by the way"),
     ];
@@ -149,6 +149,33 @@ public sealed class EnglishTextNormalizer
 
     private static Regex Word(string word) => new($@"\b{word}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    /// <summary>An abbreviation that is only an abbreviation when it carries its full stop.</summary>
+    private static Regex WordWithStop(string word)
+        => new($@"\b{word}\.", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// Abbreviations that are ALSO ordinary English words or prefixes, so they need their period.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// These were in the table below, matched on a word boundary alone, and it misfired: "co-op" was read
+    /// as "company op", because a hyphen is a word boundary. "rev the engine" becomes "reverend the
+    /// engine" by the same route, and "gen" and "hon" are a generation and a term of endearment as often
+    /// as they are a general and an honorable.
+    /// </para>
+    /// <para>
+    /// ⚠️ They must be expanded BEFORE <see cref="TitleStop"/>, which strips the period off exactly this
+    /// set of words - so by the time the main table runs, the evidence that distinguishes them is gone.
+    /// </para>
+    /// </remarks>
+    private static readonly (Regex Pattern, string Replacement)[] StopRequiredAbbreviations =
+    [
+        (WordWithStop("co"), "company"),
+        (WordWithStop("rev"), "reverend"),
+        (WordWithStop("gen"), "general"),
+        (WordWithStop("hon"), "honorable"),
+    ];
+
     // A title's full stop is an abbreviation mark, NOT a pause. Left in, "Dr. Tanner" phonemizes as
     // "doctor", a sentence break, then "Tanner" - and the model renders that break as an audible stop in
     // the middle of a person's name. Only stripped when something follows, so a sentence that genuinely
@@ -163,6 +190,9 @@ public sealed class EnglishTextNormalizer
         if (string.IsNullOrEmpty(text)) return string.Empty;
 
         text = MapPunctuation(text);
+        // BEFORE TitleStop, which strips the very period these depend on.
+        foreach (var (pattern, replacement) in StopRequiredAbbreviations)
+            text = pattern.Replace(text, replacement);
         text = TitleStop.Replace(text, "$1");     // before expansion, while the abbreviation is still short
         // Before the abbreviation table, which would otherwise read "6 ft" as "six fort".
         text = NumberWithUnit.Replace(text, ExpandUnit);

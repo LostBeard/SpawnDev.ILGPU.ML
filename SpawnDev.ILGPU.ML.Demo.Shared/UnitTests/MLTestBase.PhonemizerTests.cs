@@ -265,6 +265,41 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Phonemizer_PossessivesResolveTheirStem() => await RunTest(_ =>
+    {
+        // "Aubriella's" is a different string from "Aubriella", so it missed the dictionary and went to
+        // letter-to-sound as one long unknown word. That defeats Define outright - you could teach it a
+        // name and still have the possessive guessed - and elsewhere it was worse than a guess: "FAQ's"
+        // came back as an obscenity.
+        var dictionary = PronunciationDictionary.Parse(new[]
+        {
+            "a AH0", "a(2) EY1", "f EH1 F", "q K Y UW1", "jax JH AE1 K S", "pat P AE1 T",
+        });
+        var phonemizer = new EnglishPhonemizer(dictionary) { LetterToSound = null, Flapping = false };
+        phonemizer.Define("Aubriella", "AO2 B R IY0 EH1 L AH0");
+
+        // A DEFINED name keeps its definition when something belongs to it.
+        var owned = phonemizer.ToIpa("Aubriella's");
+        if (!owned.Contains("ˈɛ")) throw new Exception($"the definition was lost in the possessive: {owned}");
+        if (!owned.EndsWith('z')) throw new Exception($"expected a /z/ ending: {owned}");
+
+        // The ending is the regular rule, not a lookup: /s/ after a voiceless stop...
+        if (!phonemizer.ToIpa("pat's").EndsWith('s')) throw new Exception("expected /s/ after a voiceless stop");
+        // ...and a vowel plus /z/ after a sibilant. ⚠️ The vowel comes out as the REDUCED high vowel (ᵻ),
+        // not a plain ɪ - the existing reduced-ending rule owns that position and writes "roses" the same
+        // way. Asserting ɪ here fails, and the library is the one that is right.
+        if (!phonemizer.ToIpa("jax's").EndsWith("ᵻz")) throw new Exception("expected a reduced vowel plus /z/ after a sibilant");
+
+        // An acronym's possessive is spelled out too, rather than guessed as one word.
+        var faq = phonemizer.ToIpa("FAQ's");
+        if (!faq.StartsWith('ˌ') || !faq.EndsWith('z')) throw new Exception($"FAQ's was not spelled out: {faq}");
+
+        // A plural possessive adds an apostrophe on the page and no sound at all.
+        Expect(phonemizer.ToIpa("jax'"), phonemizer.ToIpa("jax"));
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Vocabulary_MapsSymbolsToTokenIdsAndBack() => await RunTest(_ =>
     {
         // ⚠️ The third line is a SPACE as a symbol, which a real ZipVoice vocabulary genuinely lists.
