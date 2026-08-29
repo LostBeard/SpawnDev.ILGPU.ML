@@ -48,6 +48,21 @@ its stress digit, throws rather than travelling silently into the output as a wr
 
 Define words at setup: the dictionary is a plain map with no locking.
 
+### Turning symbols into token ids
+
+A model wants integers, not symbols:
+
+```csharp
+var vocabulary = PhonemeVocabulary.Load("tokens.txt");
+long[] ids = vocabulary.Encode(phonemizer.ToSymbols("Hello there."));
+```
+
+⚠️ **A symbol can be whitespace** - a ZipVoice vocabulary really does list a space as a token, and it is
+the one that separates words - so the file is split on its LAST tab rather than on whitespace. `Encode`
+throws and names a symbol the model has no token for, because dropping it renders the sentence missing a
+sound with nothing to explain the gap; `TryEncode` is there when you would rather decide yourself, and
+`Decode` reads ids back for debugging.
+
 Text goes through five stages, and each can be inspected or replaced:
 
 | stage | what it does |

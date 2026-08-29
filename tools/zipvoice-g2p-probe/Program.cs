@@ -161,6 +161,53 @@ foreach (var kv in classCounts.OrderByDescending(k => k.Value))
 Console.WriteLine();
 Console.WriteLine("Classes named UNTESTED-* have no row in the sensitivity table and are unmeasured. Each one");
 Console.WriteLine("needs a perturbation adding before the phonemizer's accuracy can be trusted.");
+
+// ---- Can the model SPEAK everything this frontend emits? ---------------------------------------------
+// Accuracy is about picking the right symbol. This is the cruder question underneath it: does a token
+// exist for every symbol at all? A symbol with no token cannot be rendered - it is dropped or the render
+// is refused - so a frontend change that starts emitting a new character breaks speech outright, and it
+// would not move any number above. Cheap to check, and worth checking on every run.
+Console.WriteLine();
+var emitted = new SortedDictionary<string, string>(StringComparer.Ordinal);
+var coverageSentences = 0;
+foreach (var path in Directory.GetFiles(fixtureDir, "*.json").OrderBy(p => p))
+{
+    using var doc = JsonDocument.Parse(File.ReadAllText(path));
+    var text = doc.RootElement.GetProperty("text").GetString()!;
+    coverageSentences++;
+    foreach (var symbol in phonemizer.ToSymbols(text))
+        if (!vocabulary.TryGetId(symbol, out _)) emitted.TryAdd(symbol, text);
+}
+
+// The fixtures are read-aloud sentences and exercise a narrow inventory, so a broad sample of real
+// dictionary words is swept too - they reach far more of the phone set than any sentence list does.
+var coverageRng = new Random(1234);
+var headwords = File.ReadLines(dictPath)
+    .Where(l => l.Length > 0 && l[0] != ';')
+    .Select(l => l.Split(' ', 2)[0])
+    .Where(w => !w.Contains('('))
+    .ToArray();
+for (var i = 0; i < 8000 && headwords.Length > 0; i++)
+{
+    var word = headwords[coverageRng.Next(headwords.Length)];
+    foreach (var symbol in phonemizer.ToSymbols(word))
+        if (!vocabulary.TryGetId(symbol, out _)) emitted.TryAdd(symbol, word);
+}
+
+if (emitted.Count == 0)
+{
+    Console.WriteLine($"COVERAGE: every symbol emitted over {coverageSentences} sentences and 8,000 "
+                    + "dictionary words has a token in this model's vocabulary.");
+}
+else
+{
+    Console.WriteLine($"COVERAGE FAILED: {emitted.Count} symbol(s) the model has no token for - these cannot "
+                    + "be spoken at all:");
+    foreach (var (symbol, source) in emitted)
+        Console.WriteLine($"  '{symbol}' (U+{(int)symbol[0]:X4}) first seen in: {source}");
+    return 1;
+}
+
 return 0;
 
 // ------------------------------------------------------------------------------------------------------
