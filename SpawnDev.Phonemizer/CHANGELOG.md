@@ -85,6 +85,13 @@
 URLs are not spoken ("www.example.com"), and an attributive unit keeps its plural ("a 500 mb file" reads
 "megabytes file").
 
+⛔ **Joining hyphenated words was measured and rejected.** "re-read" reads as "ray read" because CMUdict's
+entry for "re" is the musical note, and the joined form "reread" is correct - but the same rule turns
+"co-op" into "kuːp", a chicken coop. Every part of all 15 hyphenated words tested is already IN the
+dictionary, so this is not a guessing failure at all: it is one prefix whose dictionary entry is the wrong
+sense, the same shape as "a" being the article rather than the letter name. A blanket join loses more than
+it wins.
+
 ## 1.0.0 (2026-08-28)
 
 First release. MIT English grapheme-to-phoneme (text to phoneme) with **no dependencies and no native
