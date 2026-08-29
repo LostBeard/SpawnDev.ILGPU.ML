@@ -38,7 +38,39 @@ public sealed class EnglishTextNormalizer
         (Word("ft"), "fort"), (Word("etc"), "et cetera"), (Word("btw"), "by the way"),
     ];
 
-    private static readonly Regex CommaNumber = new(@"([0-9][0-9,]+[0-9])", RegexOptions.Compiled);
+    /// <summary>
+    /// A number written with thousands separators, e.g. "1,234".
+    /// </summary>
+    /// <remarks>
+    /// Requires a comma to actually be present, which is the whole point: the grouping says this is a
+    /// QUANTITY. Nobody writes a year that way. The previous pattern also matched bare digit runs, so it
+    /// simply stripped commas and let the year heuristic below see "1234" - and "I have 1,234 of them"
+    /// was read as "twelve thirty-four". The information needed to get it right was present in the input
+    /// and being discarded.
+    /// </remarks>
+    private static readonly Regex CommaNumber =
+        new(@"\b([0-9]{1,3}(?:,[0-9]{3})+)\b", RegexOptions.Compiled);
+
+    /// <summary>A clock time, "3:30" or "9:05".</summary>
+    private static readonly Regex ClockTime =
+        new(@"\b([0-9]{1,2}):([0-5][0-9])\b", RegexOptions.Compiled);
+
+    /// <summary>An ampersand standing in for "and".</summary>
+    private static readonly Regex Ampersand = new(@"\s*&\s*", RegexOptions.Compiled);
+
+    /// <summary>A hash used as "number", as in "#1".</summary>
+    private static readonly Regex NumberSign = new(@"#\s*(?=[0-9])", RegexOptions.Compiled);
+
+    /// <summary>
+    /// "St." meaning Street rather than Saint - it follows the name of the road.
+    /// </summary>
+    /// <remarks>
+    /// The abbreviation table maps every "st" to "saint", which turns "123 Main St." into "Main saint".
+    /// A saint's name FOLLOWS the abbreviation ("St. Louis") while a street's name PRECEDES it, so what
+    /// comes before decides it: a number or a capitalised word means street.
+    /// </remarks>
+    private static readonly Regex StreetSuffix =
+        new(@"\b(?<=(?:[0-9]|\p{Lu}\p{Ll}{1,20})\s)[Ss]t\b", RegexOptions.Compiled);
     private static readonly Regex Pounds = new(@"£([0-9,]*[0-9]+)", RegexOptions.Compiled);
     private static readonly Regex Dollars = new(@"\$([0-9.,]*[0-9]+)", RegexOptions.Compiled);
     private static readonly Regex Fraction = new(@"([0-9]+)/([0-9]+)", RegexOptions.Compiled);
@@ -96,6 +128,14 @@ public sealed class EnglishTextNormalizer
 
     private static string ExpandAbbreviations(string text)
     {
+        // Symbols that stand for words. Left alone they reach the phonemizer as punctuation and are
+        // spoken as a pause or not at all - "Mr. & Mrs." loses the "and" entirely.
+        text = Ampersand.Replace(text, " and ");
+        text = NumberSign.Replace(text, "number ");
+
+        // Before the table below, which would otherwise turn every "st" into "saint".
+        text = StreetSuffix.Replace(text, "street");
+
         foreach (var (pattern, replacement) in Abbreviations)
             text = pattern.Replace(text, replacement);
         return text;
@@ -112,7 +152,26 @@ public sealed class EnglishTextNormalizer
     /// </remarks>
     private static string NormalizeNumbers(string text)
     {
-        text = CommaNumber.Replace(text, m => m.Groups[1].Value.Replace(",", ""));
+        // Times before anything else touches the digits, or the colon survives into the output as a
+        // stray symbol and "3:30" is spoken as "three, thirty".
+        text = ClockTime.Replace(text, ExpandTime);
+
+        // Grouped numbers are expanded HERE rather than merely de-comma'd, so the year heuristic never
+        // sees them - the comma is what says "quantity, not year".
+        text = CommaNumber.Replace(text, m =>
+        {
+            var digits = m.Groups[1].Value.Replace(",", "");
+            if (!long.TryParse(digits, out var grouped)) return digits;
+
+            // Grouping says QUANTITY, but English still reads a round quantity year-style: "fifteen
+            // hundred apples", not "one thousand five hundred apples". So year-style survives only for
+            // a whole number of hundreds - which is where it sounds natural - and everything else is
+            // counted out. "1,234 of them" was being read as "twelve thirty-four"; nobody counts that
+            // way, and equally nobody says "one thousand five hundred" for 1,500.
+            return grouped is > 1000 and < 3000 && grouped % 100 == 0
+                ? $" {NumberToWords.Year((int)grouped)} "
+                : $" {NumberToWords.Cardinal(grouped)} ";
+        });
         text = Pounds.Replace(text, m => $" {m.Groups[1].Value} pounds ");
         text = Dollars.Replace(text, ExpandDollars);
         text = Fraction.Replace(text, ExpandFraction);
@@ -149,6 +208,25 @@ public sealed class EnglishTextNormalizer
         if (denominator == 2) return $" {NumberToWords.Cardinal(numerator)} halves ";
         if (denominator == 4) return $" {NumberToWords.Cardinal(numerator)} quarters ";
         return $" {NumberToWords.Cardinal(numerator)} {NumberToWords.Ordinal(denominator)}s ";
+    }
+
+    /// <summary>
+    /// Read a clock time the way it is said: "three thirty", "nine oh five", "two o'clock".
+    /// </summary>
+    private static string ExpandTime(Match match)
+    {
+        if (!int.TryParse(match.Groups[1].Value, out var hour)) return match.Value;
+        if (!int.TryParse(match.Groups[2].Value, out var minute)) return match.Value;
+        if (hour > 23) return match.Value;
+
+        var spokenHour = NumberToWords.Cardinal(hour);
+        return minute switch
+        {
+            0 => $" {spokenHour} o'clock ",
+            // A leading zero is spoken, not skipped: 9:05 is "nine oh five", never "nine five".
+            < 10 => $" {spokenHour} oh {NumberToWords.Cardinal(minute)} ",
+            _ => $" {spokenHour} {NumberToWords.Cardinal(minute)} ",
+        };
     }
 
     /// <summary>Expand a bare run of digits, reading four-digit values in the 1001-2999 range as years.</summary>

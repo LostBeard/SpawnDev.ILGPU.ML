@@ -20,7 +20,27 @@
 
 ### Fixed
 
+- **A grouped number was read as a year.** "I have 1,234 of them" came out as "twelve thirty-four": the
+  commas were stripped before the year heuristic ran, so a quantity arrived indistinguishable from a
+  year - and the comma, the one thing that tells them apart, was what got discarded. Grouped numbers are
+  now expanded where the grouping is still visible. ⚠️ Round ones keep the year-style reading, because
+  that is what English says: "fifteen hundred apples", never "one thousand five hundred apples".
+  Roundness is the discriminator, not the comma - reading every grouped number as a cardinal broke that,
+  and the existing test caught it.
+- **A clock time left its colon in.** "3:30" reached the phonemizer as "three : thirty", where the colon
+  is punctuation and is spoken as a pause. Times now read "three thirty", "nine oh five", "two o'clock".
+- **"St." was always a saint.** "123 Main St." was read as "Main saint". A saint's name FOLLOWS the
+  abbreviation and a street's PRECEDES it, so what comes before now decides. The sentence-ending period
+  is preserved, since the phonemizer reads punctuation as prosody.
+- **`&` and `#` were silent.** They reached the phonemizer as punctuation, so "Mr. & Mrs." simply lost
+  the "and". Now "and" and "number".
 - Three missing XML `param` tags (CS1573). The package builds with zero warnings.
+
+### Known gaps (measured, not fixed)
+
+Units are not expanded ("5km" stays "km"), nor are operators (`+`, `=`), URLs, a leading minus, or
+hyphenated forms like "COVID-19" and "3-D". Units especially need a decision rather than a patch: "m" is
+metres, minutes or miles depending on context.
 
 ## 1.0.0 (2026-08-28)
 

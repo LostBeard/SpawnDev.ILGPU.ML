@@ -100,6 +100,87 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Normalizer_GroupedNumbersAreQuantitiesNotYears() => await RunTest(_ =>
+    {
+        // "I have 1,234 of them" was read as "twelve thirty-four". The commas were stripped before the
+        // year heuristic ran, so a quantity arrived looking exactly like a year - and the one piece of
+        // information that distinguishes them was the thing being discarded. Nobody writes a year with
+        // a thousands separator.
+        var n = new EnglishTextNormalizer();
+
+        Contains(n.Normalize("I have 1,234 of them."), "one thousand, two hundred thirty-four");
+        Contains(n.Normalize("1,234,567 stars."), "one million, two hundred thirty-four thousand");
+
+        // ...while a bare four-digit number in year range must STILL read as a year.
+        Contains(n.Normalize("Back in 2026."), "twenty twenty-six");
+        Contains(n.Normalize("It was 1999."), "nineteen ninety-nine");
+
+        // And a ROUND grouped number keeps its year-style reading, because that is what English says:
+        // "fifteen hundred apples", never "one thousand five hundred apples". Roundness is the real
+        // discriminator here, not the comma - a first attempt at this read every grouped number as a
+        // cardinal and broke exactly this case.
+        Contains(n.Normalize("1,500 apples"), "fifteen hundred");
+        Contains(n.Normalize("2,000 of them"), "two thousand");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Normalizer_ReadsClockTimes() => await RunTest(_ =>
+    {
+        // "3:30" left the colon in the output, where it reaches the phonemizer as punctuation and is
+        // spoken as a pause: "three, thirty".
+        var n = new EnglishTextNormalizer();
+
+        Contains(n.Normalize("It's 3:30 now."), "three thirty");
+        Contains(n.Normalize("Meet at 2:00."), "two o'clock");
+        // A leading zero is spoken, never skipped.
+        Contains(n.Normalize("It's 9:05."), "nine oh five");
+        Missing(n.Normalize("It's 3:30 now."), ":");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Normalizer_SaysSymbolsThatStandForWords() => await RunTest(_ =>
+    {
+        // Left alone these reach the phonemizer as punctuation and are spoken as a pause or dropped,
+        // so "Mr. & Mrs." simply loses the "and".
+        var n = new EnglishTextNormalizer();
+
+        Contains(n.Normalize("Mr. & Mrs. Tanner"), "mister and missus");
+        Contains(n.Normalize("He's #1!"), "number one");
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Normalizer_TellsAStreetFromASaint() => await RunTest(_ =>
+    {
+        // Every "st" mapped to "saint", so "123 Main St." was read as "Main saint". A saint's name
+        // FOLLOWS the abbreviation and a street's name PRECEDES it, so what comes before decides.
+        var n = new EnglishTextNormalizer();
+
+        Contains(n.Normalize("Dr. Smith lives at 123 Main St."), "Main street");
+        Contains(n.Normalize("Turn onto Oak St. and stop."), "Oak street");
+        Contains(n.Normalize("St. Louis is nice."), "saint Louis");
+
+        // The sentence-ending period has to survive, because the phonemizer reads punctuation as
+        // prosody - losing it removes the pause at the end of the sentence.
+        Contains(n.Normalize("He lives on Main St."), "street.");
+        return Task.CompletedTask;
+    });
+
+    private static void Contains(string actual, string expected)
+    {
+        if (!actual.Contains(expected, StringComparison.Ordinal))
+            throw new Exception($"expected \"{expected}\" within \"{actual}\"");
+    }
+
+    private static void Missing(string actual, string unwanted)
+    {
+        if (actual.Contains(unwanted, StringComparison.Ordinal))
+            throw new Exception($"did not expect \"{unwanted}\" in \"{actual}\"");
+    }
+
     private static void ExpectText(string actual, string expected)
     {
         if (actual != expected) throw new Exception($"expected \"{expected}\", got \"{actual}\"");
