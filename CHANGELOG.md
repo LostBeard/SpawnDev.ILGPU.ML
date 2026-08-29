@@ -2,6 +2,49 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.1.4 (2026-08-28)
+
+### FIX: the runtime Conv output-resize gave every DEPTHWISE conv a 1-channel output buffer
+
+`GraphExecutor`'s runtime Conv output sizing - added so a dynamic upstream `Resize` cannot leave a conv's
+compiled output shape stale - recomputed the channel axis as `GetWeightDims(w)[0]`. For a depthwise weight
+that is NOT the output channel count: `[1,kH,kW,C]` in NHWC, `[C,1,kH,kW]` with `group==C` in NCHW, so
+`w[0]` is 1. It therefore replaced a CORRECT compiled shape with a 1-channel one, and it fired on every
+depthwise conv precisely BECAUSE it disagreed with the compiled shape.
+
+- EfficientNetLite0 and BlazeFace failed on all six backends with
+  `DepthwiseConv2D NHWC output buffer too small: output.Length=12544 but kernel will write 401408`.
+- Now resolves `group` (including the TFLite `-1` sentinel) and takes `outC = inC` for a depthwise conv,
+  matching `ConvOperator.InferOutputShapes`. Fixed in BOTH copies of the block.
+
+### FIX: the bf16 KV conversion scratch corrupted WebGL decode when it grew
+
+`GGUFDecodeKVCache`'s bf16 conversion scratch was per-layer and grow-only. Resizing it produced wrong
+tokens on WebGL - decode diverged from full-recompute. Isolated by disabling each grow-only allocation
+independently: pinning the PACK capacity changed nothing, pinning the SCRATCH fixed it. It is the one
+`BFloat16` buffer a kernel reads directly, and reallocating it at a different length changes its backing
+texture layout, so the copy into it mis-addresses.
+
+- Allocated ONCE, at full size, shared by every layer - never resized.
+- Uses LESS memory than before: the old scratch was per-layer, so at long context it converged on
+  `nLayers` full-size buffers.
+- The convert kernel's bounds guard also tested only the destination while indexing the source - an
+  out-of-bounds read whenever the destination is longer, which is the normal state of a grow-only buffer.
+  Now guards both.
+
+### NEW: `HubModelStream.OpenWebSeedAsync` - seekable hub streaming without WebTorrent
+
+Opens a seekable stream over the hub's `/hf` web seed using plain HTTP range requests: no magnet, no
+torrent, no peers. `HttpRangeStream` is now public and reports `BytesFetched`, so a caller can verify that
+a structure-only pass really did skip the weights (measured: 1,533,463 of 10,204,519 bytes = 15.0%).
+
+### Dependencies
+
+- `SpawnDev.SpawnJS` 2.1.8 -> **2.1.9** (the app root is no longer derived by matching the framework
+  folder BY NAME, which broke when a published app renames it).
+- New dependency `SpawnDev.Phonemizer` **1.0.0**, now published in its own right. It was already a
+  `ProjectReference`, and packing without publishing it would have given every consumer NU1101 on restore.
+
 ## 5.1.2-local.12 (2026-08-19)
 
 ### FIX: `MaxTokens` default of 224 silently truncated long transcripts

@@ -33,7 +33,7 @@
 		<!-- Force the whole graph (incl. SpawnDev.ILGPU's transitive 2.0.10) up to 2.0.13-local.1, which fixes
 		     JSRef.Get<long?> (INumberNullableMarshaller) - WebGPU adapter/device limits are long?, so without it
 		     maxStorageBufferBindingSize read null and the device fell back to the 128 MiB default. -->
-		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.8" />
+		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.9" />
 	</ItemGroup>
 
 	<ItemGroup>
