@@ -26,6 +26,28 @@ phonemizer.ToSymbols("...");        // one IPA symbol per entry, ready to map to
 phonemizer.LastUnknownWords;        // words the dictionary did not have, whether or not they were sounded out
 ```
 
+### Teaching it a word
+
+The words an application says most often are exactly the ones a general dictionary lacks - character
+names, brands, jargon, people. Letter-to-sound guesses those, and it is right about half the time. When
+you know how a word is said, say so:
+
+```csharp
+phonemizer.Define("Aubriella", "AO2 B R IY0 EH1 L AH0");   // ARPAbet, as CMUdict writes it
+```
+
+| | |
+|---|---|
+| before | `ˈɔːbɹiɛlə` - stress on the "au", because that is where the rules put it |
+| after | `ˌɔːbɹiˈɛlə` - stress on the "ell", like every other "-ella" name |
+
+A definition **replaces** anything held for that word and sits ahead of both decomposition and
+letter-to-sound, so a defined word is never guessed at and never re-resolved by homograph context.
+`Remove` puts it back. Phones are validated on the way in - an unrecognised phone, or a vowel missing
+its stress digit, throws rather than travelling silently into the output as a wrong sound.
+
+Define words at setup: the dictionary is a plain map with no locking.
+
 Text goes through five stages, and each can be inspected or replaced:
 
 | stage | what it does |

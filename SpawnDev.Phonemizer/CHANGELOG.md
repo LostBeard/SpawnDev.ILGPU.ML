@@ -1,5 +1,27 @@
 # SpawnDev.Phonemizer Changelog
 
+## Unreleased
+
+### Added
+
+- **`Define` / `Remove` on `PronunciationDictionary`, and `Define` on `EnglishPhonemizer`** - teach it how
+  a word is said at runtime, without rebuilding the embedded data. The words an application says most are
+  the ones CMUdict lacks (names, brands, jargon), and letter-to-sound is right about half the time on
+  those; a word you KNOW should never be guessed at. Aubriella goes from `ˈɔːbɹiɛlə` to `ˌɔːbɹiˈɛlə`,
+  which is where every other "-ella" name in the dictionary puts its stress.
+  - Replaces rather than appends, so a definition is authoritative: `Homographs` only chooses between
+    alternates when two or more exist, and leaving the originals would let context pick one of them.
+  - Sits ahead of decomposition and letter-to-sound, so a defined word is never sounded out.
+  - Phones are validated against the same tables that convert them - an unknown phone, or a vowel with no
+    stress digit, throws naming the offender instead of emitting a wrong sound.
+  - `EnglishPhonemizer.Dictionary` is now exposed.
+- Behaviour is unchanged for anyone who defines nothing: the accuracy probe reads an identical
+  24 differences over 592 reference symbols (4.1%) before and after.
+
+### Fixed
+
+- Three missing XML `param` tags (CS1573). The package builds with zero warnings.
+
 ## 1.0.0 (2026-08-28)
 
 First release. MIT English grapheme-to-phoneme (text to phoneme) with **no dependencies and no native

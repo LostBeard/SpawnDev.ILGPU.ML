@@ -24,6 +24,21 @@ public sealed class EnglishPhonemizer
     public EnglishPhonemizer(PronunciationDictionary dictionary)
         => _dictionary = dictionary ?? throw new ArgumentNullException(nameof(dictionary));
 
+    /// <summary>The words this phonemizer knows. Use it to teach it more.</summary>
+    public PronunciationDictionary Dictionary => _dictionary;
+
+    /// <summary>
+    /// Teaches this phonemizer how one word is said, overriding the dictionary and stopping it
+    /// from ever being guessed at.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// phonemizer.Define("Aubriella", "AO2 B R IY0 EH1 L AH0");
+    /// </code>
+    /// </example>
+    /// <inheritdoc cref="PronunciationDictionary.Define(string, string)" path="/remarks"/>
+    public void Define(string word, string arpabet) => _dictionary.Define(word, arpabet);
+
     /// <summary>
     /// Apply the alveolar tap that American English uses for T and D between vowels.
     /// </summary>
@@ -181,6 +196,11 @@ public sealed class EnglishPhonemizer
     public string ToIpa(string text) => string.Concat(ToSymbols(text));
 
     /// <summary>Map one word's ARPAbet phones to IPA symbols, applying the rules.</summary>
+    /// <param name="phones">The word's ARPAbet phones, vowels carrying their stress digit.</param>
+    /// <param name="spelling">
+    /// The word as written. Needed beyond the phones themselves: whether it is a function word that
+    /// loses its stress, and which reading of a homograph applies, are both properties of the spelling.
+    /// </param>
     /// <param name="previousWord">
     /// The word before this one, or null at the start of a phrase. Used only to read a homograph:
     /// "the record" is a noun, "to record" is a verb, and they are stressed on different syllables.

@@ -152,6 +152,73 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     });
 
+    [TestMethod]
+    public async Task Phonemizer_DefineBeatsGuessingAndSurvivesASentence() => await RunTest(_ =>
+    {
+        // A name you KNOW should never be guessed at. Letter-to-sound is right about half the time,
+        // and the words an application says most are exactly the ones CMUdict lacks.
+        var phonemizer = MakePhonemizer();
+        phonemizer.LetterToSound = null;   // so a miss is visibly a miss rather than a guess
+
+        var before = phonemizer.ToIpa("Aubriella");
+        if (before.Length != 0) throw new Exception($"expected nothing for an unknown word, got \"{before}\"");
+
+        phonemizer.Define("Aubriella", "AO2 B R IY0 EH1 L AH0");
+
+        // Stress lands on the ELL, which is the entire point - every "-ella" name in CMUdict is
+        // stressed there and the guesser stresses the "au" instead.
+        var after = phonemizer.ToIpa("Aubriella");
+        if (!after.Contains("ˈɛ")) throw new Exception($"primary stress is not on the ELL: \"{after}\"");
+        if (after.StartsWith('ˈ')) throw new Exception($"primary stress is still on the first syllable: \"{after}\"");
+
+        // It has to hold mid-sentence too, not just alone.
+        var sentence = phonemizer.ToIpa("my Aubriella");
+        if (!sentence.Contains("ˈɛ")) throw new Exception($"the definition was lost in a sentence: \"{sentence}\"");
+
+        // Defining REPLACES rather than adds. If the old pronunciations survived, homograph
+        // resolution could still pick one of them, and the definition would not be authoritative.
+        if (!phonemizer.Dictionary.TryLookupAll("Aubriella", out var all) || all.Count != 1)
+            throw new Exception($"expected exactly one pronunciation after Define, got {all.Count}");
+
+        // A word already in the dictionary can be corrected the same way.
+        phonemizer.Define("water", "W AO1 T ER0 Z");
+        if (!phonemizer.ToIpa("water").EndsWith('z')) throw new Exception("Define did not override an existing entry");
+
+        // ...and removing it puts the word back to being unknown.
+        phonemizer.Dictionary.Remove("Aubriella");
+        if (phonemizer.ToIpa("Aubriella").Length != 0) throw new Exception("Remove did not forget the word");
+
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
+    public async Task Phonemizer_DefineRejectsPhonesItCannotSpeak() => await RunTest(_ =>
+    {
+        // A bad phone must fail HERE. Left unchecked it travels into the symbol stream and comes out
+        // as a missing or wrong sound, which is far harder to trace back to the typo that caused it.
+        var phonemizer = MakePhonemizer();
+
+        Rejects(() => phonemizer.Define("x", "AO2 B XX9 R"), "an unknown phone");
+        Rejects(() => phonemizer.Define("x", ""), "no phones at all");
+        Rejects(() => phonemizer.Define("", "AO2"), "a blank word");
+
+        // A vowel without its stress digit is the subtle one: it would otherwise be accepted and
+        // quietly rendered unstressed, when stress is usually the whole reason for defining a word.
+        Rejects(() => phonemizer.Define("x", "AO B R IY0"), "a vowel missing its stress digit");
+
+        // Consonants legitimately carry no digit, so this must be ACCEPTED.
+        phonemizer.Define("x", "B R IY0 Z");
+
+        return Task.CompletedTask;
+
+        static void Rejects(Action define, string what)
+        {
+            try { define(); }
+            catch (ArgumentException) { return; }
+            throw new Exception($"Define accepted {what}");
+        }
+    });
+
     private static void Expect(string actual, string expected)
     {
         if (actual != expected) throw new Exception($"expected \"{expected}\", got \"{actual}\"");

@@ -147,6 +147,7 @@ public sealed class LetterToSound
     }
 
     /// <summary>Sound out every letter, before any word-level stress rule is applied.</summary>
+    /// <param name="letters">The word being sounded out, already lower-cased.</param>
     /// <param name="lastResort">
     /// When true, a vowel letter the rules make silent is given its loudest single-letter sound instead.
     /// Only ever used to rescue a word that came back with no vowel at all - see <see cref="Predict"/>.
