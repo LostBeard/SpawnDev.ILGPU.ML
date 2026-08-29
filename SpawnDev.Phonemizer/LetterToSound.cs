@@ -104,6 +104,14 @@ public sealed class LetterToSound
         // backstop answered cost 19.5 points, counting vowel groups cost 3.1, and a run of three silent
         // letters cost 0.3. This one gains 0.1 while turning 11 unsayable words into 1. See
         // <c>tools/lts-train --analyze</c>, which prints that table.
+        //
+        // ⛔ A FOURTH idea was measured 2026-08-29 and also rejected: repairing only the SILENT TAIL
+        // rather than re-spelling the whole word. The thought was that a narrower repair would avoid
+        // damaging letters that were already right - it makes NO difference at all, scoring identically
+        // to the whole-word repair at every run length (49.7/49.7, 49.8/49.8), and still costs 0.1-0.2
+        // points to fix ONE truncated word in 5,000. `tools/lts-train --analyze --truncation` prints
+        // that sweep. The remaining truncations ("huawei") are proper nouns, and the answer to those is
+        // <see cref="PronunciationDictionary.Define"/> - a name you know should be told, not guessed.
         if (!output.Any(IsVowel) && letters.Any(c => "aeiouy".Contains(c)))
             output = Spell(letters, lastResort: true);
 

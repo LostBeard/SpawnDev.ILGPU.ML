@@ -62,7 +62,7 @@ int holdout = 5000, iterations = 6, minCount = 1;
 // Going wider is what a letter-to-sound model of this class has left to give: the errors are single
 // phones in nearly-right words, not a wrong idea about the word.
 int[] windows = [5, 4, 3, 2, 1, 0];
-bool analyze = false, analogyProbe = false;
+bool analyze = false, analogyProbe = false, truncationProbe = false;
 for (int i = 0; i < args.Length; i++)
 {
     if (args[i] == "--dict" && i + 1 < args.Length) dictPath = args[++i];
@@ -74,6 +74,7 @@ for (int i = 0; i < args.Length; i++)
         windows = args[++i].Split(',').Select(int.Parse).OrderByDescending(w => w).ToArray();
     if (args[i] == "--analyze") analyze = true;
     if (args[i] == "--analogy") analogyProbe = true;
+    if (args[i] == "--truncation") truncationProbe = true;
 }
 if (!File.Exists(dictPath)) { Console.WriteLine($"no cmudict at {dictPath}"); return 2; }
 if (windows.Length == 0 || windows[^1] != 0)
@@ -365,6 +366,55 @@ if (analyze)
     Console.WriteLine($"           CATASTROPHIC: {truncated} words lost half their phones or more, "
                     + $"{voiceless} came back with no vowel at all");
 
+    // ---- Can the truncation be repaired without costing more than it saves? ANSWER: NO -------------
+    //
+    // "nevaeh" comes back "N AH1 V" and "huawei" "HH W AO1": a run of letters at the END produced
+    // nothing at all. Four triggers were measured before and only the no-vowel guard paid - but every
+    // one of them paired with a WHOLE-WORD repair, which re-spells letters that were already right.
+    // Scope looked like the untried axis, so this sweeps the trigger (how long a trailing silent run)
+    // AGAINST the repair scope (the whole word, or only the silent tail).
+    //
+    // ⛔ MEASURED 2026-08-29 AND REJECTED. Scope makes NO DIFFERENCE - tail-only scores identically to
+    // whole-word at every run length (49.7% vs 49.7%, 49.8% vs 49.8%). The reasoning that a narrower
+    // repair would avoid collateral damage was simply wrong, and the sweep says so in one line.
+    //
+    // And the prize is smaller than it looks: the baseline truncates only 2 words in 5,000 held out.
+    // Every policy trades 0.1-0.2 points of exact accuracy to turn that 2 into a 1. Do not ship any of
+    // them, and do not re-propose repair scope. The kept sweep is here so the claim stays falsifiable.
+    //
+    // What DOES answer this class of word is PronunciationDictionary.Define: a name you know should be
+    // told, not guessed. Truncation bites hardest on proper nouns, which is exactly where a definition
+    // is available and a rule never will be.
+    if (truncationProbe)
+    {
+        Console.WriteLine();
+        Console.WriteLine("  TRUNCATION REPAIR SWEEP - trailing silent run, whole-word vs tail-only repair");
+        Console.WriteLine($"  {"policy",-44} {"exact",7} {"trunc",7} {"novowel",8}");
+
+        foreach (var (label, minRun, tailOnly, needVowel) in new (string, int, bool, bool)[]
+        {
+            ("baseline (no-vowel guard only)", 99, false, false),
+            ("run>=2, repair WHOLE word", 2, false, true),
+            ("run>=2, repair TAIL only", 2, true, true),
+            ("run>=3, repair WHOLE word", 3, false, true),
+            ("run>=3, repair TAIL only", 3, true, true),
+            ("run>=2, TAIL only, any letters", 2, true, false),
+            ("run>=1, repair TAIL only", 1, true, true),
+        })
+        {
+            int right = 0, trunc = 0, noVowel = 0;
+            foreach (var (word, phones) in test)
+            {
+                var got = PredictTail(word, minRun, tailOnly, needVowel);
+                if (got.SequenceEqual(phones)) right++;
+                if (phones.Length >= 4 && got.Length * 2 <= phones.Length) trunc++;
+                if (phones.Any(IsVowel) && !got.Any(IsVowel)) noVowel++;
+            }
+            Console.WriteLine($"  {label,-44} {right / (double)test.Count,7:P1} {trunc,7} {noVowel,8}");
+        }
+        Console.WriteLine("  A policy only ships if it cuts truncation WITHOUT losing exact-match accuracy.");
+    }
+
     Console.WriteLine();
     Console.WriteLine($"           substitutions: {vowelSubs} on vowels, {consonantSubs} on consonants; "
                     + $"{tooMany} phones too many, {tooFew} too few");
@@ -643,6 +693,34 @@ string[] Predict(string word)
         spoken = Assemble(word, i => SoundAt(word, i, repair: true),
                                 i => LookupFlat(flatStress, word, i));
     return spoken;
+}
+
+// A candidate truncation repair: the shipped no-vowel guard first, then - if the word ENDS in a run of
+// letters that produced nothing - the loudest-sound fallback applied either to the whole word or only to
+// that trailing run. Only vowel letters have a fallback, so a run of silent consonants cannot be repaired
+// and needVowel says whether to bother trying.
+string[] PredictTail(string word, int minRun, bool tailOnly, bool needVowel)
+{
+    var spoken = Assemble(word, i => SoundAt(word, i, repair: false),
+                                i => LookupFlat(flatStress, word, i));
+
+    if (!spoken.Any(IsVowel) && word.Any(c => "aeiouy".Contains(c)))
+        return Assemble(word, i => SoundAt(word, i, repair: true),
+                              i => LookupFlat(flatStress, word, i));
+
+    int run = 0;
+    for (int i = word.Length - 1; i >= 0; i--)
+    {
+        if (LookupFlat(flatSounds, word, i).Emission.Length != 0) break;
+        run++;
+    }
+    if (run < minRun || run == 0) return spoken;
+
+    int start = word.Length - run;
+    if (needVowel && !word[start..].Any(c => "aeiouy".Contains(c))) return spoken;
+
+    return Assemble(word, i => SoundAt(word, i, repair: !tailOnly || i >= start),
+                          i => LookupFlat(flatStress, word, i));
 }
 
 // The sound for one letter. In repair mode a vowel letter that came back silent is given its best
