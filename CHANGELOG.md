@@ -4,7 +4,37 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Added
+
+- **Microphone capture actually works.** `MediaStreamCapture.OnAudioReady` was DECLARED and never raised -
+  the class advertised microphone support while its only capture call was
+  `GetUserMedia(video: true, audio: false)`, and the `/whisper` page's Start Recording button was
+  `=> Task.CompletedTask`. Both compiled; neither did anything. `StartMicrophoneAsync(targetSampleRate)`
+  now opens the microphone through `MediaStreamTrackProcessor` and delivers MONO float32 chunks at the
+  requested rate (16 kHz by default - what Whisper expects), so a speech model can consume them directly.
+  Adds `StopMicrophone()`, `IsCapturingAudio`, and an `OnAudioError` channel plus `LastAudioError`, because
+  a capture that dies silently is indistinguishable from a quiet room.
+- **`MediaInterop.FromAudioDataAsync(AudioData, targetSampleRate)`** - the extraction half, sitting next to
+  the existing `FromAudioBuffer`. Handles planar and interleaved layouts in f32 or s16, downmixes to mono,
+  and resamples. An unrecognised format THROWS rather than returning silence. Gated by
+  `MLTestBase.MicrophoneCaptureTests` (5 tests, green on WebGPU + WebGL + Wasm; the desktop lanes report a
+  visible Skip since `AudioData` is browser-only), which asserts invariants a broken conversion would
+  violate - a channel average, an interleave stride, the s16 scale factor, and a DC level that must survive
+  a 48 kHz -> 16 kHz resample.
+- **`tools/drive-mic-capture.cs`** - a browser gate for the live capture path, using Chrome's fake audio
+  device. It asserts on the page's elapsed counter, which is derived from the COUNT OF SAMPLES RECEIVED,
+  so "4.0s" is proof that four seconds of audio actually traversed
+  getUserMedia -> MediaStreamTrackProcessor -> AudioData -> OnAudioReady. Verified: 64,000 samples at
+  16 kHz in 4 s of wall time - a ratio that also confirms the 48 kHz -> 16 kHz resample runs live.
+
 ### Changed
+
+- **`/whisper` opens the microphone BEFORE loading the model**, with the ~231 MB weight download running in
+  parallel and awaited at Stop. Making someone wait on a download before they can start talking - and
+  dropping whatever they said during it - was the wrong order.
+- **`/whisper`'s in-page how-to no longer teaches the obsolete `ModelHub.LoadAsync`.** The code below it had
+  already moved to `CreateFromHuggingFaceAsync`; the sample rendered in the UI had not, so it kept teaching
+  the superseded API to every reader who never sees a compiler warning.
 
 - **`ModelHub` is no longer the way to deliver model WEIGHTS.** It predates lazy-hash (this file
   2026-03-19; `HubModelStream` 2026-06-02), and its `LoadAsync` shape returns the whole model as a `byte[]`

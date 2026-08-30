@@ -24,6 +24,11 @@ public class MediaStreamCapture : IDisposable
     private HTMLCanvasElement? _hiddenCanvas;
     private CancellationTokenSource? _captureCts;
     private bool _isCapturing;
+    private MediaStream? _audioStream;
+    private MediaStreamTrackProcessor? _audioProcessor;
+    private ReadableStreamDefaultReader? _audioReader;
+    private CancellationTokenSource? _audioCts;
+    private int _audioTargetRate = 16000;
 
     /// <summary>Current capture dimensions.</summary>
     public int Width { get; private set; }
@@ -39,10 +44,23 @@ public class MediaStreamCapture : IDisposable
     public event Action<byte[], int, int>? OnFrameReady;
 
     /// <summary>
-    /// Fired when audio samples are captured (microphone mode).
+    /// Fired for every chunk of captured microphone audio, as MONO float32 at the rate requested from
+    /// <see cref="StartMicrophoneAsync"/> (16 kHz by default, which is what Whisper expects).
     /// Parameters: (float[] samples, int sampleRate)
     /// </summary>
     public event Action<float[], int>? OnAudioReady;
+
+    /// <summary>
+    /// Fired when audio capture STOPS because of an error - an unreadable sample format, most likely.
+    /// Without this a failing capture is indistinguishable from a silent microphone.
+    /// </summary>
+    public event Action<Exception>? OnAudioError;
+
+    /// <summary>The error that ended audio capture, if any. Cleared by a new StartMicrophoneAsync.</summary>
+    public Exception? LastAudioError { get; private set; }
+
+    /// <summary>Whether microphone capture is currently running.</summary>
+    public bool IsCapturingAudio => _audioReader != null;
 
     /// <summary>Target capture FPS. Actual rate may be lower if inference is slow.</summary>
     public float TargetFps { get; set; } = 30;
@@ -116,10 +134,120 @@ public class MediaStreamCapture : IDisposable
     }
 
     /// <summary>
+    /// Start capturing microphone audio. Chunks arrive on <see cref="OnAudioReady"/> as mono float32
+    /// resampled to <paramref name="targetSampleRate"/>, ready to hand straight to a speech model.
+    /// </summary>
+    /// <remarks>
+    /// Uses <c>MediaStreamTrackProcessor</c> - the browser hands us decoded <c>AudioData</c> frames
+    /// directly, so there is no <c>ScriptProcessorNode</c> on the audio thread and no polling loop.
+    /// <para>
+    /// Audio DOES cross into the .NET heap here, against the usual "bulk data stays in JS" rule. It is
+    /// the justified exception: a chunk is one AudioData frame (order of 10 ms - a few hundred floats),
+    /// speech models consume CPU-side float samples anyway, and the mel preprocessing that follows is
+    /// CPU work. Video frames, orders of magnitude larger, keep using the JS-side path.
+    /// </para>
+    /// </remarks>
+    /// <returns>True if the microphone opened and the read loop started.</returns>
+    public async Task<bool> StartMicrophoneAsync(int targetSampleRate = 16000)
+    {
+        if (_audioProcessor != null) return false;
+        if (targetSampleRate <= 0) throw new ArgumentOutOfRangeException(nameof(targetSampleRate));
+
+        LastAudioError = null;
+        _audioTargetRate = targetSampleRate;
+        try
+        {
+            using var navigator = _js.Get<Navigator>("navigator");
+            using var mediaDevices = navigator.MediaDevices;
+            _audioStream = await mediaDevices.GetUserMedia(video: false, audio: true);
+            if (_audioStream == null) return false;
+
+            using var tracks = _audioStream.GetAudioTracks();
+            var track = tracks.ToArray().FirstOrDefault();
+            if (track == null) { StopMicrophone(); return false; }
+
+            _audioProcessor = new MediaStreamTrackProcessor(new MediaStreamTrackProcessorOptions { Track = track });
+            using var readable = _audioProcessor.Readable;
+            _audioReader = readable.GetReader();
+
+            _audioCts = new CancellationTokenSource();
+            _ = AudioLoop(_audioCts.Token);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LastAudioError = ex;
+            StopMicrophone();
+            return false;
+        }
+    }
+
+    /// <summary>Stop microphone capture and release the audio track.</summary>
+    public void StopMicrophone()
+    {
+        _audioCts?.Cancel();
+        _audioCts?.Dispose();
+        _audioCts = null;
+
+        _audioReader?.Dispose();
+        _audioReader = null;
+        _audioProcessor?.Dispose();
+        _audioProcessor = null;
+
+        if (_audioStream != null)
+        {
+            using var tracks = _audioStream.GetAudioTracks();
+            tracks.ToArray().UsingEach(t => t.Stop());
+            _audioStream.Dispose();
+            _audioStream = null;
+        }
+    }
+
+    private async Task AudioLoop(CancellationToken ct)
+    {
+        // Nothing may escape this method. An unhandled exception on a runtime callback EXITS the .NET
+        // WASM runtime, taking the whole page with it - so a failure is reported through OnAudioError.
+        try
+        {
+            while (!ct.IsCancellationRequested && _audioReader != null)
+            {
+                ReadableStreamReaderReadResponse res;
+                try { res = await _audioReader.Read(); }
+                catch { break; }
+                if (res.Done) { res.Dispose(); break; }
+
+                // The chunk of an audio MediaStreamTrackProcessor is an AudioData, not a byte view -
+                // read it with the correct wrapper type rather than the reader's byte-typed Value.
+                var audioData = res.JSRef!.Get<AudioData?>("value");
+                res.Dispose();
+                if (audioData is null) continue;
+
+                try
+                {
+                    var samples = await MediaInterop.FromAudioDataAsync(audioData, _audioTargetRate);
+                    if (samples.Length > 0) OnAudioReady?.Invoke(samples, _audioTargetRate);
+                }
+                finally
+                {
+                    try { audioData.Close(); } catch { }
+                    audioData.Dispose();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // A format we cannot read would otherwise throw on EVERY frame and look like silence.
+            LastAudioError = ex;
+            try { OnAudioError?.Invoke(ex); } catch { }
+        }
+    }
+
+    /// <summary>
     /// Stop capturing and release all resources.
     /// </summary>
     public void Stop()
     {
+        StopMicrophone();
         _isCapturing = false;
         _captureCts?.Cancel();
         _captureCts?.Dispose();

@@ -27,7 +27,7 @@
 | `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Pipeline_SemanticSearch_SimilarSentencesCloser` (DistilBERT) |
 | `/inspector` | Model Inspector (structure + compat) | ✅ **VERIFIED** | Streams ONNX structure-only; GPT-2 100% compat after registry fix; inspect-by-URL live-hub test |
 | `/benchmark` | GPU benchmark | ✅ **VERIFIED** | MatMul / perf kernels (92-101 GFLOPS validated) |
-| `/whisper` | Speech-to-text (Whisper) | 🟡 **PARTIAL** | `Pipeline_WhisperDecoder_Reference_440HzTone` covers the decoder; full mic→text browser E2E not yet a green test |
+| `/whisper` | Speech-to-text (Whisper) | 🟡 **PARTIAL** | `Pipeline_WhisperDecoder_Reference_440HzTone` covers the decoder. **Microphone capture is now real and gated** - the Start Recording button was a `=> Task.CompletedTask` stub until 2026-08-30; `MLTestBase.MicrophoneCaptureTests` (5 tests, WebGPU + WebGL + Wasm) covers the AudioData→mono-float32 conversion and `tools/drive-mic-capture.cs` proves live capture in Chrome (64,000 samples at 16 kHz in 4 s). Still PARTIAL: **mic→TEXT** has no green test, because a synthetic tone has no words to assert on |
 | `/depth-voxel` | Depth → 3D voxels | 🟡 **PARTIAL** | Depth pipeline runs (see `/depth`); the 3D voxel viewer UI is still placeholder |
 | `/explain` | Model explainability | 🟡 **PARTIAL** | Intercepts the executor; works on a limited set of models |
 | `/assistant` | AI assistant (chat) | 🟡 **PARTIAL** | Real DistilGPT-2 when a model is loaded; **falls back to `GetPlaceholderResponse` when none loaded** |
@@ -60,6 +60,13 @@
 | GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | **Autoregressive KV-cache decode VERIFIED** — Example 06 Ollama-compatible server (OpenAI/Ollama/Anthropic APIs, Claude CLI) E2E on CUDA/OpenCL; Ollama-oracle byte-identical; ~51 tok/s on qwen2.5-coder:7b Q4_K_M (4070). Quants: Q4_0/Q5_0/Q8_0/Q4_K/Q6_K/MXFP4 (Q5_0 added 2026-06-29, PMT 20/0 all backends). Tokenizer: proper byte-level BPE merges (qwen byte-identical; smollm2 fixed). Archs: qwen2/llama/gemma3 coherent + oracle-matched (llama needs NORM-style RoPE; gemma3 needs V-norm gated to gemma4 + sliding-window local rope base — fixed 2026-06-30). Browser: `/ai-chat` page streams a GGUF to WebGPU via the pipeline (engine PMT-verified; full in-browser file-pick→generate is manual confirm pending model delivery) |
 
 ## Keeping this honest
+
+- **Demo PAGES have a browser gate now**, separate from the unit tests: `tools/drive-ml-pages.cs` drives a
+  route, seeds every input its handler validates, and waits for the page's own RESULT element. Two rules it
+  encodes the hard way: a page's logging is incidental (EmbeddingsPage logs ONLY on error, so waiting for a
+  "model loaded" line reported a healthy page as a timeout), and a page that validates its inputs no-ops
+  silently when you seed only the first one. Only routes marked ✅ VERIFIED above belong in its table -
+  gating on a PARTIAL/WIP page manufactures a regression that does not exist.
 - **Operator count** is rendered live from `OperatorRegistry.BuiltinOpTypes` (the documented single source of truth) — never hardcode it again.
 - **Before any "N tests passing" claim**, cite the latest PMT results JSON, not a memorized number.
 - **A demo graduates to ✅ VERIFIED only when a passing E2E test is cited here.** Adding a page is not the same as verifying it.

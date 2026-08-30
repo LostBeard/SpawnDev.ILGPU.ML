@@ -291,6 +291,78 @@ public class MediaInterop
         return AudioPreprocessor.Resample(mono, srcRate, targetSampleRate);
     }
 
+    /// <summary>
+    /// Convert one WebCodecs <c>AudioData</c> frame to MONO float32 at <paramref name="targetSampleRate"/>.
+    /// Handles planar and interleaved layouts in f32 or s16, downmixes to mono, and resamples.
+    /// This is the extraction half of microphone capture - see <c>MediaStreamCapture.StartMicrophoneAsync</c>.
+    /// </summary>
+    public static async Task<float[]> FromAudioDataAsync(AudioData audioData, int targetSampleRate)
+    {
+        int frames = audioData.NumberOfFrames;
+        int channels = Math.Max(1, audioData.NumberOfChannels);
+        int rate = (int)audioData.SampleRate;
+        string fmt = audioData.Format ?? "f32-planar";
+        bool planar = fmt.EndsWith("-planar", StringComparison.Ordinal);
+        if (frames <= 0) return System.Array.Empty<float>();
+
+        var mono = new float[frames];
+        if (planar)
+        {
+            // One plane per channel - sum them.
+            for (int c = 0; c < channels; c++)
+            {
+                var plane = await CopyPlaneAsFloatsAsync(audioData, fmt, frames, c);
+                for (int i = 0; i < frames && i < plane.Length; i++) mono[i] += plane[i];
+            }
+        }
+        else
+        {
+            // One interleaved plane holds every channel.
+            var all = await CopyPlaneAsFloatsAsync(audioData, fmt, frames * channels, 0);
+            for (int i = 0; i < frames; i++)
+            {
+                float sum = 0f;
+                for (int c = 0; c < channels; c++)
+                {
+                    int idx = i * channels + c;
+                    if (idx < all.Length) sum += all[idx];
+                }
+                mono[i] = sum;
+            }
+        }
+
+        if (channels > 1)
+        {
+            float scale = 1f / channels;
+            for (int i = 0; i < frames; i++) mono[i] *= scale;
+        }
+
+        return rate == targetSampleRate ? mono : AudioPreprocessor.Resample(mono, rate, targetSampleRate);
+    }
+
+    private static async Task<float[]> CopyPlaneAsFloatsAsync(AudioData audioData, string fmt, int count, int planeIndex)
+    {
+        var options = new AudioDataCopyToOptions { PlaneIndex = planeIndex };
+        if (fmt.StartsWith("f32", StringComparison.Ordinal))
+        {
+            using var dest = new Float32Array(count);
+            await audioData.CopyTo(dest, options);
+            return dest.ToArray();
+        }
+        if (fmt.StartsWith("s16", StringComparison.Ordinal))
+        {
+            using var dest = new Int16Array(count);
+            await audioData.CopyTo(dest, options);
+            var s = dest.ToArray();
+            var f = new float[s.Length];
+            for (int i = 0; i < s.Length; i++) f[i] = s[i] / 32768f;
+            return f;
+        }
+        // Fail loudly rather than emit silence or garbage for a format we have not implemented.
+        throw new NotSupportedException(
+            $"AudioData format '{fmt}' is not supported yet. Expected an f32* or s16* format.");
+    }
+
     // ──────────────────────────────────────────────
     //  Internal: scratch canvas management
     // ──────────────────────────────────────────────

@@ -1,4 +1,5 @@
 @page "/whisper"
+@using SpawnDev.ILGPU.ML.Preprocessing
 
 <PageTitle>Speech to Text — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -138,6 +139,9 @@
 
 @code {
     private string _selectedBackend = "WebGPU";
+    /// <summary>Whisper consumes 16 kHz mono. Both the file and microphone paths feed it at this rate.</summary>
+    private const int WhisperSampleRate = 16000;
+
     private string _mode = "file";
     private bool _isRecording;
     private double _recordingSeconds;
@@ -151,14 +155,19 @@
     private const string _howToCs = """
 // Load Whisper Tiny (encoder + decoder) onto YOUR GPU (WebGPU / Wasm) — no server, no ONNX Runtime
 using var hub = new ModelHub(JS);
-var encoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx");
-var decoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx");
-var pipeline = new SpeechRecognitionPipeline(
-    InferenceSession.CreateFromFile(accelerator, encoderBytes),
-    InferenceSession.CreateFromFile(accelerator, decoderBytes), accelerator);
+// Weights stream as a LAZY-HASH torrent: random access, OPFS-cached by piece, seeded to peers
+var encoder = await InferenceSession.CreateFromHuggingFaceAsync(accelerator, hub,
+    ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx", webTorrent: Torrents, http: Http);
+var decoder = await InferenceSession.CreateFromHuggingFaceAsync(accelerator, hub,
+    ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx", webTorrent: Torrents, http: Http);
+var pipeline = new SpeechRecognitionPipeline(encoder, decoder, accelerator);
 pipeline.LoadTokenizer(tokenizerJson);
 
-// Transcribe 16 kHz mono PCM samples — runs entirely on the GPU
+// Capture the microphone as mono 16 kHz float32 - exactly what Whisper wants
+var mic = new MediaStreamCapture(JS);
+mic.OnAudioReady += (chunk, rate) => buffer.AddRange(chunk);
+await mic.StartMicrophoneAsync(16000);
+// ...then on stop, transcribe 16 kHz mono PCM samples — runs entirely on the GPU
 var result = await pipeline.TranscribeAsync(samples, 16000);
 // result.Text, result.Language
 """;
@@ -297,8 +306,130 @@ const out = await pipe(audio);
         StateHasChanged();
     }
 
-    private Task StartRecording() => Task.CompletedTask; // Needs MediaRecorder integration
-    private Task StopRecording() => Task.CompletedTask;
+    // ── Microphone ────────────────────────────────────────────────────────────────
+    // These were `=> Task.CompletedTask` stubs: the page rendered a Start Recording button that did
+    // nothing at all. MediaStreamCapture.StartMicrophoneAsync now delivers mono float32 at the rate we
+    // ask for, so the mic feeds Whisper directly - no MediaRecorder, no encode/decode round trip.
+
+    /// <summary>Recording cap. Whisper Tiny works on 30 s windows; past that we stop and transcribe.</summary>
+    private const double MaxRecordSeconds = 30.0;
+
+    private MediaStreamCapture? _mic;
+    private readonly List<float> _micSamples = new();
+
+    private Task? _modelLoadTask;
+
+    private async Task StartRecording()
+    {
+        if (_isRecording) return;
+
+        _mic ??= new MediaStreamCapture(JS);
+        // Re-subscribing on every start would fire the handler N times per chunk.
+        _mic.OnAudioReady -= OnMicAudio;
+        _mic.OnAudioReady += OnMicAudio;
+        _mic.OnAudioError -= OnMicError;
+        _mic.OnAudioError += OnMicError;
+
+        lock (_micSamples) _micSamples.Clear();
+        _recordingSeconds = 0;
+        _transcription = null;
+
+        if (!await _mic.StartMicrophoneAsync(WhisperSampleRate))
+        {
+            _transcription = $"Error: could not open the microphone. {_mic.LastAudioError?.Message}";
+            StateHasChanged();
+            return;
+        }
+
+        _isRecording = true;
+        StateHasChanged();
+
+        // Load the model WHILE recording, not before it. Opening the microphone is instant; the weights
+        // are ~231 MB. Making the user wait on that download before they can start talking - and dropping
+        // whatever they said during it - is the wrong order.
+        if (!_isModelLoaded && !_isModelLoading) _modelLoadTask = LoadModelAsync();
+    }
+
+    private async Task StopRecording()
+    {
+        if (!_isRecording) return;
+        _mic?.StopMicrophone();
+        _isRecording = false;
+
+        float[] samples;
+        lock (_micSamples) samples = _micSamples.ToArray();
+
+        if (samples.Length < WhisperSampleRate / 2)
+        {
+            _transcription = "That was too short to transcribe - hold the button for at least half a second.";
+            StateHasChanged();
+            return;
+        }
+
+        _isRunning = true;
+        StateHasChanged();
+
+        // The weights may still be arriving - the recording was allowed to start without them.
+        if (_modelLoadTask != null)
+        {
+            try { await _modelLoadTask; } catch { }
+            _modelLoadTask = null;
+        }
+        if (_pipeline == null)
+        {
+            _transcription = "Error: the Whisper model did not load, so there is nothing to transcribe with.";
+            _isRunning = false;
+            StateHasChanged();
+            return;
+        }
+        try
+        {
+            _audioDurationSeconds = samples.Length / (double)WhisperSampleRate;
+            var result = await _pipeline.TranscribeAsync(samples, WhisperSampleRate);
+            _transcription = result.Text;
+            _detectedLanguage = result.Language;
+            _inferenceMs = result.InferenceTimeMs;
+            // The page gate watches for this line.
+            Console.WriteLine($"[Whisper] mic {_audioDurationSeconds:F1}s -> {result.Text}");
+        }
+        catch (Exception ex)
+        {
+            _transcription = $"Error: {ex.Message}";
+        }
+        _isRunning = false;
+        StateHasChanged();
+    }
+
+    private void OnMicAudio(float[] chunk, int rate)
+    {
+        double seconds;
+        lock (_micSamples)
+        {
+            _micSamples.AddRange(chunk);
+            seconds = _micSamples.Count / (double)rate;
+        }
+
+        if (seconds >= MaxRecordSeconds)
+        {
+            _ = InvokeAsync(StopRecording);
+            return;
+        }
+
+        // The sample count IS the clock - no timer needed. Repaint about 10x a second, not per chunk.
+        if (seconds - _recordingSeconds >= 0.1)
+        {
+            _recordingSeconds = seconds;
+            _ = InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void OnMicError(Exception ex)
+    {
+        // Capture died. Say so - a silent stop is indistinguishable from a quiet room.
+        _isRecording = false;
+        _transcription = $"Error: microphone capture stopped - {ex.Message}";
+        _ = InvokeAsync(StateHasChanged);
+    }
 
     private async Task CopyTranscription()
     {
@@ -314,6 +445,7 @@ const out = await pipe(audio);
 
     public void Dispose()
     {
+        _mic?.Dispose();
         _pipeline?.Dispose();
         _accelerator?.Dispose();
         _context?.Dispose();
