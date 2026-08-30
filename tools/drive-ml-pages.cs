@@ -9,15 +9,21 @@
 //
 //   dotnet run tools/drive-ml-pages.cs -- [url] [route,route,...]
 //
-// ⚠️ These pages load their model LAZILY, on the action button - "Enter text and press Analyze. The model
-// (~257 MB) downloads on first use." Navigating and waiting therefore proves nothing; the driver has to
-// DRIVE. It seeds an input (a sample chip if the page offers one, else a textarea) and clicks `.run-btn`,
-// which 9 of the demo pages share.
+// ⚠️ SCOPE IS NOT "every page". Docs/DEMO_AND_MODEL_STATUS.md is the source of truth for which demos were
+// VERIFIED before this migration. A PARTIAL/WIP page failing here says nothing about the migration - it was
+// already unfinished - so gating on one manufactures a regression that does not exist. Only add a route
+// below once you have read its status row.
 //
-// Scope, stated rather than implied: this covers the TEXT pages. The image pages (classify, detect,
-// remove-bg, super-res, depth) additionally need an image chosen before their run button enables, which is
-// per-page UI work and not done here. They call CreateFromHuggingFaceAsync with the identical shape, so the
-// migrated code path is the same one these pages exercise.
+// ⚠️ WAIT ON THE RENDERED RESULT, NOT ON A CONSOLE LINE. Two real defects in the first version of this
+// driver, both from keying on the MECHANISM instead of the MEANING:
+//   1. It filled only the FIRST text input. /embeddings needs BOTH sentences - `ComputeSimilarity` opens
+//      with `if (IsNullOrWhiteSpace(_sentenceA) || IsNullOrWhiteSpace(_sentenceB)) return;` - so the click
+//      landed and the handler returned instantly. The page sat there doing nothing, correctly.
+//   2. It waited for a /model loaded|ready/ console line. EmbeddingsPage logs ONLY on error (3 of 3
+//      WriteLines are catch blocks), so that wait could never succeed and a healthy page would have been
+//      reported as a 4-minute TIMEOUT - a false FAILURE, the mirror of a false pass.
+// A page's logging is incidental; its rendered result is the fact. `.sentiment-verdict` showing POSITIVE
+// means the model was fetched, loaded, tokenized, and run. That is what this gate asserts on.
 //
 // Exit code is the number of pages that failed, so it is usable as a gate.
 //
@@ -31,19 +37,22 @@ var url = args.Length > 0 && args[0].StartsWith("http") ? args[0].TrimEnd('/') :
 var routeArg = args.FirstOrDefault(a => !a.StartsWith("http") && !a.StartsWith("-"));
 var profileDir = Path.Combine(Path.GetTempPath(), "spawndev-ml-pages-profile");
 
-// Every page migrated to the lazy-hash loader.
+// route -> (every input that must be seeded, the element that proves a real result rendered)
+// Both routes below are ✅ VERIFIED in Docs/DEMO_AND_MODEL_STATUS.md and load weights via the migrated path.
+var pages = new Dictionary<string, (string[] Fill, string Result)>
+{
+    ["/sentiment"]  = (new[] { ".sentiment-textarea" }, ".sentiment-verdict"),
+    ["/embeddings"] = (new[] { ".sim-input" },          ".sim-score-value"),
+};
+
 // ⚠️ Normalise routes, and strip any Git Bash path mangling. Under Git Bash an argument that STARTS WITH
-// "/" is rewritten into a Windows path, so `-- "/sentiment"` arrives as "C:/Program Files/Git/sentiment"
-// and navigation fails with "Cannot navigate to invalid URL". Accept "sentiment", "/sentiment", or the
-// mangled form, so the caller cannot get this wrong.
-var routes = (routeArg ?? "sentiment,embeddings")
+// "/" is rewritten into a Windows path, so `-- "/sentiment"` arrives as "C:/Program Files/Git/sentiment".
+var routes = (routeArg ?? string.Join(',', pages.Keys))
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
     .Select(r => "/" + r.Replace("\\", "/").TrimEnd('/').Split('/').Last(part => part.Length > 0))
     .ToList();
 
-// A page reports readiness in its own console voice ("[Classify] Model loaded on ...").
-var ok = new Regex(@"model loaded|loaded on|ready|✅", RegexOptions.IgnoreCase);
-var bad = new Regex(@"\berror\b|failed|exception|obsolete", RegexOptions.IgnoreCase);
+var bad = new Regex(@"\berror\b|failed|exception", RegexOptions.IgnoreCase);
 
 Directory.CreateDirectory(profileDir);
 using var pw = await Playwright.CreateAsync();
@@ -56,74 +65,78 @@ await using var ctx = await pw.Chromium.LaunchPersistentContextAsync(profileDir,
 int failed = 0, skipped = 0;
 foreach (var route in routes)
 {
-    var page = await ctx.NewPageAsync();
-    var done = new TaskCompletionSource<(bool Ok, string Line)>();
-    var log = new List<string>();
+    Console.WriteLine($"--- {route}");
+    if (!pages.TryGetValue(route, out var spec))
+    {
+        skipped++;
+        Console.WriteLine("    SKIP not in the gate table - add its inputs + result selector first");
+        continue;
+    }
 
+    var page = await ctx.NewPageAsync();
+    var oops = new TaskCompletionSource<string>();
+    var log = new List<string>();
+    // A page's OWN error line ("[Embeddings] Error: ...") fails fast instead of burning the full timeout.
     page.Console += (_, m) =>
     {
-        var t = m.Text;
-        log.Add(t);
-        // A page's OWN error line is the failure signal; unrelated console noise is not.
-        if (bad.IsMatch(t) && t.StartsWith("[")) done.TrySetResult((false, t));
-        else if (ok.IsMatch(t)) done.TrySetResult((true, t));
+        log.Add(m.Text);
+        if (m.Text.StartsWith("[") && bad.IsMatch(m.Text)) oops.TrySetResult(m.Text);
     };
-    page.PageError += (_, e) => done.TrySetResult((false, "pageerror: " + e));
+    page.PageError += (_, e) => oops.TrySetResult("pageerror: " + e);
 
-    Console.WriteLine($"--- {route}");
     try
     {
         await page.GotoAsync(url + route, new() { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
 
         // ⚠️ WAIT for Blazor to boot before querying. DOMContentLoaded fires long before the WASM runtime
-        // has rendered anything, so an immediate Locator.CountAsync() returns 0 for controls that are
-        // simply not there YET - which the first version of this driver reported as "no .run-btn", i.e. a
-        // missing-feature verdict on a page that has the feature.
-        try
-        {
-            await page.Locator(".run-btn").First.WaitForAsync(new() { Timeout = 90_000 });
-        }
-        catch (TimeoutException)
-        {
-            skipped++;
-            Console.WriteLine("    SKIP no .run-btn after 90s - needs per-page interaction (likely an image)");
-            await page.CloseAsync();
-            continue;
-        }
+        // renders, so an immediate CountAsync() returns 0 for controls that are simply not there YET.
+        await page.Locator(".run-btn").First.WaitForAsync(new() { Timeout = 90_000 });
 
-        // Seed an input so the action button enables, then press it - the model loads on that click.
-        var chip = page.Locator(".sample-chip").First;
-        if (await chip.CountAsync() > 0)
+        // Seed EVERY required input - a page that validates its inputs will silently no-op otherwise.
+        foreach (var sel in spec.Fill)
         {
-            await chip.ClickAsync();
-        }
-        else
-        {
-            var box = page.Locator("textarea, input[type=text]").First;
-            if (await box.CountAsync() > 0) await box.FillAsync("This is a wonderful and delightful result.");
+            var boxes = page.Locator(sel);
+            var n = await boxes.CountAsync();
+            if (n == 0) throw new Exception($"input '{sel}' not found - the page markup changed");
+            for (int i = 0; i < n; i++)
+                await boxes.Nth(i).FillAsync(i == 0
+                    ? "The cat sat quietly on the warm mat."
+                    : "A kitten was resting on a soft rug.");
         }
 
         await page.Locator(".run-btn").First.ClickAsync(new() { Timeout = 30_000 });
 
+        // The RESULT element is the assertion: it renders only after weights load and inference runs.
         // First click downloads the model; later runs hit the OPFS cache.
-        var finished = await Task.WhenAny(done.Task, Task.Delay(TimeSpan.FromMinutes(4)));
-        if (finished != done.Task)
+        var result = page.Locator(spec.Result).First;
+        var ready = result.WaitForAsync(new() { Timeout = 240_000 });
+        var finished = await Task.WhenAny(ready, oops.Task);
+
+        if (finished == oops.Task)
         {
             failed++;
-            Console.WriteLine($"    TIMEOUT - no ready/error line in 4 min");
-            foreach (var l in log.TakeLast(4)) Console.WriteLine($"      | {l}");
+            Console.WriteLine($"    FAIL {oops.Task.Result}");
         }
         else
         {
-            var (good, line) = done.Task.Result;
-            if (!good) failed++;
-            Console.WriteLine($"    {(good ? "OK  " : "FAIL")} {line}");
+            await ready;   // observe a Playwright timeout as a failure, not as success
+            var text = (await result.InnerTextAsync()).Replace('\n', ' ').Trim();
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                failed++;
+                Console.WriteLine($"    FAIL '{spec.Result}' rendered EMPTY - no real result");
+            }
+            else
+            {
+                Console.WriteLine($"    OK   {spec.Result} => {text}");
+            }
         }
     }
     catch (Exception ex)
     {
         failed++;
-        Console.WriteLine($"    FAIL {ex.GetType().Name}: {ex.Message}");
+        Console.WriteLine($"    FAIL {ex.GetType().Name}: {ex.Message.Split('\n')[0]}");
+        foreach (var l in log.TakeLast(4)) Console.WriteLine($"      | {l}");
     }
     finally
     {
@@ -134,7 +147,7 @@ foreach (var route in routes)
 Console.WriteLine();
 // ⚠️ A SKIP is not a pass. The first version of this driver printed "1/1 pages reached a ready state" for
 // a page it had skipped, which is a false green - the exact failure this gate exists to catch.
-var reached = routes.Count - failed - skipped;
-Console.WriteLine($"{reached}/{routes.Count} pages reached a ready state "
+var passed = routes.Count - failed - skipped;
+Console.WriteLine($"{passed}/{routes.Count} pages produced a real result "
                 + $"({failed} failed, {skipped} skipped - a skip is NOT a pass)");
 return failed;
