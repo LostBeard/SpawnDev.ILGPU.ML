@@ -866,4 +866,82 @@ public abstract partial class MLTestBase
     // PURE-T arithmetic (all operands T), but NOT the mixed-precision fp16-weight->fp32-accumulate convert.
     // So the DEDICATED half kernels (ILGPU.Half's (float) operator [transpilable] + fp32 accumulate) are the
     // ORT-parity approach. Spike removed; do NOT reintroduce float.CreateTruncating in a kernel.
+
+    /// <summary>
+    /// The LOADER half of the native low-precision path: stream bf16 raw_data straight into a bf16 GPU buffer
+    /// via BufferPool.AllocateLowPWeightFromStreamAsync&lt;BFloat16&gt;, then multiply with it using the generic
+    /// kernel - and assert it was never expanded on the way in.
+    /// </summary>
+    /// <remarks>
+    /// F16_MatMulBFloat16Weight_MatchesFp32Reference already proved the KERNEL consumes native bf16. This
+    /// proves the missing middle: the loader was hard-coded to Half, so a bf16 weight could only reach the GPU
+    /// by being upcast to fp32 first - 2x the memory (4x for FP8), which defeats the reason the format was
+    /// chosen. The load-bearing assertion is the ELEMENT TYPE and byte count of what landed on the GPU, not
+    /// merely that the numbers came out right: an fp32 upcast would produce identical numbers while using
+    /// double the memory, so a correctness-only check cannot tell the two apart.
+    /// </remarks>
+    [TestMethod]
+    public Task F16_StreamBFloat16Weight_StaysNative_AndMultiplies() => RunTest(async accelerator =>
+    {
+        int M = 8, K = 16, N = 8;
+        var rng = new Random(1234);
+        var a = new float[M * K];
+        var bf = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+        for (int i = 0; i < bf.Length; i++) bf[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        // Build the weight EXACTLY as an ONNX BFLOAT16 raw_data blob: 2 little-endian bytes per element.
+        var bBf16 = new global::ILGPU.BFloat16[bf.Length];
+        for (int i = 0; i < bf.Length; i++) bBf16[i] = (global::ILGPU.BFloat16)bf[i];
+        var raw = new byte[bBf16.Length * 2];
+        for (int i = 0; i < bBf16.Length; i++)
+            BitConverter.GetBytes(bBf16[i].RawValue).AsSpan(0, 2).CopyTo(raw.AsSpan(i * 2, 2));
+
+        using var pool = new SpawnDev.ILGPU.ML.Tensors.BufferPool(accelerator);
+        using var ms = new MemoryStream(raw);
+        var w = await pool.AllocateLowPWeightFromStreamAsync<global::ILGPU.BFloat16>(
+            ms, 0, raw.Length, 16 /* ONNX BFLOAT16 */, new[] { K, N }, "w");
+
+        // NOT EXPANDED: the GPU view is bf16-typed and exactly K*N elements = raw.Length bytes.
+        if (w.Data.Length != K * N)
+            throw new Exception($"native bf16 view length {w.Data.Length}, expected {K * N}");
+        long gpuBytes = w.Data.Length * 2;
+        if (gpuBytes != raw.Length)
+            throw new Exception($"weight occupies {gpuBytes} GPU bytes but the source was {raw.Length} - it was EXPANDED on load");
+
+        // Refusing a mismatched dtype matters as much as accepting a matching one: silently converting here
+        // would be the in-RAM upcast this path exists to avoid.
+        bool refused = false;
+        try
+        {
+            using var msBad = new MemoryStream(raw);
+            await pool.AllocateLowPWeightFromStreamAsync<global::ILGPU.BFloat16>(msBad, 0, raw.Length, 1 /* FLOAT32 */, new[] { K, N }, "bad");
+        }
+        catch (NotSupportedException) { refused = true; }
+        if (!refused) throw new Exception("a FLOAT32 dtype was accepted into a BFloat16 buffer - it must refuse, not convert");
+
+        // And it actually computes: same fp32 reference discipline as the kernel test above.
+        var cpuC = new float[M * N];
+        for (int r = 0; r < M; r++)
+            for (int c = 0; c < N; c++)
+            {
+                float sum = 0f;
+                for (int k = 0; k < K; k++) sum += a[r * K + k] * (float)bBf16[k * N + c];
+                cpuC[r * N + c] = sum;
+            }
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var cBuf = accelerator.Allocate1D<float>(M * N);
+        var mm = new MatMulKernel(accelerator);
+        mm.MatMulLowPWeight(aBuf.View, w.Data, cBuf.View, M, K, N);
+        await accelerator.SynchronizeAsync();
+        var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
+
+        float maxErr = 0f;
+        for (int i = 0; i < cpuC.Length; i++) maxErr = MathF.Max(maxErr, MathF.Abs(gpuC[i] - cpuC[i]));
+        if (maxErr > 1e-3f)
+            throw new Exception($"streamed-native bf16 matmul maxErr={maxErr:E3} (expected < 1e-3)");
+
+        Console.WriteLine($"[F16] streamed {raw.Length} B of bf16 -> {gpuBytes} GPU bytes (no expansion), maxErr={maxErr:E3}");
+    });
 }

@@ -31,6 +31,9 @@ public class BufferPool : IDisposable
     // fp16 weight buffers (ILGPU.Half) — half the bytes of the fp32 _allBuffers. Tracked separately for
     // disposal (different element type). See AllocateHalfWeightFromStreamAsync.
     private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _allHalfBuffers = new();
+    // Native low-precision weight buffers of any element type (BFloat16 / Float8E* / ...). Held as the base
+    // MemoryBuffer because only disposal is needed here; the typed view lives on the LowPTensor<T>.
+    private readonly List<MemoryBuffer> _allLowPBuffers = new();
 
     // GPU fp16->fp32 upcast for the zero-copy weight-load path: lets an fp16-source weight that needs an
     // fp32 GPU buffer stream JS->GPU (bytes never enter .NET) instead of the CPU read+convert loop.
@@ -606,6 +609,75 @@ public class BufferPool : IDisposable
     }
 
     /// <summary>
+    /// Stream a weight into GPU memory in its NATIVE low-precision type - no conversion, no expansion.
+    /// </summary>
+    /// <remarks>
+    /// The generic form of <see cref="AllocateHalfWeightFromStreamAsync"/>, and the piece that was missing
+    /// between two already-generic ends: <c>MatMulKernel.MatMulLowPWeight&lt;T&gt;</c> has been able to consume
+    /// native Half/BFloat16/Float8E* weights since PrecisionConvert shipped, and ILGPU has carried those types
+    /// since they were added for this ML code - but the LOADER was hard-coded to Half, so a bf16 or FP8 weight
+    /// could only reach the GPU by being upcast to fp32 first. That wastes 2x the memory for bf16 and 4x for
+    /// FP8, which defeats the reason those formats exist.
+    /// <para>
+    /// This is a pure byte passthrough: the ONNX raw_data layout for a dtype IS the layout of the matching
+    /// ILGPU type (BFLOAT16 == BFloat16, FLOAT16 == Half - IEEE binary16, FLOAT8E4M3 / FLOAT8E5M2 == one byte
+    /// each), so <c>CopyFromStreamAsync</c> moves them unchanged and, on a browser IJSReadStream + browser
+    /// buffer, straight from JS to the GPU without entering the managed heap.
+    /// </para>
+    /// <para>
+    /// ⚠️ It deliberately REFUSES a mismatched dtype rather than converting: a silent fp32-&gt;bf16 downcast
+    /// here would be exactly the in-RAM conversion this method exists to avoid. Callers that genuinely need a
+    /// different storage type should say so explicitly via the fp32 or Half loaders.
+    /// </para>
+    /// </remarks>
+    /// <typeparam name="T">Native element type; must match <paramref name="dataType"/>'s layout.</typeparam>
+    /// <param name="stream">Seekable source (an IJSReadStream in the browser).</param>
+    /// <param name="byteOffset">Offset of the weight's raw_data in the stream.</param>
+    /// <param name="byteLength">Raw byte length of the weight.</param>
+    /// <param name="dataType">ONNX TensorProto dtype of the source.</param>
+    /// <param name="shape">Weight shape.</param>
+    /// <param name="name">Optional weight name.</param>
+    /// <param name="ct">Cancellation.</param>
+    /// <returns>A shape-tracked view over the native-typed GPU buffer.</returns>
+    public async Task<LowPTensor<T>> AllocateLowPWeightFromStreamAsync<T>(
+        Stream stream, long byteOffset, int byteLength, int dataType, int[] shape,
+        string? name = null, CancellationToken ct = default)
+        where T : unmanaged, System.Numerics.INumber<T>
+    {
+        int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
+        var buffer = _accelerator.Allocate1D<T>(count);
+        _allLowPBuffers.Add(buffer);
+        if (count == 0) return new LowPTensor<T>(buffer.View, shape, name);
+
+        // The dtype must MATCH the requested storage type - see the refusal note above.
+        int expectBytes = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
+        bool layoutMatches = dataType switch
+        {
+            10 => typeof(T) == typeof(global::ILGPU.Half),
+            16 => typeof(T) == typeof(global::ILGPU.BFloat16),
+            17 => typeof(T) == typeof(global::ILGPU.Float8E4M3),
+            19 => typeof(T) == typeof(global::ILGPU.Float8E5M2),
+            _ => false,
+        };
+        if (!layoutMatches)
+            throw new NotSupportedException(
+                $"Native low-precision load needs the ONNX dtype and the storage type to have the SAME layout; " +
+                $"got dtype {dataType} into {typeof(T).Name} for '{name}'. Supported: FLOAT16 (10)->Half, " +
+                "BFLOAT16 (16)->BFloat16, FLOAT8E4M3 (17)->Float8E4M3, FLOAT8E5M2 (19)->Float8E5M2. " +
+                "Converting here would be an in-RAM cast, which is what this path exists to avoid - use " +
+                "AllocatePermanentFromStreamAsync (fp32) if a converted weight is genuinely wanted.");
+        if (byteLength != (long)count * expectBytes)
+            throw new InvalidDataException(
+                $"Weight '{name}' raw byteLength {byteLength} != {count} elements x {expectBytes} bytes.");
+
+        stream.Seek(byteOffset, SeekOrigin.Begin);
+        await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+        if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
+            ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
+        return new LowPTensor<T>(buffer.View, shape, name);
+    }
+
+    /// <summary>
     /// Like <see cref="AllocatePermanentFromStreamAsync"/> but stores the weight as fp16
     /// (<see cref="ILGPU.Half"/>) — HALF the GPU bytes of the fp32 path. FLOAT16 (dtype 10) source is the
     /// common case (e.g. SD-Turbo); FLOAT32 (dtype 1) is downcast to fp16. Weight-consuming kernels read
@@ -733,6 +805,11 @@ public class BufferPool : IDisposable
             catch { /* Buffer may already be disposed by executor ref-counting or external code */ }
         }
         foreach (var buffer in _captureUnnamedSlots)
+        {
+            try { buffer.Dispose(); }
+            catch { /* may already be disposed */ }
+        }
+        foreach (var buffer in _allLowPBuffers)
         {
             try { buffer.Dispose(); }
             catch { /* may already be disposed */ }
