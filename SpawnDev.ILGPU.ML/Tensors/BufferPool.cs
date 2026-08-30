@@ -37,7 +37,9 @@ public class BufferPool : IDisposable
     private SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels? _fp16Convert;
     // Deferred fp16-upcast temp buffers: freed as a BATCH after ONE drain (see AllocatePermanentFromStreamAsync)
     // — a per-weight drain is 52s on WebGPU. Caller MUST call FlushPendingFp16ConvertsAsync at end-of-load.
-    private readonly List<MemoryBuffer1D<global::ILGPU.Half, Stride1D.Dense>> _pendingFp16Temps = new();
+    // Holds the base MemoryBuffer, not MemoryBuffer1D<Half>: the deferred-drain trick is identical for every
+    // low-precision source type (Half / BFloat16 / FP8), and disposal only needs the base.
+    private readonly List<MemoryBuffer> _pendingFp16Temps = new();
     private long _pendingFp16Bytes;
     private const long Fp16TempFlushCap = 64L * 1024 * 1024; // 64MB of pending temps → drain + free the batch
     // fp16 ACTIVATION pool (mixed-precision activations): bucketed Half buffers for graph intermediates,
@@ -509,10 +511,19 @@ public class BufferPool : IDisposable
         _allBuffers.Add(buffer);
         if (count == 0) return new Tensor(buffer.View, shape, name);
 
-        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, _ => 0 };
+        // Every float format ILGPU has a type for streams the same way: raw bytes -> a GPU buffer of that
+        // type -> ONE generic GPU upcast. Restricting this to FLOAT32+FLOAT16 meant a bf16 model had EVERY
+        // weight materialised and host-copied - the entire zero-copy path bypassed on the format modern
+        // exports increasingly use - while ILGPU already carried Half/BFloat16/Float8E4M3/Float8E5M2 and a
+        // generic PrecisionConvert.ConvertToSingle<T> added for exactly this.
+        // ⚠️ The FNUZ FP8 variants (18 = E4M3FNUZ, 20 = E5M2FNUZ) are deliberately NOT mapped onto the plain
+        // types: they differ in NaN/zero encoding, so accepting them would silently mis-decode weights. Integer
+        // and DOUBLE dtypes need a cast kernel rather than PrecisionConvert and are a separate change.
+        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, 16 => 2, 17 => 1, 19 => 1, _ => 0 };
         if (srcElemBytes == 0)
             throw new NotSupportedException(
-                $"Streaming load supports FLOAT32 (1) and FLOAT16 (10) raw_data; got dtype {dataType} for '{name}'. " +
+                $"Streaming load supports FLOAT32 (1), FLOAT16 (10), BFLOAT16 (16), FLOAT8E4M3 (17) and " +
+                $"FLOAT8E5M2 (19) raw_data; got dtype {dataType} for '{name}'. " +
                 "Load this model via CreateFromOnnx(byte[]).");
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
