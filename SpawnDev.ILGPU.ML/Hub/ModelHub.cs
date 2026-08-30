@@ -1,5 +1,7 @@
 using SpawnDev.SpawnJS;
 
+using SpawnDev.SpawnJS.Toolbox;
+
 namespace SpawnDev.ILGPU.ML.Hub;
 
 /// <summary>
@@ -72,6 +74,42 @@ public class ModelHub : IDisposable
     public Task<byte[]> LoadFromUrlAsync(string url, string? cacheKey = null)
     {
         return _cache.GetOrFetchAsync(url, cacheKey);
+    }
+
+    /// <summary>
+    /// Same as <see cref="LoadAsync"/>, but hands back a SEEKABLE stream whose bytes stay JS-side instead
+    /// of a <c>byte[]</c> - the right way to load a model in the browser.
+    /// </summary>
+    /// <remarks>
+    /// <c>LoadAsync</c> returns the whole file on the .NET/WASM managed heap. For a 300 MB+ model that
+    /// breaks the standing "bulk bytes stay in JS" rule on its own, and it is what makes a load OOM under
+    /// memory pressure. The stream returned here is a <c>BlobStream</c> over the OPFS entry, which is an
+    /// <c>IJSReadStream</c>: pass it to <c>InferenceSession.CreateFromOnnxStreamAsync</c> and the graph
+    /// structure is parsed from the stream while each weight goes JS-&gt;GPU without entering the heap.
+    /// <para>
+    /// ⚠️ On a cache MISS the first download still goes through the byte[] path before being written to
+    /// OPFS and re-opened as a stream - see <see cref="ModelCache.GetOrFetchStreamAsync"/>. Every load
+    /// after the first is fully streamed.
+    /// </para>
+    /// </remarks>
+    /// <param name="repoId">Repository ID (e.g., "onnx-community/mobilenetv2-12")</param>
+    /// <param name="filename">File within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
+    /// <param name="revision">Git revision (default: "main")</param>
+    /// <returns>A seekable JS-side stream, or null when OPFS is unavailable. Caller disposes it.</returns>
+    public Task<BlobStream?> OpenStreamAsync(string repoId, string filename, string revision = "main")
+    {
+        var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
+        var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
+        return _cache.GetOrFetchStreamAsync(url, cacheKey);
+    }
+
+    /// <summary>
+    /// Open any URL as a seekable, JS-side stream with OPFS caching. Streaming counterpart to
+    /// <see cref="LoadFromUrlAsync"/>; see <see cref="OpenStreamAsync"/> for why this is preferred.
+    /// </summary>
+    public Task<BlobStream?> OpenStreamFromUrlAsync(string url, string? cacheKey = null)
+    {
+        return _cache.GetOrFetchStreamAsync(url, cacheKey);
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 using SpawnDev.SpawnJS;
 using SpawnDev.SpawnJS.JSObjects;
+using SpawnDev.SpawnJS.Toolbox;
 
 namespace SpawnDev.ILGPU.ML.Hub;
 
@@ -195,6 +196,71 @@ public class ModelCache : IDisposable
         }
     }
 
+    /// <summary>
+    /// Open a CACHED entry as a seekable stream whose bytes stay JS-side, or <c>null</c> if it is not cached.
+    /// </summary>
+    /// <remarks>
+    /// This is the streaming counterpart to <see cref="GetOrFetchAsync"/>, and the difference is the whole
+    /// point: that method reaches the same OPFS <c>File</c> (which IS a Blob) and then calls
+    /// <c>ArrayBuffer()</c> + <c>ReadBytes()</c>, materialising the ENTIRE model in JS and then copying all
+    /// of it onto the .NET/WASM managed heap. For a 300 MB+ model that is the thing the standing rule
+    /// forbids, and it is what makes a model load OOM under memory pressure.
+    /// <para>
+    /// A <see cref="BlobStream"/> is an <c>IJSReadStream</c>, so <c>InferenceSession.CreateFromOnnxStreamAsync</c>
+    /// can parse structure from it and <c>BufferPool</c> can send each weight JS-&gt;GPU via <c>CopyFromJS</c>,
+    /// never touching the managed heap. It is async-only (<c>CanReadSync == false</c>) and seekable - the
+    /// contract the ONNX/GGUF parsers are already written against.
+    /// </para>
+    /// <para>
+    /// ⚠️ The returned stream OWNS the underlying <c>File</c>: <see cref="BlobStream.Dispose(bool)"/> disposes
+    /// it, so the handle must not be disposed here. Dispose the stream when done.
+    /// </para>
+    /// </remarks>
+    /// <param name="cacheKey">Cache key, as produced by <see cref="UrlToCacheKey"/>.</param>
+    /// <returns>A seekable JS-side stream, or null when the entry is not cached.</returns>
+    public async Task<BlobStream?> OpenCachedStreamAsync(string cacheKey)
+    {
+        await EnsureInitializedAsync();
+        if (_cacheDir == null) return null;
+
+        try
+        {
+            using var fileHandle = await _cacheDir.GetFileHandle(cacheKey);
+            var file = await fileHandle.GetFile();   // NOT disposed here - BlobStream takes ownership
+            return new BlobStream(file);
+        }
+        catch
+        {
+            return null; // Not cached
+        }
+    }
+
+    /// <summary>
+    /// Cached-or-fetched, returned as a seekable JS-side stream instead of a <c>byte[]</c>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Honest limitation: on a cache MISS this still downloads via the existing byte[] path and writes
+    /// that to OPFS before re-opening it as a stream, so the first load of a model still materialises it
+    /// once. The cached path - which is every subsequent load, and every test run after the first - no
+    /// longer does. Closing the remaining gap means fetching JS-side straight into OPFS (a JS
+    /// <c>fetch</c> -&gt; <c>Response.body</c> piped to the OPFS writable) so the bytes never enter .NET at
+    /// all; that is a separate change and is deliberately not smuggled in here.
+    /// </remarks>
+    /// <param name="url">Source URL, used only on a cache miss.</param>
+    /// <param name="cacheKey">Optional explicit cache key; derived from the URL when omitted.</param>
+    /// <returns>A seekable JS-side stream, or null when OPFS is unavailable.</returns>
+    public async Task<BlobStream?> GetOrFetchStreamAsync(string url, string? cacheKey = null)
+    {
+        cacheKey ??= UrlToCacheKey(url);
+
+        var cached = await OpenCachedStreamAsync(cacheKey);
+        if (cached != null) return cached;
+
+        var bytes = await DownloadWithProgressAsync(url);
+        await WriteToCacheAsync(cacheKey, bytes);
+        return await OpenCachedStreamAsync(cacheKey);
+    }
+
     private async Task<byte[]?> TryReadFromCacheAsync(string cacheKey)
     {
         await EnsureInitializedAsync();
@@ -234,6 +300,18 @@ public class ModelCache : IDisposable
     {
         // Use fetch for streaming progress
         using var response = await _js.Get<Window>("window").Fetch(url);
+
+        // fetch() does NOT throw on 404/500 — it resolves with ok=false and an ERROR BODY. Without this
+        // check that body was streamed, returned as if it were the model, and then WRITTEN TO THE OPFS
+        // CACHE by GetOrFetchAsync. A 404 page is ~15 bytes, so the failure surfaced much later and
+        // somewhere else entirely, as "EndOfStreamException: Expected 110 bytes, stream ended 97 short"
+        // out of the ONNX proto reader — and because it was cached, it then failed IDENTICALLY on every
+        // subsequent run with no hint that the download had failed. Only clearing the cache recovered it.
+        // MEASURED 2026-08-29: KnownModels.SqueezeNet + KnownFiles.OnnxModel 404s, and this is how it
+        // presented. Fail here, naming the status and URL, and never cache a failed response.
+        if (!response.Ok)
+            throw new HttpRequestException($"Model download failed: {(int)response.Status} {response.StatusText} for {url}");
+
         var contentLength = response.Headers.Get("content-length");
         long totalBytes = contentLength != null ? long.Parse(contentLength) : -1;
 

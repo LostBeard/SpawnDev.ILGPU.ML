@@ -985,4 +985,53 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[YOLOv8n] PASS — {session.NodeCount} nodes, {session.WeightCount} weights");
     });
+
+    /// <summary>
+    /// The OPFS model cache handed back as a SEEKABLE JS-side stream (ModelHub.OpenStreamAsync), and a real
+    /// session built from it — proving the browser load path never materialises the model on the .NET heap.
+    /// </summary>
+    /// <remarks>
+    /// The gap this closes: <c>ModelCache</c> already reached the OPFS <c>File</c> (which IS a Blob) and then
+    /// called <c>ArrayBuffer()</c> + <c>ReadBytes()</c>, copying the WHOLE model into the managed heap. The
+    /// new path wraps that same File in a <c>BlobStream</c> instead.
+    /// <para>
+    /// The assertion that carries the claim is <c>stream is IJSReadStream</c>. That interface is not
+    /// decoration: <c>BufferPool</c> tests for it to choose the zero-copy JS-&gt;GPU route, and
+    /// <c>InferenceSession</c> arms <c>BrowserBufferPolicy.StrictHostCopyMaxBytes</c> ONLY for an
+    /// IJSReadStream load — so a stream that merely seeks (HttpRangeStream, or a MemoryStream over a byte[])
+    /// would satisfy a naive "it loaded" check while silently keeping every byte on the heap.
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 300000, Category = "HeavyModel", RetryCount = 2)]
+    public async Task ModelHub_OpenStream_IsJSReadStream_AndLoadsASession() => await RunTest(async accelerator =>
+    {
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (js == null || !js.IsBrowser)
+            throw new UnsupportedTestException("OPFS + BlobStream are browser-only (not a browser lane)");
+
+        using var hub = new Hub.ModelHub(js);
+        // ⚠️ NOT KnownModels.SqueezeNet + KnownFiles.OnnxModel — that pair 404s (verified: the repo exists,
+            // the onnx/model.onnx path in it does not), and before the ModelCache status check landed a 404 body
+            // was cached AS the model. This repo/file is the same one ModelInspector_Hub_InspectByUrl uses.
+            var stream = await hub.OpenStreamAsync("onnx-community/mobilenetv3_small_100.lamb_in1k", "onnx/model.onnx");
+        if (stream == null) throw new UnsupportedTestException("OPFS unavailable in this context");
+
+        await using (stream)
+        {
+            // THE claim: JS-side, not merely seekable.
+            if (stream is not SpawnDev.SpawnJS.Toolbox.IJSReadStream)
+                throw new Exception($"OpenStreamAsync returned {stream.GetType().Name}, which is NOT an IJSReadStream "
+                                  + "— BufferPool's zero-copy JS->GPU route cannot fire and the host-copy guard never arms");
+            if (!stream.CanSeek) throw new Exception("stream is not seekable — the ONNX parser seeks back to every weight");
+            if (stream.Length <= 0) throw new Exception($"stream length {stream.Length}");
+
+            // And it must actually load. Byte-identity with the byte[] path is covered by
+            // DepthAnything_HubBytes_MatchHttpBytes; this asserts the stream path produces a usable session.
+            using var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, stream);
+            if (session.NodeCount <= 0) throw new Exception($"session NodeCount={session.NodeCount}");
+
+            Console.WriteLine($"[ModelHub/stream] {stream.GetType().Name} ({stream.Length:N0} B, IJSReadStream) "
+                            + $"-> session with {session.NodeCount} nodes, model never on the managed heap");
+        }
+    });
 }
