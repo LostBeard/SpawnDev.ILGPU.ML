@@ -2359,21 +2359,46 @@ public class InferenceSession : IDisposable
     }
 
     /// <summary>
-    /// Download bytes using stream-based chunked reading when possible.
-    /// For desktop backends: uses ResponseHeadersRead for streaming download with progress.
-    /// For browser WASM: falls back to ReadAsByteArrayAsync which works with fetch API.
-    /// Yields periodically to keep the UI thread responsive during long downloads.
+    /// Download bytes by streaming the response in 1 MB chunks, reporting progress and yielding periodically so a
+    /// long download does not freeze the UI. Streams on desktop AND in the browser.
     /// </summary>
-    /// <summary>
-    /// Download bytes using stream-based chunked reading with progress.
-    /// Avoids OOM for large files in browser WASM. Yields periodically for UI responsiveness.
-    /// </summary>
+    /// <remarks>
+    /// ⚠️ Two stacked summaries used to sit here, and the second one claimed this "avoids OOM for large files in
+    /// browser WASM". It did not. <c>HttpCompletionOption.ResponseHeadersRead</c> does nothing by itself in the
+    /// browser, so the body was buffered whole into the managed heap - by DOUBLING - and a 329 MB model then
+    /// OOM'd before reaching the chunk loop. The request now opts in to browser response streaming explicitly,
+    /// which is what makes the claim true. See the comments in the body.
+    /// <para>
+    /// This still returns a <c>byte[]</c>, so ONE copy of the file does land on the managed heap. That is the
+    /// method's contract and its callers'. Where a model can stay JS-side, prefer the streaming route
+    /// (<c>HubModelStream</c> / <c>IJSReadStream</c>) over materialising it here.
+    /// </para>
+    /// </remarks>
+    /// <param name="http">Client to download with.</param>
+    /// <param name="url">Absolute URL of the file.</param>
+    /// <param name="onProgress">Optional ("download", percent) callback.</param>
+    /// <returns>The downloaded bytes.</returns>
     public static async Task<byte[]> DownloadBytesChunkedAsync(HttpClient http, string url,
         Action<string, int>? onProgress = null)
     {
         try
         {
-            using var response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+
+            // In the BROWSER, HttpCompletionOption.ResponseHeadersRead does NOTHING on its own: the fetch-based
+            // handler buffers the whole body into the MANAGED heap unless the request explicitly opts in to
+            // response streaming. Without this line ReadAsStreamAsync below lands in LoadIntoBufferAsync and a
+            // 329 MB model is materialised whole - and grown by DOUBLING - before a single byte reaches the
+            // chunk loop this method is named for. That is the OOM, and it is the standing "bulk bytes stay in
+            // JS, never the .NET managed heap" rule broken on every browser model download.
+            //
+            // Set by the raw option key rather than Blazor's SetBrowserResponseStreamingEnabled extension, so
+            // this library keeps taking no dependency on Microsoft.AspNetCore.Components.WebAssembly. The key is
+            // exactly what that extension sets, verified against the shipped assembly. Off-browser handlers
+            // ignore an unknown option, so this is a no-op on desktop.
+            request.Options.Set(new HttpRequestOptionsKey<bool>("WebAssemblyEnableStreamingResponse"), true);
+
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
 
             var contentLength = response.Content.Headers.ContentLength;
@@ -2427,7 +2452,16 @@ public class InferenceSession : IDisposable
                     return ms.ToArray();
             }
         }
-        catch { /* Streaming download not supported — fall through to ReadAsByteArrayAsync */ }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // Streaming download not supported — fall through to ReadAsByteArrayAsync.
+            //
+            // An OutOfMemoryException is deliberately NOT caught here. The fallback below buffers the ENTIRE
+            // body a second time, so swallowing an OOM meant retrying the allocation that just failed - it
+            // turned one 329 MB allocation into two and reported the failure from the retry, hiding where the
+            // memory actually went. If we are out of memory, say so at the point it happened.
+            _ = ex;
+        }
 
         // Fallback: standard byte array download (works on all platforms including browser WASM)
         onProgress?.Invoke("download", 0);
