@@ -151,7 +151,7 @@ public class ElementWiseKernels : IDisposable
     /// <summary>
     /// In-place GELU using erf approximation (matches PyTorch nn.GELU default / ONNX Erf subgraph):
     /// GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
-    /// erf approximated via Abramowitz & Stegun (max error 1.5e-7).
+    /// erf approximated via Abramowitz &amp; Stegun (max error 1.5e-7).
     /// </summary>
     private static void GELUInPlaceImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> data)
@@ -895,7 +895,7 @@ public class ElementWiseKernels : IDisposable
     private static void ReciprocalImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = 1f / input[idx]; }
 
-    /// <summary>Erf approximation (Abramowitz & Stegun 5-term, max error 1.5e-7).</summary>
+    /// <summary>Erf approximation (Abramowitz &amp; Stegun 5-term, max error 1.5e-7).</summary>
     private static void ErfImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     {
         float x = input[idx];

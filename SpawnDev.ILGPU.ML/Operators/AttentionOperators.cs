@@ -65,7 +65,7 @@ public class RoPEOperator(OperatorRegistry reg) : IOnnxOperator
 ///     q and k are already RoPE'd (separate RoPE nodes); v is raw.
 /// attrs: n_heads:i (required), n_kv_heads:i (default = n_heads), head_dim:i (required),
 ///        causal:i (default 1), window:i (0 or >= seqKV = global/no window),
-///        scale:f (default/<= 0 = 1/sqrt(head_dim); gemma passes its
+///        scale:f (default/&lt;= 0 = 1/sqrt(head_dim); gemma passes its
 ///        query_pre_attn_scalar-derived value), kv_offset:i (default 0)
 /// out: [attn] [n_heads, seqQ, head_dim] (same layout as q).
 /// </summary>

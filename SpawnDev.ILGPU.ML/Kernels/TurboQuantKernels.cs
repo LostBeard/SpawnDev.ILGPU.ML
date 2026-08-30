@@ -514,7 +514,7 @@ public class TurboQuantKernels
     /// Flash Attention with Online Softmax and fused TurboQuant dequantization.
     /// Single pass over the KV cache — no second traversal, no intermediate N×N storage.
     ///
-    /// Online Softmax (Milakov & Gimelshein 2018): maintains running max, running sum,
+    /// Online Softmax (Milakov &amp; Gimelshein 2018): maintains running max, running sum,
     /// and running weighted output. When a new score exceeds current max, rescales
     /// accumulated state by exp(oldMax - newMax). Numerically stable, single pass.
     ///

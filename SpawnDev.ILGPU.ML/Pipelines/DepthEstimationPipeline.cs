@@ -147,11 +147,11 @@ public class DepthEstimationPipeline : IDisposable
     /// Returns a depth map normalized to [0, 1] (higher = closer).
     ///
     /// Output dimensions:
-    ///   outputWidth = 0 && outputHeight = 0 → match source (width, height) — default,
+    ///   outputWidth = 0 &amp;&amp; outputHeight = 0 → match source (width, height) — default,
     ///       preserves aspect ratio so the depth map aligns 1:1 with the input.
-    ///   outputWidth > 0 && outputHeight = 0 → use outputWidth, derive height from source aspect.
-    ///   outputWidth = 0 && outputHeight > 0 → use outputHeight, derive width from source aspect.
-    ///   outputWidth > 0 && outputHeight > 0 → exact size (may not preserve aspect).
+    ///   outputWidth > 0 &amp;&amp; outputHeight = 0 → use outputWidth, derive height from source aspect.
+    ///   outputWidth = 0 &amp;&amp; outputHeight > 0 → use outputHeight, derive width from source aspect.
+    ///   outputWidth > 0 &amp;&amp; outputHeight > 0 → exact size (may not preserve aspect).
     /// Resize is done on the accelerator via bilinear interpolation — no CPU readback of the raw map.
     /// </summary>
     public async Task<DepthResult> EstimateAsync(int[] rgbaPixels, int width, int height,

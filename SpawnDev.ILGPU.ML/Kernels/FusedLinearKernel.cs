@@ -19,7 +19,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// register write-back — the same kernel shape as <c>RegisterBlockedMatMul</c>, so the MatMul runs at
 /// full throughput, not the per-element rate. Small matrices, the WebGL / CPU group-cap backends, and the
 /// activations without a register-blocked variant (ReLU/SiLU/Sigmoid/Tanh) use the per-element kernels
-/// below. The register-blocked GELU is the erf approximation (A&S 5-term) — bit-faithful to
+/// below. The register-blocked GELU is the erf approximation (A&amp;S 5-term) — bit-faithful to
 /// <c>ElementWiseKernels.GELUImpl</c> and the per-element path here, so it preserves the ORT-matched logits.
 /// </summary>
 public class FusedLinearKernel

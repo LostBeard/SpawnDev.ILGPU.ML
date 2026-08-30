@@ -16,7 +16,12 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// hub.OnProgress += (received, total) =&gt; UpdateProgressBar(received, total);
 ///
 /// // Load from HuggingFace (cached in OPFS after first download)
-/// var bytes = await hub.LoadAsync(KnownModels.SqueezeNet, KnownFiles.OnnxModel);
+/// // ⚠️ The FILE path is repo-specific — pair a model with the filename that repo actually uses.
+/// // onnxmodelzoo/* repos store a FLAT file (squeezenet1.1-7.onnx); onnx-community/* and Xenova/*
+/// // mostly use onnx/model.onnx. Verified 2026-08-29: 18 of 27 KnownModels repos do NOT have
+/// // onnx/model.onnx, and this example previously named a pair that 404s.
+/// var bytes = await hub.LoadAsync(KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
+/// var other = await hub.LoadAsync(KnownModels.MobileNetV3Small, KnownFiles.OnnxModel);
 /// var session = InferenceSession.CreateFromFile(accelerator, bytes);
 ///
 /// // Or load any model by repo ID
@@ -191,7 +196,8 @@ public class ModelHub : IDisposable
     /// Well-known HuggingFace repository IDs for quick access.
     /// Use with <see cref="LoadAsync"/> and <see cref="KnownFiles"/>.
     /// <code>
-    /// var bytes = await hub.LoadAsync(KnownModels.SqueezeNet, KnownFiles.OnnxModel);
+    /// // ⚠️ The FILE path is repo-specific — see the type-level docs. This repo stores a flat filename.
+    /// var bytes = await hub.LoadAsync(KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
     /// </code>
     /// </summary>
     public static class KnownModels
@@ -286,6 +292,12 @@ public class ModelHub : IDisposable
     public static class KnownFiles
     {
         /// <summary>Standard ONNX model path in HuggingFace repos</summary>
+        /// <remarks>⚠️ NOT valid for every <see cref="KnownModels"/> entry. Repo layouts differ: the
+        /// onnxmodelzoo/* repos store a single flat file named after the model (e.g.
+        /// <c>squeezenet1.1-7.onnx</c>), Xenova/speecht5_tts and onnx-community/whisper-tiny use
+        /// per-component files (<c>onnx/decoder_model.onnx</c>), and schmuell/sd-turbo-ort-web uses
+        /// per-submodel folders (<c>unet/model.onnx</c>). Checked against the live hub 2026-08-29:
+        /// 18 of 27 KnownModels repos do NOT contain onnx/model.onnx.</remarks>
         public const string OnnxModel = "onnx/model.onnx";
         /// <summary>FP16 quantized ONNX model</summary>
         public const string OnnxModelFP16 = "onnx/model_fp16.onnx";
