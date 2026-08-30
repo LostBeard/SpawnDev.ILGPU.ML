@@ -949,4 +949,115 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[F16] streamed {raw.Length} B of bf16 -> {gpuBytes} GPU bytes (no expansion), maxErr={maxErr:E3}");
     });
+
+    /// <summary>
+    /// FP8 (E4M3 and E5M2) through the SAME native path as bf16: stream 1-byte-per-element raw_data into a
+    /// native FP8 GPU buffer, confirm it was not expanded, and multiply with it via MatMulLowPWeight&lt;T&gt;.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 Written because an audit found Float8E4M3 and Float8E5M2 had **ZERO** mentions in any test file,
+    /// while dtypes 17 and 19 had just been added to both the streaming gate and the native loader. That is
+    /// claimed support that was never exercised - the exact thing a "supported dtypes" list is worst at, since
+    /// nothing fails until a real FP8 model shows up.
+    /// <para>
+    /// FP8 is where expansion hurts most: fp32 storage is 4x the bytes, so on a constrained device this is the
+    /// difference between a model fitting and not. The assertions are therefore about STORAGE (DType, native
+    /// view length, and no float buffer) as much as arithmetic.
+    /// </para>
+    /// <para>
+    /// ⚠️ Tolerance is far looser than the bf16 test by necessity, not by leniency: E4M3 carries 3 mantissa
+    /// bits and E5M2 only 2, so the reference is computed from the SAME FP8-rounded weights and the bar checks
+    /// the KERNEL, not the format's precision.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public Task F16_StreamFP8Weights_StayNative_AndMultiply() => RunTest(async accelerator =>
+    {
+        int M = 4, K = 8, N = 4;
+        var rng = new Random(99);
+        var a = new float[M * K];
+        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
+
+        using var pool = new SpawnDev.ILGPU.ML.Tensors.BufferPool(accelerator);
+        using var aBuf = accelerator.Allocate1D(a);
+        var mm = new MatMulKernel(accelerator);
+
+        // ── E4M3 (ONNX dtype 17) ──
+        {
+            var wq = new global::ILGPU.Float8E4M3[K * N];
+            var raw = new byte[wq.Length];
+            for (int i = 0; i < wq.Length; i++)
+            {
+                wq[i] = (global::ILGPU.Float8E4M3)(float)(rng.NextDouble() * 2 - 1);
+                raw[i] = wq[i].RawValue;
+            }
+            using var ms = new MemoryStream(raw);
+            var w = await pool.AllocateLowPWeightFromStreamAsync<global::ILGPU.Float8E4M3>(
+                ms, 0, raw.Length, 17, new[] { K, N }, "e4m3");
+
+            if (w.DType != SpawnDev.ILGPU.ML.Tensors.TensorDataType.Float8E4M3)
+                throw new Exception($"E4M3 loaded as DType={w.DType}");
+            if (w.Data.Length != 0)
+                throw new Exception($"E4M3 weight allocated a float buffer (Data.Length={w.Data.Length}) - expanded 4x");
+            var wv = w.AsView<global::ILGPU.Float8E4M3>();
+            if (wv.Length * 1 != raw.Length)
+                throw new Exception($"E4M3 occupies {wv.Length} GPU bytes, source was {raw.Length}");
+
+            var cpuC = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < K; k++) sum += a[r * K + k] * (float)wq[k * N + c];
+                    cpuC[r * N + c] = sum;
+                }
+
+            using var cBuf = accelerator.Allocate1D<float>(M * N);
+            mm.MatMulLowPWeight(aBuf.View, wv, cBuf.View, M, K, N);
+            await accelerator.SynchronizeAsync();
+            var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
+            float err = 0f;
+            for (int i = 0; i < cpuC.Length; i++) err = MathF.Max(err, MathF.Abs(gpuC[i] - cpuC[i]));
+            if (err > 1e-3f) throw new Exception($"E4M3 matmul maxErr={err:E3} vs same-weight fp32 reference");
+            Console.WriteLine($"[F16] E4M3: {raw.Length} B native, no float buffer, maxErr={err:E3}");
+        }
+
+        // ── E5M2 (ONNX dtype 19) ──
+        {
+            var wq = new global::ILGPU.Float8E5M2[K * N];
+            var raw = new byte[wq.Length];
+            for (int i = 0; i < wq.Length; i++)
+            {
+                wq[i] = (global::ILGPU.Float8E5M2)(float)(rng.NextDouble() * 2 - 1);
+                raw[i] = wq[i].RawValue;
+            }
+            using var ms = new MemoryStream(raw);
+            var w = await pool.AllocateLowPWeightFromStreamAsync<global::ILGPU.Float8E5M2>(
+                ms, 0, raw.Length, 19, new[] { K, N }, "e5m2");
+
+            if (w.DType != SpawnDev.ILGPU.ML.Tensors.TensorDataType.Float8E5M2)
+                throw new Exception($"E5M2 loaded as DType={w.DType}");
+            if (w.Data.Length != 0)
+                throw new Exception($"E5M2 weight allocated a float buffer (Data.Length={w.Data.Length}) - expanded 4x");
+            var wv = w.AsView<global::ILGPU.Float8E5M2>();
+
+            var cpuC = new float[M * N];
+            for (int r = 0; r < M; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < K; k++) sum += a[r * K + k] * (float)wq[k * N + c];
+                    cpuC[r * N + c] = sum;
+                }
+
+            using var cBuf = accelerator.Allocate1D<float>(M * N);
+            mm.MatMulLowPWeight(aBuf.View, wv, cBuf.View, M, K, N);
+            await accelerator.SynchronizeAsync();
+            var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
+            float err = 0f;
+            for (int i = 0; i < cpuC.Length; i++) err = MathF.Max(err, MathF.Abs(gpuC[i] - cpuC[i]));
+            if (err > 1e-3f) throw new Exception($"E5M2 matmul maxErr={err:E3} vs same-weight fp32 reference");
+            Console.WriteLine($"[F16] E5M2: {raw.Length} B native, no float buffer, maxErr={err:E3}");
+        }
+    });
 }
