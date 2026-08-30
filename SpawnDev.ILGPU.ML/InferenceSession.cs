@@ -617,6 +617,36 @@ public class InferenceSession : IDisposable
         Action<string, int>? onProgress = null,
         Dictionary<string, int[]>? inputShapes = null)
     {
+        // PREFER the streaming path: hub.OpenStreamAsync hands back a BlobStream over the OPFS cache
+        // entry, which is an IJSReadStream - so the graph structure is parsed from the stream and each
+        // weight is seeked to and uploaded JS->GPU without the model ever landing on the .NET/WASM managed
+        // heap. hub.LoadAsync below returns the whole file as a byte[]; for a 300 MB+ model that is the
+        // "bulk bytes stay in JS" rule broken on every browser load, and it is what made loads OOM under
+        // memory pressure.
+        //
+        // External-data models (weights in a sibling .onnx_data file) still take the byte[] path: resolving
+        // those needs the parsed model plus a second file, which the block below already handles.
+        //
+        // ⚠️ Known inefficiency, stated rather than hidden: when the model has no external data this parses
+        // the stream TWICE - once to answer "does it have external data", then again inside
+        // CreateFromOnnxStreamAsync. Both reads come from the OPFS-cached blob so it is cheap, but the right
+        // fix is a stream entry point that accepts an already-parsed model.
+        var hubStream = await hub.OpenStreamAsync(repoId, filename, revision).ConfigureAwait(false);
+        if (hubStream != null)
+        {
+            await using (hubStream)
+            {
+                var probe = await Onnx.OnnxParser.ParseFromStreamAsync(hubStream, 1024 * 1024).ConfigureAwait(false);
+                if (!Onnx.OnnxLoader.HasExternalData(probe))
+                {
+                    hubStream.Position = 0;
+                    onProgress?.Invoke("download", 100);
+                    return await CreateFromOnnxStreamAsync(accelerator, hubStream, onProgress, inputShapes)
+                        .ConfigureAwait(false);
+                }
+            }
+        }
+
         onProgress?.Invoke("download", 0);
         var bytes = await hub.LoadAsync(repoId, filename, revision);
         onProgress?.Invoke("download", 100);

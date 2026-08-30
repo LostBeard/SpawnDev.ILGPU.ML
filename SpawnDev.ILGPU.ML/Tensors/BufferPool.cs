@@ -38,6 +38,9 @@ public class BufferPool : IDisposable
     // GPU fp16->fp32 upcast for the zero-copy weight-load path: lets an fp16-source weight that needs an
     // fp32 GPU buffer stream JS->GPU (bytes never enter .NET) instead of the CPU read+convert loop.
     private SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels? _fp16Convert;
+    // Causal-mask generator: a triangular mask is a pure function of its shape, so it is cheaper to
+    // GENERATE on the GPU than to upload. See the mask branch in AllocatePermanentChunked.
+    private SpawnDev.ILGPU.ML.Kernels.MaskKernels? _maskKernels;
     // Deferred fp16-upcast temp buffers: freed as a BATCH after ONE drain (see AllocatePermanentFromStreamAsync)
     // — a per-weight drain is 52s on WebGPU. Caller MUST call FlushPendingFp16ConvertsAsync at end-of-load.
     // Holds the base MemoryBuffer, not MemoryBuffer1D<Half>: the deferred-drain trick is identical for every
@@ -402,6 +405,36 @@ public class BufferPool : IDisposable
         // RawDataStreamOffset, so it could not be streamed and its bytes must cross the managed heap.
         // Log every one when asked - naming them is the only way to find out WHY a model stays off the
         // zero-copy path, and the per-branch logging below misses whichever branch is not taken.
+        // ── Causal mask: generate on the GPU instead of uploading it ──
+        // A decoder's attention mask is a pure function of its shape. distilgpt2 ships one as
+        // onnx::Slice_260, a 1024x1024 BOOL initializer with no raw_data stream offset - so it cannot
+        // stream, gets expanded BOOL->float32 (1 MiB of mask becoming 4 MiB), and host-copied. MEASURED
+        // 2026-08-29: that single tensor is what tripped BrowserBufferPolicy's host-copy guard on every
+        // browser backend; every other tensor taking this path in that model is a 4-byte scalar.
+        //
+        // ⚠️ TryDetectTriangular verifies EVERY element before we substitute. A generated mask standing in
+        // for data that is only MOSTLY triangular would silently change what the model computes, which is
+        // far worse than the copy this avoids. Anything that does not match exactly falls through below.
+        if (tensor.DataType == 9 && shape.Length == 2 && shape[0] > 1 && shape[1] > 1)
+        {
+            var maskBytes = tensor.RawData;
+            if (maskBytes == null && tensor.RawDataSource != null && tensor.RawDataLength >= count)
+                maskBytes = tensor.RawDataSource.AsSpan(tensor.RawDataOffset, tensor.RawDataLength).ToArray();
+
+            if (maskBytes != null && maskBytes.Length >= count &&
+                SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(maskBytes, shape[0], shape[1], out var triMode))
+            {
+                var maskBuf = _accelerator.Allocate1D<float>(count);
+                _allBuffers.Add(maskBuf);
+                (_maskKernels ??= new SpawnDev.ILGPU.ML.Kernels.MaskKernels(_accelerator))
+                    .FillTriangular(maskBuf.View, shape[0], shape[1], triMode);
+                if (LogProtoResidentTensors)
+                    Console.WriteLine($"[BufferPool] GENERATED '{name ?? tensor.Name}' {shape[0]}x{shape[1]} " +
+                                      $"{triMode} mask on the GPU - skipped a {(long)count * 4:N0}-byte host copy");
+                return new Tensor(maskBuf.View, shape, name);
+            }
+        }
+
         if (LogProtoResidentTensors)
             Console.WriteLine($"[BufferPool] NET-chunked '{name ?? tensor.Name}' dtype={tensor.DataType} " +
                               $"count={count} ({(long)count * 4:N0} B) rawData={(tensor.RawData != null ? tensor.RawData.Length.ToString() : "null")} " +
@@ -438,13 +471,25 @@ public class BufferPool : IDisposable
             // destroyed before the batched command encoder submits, causing use-after-free
             // (all weights read as zeros). CopyFromCPU is immediate — no temp buffer needed.
             int offset = 0;
-            while (offset < count)
+            try
             {
-                int n = Math.Min(CHUNK, count - offset);
-                var chunkSlice = new float[n];
-                Buffer.BlockCopy(rawBytes, rawOffset + offset * 4, chunkSlice, 0, n * 4);
-                buffer.View.SubView(offset, n).CopyFromCPU(chunkSlice);
-                offset += n;
+                while (offset < count)
+                {
+                    int n = Math.Min(CHUNK, count - offset);
+                    var chunkSlice = new float[n];
+                    Buffer.BlockCopy(rawBytes, rawOffset + offset * 4, chunkSlice, 0, n * 4);
+                    buffer.View.SubView(offset, n).CopyFromCPU(chunkSlice);
+                    offset += n;
+                }
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("StrictHostCopyMaxBytes"))
+            {
+                // Same reason as the proto-resident branch below: the raw guard message is a byte count and
+                // nothing else, and identifying a tensor from a byte count is guesswork.
+                throw new InvalidOperationException(
+                    $"Tensor '{name ?? tensor.Name}' (dtype={tensor.DataType}, {count} floats, " +
+                    $"{(long)count * 4:N0} B) took the NET-chunked host-copy path - it has raw_data but no " +
+                    "stream offset, so the streaming loader could not seek to it. " + ex.Message, ex);
             }
         }
         else
@@ -708,13 +753,18 @@ public class BufferPool : IDisposable
             16 => typeof(T) == typeof(global::ILGPU.BFloat16),
             17 => typeof(T) == typeof(global::ILGPU.Float8E4M3),
             19 => typeof(T) == typeof(global::ILGPU.Float8E5M2),
+            // Quantized integer weights store natively too - a quarter of the fp32 bytes - and are widened
+            // at USE by DequantizeLinear, not on load. Same rule as the float formats: no expansion in RAM.
+            3 => typeof(T) == typeof(sbyte),
+            2 => typeof(T) == typeof(byte),
             _ => false,
         };
         if (!layoutMatches)
             throw new NotSupportedException(
                 $"Native low-precision load needs the ONNX dtype and the storage type to have the SAME layout; " +
                 $"got dtype {dataType} into {typeof(T).Name} for '{name}'. Supported: FLOAT16 (10)->Half, " +
-                "BFLOAT16 (16)->BFloat16, FLOAT8E4M3 (17)->Float8E4M3, FLOAT8E5M2 (19)->Float8E5M2. " +
+                "BFLOAT16 (16)->BFloat16, FLOAT8E4M3 (17)->Float8E4M3, FLOAT8E5M2 (19)->Float8E5M2, "
+                + "INT8 (3)->sbyte, UINT8 (2)->byte. " +
                 "Converting here would be an in-RAM cast, which is what this path exists to avoid - use " +
                 "AllocatePermanentFromStreamAsync (fp32) if a converted weight is genuinely wanted.");
         if (byteLength != (long)count * expectBytes)

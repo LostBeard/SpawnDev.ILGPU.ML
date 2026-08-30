@@ -22,4 +22,9 @@ public enum TensorDataType
     Float8E4M3 = 17,
     /// <summary>OCP FP8 E5M2 (<c>ILGPU.Float8E5M2</c>).</summary>
     Float8E5M2 = 19,
+    /// <summary>Signed 8-bit integer (<c>sbyte</c>) — quantized weights, stored NATIVE (a quarter of the
+    /// fp32 bytes). Consumed by dequantizing at use, never expanded in memory on load.</summary>
+    Int8 = 3,
+    /// <summary>Unsigned 8-bit integer (<c>byte</c>) — quantized weights, stored NATIVE.</summary>
+    UInt8 = 2,
 }

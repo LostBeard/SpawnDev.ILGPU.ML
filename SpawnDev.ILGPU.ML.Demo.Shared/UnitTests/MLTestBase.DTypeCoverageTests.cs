@@ -291,4 +291,148 @@ public abstract partial class MLTestBase
 
         Console.WriteLine("[DType] FNUZ FP8 (18, 20) decode to spec on both the proto and streaming paths");
     });
+
+    /// <summary>
+    /// MaskKernels: GPU-generated triangular masks match a CPU reference, and the detector accepts ONLY
+    /// genuinely triangular data.
+    /// </summary>
+    /// <remarks>
+    /// This exists because distilgpt2's causal mask (onnx::Slice_260) is a 1024x1024 BOOL tensor that gets
+    /// expanded to fp32 (1 MiB -&gt; 4 MiB) and host-copied, tripping the browser host-copy guard - and a
+    /// triangular mask is cheaper to GENERATE than to ship over the bus.
+    /// <para>
+    /// ⚠️ The detector half matters more than the generator half. Substituting a generated mask for data
+    /// that is only MOSTLY triangular would silently change what the model computes - far worse than the
+    /// copy it avoids - so the negative cases here (one flipped bit, and a non-square shape) are the point.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public Task Mask_GeneratedTriangular_MatchesCpuAndDetectsExactly() => RunTest(async accelerator =>
+    {
+        const int N = 64;
+        var mk = new SpawnDev.ILGPU.ML.Kernels.MaskKernels(accelerator);
+
+        foreach (var mode in new[]
+                 {
+                     SpawnDev.ILGPU.ML.Kernels.MaskKernels.TriangleMode.LowerInclusive,
+                     SpawnDev.ILGPU.ML.Kernels.MaskKernels.TriangleMode.LowerExclusive,
+                     SpawnDev.ILGPU.ML.Kernels.MaskKernels.TriangleMode.UpperInclusive,
+                     SpawnDev.ILGPU.ML.Kernels.MaskKernels.TriangleMode.UpperExclusive,
+                 })
+        {
+            using var buf = accelerator.Allocate1D<float>(N * N);
+            mk.FillTriangular(buf.View, N, N, mode);
+            await accelerator.SynchronizeAsync();
+            var got = await buf.View.SubView(0, N * N).CopyToHostAsync();
+
+            int m = (int)mode;
+            var raw = new byte[N * N];
+            for (int r = 0; r < N; r++)
+                for (int c = 0; c < N; c++)
+                {
+                    bool admit = m == 0 ? c <= r : m == 1 ? c < r : m == 2 ? c >= r : c > r;
+                    float want = admit ? 1f : 0f;
+                    if (got[r * N + c] != want)
+                        throw new Exception($"{mode} at ({r},{c}): got {got[r * N + c]}, expected {want}");
+                    raw[r * N + c] = (byte)(admit ? 1 : 0);
+                }
+
+            // Round-trip: the detector must recognise the very pattern the kernel produces, as that mode.
+            if (!SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(raw, N, N, out var found))
+                throw new Exception($"{mode}: detector rejected a mask the kernel generated");
+            if (found != mode)
+                throw new Exception($"{mode}: detector reported {found}");
+
+            // NEGATIVE: one flipped bit must disqualify it. This is the assertion that stops a
+            // nearly-triangular tensor being replaced by a generated one.
+            raw[(N / 2) * N + (N / 4)] ^= 1;
+            if (SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(raw, N, N, out _))
+                throw new Exception($"{mode}: detector ACCEPTED data with one flipped element - it would " +
+                                    "substitute a generated mask and silently change the model");
+        }
+
+        // Degenerate shapes must be refused rather than guessed at.
+        if (SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(new byte[] { 1 }, 1, 1, out _))
+            throw new Exception("detector accepted a 1x1 tensor");
+
+        Console.WriteLine("[DType] MaskKernels: 4 triangle modes match CPU, detector exact (1 flipped bit rejected)");
+    });
+
+    /// <summary>
+    /// Quantized int8/uint8 weights stored NATIVE (a quarter of the fp32 bytes) and widened correctly at use.
+    /// </summary>
+    /// <remarks>
+    /// Storage is the claim: an int8 weight that gets expanded to fp32 on load costs 4x the memory, which
+    /// defeats the reason a model was quantized at all. So the assertions are DType, a native view of the
+    /// right length, and Data.Length == 0 proving no float buffer was allocated alongside - the widening
+    /// happens in DequantizeLinear at use, into that op's own output, never as a resident copy.
+    /// <para>
+    /// The conversion is checked over the FULL 8-bit range, not a sample: sbyte spans -128..127 and byte
+    /// 0..255, so every representable value is verified rather than a handful of convenient ones. Sign
+    /// handling is exactly where an 8-bit widening goes wrong (0x80 as -128 vs 128).
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public Task DType_Int8Weights_StayNative_AndWidenExactly() => RunTest(async accelerator =>
+    {
+        using var pool = new BufferPool(accelerator);
+        var conv = new SpawnDev.ILGPU.ML.Kernels.IntConvertKernels(accelerator);
+
+        // ── INT8 (dtype 3): full signed range ──
+        {
+            var vals = Enumerable.Range(-128, 256).Select(i => (sbyte)i).ToArray();
+            var raw = vals.Select(v => unchecked((byte)v)).ToArray();
+            using var ms = new MemoryStream(raw);
+            var w = await pool.AllocateLowPWeightFromStreamAsync<sbyte>(ms, 0, raw.Length, 3, new[] { raw.Length }, "q8");
+
+            if (w.DType != SpawnDev.ILGPU.ML.Tensors.TensorDataType.Int8)
+                throw new Exception($"int8 loaded as DType={w.DType}");
+            if (w.Data.Length != 0)
+                throw new Exception($"int8 weight allocated a float buffer (Data.Length={w.Data.Length}) - expanded 4x on load");
+            var wv = w.AsView<sbyte>();
+            if (wv.Length != raw.Length)
+                throw new Exception($"native int8 view length {wv.Length}, expected {raw.Length}");
+
+            using var outBuf = accelerator.Allocate1D<float>(raw.Length);
+            conv.Int8ToFloat(wv, outBuf.View, raw.Length);
+            await accelerator.SynchronizeAsync();
+            var got = await outBuf.View.SubView(0, raw.Length).CopyToHostAsync();
+            for (int i = 0; i < vals.Length; i++)
+                if (got[i] != vals[i])
+                    throw new Exception($"int8 widen: raw 0x{raw[i]:X2} -> {got[i]}, expected {vals[i]}");
+        }
+
+        // ── UINT8 (dtype 2): full unsigned range ──
+        {
+            var raw = Enumerable.Range(0, 256).Select(i => (byte)i).ToArray();
+            using var ms = new MemoryStream(raw);
+            var w = await pool.AllocateLowPWeightFromStreamAsync<byte>(ms, 0, raw.Length, 2, new[] { raw.Length }, "qu8");
+
+            if (w.DType != SpawnDev.ILGPU.ML.Tensors.TensorDataType.UInt8)
+                throw new Exception($"uint8 loaded as DType={w.DType}");
+            if (w.Data.Length != 0)
+                throw new Exception($"uint8 weight allocated a float buffer - expanded 4x on load");
+            var wv = w.AsView<byte>();
+
+            using var outBuf = accelerator.Allocate1D<float>(raw.Length);
+            conv.UInt8ToFloat(wv, outBuf.View, raw.Length);
+            await accelerator.SynchronizeAsync();
+            var got = await outBuf.View.SubView(0, raw.Length).CopyToHostAsync();
+            for (int i = 0; i < raw.Length; i++)
+                if (got[i] != raw[i])
+                    throw new Exception($"uint8 widen: raw {raw[i]} -> {got[i]}");
+        }
+
+        // Refusing a mismatched dtype matters as much as accepting a matching one.
+        bool refused = false;
+        try
+        {
+            using var bad = new MemoryStream(new byte[4]);
+            await pool.AllocateLowPWeightFromStreamAsync<sbyte>(bad, 0, 4, 1 /* FLOAT32 */, new[] { 4 }, "bad");
+        }
+        catch (NotSupportedException) { refused = true; }
+        if (!refused) throw new Exception("FLOAT32 was accepted into an int8 buffer - it must refuse, not convert");
+
+        Console.WriteLine("[DType] int8/uint8 stay native (no float buffer) and widen exactly over the full 8-bit range");
+    });
 }

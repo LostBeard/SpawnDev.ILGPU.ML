@@ -716,6 +716,20 @@ public class DequantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
         var x = ctx.Inputs[0]; var scale = ctx.Inputs[1];
         var zp = ctx.Inputs.Length > 2 ? ctx.Inputs[2] : null;
         int count = x.ElementCount;
+
+        // A NATIVE int8/uint8 weight has no fp32 buffer (Data is empty) - it is stored quantized, at a
+        // quarter of the fp32 bytes, and widened HERE at use. Widen into a pooled temp and continue with
+        // the existing arithmetic, so scale/zero_point broadcasting behaviour is unchanged. The expanded
+        // form is transient: it exists for this op, not as a resident copy alongside the weight.
+        if (x.DType is Tensors.TensorDataType.Int8 or Tensors.TensorDataType.UInt8)
+        {
+            var widened = ctx.Pool.Rent(x.Shape);
+            if (x.DType == Tensors.TensorDataType.Int8)
+                reg.IntConvert.Int8ToFloat(x.AsView<sbyte>(), widened.Data, count);
+            else
+                reg.IntConvert.UInt8ToFloat(x.AsView<byte>(), widened.Data, count);
+            x = widened;
+        }
         if (zp != null)
         {
             // x - zero_point → temp, then temp * scale → output

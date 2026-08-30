@@ -85,6 +85,8 @@ public class OperatorRegistry : IDisposable
     public Kernels.SliceKernel Slice { get; }
     public Kernels.ConcatKernel Concat { get; }
     public Kernels.MissingElementWiseKernels MissingElementWise { get; }
+    /// <summary>Widens NATIVE int8/uint8 quantized weights to fp32 at use (see <see cref="Kernels.IntConvertKernels"/>).</summary>
+    public Kernels.IntConvertKernels IntConvert { get; }
     /// <summary>Approach-(i) precision-aware op kernels (read+write low-p activations, no fp32 temp).
     /// Used by <see cref="IPrecisionAwareOperator"/> implementations under the F16 executor path.</summary>
     public Kernels.PrecisionAwareKernels PrecisionAware { get; }
@@ -131,6 +133,7 @@ public class OperatorRegistry : IDisposable
         Slice = new Kernels.SliceKernel(accelerator);
         Concat = new Kernels.ConcatKernel(accelerator);
         MissingElementWise = new Kernels.MissingElementWiseKernels(accelerator);
+        IntConvert = new Kernels.IntConvertKernels(accelerator);
         PrecisionAware = new Kernels.PrecisionAwareKernels(accelerator);
 
         // Register built-in operators
