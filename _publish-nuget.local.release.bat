@@ -19,4 +19,3 @@ ECHO Latest *.nupkg file is:
 ECHO %NewestFile%
 
 nuget add "%releaseFolder%\%NewestFile%" -source "%feedRoot%"
-pause

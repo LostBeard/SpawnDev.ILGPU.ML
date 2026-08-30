@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.2</Version>
-		<PackageReleaseNotes>v5.2.2 - FIX: the OPFS model cache could not download from a WORKER. ModelCache.DownloadWithProgressAsync fetched via `window`, which does not exist in a WorkerGlobalScope, so it threw a bare NullReferenceException - and a worker is exactly where a model should be loaded. It now fetches from the runtime's global scope, which works in window, dedicated worker, shared worker and service worker alike. See Changelog.</PackageReleaseNotes>
+		<Version>5.2.3-local.1</Version>
+		<PackageReleaseNotes>v5.2.3-local.1 - FIX: AudioPreprocessor.Resample had no anti-aliasing filter. It was linear interpolation, so decimating 48 kHz microphone audio to the 16 kHz speech models want folded everything from 8-24 kHz back on top of the speech - MEASURED: a 10 kHz tone survived 48k->16k at full amplitude as 6000 Hz - and Whisper answered microphone audio with fluent, confident, unrelated text. Now a windowed-sinc kernel, precomputed per output phase (48k->16k reduces to a single phase). No test caught it because every audio fixture was already 16 kHz, so the srcRate == dstRate early return fired in every test and the resampling body never ran. ADDED: real microphone capture - MediaStreamCapture.OnAudioReady was declared and never raised; StartMicrophoneAsync now delivers mono float32 through MediaStreamTrackProcessor, with OnAudioError and a frame-buffer depth so a stalled WASM thread cannot silently drop audio. See Changelog.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
