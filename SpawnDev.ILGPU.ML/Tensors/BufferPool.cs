@@ -393,6 +393,15 @@ public class BufferPool : IDisposable
     {
         int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
 
+        // Reaching this method AT ALL during a streaming load means the tensor had no
+        // RawDataStreamOffset, so it could not be streamed and its bytes must cross the managed heap.
+        // Log every one when asked - naming them is the only way to find out WHY a model stays off the
+        // zero-copy path, and the per-branch logging below misses whichever branch is not taken.
+        if (LogProtoResidentTensors)
+            Console.WriteLine($"[BufferPool] NET-chunked '{name ?? tensor.Name}' dtype={tensor.DataType} " +
+                              $"count={count} ({(long)count * 4:N0} B) rawData={(tensor.RawData != null ? tensor.RawData.Length.ToString() : "null")} " +
+                              $"rawSrc={(tensor.RawDataSource != null ? "yes" : "no")} streamOff={tensor.RawDataStreamOffset}");
+
         // For small tensors, use the standard path (no chunking overhead)
         if (count <= 262144) // 1MB
             return AllocatePermanent(tensor.ToFloatArray(), shape, name);

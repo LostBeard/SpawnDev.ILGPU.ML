@@ -116,6 +116,19 @@ public class ProjectTest
             // Capture console messages (errors + warnings) during the test
             var consoleErrors = new List<string>();
             var consoleWarnings = new List<string>();
+
+            // ...and LOG-level messages, opt-in. Only error/warning were ever kept, so a test's own
+            // Console.WriteLine (console.log in the browser) was silently DROPPED - which makes the
+            // obvious way to instrument a browser test useless, and sends you diagnosing from byte
+            // counts in exception messages instead. Off by default because a full sweep's log volume is
+            // enormous; PMT_CONSOLE_LOG=<substring> keeps only matching lines, PMT_CONSOLE_LOG=1 (or *)
+            // keeps everything for one scoped run.
+            //   PMT_CONSOLE_LOG=[BufferPool] PMT_FILTER=SomeTest dotnet test PlaywrightMultiTest/...
+            var logFilter = Environment.GetEnvironmentVariable("PMT_CONSOLE_LOG");
+            var wantAllLogs = logFilter is "1" or "*";
+            var captureLogs = !string.IsNullOrEmpty(logFilter);
+            var consoleLogs = new List<string>();
+
             void OnConsole(object? sender, IConsoleMessage msg)
             {
                 // The runtime announces its own death. Catch it here rather than waiting out the
@@ -126,6 +139,9 @@ public class ProjectTest
                     consoleErrors.Add(msg.Text);
                 else if (msg.Type == "warning")
                     consoleWarnings.Add(msg.Text);
+                else if (captureLogs && msg.Text != null
+                         && (wantAllLogs || msg.Text.Contains(logFilter!, StringComparison.OrdinalIgnoreCase)))
+                    consoleLogs.Add(msg.Text);
             }
             page.Console += OnConsole;
 
@@ -230,13 +246,16 @@ public class ProjectTest
             var unsupported = await row.EvaluateAsync<bool>("el => el.classList.contains('test-unsupported')");
 
             // Log console errors/warnings to stderr for diagnostics
-            if (consoleErrors.Count > 0 || consoleWarnings.Count > 0)
+            if (consoleErrors.Count > 0 || consoleWarnings.Count > 0 || consoleLogs.Count > 0)
             {
-                Console.Error.WriteLine($"[{Name}] Console: {consoleErrors.Count} error(s), {consoleWarnings.Count} warning(s)");
+                Console.Error.WriteLine($"[{Name}] Console: {consoleErrors.Count} error(s), {consoleWarnings.Count} warning(s)"
+                                        + (consoleLogs.Count > 0 ? $", {consoleLogs.Count} matched log(s)" : ""));
                 foreach (var err in consoleErrors)
                     Console.Error.WriteLine($"  ERROR: {err}");
                 foreach (var warn in consoleWarnings)
                     Console.Error.WriteLine($"  WARN: {warn}");
+                foreach (var log in consoleLogs)
+                    Console.Error.WriteLine($"  LOG: {log}");
             }
 
             ResultMessage = stateMessage;
