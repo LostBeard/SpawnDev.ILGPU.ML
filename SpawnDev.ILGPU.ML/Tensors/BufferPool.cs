@@ -552,19 +552,27 @@ public class BufferPool : IDisposable
         // ReadExact + CopyFromCPU loop below for the common SD-Turbo (fp16) weight case, which was pulling
         // every weight through .NET (Captain 2026-07-05). Works on all backends (browser gets true zero-copy;
         // desktop streams managed into the Half buffer, still a GPU convert not a CPU one).
-        if (dataType == 10 && byteLength == count * 2 && !DisableJsZeroCopyWeights)
+        if (dataType != 1 && byteLength == (long)count * srcElemBytes && !DisableJsZeroCopyWeights)
         {
-            var halfTmp = _accelerator.Allocate1D<global::ILGPU.Half>(count);
-            await halfTmp.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
-            (_fp16Convert ??= new SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels(_accelerator))
-                .HalfToFloat(halfTmp.View, buffer.View, count);
+            // Every low-p float dtype takes the SAME shape: stream the raw bytes into a native temp of the
+            // matching ILGPU type (no conversion - the layouts are identical), then ONE generic GPU upcast.
+            // ⚠️ Adding a dtype to the srcElemBytes switch WITHOUT a branch here silently routed it to the
+            // managed fallback below, which decoded anything-not-FLOAT32 as fp16 - bf16 0x3FC0 came back as
+            // 1.9375 instead of 1.5, and FP8's single bytes were read two at a time. Caught by
+            // DType_AllClaimedStreamingDtypes_LoadExactly on all six backends.
+            switch (dataType)
+            {
+                case 10: await StreamLowPUpcastAsync<global::ILGPU.Half>(stream, buffer, count, ct).ConfigureAwait(false); break;
+                case 16: await StreamLowPUpcastAsync<global::ILGPU.BFloat16>(stream, buffer, count, ct).ConfigureAwait(false); break;
+                case 17: await StreamLowPUpcastAsync<global::ILGPU.Float8E4M3>(stream, buffer, count, ct).ConfigureAwait(false); break;
+                case 19: await StreamLowPUpcastAsync<global::ILGPU.Float8E5M2>(stream, buffer, count, ct).ConfigureAwait(false); break;
+                default: throw new NotSupportedException($"no streaming branch for dtype {dataType} ('{name}')");
+            }
             // The convert dispatch READS halfTmp, so halfTmp must survive until the convert runs. A per-weight
             // `await SynchronizeAsync()` here is CATASTROPHIC on WebGPU — each is a full async GPU round-trip
             // (~76ms × 686 unet weights = 52s; measured 2026-07-05). Instead DEFER: every fp16 weight gets its
             // OWN temp (no reuse hazard), held in a pending list, and freed as a BATCH after ONE drain once the
             // list crosses the cap (or at end-of-load via FlushPendingFp16ConvertsAsync). ~13 drains, not 686.
-            _pendingFp16Temps.Add(halfTmp);
-            _pendingFp16Bytes += (long)count * 2;
             if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
                 ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
             if (_pendingFp16Bytes >= Fp16TempFlushCap)
@@ -584,15 +592,49 @@ public class BufferPool : IDisposable
 
             if (dataType == 1) // FLOAT32 — direct little-endian copy
                 Buffer.BlockCopy(byteBuf, 0, floatChunk, 0, wantBytes);
-            else // FLOAT16 → FLOAT32 per element
+            else if (dataType == 10) // FLOAT16 -> FLOAT32
                 for (int i = 0; i < n; i++)
                     floatChunk[i] = (float)BitConverter.ToHalf(byteBuf, i * 2);
+            else if (dataType == 16) // BFLOAT16 -> FLOAT32: the bytes ARE the top half of the fp32 word
+                for (int i = 0; i < n; i++)
+                    floatChunk[i] = BitConverter.Int32BitsToSingle(
+                        (int)((uint)(ushort)(byteBuf[i * 2] | (byteBuf[i * 2 + 1] << 8)) << 16));
+            else if (dataType == 17) // FLOAT8E4M3
+                for (int i = 0; i < n; i++)
+                    floatChunk[i] = (float)global::ILGPU.Float8E4M3.FromRawBits(byteBuf[i]);
+            else if (dataType == 19) // FLOAT8E5M2
+                for (int i = 0; i < n; i++)
+                    floatChunk[i] = (float)global::ILGPU.Float8E5M2.FromRawBits(byteBuf[i]);
+            else
+                throw new NotSupportedException($"managed fallback has no decode for dtype {dataType} ('{name}')");
 
             // Upload exactly n floats. CopyFromCPU is immediate (no temp buffer / command-encoder hazard).
             buffer.View.SubView(uploaded, n).CopyFromCPU(n == floatChunk.Length ? floatChunk : floatChunk[..n]);
             uploaded += n;
         }
         return new Tensor(buffer.View, shape, name);
+    }
+
+    /// <summary>
+    /// Stream a native low-precision weight into a temp GPU buffer of <typeparamref name="T"/> and upcast it
+    /// to the fp32 <paramref name="dst"/> on the GPU. The bytes never enter the managed heap.
+    /// </summary>
+    /// <remarks>
+    /// The temp is DEFERRED, not drained per weight: the convert dispatch reads it, and a per-weight
+    /// <c>SynchronizeAsync</c> costs ~76ms each on WebGPU (~52s over a UNet). Each weight gets its OWN temp
+    /// so there is no reuse hazard, and the batch is freed after ONE drain once the pending bytes cross the
+    /// cap - see <see cref="FlushPendingFp16ConvertsAsync"/>, which callers must invoke at end-of-load.
+    /// </remarks>
+    private async Task StreamLowPUpcastAsync<T>(
+        Stream stream, MemoryBuffer1D<float, Stride1D.Dense> dst, int count, CancellationToken ct)
+        where T : unmanaged, System.Numerics.INumber<T>
+    {
+        var tmp = _accelerator.Allocate1D<T>(count);
+        await tmp.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
+        (_fp16Convert ??= new SpawnDev.ILGPU.ML.Kernels.PrecisionConvertKernels(_accelerator))
+            .LowPToFloat<T>(tmp.View, dst.View, count);
+        _pendingFp16Temps.Add(tmp);
+        _pendingFp16Bytes += (long)count * System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
     }
 
     /// <summary>Drain once, then free the batch of deferred fp16-upcast temp buffers (see the fp16 branch of
