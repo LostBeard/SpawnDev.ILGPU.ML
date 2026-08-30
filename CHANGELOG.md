@@ -4,6 +4,33 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## Unreleased
 
+### Fixed
+
+- 🔴 **`AudioPreprocessor.Resample` had no anti-aliasing filter.** It was bare linear interpolation,
+  carrying a comment conceding "for production quality, consider using a proper sinc resampler". Linear
+  interpolation does not band-limit, so decimating 48 kHz microphone audio to the 16 kHz Whisper wants
+  folded everything from 8-24 kHz back on top of the speech - and sibilants and fricatives live exactly
+  there. MEASURED on the old code: a 10 kHz tone resampled 48k -> 16k survived at **full amplitude**
+  (0.500 of a 0.500 source) as **6000 Hz**, squarely inside the band the mel spectrogram reads. Whisper
+  answered microphone audio with fluent, confident, entirely unrelated text.
+  Now a windowed-sinc (Blackman, 8 lobes) kernel whose cutoff is the decimation ratio, normalised per
+  output sample so partial windows at the edges do not step the gain.
+  ⚠️ **Why no test caught it:** every audio fixture in the repo was already 16 kHz, so
+  `if (srcRate == dstRate) return samples;` was taken in every test and the resampling body had never
+  executed. Gated now by `MLTestBase.ResamplerTests` (5 tests, all six backends), whose key assertion is
+  that a 10 kHz tone must be REMOVED by a 48k -> 16k conversion, not aliased down - it fails loudly on the
+  old implementation. A passband test guards the opposite error.
+- **Microphone capture no longer drops audio under load.** `MediaStreamTrackProcessor` was created with the
+  default queue depth, so anything stalling the single WASM thread - a large model download, a long GPU
+  compile - made the browser silently drop frames. MEASURED: 7.2 s captured over 9 s of wall time (80%)
+  while a 231 MB download was in flight, against 100% with none. Now takes a `maxBufferedFrames` (default
+  3000), which restored capture to **9.0 s over 9 s**.
+- **Microphone capture no longer resamples every chunk.** Chunks arrive about every 10 ms, and resampling
+  each one independently gives a windowed kernel no signal either side of a chunk boundary, stitching a
+  discontinuity into the audio 100 times a second. `StartMicrophoneAsync` now defaults to delivering the
+  device's NATIVE rate (`targetSampleRate: 0`), reported through `OnAudioReady`; `/whisper` passes that
+  rate to `TranscribeAsync`, which converts the finished recording once.
+
 ### Added
 
 - **Microphone capture actually works.** `MediaStreamCapture.OnAudioReady` was DECLARED and never raised -

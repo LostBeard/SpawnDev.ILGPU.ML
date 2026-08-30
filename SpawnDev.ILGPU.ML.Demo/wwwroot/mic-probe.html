@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Microphone probe</title>
+<!--
+  A deliberately static page: no Blazor, no framework, no app code.
+
+  getUserMedia needs a secure context, and localhost counts, so this is served from the app's own origin
+  purely to BE that origin. Loading the Blazor app instead is not workable - its boot navigates, which
+  destroys the JS execution context out from under an injected probe.
+
+  Used by tools/probe-fake-mic.cs to answer one question: is Chrome's fake microphone emitting sound?
+  Keeping our own capture code out of the picture is the entire point.
+-->
+<body>microphone probe</body>

@@ -148,10 +148,29 @@ public class MediaStreamCapture : IDisposable
     /// </para>
     /// </remarks>
     /// <returns>True if the microphone opened and the read loop started.</returns>
-    public async Task<bool> StartMicrophoneAsync(int targetSampleRate = 16000)
+    /// <param name="targetSampleRate">
+    /// Rate to resample each chunk to, or <b>0 (the default) to deliver the device's NATIVE rate</b>.
+    /// <para>
+    /// ⚠️ Prefer 0. Chunks arrive about every 10 ms, so a non-zero value resamples each one
+    /// INDEPENDENTLY, and a windowed kernel has no signal either side of a chunk boundary to work with -
+    /// which stitches a discontinuity into the audio every 10 ms. Capturing native and converting the
+    /// finished recording once is both higher quality and less work. <see cref="OnAudioReady"/> reports
+    /// the rate it is handing you, and <c>SpeechRecognitionPipeline.TranscribeAsync</c> already resamples
+    /// whatever rate you pass it.
+    /// </para>
+    /// </param>
+    /// <param name="maxBufferedFrames">
+    /// How many AudioData frames the browser may queue for us. The default queue is short, so anything
+    /// that stalls the single WASM thread - a large model download, a long GPU compile - makes the browser
+    /// DROP frames, and dropped frames do not announce themselves: the capture simply comes back short and
+    /// the audio is silently chopped. MEASURED: capturing while a 231 MB download was in flight yielded
+    /// 7.2 s of audio over 9 s of wall time (80%), against 100% with no download running. Queuing instead
+    /// of dropping costs a little memory and keeps the recording intact.
+    /// </param>
+    public async Task<bool> StartMicrophoneAsync(int targetSampleRate = 0, int maxBufferedFrames = 3000)
     {
         if (_audioProcessor != null) return false;
-        if (targetSampleRate <= 0) throw new ArgumentOutOfRangeException(nameof(targetSampleRate));
+        if (targetSampleRate < 0) throw new ArgumentOutOfRangeException(nameof(targetSampleRate));
 
         LastAudioError = null;
         _audioTargetRate = targetSampleRate;
@@ -166,7 +185,11 @@ public class MediaStreamCapture : IDisposable
             var track = tracks.ToArray().FirstOrDefault();
             if (track == null) { StopMicrophone(); return false; }
 
-            _audioProcessor = new MediaStreamTrackProcessor(new MediaStreamTrackProcessorOptions { Track = track });
+            _audioProcessor = new MediaStreamTrackProcessor(new MediaStreamTrackProcessorOptions
+            {
+                Track = track,
+                MaxBufferSize = maxBufferedFrames > 0 ? maxBufferedFrames : null,
+            });
             using var readable = _audioProcessor.Readable;
             _audioReader = readable.GetReader();
 
@@ -224,8 +247,10 @@ public class MediaStreamCapture : IDisposable
 
                 try
                 {
-                    var samples = await MediaInterop.FromAudioDataAsync(audioData, _audioTargetRate);
-                    if (samples.Length > 0) OnAudioReady?.Invoke(samples, _audioTargetRate);
+                    // 0 = native: hand over the frame's own rate and do not touch the samples.
+                    int rate = _audioTargetRate > 0 ? _audioTargetRate : (int)audioData.SampleRate;
+                    var samples = await MediaInterop.FromAudioDataAsync(audioData, rate);
+                    if (samples.Length > 0) OnAudioReady?.Invoke(samples, rate);
                 }
                 finally
                 {

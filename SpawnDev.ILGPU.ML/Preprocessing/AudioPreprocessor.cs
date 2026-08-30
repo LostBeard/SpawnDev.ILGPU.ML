@@ -23,30 +23,84 @@ public static partial class AudioPreprocessor
     public const int WhisperMelBins = 80;
 
     /// <summary>
-    /// Resample audio from one sample rate to another using linear interpolation.
-    /// For production quality, consider using a proper sinc resampler.
+    /// Resample audio between two sample rates with a windowed-sinc (Lanczos-style) kernel that
+    /// band-limits the signal BEFORE decimation.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ This used to be bare linear interpolation, with a comment conceding "for production quality,
+    /// consider using a proper sinc resampler". Linear interpolation does not remove content above the
+    /// DESTINATION Nyquist, so decimating 48 kHz microphone audio to the 16 kHz Whisper wants folded
+    /// everything from 8-24 kHz back down on top of the speech - and sibilants and fricatives live exactly
+    /// there. The result is not obviously broken audio; it is audio whose formants have been polluted, so
+    /// Whisper returns fluent, confident, completely unrelated text.
+    /// <para>
+    /// It stayed invisible because the only audio the tests fed it was ALREADY 16 kHz, where
+    /// <c>srcRate == dstRate</c> returns early and no resampling happens at all. The file path was correct
+    /// and the microphone path was garbage, from one line neither test covered.
+    /// </para>
+    /// <para>
+    /// The kernel cutoff is <c>min(1, dstRate/srcRate)</c> in units of the source Nyquist: 1.0 when
+    /// upsampling (pure interpolation), and the decimation ratio when downsampling, which is the
+    /// anti-aliasing filter. Weights are normalised per output sample so partial windows at the signal
+    /// edges do not produce a gain step.
+    /// </para>
+    /// </remarks>
     public static float[] Resample(float[] samples, int srcRate, int dstRate)
     {
+        if (samples == null || samples.Length == 0) return samples ?? System.Array.Empty<float>();
+        if (srcRate <= 0) throw new ArgumentOutOfRangeException(nameof(srcRate));
+        if (dstRate <= 0) throw new ArgumentOutOfRangeException(nameof(dstRate));
         if (srcRate == dstRate) return samples;
 
         double ratio = (double)dstRate / srcRate;
         int outLength = (int)(samples.Length * ratio);
+        if (outLength <= 0) return System.Array.Empty<float>();
         var output = new float[outLength];
+
+        // Cutoff relative to the SOURCE Nyquist. Below 1.0 this IS the anti-aliasing low-pass.
+        double cutoff = Math.Min(1.0, ratio);
+        // Window half-width in source samples. Widening as the cutoff falls keeps the same number of sinc
+        // lobes, so the transition band does not degrade when downsampling hard.
+        double halfWidth = ResampleLobes / cutoff;
 
         for (int i = 0; i < outLength; i++)
         {
-            double srcPos = i / ratio;
-            int idx = (int)srcPos;
-            double frac = srcPos - idx;
+            double center = i / ratio;
+            int first = (int)Math.Ceiling(center - halfWidth);
+            int last = (int)Math.Floor(center + halfWidth);
+            if (first < 0) first = 0;
+            if (last >= samples.Length) last = samples.Length - 1;
 
-            if (idx + 1 < samples.Length)
-                output[i] = (float)(samples[idx] * (1 - frac) + samples[idx + 1] * frac);
-            else if (idx < samples.Length)
-                output[i] = samples[idx];
+            double acc = 0, norm = 0;
+            for (int j = first; j <= last; j++)
+            {
+                double t = center - j;
+                double weight = Sinc(cutoff * t) * BlackmanWindow(t / halfWidth);
+                acc += samples[j] * weight;
+                norm += weight;
+            }
+            output[i] = norm > 1e-9 ? (float)(acc / norm) : 0f;
         }
 
         return output;
+    }
+
+    /// <summary>Sinc lobes kept either side of an output sample. More lobes = sharper transition band.</summary>
+    private const int ResampleLobes = 8;
+
+    /// <summary>Normalised sinc, sin(pi x) / (pi x), with the removable singularity at 0 filled in.</summary>
+    private static double Sinc(double x)
+    {
+        if (Math.Abs(x) < 1e-9) return 1.0;
+        double px = Math.PI * x;
+        return Math.Sin(px) / px;
+    }
+
+    /// <summary>Blackman window over u in [-1, 1]; zero outside, which bounds the kernel.</summary>
+    private static double BlackmanWindow(double u)
+    {
+        if (u <= -1.0 || u >= 1.0) return 0.0;
+        return 0.42 + 0.5 * Math.Cos(Math.PI * u) + 0.08 * Math.Cos(2.0 * Math.PI * u);
     }
 
     /// <summary>

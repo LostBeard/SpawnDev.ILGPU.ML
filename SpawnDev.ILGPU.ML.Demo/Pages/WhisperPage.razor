@@ -317,6 +317,12 @@ const out = await pipe(audio);
     private MediaStreamCapture? _mic;
     private readonly List<float> _micSamples = new();
 
+    /// <summary>
+    /// The rate the MICROPHONE is actually running at (typically 48 kHz), reported by the capture.
+    /// We record at it and convert once at the end rather than resampling every 10 ms chunk.
+    /// </summary>
+    private int _micRate = WhisperSampleRate;
+
     private Task? _modelLoadTask;
 
     private async Task StartRecording()
@@ -334,7 +340,8 @@ const out = await pipe(audio);
         _recordingSeconds = 0;
         _transcription = null;
 
-        if (!await _mic.StartMicrophoneAsync(WhisperSampleRate))
+        // Native rate: one high-quality conversion at the end beats 900 per-chunk ones.
+        if (!await _mic.StartMicrophoneAsync())
         {
             _transcription = $"Error: could not open the microphone. {_mic.LastAudioError?.Message}";
             StateHasChanged();
@@ -359,7 +366,7 @@ const out = await pipe(audio);
         float[] samples;
         lock (_micSamples) samples = _micSamples.ToArray();
 
-        if (samples.Length < WhisperSampleRate / 2)
+        if (samples.Length < _micRate / 2)
         {
             _transcription = "That was too short to transcribe - hold the button for at least half a second.";
             StateHasChanged();
@@ -384,8 +391,19 @@ const out = await pipe(audio);
         }
         try
         {
-            _audioDurationSeconds = samples.Length / (double)WhisperSampleRate;
-            var result = await _pipeline.TranscribeAsync(samples, WhisperSampleRate);
+            _audioDurationSeconds = samples.Length / (double)_micRate;
+
+            // Report the LEVEL of what we captured, not just its length. Whisper answers silence with
+            // fluent, confident, entirely unrelated text, so a dead microphone and a working one produce
+            // equally plausible-looking transcripts - the difference is only visible in the audio itself.
+            double sumSq = 0;
+            for (int i = 0; i < samples.Length; i++) sumSq += samples[i] * (double)samples[i];
+            double rms = samples.Length > 0 ? Math.Sqrt(sumSq / samples.Length) : 0;
+            Console.WriteLine($"[Whisper] mic captured {_audioDurationSeconds:F1}s at {_micRate} Hz rms={rms:F4}"
+                            + (rms < 0.001 ? " - SILENT, the transcript below will be a hallucination" : ""));
+
+            // Pass the NATIVE rate: TranscribeAsync band-limits and resamples the whole recording once.
+            var result = await _pipeline.TranscribeAsync(samples, _micRate);
             _transcription = result.Text;
             _detectedLanguage = result.Language;
             _inferenceMs = result.InferenceTimeMs;
@@ -400,13 +418,28 @@ const out = await pipe(audio);
         StateHasChanged();
     }
 
+    private double _lastLevelLogSecond = -1;
+
     private void OnMicAudio(float[] chunk, int rate)
     {
+        _micRate = rate;
         double seconds;
         lock (_micSamples)
         {
             _micSamples.AddRange(chunk);
             seconds = _micSamples.Count / (double)rate;
+        }
+
+        // Report the LEVEL once a second while recording. A dead microphone and a live one look identical
+        // from sample counts alone - the counter advances either way - and Whisper turns silence into
+        // confident, fluent, unrelated text, so the level is the only signal that separates them.
+        if (Math.Floor(seconds) > _lastLevelLogSecond)
+        {
+            _lastLevelLogSecond = Math.Floor(seconds);
+            double sq = 0;
+            for (int i = 0; i < chunk.Length; i++) sq += chunk[i] * (double)chunk[i];
+            double lvl = chunk.Length > 0 ? Math.Sqrt(sq / chunk.Length) : 0;
+            Console.WriteLine($"[Whisper] level t={seconds:F0}s rms={lvl:F4}");
         }
 
         if (seconds >= MaxRecordSeconds)
