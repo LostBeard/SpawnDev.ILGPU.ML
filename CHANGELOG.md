@@ -2,6 +2,64 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.0 (2026-08-30)
+
+**Low-precision data stays low-precision.** Weights in bf16, FP8 or quantized int8/uint8 now live in GPU
+memory in their OWN type and are converted per element in the shader at the moment of use - they are no
+longer upcast to fp32 on load. Expanding on load costs 2x the memory for bf16 and 4x for FP8 and int8,
+which is precisely the memory a constrained device does not have and the reason those formats exist.
+
+The kernels could already do this (`MatMulLowPWeight<T>` has been generic over Half/BFloat16/Float8E* since
+PrecisionConvert shipped) and ILGPU already carried the types. The LOADER was the missing middle - it was
+hard-coded to `Half`, so nothing else had a route into GPU memory in its native type.
+
+### Added
+
+- `BufferPool.AllocateLowPWeightFromStreamAsync<T>` - streams a weight into a native-typed GPU buffer with
+  NO conversion (the ONNX raw_data layout IS the ILGPU type's layout) and returns a low-p `Tensor`. Refuses
+  a mismatched dtype rather than converting, because a silent cast here is the thing it exists to avoid.
+- `TensorDataType.Int8` / `UInt8` + `IntConvertKernels`: quantized weights stored at a quarter of the fp32
+  bytes; `DequantizeLinear` widens at use into a transient temp, leaving scale/zero-point broadcasting
+  unchanged.
+- FNUZ FP8 (`FLOAT8E4M3FNUZ` 18, `FLOAT8E5M2FNUZ` 20) via a dedicated decoder. These are NOT the OCP
+  formats: exponent bias is one higher, there are no infinities, and 0x80 is the only NaN - the same byte
+  means different numbers, so aliasing them onto the OCP types would have mis-decoded every weight.
+- `MaskKernels` - a causal mask is a pure function of its shape, so it is generated on the GPU instead of
+  uploaded. Every element is verified triangular first; anything else falls through untouched.
+- `ModelCache.OpenCachedStreamAsync` / `ModelHub.OpenStreamAsync` - the OPFS cache served as a seekable
+  `IJSReadStream`, and `CreateFromHuggingFaceAsync` now prefers it, so a browser model load no longer puts
+  the whole file on the managed heap.
+
+### Fixed
+
+- 🔴 **`ToFloatArray` silently returned an ALL-ZERO tensor** for any dtype missing from its size map: the
+  size defaulted to 4 bytes, raw_data then looked short, the decode was skipped, and every later branch
+  missed. A weight became zeros and the model produced garbage with nothing logged. Now throws.
+- 🔴 **bf16 and FP8 raw_data were decoded as fp16** in the streaming loader's managed fallback, whose else
+  arm treated anything-not-FLOAT32 as fp16. bf16 `0x3FC0` returned 1.9375 instead of 1.5.
+- 🔴 **The OPFS model cache stored HTTP error bodies as models.** `fetch` does not throw on 404 - it
+  resolves with `ok=false` and an error body, which was streamed, returned as the model AND CACHED, so the
+  failure resurfaced later, elsewhere, and identically on every subsequent run.
+- **Browser model downloads never actually streamed.** `ResponseHeadersRead` does nothing there without
+  opting in to response streaming, so a 329 MB model was buffered whole - and a swallowed OOM was then
+  retried by the fallback buffering it again.
+- `AllocatePermanentChunked` did not chunk its non-float fallback (one whole-tensor copy).
+- The documented `ModelHub` example named a repo/file pair that 404s; 18 of 27 `KnownModels` repos do not
+  use `onnx/model.onnx`, which nothing said.
+- 28 malformed-XML doc warnings (CS1570 now zero) - unescaped `&` and `<=` broke consumer IntelliSense.
+
+### Testing
+
+Every dtype the library CLAIMS is now verified exactly, on all six backends: 9 proto dtypes, 5 streaming
+dtypes, the native low-p types, FNUZ against hand-derived spec values, and int8/uint8 over the full 8-bit
+range. Before this, UINT8/INT8/INT32/INT64/BOOL/DOUBLE had no test anywhere. That coverage immediately
+caught the bf16/FP8 mis-decode and the silent-zeros bug.
+
+⚠️ Known: `TurboQuant_DistilGPT2_KVCacheCaptures` fails under the full sweep's memory pressure (8/8 in
+isolation). It is a TEST still on the byte[] path, holding a 329 MB array. Converting it to streaming is
+blocked on a proto-resident tensor the ONNX parser records no stream offset for - `streamThreshold` was
+tested twice as the lever and REJECTED both times.
+
 ## 5.1.5 (2026-08-29)
 
 No change to this library's own code. The version exists so the SpawnDev.Phonemizer 1.1.0 fixes reach

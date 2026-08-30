@@ -1,11 +1,11 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
+<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.1.5</Version>
-		<PackageReleaseNotes>v5.1.5 - Raises the SpawnDev.Phonemizer floor to 1.1.0 so its text-frontend fixes reach consumers transitively. No change in this package. See Changelog.</PackageReleaseNotes>
+		<Version>5.2.0</Version>
+		<PackageReleaseNotes>v5.2.0 - Low-precision weights now stay NATIVE in GPU memory instead of being upcast on load: bf16, FP8 (E4M3/E5M2) and quantized int8/uint8 keep their own bytes and are converted per-element in the shader at use. FNUZ FP8 (dtypes 18/20) supported. Causal masks are generated on the GPU rather than uploaded. Browser model loads stream from the OPFS cache without entering the .NET heap. FIXES: bf16/FP8 raw_data was decoded as fp16; ToFloatArray silently returned an ALL-ZERO tensor for any dtype missing from its size map; the OPFS cache stored HTTP error bodies as models; the browser download never actually streamed and retried an OOM by re-allocating. See Changelog.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
