@@ -4,14 +4,30 @@ using System.Text.Json;
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
 /// <summary>
-/// Reference tests for pipeline outputs: CLIP similarities, Whisper decoder tokens,
-/// text classification predictions. These validate end-to-end pipeline correctness
-/// against known Python-verified reference data.
+/// FIXTURE tests for the Python-generated reference data used elsewhere: CLIP similarities, Whisper
+/// decoder tokens, text-classification predictions.
+///
+/// <para>
+/// ⚠️ THESE DO NOT RUN THE MODEL. Each one loads a reference JSON and asserts that the JSON is
+/// internally consistent - the prefix is 4 tokens, the sequence ends with EOT,
+/// <c>steps[0].next_token == generated[0]</c>. Every assertion is about the FIXTURE, so all three pass
+/// unchanged if the entire ML library is deleted. They were previously named
+/// <c>Pipeline_*_Reference_*</c> and documented as validating "end-to-end pipeline correctness", and the
+/// status doc cited them as the evidence that <c>/clip</c> was VERIFIED and <c>/whisper</c> PARTIAL. That
+/// was wrong, and the names are now honest.
+/// </para>
+///
+/// <para>
+/// They still earn their place: a corrupt or regenerated fixture silently invalidates every test that
+/// compares against it, and these catch that. The tests that actually run our code against this data are
+/// <c>Reference_CLIPVision_MatchesOnnxRuntime</c>, <c>Reference_TextClassification_MatchesOnnxRuntime</c>
+/// and <c>Pipeline_Whisper_TranscribesKnownSpeech</c>.
+/// </para>
 /// </summary>
 public abstract partial class MLTestBase
 {
     [TestMethod]
-    public async Task Pipeline_CLIP_Reference_CatIsTopMatch()
+    public async Task ReferenceData_CLIP_FixtureIsWellFormed()
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -58,7 +74,7 @@ public abstract partial class MLTestBase
     }
 
     [TestMethod]
-    public async Task Pipeline_WhisperDecoder_Reference_440HzTone()
+    public async Task ReferenceData_WhisperDecoder_FixtureIsWellFormed()
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -102,7 +118,7 @@ public abstract partial class MLTestBase
     }
 
     [TestMethod]
-    public async Task Pipeline_TextClassification_Reference_Cases()
+    public async Task ReferenceData_TextClassification_FixtureIsWellFormed()
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");

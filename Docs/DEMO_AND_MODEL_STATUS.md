@@ -8,7 +8,9 @@
 - **🚧 WIP** — the page exists but the core action is a stub/no-op, or there is no end-to-end test yet. **Don't expect it to work.**
 - **Meta / Doc** — not an inference demo (tooling, onboarding, model browser).
 
-> Evidence basis: status reflects the cited E2E test (in `SpawnDev.ILGPU.ML.Demo.Shared/UnitTests/`) plus recent green runs. The **canonical** pass/fail at any moment is the latest `PlaywrightMultiTest` results JSON — run PMT to re-confirm before a release.
+> Evidence basis: status reflects the cited E2E test (in `SpawnDev.ILGPU.ML.Demo.Shared/UnitTests/`) plus recent green runs. The **canonical** pass/fail at any moment is the latest `PlaywrightMultiTest` results JSON - run PMT to re-confirm before a release.
+>
+> ⚠️ **A cited test only counts if it RUNS THE MODEL.** Three tests here were named `Pipeline_*_Reference_*` and documented as validating "end-to-end pipeline correctness" while only asserting that a reference JSON was internally consistent - they would pass with the ML library deleted, and two of them were this table's evidence. Before citing a test, check that it constructs an `InferenceSession` or calls a pipeline. Fixture-integrity tests are useful, but they are named `ReferenceData_*_FixtureIsWellFormed` and they are not evidence that a demo works.
 
 ## Demos
 
@@ -19,7 +21,7 @@
 | `/depth` | Depth estimation (Depth Anything) | ✅ **VERIFIED** | `Reference_DepthAnything_MatchesOnnxRuntime`, `DA3Small_DepthMap_NotFlat`, `CreateFromFile_DepthAnything_Inference` |
 | `/detect` | Object detection (YOLOv8) | ✅ **VERIFIED** | `Pipeline_YOLOv8_Reference_MatchesOnnxRuntime`, `Pipeline_YOLOv8_DetectsObjects` |
 | `/pose` | Pose estimation (MoveNet) | ✅ **VERIFIED** | `Reference_MoveNetLightning_MatchesOnnxRuntime`, `Pipeline_MoveNet_DetectsKeypoints` (asymmetric-pad decode fixed) |
-| `/clip` | Zero-shot classification (CLIP) | ✅ **VERIFIED** | `Pipeline_CLIP_Reference_CatIsTopMatch`, `Reference_CLIPVision_MatchesOnnxRuntime` |
+| `/clip` | Zero-shot classification (CLIP) | ✅ **VERIFIED** | `Reference_CLIPVision_MatchesOnnxRuntime` (runs the model against ORT). ⚠️ Previously also cited `Pipeline_CLIP_Reference_CatIsTopMatch`, which never ran the model - it asserted the reference JSON was well formed, and is now named `ReferenceData_CLIP_FixtureIsWellFormed` |
 | `/remove-bg` | Background removal (RMBG) | ✅ **VERIFIED** | `Pipeline_BackgroundRemoval_RealImage_ProducesVaryingMask` (perf caveats on WebGPU compile) |
 | `/super-res` | Super-resolution (ESPCN) | ✅ **VERIFIED** | `CreateFromFile_SuperResolution_ESPCN`, `HF_DownloadAndLoadSession_SuperResolution` |
 | `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | Transformers.js-style `GgufTextGenerationPipeline`: pick a `.gguf` → `BlobStream`→`CreateFromStreamAsync`→streaming chat on WebGPU. Engine verified on CUDA (qwen2.5:0.5b q8_0/q4_K_M ✅ coherent; smollm2:360m ✅ coherent (BPE-merge + RoPE NORM-style fix); gemma3:270m ✅ coherent (V-norm + sliding-window rope fix, matches Ollama)). Page mounts clean (Playwright, 0 console errors). In-browser file-pick→generate E2E = manual confirm (no model delivery in PMT yet) |
