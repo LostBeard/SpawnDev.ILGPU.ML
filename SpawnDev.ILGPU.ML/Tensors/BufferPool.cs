@@ -522,11 +522,12 @@ public class BufferPool : IDisposable
         // ⚠️ The FNUZ FP8 variants (18 = E4M3FNUZ, 20 = E5M2FNUZ) are deliberately NOT mapped onto the plain
         // types: they differ in NaN/zero encoding, so accepting them would silently mis-decode weights. Integer
         // and DOUBLE dtypes need a cast kernel rather than PrecisionConvert and are a separate change.
-        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, 16 => 2, 17 => 1, 19 => 1, _ => 0 };
+        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, 16 => 2, 17 => 1, 19 => 1, 18 => 1, 20 => 1, _ => 0 };
         if (srcElemBytes == 0)
             throw new NotSupportedException(
-                $"Streaming load supports FLOAT32 (1), FLOAT16 (10), BFLOAT16 (16), FLOAT8E4M3 (17) and " +
-                $"FLOAT8E5M2 (19) raw_data; got dtype {dataType} for '{name}'. " +
+                $"Streaming load supports FLOAT32 (1), FLOAT16 (10), BFLOAT16 (16), FLOAT8E4M3 (17), " +
+                $"FLOAT8E5M2 (19), FLOAT8E4M3FNUZ (18) and FLOAT8E5M2FNUZ (20) raw_data; got dtype " +
+                $"{dataType} for '{name}'. " +
                 "Load this model via CreateFromOnnx(byte[]).");
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
@@ -552,7 +553,8 @@ public class BufferPool : IDisposable
         // ReadExact + CopyFromCPU loop below for the common SD-Turbo (fp16) weight case, which was pulling
         // every weight through .NET (Captain 2026-07-05). Works on all backends (browser gets true zero-copy;
         // desktop streams managed into the Half buffer, still a GPU convert not a CPU one).
-        if (dataType != 1 && byteLength == (long)count * srcElemBytes && !DisableJsZeroCopyWeights)
+        bool hasNativeType = dataType is 10 or 16 or 17 or 19;   // FNUZ (18/20) has no ILGPU type - managed decode
+        if (hasNativeType && byteLength == (long)count * srcElemBytes && !DisableJsZeroCopyWeights)
         {
             // Every low-p float dtype takes the SAME shape: stream the raw bytes into a native temp of the
             // matching ILGPU type (no conversion - the layouts are identical), then ONE generic GPU upcast.
@@ -605,6 +607,12 @@ public class BufferPool : IDisposable
             else if (dataType == 19) // FLOAT8E5M2
                 for (int i = 0; i < n; i++)
                     floatChunk[i] = (float)global::ILGPU.Float8E5M2.FromRawBits(byteBuf[i]);
+            else if (dataType == 18) // FLOAT8E4M3FNUZ - bias 8, NOT the OCP E4M3 ILGPU carries
+                for (int i = 0; i < n; i++)
+                    floatChunk[i] = SpawnDev.ILGPU.ML.Onnx.Fp8Fnuz.E4M3FnuzToFloat(byteBuf[i]);
+            else if (dataType == 20) // FLOAT8E5M2FNUZ - bias 16, NOT the OCP E5M2 ILGPU carries
+                for (int i = 0; i < n; i++)
+                    floatChunk[i] = SpawnDev.ILGPU.ML.Onnx.Fp8Fnuz.E5M2FnuzToFloat(byteBuf[i]);
             else
                 throw new NotSupportedException($"managed fallback has no decode for dtype {dataType} ('{name}')");
 

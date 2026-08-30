@@ -114,6 +114,16 @@ public class OnnxTensorProto
         11 => 8,  // DOUBLE
         12 => 4,  // UINT32
         16 => 2,  // BFLOAT16
+        4 => 2,   // UINT16
+        13 => 8,  // UINT64
+        17 => 1,  // FLOAT8E4M3FN
+        18 => 1,  // FLOAT8E4M3FNUZ
+        19 => 1,  // FLOAT8E5M2
+        20 => 1,  // FLOAT8E5M2FNUZ
+        // ⚠️ Defaulting an UNKNOWN dtype to 4 is load-bearing and dangerous: ToFloatArray computes
+        // expectedBytes from this, and a wrong size makes raw_data look SHORT, which used to skip the
+        // decode and return an ALL-ZERO tensor silently. The throw in ToFloatArray now catches that, but
+        // any new dtype belongs in this map first.
         _ => 4,   // Default to float32 size
     };
 
@@ -151,6 +161,10 @@ public class OnnxTensorProto
                 3 => ReadRawInt8sAsFloats(rawData, count),    // INT8
                 16 => ReadRawBFloat16sAsFloats(rawData, count), // BFLOAT16
                 9 => ReadRawBoolsAsFloats(rawData, count),     // BOOL
+                17 => ReadRawFp8AsFloats(rawData, count, e5m2: false), // FLOAT8E4M3FN (OCP)
+                19 => ReadRawFp8AsFloats(rawData, count, e5m2: true),  // FLOAT8E5M2 (OCP)
+                18 => ReadRawFp8FnuzAsFloats(rawData, count, e5m2: false), // FLOAT8E4M3FNUZ
+                20 => ReadRawFp8FnuzAsFloats(rawData, count, e5m2: true),  // FLOAT8E5M2FNUZ
                 _ => throw new NotSupportedException($"Unsupported tensor data type: {DataType}")
             };
         }
@@ -161,10 +175,38 @@ public class OnnxTensorProto
         if (Int64Data != null) return Int64Data.Select(x => (float)x).ToArray();
         if (DoubleData != null) return DoubleData.Select(x => (float)x).ToArray();
 
-        return new float[count]; // Empty tensor
+        // 🔴 Raw bytes were present but no branch above consumed them - previously this fell through and
+        // returned an ALL-ZERO tensor, so a weight silently became zeros and the model just produced
+        // garbage with nothing logged. Fail loud instead, naming the dtype and both sizes.
+        if (rawData != null && rawData.Length > 0)
+            throw new NotSupportedException(
+                $"Tensor '{Name}': {rawData.Length} raw bytes of dtype {DataType} could not be decoded " +
+                $"(expected {expectedBytes} bytes for {count} elements). Returning zeros would hide this.");
+
+        return new float[count]; // genuinely empty tensor (no raw data, no typed data)
     }
 
     // ── Raw data converters ──
+
+    /// <summary>OCP FP8 (E4M3FN / E5M2) raw bytes to floats, via the ILGPU types that define those layouts.</summary>
+    private static float[] ReadRawFp8AsFloats(byte[] raw, int count, bool e5m2)
+    {
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = e5m2
+                ? (float)global::ILGPU.Float8E5M2.FromRawBits(raw[i])
+                : (float)global::ILGPU.Float8E4M3.FromRawBits(raw[i]);
+        return result;
+    }
+
+    /// <summary>FNUZ FP8 raw bytes to floats. NOT the OCP layouts - see <see cref="Fp8Fnuz"/>.</summary>
+    private static float[] ReadRawFp8FnuzAsFloats(byte[] raw, int count, bool e5m2)
+    {
+        var result = new float[count];
+        for (int i = 0; i < count; i++)
+            result[i] = e5m2 ? Fp8Fnuz.E5M2FnuzToFloat(raw[i]) : Fp8Fnuz.E4M3FnuzToFloat(raw[i]);
+        return result;
+    }
 
     private static float[] ReadRawFloats(byte[] raw, int count)
     {
@@ -308,6 +350,14 @@ public class OnnxTensorProto
                 case 9: // BOOL
                     for (int i = 0; i < count; i++)
                         target[targetOffset + i] = RawData[i] != 0 ? 1f : 0f;
+                    return;
+                case 18: // FLOAT8E4M3FNUZ — bias 8, no inf, 0x80 is the only NaN (NOT OCP E4M3)
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = Fp8Fnuz.E4M3FnuzToFloat(RawData[i]);
+                    return;
+                case 20: // FLOAT8E5M2FNUZ — bias 16, no inf, 0x80 is the only NaN (NOT OCP E5M2)
+                    for (int i = 0; i < count; i++)
+                        target[targetOffset + i] = Fp8Fnuz.E5M2FnuzToFloat(RawData[i]);
                     return;
             }
         }

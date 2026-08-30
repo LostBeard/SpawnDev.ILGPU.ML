@@ -210,4 +210,85 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DType] all {cases.Length} claimed streaming dtypes load exactly (1,10,16,17,19)");
     });
+
+    /// <summary>
+    /// The FNUZ FP8 formats - FLOAT8E4M3FNUZ (18) and FLOAT8E5M2FNUZ (20) - through both load paths.
+    /// </summary>
+    /// <remarks>
+    /// These were previously unsupported EVERYWHERE, and deliberately so: they are not the OCP formats
+    /// ILGPU carries. The exponent bias is one higher (8 vs 7, 16 vs 15), there are no infinities, and 0x80
+    /// is the only NaN rather than negative zero. Aliasing them onto Float8E4M3/Float8E5M2 would have
+    /// mis-decoded every weight by a factor of two while still producing plausible numbers.
+    /// <para>
+    /// ⚠️ The expected values are derived BY HAND from the format definition, not produced by our own
+    /// decoder - a round-trip through the code under test proves only self-consistency. The
+    /// <c>0x38</c> case is the load-bearing one: it is 1.0 in OCP E4M3 and 0.5 in E4M3FNUZ, so aliasing
+    /// would fail exactly there.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public Task DType_Fp8FnuzVariants_DecodeToSpec() => RunTest(async accelerator =>
+    {
+        // (raw byte, expected value) — hand-derived from the FNUZ definitions.
+        // E4M3FNUZ: 1 sign, 4 exp, 3 mant, bias 8.
+        var e4m3 = new (byte Raw, float Expect)[]
+        {
+            (0x00, 0f),        // zero
+            (0x38, 0.5f),      // exp 7, mant 0 -> 2^(7-8)          ⚠️ 1.0 in OCP E4M3
+            (0x40, 1.0f),      // exp 8, mant 0 -> 2^0
+            (0x48, 2.0f),      // exp 9, mant 0 -> 2^1
+            (0x41, 1.125f),    // exp 8, mant 1 -> (1+1/8)*2^0
+            (0xC0, -1.0f),     // sign 1, exp 8 -> -1
+        };
+        // E5M2FNUZ: 1 sign, 5 exp, 2 mant, bias 16.
+        var e5m2 = new (byte Raw, float Expect)[]
+        {
+            (0x00, 0f),
+            (0x3C, 0.5f),      // exp 15 -> 2^-1
+            (0x40, 1.0f),      // exp 16 -> 2^0
+            (0x44, 2.0f),      // exp 17 -> 2^1
+            (0x41, 1.25f),     // exp 16, mant 1 -> (1+1/4)
+            (0xC0, -1.0f),
+        };
+
+        using var pool = new BufferPool(accelerator);
+        var failures = new List<string>();
+
+        foreach (var (dtype, label, cases) in new (int, string, (byte Raw, float Expect)[])[]
+                 { (18, "E4M3FNUZ", e4m3), (20, "E5M2FNUZ", e5m2) })
+        {
+            var raw = cases.Select(c => c.Raw).ToArray();
+            var want = cases.Select(c => c.Expect).ToArray();
+
+            // Path 1: the proto / host path (ToFloatArray).
+            var proto = new OnnxTensorProto
+            {
+                Name = $"fnuz_{label}", DataType = dtype,
+                Dims = new long[] { raw.Length }, RawData = raw,
+            };
+            var t1 = pool.AllocatePermanentChunked(proto, new[] { raw.Length }, proto.Name);
+            await accelerator.SynchronizeAsync();
+            var got1 = await t1.Data.SubView(0, raw.Length).CopyToHostAsync();
+
+            // Path 2: the streaming loader.
+            using var ms = new MemoryStream(raw);
+            var t2 = await pool.AllocatePermanentFromStreamAsync(ms, 0, raw.Length, dtype, new[] { raw.Length }, proto.Name);
+            await pool.FlushPendingFp16ConvertsAsync();
+            await accelerator.SynchronizeAsync();
+            var got2 = await t2.Data.SubView(0, raw.Length).CopyToHostAsync();
+
+            for (int i = 0; i < want.Length; i++)
+            {
+                if (MathF.Abs(got1[i] - want[i]) > 1e-6f)
+                    failures.Add($"{label} proto 0x{cases[i].Raw:X2}: got {got1[i]}, expected {want[i]}");
+                if (MathF.Abs(got2[i] - want[i]) > 1e-6f)
+                    failures.Add($"{label} stream 0x{cases[i].Raw:X2}: got {got2[i]}, expected {want[i]}");
+            }
+        }
+
+        if (failures.Count > 0)
+            throw new Exception($"{failures.Count} FNUZ decode mismatch(es): " + string.Join(" | ", failures));
+
+        Console.WriteLine("[DType] FNUZ FP8 (18, 20) decode to spec on both the proto and streaming paths");
+    });
 }
