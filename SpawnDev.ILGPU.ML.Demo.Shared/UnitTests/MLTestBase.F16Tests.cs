@@ -903,9 +903,14 @@ public abstract partial class MLTestBase
             ms, 0, raw.Length, 16 /* ONNX BFLOAT16 */, new[] { K, N }, "w");
 
         // NOT EXPANDED: the GPU view is bf16-typed and exactly K*N elements = raw.Length bytes.
-        if (w.Data.Length != K * N)
-            throw new Exception($"native bf16 view length {w.Data.Length}, expected {K * N}");
-        long gpuBytes = w.Data.Length * 2;
+        if (w.DType != SpawnDev.ILGPU.ML.Tensors.TensorDataType.BFloat16)
+            throw new Exception($"loaded weight DType={w.DType}, expected BFloat16 - it was converted, not kept native");
+        var wView = w.AsView<global::ILGPU.BFloat16>();
+        if (wView.Length != K * N)
+            throw new Exception($"native bf16 view length {wView.Length}, expected {K * N}");
+        if (w.Data.Length != 0)
+            throw new Exception($"a native low-p weight must allocate NO float buffer, but Data.Length={w.Data.Length}");
+        long gpuBytes = wView.Length * 2;
         if (gpuBytes != raw.Length)
             throw new Exception($"weight occupies {gpuBytes} GPU bytes but the source was {raw.Length} - it was EXPANDED on load");
 
@@ -933,7 +938,7 @@ public abstract partial class MLTestBase
         using var aBuf = accelerator.Allocate1D(a);
         using var cBuf = accelerator.Allocate1D<float>(M * N);
         var mm = new MatMulKernel(accelerator);
-        mm.MatMulLowPWeight(aBuf.View, w.Data, cBuf.View, M, K, N);
+        mm.MatMulLowPWeight(aBuf.View, wView, cBuf.View, M, K, N);
         await accelerator.SynchronizeAsync();
         var gpuC = await cBuf.CopyToHostAsync<float>(0, M * N);
 

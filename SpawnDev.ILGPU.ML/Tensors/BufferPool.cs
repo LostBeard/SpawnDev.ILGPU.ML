@@ -638,8 +638,9 @@ public class BufferPool : IDisposable
     /// <param name="shape">Weight shape.</param>
     /// <param name="name">Optional weight name.</param>
     /// <param name="ct">Cancellation.</param>
-    /// <returns>A shape-tracked view over the native-typed GPU buffer.</returns>
-    public async Task<LowPTensor<T>> AllocateLowPWeightFromStreamAsync<T>(
+    /// <returns>A low-p-backed <see cref="Tensor"/>: DType set, native view readable via <c>AsView&lt;T&gt;()</c>,
+    /// no float buffer allocated. Stays Tensor-typed so the executor map and op dispatch need no change.</returns>
+    public async Task<Tensor> AllocateLowPWeightFromStreamAsync<T>(
         Stream stream, long byteOffset, int byteLength, int dataType, int[] shape,
         string? name = null, CancellationToken ct = default)
         where T : unmanaged, System.Numerics.INumber<T>
@@ -647,7 +648,7 @@ public class BufferPool : IDisposable
         int count = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
         var buffer = _accelerator.Allocate1D<T>(count);
         _allLowPBuffers.Add(buffer);
-        if (count == 0) return new LowPTensor<T>(buffer.View, shape, name);
+        if (count == 0) return Tensor.FromLowP<T>(buffer.View, (TensorDataType)dataType, shape, name);
 
         // The dtype must MATCH the requested storage type - see the refusal note above.
         int expectBytes = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
@@ -674,7 +675,7 @@ public class BufferPool : IDisposable
         await buffer.View.CopyFromStreamAsync(stream, cancellationToken: ct).ConfigureAwait(false);
         if (stream is SpawnDev.SpawnJS.Toolbox.IJSReadStream && buffer.Buffer is SpawnDev.ILGPU.IBrowserMemoryBuffer)
             ZeroCopyWeightBytes += byteLength; // count only the true JS->GPU zero-copy path
-        return new LowPTensor<T>(buffer.View, shape, name);
+        return Tensor.FromLowP<T>(buffer.View, (TensorDataType)dataType, shape, name);
     }
 
     /// <summary>
