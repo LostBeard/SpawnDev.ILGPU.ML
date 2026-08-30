@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.2 (2026-08-30)
+
+### Fixed
+
+- **The OPFS model cache could not download from a WORKER.** `ModelCache.DownloadWithProgressAsync` fetched
+  via `_js.Get<Window>("window").Fetch(url)`, and there IS no `window` in a worker - the global scope is a
+  `WorkerGlobalScope` - so it threw a bare `NullReferenceException` with nothing naming the cause. A worker
+  is precisely where a model SHOULD be loaded (SpawnDev.AI runs its accelerator and model registry in a
+  shared worker), so the hub's streaming cache was unusable from the scope that needs it most. It now
+  fetches through `SpawnJSRuntime.Fetch`, which calls `fetch` on whatever the global scope is and therefore
+  works in window, dedicated worker, shared worker and service worker alike. The `navigator.storage` half
+  was already scope-agnostic - only the download was broken. Found by SpawnDev.AI's new browser speech tests,
+  which load Whisper from inside the worker.
+
 ## 5.2.1 (2026-08-30)
 
 ### Fixed

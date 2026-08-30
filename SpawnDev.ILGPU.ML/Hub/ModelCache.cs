@@ -298,8 +298,16 @@ public class ModelCache : IDisposable
 
     private async Task<byte[]> DownloadWithProgressAsync(string url)
     {
-        // Use fetch for streaming progress
-        using var response = await _js.Get<Window>("window").Fetch(url);
+        // Use fetch for streaming progress.
+        // ⚠️ Fetch from the RUNTIME, not from `window`. There IS no `window` in a worker - the global scope
+        // is a WorkerGlobalScope - so `Get<Window>("window")` returned null there and this threw a bare
+        // NullReferenceException. That made the OPFS model cache unusable from a worker, which is precisely
+        // where a model SHOULD be loaded: SpawnDev.AI runs its GPU and model registry in a shared worker,
+        // and hit this the first time anything asked the hub for a model from that scope (2026-08-30).
+        // SpawnJSRuntime.Fetch calls "fetch" on whatever the global scope is, so it works in window,
+        // dedicated worker, shared worker and service worker alike. `navigator.storage` below is already
+        // scope-agnostic, so the cache half was never the problem - only the download.
+        using var response = await _js.Fetch(url);
 
         // fetch() does NOT throw on 404/500 — it resolves with ok=false and an ERROR BODY. Without this
         // check that body was streamed, returned as if it were the model, and then WRITTEN TO THE OPFS

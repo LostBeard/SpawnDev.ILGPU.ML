@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.1</Version>
-		<PackageReleaseNotes>v5.2.1 - Correctness release. FIVE out-of-bounds reads fixed, all found after rewriting six KV tests that asserted nothing. DequantizeLinear read past the end of a per-tensor scale/zero_point (the ONNX default) - this is the operator 5.2.0's native int8/uint8 weights widen through, so any real quantized model hit it. MatMulInteger did the same for per-row/per-column zero points, and needed a new per-ROW broadcast (AddBias is per-column and silently computes a different product). Sum/Mean read past a broadcasting input. QuantizedKVCache had been GUESSING every model's geometry as 12 heads x 64 - correct for GPT-2, wrong for whisper (6 heads), which read 384 floats off the end. KVCacheAnalyzer conflated .encoder. cross-attention with .decoder. self-attention. The GPU causal-mask generator was gated on rank 2 and had never once fired on the rank-4 mask it was written for. Full sweep 4634 passed / 0 failed on all six backends. See Changelog.</PackageReleaseNotes>
+		<Version>5.2.2</Version>
+		<PackageReleaseNotes>v5.2.2 - FIX: the OPFS model cache could not download from a WORKER. ModelCache.DownloadWithProgressAsync fetched via `window`, which does not exist in a WorkerGlobalScope, so it threw a bare NullReferenceException - and a worker is exactly where a model should be loaded. It now fetches from the runtime's global scope, which works in window, dedicated worker, shared worker and service worker alike. See Changelog.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
