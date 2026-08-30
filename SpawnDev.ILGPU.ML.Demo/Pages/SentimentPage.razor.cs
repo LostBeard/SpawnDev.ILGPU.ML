@@ -14,6 +14,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class SentimentPage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private Context? _context;
@@ -57,14 +58,17 @@ public partial class SentimentPage : IDisposable
             // Real WordPiece tokenizer straight from the model repo's tokenizer.json.
             _modelProgress = 30;
             StateHasChanged();
-            var tokJson = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
+            var tokJson = await hub.LoadSmallFileAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
             _tokenizer = TokenizerLoader.FromTokenizerJson(Encoding.UTF8.GetString(tokJson));
 
             // The fp32 ONNX classifier.
             _modelProgress = 50;
             StateHasChanged();
-            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "onnx/model.onnx");
-            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.DistilBertSST2, "onnx/model.onnx",
+                webTorrent: Torrents, http: Http);
             _pipeline = new TextClassificationPipeline(session, _accelerator);
 
             _isModelLoaded = true;

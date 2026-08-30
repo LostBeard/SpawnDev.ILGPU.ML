@@ -134,6 +134,8 @@ const out = await pipe(imageUrl, labels);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -165,19 +167,25 @@ const out = await pipe(imageUrl, labels);
             // Load CLIP vision model
             _modelProgress = 20;
             StateHasChanged();
-            var visionBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxVisionModel);
-            var visionSession = InferenceSession.CreateFromFile(_accelerator, visionBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var visionSession = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxVisionModel,
+                webTorrent: Torrents, http: Http);
 
             // Load CLIP text model
             _modelProgress = 60;
             StateHasChanged();
-            var textBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxTextModel);
-            var textSession = InferenceSession.CreateFromFile(_accelerator, textBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var textSession = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxTextModel,
+                webTorrent: Torrents, http: Http);
 
             // Load tokenizer
             _modelProgress = 90;
             StateHasChanged();
-            var tokenizerBytes = await hub.LoadAsync(ModelHub.KnownModels.CLIPVitB32, "tokenizer.json");
+            var tokenizerBytes = await hub.LoadSmallFileAsync(ModelHub.KnownModels.CLIPVitB32, "tokenizer.json");
             var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
 
             _pipeline = new ZeroShotClassificationPipeline(visionSession, textSession, _accelerator);

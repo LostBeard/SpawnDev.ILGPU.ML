@@ -230,6 +230,8 @@
     private int _nextCharId = 3;
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
     private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -253,11 +255,12 @@
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) return;
             using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2,
-                "onnx/decoder_model.onnx");
-            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
-            var tokenizerBytes = await hub.LoadAsync(
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "onnx/decoder_model.onnx",
+                webTorrent: Torrents, http: Http);
+            var tokenizerBytes = await hub.LoadSmallFileAsync(
                 SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
             _textGenPipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);
             _textGenPipeline.LoadTokenizer(System.Text.Encoding.UTF8.GetString(tokenizerBytes));

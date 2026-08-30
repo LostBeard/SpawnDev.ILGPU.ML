@@ -14,6 +14,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class BenchmarkPage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private Context? _context;
@@ -197,8 +198,11 @@ public partial class BenchmarkPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
             using var hub1 = new ModelHub(JS);
-            var sqBytes = await hub1.LoadAsync(ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
-            var session = InferenceSession.CreateFromFile(accelerator, sqBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                accelerator, hub1, ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx",
+                webTorrent: Torrents, http: Http);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new ClassificationPipeline(session, accelerator);
@@ -246,8 +250,11 @@ public partial class BenchmarkPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
             using var hub2 = new ModelHub(JS);
-            var srBytes = await hub2.LoadAsync(ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx");
-            var session = InferenceSession.CreateFromFile(accelerator, srBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                accelerator, hub2, ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx",
+                webTorrent: Torrents, http: Http);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new SuperResolutionPipeline(session, accelerator);
@@ -294,8 +301,11 @@ public partial class BenchmarkPage : IDisposable
         {
             var sw = Stopwatch.StartNew();
             using var hub3 = new ModelHub(JS);
-            var stBytes = await hub3.LoadAsync(ModelHub.KnownModels.StyleMosaic, "mosaic-9.onnx");
-            var session = InferenceSession.CreateFromFile(accelerator, stBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                accelerator, hub3, ModelHub.KnownModels.StyleMosaic, "mosaic-9.onnx",
+                webTorrent: Torrents, http: Http);
             var loadMs = sw.Elapsed.TotalMilliseconds;
 
             var pipeline = new StyleTransferPipeline(session, accelerator);

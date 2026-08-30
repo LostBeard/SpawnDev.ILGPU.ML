@@ -179,6 +179,8 @@ const out = await pipe(audio);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -210,19 +212,25 @@ const out = await pipe(audio);
             // Load encoder
             _modelProgress = 20;
             StateHasChanged();
-            var encoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx");
-            var encoderSession = InferenceSession.CreateFromFile(_accelerator, encoderBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var encoderSession = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx",
+                webTorrent: Torrents, http: Http);
 
             // Load decoder
             _modelProgress = 60;
             StateHasChanged();
-            var decoderBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx");
-            var decoderSession = InferenceSession.CreateFromFile(_accelerator, decoderBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var decoderSession = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx",
+                webTorrent: Torrents, http: Http);
 
             // Load tokenizer
             _modelProgress = 90;
             StateHasChanged();
-            var tokenizerBytes = await hub.LoadAsync(ModelHub.KnownModels.WhisperTiny, "tokenizer.json");
+            var tokenizerBytes = await hub.LoadSmallFileAsync(ModelHub.KnownModels.WhisperTiny, "tokenizer.json");
             var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
 
             _pipeline = new SpeechRecognitionPipeline(encoderSession, decoderSession, _accelerator);

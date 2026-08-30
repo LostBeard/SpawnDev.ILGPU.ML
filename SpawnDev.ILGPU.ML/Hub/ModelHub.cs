@@ -5,7 +5,29 @@ using SpawnDev.SpawnJS.Toolbox;
 namespace SpawnDev.ILGPU.ML.Hub;
 
 /// <summary>
-/// Download ONNX models from HuggingFace Hub or any URL with browser-side OPFS caching.
+/// The model CATALOGUE, HuggingFace metadata, and OPFS cache administration.
+/// </summary>
+/// <remarks>
+/// 🔴 <b>This is NOT how model WEIGHTS should be delivered.</b> Use
+/// <see cref="HubModelStream.OpenAsync"/>, which adds the file as a LAZY-HASH torrent: streamable with
+/// RANDOM ACCESS, cached to OPFS by piece under a stable URL-derived key, resumed and RESTORED on reload
+/// with zero re-download, and seeded to peers. Lazy-hash exists precisely so anything reachable by URL gets
+/// that for free.
+/// <para>
+/// This class PREDATES lazy-hash (this file 2026-03-19, <c>HubModelStream</c> 2026-06-02) and its original
+/// <c>LoadAsync</c> shape returns the whole model as a <c>byte[]</c> - in the browser, onto the
+/// single-threaded WASM heap - and re-downloads whenever the OPFS entry is absent. Those members are now
+/// obsolete FOR WEIGHTS, so reaching for them is a compiler warning rather than a habit.
+/// </para>
+/// <para>
+/// Still the right tool for: <see cref="KnownModels"/> / <see cref="KnownFiles"/> (the repo+file catalogue,
+/// including which repos do NOT use <c>onnx/model.onnx</c>); <see cref="LoadSmallFileAsync"/> for a
+/// tokenizer or config, where a few hundred KB on the heap is fine and a torrent would be silly; cache
+/// administration (<see cref="IsCachedAsync"/>, <see cref="ListCachedAsync"/>,
+/// <see cref="GetCacheSizeAsync"/>, <see cref="ClearCacheAsync"/>); and HuggingFace API access via
+/// <see cref="HuggingFaceClient"/>.
+/// </para>
+/// <para>
 /// Models are cached locally so they only download once — subsequent loads are instant.
 /// <para>
 /// For API access (search, metadata, file listing) without caching, use
@@ -64,6 +86,7 @@ public class ModelHub : IDisposable
     /// <param name="repoId">Repository ID (e.g., "onnx-community/mobilenetv2-12")</param>
     /// <param name="filename">File within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
     /// <param name="revision">Git revision (default: "main")</param>
+    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public async Task<byte[]> LoadAsync(string repoId, string filename, string revision = "main")
     {
         // HuggingFace CDN with OPFS cache (SpawnDev.WebTorrent 3.x: P2P hub delivery is via
@@ -76,6 +99,7 @@ public class ModelHub : IDisposable
     /// <summary>
     /// Load a file from any URL with caching.
     /// </summary>
+    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public Task<byte[]> LoadFromUrlAsync(string url, string? cacheKey = null)
     {
         return _cache.GetOrFetchAsync(url, cacheKey);
@@ -101,6 +125,7 @@ public class ModelHub : IDisposable
     /// <param name="filename">File within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
     /// <param name="revision">Git revision (default: "main")</param>
     /// <returns>A seekable JS-side stream, or null when OPFS is unavailable. Caller disposes it.</returns>
+    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public Task<BlobStream?> OpenStreamAsync(string repoId, string filename, string revision = "main")
     {
         var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
@@ -112,6 +137,7 @@ public class ModelHub : IDisposable
     /// Open any URL as a seekable, JS-side stream with OPFS caching. Streaming counterpart to
     /// <see cref="LoadFromUrlAsync"/>; see <see cref="OpenStreamAsync"/> for why this is preferred.
     /// </summary>
+    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public Task<BlobStream?> OpenStreamFromUrlAsync(string url, string? cacheKey = null)
     {
         return _cache.GetOrFetchStreamAsync(url, cacheKey);
@@ -121,6 +147,7 @@ public class ModelHub : IDisposable
     /// Load multiple files from a HuggingFace repo (e.g., weights + manifest + graph).
     /// Downloads happen concurrently.
     /// </summary>
+    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public async Task<Dictionary<string, byte[]>> LoadMultipleAsync(
         string repoId, string[] filenames, string revision = "main")
     {
@@ -138,6 +165,29 @@ public class ModelHub : IDisposable
     /// <summary>
     /// Check if a model file is already cached locally.
     /// </summary>
+    /// <summary>
+    /// Load a SMALL companion file - a tokenizer, a config, a vocabulary - with OPFS caching.
+    /// </summary>
+    /// <remarks>
+    /// The honest counterpart to the obsolete weight loaders. A <c>tokenizer.json</c> is a few hundred KB
+    /// and is parsed as text, so a <c>byte[]</c> is the right shape and a torrent would be pure overhead -
+    /// the "bulk bytes stay off the managed heap" rule is about model WEIGHTS. Named so the intent is
+    /// visible at the call site: if you find yourself passing an <c>.onnx</c> to this, use
+    /// <see cref="HubModelStream.OpenAsync"/> instead.
+    /// </remarks>
+    /// <param name="repoId">HuggingFace repo, e.g. from <see cref="KnownModels"/>.</param>
+    /// <param name="filename">File within the repo, e.g. <c>tokenizer.json</c>.</param>
+    /// <param name="revision">Git revision; defaults to <c>main</c>.</param>
+    /// <returns>The file's bytes.</returns>
+    public Task<byte[]> LoadSmallFileAsync(string repoId, string filename, string revision = "main")
+    {
+        var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
+        var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
+#pragma warning disable CS0618 // the small-file path is the SUPPORTED use of the byte[] cache
+        return _cache.GetOrFetchAsync(url, cacheKey);
+#pragma warning restore CS0618
+    }
+
     public Task<bool> IsCachedAsync(string repoId, string filename, string revision = "main")
     {
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";

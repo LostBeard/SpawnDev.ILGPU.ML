@@ -180,8 +180,11 @@
     private const string _howToCs = """
 // Load YOLOv8-Nano onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
 using var hub = new ModelHub(JS);
-var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx");
-var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+// by piece, restored on reload with no re-download, and seeded to peers.
+var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    accelerator, hub, ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx",
+    webTorrent: Torrents, http: Http);
 var pipeline = new ObjectDetectionPipeline(session, accelerator);
 
 // Detect objects in an RGBA image — runs entirely on the GPU
@@ -206,6 +209,8 @@ const out = await pipe(imageUrl);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -232,8 +237,11 @@ const out = await pipe(imageUrl);
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
             using var hub = new Hub.ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx");
-            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, Hub.ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx",
+                webTorrent: Torrents, http: Http);
             _pipeline = new Pipelines.ObjectDetectionPipeline(session, _accelerator);
 
             _isModelLoaded = true;

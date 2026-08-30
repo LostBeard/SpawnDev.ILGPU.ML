@@ -615,8 +615,49 @@ public class InferenceSession : IDisposable
         Accelerator accelerator, Hub.ModelHub hub,
         string repoId, string filename, string revision = "main",
         Action<string, int>? onProgress = null,
-        Dictionary<string, int[]>? inputShapes = null)
+        Dictionary<string, int[]>? inputShapes = null,
+        SpawnDev.WebTorrent.WebTorrentClient? webTorrent = null,
+        HttpClient? http = null)
     {
+        // ── PREFERRED: lazy-hash torrent through the hub ────────────────────────────────────────────────
+        // Supply webTorrent + http and the model is delivered by HubModelStream.OpenAsync: a PERSISTENT
+        // torrent from the first byte, streamable with RANDOM ACCESS, cached to OPFS by piece under a stable
+        // URL-derived key, resumed and RESTORED on reload with zero re-download, and seeded to peers. That
+        // is what lazy-hash was built for, and it is strictly better than either branch below.
+        //
+        // ⚠️ Without those two arguments this falls back to ModelHub, which PREDATES lazy-hash: its stream
+        // path is an OPFS blob (no torrent, no resume, no P2P, re-fetched when the cache entry is absent)
+        // and its byte[] path puts the whole model on the single-threaded WASM heap. Both are obsolete for
+        // weights. The fallback is kept so existing callers keep working, not because it is equivalent -
+        // pass the client.
+        if (webTorrent != null && http != null && revision == "main")
+        {
+            var lazy = new Hub.HubModelStream(webTorrent, http);
+            // deselect:false - we need the weights, not just the structure.
+            var model = await lazy.OpenAsync(repoId, filename, deselect: false).ConfigureAwait(false);
+            await using (model.Stream)
+            {
+                var lazyProbe = await Onnx.OnnxParser.ParseFromStreamAsync(model.Stream, 1024 * 1024)
+                    .ConfigureAwait(false);
+                if (!Onnx.OnnxLoader.HasExternalData(lazyProbe))
+                {
+                    model.Stream.Position = 0;
+                    onProgress?.Invoke("download", 100);
+                    return await CreateFromOnnxStreamAsync(accelerator, model.Stream, onProgress, inputShapes)
+                        .ConfigureAwait(false);
+                }
+            }
+            // External data (weights in a sibling .onnx_data) still needs the two-file byte[] resolve below.
+        }
+        else if (webTorrent != null && http != null)
+        {
+            // HubModelStream addresses the hub's /hf web seed, which serves the default revision only, so a
+            // pinned revision cannot use the lazy-hash path today. Say so rather than silently downgrading.
+            Console.WriteLine($"[InferenceSession] revision '{revision}' requested for {repoId}/{filename}; "
+                            + "the hub web seed serves the default revision, so this load uses the older "
+                            + "ModelHub path (no torrent, no resume, no P2P).");
+        }
+
         // PREFER the streaming path: hub.OpenStreamAsync hands back a BlobStream over the OPFS cache
         // entry, which is an IJSReadStream - so the graph structure is parsed from the stream and each
         // weight is seeked to and uploaded JS->GPU without the model ever landing on the .NET/WASM managed
@@ -631,6 +672,7 @@ public class InferenceSession : IDisposable
         // the stream TWICE - once to answer "does it have external data", then again inside
         // CreateFromOnnxStreamAsync. Both reads come from the OPFS-cached blob so it is cheap, but the right
         // fix is a stream entry point that accepts an already-parsed model.
+#pragma warning disable CS0618 // the documented ModelHub fallback above - obsolete on purpose, kept working
         var hubStream = await hub.OpenStreamAsync(repoId, filename, revision).ConfigureAwait(false);
         if (hubStream != null)
         {
@@ -684,6 +726,7 @@ public class InferenceSession : IDisposable
         }
 
         return CreateFromFile(accelerator, bytes, onProgress, inputShapes);
+#pragma warning restore CS0618
     }
 
     /// <summary>

@@ -194,7 +194,7 @@
     private const string _howToCs = """
 // Load DistilBERT-SST2 + its real WordPiece tokenizer onto YOUR GPU — no server, no ONNX Runtime
 var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "onnx/model.onnx");
-var tokJson    = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
+var tokJson    = await hub.LoadSmallFileAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
 var tokenizer  = TokenizerLoader.FromTokenizerJson(Encoding.UTF8.GetString(tokJson)); // builds WordPiece
 using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 var pipe = new TextClassificationPipeline(session, accelerator);

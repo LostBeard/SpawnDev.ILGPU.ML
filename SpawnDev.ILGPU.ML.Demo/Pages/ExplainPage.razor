@@ -177,6 +177,8 @@
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -205,9 +207,11 @@
             if (_accelerator == null) return;
 
             using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
-            _session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            _session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx",
+                webTorrent: Torrents, http: Http);
             _pipeline = new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(_session, _accelerator);
             _isModelLoaded = true;
             StateHasChanged();

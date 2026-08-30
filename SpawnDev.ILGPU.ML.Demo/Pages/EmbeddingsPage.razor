@@ -149,9 +149,12 @@
     private const string _howToCs = """
 // Load DistilBERT onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
 using var hub = new ModelHub(JS);
-var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel);
-var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
-    inputShapes: new() { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 } });
+// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+// by piece, restored on reload with no re-download, and seeded to peers.
+var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    accelerator, hub, ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel,
+    inputShapes: new() { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 } },
+    webTorrent: Torrents, http: Http);
 var pipeline = new FeatureExtractionPipeline(session, accelerator, maxLength: 128, hiddenSize: 768);
 
 // Embed two sentences and compare by meaning — runs entirely on the GPU
@@ -178,6 +181,8 @@ const similarity = cos_sim(a.data, b.data);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -206,18 +211,17 @@ const similarity = cos_sim(a.data, b.data);
 
             // Use DistilBERT for embeddings (already proven to work)
             using var hub = new ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel);
-            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes,
-                inputShapes: new Dictionary<string, int[]>
-                {
-                    ["input_ids"] = new[] { 1, 128 },
-                    ["attention_mask"] = new[] { 1, 128 },
-                });
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel,
+                inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 }, },
+                webTorrent: Torrents, http: Http);
             _pipeline = new FeatureExtractionPipeline(session, _accelerator, maxLength: 128, hiddenSize: 768);
 
             // Real WordPiece tokenizer from the model's own tokenizer.json (NOT the old word-hash) so the
             // embeddings are computed from real vocab tokens — i.e. actually semantic.
-            var tokJson = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
+            var tokJson = await hub.LoadSmallFileAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
             _tokenizer = TokenizerLoader.FromTokenizerJson(System.Text.Encoding.UTF8.GetString(tokJson));
 
             _isModelLoaded = true;

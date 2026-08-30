@@ -15,6 +15,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class SuperResPage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private InferenceSession? _session;
@@ -54,8 +55,11 @@ public partial class SuperResPage : IDisposable
             }
 
             using var hub = new ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx");
-            _session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            _session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx",
+                webTorrent: Torrents, http: Http);
             _pipeline = new SuperResolutionPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

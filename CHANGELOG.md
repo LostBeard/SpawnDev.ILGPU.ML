@@ -2,6 +2,32 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+### Changed
+
+- **`ModelHub` is no longer the way to deliver model WEIGHTS.** It predates lazy-hash (this file
+  2026-03-19; `HubModelStream` 2026-06-02), and its `LoadAsync` shape returns the whole model as a `byte[]`
+  - in the browser, onto the single-threaded WASM heap - and re-downloads whenever the OPFS entry is
+  absent. `LoadAsync`, `LoadFromUrlAsync`, `LoadMultipleAsync`, `OpenStreamAsync` and
+  `OpenStreamFromUrlAsync` are now `[Obsolete]` for weights, pointing at `HubModelStream.OpenAsync`, which
+  adds the file as a LAZY-HASH torrent: streamable with RANDOM ACCESS, cached to OPFS by piece, resumed and
+  restored on reload with zero re-download, and seeded to peers. Reaching for the old path is now a compiler
+  warning rather than a habit.
+- **`InferenceSession.CreateFromHuggingFaceAsync` prefers lazy-hash**, given the new optional `webTorrent`
+  and `http` arguments. Without them it falls back to the old `ModelHub` path, which is kept working and
+  documented as a fallback rather than an equal. A pinned `revision` still takes the old path - the hub web
+  seed serves the default revision - and now SAYS so instead of silently downgrading.
+- ⚠️ Nothing was removed. `KnownModels`/`KnownFiles`, cache administration and the HuggingFace API remain on
+  `ModelHub`, which is what it is actually good at.
+
+### Added
+
+- `ModelHub.LoadSmallFileAsync` - the supported path for a tokenizer, config or vocabulary, where a `byte[]`
+  is the right shape and a torrent would be pure overhead. The "bulk bytes stay off the managed heap" rule
+  is about WEIGHTS; this makes that distinction visible at the call site instead of lumping both into
+  `LoadAsync`.
+
 ## 5.2.2 (2026-08-30)
 
 ### Fixed

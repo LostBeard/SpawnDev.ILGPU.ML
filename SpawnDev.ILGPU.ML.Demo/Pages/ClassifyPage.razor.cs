@@ -13,6 +13,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class ClassifyPage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private ClassificationService? _classService;
@@ -61,9 +62,13 @@ public partial class ClassifyPage : IDisposable
             _modelProgress = 50;
             StateHasChanged();
             using var hub = new ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx");
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx",
+                webTorrent: Torrents, http: Http);
             _classService = new ClassificationService(Http);
-            await _classService.LoadModelAsync(modelBytes, _accelerator);
+            _classService.UseSession(session, _accelerator);
 
             _isModelLoaded = true;
             _modelProgress = 100;

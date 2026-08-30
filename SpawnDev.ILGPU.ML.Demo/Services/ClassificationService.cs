@@ -33,6 +33,28 @@ public class ClassificationService : IDisposable
         _pipeline = new ClassificationPipeline(_session, accelerator);
     }
 
+    /// <summary>
+    /// Adopt an already-created session - the path that lets the caller deliver weights however it likes.
+    /// </summary>
+    /// <remarks>
+    /// Added so a caller can hand over a session built by
+    /// <c>InferenceSession.CreateFromHuggingFaceAsync(..., webTorrent:, http:)</c>, i.e. delivered as a
+    /// LAZY-HASH torrent. The <c>byte[]</c> overload below forced every caller to materialise the whole
+    /// model on the managed heap first, which is what made this service the last holdout when the demo
+    /// moved off the superseded delivery path.
+    /// </remarks>
+    /// <param name="session">A live session; this service takes ownership and disposes it.</param>
+    /// <param name="accelerator">The accelerator the session was built on.</param>
+    public void UseSession(InferenceSession session, Accelerator accelerator)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        _session?.Dispose();
+        _pipeline?.Dispose();
+        _accelerator = accelerator;
+        _session = session;
+        _pipeline = new ClassificationPipeline(_session, accelerator);
+    }
+
     /// <summary>Load model from raw bytes for the given accelerator.</summary>
     public Task LoadModelAsync(byte[] modelBytes, Accelerator accelerator)
     {

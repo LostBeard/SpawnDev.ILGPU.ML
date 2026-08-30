@@ -170,8 +170,11 @@
     private const string _howToCs = """
 // Load RMBG-1.4 onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
 using var hub = new ModelHub(JS);
-var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.RMBG14, ModelHub.KnownFiles.OnnxModel);
-var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+// by piece, restored on reload with no re-download, and seeded to peers.
+var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    accelerator, hub, ModelHub.KnownModels.RMBG14, ModelHub.KnownFiles.OnnxModel,
+    webTorrent: Torrents, http: Http);
 var pipeline = new BackgroundRemovalPipeline(session, accelerator);
 
 // Run segmentation — returns a per-pixel foreground alpha mask, computed on the GPU
@@ -202,6 +205,8 @@ const [out] = await pipe(imageUrl);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -237,10 +242,11 @@ const [out] = await pipe(imageUrl);
             }
 
             using var hub = new SpawnDev.ILGPU.ML.Hub.ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.RMBG14,
-                SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel);
-            var session = SpawnDev.ILGPU.ML.InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.RMBG14, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownFiles.OnnxModel,
+                webTorrent: Torrents, http: Http);
             _pipeline = new SpawnDev.ILGPU.ML.Pipelines.BackgroundRemovalPipeline(session, _accelerator);
 
             _isModelLoaded = true;

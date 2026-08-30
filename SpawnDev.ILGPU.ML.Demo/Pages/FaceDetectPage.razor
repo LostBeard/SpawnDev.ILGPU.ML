@@ -99,8 +99,11 @@
     private const string _howToCs = """
 // Load BlazeFace (~0.5MB) from the hub and build the face pipeline on YOUR GPU — no ONNX Runtime
 using var hub = new ModelHub(JS);
-var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.BlazeFace, "model.tflite");
-var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+// by piece, restored on reload with no re-download, and seeded to peers.
+var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    accelerator, hub, ModelHub.KnownModels.BlazeFace, "model.tflite",
+    webTorrent: Torrents, http: Http);
 var pipe = new FaceDetectionPipeline(session, accelerator);
 
 // Detect — boxes + landmarks + confidence per frame, on-device
@@ -124,6 +127,8 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -151,8 +156,11 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
             using var hub = new Hub.ModelHub(JS);
-            var modelBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.BlazeFace, "model.tflite");
-            var session = InferenceSession.CreateFromFile(_accelerator, modelBytes);
+            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+            // by piece, restored on reload with no re-download, and seeded to peers.
+            var session = await InferenceSession.CreateFromHuggingFaceAsync(
+                _accelerator, hub, Hub.ModelHub.KnownModels.BlazeFace, "model.tflite",
+                webTorrent: Torrents, http: Http);
             _pipeline = new Pipelines.FaceDetectionPipeline(session, _accelerator);
 
             _isModelLoaded = true;

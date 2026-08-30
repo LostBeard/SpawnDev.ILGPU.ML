@@ -134,8 +134,11 @@
     private const string _howToCs = """
 // Load the ESPCN super-resolution model onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
 using var hub = new ModelHub(JS);
-var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx");
-var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
+// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
+// by piece, restored on reload with no re-download, and seeded to peers.
+var session = await InferenceSession.CreateFromHuggingFaceAsync(
+    accelerator, hub, ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx",
+    webTorrent: Torrents, http: Http);
 var pipeline = new SuperResolutionPipeline(session, accelerator);
 
 // Upscale an RGBA image — runs entirely on the GPU
