@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.2.1 (2026-08-30)
 
 ### Fixed
 

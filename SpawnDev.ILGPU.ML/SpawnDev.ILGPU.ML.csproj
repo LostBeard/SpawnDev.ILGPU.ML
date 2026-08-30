@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.0</Version>
-		<PackageReleaseNotes>v5.2.0 - Low-precision weights now stay NATIVE in GPU memory instead of being upcast on load: bf16, FP8 (E4M3/E5M2) and quantized int8/uint8 keep their own bytes and are converted per-element in the shader at use. FNUZ FP8 (dtypes 18/20) supported. Causal masks are generated on the GPU rather than uploaded. Browser model loads stream from the OPFS cache without entering the .NET heap. FIXES: bf16/FP8 raw_data was decoded as fp16; ToFloatArray silently returned an ALL-ZERO tensor for any dtype missing from its size map; the OPFS cache stored HTTP error bodies as models; the browser download never actually streamed and retried an OOM by re-allocating. See Changelog.</PackageReleaseNotes>
+		<Version>5.2.1</Version>
+		<PackageReleaseNotes>v5.2.1 - Correctness release. FIVE out-of-bounds reads fixed, all found after rewriting six KV tests that asserted nothing. DequantizeLinear read past the end of a per-tensor scale/zero_point (the ONNX default) - this is the operator 5.2.0's native int8/uint8 weights widen through, so any real quantized model hit it. MatMulInteger did the same for per-row/per-column zero points, and needed a new per-ROW broadcast (AddBias is per-column and silently computes a different product). Sum/Mean read past a broadcasting input. QuantizedKVCache had been GUESSING every model's geometry as 12 heads x 64 - correct for GPT-2, wrong for whisper (6 heads), which read 384 floats off the end. KVCacheAnalyzer conflated .encoder. cross-attention with .decoder. self-attention. The GPU causal-mask generator was gated on rank 2 and had never once fired on the rank-4 mask it was written for. Full sweep 4634 passed / 0 failed on all six backends. See Changelog.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
