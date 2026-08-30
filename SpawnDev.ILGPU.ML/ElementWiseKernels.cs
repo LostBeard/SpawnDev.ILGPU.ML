@@ -21,7 +21,9 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _mulKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _addBiasKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _addRowBiasKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _broadcastMulKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _broadcastSubKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _scaleKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _transposeLastTwoKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _geluInPlaceKernel;
@@ -137,6 +139,25 @@ public class ElementWiseKernels : IDisposable
         int C)
     {
         output[idx] = input[idx] * scale[idx % C];
+    }
+
+    /// <summary>Per-ROW broadcast add, in place: data[i] += bias[i / rowLength]. Row-major [rows, rowLength].</summary>
+    private static void AddRowBiasImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,   // in-place [rows * rowLength]
+        ArrayView1D<float, Stride1D.Dense> bias,    // [rows]
+        int rowLength)
+    {
+        data[idx] += bias[idx / rowLength];
+    }
+
+    /// <summary>Broadcast subtract: out[i] = input[i] - sub[i % C]. The DequantizeLinear zero-point.</summary>
+    private static void BroadcastSubImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sub,     // [C] — broadcast
+        ArrayView1D<float, Stride1D.Dense> output,
+        int C)
+    {
+        output[idx] = input[idx] - sub[idx % C];
     }
 
     /// <summary>Scale all elements: out[i] = input[i] * scalar.</summary>
@@ -509,6 +530,51 @@ public class ElementWiseKernels : IDisposable
     {
         EnsureLoaded();
         _addBiasKernel!(totalElements, data, bias, C);
+    }
+
+    /// <summary>
+    /// Per-ROW broadcast add, in place: <c>data[i] += bias[i / rowLength]</c> over a row-major
+    /// <c>[rows, rowLength]</c> buffer.
+    /// </summary>
+    /// <remarks>
+    /// The row-wise counterpart to <see cref="AddBias"/>, which indexes <c>bias[i % C]</c> and is therefore
+    /// per-COLUMN. Both shapes occur in ONNX quantization: <c>MatMulInteger</c>'s <c>a_zero_point</c> is
+    /// per-row of A <c>[M,K]</c>, while <c>b_zero_point</c> is per-column of B <c>[K,N]</c>. Using the
+    /// column form for a row-wise zero point compiles and runs and silently computes the wrong thing.
+    /// </remarks>
+    /// <param name="data">Buffer updated in place, <paramref name="totalElements"/> elements.</param>
+    /// <param name="bias">One value per row; must have at least <c>totalElements / rowLength</c> entries.</param>
+    /// <param name="totalElements">Elements to update.</param>
+    /// <param name="rowLength">Elements per row; must be at least 1.</param>
+    public void AddRowBias(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> bias, int totalElements, int rowLength)
+    {
+        if (rowLength < 1) throw new ArgumentOutOfRangeException(nameof(rowLength), rowLength, "row length must be >= 1");
+        EnsureLoaded();
+        _addRowBiasKernel!(totalElements, data, bias, rowLength);
+    }
+
+    /// <summary>
+    /// Broadcast subtract: <c>out[i] = a[i] - sub[i % C]</c>, the out-of-place counterpart to
+    /// <see cref="AddBias"/> and the mirror of <see cref="BroadcastMul"/>.
+    /// </summary>
+    /// <remarks>
+    /// Exists because <see cref="Sub"/> indexes BOTH operands with the dispatch index, so subtracting a
+    /// 1-element zero-point from an N-element tensor reads N-1 elements past the end of it - the same
+    /// hazard <c>QuantizeLinear</c> already avoided ("Div reads OOB for 1-element scale against count>1").
+    /// </remarks>
+    /// <param name="a">Left operand, <paramref name="totalElements"/> elements.</param>
+    /// <param name="sub">Right operand, <paramref name="C"/> elements, broadcast.</param>
+    /// <param name="output">Destination, <paramref name="totalElements"/> elements.</param>
+    /// <param name="totalElements">Elements to write.</param>
+    /// <param name="C">Length of <paramref name="sub"/>; must be at least 1.</param>
+    public void BroadcastSub(ArrayView1D<float, Stride1D.Dense> a,
+        ArrayView1D<float, Stride1D.Dense> sub,
+        ArrayView1D<float, Stride1D.Dense> output, int totalElements, int C)
+    {
+        if (C < 1) throw new ArgumentOutOfRangeException(nameof(C), C, "broadcast length must be >= 1");
+        EnsureLoaded();
+        _broadcastSubKernel!(totalElements, a, sub, output, C);
     }
 
     /// <summary>Broadcast multiply: out[i] = a[i] * scale[i % C]. For LayerScale.</summary>
@@ -1961,6 +2027,12 @@ public class ElementWiseKernels : IDisposable
         _broadcastMulKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, int>(BroadcastMulImpl);
+        _broadcastSubKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int>(BroadcastSubImpl);
+        _addRowBiasKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int>(AddRowBiasImpl);
         _scaleKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             float>(ScaleImpl);

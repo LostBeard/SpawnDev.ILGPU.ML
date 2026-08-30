@@ -14,91 +14,190 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     /// <summary>
-    /// Load DistilGPT-2, verify GraphExecutor auto-detects KV cache pattern.
+    /// The DistilGPT-2 export that actually HAS a KV cache interface. See
+    /// <see cref="TurboQuant_DistilGPT2_KVCacheAutoDetected"/> for why the plain decoder cannot be used.
     /// </summary>
+    private const string DistilGpt2WithPastUrl =
+        "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_with_past_model.onnx";
+
+    // DistilGPT-2 KV geometry (config.json: n_layer=6, n_head=12, n_embd=768 -> head_dim=64).
+    private const int DistilGpt2Layers = 6, DistilGpt2Heads = 12, DistilGpt2HeadDim = 64;
+
+    /// <summary>The base decoder: <c>present.*</c> outputs but NO <c>past_key_values.*</c> inputs.</summary>
+    private const string DistilGpt2BaseUrl =
+        "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+
+    /// <summary>"The cat sat on the" in DistilGPT-2 tokens.</summary>
+    private static readonly float[] Gpt2Prompt = { 464, 3797, 3332, 319, 262 };
+
+    /// <summary>Input shapes for one incremental decode step over <paramref name="pastSeq"/> cached tokens.</summary>
+    private static Dictionary<string, int[]> DistilGpt2StepShapes(int pastSeq)
+    {
+        var shapes = new Dictionary<string, int[]>
+        {
+            ["input_ids"] = new[] { 1, 1 },
+            ["attention_mask"] = new[] { 1, pastSeq + 1 },
+        };
+        for (int l = 0; l < DistilGpt2Layers; l++)
+        {
+            shapes[$"past_key_values.{l}.key"] = new[] { 1, DistilGpt2Heads, pastSeq, DistilGpt2HeadDim };
+            shapes[$"past_key_values.{l}.value"] = new[] { 1, DistilGpt2Heads, pastSeq, DistilGpt2HeadDim };
+        }
+        return shapes;
+    }
+
+    /// <summary>
+    /// Load DistilGPT-2's with-past decoder and verify GraphExecutor auto-detects the KV cache pattern.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This test and <see cref="TurboQuant_DistilGPT2_KVCacheCaptures"/> used to load
+    /// <c>decoder_model.onnx</c> on the stated reasoning that the base decoder has "no If control flow
+    /// nodes - same KV cache outputs". Same OUTPUTS, yes; but <see cref="Graph.KVCacheAnalyzer"/> pairs
+    /// <c>past_key_values.N.key/value</c> INPUTS with <c>present.N.key/value</c> outputs, and the base
+    /// decoder has no past inputs at all (MEASURED 2026-08-30: its 2 inputs are input_ids and
+    /// attention_mask). So <c>HasKVCache</c> was ALWAYS false, and both tests took their
+    /// <c>if (!HasKVCache) return;</c> / <c>if (hasCache)</c> escape and asserted NOTHING after
+    /// downloading 329 MB. Neither could ever have failed on a KV-cache regression.
+    /// <para>
+    /// <c>decoder_with_past_model.onnx</c> is the export with the past interface (14 inputs / 13 outputs),
+    /// and detection is now asserted UNCONDITIONALLY - no skip branch to hide behind.
+    /// </para>
+    /// </remarks>
     [TestMethod(Timeout = 600000)]
     public async Task TurboQuant_DistilGPT2_KVCacheAutoDetected() => await RunTest(async accelerator =>
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        await using var model = await OpenSeekableModelStreamAsync(DistilGpt2WithPastUrl);
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(
+            accelerator, model, inputShapes: DistilGpt2StepShapes(1), enableOptimization: false);
 
-        // Use base decoder (no If control flow nodes) — same KV cache outputs
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+        // The interface the analyzer keys off. Assert it directly so a bad export is named as such
+        // rather than surfacing as a confusing "cache not detected".
+        bool hasPast = session.InputNames.Any(n => n.Contains("past_key_values"));
+        bool hasPresent = session.OutputNames.Any(n => n.StartsWith("present"));
+        if (!hasPast || !hasPresent)
+            throw new Exception(
+                $"with-past export lacks the KV interface — hasPast={hasPast} hasPresent={hasPresent}; " +
+                $"inputs: {string.Join(",", session.InputNames)}");
 
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["input_ids"] = new[] { 1, 5 },
-            },
-            enableOptimization: false);
+        if (!session.Executor.HasKVCache)
+            throw new Exception(
+                "HasKVCache is false on the with-past decoder — KVCacheAnalyzer failed to pair " +
+                $"past_key_values.*/present.* ({session.InputNames.Length} inputs, {session.OutputNames.Length} outputs)");
 
-        bool hasCache = session.Executor.HasKVCache;
-        Console.WriteLine($"[TurboQuant] DistilGPT-2 HasKVCache: {hasCache}");
+        var kvCache = session.Executor.KVCache!;
+        if (kvCache.NumLayers != DistilGpt2Layers)
+            throw new Exception($"KV cache layers={kvCache.NumLayers}, expected {DistilGpt2Layers}");
 
-        if (hasCache)
-        {
-            var kvCache = session.Executor.KVCache!;
-            Console.WriteLine($"[TurboQuant] KV cache: {kvCache.NumLayers} layers, maxSeq={kvCache.MaxSeqLen}");
-            if (kvCache.NumLayers < 1)
-                throw new Exception("KV cache detected but has 0 layers");
-        }
-
-        Console.WriteLine($"[TurboQuant] DistilGPT-2 KV cache detection: PASS");
+        Console.WriteLine($"[TurboQuant] DistilGPT-2 KV cache detection: PASS " +
+                          $"({kvCache.NumLayers} layers, maxSeq={kvCache.MaxSeqLen})");
     });
 
     /// <summary>
-    /// Run one step of DistilGPT-2 inference, verify KV cache captures tokens.
+    /// Run one incremental DistilGPT-2 decode step and verify the KV cache actually CAPTURES the token.
     /// </summary>
+    /// <remarks>
+    /// The assertion that carries the claim is <c>CurrentSeqLen</c> advancing 0 -&gt; 1 across the run:
+    /// the executor read the model's <c>present.N.key/value</c> outputs and appended them. Checking only
+    /// <c>CurrentSeqLen &gt;= 1</c> after the fact would pass on a cache that was somehow pre-populated,
+    /// so the BEFORE value is asserted too. Logits are checked for finiteness because a KV cache wired to
+    /// the wrong layer still produces a shaped output - full numerical agreement with ORT across a
+    /// growing sequence is Reference_DistilGPT2_GreedyGeneration's job, not this one's.
+    /// </remarks>
     [TestMethod(Timeout = 600000)]
     public async Task TurboQuant_DistilGPT2_KVCacheCaptures() => await RunTest(async accelerator =>
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-
-        // Use base decoder (no If control flow nodes) — same KV cache outputs
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
-
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["input_ids"] = new[] { 1, 5 },
-            },
-            enableOptimization: false);
+        const int pastSeq = 1;
+        await using var model = await OpenSeekableModelStreamAsync(DistilGpt2WithPastUrl);
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(
+            accelerator, model, inputShapes: DistilGpt2StepShapes(pastSeq), enableOptimization: false);
 
         if (!session.Executor.HasKVCache)
-        {
-            Console.WriteLine("[TurboQuant] Skipping — no KV cache detected");
-            return;
-        }
-
-        // Run inference
-        var tokenIds = new float[] { 464, 3797, 3332, 319, 262 };
-        var mask = new float[] { 1, 1, 1, 1, 1 };
-        var posIds = new float[] { 0, 1, 2, 3, 4 };
-
-        using var idsBuf = accelerator.Allocate1D(tokenIds);
-        using var maskBuf = accelerator.Allocate1D(mask);
-        using var posBuf = accelerator.Allocate1D(posIds);
-
-        var inputs = new Dictionary<string, Tensor>
-        {
-            ["input_ids"] = new Tensor(idsBuf.View, new[] { 1, 5 }),
-            ["attention_mask"] = new Tensor(maskBuf.View, new[] { 1, 5 }),
-            ["position_ids"] = new Tensor(posBuf.View, new[] { 1, 5 }),
-        };
-
-        var outputs = await session.RunAsync(inputs);
+            throw new Exception("HasKVCache is false on the with-past decoder — cannot test capture");
 
         var kvCache = session.Executor.KVCache!;
-        Console.WriteLine($"[TurboQuant] After inference: cache seqLen={kvCache.CurrentSeqLen}, layers={kvCache.NumLayers}");
+        int seqLenBefore = kvCache.CurrentSeqLen;
+        if (seqLenBefore != 0)
+            throw new Exception($"KV cache is not empty before the first run: seqLen={seqLenBefore}");
 
-        if (kvCache.CurrentSeqLen < 1)
-            throw new Exception($"KV cache empty after inference — expected ≥1, got {kvCache.CurrentSeqLen}");
+        var buffers = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        try
+        {
+            MemoryBuffer1D<float, Stride1D.Dense> Upload(float[] data)
+            {
+                var buf = accelerator.Allocate1D(data);
+                buffers.Add(buf);
+                return buf;
+            }
 
-        Console.WriteLine($"[TurboQuant] DistilGPT-2 KV cache capture: PASS (seqLen={kvCache.CurrentSeqLen})");
+            // One decode step: the token " the" (262) attending over pastSeq cached tokens.
+            var inputs = new Dictionary<string, Tensor>
+            {
+                ["input_ids"] = new Tensor(Upload(new float[] { 262 }).View, new[] { 1, 1 }),
+                ["attention_mask"] = new Tensor(
+                    Upload(Enumerable.Repeat(1f, pastSeq + 1).ToArray()).View, new[] { 1, pastSeq + 1 }),
+            };
+            // Deterministic pseudo-past. Values only have to be finite and in a sane activation range -
+            // this asserts cache MECHANICS, and a fixed seed keeps the step reproducible across backends.
+            var rng = new Random(7);
+            int kvElems = DistilGpt2Heads * pastSeq * DistilGpt2HeadDim;
+            float[] PseudoPast()
+            {
+                var a = new float[kvElems];
+                for (int i = 0; i < kvElems; i++) a[i] = (float)(rng.NextDouble() * 0.2 - 0.1);
+                return a;
+            }
+            var kvShape = new[] { 1, DistilGpt2Heads, pastSeq, DistilGpt2HeadDim };
+            for (int l = 0; l < DistilGpt2Layers; l++)
+            {
+                inputs[$"past_key_values.{l}.key"] = new Tensor(Upload(PseudoPast()).View, kvShape);
+                inputs[$"past_key_values.{l}.value"] = new Tensor(Upload(PseudoPast()).View, kvShape);
+            }
+
+            var outputs = await session.RunAsync(inputs);
+
+            if (!outputs.TryGetValue("logits", out var logits))
+                throw new Exception($"no 'logits' output — got: {string.Join(",", outputs.Keys)}");
+
+            // A cache wired to the wrong layer still produces a correctly SHAPED output, so shape alone
+            // proves nothing. Read the logits back and check they are finite and non-degenerate. This is a
+            // 50,257-float (~200 KB) readback, not bulk data - and there is no GPU-side finite reduction to
+            // use instead: ElementWiseKernels' max reduce is an `if (d > max)` scan, which does not
+            // propagate NaN, so a GPU-side "compare against zeros" would report a clean max on NaN input.
+            int vocab = logits.Shape[^1];
+            var logitValues = await logits.Data.CopyToAsync(accelerator, vocab);
+            float lo = float.PositiveInfinity, hi = float.NegativeInfinity;
+            for (int i = 0; i < logitValues.Length; i++)
+            {
+                float v = logitValues[i];
+                if (!float.IsFinite(v))
+                    throw new Exception($"logits[{i}] is {v} — decode step produced non-finite output");
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+            }
+            if (hi - lo < 1e-3f)
+                throw new Exception($"logits are degenerate (min={lo:F6}, max={hi:F6}) — the step computed nothing");
+
+            int seqLenAfter = kvCache.CurrentSeqLen;
+            if (seqLenAfter != seqLenBefore + 1)
+                throw new Exception(
+                    $"KV cache did not capture the decoded token — seqLen {seqLenBefore} -> {seqLenAfter}, " +
+                    $"expected {seqLenBefore + 1}. The executor did not append the model's present.* outputs.");
+
+            Console.WriteLine($"[TurboQuant] DistilGPT-2 KV cache capture: PASS " +
+                              $"(seqLen {seqLenBefore} -> {seqLenAfter} over {kvCache.NumLayers} layers)");
+        }
+        finally
+        {
+            // Drain BEFORE disposing. Per CLAUDE.md: on WebGPU a dispatch referencing these buffers may
+            // still be pending in the command encoder, and on Wasm a flush is not enough - freeing the
+            // SharedArrayBuffer region under a queued dispatch throws "offset is out of bounds" when it
+            // finally runs. The happy path already drains inside the logits readback; this covers the
+            // path where an assertion throws before it.
+            await accelerator.SynchronizeAsync();
+            foreach (var buf in buffers) buf.Dispose();
+        }
     });
+
     [TestMethod]
     public async Task TurboQuant_QuantizedAttention_MatchesFP32() => await RunTest(async accelerator =>
     {
@@ -1023,119 +1122,168 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[FlashAttn] PASS — Online Softmax matches two-pass (cosine={cosineSim:F6})");
     });
 
+    /// <summary>The Whisper export that carries a KV cache interface (17 inputs / 9 outputs).</summary>
+    private const string WhisperTinyWithPastUrl =
+        "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_with_past_model.onnx";
+
+    // whisper-tiny decoder geometry, MEASURED from the export's own value_info 2026-08-30:
+    // 4 layers, 6 heads, head_dim 64. Encoder (cross-attention) KV length is SYMBOLIC
+    // ("encoder_sequence_length_out"), so the tests pick a small one - whisper's real 1500 is an acoustic
+    // property, and these tests are about cache mechanics. Both 4 and 1500 verified to run.
+    private const int WhisperLayers = 4, WhisperHeads = 6, WhisperHeadDim = 64, WhisperEncoderSeq = 4;
+
+    /// <summary>Input shapes for one whisper decode step over <paramref name="pastSeq"/> cached tokens.</summary>
+    private static Dictionary<string, int[]> WhisperStepShapes(int pastSeq)
+    {
+        var shapes = new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 1 } };
+        for (int l = 0; l < WhisperLayers; l++)
+        {
+            shapes[$"past_key_values.{l}.decoder.key"] = new[] { 1, WhisperHeads, pastSeq, WhisperHeadDim };
+            shapes[$"past_key_values.{l}.decoder.value"] = new[] { 1, WhisperHeads, pastSeq, WhisperHeadDim };
+            shapes[$"past_key_values.{l}.encoder.key"] = new[] { 1, WhisperHeads, WhisperEncoderSeq, WhisperHeadDim };
+            shapes[$"past_key_values.{l}.encoder.value"] = new[] { 1, WhisperHeads, WhisperEncoderSeq, WhisperHeadDim };
+        }
+        return shapes;
+    }
+
     /// <summary>
-    /// Load Whisper Tiny decoder (merged), verify GraphExecutor auto-detects KV cache.
-    /// Whisper Tiny has 4 decoder layers with both self-attention and cross-attention KV cache.
+    /// Whisper Tiny's with-past decoder: verify the KV cache is detected AND that it pairs the
+    /// SELF-attention (<c>.decoder.</c>) entries, not the static cross-attention ones.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ This test used to load <c>decoder_model.onnx</c>, which has no <c>past_key_values.*</c> inputs at
+    /// all, so <c>HasKVCache</c> was false and every KV assertion sat in an untaken <c>if</c>.
+    /// <para>
+    /// Encoder-decoder models qualify KV names by attention block: <c>past_key_values.0.decoder.key</c> is
+    /// the autoregressive cache, <c>past_key_values.0.encoder.key</c> is cross-attention over the encoder
+    /// output - constant for the whole generation, with NO matching <c>present.*</c>. Both forms used to
+    /// parse to the same (layer, isKey) slot, so the encoder entry overwrote the decoder one and the
+    /// analyzer paired ENCODER past against DECODER present while still reporting a healthy 4-layer cache.
+    /// Asserting <c>HasKVCache</c> alone would pass on that bug; the assertion that catches it is the
+    /// PAIRED INPUT NAME, which is why it is checked here.
+    /// </para>
+    /// </remarks>
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_WhisperDecoder_KVCacheAutoDetected() => await RunTest(async accelerator =>
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        await using var model = await OpenSeekableModelStreamAsync(WhisperTinyWithPastUrl);
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, model,
+            inputShapes: WhisperStepShapes(1), enableOptimization: false);
 
-        // Use base decoder (no If control flow nodes) — same KV cache outputs
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model.onnx");
+        Console.WriteLine($"[TurboQuant] Whisper inputs ({session.InputNames.Length}): {string.Join(", ", session.InputNames)}");
+        Console.WriteLine($"[TurboQuant] Whisper outputs ({session.OutputNames.Length}): {string.Join(", ", session.OutputNames)}");
 
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["input_ids"] = new[] { 1, 1 },
-            },
-            enableOptimization: false);
+        if (!session.Executor.HasKVCache)
+            throw new Exception(
+                "HasKVCache is false on whisper's with-past decoder — the analyzer failed to pair " +
+                "past_key_values.N.decoder.* with present.N.decoder.*");
 
-        Console.WriteLine($"[TurboQuant] Whisper decoder inputs: {string.Join(", ", session.InputNames)}");
-        Console.WriteLine($"[TurboQuant] Whisper decoder outputs: {string.Join(", ", session.OutputNames)}");
+        var kvCache = session.Executor.KVCache!;
+        if (kvCache.NumLayers != WhisperLayers)
+            throw new Exception($"whisper KV cache layers={kvCache.NumLayers}, expected {WhisperLayers}");
 
-        bool hasCache = session.Executor.HasKVCache;
-        Console.WriteLine($"[TurboQuant] Whisper HasKVCache: {hasCache}");
-
-        // Base decoder uses present.N.decoder.key naming (not present.N.key).
-        // KV cache auto-detection may not match this pattern yet.
-        // Full KV cache support requires the merged model + If operator.
-        if (hasCache)
+        // THE regression guard: cross-attention must not be mistaken for the autoregressive cache.
+        var info = Graph.KVCacheAnalyzer.Analyze(session.InputNames, session.OutputNames, WhisperStepShapes(1));
+        foreach (var layer in info.Layers)
         {
-            var kvCache = session.Executor.KVCache!;
-            Console.WriteLine($"[TurboQuant] Whisper KV cache: {kvCache.NumLayers} layers, maxSeq={kvCache.MaxSeqLen}");
-        }
-        else
-        {
-            // Verify the model at least has present outputs (KV cache structure exists)
-            bool hasPresentOutputs = session.OutputNames.Any(n => n.StartsWith("present."));
-            if (!hasPresentOutputs)
-                throw new Exception("Whisper decoder should have present.* outputs but none found");
-            Console.WriteLine($"[TurboQuant] Whisper has {session.OutputNames.Count(n => n.StartsWith("present."))} present outputs (KV cache structure present, auto-detection pending)");
+            if (layer.PastKeyInput.Contains(".encoder.") || layer.PastValueInput.Contains(".encoder."))
+                throw new Exception(
+                    $"layer {layer.LayerIndex} paired CROSS-ATTENTION past ('{layer.PastKeyInput}') — encoder " +
+                    "KV is constant for the whole generation and has no present.* counterpart");
+            if (!layer.PastKeyInput.Contains(".decoder."))
+                throw new Exception($"layer {layer.LayerIndex} past key '{layer.PastKeyInput}' is not a decoder entry");
         }
 
-        Console.WriteLine($"[TurboQuant] Whisper decoder KV cache detection: PASS");
+        Console.WriteLine($"[TurboQuant] Whisper KV cache: PASS — {kvCache.NumLayers} self-attention layers, " +
+                          "cross-attention excluded");
     });
 
     /// <summary>
-    /// Run one decoder step of Whisper Tiny with fake encoder output,
-    /// verify quantized KV cache captures the token's key/value data.
+    /// Run one Whisper decode step and verify the KV cache actually CAPTURES the token.
     /// </summary>
+    /// <remarks>
+    /// This is the test that first executed the whisper KV path end to end, and it immediately found a
+    /// crash that had been latent the whole time: <c>KVCachePoint.Shape</c> was null for EVERY model
+    /// (GraphExecutor built its shape dictionary from WEIGHTS, and <c>past_key_values.*</c> are graph
+    /// INPUTS), so <c>QuantizedKVCache</c> silently fell back to a hardcoded 12 heads x 64. That is exactly
+    /// right for the GPT-2 family and wrong for whisper's 6 heads, so the cache sized itself for 768 while
+    /// the executor supplied the true 384-element vector and TurboQuant's ComputeNorms read off the end of
+    /// the buffer.
+    /// </remarks>
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_WhisperDecoder_KVCacheCaptures() => await RunTest(async accelerator =>
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-
-        // Use base decoder (no If control flow nodes) — same KV cache outputs
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_model.onnx");
-
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["input_ids"] = new[] { 1, 4 },
-            },
-            enableOptimization: false);
+        const int pastSeq = 1;
+        await using var model = await OpenSeekableModelStreamAsync(WhisperTinyWithPastUrl);
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, model,
+            inputShapes: WhisperStepShapes(pastSeq), enableOptimization: false);
 
         if (!session.Executor.HasKVCache)
-        {
-            Console.WriteLine("[TurboQuant] Skipping — no KV cache detected");
-            return;
-        }
-
-        // Whisper Tiny: encoder output is [1, 1500, 384]
-        // Create fake encoder hidden states (random but deterministic)
-        var rng = new Random(42);
-        int encoderSeq = 1500, encoderDim = 384;
-        var encoderData = new float[encoderSeq * encoderDim];
-        for (int i = 0; i < encoderData.Length; i++)
-            encoderData[i] = (float)(rng.NextDouble() * 2 - 1) * 0.1f;
-
-        using var encoderBuf = accelerator.Allocate1D(encoderData);
-
-        // Whisper prefix tokens: SOT=50258, EN=50259, TRANSCRIBE=50360, NO_TIMESTAMPS=50364
-        var tokenIds = new float[] { 50258, 50259, 50360, 50364 };
-        using var idsBuf = accelerator.Allocate1D(tokenIds);
-
-        var inputs = new Dictionary<string, Tensor>
-        {
-            ["input_ids"] = new Tensor(idsBuf.View, new[] { 1, 4 }),
-        };
-
-        // Find the encoder_hidden_states input name
-        foreach (var inputName in session.InputNames)
-        {
-            if (inputName.Contains("encoder") && !inputName.Contains("past_key"))
-            {
-                inputs[inputName] = new Tensor(encoderBuf.View, new[] { 1, encoderSeq, encoderDim });
-                Console.WriteLine($"[TurboQuant] Encoder input mapped to: {inputName}");
-                break;
-            }
-        }
-
-        var outputs = await session.RunAsync(inputs);
+            throw new Exception("HasKVCache is false on whisper's with-past decoder — cannot test capture");
 
         var kvCache = session.Executor.KVCache!;
-        Console.WriteLine($"[TurboQuant] Whisper after inference: cache seqLen={kvCache.CurrentSeqLen}, layers={kvCache.NumLayers}");
+        int seqLenBefore = kvCache.CurrentSeqLen;
+        if (seqLenBefore != 0)
+            throw new Exception($"whisper KV cache is not empty before the first run: seqLen={seqLenBefore}");
 
-        if (kvCache.CurrentSeqLen < 1)
-            throw new Exception($"Whisper KV cache empty after inference — expected ≥1, got {kvCache.CurrentSeqLen}");
+        var buffers = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        try
+        {
+            MemoryBuffer1D<float, Stride1D.Dense> Upload(float[] d)
+            {
+                var b = accelerator.Allocate1D(d);
+                buffers.Add(b);
+                return b;
+            }
+            var rng = new Random(42);
+            float[] Pseudo(int n)
+            {
+                var a = new float[n];
+                for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 0.2 - 0.1);
+                return a;
+            }
 
-        Console.WriteLine($"[TurboQuant] Whisper decoder KV cache capture: PASS (seqLen={kvCache.CurrentSeqLen})");
+            // <|startoftranscript|> decoded against one cached token and a short pseudo-encoder context.
+            var inputs = new Dictionary<string, Tensor>
+            {
+                ["input_ids"] = new Tensor(Upload(new float[] { 50258 }).View, new[] { 1, 1 }),
+            };
+            var decShape = new[] { 1, WhisperHeads, pastSeq, WhisperHeadDim };
+            var encShape = new[] { 1, WhisperHeads, WhisperEncoderSeq, WhisperHeadDim };
+            int decElems = WhisperHeads * pastSeq * WhisperHeadDim;
+            int encElems = WhisperHeads * WhisperEncoderSeq * WhisperHeadDim;
+            for (int l = 0; l < WhisperLayers; l++)
+            {
+                inputs[$"past_key_values.{l}.decoder.key"] = new Tensor(Upload(Pseudo(decElems)).View, decShape);
+                inputs[$"past_key_values.{l}.decoder.value"] = new Tensor(Upload(Pseudo(decElems)).View, decShape);
+                inputs[$"past_key_values.{l}.encoder.key"] = new Tensor(Upload(Pseudo(encElems)).View, encShape);
+                inputs[$"past_key_values.{l}.encoder.value"] = new Tensor(Upload(Pseudo(encElems)).View, encShape);
+            }
+
+            var outputs = await session.RunAsync(inputs);
+            if (!outputs.TryGetValue("logits", out var logitsTensor))
+                throw new Exception($"no 'logits' output — got: {string.Join(",", outputs.Keys)}");
+
+            int vocab = logitsTensor.Shape[^1];
+            var logits = await logitsTensor.Data.CopyToAsync(accelerator, vocab);
+            for (int i = 0; i < logits.Length; i++)
+                if (!float.IsFinite(logits[i]))
+                    throw new Exception($"whisper logits[{i}] is {logits[i]} — decode step produced non-finite output");
+
+            int seqLenAfter = kvCache.CurrentSeqLen;
+            if (seqLenAfter != seqLenBefore + 1)
+                throw new Exception(
+                    $"whisper KV cache did not capture the decoded token — seqLen {seqLenBefore} -> {seqLenAfter}, " +
+                    $"expected {seqLenBefore + 1}");
+
+            Console.WriteLine($"[TurboQuant] Whisper KV cache capture: PASS " +
+                              $"(seqLen {seqLenBefore} -> {seqLenAfter} over {kvCache.NumLayers} layers)");
+        }
+        finally
+        {
+            await accelerator.SynchronizeAsync();
+            foreach (var b in buffers) b.Dispose();
+        }
     });
 
     /// <summary>
@@ -1388,184 +1536,198 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
-    /// GPT-2 baseline: run one forward pass WITHOUT KV cache (non-merged model).
-    /// Establishes expected next token for "The cat sat on the" prompt.
-    /// This must pass before TurboQuant integration is tested.
+    /// GPT-2 baseline: one full forward pass through the base decoder, which has NO KV cache.
+    /// Establishes the next token for "The cat sat on the" and that the graph produces finite logits.
     /// </summary>
+    /// <remarks>
+    /// The base decoder genuinely has no <c>past_key_values.*</c> inputs, so <c>HasKVCache</c> being false
+    /// here is CORRECT and is asserted rather than merely logged. Its partner
+    /// <see cref="TurboQuant_GPT2_WithKVCache"/> is what exercises the cache.
+    /// </remarks>
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_GPT2_Baseline_NoKVCache() => await RunTest(async accelerator =>
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
-
-        // DistilGPT-2 base decoder (no If control flow, no past_key_values inputs)
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
-
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["input_ids"] = new[] { 1, 5 },
-            },
+        await using var model = await OpenSeekableModelStreamAsync(DistilGpt2BaseUrl);
+        using var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, model,
+            inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, Gpt2Prompt.Length } },
             enableOptimization: false);
 
         Console.WriteLine($"[GPT-2 Baseline] inputs: {string.Join(", ", session.InputNames)}");
-        Console.WriteLine($"[GPT-2 Baseline] HasKVCache: {session.Executor.HasKVCache}");
 
-        // "The cat sat on the" tokens for DistilGPT-2
-        var tokenIds = new float[] { 464, 3797, 3332, 319, 262 };
-        var mask = new float[] { 1, 1, 1, 1, 1 };
+        // The base decoder has no past_key_values.* inputs. Assert that, so this test states a fact about
+        // the model instead of quietly tolerating either answer.
+        if (session.Executor.HasKVCache)
+            throw new Exception(
+                "base decoder reports a KV cache — it has no past_key_values.* inputs, so detection is wrong");
 
-        using var idsBuf = accelerator.Allocate1D(tokenIds);
-        using var maskBuf = accelerator.Allocate1D(mask);
+        var (nextToken, logits) = await Gpt2FullForwardAsync(accelerator, session);
 
-        var inputs = new Dictionary<string, Tensor>
-        {
-            [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 }),
-        };
-        if (session.InputNames.Length > 1)
-            inputs[session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, 5 });
-
-        var outputs = await session.RunAsync(inputs);
-        var output = outputs[session.OutputNames[0]];
-
-        // Get last token logits
-        int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
-        int lastOffset = (5 - 1) * vocabSize;
-
-        using var readBuf = accelerator.Allocate1D<float>(vocabSize);
-        new ElementWiseKernels(accelerator).Scale(
-            output.Data.SubView(lastOffset, vocabSize), readBuf.View, vocabSize, 1f);
-        await accelerator.SynchronizeAsync();
-        var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
-
-        // Find argmax
-        int nextToken = 0;
-        float maxLogit = float.MinValue;
-        for (int i = 0; i < logits.Length; i++)
-        {
-            if (!float.IsNaN(logits[i]) && logits[i] > maxLogit)
-            {
-                maxLogit = logits[i];
-                nextToken = i;
-            }
-        }
-
-        Console.WriteLine($"[GPT-2 Baseline] Next token: {nextToken} (logit={maxLogit:F4})");
-        Console.WriteLine($"[GPT-2 Baseline] Top 5 logits:");
-        var topIndices = logits.Select((v, i) => (v, i))
-            .OrderByDescending(x => x.v).Take(5).ToArray();
-        foreach (var (v, i) in topIndices)
-            Console.WriteLine($"  token {i}: {v:F4}");
-
-        // Verify no NaN
         int nanCount = logits.Count(v => float.IsNaN(v) || float.IsInfinity(v));
-        if (nanCount > 0)
-            throw new Exception($"[GPT-2 Baseline] {nanCount} NaN/Inf logits");
+        if (nanCount > 0) throw new Exception($"[GPT-2 Baseline] {nanCount} NaN/Inf logits");
 
-        Console.WriteLine($"[GPT-2 Baseline] PASS — next token {nextToken}, no NaN");
+        Console.WriteLine($"[GPT-2 Baseline] PASS — next token {nextToken}, no KV cache, no NaN");
     });
 
     /// <summary>
-    /// GPT-2 with TurboQuant KV cache: run DistilGPT-2 merged model with auto KV cache.
-    /// The merged model has past_key_values inputs/outputs — GraphExecutor auto-detects
-    /// and creates QuantizedKVCache (3+1 QJL default). Verifies:
-    /// 1. KV cache is auto-detected and active
-    /// 2. First forward pass produces valid logits (no NaN)
-    /// 3. KV cache captures token data after inference
-    /// 4. Top token is logged for comparison with baseline
+    /// The KV-cache half of the A/B: prefill on the base decoder, then take ONE incremental step through
+    /// the with-past decoder and require it to predict the SAME token as a full forward pass.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ This test used to load the SAME <c>decoder_model.onnx</c> as
+    /// <see cref="TurboQuant_GPT2_Baseline_NoKVCache"/> - on the stated reasoning "use base decoder (no If
+    /// control flow nodes) - same KV cache outputs". Same outputs, but that model has no
+    /// <c>past_key_values.*</c> INPUTS, so <c>HasKVCache</c> was always false, its cache block was
+    /// log-only, and the test was BEHAVIOURALLY IDENTICAL to the baseline it is supposed to be compared
+    /// against. The A/B pair compared a model against itself, and the final line printed "KV cache active"
+    /// while no cache existed.
+    /// <para>
+    /// The claim worth making is EQUIVALENCE: decoding token N through a KV cache must produce what a full
+    /// forward pass over tokens 0..N produces. Asserting only "HasKVCache is true" would pass on a cache
+    /// wired to the wrong layer; asserting the predicted TOKEN catches that.
+    /// </para>
+    /// </remarks>
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
     public async Task TurboQuant_GPT2_WithKVCache() => await RunTest(async accelerator =>
     {
-        var http = GetHttpClient();
-        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+        int prefix = Gpt2Prompt.Length - 1;          // prefill 0..3, decode token 4
 
-        // DistilGPT-2 merged (WITH KV cache inputs/outputs)
-        // Use base decoder (no If control flow nodes) — same KV cache outputs
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
-
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["input_ids"] = new[] { 1, 5 },
-            },
-            enableOptimization: false);
-
-        Console.WriteLine($"[GPT-2 TurboQuant] inputs: {string.Join(", ", session.InputNames)}");
-        Console.WriteLine($"[GPT-2 TurboQuant] HasKVCache: {session.Executor.HasKVCache}");
-
-        if (session.Executor.HasKVCache)
+        // ── A: full forward over the whole prompt, base decoder, no cache ──
+        int fullToken;
+        Dictionary<string, float[]> past;
+        await using (var baseModel = await OpenSeekableModelStreamAsync(DistilGpt2BaseUrl))
         {
-            var kv = session.Executor.KVCache!;
-            Console.WriteLine($"[GPT-2 TurboQuant] KV cache mode: {kv.Mode}, layers: {kv.NumLayers}");
+            using var full = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, baseModel,
+                inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, Gpt2Prompt.Length } },
+                enableOptimization: false);
+            (fullToken, _) = await Gpt2FullForwardAsync(accelerator, full);
+        }
+        // Prefill separately at the shorter length: the session compiles for a fixed input shape.
+        await using (var baseModel2 = await OpenSeekableModelStreamAsync(DistilGpt2BaseUrl))
+        {
+            using var pre = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, baseModel2,
+                inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, prefix } },
+                enableOptimization: false);
+            past = await Gpt2PrefillPresentsAsync(accelerator, pre, prefix);
         }
 
-        // Same prompt as baseline: "The cat sat on the"
-        var tokenIds = new float[] { 464, 3797, 3332, 319, 262 };
-        var mask = new float[] { 1, 1, 1, 1, 1 };
-        var posIds = new float[] { 0, 1, 2, 3, 4 };
+        // ── B: one incremental step through the with-past decoder, fed A's presents ──
+        await using var pastModel = await OpenSeekableModelStreamAsync(DistilGpt2WithPastUrl);
+        using var step = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, pastModel,
+            inputShapes: DistilGpt2StepShapes(prefix), enableOptimization: false);
 
-        using var idsBuf = accelerator.Allocate1D(tokenIds);
-        using var maskBuf = accelerator.Allocate1D(mask);
-        using var posBuf = accelerator.Allocate1D(posIds);
+        if (!step.Executor.HasKVCache)
+            throw new Exception("with-past decoder reports NO KV cache — detection failed");
+        var kv = step.Executor.KVCache!;
+        if (kv.NumLayers != DistilGpt2Layers)
+            throw new Exception($"KV cache layers={kv.NumLayers}, expected {DistilGpt2Layers}");
 
+        var buffers = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+        try
+        {
+            MemoryBuffer1D<float, Stride1D.Dense> Upload(float[] d)
+            {
+                var b = accelerator.Allocate1D(d);
+                buffers.Add(b);
+                return b;
+            }
+
+            var inputs = new Dictionary<string, Tensor>
+            {
+                ["input_ids"] = new Tensor(Upload(new[] { Gpt2Prompt[prefix] }).View, new[] { 1, 1 }),
+                ["attention_mask"] = new Tensor(
+                    Upload(Enumerable.Repeat(1f, prefix + 1).ToArray()).View, new[] { 1, prefix + 1 }),
+            };
+            var kvShape = new[] { 1, DistilGpt2Heads, prefix, DistilGpt2HeadDim };
+            for (int l = 0; l < DistilGpt2Layers; l++)
+            {
+                inputs[$"past_key_values.{l}.key"] = new Tensor(Upload(past[$"present.{l}.key"]).View, kvShape);
+                inputs[$"past_key_values.{l}.value"] = new Tensor(Upload(past[$"present.{l}.value"]).View, kvShape);
+            }
+
+            var outputs = await step.RunAsync(inputs);
+            if (!outputs.TryGetValue("logits", out var logitsTensor))
+                throw new Exception($"no 'logits' output — got: {string.Join(",", outputs.Keys)}");
+
+            int vocab = logitsTensor.Shape[^1];
+            var logits = await logitsTensor.Data.CopyToAsync(accelerator, vocab);
+            int nan = logits.Count(v => float.IsNaN(v) || float.IsInfinity(v));
+            if (nan > 0) throw new Exception($"[GPT-2 KV] {nan} NaN/Inf logits");
+
+            int kvToken = 0;
+            for (int i = 1; i < logits.Length; i++) if (logits[i] > logits[kvToken]) kvToken = i;
+
+            if (kvToken != fullToken)
+                throw new Exception(
+                    $"KV-cache decode disagrees with the full forward pass: cached step predicted {kvToken}, " +
+                    $"full pass predicted {fullToken}. Same prompt, same weights — the cache changed the answer.");
+
+            if (kv.CurrentSeqLen < 1)
+                throw new Exception($"KV cache did not capture the step: seqLen={kv.CurrentSeqLen}");
+
+            Console.WriteLine($"[GPT-2 KV] PASS — cached decode and full forward both predict token " +
+                              $"{kvToken}; cache seqLen={kv.CurrentSeqLen} over {kv.NumLayers} layers");
+        }
+        finally
+        {
+            await accelerator.SynchronizeAsync();
+            foreach (var b in buffers) b.Dispose();
+        }
+    });
+
+    /// <summary>Full forward pass over <see cref="Gpt2Prompt"/>; returns the greedy next token and the
+    /// last position's logits.</summary>
+    private static async Task<(int nextToken, float[] logits)> Gpt2FullForwardAsync(
+        Accelerator accelerator, InferenceSession session)
+    {
+        int n = Gpt2Prompt.Length;
+        using var ids = accelerator.Allocate1D(Gpt2Prompt);
+        using var mask = accelerator.Allocate1D(Enumerable.Repeat(1f, n).ToArray());
         var inputs = new Dictionary<string, Tensor>
         {
-            [session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, 5 }),
+            ["input_ids"] = new Tensor(ids.View, new[] { 1, n }),
         };
         if (session.InputNames.Contains("attention_mask"))
-            inputs["attention_mask"] = new Tensor(maskBuf.View, new[] { 1, 5 });
-        if (session.InputNames.Contains("position_ids"))
-            inputs["position_ids"] = new Tensor(posBuf.View, new[] { 1, 5 });
+            inputs["attention_mask"] = new Tensor(mask.View, new[] { 1, n });
 
         var outputs = await session.RunAsync(inputs);
-        var output = outputs[session.OutputNames[0]];
-
-        // Get last token logits
-        int vocabSize = output.Shape.Length >= 3 ? output.Shape[^1] : 50257;
-        int lastOffset = (5 - 1) * vocabSize;
-
-        using var readBuf = accelerator.Allocate1D<float>(vocabSize);
-        new ElementWiseKernels(accelerator).Scale(
-            output.Data.SubView(lastOffset, vocabSize), readBuf.View, vocabSize, 1f);
+        var output = outputs["logits"];
+        int vocab = output.Shape[^1];
+        // Only the LAST position predicts the next token.
+        var logits = await output.Data.SubView((n - 1) * vocab, vocab).CopyToAsync(accelerator, vocab);
+        int best = 0;
+        for (int i = 1; i < logits.Length; i++)
+            if (!float.IsNaN(logits[i]) && logits[i] > logits[best]) best = i;
         await accelerator.SynchronizeAsync();
-        var logits = await readBuf.CopyToHostAsync<float>(0, vocabSize);
+        return (best, logits);
+    }
 
-        // Find argmax
-        int nextToken = 0;
-        float maxLogit = float.MinValue;
-        for (int i = 0; i < logits.Length; i++)
+    /// <summary>Run the base decoder over the first <paramref name="prefix"/> prompt tokens and read back
+    /// its <c>present.*</c> tensors, to be fed as the with-past decoder's past_key_values.</summary>
+    private static async Task<Dictionary<string, float[]>> Gpt2PrefillPresentsAsync(
+        Accelerator accelerator, InferenceSession session, int prefix)
+    {
+        using var ids = accelerator.Allocate1D(Gpt2Prompt.Take(prefix).ToArray());
+        using var mask = accelerator.Allocate1D(Enumerable.Repeat(1f, prefix).ToArray());
+        var inputs = new Dictionary<string, Tensor>
         {
-            if (!float.IsNaN(logits[i]) && logits[i] > maxLogit)
-            {
-                maxLogit = logits[i];
-                nextToken = i;
-            }
-        }
+            ["input_ids"] = new Tensor(ids.View, new[] { 1, prefix }),
+        };
+        if (session.InputNames.Contains("attention_mask"))
+            inputs["attention_mask"] = new Tensor(mask.View, new[] { 1, prefix });
 
-        Console.WriteLine($"[GPT-2 TurboQuant] Next token: {nextToken} (logit={maxLogit:F4})");
-        Console.WriteLine($"[GPT-2 TurboQuant] Top 5 logits:");
-        var topIndices = logits.Select((v, i) => (v, i))
-            .OrderByDescending(x => x.v).Take(5).ToArray();
-        foreach (var (v, i) in topIndices)
-            Console.WriteLine($"  token {i}: {v:F4}");
-
-        // Verify no NaN
-        int nanCount = logits.Count(v => float.IsNaN(v) || float.IsInfinity(v));
-        if (nanCount > 0)
-            throw new Exception($"[GPT-2 TurboQuant] {nanCount} NaN/Inf logits");
-
-        // Verify KV cache captured data
-        if (session.Executor.HasKVCache)
+        var outputs = await session.RunAsync(inputs);
+        var presents = new Dictionary<string, float[]>();
+        foreach (var (name, tensor) in outputs)
         {
-            var kv = session.Executor.KVCache!;
-            Console.WriteLine($"[GPT-2 TurboQuant] KV cache seqLen after inference: {kv.CurrentSeqLen}");
+            if (!name.StartsWith("present.")) continue;
+            int count = tensor.Shape.Aggregate(1, (a, b) => a * b);
+            presents[name] = await tensor.Data.CopyToAsync(accelerator, count);
         }
-
-        Console.WriteLine($"[GPT-2 TurboQuant] PASS — next token {nextToken}, KV cache active, no NaN");
-    });
+        await accelerator.SynchronizeAsync();
+        if (presents.Count == 0)
+            throw new Exception($"prefill produced no present.* outputs — got: {string.Join(",", outputs.Keys)}");
+        return presents;
+    }
 
     /// <summary>
     /// QuantizedKVCache.FlashAttention(): store vectors, then run single-pass
@@ -1711,4 +1873,19 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[KVCache FlashAttn] PASS — end-to-end quantized Flash Attention (cosine={cosineSim:F6})");
     });
+}
+
+
+// Helper extension for reading tensor data (same shape as MLTestBase.OperatorTests.cs's).
+static file class TurboQuantTensorReadExtensions
+{
+    public static async Task<float[]> CopyToAsync(this ArrayView1D<float, Stride1D.Dense> view,
+        Accelerator accelerator, int count)
+    {
+        using var temp = accelerator.Allocate1D<float>(count);
+        var ew = new ElementWiseKernels(accelerator);
+        ew.Scale(view, temp.View, count, 1f);
+        await accelerator.SynchronizeAsync();
+        return await temp.CopyToHostAsync<float>(0, count);
+    }
 }

@@ -1520,8 +1520,29 @@ public class SumOperator(OperatorRegistry reg) : IOnnxOperator
             var tempBuf = ctx.Pool.Rent(new[] { count });
             for (int i = 1; i < ctx.Inputs.Length; i++)
             {
-                reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.Data, count);
-                reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, count, 1f);
+                // ⚠️ `Add` indexes BOTH operands by the dispatch index, so an input SMALLER than the output
+                // is read out of bounds - and ONNX Sum/Mean are variadic with multidirectional
+                // broadcasting, so a smaller input is legal. A scalar is the case that actually occurs and
+                // AddBias broadcasts it correctly; anything else is refused rather than silently read past
+                // the end of the buffer (on a GPU backend that is a silent wrong answer, not a crash).
+                int inCount = ctx.Inputs[i].ElementCount;
+                if (inCount == count)
+                {
+                    reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.Data, count);
+                    reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, count, 1f);
+                }
+                else if (inCount == 1)
+                {
+                    reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[i].Data, count, 1);
+                }
+                else
+                {
+                    ctx.Pool.Return(tempBuf);
+                    throw new NotSupportedException(
+                        $"{OpType}: input {i} has {inCount} elements against an output of {count}. Only " +
+                        "equal-size or scalar inputs are supported; general multidirectional broadcasting " +
+                        "across variadic inputs is not implemented.");
+                }
             }
         }
     }
@@ -1540,8 +1561,29 @@ public class MeanOperator(OperatorRegistry reg) : IOnnxOperator
             var tempBuf = ctx.Pool.Rent(new[] { count });
             for (int i = 1; i < ctx.Inputs.Length; i++)
             {
-                reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.Data, count);
-                reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, count, 1f);
+                // ⚠️ `Add` indexes BOTH operands by the dispatch index, so an input SMALLER than the output
+                // is read out of bounds - and ONNX Sum/Mean are variadic with multidirectional
+                // broadcasting, so a smaller input is legal. A scalar is the case that actually occurs and
+                // AddBias broadcasts it correctly; anything else is refused rather than silently read past
+                // the end of the buffer (on a GPU backend that is a silent wrong answer, not a crash).
+                int inCount = ctx.Inputs[i].ElementCount;
+                if (inCount == count)
+                {
+                    reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.Data, count);
+                    reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, count, 1f);
+                }
+                else if (inCount == 1)
+                {
+                    reg.ElementWise.AddBias(ctx.Outputs[0].Data, ctx.Inputs[i].Data, count, 1);
+                }
+                else
+                {
+                    ctx.Pool.Return(tempBuf);
+                    throw new NotSupportedException(
+                        $"{OpType}: input {i} has {inCount} elements against an output of {count}. Only " +
+                        "equal-size or scalar inputs are supported; general multidirectional broadcasting " +
+                        "across variadic inputs is not implemented.");
+                }
             }
         }
         reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, count, 1f / ctx.Inputs.Length);

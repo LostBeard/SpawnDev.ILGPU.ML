@@ -517,6 +517,16 @@ public class GraphExecutor : IDisposable
 
         // Auto-detect KV cache pattern
         var inputShapes = new Dictionary<string, int[]>();
+        // ⚠️ Seed from the graph's declared INPUTS first. This dictionary used to be built ONLY from
+        // `weights`, but `past_key_values.*` are graph INPUTS and never weights - so the analyzer's
+        // `KVCachePoint.Shape` was null for EVERY model, and QuantizedKVCache silently fell back to a
+        // hardcoded 12 heads x 64. That guess is exactly right for the GPT-2 family, which is why nothing
+        // ever caught it; MEASURED 2026-08-30 on whisper-tiny (6 heads), the cache sized itself for
+        // 12*64=768 while the executor handed it the true 384-element vector, and TurboQuant's
+        // ComputeNorms read 384 floats past the end of the buffer.
+        foreach (var (name, shape) in graph.InputShapes)
+            if (!string.IsNullOrEmpty(name) && shape is { Length: > 0 })
+                inputShapes[name] = shape;
         foreach (var node in graph.Nodes)
         {
             for (int i = 0; i < node.InputNames.Length; i++)

@@ -647,13 +647,22 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
             var azp = ctx.TryGetInputValues(2);
             if (azp != null && azp.Length > 0)
             {
-                // Broadcast subtract: scalar or per-row zero point
+                // a_zero_point is scalar, or PER-ROW of A [M, K] (one value per row of the M axis).
+                // ⚠️ The per-row branch used to call the raw `Add`, which indexes BOTH operands by the
+                // dispatch index and therefore read a.ElementCount (= M*K) values out of an M-element
+                // zero-point buffer. And `AddBias` is NOT the fix: it indexes bias[i % C], which is
+                // per-COLUMN. A row-major element i belongs to row i / K, so the row form is required -
+                // the column form runs happily and computes the wrong number.
                 var zpBuf = ctx.Pool.Rent(ctx.Inputs[2].Shape, "_mmi_azp");
                 reg.ElementWise.Scale(ctx.Inputs[2].Data, zpBuf.Data, ctx.Inputs[2].ElementCount, -1f);
                 if (azp.Length == 1)
                     reg.ElementWise.AddBias(aAdj.Data, zpBuf.Data, a.ElementCount, 1);
+                else if (azp.Length == M && K > 0)
+                    reg.ElementWise.AddRowBias(aAdj.Data, zpBuf.Data, a.ElementCount, K);
                 else
-                    reg.ElementWise.Add(aAdj.Data, zpBuf.Data, aAdj.Data, a.ElementCount);
+                    throw new NotSupportedException(
+                        $"MatMulInteger a_zero_point has {azp.Length} values; expected 1 (per-tensor) or " +
+                        $"{M} (per-row of A [{M},{K}]).");
                 ctx.Pool.Return(zpBuf);
             }
         }
@@ -665,12 +674,20 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
             var bzp = ctx.TryGetInputValues(3);
             if (bzp != null && bzp.Length > 0)
             {
+                // b_zero_point is scalar, or PER-COLUMN of B [K, N]. Row-major element i sits in column
+                // i % N, so this one genuinely IS AddBias's bias[i % C] shape - unlike a_zero_point above.
+                // The raw `Add` it used to call read b.ElementCount (= K*N) values out of an N-element
+                // buffer.
                 var zpBuf = ctx.Pool.Rent(ctx.Inputs[3].Shape, "_mmi_bzp");
                 reg.ElementWise.Scale(ctx.Inputs[3].Data, zpBuf.Data, ctx.Inputs[3].ElementCount, -1f);
                 if (bzp.Length == 1)
                     reg.ElementWise.AddBias(bAdj.Data, zpBuf.Data, b.ElementCount, 1);
+                else if (bzp.Length == N)
+                    reg.ElementWise.AddBias(bAdj.Data, zpBuf.Data, b.ElementCount, N);
                 else
-                    reg.ElementWise.Add(bAdj.Data, zpBuf.Data, bAdj.Data, b.ElementCount);
+                    throw new NotSupportedException(
+                        $"MatMulInteger b_zero_point has {bzp.Length} values; expected 1 (per-tensor) or " +
+                        $"{N} (per-column of B [{K},{N}]).");
                 ctx.Pool.Return(zpBuf);
             }
         }

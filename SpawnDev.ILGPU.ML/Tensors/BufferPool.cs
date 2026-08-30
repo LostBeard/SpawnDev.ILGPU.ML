@@ -407,29 +407,37 @@ public class BufferPool : IDisposable
         // zero-copy path, and the per-branch logging below misses whichever branch is not taken.
         // ── Causal mask: generate on the GPU instead of uploading it ──
         // A decoder's attention mask is a pure function of its shape. distilgpt2 ships one as
-        // onnx::Slice_260, a 1024x1024 BOOL initializer with no raw_data stream offset - so it cannot
-        // stream, gets expanded BOOL->float32 (1 MiB of mask becoming 4 MiB), and host-copied. MEASURED
-        // 2026-08-29: that single tensor is what tripped BrowserBufferPolicy's host-copy guard on every
-        // browser backend; every other tensor taking this path in that model is a 4-byte scalar.
+        // onnx::Slice_260 - a 1024x1024 BOOL mask carried as a Constant NODE ATTRIBUTE, not a graph
+        // initializer, which is why the streaming parser records no raw_data offset for it: node
+        // submessages are read whole. So it cannot stream, gets expanded BOOL->float32 (1 MiB of mask
+        // becoming 4 MiB), and is host-copied. MEASURED 2026-08-30 over a full streaming load: it is the
+        // ONLY non-scalar host copy distilgpt2 makes - every other tensor on this path in that model is a
+        // 4-byte scalar - and it is what tripped BrowserBufferPolicy's host-copy guard on every browser
+        // backend (as a 1,048,576-byte FIRST CHUNK, once the fallthrough branch below was chunked).
+        //
+        // ⚠️ Rank: the mask ships as [1,1,1024,1024], NOT [1024,1024], so the `shape.Length == 2` gate this
+        // check used to carry never once fired on the tensor the code was written for - MEASURED
+        // 2026-08-30: `GENERATED` logged ZERO times across a full distilgpt2 load. Leading singleton dims
+        // are broadcast axes carrying no data, so they are collapsed away before the check.
         //
         // ⚠️ TryDetectTriangular verifies EVERY element before we substitute. A generated mask standing in
         // for data that is only MOSTLY triangular would silently change what the model computes, which is
         // far worse than the copy this avoids. Anything that does not match exactly falls through below.
-        if (tensor.DataType == 9 && shape.Length == 2 && shape[0] > 1 && shape[1] > 1)
+        if (tensor.DataType == 9 && TryAsMaskExtent(shape, out int maskRows, out int maskCols))
         {
             var maskBytes = tensor.RawData;
             if (maskBytes == null && tensor.RawDataSource != null && tensor.RawDataLength >= count)
                 maskBytes = tensor.RawDataSource.AsSpan(tensor.RawDataOffset, tensor.RawDataLength).ToArray();
 
             if (maskBytes != null && maskBytes.Length >= count &&
-                SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(maskBytes, shape[0], shape[1], out var triMode))
+                SpawnDev.ILGPU.ML.Kernels.MaskKernels.TryDetectTriangular(maskBytes, maskRows, maskCols, out var triMode))
             {
                 var maskBuf = _accelerator.Allocate1D<float>(count);
                 _allBuffers.Add(maskBuf);
                 (_maskKernels ??= new SpawnDev.ILGPU.ML.Kernels.MaskKernels(_accelerator))
-                    .FillTriangular(maskBuf.View, shape[0], shape[1], triMode);
+                    .FillTriangular(maskBuf.View, maskRows, maskCols, triMode);
                 if (LogProtoResidentTensors)
-                    Console.WriteLine($"[BufferPool] GENERATED '{name ?? tensor.Name}' {shape[0]}x{shape[1]} " +
+                    Console.WriteLine($"[BufferPool] GENERATED '{name ?? tensor.Name}' {maskRows}x{maskCols} " +
                                       $"{triMode} mask on the GPU - skipped a {(long)count * 4:N0}-byte host copy");
                 return new Tensor(maskBuf.View, shape, name);
             }
@@ -437,7 +445,8 @@ public class BufferPool : IDisposable
 
         if (LogProtoResidentTensors)
             Console.WriteLine($"[BufferPool] NET-chunked '{name ?? tensor.Name}' dtype={tensor.DataType} " +
-                              $"count={count} ({(long)count * 4:N0} B) rawData={(tensor.RawData != null ? tensor.RawData.Length.ToString() : "null")} " +
+                              $"shape=[{string.Join(",", shape)}] count={count} ({(long)count * 4:N0} B) " +
+                              $"rawData={(tensor.RawData != null ? tensor.RawData.Length.ToString() : "null")} " +
                               $"rawSrc={(tensor.RawDataSource != null ? "yes" : "no")} streamOff={tensor.RawDataStreamOffset}");
 
         // For small tensors, use the standard path (no chunking overhead)
@@ -541,6 +550,31 @@ public class BufferPool : IDisposable
         }
 
         return new Tensor(buffer.View, shape, name);
+    }
+
+    /// <summary>
+    /// View <paramref name="shape"/> as a 2-D mask extent, collapsing LEADING singleton (broadcast) axes:
+    /// <c>[1,1,1024,1024]</c>, <c>[1,1024,1024]</c> and <c>[1024,1024]</c> all yield 1024x1024.
+    /// </summary>
+    /// <remarks>
+    /// Only leading 1s are dropped, and only the trailing TWO axes are taken as the extent - the mask
+    /// kernel writes row-major over rows*cols, so a real (non-1) axis in front of those two would mean the
+    /// buffer holds SEVERAL planes and one triangular fill would be wrong for every plane but the first.
+    /// Rows and columns must both exceed 1: a 1xN or Nx1 "triangle" is degenerate and matches trivially.
+    /// </remarks>
+    /// <param name="shape">Tensor shape.</param>
+    /// <param name="rows">Mask row count when this returns true.</param>
+    /// <param name="cols">Mask column count when this returns true.</param>
+    /// <returns>True when the shape describes a single 2-D mask plane.</returns>
+    internal static bool TryAsMaskExtent(int[] shape, out int rows, out int cols)
+    {
+        rows = cols = 0;
+        if (shape == null || shape.Length < 2) return false;
+        for (int i = 0; i < shape.Length - 2; i++)
+            if (shape[i] != 1) return false;                     // a real leading axis = multiple planes
+        rows = shape[shape.Length - 2];
+        cols = shape[shape.Length - 1];
+        return rows > 1 && cols > 1;
     }
 
     /// <summary>

@@ -730,17 +730,27 @@ public class DequantizeLinearOperator(OperatorRegistry reg) : IOnnxOperator
                 reg.IntConvert.UInt8ToFloat(x.AsView<byte>(), widened.Data, count);
             x = widened;
         }
+        // ⚠️ scale and zero_point are PER-TENSOR (1 element) or per-axis - almost never x's element count.
+        // `Sub`/`Mul` index BOTH operands with the dispatch index, so they read `count` elements out of a
+        // 1-element zero_point: OOB. MEASURED 2026-08-30 - loading Xenova/distilgpt2
+        // decoder_with_past_model_quantized.onnx died with "Assertion Failed: X index out of bounds" in
+        // ElementWiseKernels.Sub on the CPU backend; on a GPU backend the same read is silent garbage.
+        // QuantizeLinear, the inverse op right below, already avoided exactly this ("Div reads OOB for
+        // 1-element scale against count>1") - Dequantize never got the same treatment.
+        // Broadcast* index the right operand as [i % C], which is identity when C == count, so this is
+        // correct for per-tensor, per-axis AND fully-elementwise scales alike.
+        int scaleCount = scale.ElementCount;
         if (zp != null)
         {
             // x - zero_point → temp, then temp * scale → output
             // Pool.Rent (no name) keeps buffer alive until session dispose — safe for WebGPU command batching
             var temp = ctx.Pool.Rent(x.Shape);
-            reg.ElementWise.Sub(x.Data, zp.Data, temp.Data, count);
-            reg.ElementWise.Mul(temp.Data, scale.Data, ctx.Outputs[0].Data, count);
+            reg.ElementWise.BroadcastSub(x.Data, zp.Data, temp.Data, count, zp.ElementCount);
+            reg.ElementWise.BroadcastMul(temp.Data, scale.Data, ctx.Outputs[0].Data, count, scaleCount);
         }
         else
         {
-            reg.ElementWise.Mul(x.Data, scale.Data, ctx.Outputs[0].Data, count);
+            reg.ElementWise.BroadcastMul(x.Data, scale.Data, ctx.Outputs[0].Data, count, scaleCount);
         }
     }
 }

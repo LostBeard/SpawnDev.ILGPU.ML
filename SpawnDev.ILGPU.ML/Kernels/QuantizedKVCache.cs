@@ -145,19 +145,27 @@ public class QuantizedKVCache : IDisposable
         _bitsPerValue = _mode == KVQuantMode.TurboQuant3Bit ? 3 : 4;
         _valuesPerInt = _mode == KVQuantMode.TurboQuant3Bit ? 10 : 8;
 
-        // Extract dimensions from first layer's shape [batch, heads, seq, head_dim]
+        // Extract dimensions from first layer's shape [batch, heads, seq, head_dim].
+        // ⚠️ NO FALLBACK. This used to default to 12 heads x 64 when the shape was unknown, which sizes
+        // every packed buffer in this cache. The default is exactly right for the GPT-2 family and wrong
+        // for everything else, and nothing downstream re-checks it: GraphExecutor computes the REAL vector
+        // width from the present tensor and hands over a view of that width, so a cache built on the guess
+        // reads past the end of it (MEASURED 2026-08-30 on whisper-tiny, 6 heads: cache assumed 768,
+        // executor supplied 384, TurboQuant's ComputeNorms ran off the buffer). Guessing the geometry of a
+        // model's KV cache is not a recoverable position - throw, and let the caller disable the cache
+        // rather than quantize into a wrongly-sized buffer.
         var firstShape = cacheInfo.Layers[0].Shape;
-        if (firstShape != null && firstShape.Length >= 4)
-        {
-            _numHeads = firstShape[1];
-            _headDim = firstShape[3];
-        }
-        else
-        {
-            // Fallback: common defaults
-            _numHeads = 12;
-            _headDim = 64;
-        }
+        if (firstShape == null || firstShape.Length < 4)
+            throw new InvalidOperationException(
+                $"KV cache geometry unknown: layer 0's past input '{cacheInfo.Layers[0].PastKeyInput}' has " +
+                $"shape [{(firstShape == null ? "null" : string.Join(",", firstShape))}], expected rank 4 " +
+                "[batch, heads, seq, head_dim]. TurboQuant cannot size its packed buffers without it.");
+        _numHeads = firstShape[1];
+        _headDim = firstShape[3];
+        if (_numHeads <= 0 || _headDim <= 0)
+            throw new InvalidOperationException(
+                $"KV cache geometry invalid: heads={_numHeads}, headDim={_headDim} from " +
+                $"'{cacheInfo.Layers[0].PastKeyInput}' shape [{string.Join(",", firstShape)}].");
 
         int vecDim = _numHeads * _headDim; // total elements per token per K or V
         int packedDim = (vecDim + _valuesPerInt - 1) / _valuesPerInt;

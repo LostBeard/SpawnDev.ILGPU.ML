@@ -84,9 +84,13 @@ public class KVCacheAnalyzer
                 continue;
             }
 
-            // Match patterns: "past_key_values.N.key", "past_key_values.N.value"
-            if (TryParseKVInput(name, out int layer, out bool isKey))
+            // Match patterns: "past_key_values.N.key", "past_key_values.N.value",
+            // "past_key_values.N.decoder.key". Cross-attention (".encoder.") is NOT an autoregressive
+            // cache - it is constant for the whole generation and has no present.* counterpart - so it is
+            // skipped rather than allowed to overwrite the self-attention entry for the same layer.
+            if (TryParseKVInput(name, out int layer, out bool isKey, out bool isCross))
             {
+                if (isCross) continue;
                 if (isKey)
                     pastKeyInputs[layer] = name;
                 else
@@ -97,8 +101,9 @@ public class KVCacheAnalyzer
         // Scan model outputs for present.N.key / present.N.value
         foreach (var name in outputNames)
         {
-            if (TryParseKVOutput(name, out int layer, out bool isKey))
+            if (TryParseKVOutput(name, out int layer, out bool isKey, out bool isCross))
             {
+                if (isCross) continue;
                 if (isKey)
                     presentKeyOutputs[layer] = name;
                 else
@@ -143,56 +148,92 @@ public class KVCacheAnalyzer
     }
 
     /// <summary>
-    /// Parse "past_key_values.N.key" or "past_key_values.N.value" input names.
-    /// Also handles variants: "past_key_values.N.key", "pkv.N.key", etc.
+    /// Parse a <c>past_key_values.N[.decoder|.encoder].key|value</c> input name.
     /// </summary>
-    private static bool TryParseKVInput(string name, out int layer, out bool isKey)
+    /// <remarks>
+    /// ⚠️ Encoder-decoder models (Whisper, T5, BART) qualify the name with the ATTENTION BLOCK:
+    /// <c>past_key_values.0.decoder.key</c> is the autoregressive self-attention cache, while
+    /// <c>past_key_values.0.encoder.key</c> is CROSS-attention over the encoder output - computed once and
+    /// constant for the whole generation, with no matching <c>present.*</c> output at all.
+    /// <para>
+    /// MEASURED 2026-08-30 on <c>onnx-community/whisper-tiny decoder_with_past_model.onnx</c> (17 inputs /
+    /// 9 outputs): both forms used to parse to the SAME (layer, isKey) slot, so the encoder entry - which
+    /// comes second in the input list - silently OVERWROTE the decoder one. The analyzer then paired
+    /// ENCODER past against DECODER present and reported a healthy 4-layer cache, so the executor would
+    /// have appended decoder keys into a cache addressed by the static cross-attention inputs. It failed
+    /// loudly nowhere. Cross-attention entries are now identified and excluded.
+    /// </para>
+    /// </remarks>
+    /// <param name="name">Input name.</param>
+    /// <param name="layer">Parsed layer index.</param>
+    /// <param name="isKey">True for a key entry, false for a value entry.</param>
+    /// <param name="isCrossAttention">True when the name is an <c>.encoder.</c>-qualified entry.</param>
+    /// <returns>True when the name is a past-KV entry.</returns>
+    private static bool TryParseKVInput(string name, out int layer, out bool isKey, out bool isCrossAttention)
     {
         layer = -1;
         isKey = false;
+        isCrossAttention = false;
 
         // "past_key_values.0.key" → layer=0, isKey=true
-        // "past_key_values.0.value" → layer=0, isKey=false
-        if (name.StartsWith("past_key_values.") || name.StartsWith("past_"))
-        {
-            var parts = name.Split('.');
-            if (parts.Length >= 3)
-            {
-                if (int.TryParse(parts[^2], out layer) || int.TryParse(parts[1], out layer))
-                {
-                    var lastPart = parts[^1].ToLowerInvariant();
-                    if (lastPart == "key" || lastPart == "k") { isKey = true; return true; }
-                    if (lastPart == "value" || lastPart == "v") { isKey = false; return true; }
-                }
-            }
-        }
-
-        return false;
+        // "past_key_values.0.decoder.key" → layer=0, isKey=true, self-attention
+        // "past_key_values.0.encoder.key" → layer=0, isKey=true, CROSS-attention (excluded by the caller)
+        if (!name.StartsWith("past_key_values.") && !name.StartsWith("past_")) return false;
+        var parts = name.Split('.');
+        if (parts.Length < 3) return false;
+        if (!TryParseKeyOrValue(parts[^1], out isKey)) return false;
+        if (!TryParseLayerAndQualifier(parts, out layer, out isCrossAttention)) return false;
+        return true;
     }
 
     /// <summary>
-    /// Parse "present.N.key" or "present.N.value" output names.
+    /// Parse a <c>present.N[.decoder|.encoder].key|value</c> output name. See
+    /// <see cref="TryParseKVInput"/> for why the qualifier matters.
     /// </summary>
-    private static bool TryParseKVOutput(string name, out int layer, out bool isKey)
+    /// <param name="name">Output name.</param>
+    /// <param name="layer">Parsed layer index.</param>
+    /// <param name="isKey">True for a key entry, false for a value entry.</param>
+    /// <param name="isCrossAttention">True when the name is an <c>.encoder.</c>-qualified entry.</param>
+    /// <returns>True when the name is a present-KV entry.</returns>
+    private static bool TryParseKVOutput(string name, out int layer, out bool isKey, out bool isCrossAttention)
     {
         layer = -1;
         isKey = false;
+        isCrossAttention = false;
 
-        // "present.0.key" → layer=0, isKey=true
-        if (name.StartsWith("present."))
+        if (!name.StartsWith("present.")) return false;
+        var parts = name.Split('.');
+        if (parts.Length < 3) return false;
+        if (!TryParseKeyOrValue(parts[^1], out isKey)) return false;
+        if (!TryParseLayerAndQualifier(parts, out layer, out isCrossAttention)) return false;
+        return true;
+    }
+
+    /// <summary>Recognise the trailing <c>key</c>/<c>k</c>/<c>value</c>/<c>v</c> segment.</summary>
+    private static bool TryParseKeyOrValue(string last, out bool isKey)
+    {
+        switch (last.ToLowerInvariant())
         {
-            var parts = name.Split('.');
-            if (parts.Length >= 3)
-            {
-                if (int.TryParse(parts[1], out layer))
-                {
-                    var lastPart = parts[^1].ToLowerInvariant();
-                    if (lastPart == "key" || lastPart == "k") { isKey = true; return true; }
-                    if (lastPart == "value" || lastPart == "v") { isKey = false; return true; }
-                }
-            }
+            case "key":
+            case "k": isKey = true; return true;
+            case "value":
+            case "v": isKey = false; return true;
+            default: isKey = false; return false;
         }
+    }
 
-        return false;
+    /// <summary>
+    /// Pull the layer index out of a split KV name, and say whether the segment before key/value marks it
+    /// as cross-attention. A NUMERIC segment there means there is no qualifier at all
+    /// (<c>present.0.key</c>); otherwise that segment is the block name (<c>decoder</c> / <c>encoder</c>)
+    /// and the layer index is the one right after the prefix.
+    /// </summary>
+    private static bool TryParseLayerAndQualifier(string[] parts, out int layer, out bool isCrossAttention)
+    {
+        isCrossAttention = false;
+        if (int.TryParse(parts[^2], out layer)) return true;      // unqualified: ...N.key
+
+        isCrossAttention = parts[^2].Equals("encoder", StringComparison.OrdinalIgnoreCase);
+        return int.TryParse(parts[1], out layer);                 // qualified: ...N.<block>.key
     }
 }

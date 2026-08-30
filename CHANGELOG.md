@@ -2,6 +2,74 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased
+
+### Fixed
+
+- **`DequantizeLinear` read out of bounds for every real quantized model.** It computed
+  `y = (x - zero_point) * scale` with the raw `Sub`/`Mul` kernels, which index BOTH operands by the
+  dispatch index - but ONNX scale/zero_point are per-tensor (1 element) by default, so both kernels read
+  `count-1` elements past the end. On CPU that asserts; on a GPU backend it is a SILENT out-of-bounds read
+  feeding the model's weights. MEASURED on `Xenova/distilgpt2 decoder_with_past_model_quantized.onnx`:
+  `Assertion Failed: X index out of bounds` in `ElementWiseKernels.Sub`. `QuantizeLinear`, the inverse op
+  in the same file, had always broadcast correctly. Now fixed via the new
+  `ElementWiseKernels.BroadcastSub` (`out[i] = a[i] - sub[i % C]`, the out-of-place mirror of
+  `BroadcastMul`); `[i % C]` is the identity when `C == count`, so per-tensor, per-axis and element-wise
+  scales all take one correct path. The quantized export now runs and predicts the SAME token as the fp32
+  export. The pre-existing test could not have caught this: it passed scale and zero_point sized
+  element-for-element with `x`, the one shape that stays in bounds. Three tests added for the shapes that
+  ship.
+  ⚠️ 5.2.0's headline native int8/uint8 weights are widened by exactly this operator, so any real quantized
+  model with a per-tensor scale hit the out-of-bounds read on the shipped 5.2.0. The dtype coverage tests
+  exercise `IntConvertKernels` directly rather than the operator, which is why they stayed green.
+- **`MatMulInteger` read out of bounds for non-scalar zero points, and `AddBias` would only have fixed
+  half of it.** Both the `a_zero_point` and `b_zero_point` branches fell back to the raw `Add`, which
+  indexes both operands by the dispatch index - so an M-element per-row zero point was read `M*K` times and
+  an N-element per-column one `K*N` times. ⚠️ Substituting `AddBias` is NOT the fix: it indexes
+  `bias[i % C]`, which is per-COLUMN and correct for `b_zero_point` (B is `[K,N]`, element `i` is in column
+  `i % N`) but WRONG for `a_zero_point` (A is `[M,K]`, element `i` is in row `i / K`) - it runs clean and
+  silently computes the wrong product. Added `ElementWiseKernels.AddRowBias`
+  (`data[i] += bias[i / rowLength]`) for the row form, kept `AddBias` for the column form, and anything
+  that is neither scalar nor the expected length now throws instead of reading past the buffer. New CPU-
+  reference tests cover per-tensor, per-row+per-column, and a square case where the row/column mix-up stays
+  in bounds so only the VALUES differ.
+- **`Sum` and `Mean` read out of bounds for a broadcasting input.** Both add each variadic input using the
+  OUTPUT's element count, but ONNX Sum/Mean broadcast, so a smaller input is legal. Scalars (the case that
+  occurs) now broadcast correctly via `AddBias`; any other mismatch throws rather than reading past the end
+  - on a GPU backend that read is a silent wrong answer, not a crash. General multidirectional broadcasting
+  across variadic inputs remains unimplemented and is now refused explicitly.
+- **`QuantizedKVCache` was guessing every model's KV geometry.** `GraphExecutor` built its shape dictionary
+  only from WEIGHTS, but `past_key_values.*` are graph INPUTS - so `KVCachePoint.Shape` was null for every
+  model that has ever run, and the cache fell through to a hardcoded `12 heads x 64`. That is exactly right
+  for the GPT-2 family, so it never surfaced. MEASURED 2026-08-30 on whisper-tiny (6 heads): the cache sized
+  its packed buffers for 768 while the executor supplied the true 384-element vector, and TurboQuant's
+  `ComputeNorms` read 384 floats past the end of the buffer. The shape dictionary is now seeded from
+  `CompiledGraph.InputShapes`, and the 12x64 fallback is DELETED - sizing a cache on a guess is not
+  recoverable, so it throws and the caller disables the cache instead of quantizing into a wrong buffer.
+- **`KVCacheAnalyzer` mistook cross-attention for the autoregressive cache.** Encoder-decoder models
+  (Whisper, T5, BART) qualify KV names by attention block. `past_key_values.0.decoder.key` and
+  `past_key_values.0.encoder.key` both parsed to the same `(layer, isKey)` slot, so the encoder entry -
+  second in the input list - silently overwrote the decoder one, and the analyzer paired ENCODER past
+  against DECODER present while still reporting a healthy cache. Cross-attention KV is constant for the
+  whole generation and has no `present.*` counterpart; those entries are now identified and excluded.
+  ⚠️ `HasKVCache` is true both before and after this fix - the assertion that catches it is the paired
+  input NAME, which the new `KVCacheAnalyzer_*` tests check.
+- **The GPU causal-mask generator added in 5.2.0 had never once fired.** It was gated `shape.Length == 2`,
+  but a decoder's mask ships as `[1,1,1024,1024]` - MEASURED: `GENERATED` logged ZERO times across a full
+  distilgpt2 load, so every such mask was still expanded BOOL->float32 (1 MiB becoming 4 MiB) and host
+  copied, tripping `BrowserBufferPolicy.StrictHostCopyMaxBytes` on the browser backends. Leading singleton
+  (broadcast) axes are now collapsed before the check. distilgpt2 makes NO non-scalar host copy on a
+  streaming load, and byte[]-loaded vs stream-loaded logits are bit-identical (0 of 251,285 elements
+  differ). Note the mask is a Constant NODE ATTRIBUTE, not an initializer - that, not a parser gap, is why
+  it has no raw_data stream offset; all 76 of the model's real initializers stream.
+
+### Added
+
+- `ElementWiseKernels.BroadcastSub(a, sub, output, totalElements, C)` - broadcast subtract, the
+  out-of-place counterpart to `AddBias` and mirror of `BroadcastMul`.
+- `ElementWiseKernels.AddRowBias(data, bias, totalElements, rowLength)` - per-ROW broadcast add
+  (`data[i] += bias[i / rowLength]`), the row-wise counterpart to the per-column `AddBias`.
+
 ## 5.2.0 (2026-08-30)
 
 **Low-precision data stays low-precision.** Weights in bf16, FP8 or quantized int8/uint8 now live in GPU

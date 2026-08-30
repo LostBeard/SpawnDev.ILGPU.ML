@@ -43,8 +43,18 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
-    /// Test auto-format detection — same API loads both ONNX and TFLite.
+    /// Test auto-format detection — the same API loads both ONNX and TFLite.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ This test used to wrap BOTH loads in <c>catch (HttpRequestException)</c> that only logged, then
+    /// print "PASS — format auto-detection works" unconditionally. It asserted NOTHING: if both fetches
+    /// 404'd it passed having loaded no model at all, and even on success it never checked that a session
+    /// came back usable. Both files ARE served from the demo's wwwroot (verified 2026-08-30:
+    /// models/squeezenet/model.onnx and models/blaze-face/model.tflite), so a fetch failure is a real
+    /// regression in serving or paths - exactly what this test should catch - not a reason to pass.
+    /// A genuinely absent model now reports as a visible Skip via <see cref="UnsupportedTestException"/>,
+    /// matching how <c>LoadTFLite_BlazeFace</c> above handles it.
+    /// </remarks>
     [TestMethod(Timeout = 60000)]
     public async Task AutoDetect_LoadOnnxAndTFLite() => await RunTest(async accelerator =>
     {
@@ -53,32 +63,44 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         // Load ONNX via auto-detect
+        InferenceSession onnxSession;
         try
         {
-            var onnxSession = await InferenceSession.CreateFromFileAsync(
+            onnxSession = await InferenceSession.CreateFromFileAsync(
                 accelerator, http, "models/squeezenet/model.onnx");
-            Console.WriteLine($"[AutoDetect] ONNX: {onnxSession.ModelName}, {onnxSession.NodeCount} nodes");
-            onnxSession.Dispose();
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException ex)
         {
-            Console.WriteLine("[AutoDetect] SqueezeNet not available — skipping ONNX test");
+            throw new UnsupportedTestException(
+                $"models/squeezenet/model.onnx not served by this lane ({ex.Message})");
+        }
+        using (onnxSession)
+        {
+            Console.WriteLine($"[AutoDetect] ONNX: {onnxSession.ModelName}, {onnxSession.NodeCount} nodes");
+            if (onnxSession.NodeCount <= 0)
+                throw new Exception($"ONNX auto-detect produced an empty graph: NodeCount={onnxSession.NodeCount}");
         }
 
-        // Load TFLite via auto-detect
+        // Load TFLite via auto-detect — the point of the test is that this is the SAME call.
+        InferenceSession tfliteSession;
         try
         {
-            var tfliteSession = await InferenceSession.CreateFromFileAsync(
+            tfliteSession = await InferenceSession.CreateFromFileAsync(
                 accelerator, http, "models/blaze-face/model.tflite");
-            Console.WriteLine($"[AutoDetect] TFLite: {tfliteSession.ModelName}, {tfliteSession.NodeCount} nodes");
-            tfliteSession.Dispose();
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException ex)
         {
-            Console.WriteLine("[AutoDetect] BlazeFace not available — skipping TFLite test");
+            throw new UnsupportedTestException(
+                $"models/blaze-face/model.tflite not served by this lane ({ex.Message})");
+        }
+        using (tfliteSession)
+        {
+            Console.WriteLine($"[AutoDetect] TFLite: {tfliteSession.ModelName}, {tfliteSession.NodeCount} nodes");
+            if (tfliteSession.NodeCount <= 0)
+                throw new Exception($"TFLite auto-detect produced an empty graph: NodeCount={tfliteSession.NodeCount}");
         }
 
-        Console.WriteLine("[AutoDetect] PASS — format auto-detection works");
+        Console.WriteLine("[AutoDetect] PASS — both formats loaded through one API, each with a non-empty graph");
     });
 
     /// <summary>

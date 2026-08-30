@@ -929,6 +929,226 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "DequantizeLinear: ");
     });
 
+    /// <summary>
+    /// DequantizeLinear with a PER-TENSOR (1-element) scale and zero_point - the shape real quantized ONNX
+    /// actually ships.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This is the case <see cref="Op_DequantizeLinear_MatchesCpu"/> could never have caught: it passes
+    /// scale and zero_point as 5-element arrays, matching x element-for-element, which is the ONE shape
+    /// where the old implementation's <c>Sub</c>/<c>Mul</c> stayed in bounds. Both index the RIGHT operand
+    /// with the dispatch index, so a 1-element zero_point was read <c>count-1</c> elements past its end.
+    /// MEASURED 2026-08-30: loading <c>Xenova/distilgpt2 decoder_with_past_model_quantized.onnx</c> died
+    /// with "Assertion Failed: X index out of bounds" in <c>ElementWiseKernels.Sub</c> on CPU; on a GPU
+    /// backend the same read is silent garbage, which is worse. A per-tensor scale is the DEFAULT for
+    /// ONNX quantization, so this was the common path, not an edge case.
+    /// </remarks>
+    [TestMethod]
+    public async Task Op_DequantizeLinear_PerTensorScale_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        // y = (x - zero_point) * scale, with scalar scale/zp broadcast over all of x.
+        var x = new float[] { 0f, 1f, 2f, 3f, 4f, 250f, 255f, 128f };
+        var scale = new float[] { 0.25f };
+        var zeroPoint = new float[] { 128f };
+        var expected = new float[x.Length];
+        for (int i = 0; i < x.Length; i++) expected[i] = (x[i] - zeroPoint[0]) * scale[0];
+
+        using var xBuf = accelerator.Allocate1D(x);
+        using var scaleBuf = accelerator.Allocate1D(scale);
+        using var zpBuf = accelerator.Allocate1D(zeroPoint);
+        using var outBuf = accelerator.Allocate1D<float>(x.Length);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[] {
+                new Tensor(xBuf.View, new[] { x.Length }),
+                new Tensor(scaleBuf.View, new[] { 1 }),
+                new Tensor(zpBuf.View, new[] { 1 })
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { x.Length }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "x", "x_scale", "x_zero_point" },
+            ConstantValues = new Dictionary<string, float[]> { ["x"] = x, ["x_scale"] = scale, ["x_zero_point"] = zeroPoint }
+        };
+        reg.Resolve("DequantizeLinear")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "DequantizeLinear (per-tensor): ");
+    });
+
+    /// <summary>
+    /// DequantizeLinear with a PER-AXIS scale/zero_point (C values broadcast over N*C elements) - the other
+    /// shape ONNX allows, and proof the broadcast indexes <c>[i % C]</c> rather than merely tolerating a
+    /// scalar.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_DequantizeLinear_PerAxisScale_MatchesCpu() => await RunTest(async accelerator =>
+    {
+        const int rows = 3, C = 4;
+        var x = new float[rows * C];
+        for (int i = 0; i < x.Length; i++) x[i] = i;
+        var scale = new float[] { 0.5f, 0.25f, 2f, 1f };
+        var zeroPoint = new float[] { 0f, 1f, 2f, 3f };
+        var expected = new float[x.Length];
+        for (int i = 0; i < x.Length; i++) expected[i] = (x[i] - zeroPoint[i % C]) * scale[i % C];
+
+        using var xBuf = accelerator.Allocate1D(x);
+        using var scaleBuf = accelerator.Allocate1D(scale);
+        using var zpBuf = accelerator.Allocate1D(zeroPoint);
+        using var outBuf = accelerator.Allocate1D<float>(x.Length);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[] {
+                new Tensor(xBuf.View, new[] { rows, C }),
+                new Tensor(scaleBuf.View, new[] { C }),
+                new Tensor(zpBuf.View, new[] { C })
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { rows, C }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "x", "x_scale", "x_zero_point" },
+            ConstantValues = new Dictionary<string, float[]> { ["x"] = x, ["x_scale"] = scale, ["x_zero_point"] = zeroPoint }
+        };
+        reg.Resolve("DequantizeLinear")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "DequantizeLinear (per-axis): ");
+    });
+
+    /// <summary>
+    /// DequantizeLinear with a per-tensor scale and NO zero_point - the same broadcast hazard on the
+    /// <c>Mul</c>-only branch.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_DequantizeLinear_PerTensorScale_NoZeroPoint() => await RunTest(async accelerator =>
+    {
+        var x = new float[] { 0f, 2f, 4f, 8f, 16f, 32f };
+        var scale = new float[] { 0.125f };
+        var expected = new float[x.Length];
+        for (int i = 0; i < x.Length; i++) expected[i] = x[i] * scale[0];
+
+        using var xBuf = accelerator.Allocate1D(x);
+        using var scaleBuf = accelerator.Allocate1D(scale);
+        using var outBuf = accelerator.Allocate1D<float>(x.Length);
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[] {
+                new Tensor(xBuf.View, new[] { x.Length }),
+                new Tensor(scaleBuf.View, new[] { 1 })
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { x.Length }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "x", "x_scale" },
+            ConstantValues = new Dictionary<string, float[]> { ["x"] = x, ["x_scale"] = scale }
+        };
+        reg.Resolve("DequantizeLinear")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, 1e-4f, "DequantizeLinear (per-tensor, no zp): ");
+    });
+
+    // ═══════════════════════════════════════════════════════════
+    //  MatMulInteger zero points
+    // ═══════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Run <c>MatMulInteger</c> through the registry with the given zero points and compare against a CPU
+    /// reference of <c>matmul(A - azp, B - bzp)</c>.
+    /// </summary>
+    private async Task MatMulIntegerZeroPointBody(Accelerator accelerator,
+        int M, int K, int N, float[] azp, float[] bzp, string label)
+    {
+        var rng = new Random(1234);
+        var a = new float[M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.Next(0, 256);      // uint8 range
+        for (int i = 0; i < b.Length; i++) b[i] = rng.Next(0, 256);
+
+        // CPU reference. azp is per-ROW of A [M,K]; bzp is per-COLUMN of B [K,N]; length 1 = per-tensor.
+        var expected = new float[M * N];
+        for (int m = 0; m < M; m++)
+            for (int n = 0; n < N; n++)
+            {
+                float sum = 0f;
+                for (int k = 0; k < K; k++)
+                {
+                    float av = a[m * K + k] - (azp.Length == 1 ? azp[0] : azp[m]);
+                    float bv = b[k * N + n] - (bzp.Length == 1 ? bzp[0] : bzp[n]);
+                    sum += av * bv;
+                }
+                expected[m * N + n] = sum;
+            }
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var azpBuf = accelerator.Allocate1D(azp);
+        using var bzpBuf = accelerator.Allocate1D(bzp);
+        using var outBuf = accelerator.Allocate1D<float>(M * N);
+
+        var reg = new OperatorRegistry(accelerator);
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(aBuf.View, new[] { M, K }),
+                new Tensor(bBuf.View, new[] { K, N }),
+                new Tensor(azpBuf.View, azp.Length == 1 ? new[] { 1 } : new[] { azp.Length }),
+                new Tensor(bzpBuf.View, bzp.Length == 1 ? new[] { 1 } : new[] { bzp.Length }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { M, N }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "A", "B", "a_zero_point", "b_zero_point" },
+            ConstantValues = new Dictionary<string, float[]>
+            {
+                ["A"] = a, ["B"] = b, ["a_zero_point"] = azp, ["b_zero_point"] = bzp,
+            },
+        };
+        reg.Resolve("MatMulInteger")!.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        // Values reach ~K*255*255, so scale the tolerance to the magnitude rather than using a fixed eps.
+        await AssertCloseGpu(accelerator, outBuf.View, expected, K * 8f, label);
+    }
+
+    /// <summary>Per-tensor (scalar) zero points — the common case, and the one that already worked.</summary>
+    [TestMethod]
+    public async Task Op_MatMulInteger_PerTensorZeroPoints() => await RunTest(async accelerator =>
+        await MatMulIntegerZeroPointBody(accelerator, M: 3, K: 4, N: 5,
+            azp: new[] { 128f }, bzp: new[] { 120f }, "MatMulInteger (per-tensor zp): "));
+
+    /// <summary>
+    /// PER-ROW <c>a_zero_point</c> and PER-COLUMN <c>b_zero_point</c> — the shapes ONNX allows alongside
+    /// the scalar, and the ones that were broken.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Both non-scalar branches used the raw <c>Add</c>, which indexes BOTH operands by the dispatch
+    /// index: an M-element row zero point was read <c>M*K</c> times and an N-element column zero point
+    /// <c>K*N</c> times, i.e. far off the end of each buffer. And swapping in <c>AddBias</c> fixes only
+    /// HALF of it — <c>AddBias</c> indexes <c>bias[i % C]</c>, which is per-COLUMN semantics and correct
+    /// for <c>b_zero_point</c> but WRONG for <c>a_zero_point</c>, whose row-major element <c>i</c> belongs
+    /// to row <c>i / K</c>. That variant runs clean and silently computes the wrong product, which is why
+    /// this test compares against a CPU reference rather than just checking it does not crash.
+    /// </remarks>
+    [TestMethod]
+    public async Task Op_MatMulInteger_PerRowAndPerColumnZeroPoints() => await RunTest(async accelerator =>
+        await MatMulIntegerZeroPointBody(accelerator, M: 3, K: 4, N: 5,
+            azp: new[] { 10f, 200f, 55f },                  // per row of A [3,4]
+            bzp: new[] { 5f, 250f, 60f, 128f, 33f },        // per column of B [4,5]
+            "MatMulInteger (per-row/per-col zp): "));
+
+    /// <summary>
+    /// A per-row zero point must not be applied per-COLUMN. Uses a square matrix so both the correct and
+    /// the incorrect indexing stay in bounds — only the VALUES differ, so this fails on a plausible-looking
+    /// mix-up that no bounds check would catch.
+    /// </summary>
+    [TestMethod]
+    public async Task Op_MatMulInteger_PerRowZeroPoint_IsNotAppliedPerColumn() => await RunTest(async accelerator =>
+        await MatMulIntegerZeroPointBody(accelerator, M: 4, K: 4, N: 4,
+            azp: new[] { 0f, 64f, 128f, 192f },             // distinct per row: order matters
+            bzp: new[] { 1f },
+            "MatMulInteger (per-row zp, square): "));
+
     // ═══════════════════════════════════════════════════════════
     //  ScatterElements
     // ═══════════════════════════════════════════════════════════
