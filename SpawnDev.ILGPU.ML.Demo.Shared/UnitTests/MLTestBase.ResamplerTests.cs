@@ -134,4 +134,38 @@ public abstract partial class MLTestBase
                 throw new Exception($"sample {i} changed from {tone[i]} to {got[i]}");
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// BRANCH COVERAGE for the kernel table. Resample precomputes one kernel per distinct output phase,
+    /// and there are <c>dstRate / gcd(srcRate, dstRate)</c> of those - one, for 48k -> 16k. Coprime rates
+    /// blow that up, so past 4096 phases it falls back to evaluating the kernel per sample. 48000 -> 16001
+    /// is coprime, which forces the fallback.
+    ///
+    /// <para>
+    /// Without this, every resampler test above would take the table path and the fallback would never
+    /// execute - the same way every audio fixture being 16 kHz meant the resampling body itself never ran.
+    /// The invariant asserted is the physical one, not "both branches agree": 10 kHz cannot exist below an
+    /// 8 kHz Nyquist either way.
+    /// </para>
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public Task Resample_CoprimeRates_FallbackPath_StillBandLimits()
+    {
+        var tone = Tone(48000, 10000, 0.5);
+        var got = AudioPreprocessor.Resample(tone, 48000, 16001);   // gcd 1 -> 16001 phases -> fallback
+
+        var peak = PeakInterior(got);
+        if (peak > 0.1)
+            throw new Exception(
+                $"a 10 kHz tone survived 48000 -> 16001 at peak {peak:F3} (source 0.5) - the per-sample "
+                + "fallback path is not band-limiting");
+
+        // And the passband still has to survive that path.
+        var low = AudioPreprocessor.Resample(Tone(48000, 1000, 0.5), 48000, 16001);
+        var lowPeak = PeakInterior(low);
+        if (lowPeak < 0.45 || lowPeak > 0.55)
+            throw new Exception($"1 kHz through the fallback path peaked at {lowPeak:F3}, expected ~0.5");
+        return Task.CompletedTask;
+    }
+
 }

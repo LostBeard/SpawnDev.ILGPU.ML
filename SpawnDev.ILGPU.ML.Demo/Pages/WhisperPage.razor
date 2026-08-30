@@ -236,13 +236,32 @@ const out = await pipe(audio);
                 _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx",
                 webTorrent: Torrents, http: Http);
 
+            // Optional KV-cache decoder. Without it every decode step re-feeds the whole token prefix, so
+            // decoding is quadratic - absence costs SPEED, not correctness, and a repo lacking the file
+            // still works. AiSpeechEngine loads it the same way.
+            _modelProgress = 80;
+            StateHasChanged();
+            InferenceSession? decoderWithPast = null;
+            try
+            {
+                decoderWithPast = await InferenceSession.CreateFromHuggingFaceAsync(
+                    _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/decoder_with_past_model.onnx",
+                    webTorrent: Torrents, http: Http);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Whisper] no with-past decoder ({ex.GetType().Name}); decode will be "
+                                + "quadratic. This costs speed, not correctness.");
+            }
+
             // Load tokenizer
             _modelProgress = 90;
             StateHasChanged();
             var tokenizerBytes = await hub.LoadSmallFileAsync(ModelHub.KnownModels.WhisperTiny, "tokenizer.json");
             var tokenizerJson = System.Text.Encoding.UTF8.GetString(tokenizerBytes);
 
-            _pipeline = new SpeechRecognitionPipeline(encoderSession, decoderSession, _accelerator);
+            _pipeline = new SpeechRecognitionPipeline(encoderSession, decoderSession, _accelerator, decoderWithPast);
+            Console.WriteLine($"[Whisper] KV-cache decode: {(_pipeline.UsesKVCache ? "on" : "OFF (quadratic)")}");
             _pipeline.LoadTokenizer(tokenizerJson);
 
             _isModelLoaded = true;

@@ -25,6 +25,13 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   compile - made the browser silently drop frames. MEASURED: 7.2 s captured over 9 s of wall time (80%)
   while a 231 MB download was in flight, against 100% with none. Now takes a `maxBufferedFrames` (default
   3000), which restored capture to **9.0 s over 9 s**.
+- **`/whisper` now passes the `decoder_with_past` session.** It was the only consumer that did not - and
+  `AiSpeechEngine` had carried a comment explaining why it mattered the whole time. Without it every decode
+  step re-feeds the entire token prefix and recomputes every previous position's K/V, which is quadratic.
+  Absence costs speed, not correctness, so a repo lacking the file still works. Gated by
+  `Pipeline_Whisper_KVCacheDecode_MatchesFullDecode`, which runs the same audio through both decoders and
+  requires byte-identical transcripts - the cached path is a genuinely different code path
+  (`DecodeWithKVCacheAsync`), so speed is the only thing allowed to differ.
 - **Microphone capture no longer resamples every chunk.** Chunks arrive about every 10 ms, and resampling
   each one independently gives a windowed kernel no signal either side of a chunk boundary, stitching a
   discontinuity into the audio 100 times a second. `StartMicrophoneAsync` now defaults to delivering the

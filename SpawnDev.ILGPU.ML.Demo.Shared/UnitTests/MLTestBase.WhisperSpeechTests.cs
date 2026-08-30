@@ -117,4 +117,72 @@ public abstract partial class MLTestBase
                 $"only {overlap:P0} of the known transcript's words appear (floor is 70%). "
                 + $"Expected \"All LibriVox recordings are in the public domain.\", got \"{got}\"");
     });
+
+    /// <summary>
+    /// The KV-cache decoder must be an OPTIMISATION, not a second implementation with its own answers.
+    /// <c>SpeechRecognitionPipeline</c> takes an optional <c>decoder_with_past</c> session and switches to
+    /// <c>DecodeWithKVCacheAsync</c>, a genuinely different code path: without it every step re-feeds the
+    /// whole token prefix and decoding is quadratic. Speed is the only thing that may differ, so this runs
+    /// the same audio through both and requires the transcripts to match EXACTLY.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task Pipeline_Whisper_KVCacheDecode_MatchesFullDecode() => await RunTest(async accelerator =>
+    {
+        var assets = GetHttpClient();
+        if (assets == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var wavBytes = await assets.GetByteArrayAsync("test-audio/librivox-public-domain.wav");
+        var samples = WavDecoder.DecodeWavFile(wavBytes)
+            ?? throw new Exception("could not decode test-audio/librivox-public-domain.wav");
+
+        using var http = CreateHuggingFaceHttpClient();
+        var hf = new HuggingFaceClient(http);
+        var repo = ModelHub.KnownModels.WhisperTiny;
+
+        var encoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, HuggingFaceClient.GetDownloadUrl(repo, "onnx/encoder_model.onnx"));
+        var decoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, HuggingFaceClient.GetDownloadUrl(repo, "onnx/decoder_model.onnx"));
+        var withPastBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, HuggingFaceClient.GetDownloadUrl(repo, "onnx/decoder_with_past_model.onnx"));
+
+        var tokenizerJson = Encoding.UTF8.GetString(await hf.DownloadFileAsync(repo, "tokenizer.json"));
+
+        string full, cached;
+
+        // Full decode: no with-past session, so every step re-feeds the prefix.
+        using (var enc = InferenceSession.CreateFromFile(accelerator, encoderBytes))
+        using (var dec = InferenceSession.CreateFromFile(accelerator, decoderBytes))
+        using (var pipeline = new SpeechRecognitionPipeline(enc, dec, accelerator))
+        {
+            pipeline.LoadTokenizer(tokenizerJson);
+            if (pipeline.UsesKVCache)
+                throw new Exception("expected the full-decode pipeline to report UsesKVCache == false");
+            full = ((await pipeline.TranscribeAsync(samples, 16000)).Text ?? "").Trim();
+        }
+
+        // KV-cache decode: the same audio down the DecodeWithKVCacheAsync path.
+        using (var enc = InferenceSession.CreateFromFile(accelerator, encoderBytes))
+        using (var dec = InferenceSession.CreateFromFile(accelerator, decoderBytes))
+        using (var past = InferenceSession.CreateFromFile(accelerator, withPastBytes))
+        using (var pipeline = new SpeechRecognitionPipeline(enc, dec, accelerator, past))
+        {
+            pipeline.LoadTokenizer(tokenizerJson);
+            if (!pipeline.UsesKVCache)
+                throw new Exception("a decoder_with_past session was supplied but UsesKVCache is false - "
+                                  + "the KV path is not actually being taken, so this test proves nothing");
+            cached = ((await pipeline.TranscribeAsync(samples, 16000)).Text ?? "").Trim();
+        }
+
+        Console.WriteLine($"[Whisper] full   : \"{full}\"");
+        Console.WriteLine($"[Whisper] kvcache: \"{cached}\"");
+
+        if (full.Length == 0)
+            throw new Exception("full decode produced nothing, so there is nothing to compare against");
+        if (!string.Equals(full, cached, StringComparison.Ordinal))
+            throw new Exception(
+                "KV-cache decode disagrees with full decode. "
+                + $"full=[{full}] kvcache=[{cached}]");
+    });
+
 }

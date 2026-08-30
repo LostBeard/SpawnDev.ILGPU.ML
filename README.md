@@ -16,7 +16,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 
 > **What actually works:** [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth — a per-demo **VERIFIED / PARTIAL / WIP** table with the test that proves each one. We mark stubs as WIP honestly, so a demo never lies to you.
 
-- **Demos** — **12 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, CLIP, background-removal, super-res, text-gen, embeddings, inspector, benchmark), plus several PARTIAL/WIP (image-to-3D, voice, SD-Turbo image-gen are not done yet). See the status doc for exactly which.
+- **Demos** - **13 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, CLIP, background-removal, super-res, text-gen, embeddings, inspector, benchmark, and speech-to-text), plus several PARTIAL/WIP (image-to-3D, voice-collab, SD-Turbo image-gen are not done yet). See the status doc for exactly which.
 - **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
@@ -260,7 +260,7 @@ Style models: mosaic, candy, rain princess, udnie, pointilism.
 | **Phi-4 14B** | Conversational LLM | ~8 GB (Q4 GGUF) | Tier 3: maximum intelligence on 12GB+ GPU. MIT license. |
 | **DistilBERT-SST2** | Sentiment analysis | 268 MB | **Working** — matches ONNX Runtime reference |
 | **DistilGPT-2** | Text generation | 314 MB | **Working** — streaming weight loader |
-| **Whisper Tiny** | Speech-to-text | 231 MB | **Working** — encoder + decoder autoregressive |
+| **Whisper Tiny** | Speech-to-text | 231 MB | **Working** - microphone to text, verified on all six backends (`Pipeline_Whisper_TranscribesKnownSpeech`) |
 | **SD-Turbo** | Image generation | ~2.5 GB (FP16) | ONE step, 512x512 from text prompts |
 | **CLIP ViT-B/32** | Vision-language embeddings | 606 MB | Zero-shot classification from any text |
 | **SpeechT5** | Text-to-speech | 643 MB | Neural voice synthesis |

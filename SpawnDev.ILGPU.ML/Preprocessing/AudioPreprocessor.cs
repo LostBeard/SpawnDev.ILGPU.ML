@@ -63,6 +63,57 @@ public static partial class AudioPreprocessor
         // lobes, so the transition band does not degrade when downsampling hard.
         double halfWidth = ResampleLobes / cutoff;
 
+        // Output i sits at source position i * srcRate / dstRate. Reduce the rate pair by its gcd to S/D:
+        // the FRACTIONAL part of that position then depends only on (i mod D), so there are just D
+        // distinct kernels no matter how long the signal is. 48 kHz -> 16 kHz reduces to 3/1 - ONE phase,
+        // the same kernel for every output sample. Computing the window per tap instead costs two trig
+        // calls per tap, which for a 30 s clip at ~48 taps per output is tens of millions of them.
+        int g = Gcd(srcRate, dstRate);
+        int phaseStride = srcRate / g;     // source samples advanced per D outputs
+        int phaseCount = dstRate / g;      // distinct fractional offsets
+
+        // Coprime rates make phaseCount as large as dstRate. Past a sane bound the table costs more than
+        // it saves, so fall back to evaluating the kernel directly.
+        if (phaseCount <= MaxResamplePhases)
+        {
+            var kernels = new float[phaseCount][];
+            var offsets = new int[phaseCount];
+            for (int r = 0; r < phaseCount; r++)
+            {
+                double c = (double)r * phaseStride / phaseCount;
+                int f = (int)Math.Ceiling(c - halfWidth);
+                int l = (int)Math.Floor(c + halfWidth);
+                offsets[r] = f;
+                var k = new float[l - f + 1];
+                for (int t = 0; t < k.Length; t++)
+                {
+                    double dt = c - (f + t);
+                    k[t] = (float)(Sinc(cutoff * dt) * BlackmanWindow(dt / halfWidth));
+                }
+                kernels[r] = k;
+            }
+
+            for (int i = 0; i < outLength; i++)
+            {
+                int q = i / phaseCount;
+                int r = i - q * phaseCount;
+                var k = kernels[r];
+                int start = q * phaseStride + offsets[r];
+
+                double acc = 0, norm = 0;
+                for (int t = 0; t < k.Length; t++)
+                {
+                    int j = start + t;
+                    if (j < 0 || j >= samples.Length) continue;
+                    acc += samples[j] * k[t];
+                    norm += k[t];
+                }
+                output[i] = norm > 1e-9 ? (float)(acc / norm) : 0f;
+            }
+
+            return output;
+        }
+
         for (int i = 0; i < outLength; i++)
         {
             double center = i / ratio;
@@ -87,6 +138,16 @@ public static partial class AudioPreprocessor
 
     /// <summary>Sinc lobes kept either side of an output sample. More lobes = sharper transition band.</summary>
     private const int ResampleLobes = 8;
+
+    /// <summary>Largest kernel table worth precomputing, in distinct phases.</summary>
+    private const int MaxResamplePhases = 4096;
+
+    /// <summary>Greatest common divisor, used to reduce a sample-rate pair to its smallest ratio.</summary>
+    private static int Gcd(int a, int b)
+    {
+        while (b != 0) { (a, b) = (b, a % b); }
+        return a < 0 ? -a : a;
+    }
 
     /// <summary>Normalised sinc, sin(pi x) / (pi x), with the removable singularity at 0 filled in.</summary>
     private static double Sinc(double x)
