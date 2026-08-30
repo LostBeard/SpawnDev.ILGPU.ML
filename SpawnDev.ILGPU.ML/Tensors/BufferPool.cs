@@ -99,6 +99,15 @@ public class BufferPool : IDisposable
     public static bool LogLargeRunAllocs = false;
     /// <summary>Threshold (bytes) for LogLargeRunAllocs. Default 64 MiB.</summary>
     public static long LargeRunAllocThresholdBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// Opt-in diagnostic: log each tensor that takes the PROTO-RESIDENT path in
+    /// <see cref="AllocatePermanentChunked"/> - i.e. it has no <c>raw_data</c> to seek to, so the streaming
+    /// loader cannot stream it and its values must be converted and host-copied. Off by default (libraries
+    /// do not log unconditionally). Turn it on to find out WHICH tensors keep a model off the zero-copy
+    /// path, rather than inferring it from a byte count in a guard message.
+    /// </summary>
+    public static bool LogProtoResidentTensors = false;
     /// <summary>Max total fp32+fp16 bytes ever allocated by ANY pool at one Rent (sum of all live buffers).</summary>
     public static long PeakTotalBytes;
     /// <summary>Max simultaneously-RENTED (named/live, not yet Returned) bytes at one Rent — the true working set.</summary>
@@ -426,9 +435,50 @@ public class BufferPool : IDisposable
         }
         else
         {
-            // Other formats: convert full tensor (fallback — rare for large tensors)
+            // Other formats (no raw_data, or a non-FLOAT dtype): the values live in the proto's TYPED
+            // fields, so there is no stream offset to seek to and they have to be converted. But the
+            // upload was a SINGLE whole-tensor CopyFromCPU, which made this method a lie about its own
+            // name for exactly the tensors that most need chunking. MEASURED 2026-08-29: loading
+            // distilgpt2 through CreateFromOnnxStreamAsync tripped the browser host-copy guard here with
+            // ONE 4,194,304-byte copy (1,048,576 floats) — and on the byte[] path the same full
+            // materialisation is part of what OOM'd the sweep.
+            //
+            // Chunked the same way as the raw-float branch above: peak CPU is now one chunk instead of
+            // the whole tensor. ⚠️ This does NOT make the browser guard pass, and should not be read as
+            // fixing that — a genuinely proto-resident tensor is already in the managed heap by the time
+            // it gets here, so no chunk size makes it a JS-side transfer. Making THAT true means teaching
+            // the ONNX parser to stream typed-field tensors, which is a separate change.
             var data = tensor.ToFloatArray();
-            buffer.CopyFromCPU(data);
+            // PMT captures NO test console output (measured 2026-08-29), so a Console.WriteLine here is
+            // invisible in a run. The EXCEPTION is the only channel that survives, which is why the
+            // host-copy failure below is re-thrown naming the tensor: the raw guard message gives a byte
+            // count and nothing else, and identifying the tensor from a byte count is guesswork.
+            if (LogProtoResidentTensors)
+                Console.WriteLine($"[BufferPool] '{name ?? tensor.Name}' dtype={tensor.DataType} " +
+                                  $"count={data.Length} ({(long)data.Length * 4:N0} B) took the proto-resident " +
+                                  "path (no raw_data) — cannot stream, host copy required");
+            int off = 0;
+            try
+            {
+                while (off < data.Length)
+                {
+                    int n = Math.Min(CHUNK, data.Length - off);
+                    var slice = new float[n];
+                    Array.Copy(data, off, slice, 0, n);
+                    buffer.View.SubView(off, n).CopyFromCPU(slice);
+                    off += n;
+                }
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("StrictHostCopyMaxBytes"))
+            {
+                // The browser host-copy guard fired. Its message names a byte count and nothing else, so
+                // say WHICH tensor forced the host copy and why - that is the actionable part.
+                throw new InvalidOperationException(
+                    $"Tensor '{name ?? tensor.Name}' (dtype={tensor.DataType}, {data.Length} floats, " +
+                    $"{(long)data.Length * 4:N0} B) is PROTO-RESIDENT - it has no raw_data for the streaming " +
+                    "loader to seek to, so its values must be converted and host-copied, which no chunk size " +
+                    "can turn into a JS-side transfer. " + ex.Message, ex);
+            }
         }
 
         return new Tensor(buffer.View, shape, name);
