@@ -45,9 +45,33 @@ public sealed class ZipVoiceTokenizer
     /// separator, and splitting on the first tab would lose it.
     /// </remarks>
     public static Dictionary<string, long> LoadSymbolTable(string tokensPath)
+        => ParseSymbolTable(File.ReadLines(tokensPath));
+
+    /// <summary>
+    /// Build the tokenizer from the CONTENT of a <c>tokens.txt</c> rather than a path on disk.
+    /// </summary>
+    /// <remarks>
+    /// The browser has no filesystem, and this was the ONLY thing in the whole ZipVoice path that assumed
+    /// one - the pipeline, the graphs and the feature extraction are all filesystem-free, and the
+    /// interface's own remarks say it is async precisely so it is not "quietly restricted to the desktop".
+    /// Without this overload it was, at the last step.
+    /// </remarks>
+    /// <param name="tokensContent">The whole tokens.txt, as fetched.</param>
+    public static ZipVoiceTokenizer CreateFromTokens(string tokensContent)
+        => new(ParseSymbolTable(SplitLines(tokensContent)), EmbeddedData.CreatePhonemizer());
+
+    /// <summary>Enumerate the lines of an in-memory tokens.txt, tolerating CRLF or LF.</summary>
+    private static IEnumerable<string> SplitLines(string content)
+    {
+        using var reader = new System.IO.StringReader(content);
+        while (reader.ReadLine() is { } line) yield return line;
+    }
+
+    /// <summary>Parse "symbol TAB id" lines into a symbol table.</summary>
+    public static Dictionary<string, long> ParseSymbolTable(IEnumerable<string> lines)
     {
         var table = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var raw in File.ReadLines(tokensPath))
+        foreach (var raw in lines)
         {
             var line = raw.TrimEnd('\r', '\n');
             if (line.Length == 0) continue;
