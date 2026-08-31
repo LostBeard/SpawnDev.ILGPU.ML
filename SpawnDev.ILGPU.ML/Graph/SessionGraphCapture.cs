@@ -76,6 +76,26 @@ public sealed class SessionGraphCapture : IDisposable
         {
             _captureAttempted = true;
             _capturedShapes = shapes;
+
+            // ⚠️ Control flow is refused HERE, for EVERY backend - not inside the CUDA path.
+            //
+            // If/Loop/Scan run their bodies through SubgraphRunner, which calls BuildExecutor on every
+            // execution and allocates permanent buffers there. A device allocation inside a capture window
+            // is fatal in a way no try/catch reaches: on CUDA a mid-capture cuMemAlloc is an uncatchable
+            // 0xC0000005 (segfault, exit 139), and on WebGPU it HUNG THE GPU - DXGI_ERROR_DEVICE_HUNG, a
+            // D3D12 TDR, reproducibly, which surfaces later as "device has been lost" on an innocent node.
+            //
+            // I first put this guard in CudaGraphCapture alone. That fixed CUDA and left WebGPU - the one
+            // backend this project actually ships to - hanging the device instead. The eligibility decision
+            // is made in this class, so the guard belongs in this class.
+            if (_session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
+            {
+                var cf = string.Join(", ", _session.OperatorTypes.Where(o => o is "If" or "Loop" or "Scan"));
+                Console.WriteLine($"[SessionGraphCapture] graph contains control flow ({cf}), whose subgraph "
+                    + "executors allocate per call - a mid-capture allocation is unrecoverable on both CUDA "
+                    + "and WebGPU; running direct forward.");
+                return await _session.RunAsync(inputs).ConfigureAwait(false);
+            }
             // The capture BINDS its input buffers into the recorded graph (CUDA graph nodes hold
             // device pointers; WebGPU plans hold GPUBuffer refs) - so the capture-pass inputs must
             // OUTLIVE the capture. Callers pass per-step transients (disposing one crashed cuMemFree

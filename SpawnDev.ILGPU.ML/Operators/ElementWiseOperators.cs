@@ -82,7 +82,14 @@ internal static class BroadcastHelper
             // Nothing about it was necessary: BroadcastBinaryOpND already broadcasts on the GPU from a
             // stride map, so the operand only has to BE there - it does not have to be expanded first. One
             // element is uploaded instead of `outCount`.
-            var scalarShape = new[] { 1 };
+            // ⚠️ RANK-MATCHED to the output, not literally [1]. BroadcastBinaryOpND maps indices from
+            // stride arrays, and handing it a rank-1 shape against a rank-3 output HUNG the GPU on WebGPU -
+            // DXGI_ERROR_DEVICE_HUNG, a D3D12 TDR, reproducibly - while CUDA and OpenCL produced correct
+            // output from the very same call. A shape of all 1s broadcasts identically and keeps the two
+            // stride arrays the same length, which is the shape contract the expanded path below was
+            // already honouring by passing outShape.
+            var scalarShape = new int[outShape.Length];
+            Array.Fill(scalarShape, 1);
             var scalarTensor = ctx.Pool.Rent(scalarShape, "_broadcast_scalar");
             if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
             {
