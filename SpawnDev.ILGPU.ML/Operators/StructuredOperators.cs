@@ -1119,7 +1119,10 @@ public class ScatterNDOperator(OperatorRegistry reg) : IOnnxOperator
         var idxFloats = ctx.TryGetInputValues(1);
         if (idxFloats == null)
         {
-            // Runtime indices not available as constants — fall back to identity (output = data copy)
+            // MEASURED 2026-08-30: this does NOT fire for ZipVoice's text encoder - its ScatterND indices
+            // are constant-folded, so the real path runs. It remains a silently wrong answer for any graph
+            // that computes them at runtime (the updates are simply discarded), so it still needs a GPU
+            // scatter; it is just not the encoder's divergence.
             return;
         }
 

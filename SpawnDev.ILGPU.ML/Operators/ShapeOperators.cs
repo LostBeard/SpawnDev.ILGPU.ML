@@ -606,8 +606,19 @@ public class GatherElementsOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            int copyCount = Math.Min(data.ElementCount, outCount);
-            output.Data.SubView(0, copyCount).CopyFrom(data.Data.SubView(0, copyCount));
+            // ⚠️ This used to be `output = data` - copy the input, IGNORE the indices. A silently wrong
+            // answer of exactly the right shape, and the ONLY branch that ran for any model computing its
+            // indices at runtime, which is what relative-position attention does. ZipVoice's text encoder
+            // has four of these and diverged from onnxruntime by 18.6% of peak because of it.
+            var idxShape = indices.Shape;
+            int outer = 1, inner = 1;
+            for (int d = 0; d < axis; d++) outer *= idxShape[d];
+            for (int d = axis + 1; d < idxShape.Length; d++) inner *= idxShape[d];
+            int idxAxis = axis < idxShape.Length ? idxShape[axis] : 1;
+            int dataAxis = axis < data.Shape.Length ? data.Shape[axis] : 1;
+
+            reg.Gather.GatherElements(indices: indices.Data, data: data.Data, output: output.Data,
+                outer: outer, idxAxis: idxAxis, inner: inner, dataAxis: dataAxis);
         }
     }
 }

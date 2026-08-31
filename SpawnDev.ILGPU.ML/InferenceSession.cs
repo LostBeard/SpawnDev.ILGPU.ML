@@ -1424,6 +1424,14 @@ public class InferenceSession : IDisposable
                 var jsonDict = new Dictionary<string, System.Text.Json.JsonElement>();
                 foreach (var (key, value) in node.Attributes)
                 {
+                    // A subgraph cannot round-trip through JSON: it serialises to an object and comes back
+                    // as raw TEXT, which is how If/Loop/Scan silently stopped executing their branches.
+                    // Carry it out of band instead. See GraphNode.RawAttributes.
+                    if (value is Onnx.OnnxGraphProto)
+                    {
+                        (graphNode.RawAttributes ??= new Dictionary<string, object>())[key] = value;
+                        continue;
+                    }
                     var json = System.Text.Json.JsonSerializer.Serialize(value, nanSafeOptions);
                     jsonDict[key] = System.Text.Json.JsonDocument.Parse(json).RootElement.Clone();
                 }

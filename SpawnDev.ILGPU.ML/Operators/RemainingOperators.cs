@@ -966,6 +966,24 @@ internal static class SubgraphRunner
             }
         }
 
+        // A subgraph usually carries a lookup table as a Constant NODE rather than an initializer, and
+        // initializers alone miss it. ZipVoice's If then_branch is exactly one Constant holding the
+        // [1999, 48] relative positional-encoding table.
+        // ⚠️ It cannot be left to the Constant operator either: a TENSOR attribute reaches an operator
+        // through ConvertAttribute -> ExtractTensorScalar, which returns ONE number. Before this, the
+        // branch produced a correctly shaped tensor of ZEROS.
+        foreach (var cn in subgraph.Nodes)
+        {
+            if (cn.OpType != "Constant" || cn.Outputs.Count == 0 || string.IsNullOrEmpty(cn.Outputs[0])) continue;
+            var valueAttr = cn.Attributes.FirstOrDefault(a => a.Name == "value");
+            if (valueAttr?.T == null) continue;
+            var cfloats = valueAttr.T.ToFloatArray();
+            if (cfloats.Length == 0) continue;
+            var cshape = valueAttr.T.Dims.Select(d => (int)d).ToArray();
+            if (cshape.Length == 0) cshape = new[] { cfloats.Length };
+            weights[cn.Outputs[0]] = ctx.Pool.AllocatePermanent(cfloats, cshape, cn.Outputs[0]);
+        }
+
         // Merge outer scope tensors as weights (subgraphs reference parent graph tensors)
         foreach (var (name, tensor) in subgraphInputs)
         {
@@ -1006,8 +1024,24 @@ internal static class SubgraphRunner
             graph.Initializers[init.Name] = init.Dims.Select(d => (int)d).ToArray();
         }
 
+        // Fold Constant NODES holding a real tensor into initializers: BuildExecutor supplies their data,
+        // so the node itself must not run - it would overwrite the table with the scalar that
+        // ExtractTensorScalar hands the Constant operator.
+        var foldedConstants = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in onnxGraph.Nodes)
+        {
+            if (n.OpType != "Constant" || n.Outputs.Count == 0 || string.IsNullOrEmpty(n.Outputs[0])) continue;
+            var valueAttr = n.Attributes.FirstOrDefault(a => a.Name == "value");
+            if (valueAttr?.T == null) continue;
+            var dims = valueAttr.T.Dims.Select(d => (int)d).ToArray();
+            if (dims.Length == 0) dims = new[] { Math.Max(1, (int)valueAttr.T.ElementCount) };
+            graph.Initializers[n.Outputs[0]] = dims;
+            foldedConstants.Add(n.Outputs[0]);
+        }
+
         // Convert node attributes to the typed dictionary format expected by GraphNode
-        graph.Nodes = onnxGraph.Nodes.Select(n =>
+        graph.Nodes = onnxGraph.Nodes.Where(n => !(n.OpType == "Constant" && n.Outputs.Count > 0
+                                                  && foldedConstants.Contains(n.Outputs[0]))).Select(n =>
         {
             var typedAttrs = n.Attributes.ToDictionary(
                 a => a.Name,
@@ -1020,8 +1054,10 @@ internal static class SubgraphRunner
                 jsonAttrs = new Dictionary<string, System.Text.Json.JsonElement>();
                 foreach (var (key, value) in typedAttrs)
                 {
-                    // GraphProto attributes can't be serialized to JSON — store as-is via the compiled node's typed attributes
-                    if (value is Onnx.OnnxGraphProto) continue;
+                    // A nested subgraph cannot be serialised to JSON; it travels out of band, the same
+                    // way the outer graph carries one (see GraphNode.RawAttributes). Dropping it here
+                    // silently disabled nested control flow.
+                    if (value is Onnx.OnnxGraphProto) continue;   // handled below via RawAttributes
                     try
                     {
                         var json = System.Text.Json.JsonSerializer.Serialize(value);
@@ -1031,12 +1067,18 @@ internal static class SubgraphRunner
                 }
             }
 
+            Dictionary<string, object>? rawAttrs = null;
+            foreach (var (key, value) in typedAttrs)
+                if (value is Onnx.OnnxGraphProto)
+                    (rawAttrs ??= new Dictionary<string, object>())[key] = value;
+
             return new Graph.GraphNode
             {
                 OpType = n.OpType,
                 Inputs = n.Inputs.ToList(),
                 Outputs = n.Outputs.ToList(),
                 Attributes = jsonAttrs,
+                RawAttributes = rawAttrs,
             };
         }).ToList();
 
@@ -1047,7 +1089,67 @@ internal static class SubgraphRunner
 public class IfOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "If";
-    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+
+    /// <summary>
+    /// Output shapes come from the BRANCH SUBGRAPHS, which declare them, and never from the inputs.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This used to return <c>inputs[0]</c> - and <c>inputs[0]</c> of an If is the CONDITION, a bool
+    /// scalar. So the output buffer was allocated with ONE element for whatever the branch produced, and
+    /// <see cref="Execute"/>'s <c>Math.Min</c> clamp then silently truncated the branch's real result to
+    /// that single value. No error, no wrong shape reported upward - just a scalar where a tensor belongs.
+    /// <para>
+    /// MEASURED on ZipVoice's text encoder, which reaches its relative positional-encoding table through
+    /// exactly one If (the standard "reuse the cached table if it is long enough, else extend it" shape):
+    /// onnxruntime returns <c>[1999, 48]</c> of sin/cos values in [-1, 1]; we returned <c>[1]</c> holding
+    /// 1.0. Every relative-position bias in all four encoder layers was therefore computed from a scalar,
+    /// which is why the encoder diverged from ORT by 18.6% of peak while still producing correct SHAPES
+    /// downstream - <c>linear_pos</c> collapsed [1, 25, 16] to [1, 16] and nothing complained.
+    /// </para>
+    /// <para>
+    /// ONNX requires both branches to agree on output types and ranks, so either declaration is a valid
+    /// source. A branch whose dims are fully static is preferred, since a symbolic one cannot size a
+    /// buffer; then_branch is tried first only to be deterministic.
+    /// </para>
+    /// </remarks>
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a)
+    {
+        foreach (var key in new[] { "then_branch", "else_branch" })
+        {
+
+            if (a.TryGetValue(key, out var obj) && obj is Onnx.OnnxGraphProto sub
+                && TryDeclaredOutputShapes(sub, out var shapes))
+                return shapes;
+        }
+
+        // Neither branch declares usable dims. Returning the condition's shape would be the old silent
+        // truncation, so fall back to a single element and let the runtime resize path handle it.
+        return new[] { i.Length > 1 ? i[1] : new[] { 1 } };
+    }
+
+    /// <summary>Declared output shapes of a subgraph, or false if any dimension is symbolic.</summary>
+    private static bool TryDeclaredOutputShapes(Onnx.OnnxGraphProto sub, out int[][] shapes)
+    {
+        shapes = Array.Empty<int[]>();
+        if (sub.Outputs.Count == 0) return false;
+
+        var result = new int[sub.Outputs.Count][];
+        for (int o = 0; o < sub.Outputs.Count; o++)
+        {
+            var dims = sub.Outputs[o].Shape;
+            if (dims.Count == 0) return false;
+            var shape = new int[dims.Count];
+            for (int d = 0; d < dims.Count; d++)
+            {
+                // A symbolic dim cannot size a buffer, and guessing 1 is how a scalar got here before.
+                if (dims[d].DimValue is not { } v || v <= 0) return false;
+                shape[d] = (int)v;
+            }
+            result[o] = shape;
+        }
+        shapes = result;
+        return true;
+    }
     public void Execute(OnnxOpContext ctx)
     {
         // If: evaluate condition scalar, execute then_branch or else_branch subgraph

@@ -90,6 +90,28 @@ public class GraphNode
     [JsonPropertyName("attributes")]
     public Dictionary<string, JsonElement>? Attributes { get; set; }
 
+    /// <summary>
+    /// Attributes that cannot survive a JSON round trip, keyed by attribute name. Subgraphs
+    /// (<c>then_branch</c>, <c>else_branch</c>, <c>body</c>) are the only ones so far.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ <see cref="Attributes"/> is <see cref="JsonElement"/> so a graph can be serialised, and the
+    /// ONNX path reaches it by serialising each typed attribute and re-parsing. An <c>OnnxGraphProto</c>
+    /// serialises to a JSON OBJECT, and <see cref="GetTypedAttributes"/> has no case for an object, so it
+    /// fell through to <c>GetRawText()</c> - the subgraph arrived at the operator as a STRING.
+    /// <para>
+    /// That silently disabled ALL ONNX control flow. <c>IfOperator.Execute</c> tests
+    /// <c>branchObj is OnnxGraphProto</c>, which was never true, so neither branch ever ran and the node
+    /// emitted whatever its output buffer already held. MEASURED on ZipVoice's text encoder, whose
+    /// relative positional-encoding table comes through a single If: onnxruntime returns [1999, 48] of
+    /// sin/cos values, we returned the scalar 1.0, and every relative-position bias in all four layers
+    /// was computed from it. <c>If</c> was listed in <c>BuiltinOpTypes</c> and had a complete-looking
+    /// implementation the whole time.
+    /// </para>
+    /// </remarks>
+    [JsonIgnore]
+    public Dictionary<string, object>? RawAttributes { get; set; }
+
     /// <summary>Convert JSON attributes to typed dictionary for operator execution.</summary>
     public Dictionary<string, object> GetTypedAttributes()
     {
@@ -108,6 +130,13 @@ public class GraphNode
                 _ => elem.GetRawText()
             };
         }
+
+        // Out-of-band attributes win: they are the ones JSON could not represent, and the JSON copy of a
+        // subgraph is the raw text that used to be mistaken for its value.
+        if (RawAttributes != null)
+            foreach (var (key, value) in RawAttributes)
+                result[key] = value;
+
         return result;
     }
 }

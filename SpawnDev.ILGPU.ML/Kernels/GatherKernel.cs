@@ -17,6 +17,11 @@ public class GatherKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int>? _gatherAxis0Kernel;
 
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gatherElementsKernel;
+    private MemoryBuffer1D<int, Stride1D.Dense>? _lastElementsParams;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldElementsParams = new();
+
     public GatherKernel(Accelerator accelerator) => _accelerator = accelerator;
 
     /// <summary>
@@ -163,6 +168,78 @@ public class GatherKernel : IDisposable
         _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, paramsView);
     }
 
+    /// <summary>
+    /// ONNX GatherElements: an ELEMENT-WISE gather along one axis.
+    /// <c>output[i,j,k] = data[i, indices[i,j,k], k]</c> for axis 1, and so on. Indices have the SAME
+    /// shape as the output, which is what distinguishes this from Gather - Gather takes whole slices,
+    /// GatherElements picks one element per output position.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This exists because the operator had NO GPU path at all. It computed the gather only when
+    /// BOTH data and indices happened to be readable as host values, and otherwise fell through to
+    /// <c>output = data</c> - copying the input and IGNORING the indices. That is a silently wrong answer
+    /// of exactly the right shape, and relative-position attention (ZipVoice's text encoder uses four of
+    /// them) computes its indices at runtime, so the wrong branch was the only one that ever ran there.
+    /// <para>
+    /// Flattened to [outer, axis, inner] so the kernel needs four scalars instead of a stride array:
+    /// outer is the product of the dims before the axis, inner the product of those after. Non-axis dims
+    /// agree between data and indices by the ONNX spec, so only the axis length differs.
+    /// </para>
+    /// </remarks>
+    private static void GatherElementsImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<int, Stride1D.Dense> p)
+    {
+        int idxAxis = p[0];    // axis length of indices/output
+        int inner = p[1];      // product of dims after the axis
+        int dataAxis = p[2];   // axis length of data (may differ from idxAxis)
+
+        int plane = idxAxis * inner;
+        int outerIdx = idx / plane;
+        int rem = idx - outerIdx * plane;
+        int innerIdx = rem - (rem / inner) * inner;
+
+        int g = (int)indices[idx];
+        if (g < 0) g += dataAxis;
+
+        int srcLinear = (outerIdx * dataAxis + g) * inner + innerIdx;
+        output[idx] = (g >= 0 && g < dataAxis && srcLinear >= 0 && srcLinear < data.Length)
+            ? data[srcLinear] : 0f;
+    }
+
+    /// <summary>
+    /// GatherElements along <paramref name="axis"/>, with indices held on the GPU as floats.
+    /// </summary>
+    /// <param name="outer">Product of the output dims BEFORE the axis.</param>
+    /// <param name="idxAxis">Length of the axis in indices/output.</param>
+    /// <param name="inner">Product of the output dims AFTER the axis.</param>
+    /// <param name="dataAxis">Length of the axis in data.</param>
+    public void GatherElements(ArrayView1D<float, Stride1D.Dense> data,
+        ArrayView1D<float, Stride1D.Dense> indices,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int outer, int idxAxis, int inner, int dataAxis)
+    {
+        EnsureLoaded();
+        var packed = new[] { idxAxis, inner, dataAxis, outer };
+        ArrayView1D<int, Stride1D.Dense> paramsView;
+        if (Graph.GraphExecutor.UseCaptureParamSlots)
+        {
+            // CUDA-graph capture: a stable per-forward slot, since cuMemAlloc mid-capture is illegal.
+            paramsView = CaptureParamArena.Shared(_accelerator).RentStableSlot(packed);
+        }
+        else
+        {
+            // Retire rather than dispose: the dispatch may still be pending in an un-submitted WebGPU
+            // command batch, and freeing a buffer it reads makes the GPU read zeros.
+            if (_lastElementsParams != null) _oldElementsParams.Add(_lastElementsParams);
+            _lastElementsParams = _accelerator.Allocate1D(packed);
+            paramsView = _lastElementsParams.View;
+        }
+        _gatherElementsKernel!(outer * idxAxis * inner, data, indices, output, paramsView);
+    }
+
     private void EnsureLoaded()
     {
         _gatherAxis0Kernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
@@ -174,6 +251,9 @@ public class GatherKernel : IDisposable
         _gatherGenericFloatKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherGenericFloatImpl);
+        _gatherElementsKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GatherElementsImpl);
     }
 
     public void Dispose()
@@ -182,5 +262,9 @@ public class GatherKernel : IDisposable
         _lastGenericParams = null;
         foreach (var b in _oldGenericParams) b.Dispose();
         _oldGenericParams.Clear();
+        _lastElementsParams?.Dispose();
+        _lastElementsParams = null;
+        foreach (var b in _oldElementsParams) b.Dispose();
+        _oldElementsParams.Clear();
     }
 }

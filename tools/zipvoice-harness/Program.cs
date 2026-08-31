@@ -1,3 +1,7 @@
+using ILGPU;
+using ILGPU.Runtime;
+using SpawnDev.ILGPU;
+using SpawnDev.ILGPU.ML;
 // ZipVoice (zero-shot voice cloning TTS) desktop gate.
 //
 //   dotnet run --project tools/zipvoice-harness -c Release -- roundtrip [wav]
@@ -157,8 +161,43 @@ int Synth(string fixturePath, string? outPath)
     var graphDir = int8
         ? modelDir.Replace("zipvoice-distill-zh-en", "zipvoice-distill-int8-zh-en")
         : modelDir;
-    using var graphs = new OrtZipVoiceGraphs(graphDir, int8);
+    // ZIPVOICE_ENGINE=ilgpu renders through OUR engine instead of onnxruntime. Every render mode in this
+    // harness used ORT, so our engine had never produced a finished clip - only stage-by-stage diffs in
+    // `compare`. Being able to LISTEN to our own output is what turns "the stages match" into "it speaks".
+    bool useOurs = string.Equals(Environment.GetEnvironmentVariable("ZIPVOICE_ENGINE"), "ilgpu",
+                                 StringComparison.OrdinalIgnoreCase);
+    IZipVoiceGraphs graphs;
+    IDisposable? ourAccel = null, ourCtx = null;
+    if (useOurs)
+    {
+        var mlCtxBuilder = MLContext.Create();
+        mlCtxBuilder.AllAcceleratorsAsync().GetAwaiter().GetResult();
+        var mlCtx = mlCtxBuilder.ToContext();
+        var accelerator = mlCtx.CreatePreferredAcceleratorAsync().GetAwaiter().GetResult()
+            ?? throw new InvalidOperationException("no accelerator available");
+        ourCtx = mlCtx; ourAccel = accelerator;
+        var encPath = Path.Combine(graphDir, int8 ? "text_encoder_int8.onnx" : "text_encoder.onnx");
+        var decPath = Path.Combine(graphDir, int8 ? "fm_decoder_int8.onnx" : "fm_decoder.onnx");
+        var vocPath = Path.Combine(graphDir, "vocos_24khz.onnx");
+        graphs = new IlgpuZipVoiceGraphs(
+            InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(encPath)),
+            InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(decPath)),
+            InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(vocPath)),
+            accelerator);
+        Console.WriteLine($"engine   : ILGPU ({accelerator.Name})");
+    }
+    else
+    {
+        graphs = new OrtZipVoiceGraphs(graphDir, int8);
+        Console.WriteLine("engine   : onnxruntime");
+    }
     Console.WriteLine($"graphs   : {(int8 ? "int8" : "fp32")}");
+    // `using var` disposes in REVERSE declaration order, and the sessions own buffers that live on the
+    // accelerator - disposing the accelerator first throws inside MemoryBuffer.DisposeAcceleratorObject.
+    // Declaring graphs LAST is what makes it disposed FIRST.
+    using var _ctxOwner = ourCtx;
+    using var _accelOwner = ourAccel;
+    using var _graphsOwner = graphs;
     using var pipeline = new ZipVoicePipeline(graphs, config)
     {
         // Fixed so two runs of this gate are comparable; production leaves it null and re-rolls.

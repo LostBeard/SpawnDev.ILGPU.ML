@@ -1223,6 +1223,11 @@ public static class GraphOptimizer
                 Outputs = new List<string>(n.Outputs),
                 Attributes = n.Attributes != null
                     ? new Dictionary<string, JsonElement>(n.Attributes)
+                    : null,
+                // Subgraphs travel outside the JSON attributes (see GraphNode.RawAttributes). Dropping
+                // them here silently disables control flow in any optimised graph - which is every graph.
+                RawAttributes = n.RawAttributes != null
+                    ? new Dictionary<string, object>(n.RawAttributes)
                     : null
             }).ToList(),
             Initializers = new Dictionary<string, int[]>(src.Initializers),
