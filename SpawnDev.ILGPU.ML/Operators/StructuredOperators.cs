@@ -1884,11 +1884,28 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
                 int s2 = starts[idx] < int.MinValue ? int.MinValue : starts[idx] > int.MaxValue ? int.MaxValue : (int)starts[idx];
                 int e2 = ends[idx] < int.MinValue ? int.MinValue : ends[idx] > int.MaxValue ? int.MaxValue : (int)ends[idx];
                 int st2 = steps[idx];
-                if (s2 < 0) s2 += outShape[dim];
-                if (e2 < 0) e2 += outShape[dim];
-                s2 = Math.Clamp(s2, 0, outShape[dim]);
-                e2 = Math.Clamp(e2, 0, outShape[dim]);
-                outShape[dim] = (e2 - s2 + st2 - 1) / st2;
+                if (st2 == 0) st2 = 1;
+                int axDim = outShape[dim];
+                if (s2 < 0) s2 += axDim;
+                if (e2 < 0) e2 += axDim;
+                if (axDim <= 0)
+                {
+                    outShape[dim] = 0;
+                }
+                else if (st2 > 0)
+                {
+                    s2 = Math.Clamp(s2, 0, axDim);
+                    e2 = Math.Clamp(e2, 0, axDim);
+                    outShape[dim] = e2 > s2 ? (e2 - s2 + st2 - 1) / st2 : 0;
+                }
+                else
+                {
+                    // Matches GraphCompiler's resolution and Execute's clamp: a reversed slice ends one
+                    // BEFORE index 0, and the forward formula returns an empty axis for it.
+                    s2 = Math.Clamp(s2, 0, axDim - 1);
+                    e2 = Math.Clamp(e2, -1, axDim - 1);
+                    outShape[dim] = s2 > e2 ? (s2 - e2 - 1) / (-st2) + 1 : 0;
+                }
             }
             return new[] { outShape };
         }
@@ -1967,10 +1984,34 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             int s = i < starts.Length ? starts[i] : 0;
             int e = i < ends.Length ? ends[i] : inShape[ax];
             int st = i < steps.Length ? steps[i] : 1;
+            if (st == 0) st = 1;
             if (s < 0) s += inShape[ax];
             if (e < 0) e += inShape[ax];
-            s = Math.Clamp(s, 0, inShape[ax]);
-            e = Math.Clamp(e, 0, inShape[ax]);
+            if (inShape[ax] <= 0)
+            {
+                // Nothing to take. Written explicitly because the negative-step clamp below would other-
+                // wise ask Math.Clamp for the range [0, -1], which throws.
+                s = 0; e = st > 0 ? 0 : -1;
+            }
+            else if (st > 0)
+            {
+                s = Math.Clamp(s, 0, inShape[ax]);
+                e = Math.Clamp(e, 0, inShape[ax]);
+            }
+            else
+            {
+                // ONNX clamps a REVERSED slice differently, and this is not a detail: the start may sit ON
+                // the last element, and the end may legitimately fall one BEFORE index 0 - which is exactly
+                // what the INT64_MIN sentinel means in `x[..., ::-1]`. Clamping the end up to 0 the way the
+                // forward case does left SliceCPU/SliceGPU running `for (i = 2; i < 0; i += -1)`: zero
+                // iterations, output buffer never written, all zeros, and no error anywhere.
+                // MEASURED on Silero VAD, whose adaptive_normalization reverses a [1,1,3] axis twice - the
+                // detector produced a plausible probability that was simply wrong.
+                // GraphCompiler and the shape interpreter already got this right, so the SHAPE was [1,1,3]
+                // while the VALUES were zeros - which is why nothing downstream complained.
+                s = Math.Clamp(s, 0, inShape[ax] - 1);
+                e = Math.Clamp(e, -1, inShape[ax] - 1);
+            }
             sliceStarts[ax] = s;
             sliceEnds[ax] = e;
             sliceSteps[ax] = st;
@@ -2038,7 +2079,10 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
                 output[outIdx++] = input[inOffset];
             return;
         }
-        for (int i = starts[dim]; i < ends[dim]; i += steps[dim])
+        // `i < ends[dim]` is false from the first iteration when the step is negative, so a reversed axis
+        // silently produced NOTHING. The bound belongs to the direction of travel.
+        int st = steps[dim];
+        for (int i = starts[dim]; st > 0 ? i < ends[dim] : i > ends[dim]; i += st)
             SliceCPU(input, output, shape, starts, ends, steps, strides, rank, dim + 1, inOffset + i * strides[dim], ref outIdx);
     }
 
@@ -2062,7 +2106,8 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             }
             else
             {
-                for (int i = start; i < end; i += step)
+                // Direction-aware for the same reason as SliceCPU: a negative step never entered this loop.
+                for (int i = start; step > 0 ? i < end : i > end; i += step)
                 {
                     if (outIdx < (int)output.Length)
                         reg2.ElementWise.Scale(input.SubView(inOffset + i, 1), output.SubView(outIdx, 1), 1, 1f);
@@ -2071,7 +2116,8 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             }
             return;
         }
-        for (int i = starts[dim]; i < ends[dim]; i += steps[dim])
+        int stepOuter = steps[dim];
+        for (int i = starts[dim]; stepOuter > 0 ? i < ends[dim] : i > ends[dim]; i += stepOuter)
             SliceGPU(input, output, shape, starts, ends, steps, strides, rank, dim + 1, inOffset + i * strides[dim], ref outIdx, reg2);
     }
 }

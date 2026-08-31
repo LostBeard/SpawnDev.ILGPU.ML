@@ -103,4 +103,4 @@ for (op, nm, out), v in zip(wanted, vals):
         print(f"  {op:18s} {str(list(a.shape)):18s} {'-':>12s} {'-':>12s} {'-':>12s}  {out}")
         continue
     f = a.astype(np.float64).ravel()
-    print(f"  {op:18s} {str(list(a.shape)):18s} {f.min():12.6f} {f.max():12.6f} {f.mean():12.6f}  {out}")
+    print(f"  {op:18s} {str(list(a.shape)):18s} {f.min():12.6g} {f.max():12.6g} {f.mean():12.6g}  {out}")
