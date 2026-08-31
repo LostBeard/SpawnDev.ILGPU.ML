@@ -35,8 +35,9 @@ public class Conv1DKernel : IDisposable
     // buffer with CopyFromCPU-per-call is a batching hazard on async backends: a pending dispatch in
     // an un-submitted WebGPU encoder / on the Wasm worker pool still references it, so the next
     // call's overwrite hands the pending dispatch the WRONG params (the DAv3 Slice_4 corruption class).
-    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
+
+    /// <summary>One buffer per distinct param set - eighteen Conv nodes share this one kernel instance.</summary>
+    private readonly ParamBufferCache<int> _paramsCache = new();
 
     public Conv1DKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -62,12 +63,26 @@ public class Conv1DKernel : IDisposable
         EnsureLoaded();
 
         // Pack params into int array to avoid exceeding scalar parameter limits.
-        // FRESH buffer per call, previous retired for deferred disposal (see _oldParamsBufs).
         var paramsData = new int[] { inC, inL, outC, outL, kL, stride, padding, dilation, groups, inCPerGroup, outCPerGroup, kernelLoopSize };
-        if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-        _paramsBuf = _accelerator.Allocate1D(paramsData);
 
-        _conv1dFlatKernel!(totalOutput, input, weight, bias, output, _paramsBuf.View);
+        // Reuse the buffer when these values are UNCHANGED, which for a fixed-shape graph means uploading
+        // once for the life of the session - every param here is a pure function of the shapes.
+        //
+        // 🔴 This was "a FRESH buffer per call", and that made CUDA GRAPH CAPTURE IMPOSSIBLE for any graph
+        // containing a Conv1D: `Allocate1D` is a cuMemAlloc, which is illegal inside a capture window and
+        // faults with an ACCESS VIOLATION (0xC0000005) that no try/catch can see - the process just dies.
+        // MEASURED via GraphExecutor.CaptureTraceFile on Silero VAD: the capture pass died at node 13,
+        // `Conv /feature_extractor/Conv_output_0`, the graph's first Conv. CudaGraphCapture's own comments
+        // predict exactly this failure.
+        //
+        // ⚠️ Why fresh-per-call existed, and why reuse is still safe: rewriting a params buffer that a
+        // PENDING dispatch still reads would corrupt it (the WebGPU command-batching hazard). Reuse here
+        // performs NO WRITE at all - the values are already the ones resident - so there is nothing to
+        // corrupt. When the values genuinely change we allocate fresh exactly as before and retire the old
+        // buffer for deferred disposal, because a queued dispatch may still be reading it.
+        var paramsView = _paramsCache.Get(_accelerator, paramsData);
+
+        _conv1dFlatKernel!(totalOutput, input, weight, bias, output, paramsView);
     }
 
     /// <summary>
@@ -129,9 +144,6 @@ public class Conv1DKernel : IDisposable
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose();
-        _paramsBuf = null;
-        foreach (var b in _oldParamsBufs) b.Dispose();
-        _oldParamsBufs.Clear();
+        _paramsCache.Dispose();
     }
 }
