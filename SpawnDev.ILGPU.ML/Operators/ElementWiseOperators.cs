@@ -70,6 +70,36 @@ internal static class BroadcastHelper
             else
                 ctx.Outputs[0].Data.SubView(0, outCount).CopyFromCPU(result);
         }
+        else if (bVals != null && bVals.Length == 1 && a.ElementCount > 1)
+        {
+            // ⚠️ SCALAR fast path. The general branch below expands the constant to the FULL output
+            // shape in a host array, then uploads it - so subtracting a single zero-point from a
+            // 460k-element activation allocated a 460k float[], ran a 460k-iteration MapIndex loop on the
+            // CPU, and pushed 1.8 MB across the bus. Per call. On ZipVoice's decoder that made `Sub` the
+            // single largest GPU-attributed cost at 27.8% (406 calls, 1.26 ms each) against `Mul` at
+            // 0.034 ms for the same kind of elementwise work.
+            //
+            // Nothing about it was necessary: BroadcastBinaryOpND already broadcasts on the GPU from a
+            // stride map, so the operand only has to BE there - it does not have to be expanded first. One
+            // element is uploaded instead of `outCount`.
+            var scalarShape = new[] { 1 };
+            var scalarTensor = ctx.Pool.Rent(scalarShape, "_broadcast_scalar");
+            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.UseCaptureParamSlots)
+            {
+                // Same reasoning as the expanded path: a pooled transient's H2D is skipped during capture
+                // replay, so a deterministic constant needs a stable arena slot instead.
+                var sView = Kernels.CaptureParamArena.Shared(reg.Accelerator).RentStableSlotFloat(bVals);
+                scalarTensor = new Tensor(sView, scalarShape, "_broadcast_scalar");
+            }
+            else
+            {
+                scalarTensor.Data.SubView(0, 1).CopyFromCPU(bVals);
+            }
+            reg.ElementWise.BroadcastBinaryOpND(
+                a.Data, scalarTensor.Data, ctx.Outputs[0].Data,
+                a.Shape, scalarShape, outShape, gpuOp);
+            ctx.Pool.Return(scalarTensor);
+        }
         else if (bVals != null && a.ElementCount > b.ElementCount)
         {
             // b is a small runtime constant, a is a large GPU tensor.

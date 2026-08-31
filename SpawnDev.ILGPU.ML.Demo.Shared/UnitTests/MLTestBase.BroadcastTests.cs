@@ -540,4 +540,49 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[{opType}_GPUPath] PASS — {string.Join("x", aShape)} op {string.Join("x", bShape)} → maxErr={maxErr:E1}");
     }
+
+    /// <summary>
+    /// A scalar broadcast against a LARGE tensor, on several ops and a non-round element count.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ Every other scalar-broadcast test in this file uses four to six elements. Those are correct and
+    /// they were never in danger - but they also never touched the branch that actually runs in a model.
+    /// A constant operand used to be EXPANDED to the full output shape in a host array and uploaded, so
+    /// subtracting one zero-point from a 460k-element activation allocated a 460k `float[]`, ran a
+    /// 460k-iteration index-mapping loop on the CPU, and pushed 1.8 MB across the bus - per call. On
+    /// ZipVoice's int8 decoder that made `Sub` the single largest GPU-attributed cost (27.8%, 406 calls at
+    /// 1.26 ms each) next to `Mul` at 0.034 ms for the same kind of work.
+    /// </para>
+    /// <para>
+    /// The scalar now stays one element and `BroadcastBinaryOpND` maps it on the GPU, which it could always
+    /// do. Decoder 4,030 ms -> 1,188 ms, output bit-identical. This test covers that path at a size where
+    /// the difference exists, with a count that is deliberately NOT a round number or a multiple of any
+    /// likely workgroup size, so a mishandled tail cannot hide.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public async Task Broadcast_Scalar_AgainstALargeTensor() => await RunTest(async accelerator =>
+    {
+        const int n = 100_003;
+        var a = new float[n];
+        for (int i = 0; i < n; i++) a[i] = MathF.Sin(i * 0.001f) * 10f;
+
+        // Sub and Mul are the quantise/dequantise pair (x - zero_point, x * scale) that made this hot;
+        // Greater exercises a comparison, whose output is 0/1 rather than arithmetic.
+        var sub = new float[n];
+        var mul = new float[n];
+        var gtr = new float[n];
+        const float scalar = 2.5f;
+        for (int i = 0; i < n; i++)
+        {
+            sub[i] = a[i] - scalar;
+            mul[i] = a[i] * scalar;
+            gtr[i] = a[i] > scalar ? 1f : 0f;
+        }
+
+        await VerifyBinaryOp(accelerator, "Sub", a, new[] { n }, new[] { scalar }, new[] { 1 }, sub, new[] { n });
+        await VerifyBinaryOp(accelerator, "Mul", a, new[] { n }, new[] { scalar }, new[] { 1 }, mul, new[] { n });
+        await VerifyBinaryOp(accelerator, "Greater", a, new[] { n }, new[] { scalar }, new[] { 1 }, gtr, new[] { n });
+    });
 }
