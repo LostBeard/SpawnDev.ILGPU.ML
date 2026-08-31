@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>StftOracle</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Compile the REAL preprocessing source (it has no dependencies), so this tests what ships.
+         BOTH partials: AudioPreprocessor was split and the spectral half holds the periodic-window
+         overload the other half calls. Including only the first stopped this building - which nobody
+         noticed while the tool lived outside the repository and nothing built it. -->
+    <Compile Include="..\..\SpawnDev.ILGPU.ML\Preprocessing\AudioPreprocessor.cs" />
+    <Compile Include="..\..\SpawnDev.ILGPU.ML\Preprocessing\AudioPreprocessor.Spectral.cs" />
+  </ItemGroup>
+</Project>

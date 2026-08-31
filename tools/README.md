@@ -103,12 +103,26 @@ with a looping `BufferSource` of a known WAV. `drive-mic-capture.cs` does this.
 | `gen_silero_vad_reference.py` | Per-frame speech probabilities from onnxruntime, plus the frozen-state negative control. |
 | `gen_vad_segment_fixture.py` | Builds the three-utterance wav the endpointing gate runs on. |
 
-## Other
+## Brought in from outside version control (2026-08-31)
 
-⚠️ **`whisper-harness` and `stft-oracle` are NOT in this repository.** They sit in the workspace folder
-one level up (`SpawnDev.ILGPU.ML/tools/`, alongside a 314 MB `distilgpt2_decoder_model.onnx`), which is
-outside the git root - so run them as `--project ../tools/<name>`, and be aware a standing release gate is
-currently unversioned.
+These lived in the workspace folder one level up and had never been committed - including a STANDING
+RELEASE GATE. `stft-oracle` did not even build when moved in: `AudioPreprocessor` had been split into
+partials and the project compiled only one half, which nothing had noticed because nothing built it.
+Out-of-repo tooling rots silently; project tooling belongs in the repository.
+
+| tool | answers |
+|---|---|
+| `whisper-harness` | **Does Whisper still transcribe the fixture word-identically?** The transcript regression gate - part of the standing set after any engine change. Also holds `ort_decode_ab.py` and `ort_mask_reference.py`. |
+| `stft-oracle` | Our STFT against a reference, compiling the REAL `AudioPreprocessor` source (both partials) so it tests what ships. |
+| `gen_references.py` · `gen_operator_tests.py` · `gen_operator_tests_expanded.py` · `gen_turboquant_references.py` · `gen_nlp_audio_references.py` | Reference-fixture generators for the operator, TurboQuant and NLP/audio suites. |
+| `distilgpt2_ref.py` · `distilgpt2_greedy_ref.py` · `distilgpt2_dump_intermediates.py` | DistilGPT-2 reference logits and per-node intermediates. |
+| `inspect_ops.cs` · `onnx_nodewalk.cs` · `gpt2_optypes.cs` | Graph/operator inspection one-liners (`dotnet run tools/<name>.cs`). |
+
+⚠️ The 314 MB `distilgpt2_decoder_model.onnx` stayed OUT, along with every `bin`/`obj`. Large model
+binaries are not repository content - but their presence is not a reason to leave the SOURCE outside too,
+which is the mistake that hid a broken gate.
+
+## Other
 
 `whisper-harness` (transcript regression gate - must stay word-identical) · `stft-oracle` ·
 `extract_onnx.py` · `distilgpt2_*.py` (reference logits) · `bmpdiff.cs` · `lts-train` · `GptOssRun`
@@ -153,7 +167,7 @@ browser backends verify the kernel is LEGAL.
 
 ```
 PMT_FILTER=Operator dotnet test PlaywrightMultiTest/PlaywrightMultiTest.csproj   # 97/97
-dotnet run --project ../tools/whisper-harness -c Release                         # PASS 57 words
+dotnet run --project tools/whisper-harness -c Release                            # PASS 57 words
 ```
 
 Then the group you touched: `ControlFlow_`, `Recurrent_`, `Scatter_`, `Slice_`, `Vad_`, `Resample`,
