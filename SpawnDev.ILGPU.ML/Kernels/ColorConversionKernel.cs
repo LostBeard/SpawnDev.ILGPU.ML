@@ -20,8 +20,8 @@ public class ColorConversionKernel : IDisposable
     private Action<Index1D, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, int, int>? _flipVerticalKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _depthToColormapKernel;
 
-    private MemoryBuffer1D<float, Stride1D.Dense>? _paramsBuf;
-    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldColormapParamsBufs = new();
+    /// <summary>One buffer per distinct colormap param set - see <see cref="ParamBufferCache{T}"/>.</summary>
+    private readonly ParamBufferCache<float> _colormapParams = new();
 
     public ColorConversionKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -177,8 +177,8 @@ public class ColorConversionKernel : IDisposable
     // Dispose / CopyFromCPU overwrite of a buffer a batched dispatch still references corrupts or
     // faults async backends (the DAv3 Slice_4 params-content class). Old buffers retire here and
     // free in Dispose().
-    private MemoryBuffer1D<int, Stride1D.Dense>? _flipParamsBuf;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldFlipParamsBufs = new();
+    /// <summary>One buffer per distinct (width, height) - see <see cref="ParamBufferCache{T}"/>.</summary>
+    private readonly ParamBufferCache<int> _flipParams = new();
 
     public void FlipHorizontal(
         ArrayView1D<int, Stride1D.Dense> input,
@@ -189,9 +189,11 @@ public class ColorConversionKernel : IDisposable
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlipHorizontalImpl);
-        if (_flipParamsBuf != null) _oldFlipParamsBufs.Add(_flipParamsBuf);
-        _flipParamsBuf = _accelerator.Allocate1D(new[] { width, height });
-        _flipHorizontalKernel(width * height, input, output, _flipParamsBuf.View);
+        // Allocating a fresh buffer per call is a cuMemAlloc, which is ILLEGAL inside a CUDA graph-capture
+        // window and faults with an uncatchable access violation - it is why capture was impossible for any
+        // graph containing a Conv1D until 5.2.5, and this kernel sits in the depth pipeline, which captures.
+        var flipParamsView = _flipParams.Get(_accelerator, new[] { width, height });
+        _flipHorizontalKernel(width * height, input, output, flipParamsView);
     }
 
     // ──────────────────────────────────────────────
@@ -271,27 +273,22 @@ public class ColorConversionKernel : IDisposable
         int pixelCount,
         float minDepth, float maxDepth, int paletteId = 0)
     {
-        // FRESH buffer per call, previous retired for deferred disposal (see _oldColormapParamsBufs).
+        // One buffer per distinct param set. A fresh allocation per call is a cuMemAlloc, illegal inside a
+        // CUDA graph-capture window (uncatchable access violation) - and this kernel is in the depth
+        // pipeline, which uses capture.
         var paramsData = new float[] { minDepth, maxDepth, paletteId };
-        if (_paramsBuf != null) _oldColormapParamsBufs.Add(_paramsBuf);
-        _paramsBuf = _accelerator.Allocate1D(paramsData);
+        var colormapParamsView = _colormapParams.Get(_accelerator, paramsData);
 
         _depthToColormapKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>>(DepthToColormapImpl);
-        _depthToColormapKernel(pixelCount, depth, rgba, _paramsBuf.View);
+        _depthToColormapKernel(pixelCount, depth, rgba, colormapParamsView);
     }
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose();
-        _paramsBuf = null;
-        foreach (var b in _oldColormapParamsBufs) b.Dispose();
-        _oldColormapParamsBufs.Clear();
-        _flipParamsBuf?.Dispose();
-        _flipParamsBuf = null;
-        foreach (var b in _oldFlipParamsBufs) b.Dispose();
-        _oldFlipParamsBufs.Clear();
+        _colormapParams.Dispose();
+        _flipParams.Dispose();
     }
 }

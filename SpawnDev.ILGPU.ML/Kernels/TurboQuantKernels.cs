@@ -14,9 +14,15 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 public class TurboQuantKernels
 {
     private readonly Accelerator _accelerator;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _fusedParamsBuf;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _flashParamsBuf;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
+    /// <summary>One buffer per distinct param set - see <see cref="ParamBufferCache{T}"/>.</summary>
+    /// <remarks>
+    /// Replaces a fresh allocation per call, which is a cuMemAlloc and therefore ILLEGAL inside a CUDA
+    /// graph-capture window (uncatchable access violation). A cache HIT performs no write, so the hazard
+    /// the old comment guarded against - "don't dispose previous, it may still be in the WebGPU command
+    /// encoder" - cannot arise: nothing is rewritten and nothing is retired.
+    /// </remarks>
+    private readonly ParamBufferCache<int> _fusedParams = new();
+    private readonly ParamBufferCache<int> _flashParams = new();
     private readonly FWHTKernel _fwht;
 
     // Normalize is TWO kernels (one-store-per-thread, WebGL-TF-safe): compute the per-vector norm
@@ -391,9 +397,7 @@ public class TurboQuantKernels
         int indexMask = (1 << bitsPerValue) - 1; // 0x7 for 3-bit, 0xF for 4-bit
         var paramsData = new int[] { numQueries, numKV, headDim,
             BitConverter.SingleToInt32Bits(scale), valuesPerInt, bitsPerValue, indexMask };
-        // Don't dispose previous — it may still be in the WebGPU command encoder
-        if (_fusedParamsBuf != null) _oldParamsBufs.Add(_fusedParamsBuf);
-        _fusedParamsBuf = _accelerator.Allocate1D(paramsData);
+        var fusedParamsView = _fusedParams.Get(_accelerator, paramsData);
 
         _fusedAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -403,7 +407,7 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FusedAttentionImpl);
         _fusedAttentionKernel(numQueries * headDim, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, _fusedParamsBuf.View);
+            K_norms, V_norms, output, fusedParamsView);
     }
 
     /// <summary>
@@ -539,8 +543,7 @@ public class TurboQuantKernels
         int indexMask = (1 << bitsPerValue) - 1; // 0x7 for 3-bit, 0xF for 4-bit
         var paramsData = new int[] { numQueries, numKV, headDim,
             BitConverter.SingleToInt32Bits(scale), valuesPerInt, bitsPerValue, indexMask };
-        if (_flashParamsBuf != null) _oldParamsBufs.Add(_flashParamsBuf);
-        _flashParamsBuf = _accelerator.Allocate1D(paramsData);
+        var flashParamsView = _flashParams.Get(_accelerator, paramsData);
 
         _flashAttentionKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
@@ -550,7 +553,7 @@ public class TurboQuantKernels
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(FlashAttentionImpl);
         _flashAttentionKernel(numQueries * headDim, Q, K_packed, K_codebook, V_packed, V_codebook,
-            K_norms, V_norms, output, _flashParamsBuf.View);
+            K_norms, V_norms, output, flashParamsView);
     }
 
     /// <summary>

@@ -43,8 +43,8 @@ public sealed class GatedDeltaNetKernel : IDisposable
         ArrayView1D<float, Stride1D.Dense>,   // state [numVHeads, headVDim, headKDim]  (persists)
         ArrayView1D<int, Stride1D.Dense>>? _kernel;   // params [seq, numKHeads, headKDim, numVHeads, headVDim]
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
+    /// <summary>One buffer per distinct param set - see <see cref="ParamBufferCache{T}"/>.</summary>
+    private readonly ParamBufferCache<int> _paramsCache = new();
 
     public GatedDeltaNetKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -72,10 +72,11 @@ public sealed class GatedDeltaNetKernel : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ScanImpl);
 
         var p = new[] { seq, numKHeads, headKDim, numVHeads, headVDim };
-        if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-        _paramsBuf = _accelerator.Allocate1D(p);
+        // A fresh allocation per call is a cuMemAlloc, illegal inside a CUDA graph-capture window and
+        // fatal with an uncatchable access violation. One buffer per distinct param set instead.
+        var paramsView = _paramsCache.Get(_accelerator, p);
 
-        _kernel(numVHeads * headVDim, q, k, v, a, b, ssmA, ssmDt, outp, state, _paramsBuf.View);
+        _kernel(numVHeads * headVDim, q, k, v, a, b, ssmA, ssmDt, outp, state, paramsView);
     }
 
     private static void ScanImpl(Index1D idx,
@@ -147,8 +148,6 @@ public sealed class GatedDeltaNetKernel : IDisposable
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose(); _paramsBuf = null;
-        foreach (var b in _oldParamsBufs) b.Dispose();
-        _oldParamsBufs.Clear();
+        _paramsCache.Dispose();
     }
 }

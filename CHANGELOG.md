@@ -2,6 +2,47 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.6 (2026-08-31)
+
+### Fixed - the rest of the per-call device allocations that blocked CUDA graph capture
+
+5.2.5 fixed `Conv1DKernel` and listed six further sites carrying the same pattern. They are all converted
+to `ParamBufferCache<T>` now - eight sites across six kernels:
+
+| kernel | sites | affects |
+|---|---|---|
+| `ColorConversionKernel` | 2 | the **depth pipeline**, which uses graph capture |
+| `TurboQuantKernels` | 2 | quantized attention (fused + flash) |
+| `ShortConvKernel` | 2 | LFM2 decode |
+| `GatedDeltaNetKernel` | 1 | qwen3.5 GatedDeltaNet |
+| `MissingElementWiseKernels` | 1 | DepthToSpace and siblings |
+| `Conv1DKernel` | 1 | (already fixed in 5.2.5) |
+
+Each allocated a device params buffer on a path that runs per call. `Allocate1D` is a `cuMemAlloc`, which
+is illegal inside a CUDA graph-capture window and faults with an ACCESS VIOLATION no `try`/`catch` can
+observe - so capture was impossible for any graph containing one of these kernels. It also cost an
+allocation plus a host-to-device copy per call on every backend, for values that are a pure function of the
+shapes.
+
+Two were worse than a capture blocker:
+
+- **`MissingElementWiseKernels` allocated AND THEN REWROTE the buffer**, which is exactly the corruption
+  its own comment warned about ("the command-encoder may still reference the prior `_paramsBuf` at next
+  sync"). A cache hit writes nothing, so the hazard is removed rather than managed - and the exact-size
+  `SubView` dance that existed to make the rewrite safe is gone with it.
+- **`ShortConvKernel` used a single "last values" slot**, which is correct only while every node using the
+  kernel shares one param set - an assumption about LFM2's layer uniformity. Per-set caching does not
+  depend on it. This is the same trap that made the first attempt at the `Conv1DKernel` fix fail: with
+  eighteen Conv nodes, a warm pass ends with the LAST node's params resident and the next pass misses on
+  its FIRST.
+
+`TurboQuantKernels` had no `Dispose` at all, so its retired-buffer list was never freed for the life of the
+session; the cache is bounded by construction and disposed with the kernel.
+
+The five allocations left in these files are capacity-guarded (`FWHTKernel` ping/pad buffers,
+`MissingElementWiseKernels`' top-k index buffer) - they allocate only when a larger buffer is needed, which
+is not a per-call cost and is safe to leave.
+
 ## 5.2.5 (2026-08-31)
 
 ### Performance - the browser VAD now keeps up with a live microphone

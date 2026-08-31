@@ -34,7 +34,8 @@ public class MissingElementWiseKernels : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _topKIdxBuf;
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldTopKIdxBufs = new();
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _paramsBuf;
+    /// <summary>One buffer per distinct param set - see <see cref="ParamBufferCache{T}"/>.</summary>
+    private readonly ParamBufferCache<int> _params = new();
     // Deferred disposal: see TransposeKernel for the rationale (WebGPU
     // command-encoder may still reference the prior _paramsBuf at next sync).
     private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParamsBufs = new();
@@ -43,7 +44,7 @@ public class MissingElementWiseKernels : IDisposable
 
     public void Dispose()
     {
-        _paramsBuf?.Dispose();
+        _params.Dispose();
         foreach (var buf in _oldParamsBufs) buf.Dispose();
         _oldParamsBufs.Clear();
         _topKIdxBuf?.Dispose();
@@ -148,18 +149,18 @@ public class MissingElementWiseKernels : IDisposable
         int totalOutput = outC * inH * blockSize * inW * blockSize;
         // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
         var paramsData = new int[] { outC, inH, inW, blockSize, mode };
-        EnsureParamsBuf(paramsData.Length);
-        // Copy into an EXACT-size subview: EnsureParamsBuf only grows the persistent buffer, so a smaller
-        // params payload (a lower-rank op following a higher-rank one) is shorter than _paramsBuf, and
-        // ILGPU's CopyFromCPU requires data.Length == view.Length — copying the whole (larger) view throws
-        // ArgumentOutOfRange. Sub-viewing to paramsData.Length keeps the lengths matched.
-        _paramsBuf!.View.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
+        // One buffer per DISTINCT param set, holding exactly these values - so there is no write here at
+        // all, and the exact-size dance below is unnecessary. The previous version allocated a fresh buffer
+        // per call, which is a cuMemAlloc and therefore ILLEGAL inside a CUDA graph-capture window
+        // (uncatchable access violation), and then REWROTE it - the very corruption the old comment warned
+        // about. A cache hit rewrites nothing.
+        var paramsView = _params.Get(_accelerator, paramsData);
 
         _depthToSpaceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(DepthToSpaceImpl);
-        _depthToSpaceKernel(totalOutput, input, output, _paramsBuf.View);
+        _depthToSpaceKernel(totalOutput, input, output, paramsView);
     }
 
     // ──────────────────────────────────────────────
@@ -242,13 +243,9 @@ public class MissingElementWiseKernels : IDisposable
         else
         {
             // Persistent buffer avoids use-after-dispose on async backends (WebGPU, Wasm)
-            EnsureParamsBuf(paramsData.Length);
-            // Copy into an EXACT-size subview: EnsureParamsBuf only grows the persistent buffer, so a smaller
-            // params payload (a lower-rank op following a higher-rank one) is shorter than _paramsBuf, and
-            // ILGPU's CopyFromCPU requires data.Length == view.Length — copying the whole (larger) view throws
-            // ArgumentOutOfRange. Sub-viewing to paramsData.Length keeps the lengths matched.
-            _paramsBuf!.View.SubView(0, paramsData.Length).CopyFromCPU(paramsData);
-            paramsView = _paramsBuf.View.SubView(0, paramsData.Length);
+            // One buffer per distinct param set - no write, so nothing a pending dispatch reads is
+            // rewritten, and no per-call cuMemAlloc to break CUDA graph capture.
+            paramsView = _params.Get(_accelerator, paramsData);
         }
 
         _expandKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
@@ -375,9 +372,4 @@ public class MissingElementWiseKernels : IDisposable
     /// still references the buffer, so the next call's CopyFromCPU handed it the WRONG params (the
     /// DAv3 Slice_4 params-content corruption class; see SliceKernel/GatherKernel).
     /// </summary>
-    private void EnsureParamsBuf(int minSize)
-    {
-        if (_paramsBuf != null) _oldParamsBufs.Add(_paramsBuf);
-        _paramsBuf = _accelerator.Allocate1D<int>(minSize);
-    }
 }
