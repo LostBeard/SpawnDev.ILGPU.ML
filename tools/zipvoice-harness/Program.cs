@@ -1,3 +1,4 @@
+using SpawnDev.ILGPU.ML.Tensors;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU;
@@ -32,6 +33,7 @@ return command switch
     "synth" => Synth(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json",
                      args.Length > 2 ? args[2] : null),
     "compare" => CompareEngines(args.Length > 1 ? args[1] : "fixtures/paint-the-sockets.json"),
+    "runonnx" => RunOnnx(args.Length > 1 ? args[1] : "", args.Length > 2 ? args[2] : ""),
     "sensitivity" => RunSensitivity(args.Length > 1 ? args[1] : "fixtures/loaded-classes.json",
                                     args.Length > 2 ? args[2] : null),
     "endtoend" => RunEndToEnd(args.Length > 1 ? args[1] : "fixtures/phase1",
@@ -399,4 +401,88 @@ static byte[] WriteWav(float[] samples, int sampleRate)
 
     writer.Flush();
     return stream.ToArray();
+}
+
+// Run ANY onnx model on our engine and print each output's stats. Exists because a failing unit test tells
+// you a number is wrong but not what the engine did, and PMT buffers the operator-level diagnostics that
+// would say. Feeds inputs from the same JSON the controlflow/recurrent fixtures use:
+//   { "inputs": { "name": { "shape": [..], "data": [..] } }, "outputs": { ... } }
+//
+//   dotnet run --project tools/zipvoice-harness -c Release -- runonnx <model.onnx> [fixture.json]
+int RunOnnx(string modelPath, string fixturePath)
+{
+    if (!File.Exists(modelPath)) { Console.WriteLine($"no model at {modelPath}"); return 2; }
+
+    var mlBuilder = MLContext.Create();
+    mlBuilder.AllAcceleratorsAsync().GetAwaiter().GetResult();
+    using var mlCtx = mlBuilder.ToContext();
+    using var accel = mlCtx.CreatePreferredAcceleratorAsync().GetAwaiter().GetResult()
+        ?? throw new InvalidOperationException("no accelerator");
+    Console.WriteLine($"device   : {accel.AcceleratorType} {accel.Name}");
+
+    var inputData = new Dictionary<string, (int[] Shape, float[] Data)>();
+    var expected = new Dictionary<string, float[]>();
+    if (File.Exists(fixturePath))
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(fixturePath));
+        float ToF(System.Text.Json.JsonElement e) => e.ValueKind switch
+        {
+            System.Text.Json.JsonValueKind.True => 1f,
+            System.Text.Json.JsonValueKind.False => 0f,
+            _ => (float)e.GetDouble(),
+        };
+        if (doc.RootElement.TryGetProperty("inputs", out var ins))
+            foreach (var i in ins.EnumerateObject())
+            {
+                var shape = i.Value.GetProperty("shape").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+                var data = i.Value.GetProperty("data").EnumerateArray().Select(ToF).ToArray();
+                if (shape.Length == 0) shape = new[] { 1 };
+                if (data.Length == 0) data = new[] { 0f };
+                inputData[i.Name] = (shape, data);
+            }
+        if (doc.RootElement.TryGetProperty("outputs", out var outs))
+            foreach (var o in outs.EnumerateObject())
+                expected[o.Name] = o.Value.GetProperty("data").EnumerateArray().Select(ToF).ToArray();
+    }
+
+    using var session = InferenceSession.CreateFromFile(accel, File.ReadAllBytes(modelPath),
+        inputShapes: inputData.ToDictionary(kv => kv.Key, kv => kv.Value.Shape));
+
+    Console.WriteLine($"compiled : {session.NodeCount} node(s), ops = {string.Join(", ", session.OperatorTypes)}");
+    Console.WriteLine($"inputs   : {string.Join(", ", session.InputNames)}");
+    Console.WriteLine($"outputs  : {string.Join(", ", session.OutputNames)}");
+
+    var buffers = new List<MemoryBuffer1D<float, Stride1D.Dense>>();
+    var feeds = new Dictionary<string, Tensor>();
+    foreach (var (name, v) in inputData)
+    {
+        var buf = accel.Allocate1D(v.Data);
+        buffers.Add(buf);
+        feeds[name] = new Tensor(buf.View, v.Shape);
+    }
+
+    var results = session.RunAsync(feeds).GetAwaiter().GetResult();
+    int bad = 0;
+    foreach (var (name, t) in results)
+    {
+        int n = t.ElementCount;
+        using var host = accel.Allocate1D<float>(n);
+        host.View.CopyFrom(t.Data.SubView(0, n));
+        accel.Synchronize();
+        var got = host.GetAsArray1D();
+        var head = string.Join(" ", got.Take(6).Select(x => x.ToString("F4")));
+        Console.Write($"  {name,-16} shape=[{string.Join(",", t.Shape)}] n={n} head=[{head}]");
+        if (expected.TryGetValue(name, out var exp))
+        {
+            int m = Math.Min(exp.Length, n);
+            double worst = 0;
+            for (int i = 0; i < m; i++) worst = Math.Max(worst, Math.Abs(got[i] - exp[i]));
+            Console.Write($"  vs ORT: max|d|={worst:E2}{(worst > 1e-4 ? "  MISMATCH" : "  OK")}");
+            if (worst > 1e-4) bad++;
+        }
+        Console.WriteLine();
+    }
+    foreach (var b in buffers) b.Dispose();
+    Console.WriteLine(bad == 0 ? "RESULT   : PASS" : $"RESULT   : FAIL ({bad})");
+    return bad;
 }

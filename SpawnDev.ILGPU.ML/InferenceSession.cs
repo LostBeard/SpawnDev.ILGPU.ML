@@ -415,7 +415,11 @@ public class InferenceSession : IDisposable
         }
 
         // Create executor with pre-read constant values (avoids GPU→CPU readback during inference)
-        var executor = new GraphExecutor(accelerator, compiled, weights, constantFloatValues);
+        // ⚠️ The registry MUST be passed: without it GraphExecutor._registry is null, so every operator
+        // context has Registry == null, and SubgraphRunner.BuildExecutor bails immediately - which
+        // silently disables ALL ONNX control flow (If/Loop/Scan) for every model loaded here. The
+        // If then fell back to copying its CONDITION into the output.
+        var executor = new GraphExecutor(accelerator, compiled, weights, constantFloatValues, registry: registry);
         onProgress?.Invoke("ready", 100);
 
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
@@ -462,7 +466,11 @@ public class InferenceSession : IDisposable
         var compiler = new GraphCompiler(registry);
         var compiled = compiler.Compile(graph);
         var pool = new BufferPool(accelerator);
-        var executor = new GraphExecutor(accelerator, compiled, weights, constantFloatValues);
+        // ⚠️ The registry MUST be passed: without it GraphExecutor._registry is null, so every operator
+        // context has Registry == null, and SubgraphRunner.BuildExecutor bails immediately - which
+        // silently disables ALL ONNX control flow (If/Loop/Scan) for every model loaded here. The
+        // If then fell back to copying its CONDITION into the output.
+        var executor = new GraphExecutor(accelerator, compiled, weights, constantFloatValues, registry: registry);
         return new InferenceSession(accelerator, registry, compiled, executor, pool, weights)
         {
             ModelName = graph.Name
@@ -900,7 +908,7 @@ public class InferenceSession : IDisposable
 
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX: {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
 
-        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues, registry: registry);
         onProgress?.Invoke("ready", 100);
 
         var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
@@ -1041,7 +1049,7 @@ public class InferenceSession : IDisposable
 
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX (ext): {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
 
-        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues, registry: registry);
         onProgress?.Invoke("ready", 100);
 
         var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
@@ -1334,7 +1342,7 @@ public class InferenceSession : IDisposable
 
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX (stream): {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
 
-        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues, registry: registry);
         onProgress?.Invoke("ready", 100);
 
         var session = new InferenceSession(accelerator, registry, compiled, executor, pool, gpuWeights)
@@ -1510,7 +1518,7 @@ public class InferenceSession : IDisposable
 
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] TFLite: {graph.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
 
-        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues);
+        var executor = new GraphExecutor(accelerator, compiled, gpuWeights, constantFloatValues, registry: registry);
         executor.Format = DataFormat.NHWC; // TFLite models use NHWC natively
         onProgress?.Invoke("ready", 100);
 

@@ -916,8 +916,33 @@ internal static class SubgraphRunner
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs)
     {
-        var executor = BuildExecutor(ctx, subgraph, subgraphInputs);
-        return executor?.Run(subgraphInputs);
+        var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var weights);
+        if (executor == null) return null;
+        return MergeDeclaredOutputs(subgraph, executor.Run(subgraphInputs), weights);
+    }
+
+    /// <summary>
+    /// Adds any declared subgraph output that no NODE produces, taking it from the weights.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A branch is very often a single <c>Constant</c> holding a table. Those are folded into
+    /// initializers so the Constant operator cannot overwrite the table with the scalar
+    /// <c>ExtractTensorScalar</c> hands it - which leaves the subgraph with ZERO nodes and its declared
+    /// output produced by nothing. The executor then returns an empty result and the caller copies nothing,
+    /// so the branch silently yields zeros. Declared outputs are part of the contract whether a node
+    /// computed them or not.
+    /// </remarks>
+    private static Dictionary<string, Tensor>? MergeDeclaredOutputs(
+        Onnx.OnnxGraphProto subgraph, Dictionary<string, Tensor>? result,
+        Dictionary<string, Tensor> weights)
+    {
+        result ??= new Dictionary<string, Tensor>();
+        foreach (var declared in subgraph.Outputs)
+        {
+            if (string.IsNullOrEmpty(declared.Name) || result.ContainsKey(declared.Name)) continue;
+            if (weights.TryGetValue(declared.Name, out var t)) result[declared.Name] = t;
+        }
+        return result;
     }
 
     /// <summary>
@@ -930,9 +955,9 @@ internal static class SubgraphRunner
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs)
     {
-        var executor = BuildExecutor(ctx, subgraph, subgraphInputs);
+        var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var weights);
         if (executor == null) return null;
-        return await executor.RunAsync(subgraphInputs);
+        return MergeDeclaredOutputs(subgraph, await executor.RunAsync(subgraphInputs), weights);
     }
 
     /// <summary>
@@ -942,8 +967,10 @@ internal static class SubgraphRunner
     /// </summary>
     private static Graph.GraphExecutor? BuildExecutor(
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
-        Dictionary<string, Tensor> subgraphInputs)
+        Dictionary<string, Tensor> subgraphInputs,
+        out Dictionary<string, Tensor> weightsOut)
     {
+        weightsOut = new Dictionary<string, Tensor>();
         if (ctx.Registry == null) return null;
 
         // Convert OnnxGraphProto to ModelGraph IR
@@ -991,6 +1018,7 @@ internal static class SubgraphRunner
                 weights[name] = tensor;
         }
 
+        weightsOut = weights;
         return new Graph.GraphExecutor(
             ctx.Registry.Accelerator, compiled, weights,
             ctx.ConstantValues, registry: ctx.Registry);
@@ -1127,37 +1155,22 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         return new[] { i.Length > 1 ? i[1] : new[] { 1 } };
     }
 
-    /// <summary>Declared output shapes of a subgraph, or false if any dimension is symbolic.</summary>
     private static bool TryDeclaredOutputShapes(Onnx.OnnxGraphProto sub, out int[][] shapes)
-    {
-        shapes = Array.Empty<int[]>();
-        if (sub.Outputs.Count == 0) return false;
-
-        var result = new int[sub.Outputs.Count][];
-        for (int o = 0; o < sub.Outputs.Count; o++)
-        {
-            var dims = sub.Outputs[o].Shape;
-            if (dims.Count == 0) return false;
-            var shape = new int[dims.Count];
-            for (int d = 0; d < dims.Count; d++)
-            {
-                // A symbolic dim cannot size a buffer, and guessing 1 is how a scalar got here before.
-                if (dims[d].DimValue is not { } v || v <= 0) return false;
-                shape[d] = (int)v;
-            }
-            result[o] = shape;
-        }
-        shapes = result;
-        return true;
-    }
+        => SubgraphShapes.TryDeclaredOutputShapes(sub, out shapes);
     public void Execute(OnnxOpContext ctx)
     {
         // If: evaluate condition scalar, execute then_branch or else_branch subgraph
         // Input[0] = condition (bool scalar), Attrs: then_branch (GraphProto), else_branch (GraphProto)
+        // ⚠️ ctx.TryGetInputValues returns COMPILE-TIME CONSTANTS ONLY, so a condition computed at runtime
+        // read as null and this defaulted to FALSE - the else branch, always, regardless of the condition.
         bool condition = false;
-        var condVals = ctx.TryGetInputValues(0);
+        var condVals = OperatorInputReader.Read(reg, ctx, 0);
         if (condVals != null && condVals.Length > 0)
             condition = condVals[0] != 0f;
+        else if (ctx.TryGetInputValues(0) == null)
+            throw new NotSupportedException(
+                "If could not read its condition. On a browser backend this operator needs the async path "
+                + "(GraphExecutor.RunAsync); defaulting to the else branch silently picks the wrong one.");
 
         // Select branch subgraph
         string branchKey = condition ? "then_branch" : "else_branch";
@@ -1197,14 +1210,21 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         }
     }
 
-    /// <summary>Browser-safe async If: runs the selected branch subgraph through the async
-    /// subgraph runner (the condition is read from pre-read constants, no GPU readback here).</summary>
+    /// <summary>Browser-safe async If: runs the selected branch through the async subgraph runner.</summary>
+    /// <remarks>
+    /// ⚠️ This used to read the condition from <c>ctx.TryGetInputValues</c> - "pre-read constants", as its
+    /// old comment put it - which returns null for a condition computed at runtime. It then defaulted to
+    /// FALSE and took the else branch every time, regardless of the actual condition. Because
+    /// <c>GraphExecutor.RunAsync</c> calls THIS method and not <c>Execute</c>, fixing only the sync path
+    /// changed nothing at all: the same logic lived twice.
+    /// </remarks>
     public async Task ExecuteAsync(OnnxOpContext ctx)
     {
-        bool condition = false;
-        var condVals = ctx.TryGetInputValues(0);
-        if (condVals != null && condVals.Length > 0)
-            condition = condVals[0] != 0f;
+        var condVals = await OperatorInputReader.ReadAsync(reg, ctx, 0);
+        if (condVals == null || condVals.Length == 0)
+            throw new NotSupportedException(
+                "If could not read its condition. Defaulting to a branch would silently pick the wrong one.");
+        bool condition = condVals[0] != 0f;
 
         string branchKey = condition ? "then_branch" : "else_branch";
         if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
@@ -1219,16 +1239,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
             var result = await SubgraphRunner.ExecuteAsync(ctx, subgraph, subInputs);
             if (result != null)
             {
-                int outIdx = 0;
-                foreach (var (name, tensor) in result)
-                {
-                    if (outIdx < ctx.Outputs.Length)
-                    {
-                        int c = Math.Min(tensor.ElementCount, ctx.Outputs[outIdx].ElementCount);
-                        if (c > 0) reg.ElementWise.Scale(tensor.Data.SubView(0, c), ctx.Outputs[outIdx].Data.SubView(0, c), c, 1f);
-                        outIdx++;
-                    }
-                }
+                SubgraphOutputCopy.Apply(reg, ctx, subgraph, result);
                 return;
             }
         }
@@ -1244,18 +1255,54 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
 public class LoopOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Loop";
-    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+
+    /// <summary>
+    /// Output shapes come from the BODY subgraph, never from the inputs.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This used to return <c>inputs[0]</c>, and <c>inputs[0]</c> of a Loop is the SCALAR max trip
+    /// count - so every output was allocated with one element, exactly the bug just fixed in
+    /// <c>If</c> (there it was the condition). Body outputs are
+    /// <c>[condition, carried..., scan_outputs...]</c> while the node's outputs are
+    /// <c>[carried..., scan_outputs...]</c>, so the carried shapes are the body's outputs offset by one.
+    /// <para>
+    /// A SCAN output gains a leading iteration dimension whose length is the trip count, which is not
+    /// knowable from shapes alone (it is a runtime value, and the loop may also stop early on its
+    /// condition). Rather than guess - guessing is what produced a scalar here before - a Loop with scan
+    /// outputs throws and says so. Loop-carried state alone is the common case and is handled exactly.
+    /// </para>
+    /// </remarks>
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a)
+    {
+        if (!a.TryGetValue("body", out var bodyObj) || bodyObj is not Onnx.OnnxGraphProto body
+            || !SubgraphShapes.TryDeclaredOutputShapes(body, out var bodyShapes) || bodyShapes.Length < 1)
+            return new[] { i.Length > 2 ? i[2] : new[] { 1 } };
+
+        // Node inputs: [max_trip_count, condition, carried...]
+        int carried = Math.Max(0, i.Length - 2);
+        int bodyScanOutputs = bodyShapes.Length - 1 - carried;
+        if (bodyScanOutputs > 0)
+            throw new NotSupportedException(
+                $"Loop with {bodyScanOutputs} scan output(s) is not supported: the iteration dimension is a "
+                + "runtime trip count, so its shape cannot be inferred. Loop-carried state is supported.");
+
+        var result = new int[carried][];
+        for (int k = 0; k < carried; k++) result[k] = bodyShapes[k + 1];   // skip the body's condition
+        return result.Length > 0 ? result : new[] { new[] { 1 } };
+    }
     public void Execute(OnnxOpContext ctx)
     {
         // Loop: Input[0]=max_trip_count, Input[1]=condition, Input[2+]=initial carried state
         // Attr: body (GraphProto) — body inputs: [iteration, condition, carried...], outputs: [condition, carried..., scan_outputs...]
+        // Both of these are runtime scalars in a real model, so TryGetInputValues returned null for them
+        // and the loop silently fell back to its 100-iteration safety limit.
         int maxTrips = 100; // safety limit
-        var tripVals = ctx.TryGetInputValues(0);
+        var tripVals = OperatorInputReader.Read(reg, ctx, 0);
         if (tripVals != null && tripVals.Length > 0 && tripVals[0] > 0)
             maxTrips = Math.Min((int)tripVals[0], 10000);
 
         bool keepGoing = true;
-        var condVals = ctx.TryGetInputValues(1);
+        var condVals = OperatorInputReader.Read(reg, ctx, 1);
         if (condVals != null && condVals.Length > 0)
             keepGoing = condVals[0] != 0f;
 
@@ -1349,12 +1396,15 @@ public class LoopOperator(OperatorRegistry reg) : IOnnxOperator
     public async Task ExecuteAsync(OnnxOpContext ctx)
     {
         int maxTrips = 100;
-        var tripVals = ctx.TryGetInputValues(0);
+        // ⚠️ Same logic lives in Execute and here, and GraphExecutor.RunAsync calls THIS one. Reading the
+        // trip count from compile-time constants returned null for a runtime scalar, so the loop silently
+        // fell back to its 100-iteration safety limit - measured as carried_final 100x the correct value.
+        var tripVals = await OperatorInputReader.ReadAsync(reg, ctx, 0);
         if (tripVals != null && tripVals.Length > 0 && tripVals[0] > 0)
             maxTrips = Math.Min((int)tripVals[0], 10000);
 
         bool keepGoing = true;
-        var condVals = ctx.TryGetInputValues(1);
+        var condVals = await OperatorInputReader.ReadAsync(reg, ctx, 1);
         if (condVals != null && condVals.Length > 0)
             keepGoing = condVals[0] != 0f;
 
@@ -1433,7 +1483,47 @@ public class LoopOperator(OperatorRegistry reg) : IOnnxOperator
 public class ScanOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "Scan";
-    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a) => new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+
+    /// <summary>
+    /// Output shapes come from the BODY subgraph, with the sequence length taken from the scanned input.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This used to return <c>inputs[0]</c> - the first STATE input - so every output was sized like it,
+    /// the same class of bug as <c>If</c> and <c>Loop</c>.
+    /// <para>
+    /// Unlike Loop, Scan is fully inferable: its scan outputs gain a leading dimension equal to the
+    /// SEQUENCE LENGTH, and that is the leading dimension of the scanned input, which is a shape and
+    /// therefore known at compile time. Node inputs are <c>[state..., scan_input...]</c>, body outputs are
+    /// <c>[state..., scan_output...]</c> (no condition, unlike Loop).
+    /// </para>
+    /// </remarks>
+    public int[][] InferOutputShapes(int[][] i, Dictionary<string, object> a)
+    {
+        if (!a.TryGetValue("body", out var bodyObj) || bodyObj is not Onnx.OnnxGraphProto body
+            || !SubgraphShapes.TryDeclaredOutputShapes(body, out var bodyShapes) || bodyShapes.Length == 0)
+            return new[] { i.Length > 0 ? i[0] : new[] { 1 } };
+
+        int numScanInputs = a.TryGetValue("num_scan_inputs", out var nsi) ? Convert.ToInt32(nsi) : 1;
+        int numState = Math.Max(0, i.Length - numScanInputs);
+        int numScanOutputs = Math.Max(0, bodyShapes.Length - numState);
+
+        // The scanned input's leading dimension IS the sequence length.
+        int seqLen = 1;
+        if (numState < i.Length && i[numState] is { Length: > 0 } firstScanned) seqLen = firstScanned[0];
+
+        var result = new int[bodyShapes.Length][];
+        for (int k = 0; k < numState && k < bodyShapes.Length; k++)
+            result[k] = bodyShapes[k];                            // final state: same shape as body state
+        for (int j = 0; j < numScanOutputs; j++)
+        {
+            var perStep = bodyShapes[numState + j];
+            var stacked = new int[perStep.Length + 1];
+            stacked[0] = seqLen;                                  // stacked over the sequence
+            Array.Copy(perStep, 0, stacked, 1, perStep.Length);
+            result[numState + j] = stacked;
+        }
+        return result;
+    }
     public void Execute(OnnxOpContext ctx)
     {
         // Scan: sequential scan over input sequence, applying body subgraph at each step.
@@ -1502,6 +1592,21 @@ public class ScanOperator(OperatorRegistry reg) : IOnnxOperator
                 {
                     if (result.TryGetValue(bodyOutputNames[i], out var newState))
                         state[i] = newState;
+                }
+
+                // ⚠️ SCAN OUTPUTS were never written - the loop tracked state and ignored everything after
+                // it, so `stacked` came back all zeros while the final state was correct. Each step's body
+                // output is one slice of the stacked result, written at this step's offset.
+                for (int j = 0; numStateInputs + j < bodyOutputNames.Count; j++)
+                {
+                    int outIdx = numStateInputs + j;
+                    if (outIdx >= ctx.Outputs.Length) break;
+                    if (!result.TryGetValue(bodyOutputNames[outIdx], out var stepOut)) continue;
+                    int per = stepOut.ElementCount;
+                    int offset = step * per;
+                    if (per > 0 && offset + per <= ctx.Outputs[outIdx].ElementCount)
+                        reg.ElementWise.Scale(stepOut.Data.SubView(0, per),
+                            ctx.Outputs[outIdx].Data.SubView(offset, per), per, 1f);
                 }
             }
 
@@ -1582,6 +1687,21 @@ public class ScanOperator(OperatorRegistry reg) : IOnnxOperator
                     if (result.TryGetValue(bodyOutputNames[i], out var newState))
                         state[i] = newState;
                 }
+
+                // ⚠️ SCAN OUTPUTS were never written - the loop tracked state and ignored everything after
+                // it, so `stacked` came back all zeros while the final state was correct. Each step's body
+                // output is one slice of the stacked result, written at this step's offset.
+                for (int j = 0; numStateInputs + j < bodyOutputNames.Count; j++)
+                {
+                    int outIdx = numStateInputs + j;
+                    if (outIdx >= ctx.Outputs.Length) break;
+                    if (!result.TryGetValue(bodyOutputNames[outIdx], out var stepOut)) continue;
+                    int per = stepOut.ElementCount;
+                    int offset = step * per;
+                    if (per > 0 && offset + per <= ctx.Outputs[outIdx].ElementCount)
+                        reg.ElementWise.Scale(stepOut.Data.SubView(0, per),
+                            ctx.Outputs[outIdx].Data.SubView(offset, per), per, 1f);
+                }
             }
 
             for (int i = 0; i < numStateInputs && i < ctx.Outputs.Length; i++)
@@ -1600,3 +1720,66 @@ public class ScanOperator(OperatorRegistry reg) : IOnnxOperator
     }
 }
 // RNN, LSTM, GRU moved to RecurrentOperators.cs with full implementations
+
+/// <summary>
+/// Shapes declared by a control-flow subgraph. Used by <c>If</c>, <c>Loop</c> and <c>Scan</c>.
+/// </summary>
+/// <remarks>
+/// ⚠️ All three of those operators previously inferred their output shapes from <c>inputs[0]</c>, which is
+/// the condition for If, the trip count for Loop and the first state for Scan - never the output. Every one
+/// therefore allocated a buffer of the wrong size and the branch/body result was silently truncated into
+/// it. The subgraph declares what it produces; that is the only correct source.
+/// </remarks>
+internal static class SubgraphShapes
+{
+    /// <summary>Declared output shapes of a subgraph, or false if any dimension is symbolic.</summary>
+    public static bool TryDeclaredOutputShapes(Onnx.OnnxGraphProto sub, out int[][] shapes)
+    {
+        shapes = Array.Empty<int[]>();
+        if (sub.Outputs.Count == 0) return false;
+
+        var result = new int[sub.Outputs.Count][];
+        for (int o = 0; o < sub.Outputs.Count; o++)
+        {
+            var dims = sub.Outputs[o].Shape;
+            if (dims.Count == 0) return false;
+            var shape = new int[dims.Count];
+            for (int d = 0; d < dims.Count; d++)
+            {
+                // A symbolic dim cannot size a buffer, and guessing 1 is how a scalar got here before.
+                if (dims[d].DimValue is not { } v || v <= 0) return false;
+                shape[d] = (int)v;
+            }
+            result[o] = shape;
+        }
+        shapes = result;
+        return true;
+    }
+}
+
+/// <summary>
+/// Copies a subgraph's results into an operator's outputs, in the subgraph's DECLARED output order.
+/// </summary>
+/// <remarks>
+/// ⚠️ The control-flow operators used to walk the result DICTIONARY and assign to outputs by position.
+/// Dictionary order is not the graph's output order, and it stopped being even incidentally right once
+/// declared-but-unproduced outputs (a branch that is a single folded Constant) were merged in. For a
+/// single-output If it was harmless; for Loop and Scan it silently permutes results.
+/// </remarks>
+internal static class SubgraphOutputCopy
+{
+    public static void Apply(OperatorRegistry reg, OnnxOpContext ctx,
+        Onnx.OnnxGraphProto subgraph, Dictionary<string, Tensor> result, int skipLeading = 0)
+    {
+        int outIdx = 0;
+        for (int d = skipLeading; d < subgraph.Outputs.Count && outIdx < ctx.Outputs.Length; d++)
+        {
+            var name = subgraph.Outputs[d].Name;
+            if (string.IsNullOrEmpty(name) || !result.TryGetValue(name, out var tensor)) { outIdx++; continue; }
+            int c = Math.Min(tensor.ElementCount, ctx.Outputs[outIdx].ElementCount);
+            if (c > 0)
+                reg.ElementWise.Scale(tensor.Data.SubView(0, c), ctx.Outputs[outIdx].Data.SubView(0, c), c, 1f);
+            outIdx++;
+        }
+    }
+}

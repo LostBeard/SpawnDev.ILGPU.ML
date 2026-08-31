@@ -1094,6 +1094,14 @@ public static class GraphOptimizer
             string inputName = node.Inputs[0];
             string outputName = node.Outputs[0];
 
+            // ⚠️ An output NAME is part of the model's contract. Eliminating an Identity that feeds a
+            // declared graph output used to RENAME that output to the Identity's input, so a caller asking
+            // for it by name no longer found it - and when the input was itself a graph output, two entries
+            // collapsed onto one name and compilation died with "An item with the same key has already been
+            // added". A Scan body whose scan output is an Identity of its state output is exactly that
+            // shape, and it is perfectly legal ONNX. One copy is cheaper than a broken contract.
+            if (graph.Outputs.Any(o => o.Name == outputName)) continue;
+
             // Rewrite all downstream references from outputName to inputName
             for (int j = i + 1; j < graph.Nodes.Count; j++)
             {
