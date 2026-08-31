@@ -982,6 +982,78 @@ public class StringSplitOperator(OperatorRegistry reg) : IOnnxOperator { public 
 // Subgraphs are stored as OnnxGraphProto in operator attributes (then_branch, else_branch, body).
 
 /// <summary>Helper: compile and execute a subgraph with given inputs.</summary>
+/// <summary>Resolves the values a control-flow body reads from the enclosing graph.</summary>
+internal static class OuterScope
+{
+    /// <summary>
+    /// Add every tensor <paramref name="subgraph"/> references but does not itself produce.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONNX subgraphs capture from the enclosing scope implicitly - a branch body can name any value
+    /// visible where the node sits, without declaring it. An If node carries only its condition, so
+    /// without this the body receives nothing and fails to compile ("shapes=(?; ...)") or reads a tensor
+    /// that was never bound.
+    ///
+    /// "References but does not produce" is the whole rule: anything a node inside the body outputs, or
+    /// that is an initializer or a declared input, belongs to the body. Everything else must come from
+    /// outside.
+    /// </remarks>
+    /// <summary>ML_TRACE_OUTER_SCOPE=1 reports what a branch captured, and what it could not.</summary>
+    internal static readonly bool TraceOuterScope =
+        Environment.GetEnvironmentVariable("ML_TRACE_OUTER_SCOPE") == "1";
+
+    public static void Add(OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph, Dictionary<string, Tensor> into)
+    {
+        var scope = ctx.ScopeTensors;
+        if (scope == null) return;
+
+        var produced = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in subgraph.Nodes)
+            foreach (var o in n.Outputs)
+                if (!string.IsNullOrEmpty(o)) produced.Add(o);
+        foreach (var init in subgraph.Initializers) produced.Add(init.Name);
+        foreach (var inp in subgraph.Inputs) produced.Add(inp.Name);
+
+        foreach (var n in subgraph.Nodes)
+            foreach (var inName in n.Inputs)
+            {
+                if (string.IsNullOrEmpty(inName) || produced.Contains(inName)) continue;
+                if (into.ContainsKey(inName)) continue;
+                if (scope.TryGetValue(inName, out var t)) { into[inName] = t; continue; }
+
+                // ⚠️ Not every outer value is a TENSOR. Small shape/index values are resolved on the CPU and
+                // their dispatches ELIDED, so they live in runtimeConstants and never appear in the tensor
+                // map - which is exactly what a branch reading `Gather_output_0` needs. Materialise them
+                // into a small buffer so the body is self-contained: the compiler gets a shape (without one
+                // it infers nothing and crashes on the first node) and the executor gets a value.
+                //
+                // Rented under a stable name, so this reuses one buffer per value rather than allocating
+                // per execution - a per-call device allocation is what makes a graph uncapturable.
+                if (ctx.ConstantValues != null && ctx.ConstantValues.TryGetValue(inName, out var vals)
+                    && vals != null && vals.Length > 0)
+                {
+                    var buf = ctx.Pool.Rent(new[] { vals.Length }, "_outerscope_" + inName);
+                    buf.Data.SubView(0, vals.Length).CopyFromCPU(vals);
+                    into[inName] = new Tensor(buf.Data.SubView(0, vals.Length), new[] { vals.Length }, inName);
+                    if (TraceOuterScope)
+                        Console.WriteLine($"[OuterScope] '{inName}' materialised from runtimeConstants "
+                                        + $"({vals.Length} value(s)) - it was elided, not a live tensor");
+                    continue;
+                }
+
+                if (TraceOuterScope)
+                    // A referenced value the enclosing scope does not have. Naming it matters: the compile
+                    // failure downstream reports only "shapes=(?)", which cannot distinguish "never
+                    // captured" from "captured with an unknown shape".
+                    Console.WriteLine($"[OuterScope] '{inName}' referenced by the branch but NOT present in "
+                                    + $"the enclosing scope ({scope.Count} tensors live)");
+            }
+        if (TraceOuterScope)
+            Console.WriteLine($"[OuterScope] captured {into.Count} tensor(s) for the branch: "
+                            + string.Join(", ", into.Keys.Take(8)));
+    }
+}
+
 internal static class SubgraphRunner
 {
     /// <summary>
@@ -1106,7 +1178,7 @@ internal static class SubgraphRunner
         if (ctx.Registry == null) return null;
 
         // Convert OnnxGraphProto to ModelGraph IR
-        var modelGraph = ConvertToModelGraph(subgraph);
+        var modelGraph = ConvertToModelGraph(subgraph, subgraphInputs);
 
         // Compile
         var compiler = new Graph.GraphCompiler(ctx.Registry);
@@ -1114,6 +1186,10 @@ internal static class SubgraphRunner
 
         // Build weights from subgraph initializers
         var weights = new Dictionary<string, Tensor>();
+        // Runtime constants visible to the body: the enclosing graph's, plus the body's own Constant nodes.
+        var subgraphConstants = ctx.ConstantValues != null
+            ? new Dictionary<string, float[]>(ctx.ConstantValues)
+            : new Dictionary<string, float[]>();
         foreach (var init in subgraph.Initializers)
         {
             var floats = init.ToFloatArray();
@@ -1141,6 +1217,17 @@ internal static class SubgraphRunner
             var cshape = valueAttr.T.Dims.Select(d => (int)d).ToArray();
             if (cshape.Length == 0) cshape = new[] { cfloats.Length };
             weights[cn.Outputs[0]] = ctx.Pool.AllocatePermanent(cfloats, cshape, cn.Outputs[0]);
+            // ⚠️ ALSO as a runtime constant, not only as a GPU tensor. Ops that need a value on the CPU -
+            // Range's start/limit/delta, Slice's bounds, Reshape's dims - read runtimeConstants, and a
+            // Constant node declared INSIDE a subgraph never reached that map: the branch compiled and then
+            // died with "Range: scalar inputs not available as runtime constants ... delta=null" while the
+            // very same value sat in weights as a buffer.
+            //
+            // Bounded deliberately: a lookup table belongs on the GPU and nothing reads it as a scalar. The
+            // 4096 cap keeps the [1999, 48] positional table (95,952 values) out of this map while letting
+            // through the scalars and short vectors that shape arithmetic actually consumes.
+            if (cfloats.Length <= 4096)
+                subgraphConstants[cn.Outputs[0]] = cfloats;
         }
 
         // ⚠️ Outer-scope tensors are deliberately NOT merged in here any more. They reach the body through
@@ -1152,10 +1239,27 @@ internal static class SubgraphRunner
         weightsOut = weights;
         return new Graph.GraphExecutor(
             ctx.Registry.Accelerator, compiled, weights,
-            ctx.ConstantValues, registry: ctx.Registry);
+            subgraphConstants, registry: ctx.Registry);
     }
 
-    private static Graph.ModelGraph ConvertToModelGraph(Onnx.OnnxGraphProto onnxGraph)
+    /// <param name="outerScope">
+    /// Tensors the subgraph reads from the ENCLOSING graph, with their runtime shapes.
+    /// </param>
+    /// <remarks>
+    /// ⚠️ ONNX lets a subgraph reference values from the enclosing scope without declaring them as inputs,
+    /// and they were never declared here - so the compiler had no shape for them and inferred nothing
+    /// downstream. That is invisible while every branch a model actually takes happens to be simple.
+    ///
+    /// ZipVoice's decoder made it visible: an utterance longer than its precomputed [1999, 48] positional
+    /// table takes a DIFFERENT If branch, 156 nodes that read the parent's Gather output. Compiling it
+    /// crashed with "Node 0/156 'Sub' ... shapes=(?; [1])" - the `?` being the outer-scope value. Short
+    /// utterances take the other branch (a single Constant), which is why every test until now passed and
+    /// the first realistic chat reply did not.
+    ///
+    /// The shapes are known at runtime, so they are declared here.
+    /// </remarks>
+    private static Graph.ModelGraph ConvertToModelGraph(
+        Onnx.OnnxGraphProto onnxGraph, Dictionary<string, Tensor>? outerScope = null)
     {
         var graph = new Graph.ModelGraph { Name = onnxGraph.Name };
 
@@ -1167,6 +1271,21 @@ internal static class SubgraphRunner
                 Name = input.Name,
                 Shape = input.Shape?.Select(d => (int)(d.DimValue ?? 1)).ToArray() ?? new[] { 1 }
             });
+        }
+
+        if (outerScope != null)
+        {
+            var declared = new HashSet<string>(graph.Inputs.Select(i => i.Name), StringComparer.Ordinal);
+            foreach (var (name, tensor) in outerScope)
+            {
+                if (declared.Contains(name)) continue;
+                if (onnxGraph.Initializers.Any(i => i.Name == name)) continue;
+                graph.Inputs.Add(new Graph.GraphValueInfo
+                {
+                    Name = name,
+                    Shape = (int[])tensor.Shape.Clone(),
+                });
+            }
         }
 
         foreach (var output in onnxGraph.Outputs)
@@ -1309,6 +1428,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         {
             // Subgraph inputs reference outer graph tensors — pass all available tensors
             var subInputs = new Dictionary<string, Tensor>();
+            OuterScope.Add(ctx, subgraph, subInputs);
             for (int i = 0; i < ctx.InputNames.Length; i++)
             {
                 if (!string.IsNullOrEmpty(ctx.InputNames[i]) && i < ctx.Inputs.Length)
@@ -1361,6 +1481,7 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
         {
             var subInputs = new Dictionary<string, Tensor>();
+            OuterScope.Add(ctx, subgraph, subInputs);
             for (int i = 0; i < ctx.InputNames.Length; i++)
             {
                 if (!string.IsNullOrEmpty(ctx.InputNames[i]) && i < ctx.Inputs.Length)

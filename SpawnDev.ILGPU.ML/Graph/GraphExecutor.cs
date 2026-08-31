@@ -3081,6 +3081,9 @@ public class GraphExecutor : IDisposable
                 QuantizedWeights = _quantizedWeights,
                 Registry = _registry,
                 IntegerTensorNames = _integerTensorNames,
+                // The live tensor map, so control-flow bodies can resolve outer-scope references. Passed by
+                // reference - no copy - and read only by If/Loop/Scan.
+                ScopeTensors = tensors,
             };
             // ── LFM2 short-conv decode intercept (conv analogue of the FusedAttention KV intercept above) ──
             // When the conv-state cache is active, run ShortConv THROUGH it so a decode step (pastLen>0) sees

@@ -70,6 +70,26 @@ public class OnnxOpContext
     /// Allows control flow operators to compile and execute embedded ONNX subgraphs.</summary>
     public OperatorRegistry? Registry { get; init; }
 
+    /// <summary>
+    /// Every tensor live in the ENCLOSING graph, for control-flow operators only.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ ONNX subgraphs may read values from the enclosing scope WITHOUT declaring them as inputs, and an
+    /// <c>If</c> node has exactly one input of its own - the condition. So a branch body that references a
+    /// parent tensor could neither be compiled (no shape) nor executed (no tensor): it simply was not
+    /// passed anything.
+    ///
+    /// That is invisible while every branch a model actually takes is self-contained. ZipVoice's decoder
+    /// made it visible: an utterance longer than its precomputed [1999, 48] positional table takes a
+    /// DIFFERENT branch - 156 nodes that read the parent's Gather output - and compiling it crashed with
+    /// "shapes=(?; [1])". Short utterances take the other branch, a single Constant, which is why every
+    /// test passed until the first realistic chat reply.
+    ///
+    /// ⚠️ Read ONLY for outer-scope capture. It is the executor's live tensor map, not a general-purpose
+    /// back door: an operator reaching into it for anything else is reading state it has no contract with.
+    /// </remarks>
+    public IReadOnlyDictionary<string, Tensor>? ScopeTensors { get; init; }
+
     /// <summary>Names of tensors whose ONNX-declared dtype is integer (INT8/16/32/64, UINT8/16,
     /// BOOL). Populated at session-init by walking initializers (with their TensorProto.DataType),
     /// Cast nodes (with their `to` attribute), and known integer-producing ops (ArgMax, Shape,
