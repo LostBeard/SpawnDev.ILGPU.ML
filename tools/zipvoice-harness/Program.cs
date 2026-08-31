@@ -274,7 +274,7 @@ int Synth(string fixturePath, string? outPath)
             Console.WriteLine("by op    :");
             foreach (var g in timings.GroupBy(kv => kv.Key.Split('_')[1])
                                      .Select(g => (Op: g.Key, Ms: g.Sum(x => x.Value), N: g.Count()))
-                                     .OrderByDescending(x => x.Ms).Take(12))
+                                     .OrderByDescending(x => x.Ms).Take(30))
                 Console.WriteLine($"           {g.Ms,9:F1}ms  {100 * g.Ms / total,5:F1}%  {g.N,5} x {g.Op}");
             Console.WriteLine("slowest  :");
             foreach (var kv in timings.OrderByDescending(kv => kv.Value).Take(10))
