@@ -66,6 +66,10 @@ public class OperatorRegistry : IDisposable
     public ElementWiseKernels ElementWise { get; }
     public Conv2DKernel Conv2D { get; }
     public Conv1DKernel Conv1D { get; }
+
+    /// <summary>The LSTM recurrence as a GPU kernel - see <see cref="Kernels.RecurrentKernels"/>
+    /// for why the host path it replaces was unusable in a browser.</summary>
+    public RecurrentKernels Recurrent { get; }
     public ShortConvKernel ShortConv { get; }
     public GatedDeltaNetKernel GatedDeltaNetScan { get; }
     public GatedDeltaNetOps GatedDeltaNetOps { get; }
@@ -117,6 +121,7 @@ public class OperatorRegistry : IDisposable
         ElementWise = new ElementWiseKernels(accelerator);
         Conv2D = new Conv2DKernel(accelerator);
         Conv1D = new Conv1DKernel(accelerator);
+        Recurrent = new RecurrentKernels(accelerator);
         ShortConv = new ShortConvKernel(accelerator);
         GatedDeltaNetScan = new GatedDeltaNetKernel(accelerator);
         GatedDeltaNetOps = new GatedDeltaNetOps(accelerator);

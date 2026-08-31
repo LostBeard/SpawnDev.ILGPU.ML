@@ -2,6 +2,118 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.4 (2026-08-31)
+
+### Fixed
+
+- 🔴 **A REVERSED slice - `x[..., ::-1]` - produced an all-zeros buffer on every backend.**
+  `SliceOperator.Execute` clamped `ends` into `[0, dim]` regardless of the step's sign. ONNX clamps it into
+  `[-1, dim-1]` when the step is negative, because a reversed slice legitimately ends one BEFORE index 0 -
+  which is exactly what the `INT64_MIN` sentinel that torch emits for `::-1` means. Floored at 0, both copy
+  loops ran `for (i = start; i < end; i += step)` with `start=2, end=0, step=-1`: zero iterations, output
+  buffer never written, no exception.
+  ⚠️ **What made it invisible for so long: the SHAPE was right.** `GraphCompiler` and the shape interpreter
+  both handled negative steps correctly already, so the output tensor had exactly the dimensions ONNX
+  specifies and was full of zeros. Every downstream shape check passed and the model simply returned a
+  wrong number. Found by running Silero VAD against onnxruntime - its `adaptive_normalization` reverses a
+  `[1,1,3]` axis twice, and the detector answered with a confident, plausible, wrong probability.
+  `InferOutputShapes`' opset<10 attribute path had the same forward-only formula and is fixed to match.
+  Gated by `MLTestBase.SliceReverseTests` - 9 cases (6 reversed, 3 forward), all six backends, referenced
+  against onnxruntime.
+
+### Added
+
+- **Silero VAD runs on our engine, and is gated against onnxruntime.** 4 s of real speech, 125 frames of
+  512 samples, state threaded frame to frame: max |d| vs onnxruntime **3.3e-8** on `prob`, **1.1e-6** on
+  the LSTM state. The model is stateful in the way that is easiest to get silently wrong - `h`/`c` arrive
+  as graph INPUTS and the updated state comes back out every frame - so `MLTestBase.SileroVadTests` also
+  asserts the run is FAR from a frozen-state negative control that is carried in the fixture. Without that
+  second assertion an engine caching those inputs would still pass wherever the two happened to agree; the
+  measured gap between threaded and frozen is 0.978.
+- **`VoiceActivityDetector` and `SileroVad`** (`Pipelines/VoiceActivityDetection.cs`): streaming
+  endpointing that turns microphone samples into finished utterances. Accepts any chunk size and reframes
+  to the model's fixed 512 internally, because a microphone does not hand over 512-sample buffers and RTP
+  hands over 320. The state machine follows silero-vad's own `VADIterator`, including the negative
+  threshold - the hysteresis gap is what stops a probability hovering at 0.5 opening and closing the
+  segment on alternating frames. Defaults are the ones `RoseEars` runs on the robot (0.5 threshold, 500 ms
+  min-silence, 250 ms min-speech, 20 s max-speech), chosen for a child mid-thought rather than a dictation
+  app. Gated against **sherpa-onnx** - a separate C++ implementation of the same endpointing - because this
+  is a port, so the claim under test is "same behaviour", and a reference transcribed by hand from the same
+  upstream source would only prove it was read the same way twice.
+
+### Performance - the LSTM recurrence moved onto the accelerator
+
+`LSTMOperator` computed on the HOST: it read X, `initial_h` and `initial_c` back, ran the recurrence in
+C#, and uploaded Y/Y_h/Y_c. That is what made LSTM correct on six backends in 5.2.3, and it is fine on
+CUDA/OpenCL where a readback is a synchronous memcpy. In a browser every one of those is a `mapAsync` that
+flushes the command encoder and WAITS - a pipeline barrier, not a transfer.
+
+`Kernels/RecurrentKernels` runs it on the GPU instead, and the executor's readback skip-set was sharpened
+to match (below). MEASURED per frame (`Vad_Benchmark_FrameRate`, 60 warmed frames, timing only
+`ProcessFrameAsync`; a frame of audio is 32 ms):
+
+| backend | 5.2.3 | GPU recurrence | + skip-set |
+|---|---|---|---|
+| WebGPU | 177.9 ms | 170.1 ms | **126.7 ms** |
+| WebGL | 85.6 ms | 71.8 ms | **65.6 ms** |
+| Wasm | 191.8 ms | 157.0 ms | **168.0 ms** |
+| OpenCL (desktop) | 4.99 ms mean / **47.4 ms p99** | **4.25 ms mean / 7.78 ms p99** | - |
+
+The desktop p99 collapse matters more than the mean: a 47 ms spike against a 32 ms budget is a frame you
+cannot catch up from. WebGPU per-frame readbacks went 16 -> 10 and its readback time 103.5 -> 64.4 ms.
+
+⚠️ **Still 0.25x realtime on WebGPU, so the browser VAD does not yet keep up with a live microphone.** The
+remaining ten readbacks all trace to `Concat`, which is in the requires-value list and so pins a readback
+on every input - but all of Concat's inputs are DATA, so this needs a TRANSITIVE analysis (a tensor needs a
+host value only if something downstream truly reads one; Concat propagates that need rather than creating
+it) rather than another per-position entry. That is the next lever.
+
+⚠️ `SessionGraphCapture` is NOT the answer here and was tried and reverted: it left WebGPU finding 0
+utterances and crashed CUDA with an access violation. `TryCaptureAsync` runs the graph six times to
+discover patch points, and Silero's `h`/`c` are genuine per-frame state rather than a position-addressed KV
+cache, so they do not survive the probing - the hazard CLAUDE.md documents for per-step stateful caches.
+
+Two defects in the new kernel were caught only by a browser backend, and both produced correct results on
+CUDA and OpenCL first:
+- A placeholder view for the optional B/P inputs was sliced from the state buffer the kernel already binds
+  - storage-buffer aliasing, which WebGPU rejects outright.
+- Writing Y as a third kernel output produced ZEROS on WebGL while Y_h stayed correct. Y is now a native
+  GPU-to-GPU copy of the new hidden state, and the kernel writes two buffers.
+
+GRU and RNN still take the host path. They are correct, not yet fast; Silero needs only LSTM, which is
+where the readbacks were.
+
+### Changed - the readback skip-set is per INPUT POSITION, not per op
+
+`ReadbackRequiresValueConsumers` forced a mid-graph readback for any tensor feeding a listed op. That is
+too coarse for ops taking a data tensor plus a small parameter tensor: `Squeeze(data, axes)` needs a host
+value for AXES and never looks at DATA, but listing `Squeeze` pinned a readback on whatever fed input 0.
+MEASURED on Silero VAD, six of sixteen per-frame readbacks were both LSTM nodes' three outputs, promoted
+solely because a `Squeeze` consumed them.
+
+`ReadbackValueNeedingInputs` now names the positions that actually need a value, and every entry was
+verified by READING our operator source rather than the ONNX spec: `Squeeze`, `Unsqueeze` and `Reshape`
+(`{1}` - each `Execute` does nothing but a GPU-to-GPU copy of input 0), and `Slice` (`{1,2,3,4}`; its
+input-0 value feeds only an optional small-tensor CPU path that falls through correctly without one). An op
+absent from the map keeps the old all-inputs behaviour, so the change is additive.
+
+`LSTM` is also now marked value-free, which is true ONLY because of the kernel above - this entry would
+have been wrong before it. It remains correct on the `layout=1` host fallback, because that path reads its
+tensors directly through `OperatorInputReader` rather than through `runtimeConstants`. GRU and RNN are
+deliberately excluded while they remain host-side.
+
+### Tooling
+
+- `tools/ort_node_reference.py` - per-node onnxruntime values for **any** model, driven by the runonnx
+  fixture format. The existing `zipvoice/ort_intermediates.py` did this only for the ZipVoice encoder.
+- `tools/vad-oracle` - segment boundaries from sherpa-onnx. Deliberately does not reference
+  SpawnDev.ILGPU.ML, so it shares no code with what it grades and can be built during a PMT sweep.
+- `tools/zipvoice/first_divergence.py` now prefers a tensor's `[interp]` value over its `[dump]` line.
+  Shape-lane nodes print BOTH, and the `[dump]` line reads a stale GPU buffer that is usually all zeros -
+  which reported a 100% divergence on a node that was entirely correct and cost a full false lead. Both ORT
+  printers now emit 6 SIGNIFICANT digits rather than 6 decimal places, so a mean of 4.478e-05 stops
+  rendering as `0.000045` and reading as a 0.5% mismatch.
+
 ## 5.2.3 (2026-08-30)
 
 ### Fixed

@@ -203,7 +203,7 @@ public class RNNOperatorImpl(OperatorRegistry reg) : IOnnxOperator
 /// Gate ordering in W/R: [i, o, f, c] (ONNX spec, differs from PyTorch [i, f, g, o])
 /// Spec: https://onnx.ai/onnx/operators/onnx__LSTM.html
 /// </summary>
-public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator
+public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator, IDisposable
 {
     public string OpType => "LSTM";
 
@@ -250,6 +250,12 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator
     /// </remarks>
     public async Task ExecuteAsync(OnnxOpContext ctx)
     {
+        // The recurrence runs on the accelerator when it can. The host path below is correct and stays as
+        // the fallback, but it reads X and h/c back and uploads Y/Y_h/Y_c on EVERY call - MEASURED as 11
+        // of the 16 host readbacks in a Silero VAD frame, and on WebGPU each one is a mapAsync that
+        // flushes the command encoder and WAITS. See Kernels/RecurrentKernels.
+        if (TryExecuteOnAccelerator(ctx)) return;
+
         var pre = new Dictionary<int, float[]>();
         foreach (int i in DynamicInputs)
         {
@@ -262,6 +268,158 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator
             if (v != null) pre[i] = v;
         }
         ExecuteCore(ctx, pre);
+    }
+
+
+    // GPU path -------------------------------------------------------------------------------------
+    // Scratch owned by the OPERATOR rather than the call. Two reasons, both hard: a browser backend must
+    // not free a buffer a queued dispatch still references (CLAUDE.md), and a detector running 31 times a
+    // second would otherwise churn the buffer pool for the life of the session.
+    private MemoryBuffer1D<float, Stride1D.Dense>? _hA, _hB, _cA, _cB;
+
+    // Placeholders for the optional inputs (B, P) and for Y when the model asks for no Y. A kernel
+    // parameter still has to be a bindable view even when the kernel never reads it.
+    // Three DISJOINT slots of one tiny buffer, not one slot reused: WebGPU forbids binding the same
+    // buffer to two read_write slots with OVERLAPPING ranges, and reusing a single slot for B and P
+    // trips that the moment a model omits both. Disjoint ranges are fine, so this costs one allocation.
+    private MemoryBuffer1D<float, Stride1D.Dense>? _unused;
+
+    private ArrayView1D<float, Stride1D.Dense> Scratch(
+        ref MemoryBuffer1D<float, Stride1D.Dense>? buf, int elements)
+    {
+        if (buf == null || buf.Length < elements)
+        {
+            buf?.Dispose();
+            buf = reg.Accelerator.Allocate1D<float>(elements);
+        }
+        return buf.View;
+    }
+
+    /// <summary>
+    /// Runs the recurrence entirely on the accelerator, or returns false to leave it to the host path.
+    /// </summary>
+    /// <remarks>
+    /// Everything this needs to DECIDE is host metadata - shapes and attributes - so choosing costs no
+    /// readback. It declines only what it does not implement, and the refusal is a real capability limit
+    /// rather than a convenience: <c>layout=1</c> indexes Y per batch, which this kernel's flat Y offset
+    /// does not model.
+    /// </remarks>
+    private bool TryExecuteOnAccelerator(OnnxOpContext ctx)
+    {
+        int layout = ctx.GetInt("layout", 0);
+        if (layout != 0) return false;
+
+        var xShape = ctx.Inputs[0].Shape;
+        if (xShape.Length != 3) return false;
+
+        string direction = ctx.GetString("direction", "forward");
+        int numDir = direction == "bidirectional" ? 2 : 1;
+        int seqLen = xShape[0], batch = xShape[1], inputSize = xShape[2];
+        int H = ctx.GetInt("hidden_size", 0);
+        if (H == 0 && inputSize > 0) H = ctx.Inputs[1].ElementCount / (numDir * 4 * inputSize);
+        if (H <= 0 || batch <= 0 || seqLen <= 0 || inputSize <= 0) return false;
+
+        var w = ctx.Inputs[1];
+        var r = ctx.Inputs[2];
+        if (w == null || r == null) return false;
+        var bTensor = ctx.Inputs.Length > 3 ? ctx.Inputs[3] : null;
+        var initH = ctx.Inputs.Length > 5 ? ctx.Inputs[5] : null;
+        var initC = ctx.Inputs.Length > 6 ? ctx.Inputs[6] : null;
+        var pTensor = ctx.Inputs.Length > 7 ? ctx.Inputs[7] : null;
+
+        int stateSize = batch * H;
+        // SEPARATE buffers, alternated by step parity. One allocation indexed by step would make hIn and
+        // hOut the same buffer, which WebGPU rejects as storage-buffer aliasing regardless of how disjoint
+        // the ranges are. These are per-call scratch, so the alternation is safe.
+        var hA = Scratch(ref _hA, stateSize);
+        var hB = Scratch(ref _hB, stateSize);
+        var cA = Scratch(ref _cA, stateSize);
+        var cB = Scratch(ref _cB, stateSize);
+
+        bool haveY = ctx.Outputs.Length > 0 && ctx.Outputs[0] != null;
+        // ⚠️ These must NOT be slices of hAll: hIn/hOut already bind it, and the overlap is an aliasing
+        // violation that WebGPU rejects outright ("binding 4 and binding 5 reference the same GPU buffer
+        // with overlapping ranges"). Separate, disjoint slots.
+        var unused = Scratch(ref _unused, 2);
+        var emptyB = unused.SubView(0, 1);
+        var emptyP = unused.SubView(1, 1);
+
+        for (int dir = 0; dir < numDir; dir++)
+        {
+            var h0 = hA;
+            var c0 = cA;
+            // ⚠️ ScaleInPlace, NOT Scale(v, v, ...): passing one view as both source and destination binds
+            // the same buffer to two read_write slots, which WebGPU rejects outright. It would not have
+            // shown up in the VAD gates - Silero always supplies initial_h/initial_c as graph inputs, so
+            // this branch never runs there - and would have fired on the first model that omits them.
+            if (initH != null && initH.ElementCount >= (dir + 1) * stateSize)
+                h0.CopyFrom(initH.Data.SubView(dir * stateSize, stateSize));
+            else reg.ElementWise.ScaleInPlace(h0, stateSize, 0f);
+            if (initC != null && initC.ElementCount >= (dir + 1) * stateSize)
+                c0.CopyFrom(initC.Data.SubView(dir * stateSize, stateSize));
+            else reg.ElementWise.ScaleInPlace(c0, stateSize, 0f);
+
+            bool reverse = (dir == 1) || direction == "reverse";
+            for (int t = 0; t < seqLen; t++)
+            {
+                int timeIdx = reverse ? seqLen - 1 - t : t;
+                bool even = (t % 2) == 0;
+                var hIn = even ? hA : hB;
+                var cIn = even ? cA : cB;
+                var hOut = even ? hB : hA;
+                var cOut = even ? cB : cA;
+
+                reg.Recurrent.LstmStep(
+                    ctx.Inputs[0].Data, w.Data, r.Data,
+                    bTensor != null ? bTensor.Data : emptyB,
+                    pTensor != null ? pTensor.Data : emptyP,
+                    hIn, cIn, hOut, cOut,
+                    new Kernels.RecurrentKernels.LstmStepParams
+                    {
+                        Batch = batch,
+                        Hidden = H,
+                        InputSize = inputSize,
+                        XOff = timeIdx * batch * inputSize,
+                        WOff = dir * 4 * H * inputSize,
+                        ROff = dir * 4 * H * H,
+                        BOff = dir * 8 * H,
+                        POff = dir * 3 * H,
+                        HasBias = (bTensor != null && bTensor.ElementCount >= (dir + 1) * 8 * H) ? 1 : 0,
+                        HasPeephole = (pTensor != null && pTensor.ElementCount >= (dir + 1) * 3 * H) ? 1 : 0,
+                    });
+
+                // Y is this step's hidden state. A native copy rather than a third kernel output: writing
+                // Y inside the kernel produced ZEROS on WebGL while Y_h stayed correct.
+                if (haveY)
+                {
+                    int yOff = (timeIdx * numDir + dir) * batch * H;
+                    if (ctx.Outputs[0].ElementCount >= yOff + stateSize)
+                        ctx.Outputs[0].Data.SubView(yOff, stateSize).CopyFrom(hOut);
+                }
+            }
+
+            // Y_h / Y_c are the final step's state - which buffer that is depends on the parity of the
+            // last step written.
+            bool lastEven = ((seqLen - 1) % 2) == 0;
+            var hFinal = lastEven ? hB : hA;
+            var cFinal = lastEven ? cB : cA;
+            if (ctx.Outputs.Length > 1 && ctx.Outputs[1] != null
+                && ctx.Outputs[1].ElementCount >= (dir + 1) * stateSize)
+                ctx.Outputs[1].Data.SubView(dir * stateSize, stateSize).CopyFrom(hFinal);
+            if (ctx.Outputs.Length > 2 && ctx.Outputs[2] != null
+                && ctx.Outputs[2].ElementCount >= (dir + 1) * stateSize)
+                ctx.Outputs[2].Data.SubView(dir * stateSize, stateSize).CopyFrom(cFinal);
+        }
+        return true;
+    }
+
+    public void Dispose()
+    {
+        _hA?.Dispose(); _hA = null;
+        _hB?.Dispose(); _hB = null;
+        _cA?.Dispose(); _cA = null;
+        _cB?.Dispose(); _cB = null;
+        _unused?.Dispose(); _unused = null;
     }
 
     private void ExecuteCore(OnnxOpContext ctx, Dictionary<int, float[]>? pre)

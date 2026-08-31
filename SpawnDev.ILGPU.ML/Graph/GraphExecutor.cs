@@ -3596,7 +3596,48 @@ public class GraphExecutor : IDisposable
         "Sigmoid", "Tanh", "HardSigmoid", "HardSwish", "SiLU", "Mish", "Softplus", "Elu", "Selu", "Celu",
         "MatMul", "Gemm", "Conv", "ConvTranspose", "LayerNormalization", "BatchNormalization",
         "InstanceNormalization", "GroupNormalization", "RMSNormalization",
+        // LSTM earns its place only because the recurrence now runs on the accelerator
+        // (Kernels/RecurrentKernels). Before that it read X and h/c back on every call and this entry
+        // would have been wrong. It stays correct even on the layout=1 host fallback, because that path
+        // reads its tensors DIRECTLY through OperatorInputReader rather than through runtimeConstants -
+        // so skipping the promotion costs it nothing. GRU and RNN are deliberately NOT here: they are
+        // still host-side, and adding them would be a guess rather than a measurement.
+        "LSTM",
     };
+
+    /// <summary>
+    /// For an op in <see cref="ReadbackRequiresValueConsumers"/>, WHICH input positions actually need a
+    /// host value. An op absent from this map keeps the old all-inputs-need-it behaviour.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The requires-value list is per-OP, which is far too coarse for the ops that take a data tensor plus
+    /// a small parameter tensor. <c>Squeeze(data, axes)</c> needs a value for AXES and never looks at
+    /// DATA - but listing "Squeeze" forced a readback of whatever fed input 0. MEASURED on Silero VAD:
+    /// six of sixteen per-frame readbacks were both LSTM nodes' three outputs, promoted to host constants
+    /// solely because a Squeeze consumed them, and on WebGPU those readbacks are the dominant frame cost.
+    /// </para>
+    /// <para>
+    /// ⚠️ Every entry here is VERIFIED against our operator source, not against the ONNX spec from memory,
+    /// because the surrounding comment is right that omission is the dangerous direction. Squeeze,
+    /// Unsqueeze and Reshape were each read and do nothing but a GPU-to-GPU copy of input 0. Slice reads
+    /// inputs 1-4 for its params; it also has an OPTIONAL small-tensor CPU path that uses input 0's value
+    /// when one happens to be available, and falls through to the GPU path correctly when it is not.
+    /// Add an op here only after reading its Execute.
+    /// </para>
+    /// </remarks>
+    private static readonly Dictionary<string, int[]> ReadbackValueNeedingInputs =
+        new(StringComparer.Ordinal)
+        {
+            ["Squeeze"] = new[] { 1 },      // axes
+            ["Unsqueeze"] = new[] { 1 },    // axes
+            ["Reshape"] = new[] { 1 },      // shape
+            ["Slice"] = new[] { 1, 2, 3, 4 }, // starts, ends, axes, steps
+        };
+
+    /// <summary>Whether <paramref name="op"/> needs a host value for the tensor at <paramref name="index"/>.</summary>
+    private static bool ReadbackNeedsValueAt(string op, int index)
+        => !ReadbackValueNeedingInputs.TryGetValue(op, out var idx) || Array.IndexOf(idx, index) >= 0;
 
     /// <summary>Ops that read at least one input's runtime-constant VALUE and have NO correct GPU-only
     /// fallback for it — i.e. they GENUINELY need the readback (shape/index/param resolution). If an
@@ -3622,16 +3663,23 @@ public class GraphExecutor : IDisposable
         var skip = new HashSet<string>(StringComparer.Ordinal);
         // producer op-type per output, consumer op-types per tensor name
         var producerOp = new Dictionary<string, string>(StringComparer.Ordinal);
-        var consumerOps = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        // (consumer op, INPUT POSITION). The position is what lets "Squeeze needs axes but not data"
+        // be expressed; without it the requires-value test is per-op and pins a readback on every input.
+        var consumerOps = new Dictionary<string, List<(string Op, int Index)>>(StringComparer.Ordinal);
         foreach (var node in graph.Nodes)
         {
             foreach (var o in node.OutputNames)
                 if (!string.IsNullOrEmpty(o)) producerOp[o] = node.OpType;
-            foreach (var inp in node.InputNames)
+            for (int ii = 0; ii < node.InputNames.Length; ii++)
             {
+                var inp = node.InputNames[ii];
                 if (string.IsNullOrEmpty(inp)) continue;
-                if (!consumerOps.TryGetValue(inp, out var list)) { list = new List<string>(); consumerOps[inp] = list; }
-                list.Add(node.OpType);
+                if (!consumerOps.TryGetValue(inp, out var list))
+                {
+                    list = new List<(string, int)>();
+                    consumerOps[inp] = list;
+                }
+                list.Add((node.OpType, ii));
             }
         }
 
@@ -3641,12 +3689,15 @@ public class GraphExecutor : IDisposable
             {
                 if (string.IsNullOrEmpty(o)) continue;
                 var cons = consumerOps.GetValueOrDefault(o);
-                // Any consumer that genuinely needs the value → must keep the readback.
-                if (cons != null && cons.Any(c => ReadbackRequiresValueConsumers.Contains(c))) continue;
+                // Any consumer that genuinely needs the value AT THE POSITION IT READS THIS TENSOR must
+                // keep the readback. A Squeeze consuming a data tensor at input 0 does not qualify.
+                if (cons != null && cons.Any(c => ReadbackRequiresValueConsumers.Contains(c.Op)
+                                                  && ReadbackNeedsValueAt(c.Op, c.Index))) continue;
                 bool featureProducer = ReadbackFeatureOnlyProducers.Contains(node.OpType);
                 // Rule B: every consumer is itself a feature-only op (which never reads a value). Vacuously
                 // true for a dead/graph-output tensor (nothing reads its value either).
-                bool allConsumersFeatureOnly = cons == null || cons.All(c => ReadbackFeatureOnlyProducers.Contains(c));
+                bool allConsumersFeatureOnly = cons == null
+                    || cons.All(c => ReadbackFeatureOnlyProducers.Contains(c.Op));
                 if (featureProducer || allConsumersFeatureOnly)
                     skip.Add(o);
             }
