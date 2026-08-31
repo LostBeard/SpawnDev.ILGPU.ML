@@ -3596,6 +3596,30 @@ public class GraphExecutor : IDisposable
         "Sigmoid", "Tanh", "HardSigmoid", "HardSwish", "SiLU", "Mish", "Softplus", "Elu", "Selu", "Celu",
         "MatMul", "Gemm", "Conv", "ConvTranspose", "LayerNormalization", "BatchNormalization",
         "InstanceNormalization", "GroupNormalization", "RMSNormalization",
+        // Pure data movers. Each one's Execute was READ and does nothing but copy GPU tensors plus consult
+        // shape metadata or an attribute - none touches a host value:
+        //   Concat    - copy loops over its inputs, axis is an attribute
+        //   Transpose - reg.Transpose over GPU data, `perm` is an attribute
+        //   Squeeze / Unsqueeze - a single GPU-to-GPU Scale of input 0
+        //   Reshape   - a single GPU-to-GPU CopyFrom of input 0
+        // ⚠️ These also appear in ReadbackRequiresValueConsumers, and that is not a contradiction: the two
+        // sets answer different questions. As a CONSUMER, Reshape needs a host value for its SHAPE input;
+        // as a PRODUCER, its output needs no readback unless something downstream reads it - which the
+        // needsValue fixed point below decides. Being in both is the accurate description.
+        // MEASURED on Silero VAD: these five entries are what let the last five per-frame readbacks go.
+        "Concat", "Transpose", "Squeeze", "Unsqueeze", "Reshape",
+        // Slice is here as a PRODUCER, and it is the subtle one. Its Execute does opportunistically read
+        // input 0's value for a small-tensor CPU path - but that path FALLS THROUGH correctly to the GPU
+        // kernel when no host value is available, so losing the promotion costs a fast path, not
+        // correctness. And whenever a Slice output really IS a shape vector, the needsValue fixed point
+        // below keeps its readback, because the consumer that reads it (Reshape's shape input, say) says so.
+        // ⚠️ MEASURED why this matters beyond a readback saved: promoting a small DATA tensor makes the
+        // shape interpreter believe it KNOWS the value, so ShapeInterpElideDispatch drops its dispatch -
+        // and under capture/replay that freezes it at its CAPTURE-TIME value. Silero's
+        // adaptive_normalization slices are audio-derived, so the whole frame silently normalised against a
+        // stale frame (0.036 drift by frame 20), and on CUDA the readback's SynchronizeAsync inside a
+        // graph-capture region was an outright access violation. One cause, both failures.
+        "Slice",
         // LSTM earns its place only because the recurrence now runs on the accelerator
         // (Kernels/RecurrentKernels). Before that it read X and h/c back on every call and this entry
         // would have been wrong. It stays correct even on the layout=1 host fallback, because that path

@@ -2,6 +2,9 @@
 //
 //   dotnet run --project tools/vad-harness -c Release -- bench    [frames]
 //   dotnet run --project tools/vad-harness -c Release -- segments
+//   dotnet run --project tools/vad-harness -c Release -- capture           (repro the CUDA capture crash)
+//
+// VAD_BACKEND=cuda|opencl|cpu forces a backend instead of taking the preferred one.
 //
 // WHY: PMT is the gate, but it buffers per-test console output, so a passing run tells you the boundaries
 // were inside tolerance and not what they actually were - and its durations mix model time with harness
@@ -14,6 +17,9 @@ using System.Diagnostics;
 using System.Text.Json;
 using ILGPU;
 using ILGPU.Runtime;
+using ILGPU.Runtime.CPU;
+using ILGPU.Runtime.Cuda;
+using ILGPU.Runtime.OpenCL;
 using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
@@ -32,8 +38,19 @@ if (!File.Exists(modelPath))
 var mlBuilder = MLContext.Create();
 await mlBuilder.AllAcceleratorsAsync();
 using var mlCtx = mlBuilder.ToContext();
-using var accel = await mlCtx.CreatePreferredAcceleratorAsync()
-    ?? throw new InvalidOperationException("no accelerator");
+
+// The preferred accelerator is OpenCL on this box, so a CUDA-specific defect is unreachable without a
+// way to ASK for CUDA. That is not a hypothetical: capture/replay access-violates on CUDA for this graph.
+var want = Environment.GetEnvironmentVariable("VAD_BACKEND")?.Trim().ToLowerInvariant();
+using var accel = want switch
+{
+    // Device-first, the way CudaTests/CPUTests in the demo console do it.
+    "cuda" => mlCtx.GetCudaDevices()[0].CreateCudaAccelerator(mlCtx),
+    "opencl" => mlCtx.GetCLDevices()[0].CreateCLAccelerator(mlCtx),
+    "cpu" => mlCtx.GetCPUDevices()[0].CreateCPUAccelerator(mlCtx),
+    _ => await mlCtx.CreatePreferredAcceleratorAsync()
+         ?? throw new InvalidOperationException("no accelerator"),
+};
 Console.WriteLine($"device   : {accel.AcceleratorType} {accel.Name}");
 
 var modelBytes = File.ReadAllBytes(modelPath);
@@ -42,13 +59,53 @@ return command switch
 {
     "bench" => await Bench(args.Length > 1 ? int.Parse(args[1]) : 200),
     "segments" => await Segments(),
+    "capture" => await Capture(),
     _ => Usage(),
 };
 
 int Usage()
 {
-    Console.WriteLine("commands: bench [frames] | segments");
+    Console.WriteLine("commands: bench [frames] | segments | capture");
+    Console.WriteLine("env:      VAD_BACKEND=cuda|opencl|cpu");
     return 2;
+}
+
+/// Forces graph capture ON for whatever backend was selected, with the per-node capture trace armed.
+///
+/// WHY: capture/replay access-violates on CUDA for this graph (exit=-1073741819). An access violation is
+/// not a catchable exception - the process dies and the managed stack shows only async plumbing - so the
+/// only way to localise it is a trace that is FLUSHED BEFORE each node's work. GraphExecutor.CaptureTraceFile
+/// does exactly that, so after the crash the file's LAST LINE names the node that was executing.
+async Task<int> Capture()
+{
+    var tracePath = Path.Combine(Path.GetTempPath(), "vad-capture-trace.txt");
+    if (File.Exists(tracePath)) File.Delete(tracePath);
+    SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureTraceFile = tracePath;
+    Console.WriteLine($"trace    : {tracePath}");
+    Console.WriteLine($"capture  : FORCED ON for {accel.AcceleratorType}");
+    Console.Out.Flush();
+
+    var wav = Path.Combine(www, "test-audio", "librivox-public-domain.wav");
+    var samples = WavDecoder.DecodeWavFile(File.ReadAllBytes(wav))!;
+
+    using var vad = SileroVad.Create(accel, modelBytes, enableGraphCapture: true);
+    var frame = new float[SileroVad.WindowSize];
+
+    for (int f = 0; f < 8; f++)
+    {
+        Array.Copy(samples, f * SileroVad.WindowSize, frame, 0, frame.Length);
+        Console.WriteLine($"frame {f}: calling ProcessFrameAsync (captured={vad.IsCaptured}) ...");
+        Console.Out.Flush();
+        float p = await vad.ProcessFrameAsync(frame);
+        Console.WriteLine($"frame {f}: prob {p:F6}  captured={vad.IsCaptured} dispatches={vad.DispatchCount}");
+        Console.Out.Flush();
+    }
+
+    SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureTraceFile = null;
+    var lines = File.Exists(tracePath) ? File.ReadAllLines(tracePath) : Array.Empty<string>();
+    Console.WriteLine($"\nSURVIVED. trace has {lines.Length} lines; last 5:");
+    foreach (var l in lines.TakeLast(5)) Console.WriteLine($"  {l}");
+    return 0;
 }
 
 async Task<int> Bench(int frames)

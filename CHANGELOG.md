@@ -2,6 +2,99 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.5 (2026-08-31)
+
+### Performance - the browser VAD now keeps up with a live microphone
+
+Silero VAD on WebGPU, per 512-sample frame. A frame IS 32 ms of audio, so that is the budget:
+
+| stage | WebGPU | vs realtime |
+|---|---|---|
+| 5.2.3 | 177.9 ms | 0.18x |
+| 5.2.4 (GPU recurrence + skip-set + transitive value-need) | 98.7 ms | 0.32x |
+| **5.2.5** | **7.81 ms** | **4.10x** |
+
+**22.8x from 5.2.3, and per-frame host readbacks are now ZERO** (they were 16). Desktop improved too:
+OpenCL 4.99 -> 2.44 ms (13.1x realtime) with p99 47.4 -> 5.88 ms.
+
+Three changes, in the order they mattered:
+
+- **Capture/replay for `SileroVad`** (CUDA and WebGPU; transparent fall-through elsewhere). The graph is identical every frame and every shape is fixed, so the
+  forward is recorded once into a `WebGPUDispatchPlan` and replayed. **98 dispatches now cost 0.12 ms in a
+  single interop crossing**, against 41 ms of per-node .NET->JS encoding before (MEASURED 0.547 ms/node on
+  WebGPU vs 0.032 ms on OpenCL - the gap was never arithmetic).
+  ⚠️ This was tried in 5.2.4 and reverted as "not a drop-in", which was the WRONG diagnosis. Capture
+  records GPU DISPATCHES; while the LSTM computed on the host it contributed nothing to the plan, so replay
+  returned a constant probability (0 utterances) and CUDA access-violated on a host copy inside the capture
+  region. Moving the recurrence to the GPU in 5.2.4 is what made capture possible - the order mattered even
+  though the reasoning about why did not hold up.
+- **The last readbacks removed**, which turned out to be a CORRECTNESS requirement under capture and not
+  only a cost. Promoting a small tensor into `runtimeConstants` makes the shape interpreter believe it
+  knows the value, so `ShapeInterpElideDispatch` drops its dispatch - and under capture that FREEZES it at
+  the capture-time value. Silero's `adaptive_normalization` slices are audio-derived, so every frame
+  normalised against a stale one. The drift was small enough that segmentation still matched sherpa-onnx
+  3/3 at 14 ms; only the frame-by-frame probability comparison caught it (0.036 by frame 20).
+  `ReadbackFeatureOnlyProducers` now includes the verified data movers - `Concat`, `Transpose`, `Squeeze`,
+  `Unsqueeze`, `Reshape` and `Slice` - each confirmed by reading its `Execute`. Slice's small-tensor CPU
+  path falls through correctly to the GPU kernel when no host value is available, so it loses a fast path,
+  not correctness; and where a Slice output really is a shape vector the transitive value-need analysis
+  keeps its readback.
+- **One GPU round trip per frame instead of two.** Reading a single float the obvious way - stage into a
+  scratch buffer, `SynchronizeAsync`, then `CopyToHostAsync` - costs a second full round trip on top of the
+  one the replay already paid. `prob` is now read straight out of the buffer the graph wrote
+  (`CopyToHostAsync` drains itself), and the h/c state copies are queued AFTER it without a fence: they are
+  queue-ordered ahead of the next frame's submit, so correctness comes from queue order rather than a wait.
+  MEASURED 9.57 -> 7.81 ms on WebGPU and 4.25 -> 2.44 ms on OpenCL - improving BOTH is the tell that it was
+  waste rather than a browser-specific trick.
+
+Final split of a 7.81 ms frame: `inputCopy 0.29ms | planCall 0.12ms | sync 4.89ms | unattributed 2.51ms`.
+The `sync` term is the GPU doing the work plus `onSubmittedWorkDone` and is near-irreducible for a
+per-frame fence; going further would mean batching several frames per fence, trading latency for
+throughput, which a 500 ms min-silence endpointer has no reason to do.
+
+`SessionGraphCapture` now surfaces `LastReplaySplit` and `DispatchCount`, because a caller timing a
+replayed frame could otherwise only see the total and had to guess which term dominated - and the terms
+differ in kind.
+
+### Fixed - a per-call device allocation made CUDA graph capture impossible
+
+🔴 **`Conv1DKernel.Forward` allocated a FRESH device params buffer on every call.** `Allocate1D` is a
+`cuMemAlloc`, which is illegal inside a CUDA graph-capture window and faults with an ACCESS VIOLATION
+(0xC0000005) that no `try`/`catch` can observe - the process dies and the managed stack shows only async
+plumbing. So **capture was impossible for ANY graph containing a Conv1D**, and `CudaGraphCapture`'s own
+comments had predicted this exact failure ("a mid-capture cuMemAlloc would AV (0xC0000005, uncatchable)")
+- nothing had tripped it because nothing had yet captured a graph with a Conv1D in it.
+
+Localised with `GraphExecutor.CaptureTraceFile`, which flushes a line BEFORE each node's work so a native
+fault leaves the offending node as the file's last line: the capture pass died at node 13,
+`Conv /feature_extractor/Conv_output_0`, with `cuMemAlloc_v2` atop the native stack.
+
+New `Kernels/ParamBufferCache<T>`: one device buffer per DISTINCT param set, reused for the kernel's life.
+
+⚠️ **A single "last values" slot is NOT enough**, and it fails in a way that looks correct: one kernel
+instance serves every node of its type, and their shapes differ. Silero VAD has EIGHTEEN Conv nodes, so a
+warm pass ends with the last node's params resident and the next pass misses on its FIRST node - which
+under capture is exactly the fatal allocation. Per-set caching means two warm passes make every set
+resident and the capture pass allocates nothing.
+
+⚠️ Reuse is safe where fresh-per-call was defensive: rewriting a params buffer a PENDING dispatch still
+reads would corrupt it (the browser command-batching hazard), but a cache hit performs NO WRITE - the
+values are already resident - so there is nothing to corrupt.
+
+Beyond fixing capture this removes a `cuMemAlloc` + host-to-device copy per Conv1D call on every backend,
+and stops the retired-buffer list growing for the life of the session.
+
+### Known
+
+⚠️ **Six further per-call allocation sites share this pattern and are NOT yet converted**:
+`ColorConversionKernel` (2), `GatedDeltaNetKernel` (1), `MissingElementWiseKernels` (1),
+`TurboQuantKernels` (2). Each blocks CUDA graph capture for any graph containing that kernel, and
+`ColorConversionKernel` sits in the depth pipeline, which does use capture. They are latent rather than
+observed, and each needs its own verification; `ParamBufferCache` is the fix to apply.
+
+⚠️ **WebGL is 53.3 ms / 0.60x realtime** - capture does not apply there, and its per-node cost is
+0.618 ms. Known-slow lane.
+
 ## 5.2.4 (2026-08-31)
 
 ### Fixed

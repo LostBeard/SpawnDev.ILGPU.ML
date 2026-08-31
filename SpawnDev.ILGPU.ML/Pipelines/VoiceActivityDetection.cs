@@ -1,5 +1,6 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Tensors;
 using System;
 using System.Collections.Generic;
@@ -35,6 +36,27 @@ public sealed class SileroVad : IDisposable
 
     private readonly Accelerator _accelerator;
     private readonly InferenceSession _session;
+
+    /// <summary>
+    /// Capture-once / replay-many. Silero is close to the ideal case: the graph is IDENTICAL every frame,
+    /// every shape is fixed, and only three small buffers change contents.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This did NOT work before the recurrence moved onto the GPU, and the reason is worth keeping.
+    /// <c>TryCaptureAsync</c> records GPU DISPATCHES - two warm forwards, then the third captured under a
+    /// dispatch-elide regime. While <c>LSTMOperator</c> computed on the host (reading X/h/c back and
+    /// uploading results with <c>CopyFromCPU</c>) that work could not be recorded at all, so on replay the
+    /// LSTM never ran: WebGPU returned a constant probability and found 0 utterances, and on CUDA a
+    /// synchronous host copy inside a graph-capture region is illegal, which is what the access violation
+    /// was. A host-side operator is invisible to a dispatch plan.
+    /// <para>
+    /// State is safe across the capture: the three internal forwards all read the same <c>h</c>/<c>c</c>
+    /// and <c>RunAsync</c> does not write the caller's input buffers, so nothing advances. The first frame
+    /// simply costs more.
+    /// </para>
+    /// </remarks>
+    private readonly SessionGraphCapture _capture;
+
     private readonly int[] _xShape = { 1, WindowSize };
     private readonly int[] _stateShape = { 2, 1, 64 };
 
@@ -45,7 +67,7 @@ public sealed class SileroVad : IDisposable
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _xBuf;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _hBuf;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _cBuf;
-    private readonly MemoryBuffer1D<float, Stride1D.Dense> _probBuf;
+
 
     /// <remarks>
     /// ⚠️ PERFORMANCE, and the thing to read before optimising this. MEASURED in-browser
@@ -74,19 +96,37 @@ public sealed class SileroVad : IDisposable
     /// The endpointing and flush gates are what caught it.
     /// </para>
     /// </remarks>
-    private SileroVad(Accelerator accelerator, InferenceSession session)
+    private SileroVad(Accelerator accelerator, InferenceSession session, bool? enableGraphCapture = null)
     {
         _accelerator = accelerator;
         _session = session;
+        // Capture is where the browser win comes from: MEASURED 0.547 ms per node on WebGPU against
+        // 0.032 ms on OpenCL, so replaying a recorded plan takes a WebGPU frame from 98.7 ms to ~8 ms.
+        // SessionGraphCapture decides eligibility (CUDA and WebGPU) and falls through everywhere else.
+        //
+        // ⚠️ CUDA capture used to ACCESS-VIOLATE on this graph, and the cause was not in this file:
+        // `Conv1DKernel` allocated a FRESH device params buffer on every call, and a mid-capture
+        // cuMemAlloc is illegal and uncatchable. Localised with GraphExecutor.CaptureTraceFile - the
+        // capture pass died at node 13, the graph's first Conv, with cuMemAlloc_v2 atop the native stack.
+        // Fixed in Kernels/ParamBufferCache; do not re-scope this to WebGPU without re-checking that.
+        _capture = new SessionGraphCapture(session, accelerator)
+        {
+            Enabled = enableGraphCapture ?? true,
+        };
         _xBuf = accelerator.Allocate1D<float>(WindowSize);
         _hBuf = accelerator.Allocate1D<float>(StateCount);
         _cBuf = accelerator.Allocate1D<float>(StateCount);
-        _probBuf = accelerator.Allocate1D<float>(1);
         Reset();
     }
 
     /// <summary>Loads the detector from silero_vad.onnx (643 KB).</summary>
-    public static SileroVad Create(Accelerator accelerator, byte[] modelBytes)
+    /// <param name="enableGraphCapture">
+    /// Overrides the default capture policy. Null (the default) means WebGPU only - see the constructor
+    /// for why. Pass true to force it on a backend it is normally off for; that exists so the CUDA crash
+    /// can be REPRODUCED and root-caused (`tools/vad-harness capture`) rather than only avoided.
+    /// </param>
+    public static SileroVad Create(Accelerator accelerator, byte[] modelBytes,
+        bool? enableGraphCapture = null)
     {
         var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -95,7 +135,7 @@ public sealed class SileroVad : IDisposable
                 ["h"] = new[] { 2, 1, 64 },
                 ["c"] = new[] { 2, 1, 64 },
             });
-        return new SileroVad(accelerator, session);
+        return new SileroVad(accelerator, session, enableGraphCapture);
     }
 
     /// <summary>Clears the recurrent state, so the next frame starts a new stream.</summary>
@@ -137,22 +177,31 @@ public sealed class SileroVad : IDisposable
         // dependency on the browser backends.
         _xBuf.View.CopyFromCPU(frame);
 
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        var outputs = await _capture.RunAsync(new Dictionary<string, Tensor>
         {
             ["x"] = new Tensor(_xBuf.View, _xShape),
             ["h"] = new Tensor(_hBuf.View, _stateShape),
             ["c"] = new Tensor(_cBuf.View, _stateShape),
         });
 
-        // GPU-to-GPU. Native CopyBufferToBuffer on WebGPU - no shader, no dispatch, no host round trip.
+        if (!outputs.TryGetValue("prob", out var probTensor))
+            throw new InvalidOperationException("Silero VAD produced no output named 'prob'.");
+
+        // ⚠️ ORDER MATTERS, and it is worth one full GPU round trip per frame. Read `prob` FIRST, straight
+        // out of the buffer the graph wrote, with no staging copy and no explicit Synchronize -
+        // CopyToHostAsync drains on its own. The obvious version (stage into a scratch buffer, Synchronize,
+        // then read) costs a SECOND round trip on top of the one the replay already paid: MEASURED on
+        // WebGPU as 5.40 ms of a 9.57 ms frame, against a replay whose own sync was 3.60 ms and whose 98
+        // dispatches cost 0.15 ms.
+        var prob = await probTensor.Data.BaseView.SubView(0, 1).CopyToHostAsync();
+
+        // Then thread the state, GPU-to-GPU, and DO NOT wait for it. These are queue-ordered ahead of the
+        // next frame's replay - which copies h/c into the plan's stable inputs and then submits - so
+        // correctness comes from queue order rather than from a fence. Waiting here would buy nothing and
+        // cost another round trip.
         CopyState(outputs, "new_h", _hBuf);
         CopyState(outputs, "new_c", _cBuf);
 
-        if (!outputs.TryGetValue("prob", out var probTensor))
-            throw new InvalidOperationException("Silero VAD produced no output named 'prob'.");
-        _probBuf.View.CopyFrom(probTensor.Data.SubView(0, 1));
-        await _accelerator.SynchronizeAsync();
-        var prob = await _probBuf.CopyToHostAsync<float>(0, 1);
         return prob[0];
     }
 
@@ -167,13 +216,22 @@ public sealed class SileroVad : IDisposable
         into.View.CopyFrom(t.Data.SubView(0, StateCount));
     }
 
+    /// <summary>True once a dispatch plan is live and frames are replaying rather than being walked.</summary>
+    public bool IsCaptured => _capture.IsCaptured;
+
+    /// <summary>The replay's own split of the last frame, when a WebGPU plan is live. Diagnostic.</summary>
+    public (double InputCopyMs, double PlanCallMs, double SyncMs)? LastReplaySplit => _capture.LastReplaySplit;
+
+    /// <summary>GPU dispatches the captured plan replays per frame. 0 when walking the graph normally.</summary>
+    public int DispatchCount => _capture.DispatchCount;
+
     public void Dispose()
     {
+        _capture.Dispose();
         _session.Dispose();
         _xBuf.Dispose();
         _hBuf.Dispose();
         _cBuf.Dispose();
-        _probBuf.Dispose();
     }
 }
 

@@ -37,6 +37,22 @@ public sealed class SessionGraphCapture : IDisposable
     public bool IsCaptured => _cuda != null || _webGpu != null;
 
     /// <summary>
+    /// The WebGPU replay's own split of the last frame - input copies, the single plan crossing, and the
+    /// wait for GPU completion. Null on CUDA or before a capture is live.
+    /// </summary>
+    /// <remarks>
+    /// Surfaced because without it a caller measuring a replayed frame can only see the total and has to
+    /// GUESS which term dominates - and the terms are wildly different in kind: the plan call is one
+    /// interop crossing, while the sync is a round trip through the JS event loop.
+    /// </remarks>
+    public (double InputCopyMs, double PlanCallMs, double SyncMs)? LastReplaySplit
+        => _webGpu == null ? null
+         : (_webGpu.LastInputCopyMs, _webGpu.LastPlanCallMs, _webGpu.LastSyncMs);
+
+    /// <summary>Number of GPU dispatches the captured WebGPU plan replays. 0 when no plan is live.</summary>
+    public int DispatchCount => _webGpu?.DispatchCount ?? 0;
+
+    /// <summary>
     /// Run the session: first eligible call captures (paying a few warm forwards), subsequent calls
     /// replay. Input tensor shapes must match the captured shapes exactly.
     /// </summary>

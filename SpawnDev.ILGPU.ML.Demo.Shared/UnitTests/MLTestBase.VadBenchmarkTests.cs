@@ -111,6 +111,45 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[Benchmark] Silero VAD [{accelerator.AcceleratorType}] readback owners: "
                         + (names.Count == 0 ? "(none recorded)" : string.Join(", ", names)));
 
+        // When a dispatch plan is live, the frame is no longer a graph walk and the per-node numbers below
+        // describe nothing. What matters instead is the replay's own split, because its terms differ in
+        // KIND: the plan call is a single interop crossing, while the sync is a round trip through the JS
+        // event loop - and only one of those is ours to shrink.
+        if (vad.IsCaptured && vad.LastReplaySplit is { } split)
+        {
+            Console.WriteLine($"[Benchmark] Silero VAD [{accelerator.AcceleratorType}] REPLAYING "
+                            + $"{vad.DispatchCount} dispatches | inputCopy {split.InputCopyMs:F2}ms  "
+                            + $"planCall {split.PlanCallMs:F2}ms  sync {split.SyncMs:F2}ms  "
+                            + $"| unattributed {Math.Max(0, mean - split.InputCopyMs - split.PlanCallMs - split.SyncMs):F2}ms "
+                            + $"of the {mean:F2}ms mean (state copies + the prob readback)");
+        }
+
+        // Where the NON-readback time goes, aggregated by op type. Silero is 125 nodes of trivial
+        // arithmetic (about 64K multiply-adds all told), so if the frame is dominated by per-node cost
+        // rather than by a few heavy nodes, the lever is orchestration - one dispatch plan replayed -
+        // rather than any individual kernel. Opt-in and off unless this block runs.
+        var timings = new System.Collections.Generic.Dictionary<string, double>();
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = timings;
+        try
+        {
+            Array.Copy(samples, 0, frame, 0, frame.Length);
+            await vad.ProcessFrameAsync(frame);
+        }
+        finally { SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = null; }
+
+        double timedTotal = timings.Values.Sum();
+        var byOp = timings
+            .GroupBy(kv => kv.Key.Split('_')[1])
+            .Select(g => (Op: g.Key, Ms: g.Sum(x => x.Value), N: g.Count()))
+            .OrderByDescending(x => x.Ms).Take(8);
+        Console.WriteLine($"[Benchmark] Silero VAD [{accelerator.AcceleratorType}] per-node total "
+                        + $"{timedTotal:F2}ms over {timings.Count} nodes "
+                        + $"(mean {(timings.Count > 0 ? timedTotal / timings.Count : 0):F3}ms/node) | by op: "
+                        + string.Join(", ", byOp.Select(x => $"{x.Op} {x.Ms:F2}ms x{x.N}")));
+        var top = timings.OrderByDescending(kv => kv.Value).Take(5);
+        Console.WriteLine($"[Benchmark] Silero VAD [{accelerator.AcceleratorType}] slowest nodes: "
+                        + string.Join(", ", top.Select(kv => $"{kv.Key}={kv.Value:F2}ms")));
+
         // The only hard failure: so slow the detector could not be used for anything, live or offline.
         // Anything short of that is reported and left to judgement, because this shares a machine.
         if (mean > VadFrameAudioMs * 20)
