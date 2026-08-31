@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    An INDEPENDENT Silero VAD, for checking ours against.
+
+    It deliberately does NOT reference SpawnDev.ILGPU.ML. The value of an oracle is that it shares no code
+    with the thing it grades: sherpa-onnx is a separate C++ implementation of the same endpointing, and it
+    is the one RoseEars already runs on the robot, so agreeing with it means our port matches the behaviour
+    that has been in front of a real user. A reference I wrote myself from the same reading of the same
+    upstream source would agree with my own misreadings.
+
+    Keeping it out of the solution's project graph also means it can be built while a PMT sweep is running.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>VadOracle</AssemblyName>
+    <RootNamespace>VadOracle</RootNamespace>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="org.k2fsa.sherpa.onnx" Version="1.13.4" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-x64" Version="1.13.4" />
+  </ItemGroup>
+
+</Project>

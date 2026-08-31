@@ -1,0 +1,35 @@
+{
+  "source": "sherpa-onnx 1.13.4 (org.k2fsa.sherpa.onnx)",
+  "model": "silero_vad.onnx",
+  "audio": "vad_three_utterances.wav",
+  "sample_rate": 16000,
+  "window": 512,
+  "threshold": 0.5,
+  "min_silence_seconds": 0.5,
+  "min_speech_seconds": 0.25,
+  "max_speech_seconds": 20,
+  "total_samples": 185600,
+  "segments": [
+    {
+      "start_sample": 14944,
+      "end_sample": 50880,
+      "start_seconds": 0.934,
+      "duration_seconds": 2.246,
+      "samples": 35936
+    },
+    {
+      "start_sample": 66656,
+      "end_sample": 94912,
+      "start_seconds": 4.166,
+      "duration_seconds": 1.766,
+      "samples": 28256
+    },
+    {
+      "start_sample": 112224,
+      "end_sample": 165056,
+      "start_seconds": 7.014,
+      "duration_seconds": 3.302,
+      "samples": 52832
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>VadHarness</AssemblyName>
+    <!-- SpawnJS is browser-annotated; this harness only touches the desktop paths of ILGPU.ML. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The REAL library. PMT is the gate; this is the instrument you reach for when the gate says a
+         number is wrong, or slow, but not what the engine did. -->
+    <ProjectReference Include="..\..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+  </ItemGroup>
+</Project>
