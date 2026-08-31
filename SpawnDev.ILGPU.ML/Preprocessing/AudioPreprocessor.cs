@@ -34,9 +34,12 @@ public static partial class AudioPreprocessor
     /// there. The result is not obviously broken audio; it is audio whose formants have been polluted, so
     /// Whisper returns fluent, confident, completely unrelated text.
     /// <para>
-    /// It stayed invisible because the only audio the tests fed it was ALREADY 16 kHz, where
-    /// <c>srcRate == dstRate</c> returns early and no resampling happens at all. The file path was correct
-    /// and the microphone path was garbage, from one line neither test covered.
+    /// ⚠️ It stayed invisible even though a test DID exercise this method.
+    /// <c>AudioPreprocessor_Resample_Frequency</c> called <c>Resample(samples, 44100, 16000)</c> and
+    /// asserted the output LENGTH (within one sample) and that values sit in [-1.1, 1.1]. Aliasing
+    /// violates neither. Its input was a 440 Hz tone, far below the 8 kHz destination Nyquist, so there
+    /// was nothing in it to alias - the test ran the real conversion and COULD NOT FAIL. Test a rate
+    /// conversion with content ABOVE the destination Nyquist, or it proves nothing about band-limiting.
     /// </para>
     /// <para>
     /// The kernel cutoff is <c>min(1, dstRate/srcRate)</c> in units of the source Nyquist: 1.0 when

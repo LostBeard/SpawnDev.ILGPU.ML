@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased
+## 5.2.3 (2026-08-30)
 
 ### Fixed
 
@@ -15,9 +15,12 @@ Notable changes per release. Pre-stable; API will change between preview drops.
   answered microphone audio with fluent, confident, entirely unrelated text.
   Now a windowed-sinc (Blackman, 8 lobes) kernel whose cutoff is the decimation ratio, normalised per
   output sample so partial windows at the edges do not step the gain.
-  ⚠️ **Why no test caught it:** every audio fixture in the repo was already 16 kHz, so
-  `if (srcRate == dstRate) return samples;` was taken in every test and the resampling body had never
-  executed. Gated now by `MLTestBase.ResamplerTests` (5 tests, all six backends), whose key assertion is
+  ⚠️ **Why no test caught it, and it is not the obvious reason:** a test DID exercise this method.
+  `AudioPreprocessor_Resample_Frequency` called `Resample(samples, 44100, 16000)` and asserted the output
+  LENGTH (within one sample) and that values sit in [-1.1, 1.1]. Aliasing violates neither. Its input was
+  a 440 Hz tone, far below the 8 kHz destination Nyquist, so there was nothing in it to alias - the test
+  ran the real conversion and COULD NOT FAIL. Having a test for a function is not coverage of what the
+  function must get right. Gated now by `MLTestBase.ResamplerTests` (5 tests, all six backends), whose key assertion is
   that a 10 kHz tone must be REMOVED by a 48k -> 16k conversion, not aliased down - it fails loudly on the
   old implementation. A passband test guards the opposite error.
 - **Microphone capture no longer drops audio under load.** `MediaStreamTrackProcessor` was created with the

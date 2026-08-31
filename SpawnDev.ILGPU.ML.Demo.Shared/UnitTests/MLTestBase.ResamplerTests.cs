@@ -18,9 +18,13 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </para>
 ///
 /// <para>
-/// It was invisible because every existing audio test fed audio that was ALREADY 16 kHz, where
-/// <c>srcRate == dstRate</c> returns early and no resampling runs. The file path was correct and the
-/// microphone path was garbage, from a line no test exercised. THE RATE CONVERSION ITSELF NEEDED A TEST.
+/// ⚠️ It was invisible even though a test already exercised the method.
+/// <c>AudioPreprocessor_Resample_Frequency</c> calls <c>Resample(samples, 44100, 16000)</c> and asserts
+/// the output LENGTH (within one sample) and that values sit in [-1.1, 1.1]. Aliasing violates neither.
+/// Its input is a 440 Hz tone, far below the 8 kHz destination Nyquist, so there is nothing in it to
+/// alias - it runs the real conversion and CANNOT FAIL. Having a test for a function is not coverage of
+/// what the function must get right: a rate conversion has to be fed content ABOVE the destination
+/// Nyquist before "does it band-limit" is even asked.
 /// </para>
 ///
 /// <para>
@@ -143,9 +147,9 @@ public abstract partial class MLTestBase
     ///
     /// <para>
     /// Without this, every resampler test above would take the table path and the fallback would never
-    /// execute - the same way every audio fixture being 16 kHz meant the resampling body itself never ran.
-    /// The invariant asserted is the physical one, not "both branches agree": 10 kHz cannot exist below an
-    /// 8 kHz Nyquist either way.
+    /// execute - the same shape as the original bug, where the one pre-existing test drove the method with
+    /// a 440 Hz tone that had nothing to alias. The invariant asserted is the physical one, not "both
+    /// branches agree": 10 kHz cannot exist below an 8 kHz Nyquist either way.
     /// </para>
     /// </summary>
     [TestMethod(Timeout = 120000)]
