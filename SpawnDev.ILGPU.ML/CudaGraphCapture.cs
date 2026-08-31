@@ -149,6 +149,47 @@ public sealed class CudaGraphCapture : IDisposable
                     capStream.Dispose();
                     return null;
                 }
+                // ⚠️ WARM UNTIL NOTHING NEW REGISTERS, then quiesce ILGPU's collector.
+                //
+                // ILGPU runs a BACKGROUND GC THREAD (Accelerator.GC.cs): it waits on a monitor and, when
+                // pulsed, disposes collected child objects and evicts cached kernels - i.e. it calls
+                // cuModuleUnload FROM ANOTHER THREAD AT AN ARBITRARY MOMENT. The pulse comes from
+                // RegisterChildObject, every Nth registration.
+                //
+                // CUDA forbids driver work on a capturing stream, so that thread firing inside the capture
+                // window is fatal and uncatchable: 0xC0000005 in cuModuleUnload (measured, on ZipVoice's
+                // decoder). It is also why capture works at all for the graphs that already use it - a
+                // fully warm forward registers nothing, so the collector never wakes.
+                //
+                // Two warm passes are not enough when a graph has CONTROL FLOW: a branch body builds its
+                // own executor and kernels the first time that branch is taken, so a body first entered on
+                // the capture pass registers objects exactly where it must not. Warming to a FIXED POINT -
+                // repeat until the child-object count stops moving - is what makes "no registrations during
+                // capture" provable rather than hoped for.
+                //
+                // The GC.Collect + WaitForPendingFinalizers then leaves nothing dead for the collector to
+                // find even if it does wake: a pulse it cannot act on is harmless.
+                int prevChildren = -1;
+                for (int warm = 0; warm < 6 && acc.NumberChildObjects != prevChildren; warm++)
+                {
+                    prevChildren = acc.NumberChildObjects;
+                    await session.RunAsync(inputs);
+                    await acc.SynchronizeAsync();
+                }
+                if (acc.NumberChildObjects != prevChildren)
+                {
+                    Console.WriteLine($"[CudaGraphCapture] accelerator objects still growing after 6 warm "
+                        + $"passes ({prevChildren} -> {acc.NumberChildObjects}); a registration inside the "
+                        + "capture window would unload a module on ILGPU's GC thread and take the process "
+                        + "down. Running direct forward.");
+                    capStream.Dispose();
+                    return null;
+                }
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                await acc.SynchronizeAsync();
+
                 // Capture: record the forward. Drains suppressed → no periodic drain / final sync / buffer-return
                 // aborts the capture; the seeded runtimeConstants keep eliding identical to warm.
                 GraphExecutor.SuppressDrains = true;
