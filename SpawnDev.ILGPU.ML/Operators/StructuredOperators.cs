@@ -1119,10 +1119,28 @@ public class ScatterNDOperator(OperatorRegistry reg) : IOnnxOperator
         var idxFloats = ctx.TryGetInputValues(1);
         if (idxFloats == null)
         {
-            // MEASURED 2026-08-30: this does NOT fire for ZipVoice's text encoder - its ScatterND indices
-            // are constant-folded, so the real path runs. It remains a silently wrong answer for any graph
-            // that computes them at runtime (the updates are simply discarded), so it still needs a GPU
-            // scatter; it is just not the encoder's divergence.
+            // ⚠️ This used to "fall back to identity", in its own words - the updates were DISCARDED and
+            // the output was just a copy of data. Runtime indices are the normal case, so that was the
+            // only path a real model took.
+            if (!string.Equals(reduction, "none", StringComparison.OrdinalIgnoreCase))
+                throw new NotSupportedException(
+                    $"ScatterND reduction='{reduction}' needs atomics and is not implemented.");
+
+            var ndShape = data.Shape;
+            var ndIdxShape = indices.Shape;
+            int ndDepth = ndIdxShape.Length > 0 ? ndIdxShape[^1] : 0;
+            if (ndDepth <= 0 || ndDepth > ndShape.Length || ndDepth > Kernels.ScatterKernel.MaxRank)
+                throw new NotSupportedException(
+                    $"ScatterND index depth {ndDepth} is not usable against a rank-{ndShape.Length} tensor.");
+
+            int ndUpdates = 1;
+            for (int i = 0; i < ndIdxShape.Length - 1; i++) ndUpdates *= ndIdxShape[i];
+            int ndSlice = 1;
+            for (int i = ndDepth; i < ndShape.Length; i++) ndSlice *= ndShape[i];
+
+            if (ndUpdates > 0 && ndSlice > 0)
+                reg.Scatter.ScatterND(indices.Data, updates.Data, output.Data,
+                    ndShape, ndDepth, ndUpdates, ndSlice, output.ElementCount);
             return;
         }
 
@@ -2346,7 +2364,32 @@ public class ScatterElementsOperator(OperatorRegistry reg) : IOnnxOperator
         // Copy data to output first
         reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, total, 1f);
 
-        if (dataVals == null || idxVals == null || updateVals == null) return;
+        if (dataVals == null || idxVals == null || updateVals == null)
+        {
+            // ⚠️ This used to `return` here, leaving the copied data and DISCARDING every update - a
+            // correctly shaped, plausible tensor that is simply wrong. TryGetInputValues only ever returns
+            // compile-time constants, and a real model computes its indices and updates at runtime, so
+            // that was the ONLY path ever taken. Scatter on the GPU instead; the output already holds the
+            // data copy, so the kernel writes just the updated positions.
+            int scatterAxis = ctx.GetInt("axis", 0);
+            var dShape = ctx.Inputs[0].Shape;
+            if (scatterAxis < 0) scatterAxis += dShape.Length;
+
+            string reduction = ctx.GetString("reduction", "none");
+            if (!string.Equals(reduction, "none", StringComparison.OrdinalIgnoreCase))
+                throw new NotSupportedException(
+                    $"ScatterElements reduction='{reduction}' needs atomics and is not implemented. "
+                    + "Silently applying 'none' would produce a wrong answer that looks right.");
+
+            if (dShape.Length > Kernels.ScatterKernel.MaxRank)
+                throw new NotSupportedException(
+                    $"ScatterElements rank {dShape.Length} exceeds the packed-parameter limit of "
+                    + $"{Kernels.ScatterKernel.MaxRank}.");
+
+            reg.Scatter.ScatterElements(ctx.Inputs[1].Data, ctx.Inputs[2].Data, ctx.Outputs[0].Data,
+                ctx.Inputs[1].Shape, dShape, scatterAxis, ctx.Outputs[0].ElementCount);
+            return;
+        }
 
         int axis = ctx.GetInt("axis", 0);
         var shape = ctx.Inputs[0].Shape;

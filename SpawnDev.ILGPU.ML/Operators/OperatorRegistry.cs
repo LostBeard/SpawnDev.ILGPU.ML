@@ -75,6 +75,9 @@ public class OperatorRegistry : IDisposable
     public NormalizationKernels Normalization { get; }
     public TransposeKernel Transpose { get; }
     public GatherKernel Gather { get; }
+
+    /// <summary>GPU scatter for ScatterElements / ScatterND (both were no-ops before it existed).</summary>
+    public ScatterKernel Scatter { get; }
     public PadKernel Pad { get; }
     public ConvTranspose2DKernel ConvTranspose { get; }
     public Kernels.FusedDequantMatMul FusedDequant { get; }
@@ -123,6 +126,7 @@ public class OperatorRegistry : IDisposable
         Normalization = new NormalizationKernels(accelerator);
         Transpose = new TransposeKernel(accelerator);
         Gather = new GatherKernel(accelerator);
+        Scatter = new ScatterKernel(accelerator);
         Pad = new PadKernel(accelerator);
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
@@ -416,6 +420,7 @@ public class OperatorRegistry : IDisposable
         try { (Normalization as IDisposable)?.Dispose(); } catch { }
         try { (Transpose as IDisposable)?.Dispose(); } catch { }
         try { (Gather as IDisposable)?.Dispose(); } catch { }
+        try { (Scatter as IDisposable)?.Dispose(); } catch { }
         try { (Pad as IDisposable)?.Dispose(); } catch { }
         try { (ConvTranspose as IDisposable)?.Dispose(); } catch { }
         try { (FusedDequant as IDisposable)?.Dispose(); } catch { }
