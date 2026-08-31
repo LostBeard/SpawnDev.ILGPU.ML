@@ -74,7 +74,9 @@ public sealed class CudaGraphCapture : IDisposable
         // per-call allocation from every control-flow graph as well as unblocking capture - but a guard
         // that turns a process crash into a graceful fallback should not wait on that work.
         var controlFlow = new[] { "If", "Loop", "Scan" };
-        var present = session.OperatorTypes.Where(o => controlFlow.Contains(o)).ToArray();
+        var present = Graph.SessionGraphCapture.RefuseControlFlow
+            ? session.OperatorTypes.Where(o => controlFlow.Contains(o)).ToArray()
+            : Array.Empty<string>();
         if (present.Length > 0)
         {
             Console.WriteLine($"[CudaGraphCapture] graph contains control flow ({string.Join(", ", present)}), "

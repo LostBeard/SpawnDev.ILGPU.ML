@@ -205,6 +205,13 @@ int Synth(string fixturePath, string? outPath)
         // ZIPVOICE_NO_CAPTURE=1 forces the plain forward. Needed as the CONTROL: a capture that froze an
         // elided dispatch still renders confident, plausible audio, so the only way to detect it is to
         // render both ways and compare samples.
+        // ZIPVOICE_CF_CAPTURE=1 lifts the control-flow refusal. Deliberately opt-in: if the body still
+        // allocates during capture, CUDA segfaults and WebGPU hangs the DISPLAY DRIVER.
+        if (Environment.GetEnvironmentVariable("ZIPVOICE_CF_CAPTURE") == "1")
+        {
+            SpawnDev.ILGPU.ML.Graph.SessionGraphCapture.RefuseControlFlow = false;
+            Console.WriteLine("capture  : control-flow refusal LIFTED (ZIPVOICE_CF_CAPTURE=1)");
+        }
         if (Environment.GetEnvironmentVariable("ZIPVOICE_NO_CAPTURE") == "1")
             ((IlgpuZipVoiceGraphs)graphs).EnableGraphCapture = false;
         // Print the accelerator TYPE, not just the device name. "NVIDIA GeForce RTX 4070" is the same

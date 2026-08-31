@@ -27,6 +27,22 @@ public sealed class SessionGraphCapture : IDisposable
     /// <summary>False disables capture entirely (plain RunAsync) - the per-pipeline opt-out.</summary>
     public bool Enabled { get; set; } = true;
 
+    /// <summary>
+    /// Refuse to capture graphs containing If/Loop/Scan. Default true.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ The reason to keep this ON is that the failure it prevents is UNRECOVERABLE, not merely wrong:
+    /// a device allocation inside a capture window is an uncatchable 0xC0000005 on CUDA and a HUNG DEVICE
+    /// on WebGPU (DXGI_ERROR_DEVICE_HUNG - a TDR that resets the display driver, which is felt outside the
+    /// process). No try/catch reaches either.
+    ///
+    /// It became liftable once SubgraphRunner started caching its compiled plans, because the allocation
+    /// it guards against now happens on the FIRST execution - during capture's warm passes - instead of
+    /// every execution. Verify per graph before trusting it: a body that allocates for some other reason
+    /// still bites exactly as hard.
+    /// </remarks>
+    public static bool RefuseControlFlow { get; set; } = true;
+
     public SessionGraphCapture(InferenceSession session, Accelerator accelerator)
     {
         _session = session;
@@ -88,7 +104,7 @@ public sealed class SessionGraphCapture : IDisposable
             // I first put this guard in CudaGraphCapture alone. That fixed CUDA and left WebGPU - the one
             // backend this project actually ships to - hanging the device instead. The eligibility decision
             // is made in this class, so the guard belongs in this class.
-            if (_session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
+            if (RefuseControlFlow && _session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
             {
                 var cf = string.Join(", ", _session.OperatorTypes.Where(o => o is "If" or "Loop" or "Scan"));
                 Console.WriteLine($"[SessionGraphCapture] graph contains control flow ({cf}), whose subgraph "

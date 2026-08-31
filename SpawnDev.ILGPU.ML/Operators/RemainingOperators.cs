@@ -992,9 +992,9 @@ internal static class SubgraphRunner
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs)
     {
-        var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var weights);
-        if (executor == null) return null;
-        return MergeDeclaredOutputs(subgraph, executor.Run(subgraphInputs), weights);
+        var plan = GetOrBuildPlan(ctx, subgraph, subgraphInputs);
+        if (plan == null) return null;
+        return MergeDeclaredOutputs(subgraph, plan.Executor.Run(subgraphInputs), plan.Constants);
     }
 
     /// <summary>
@@ -1031,9 +1031,12 @@ internal static class SubgraphRunner
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs)
     {
-        var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var weights);
-        if (executor == null) return null;
-        return MergeDeclaredOutputs(subgraph, await executor.RunAsync(subgraphInputs), weights);
+        // ⚠️ The SAME cached plan as the sync path. This is the entry point the control-flow operators
+        // actually use (IfOperator.ExecuteAsync -> here), so caching only the sync path left every real
+        // execution rebuilding - and the crash it was meant to prevent still fired, from this line.
+        var plan = GetOrBuildPlan(ctx, subgraph, subgraphInputs);
+        if (plan == null) return null;
+        return MergeDeclaredOutputs(subgraph, await plan.Executor.RunAsync(subgraphInputs), plan.Constants);
     }
 
     /// <summary>
@@ -1041,6 +1044,59 @@ internal static class SubgraphRunner
     /// the weight map (subgraph initializers + outer-scope tensors), and returns a ready
     /// GraphExecutor. Returns null when there is no registry. Pure setup — no execution.
     /// </summary>
+    /// <summary>
+    /// The compiled plan for this subgraph at these input shapes - built once, reused after.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ <c>BuildExecutor</c> used to run on EVERY execution, and it is not cheap: it converts the graph
+    /// to IR, runs the full <see cref="Graph.GraphCompiler"/>, and calls <c>Pool.AllocatePermanent</c> for
+    /// every initializer and Constant table. ZipVoice's If branch is a single Constant holding a
+    /// <c>[1999, 48]</c> positional table - 384 KB allocated PERMANENTLY, per call, never freed.
+    /// </para>
+    /// <para>
+    /// ⚠️ It also made control flow UNCAPTURABLE, which is the expensive part. A device allocation inside a
+    /// capture window is unrecoverable - an uncatchable 0xC0000005 on CUDA, a hung device on WebGPU - so
+    /// <see cref="Graph.SessionGraphCapture"/> has to refuse any graph containing If/Loop/Scan. In the
+    /// browser that refusal costs about 20x: ZipVoice's decoder spends ~4.5 ms per node on interop
+    /// crossings that a replayed plan does in microseconds (measured: 0 readbacks, 575 ms of syncs, and
+    /// 38.7 s across ~8,520 node executions).
+    /// </para>
+    /// <para>
+    /// ⚠️ The executor's <c>_weights</c> OVERRIDE the tensors passed to <c>Run</c> - weights are registered
+    /// after inputs. The old per-call build merged this call's outer-scope tensors into weights, which was
+    /// correct only because the executor was thrown away afterwards. A cached executor carrying them would
+    /// let the FIRST call's outer-scope tensors shadow every later call's inputs forever, silently. So the
+    /// plan keeps ONLY constants, and outer-scope tensors reach the body through <c>Run</c> alone - where
+    /// they are registered, ref-counted as external, and never released.
+    /// </para>
+    /// </remarks>
+    private static OperatorRegistry.SubgraphPlan? GetOrBuildPlan(
+        OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph, Dictionary<string, Tensor> subgraphInputs)
+    {
+        if (ctx.Registry == null) return null;
+
+        // A GraphExecutor is shape-specialised, so the shapes are part of the identity.
+        var sig = string.Join("|", subgraphInputs.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => $"{kv.Key}:{string.Join(",", kv.Value.Shape)}"));
+
+        if (ctx.Registry.SubgraphPlans.TryGetValue(sig, out var bucket))
+            foreach (var candidate in bucket)
+                if (ReferenceEquals(candidate.Subgraph, subgraph))
+                    return candidate;
+
+        var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var constants);
+        if (executor == null) return null;
+
+        var plan = new OperatorRegistry.SubgraphPlan
+        {
+            Subgraph = subgraph, Executor = executor, Constants = constants,
+        };
+        if (bucket == null) ctx.Registry.SubgraphPlans[sig] = bucket = new List<OperatorRegistry.SubgraphPlan>();
+        bucket.Add(plan);
+        return plan;
+    }
+
     private static Graph.GraphExecutor? BuildExecutor(
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs,
@@ -1087,12 +1143,11 @@ internal static class SubgraphRunner
             weights[cn.Outputs[0]] = ctx.Pool.AllocatePermanent(cfloats, cshape, cn.Outputs[0]);
         }
 
-        // Merge outer scope tensors as weights (subgraphs reference parent graph tensors)
-        foreach (var (name, tensor) in subgraphInputs)
-        {
-            if (!weights.ContainsKey(name))
-                weights[name] = tensor;
-        }
+        // ⚠️ Outer-scope tensors are deliberately NOT merged in here any more. They reach the body through
+        // Run(subgraphInputs), which registers them and ref-counts them as external ("never release") -
+        // so nothing is lost - and keeping them OUT of weights is what makes this executor reusable.
+        // Weights override Run's inputs (registered after them), so a cached executor holding call 1's
+        // outer-scope tensors would shadow every later call's inputs, forever, without an error.
 
         weightsOut = weights;
         return new Graph.GraphExecutor(

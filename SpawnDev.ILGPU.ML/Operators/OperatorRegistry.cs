@@ -401,8 +401,49 @@ public class OperatorRegistry : IDisposable
         Register(new AddRMSNormOperator(this));
     }
 
+    /// <summary>
+    /// Compiled subgraph plans for control-flow bodies (If/Loop/Scan), reused across executions.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ Lives on the REGISTRY, which is per-session, so these die with the session that made them. A
+    /// static cache would outlive the accelerator and hand a disposed device's buffers to the next one.
+    /// </para>
+    /// <para>
+    /// Keyed by input-shape signature, and each entry also holds the subgraph REFERENCE so a lookup can
+    /// confirm identity rather than trust a hash. Two different subgraphs with the same input shapes are
+    /// ordinary; silently running one in place of the other would not be.
+    /// </para>
+    /// </remarks>
+    internal readonly Dictionary<string, List<SubgraphPlan>> SubgraphPlans = new();
+
+    /// <summary>One compiled control-flow body: its executor and the constants it owns.</summary>
+    internal sealed class SubgraphPlan : IDisposable
+    {
+        public object Subgraph = null!;
+        public Graph.GraphExecutor Executor = null!;
+        /// <summary>Initializers and Constant-node tables, allocated ONCE instead of per execution.</summary>
+        public Dictionary<string, Tensors.Tensor> Constants = null!;
+        // See OperatorRegistry.Dispose: these are dropped rather than disposed, because a GraphExecutor
+        // unloads kernel modules that the registry's own kernels share.
+        public void Dispose() { }
+    }
+
     public void Dispose()
     {
+        // ⚠️ Cached subgraph executors are dropped, NOT disposed, and that is deliberate.
+        //
+        // GraphExecutor.Dispose tears down its ElementWise/Normalization/PrecisionAware kernels, and ILGPU
+        // caches compiled kernels per ACCELERATOR - so unloading a module here pulls it out from under the
+        // registry's own kernels, which are disposed a few lines below. MEASURED: 0xC0000005 inside
+        // cuModuleUnload during teardown.
+        //
+        // Nothing regresses by not disposing them: before the plan cache existed, a control-flow body built
+        // a BRAND NEW executor on every execution and disposed none of them. One executor per (subgraph,
+        // input shape) is strictly less than one per call. Making these individually disposable is a real
+        // improvement, but it is a change to kernel OWNERSHIP and belongs with that work, not smuggled in
+        // behind a caching fix.
+        SubgraphPlans.Clear();
         // Dispose operator instances that hold GPU param buffers.
         foreach (var op in _ops.Values)
             if (op is IDisposable d) try { d.Dispose(); } catch { }
