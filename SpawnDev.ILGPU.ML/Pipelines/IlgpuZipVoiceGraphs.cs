@@ -51,6 +51,31 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             InferenceSession.CreateFromFile(accelerator, vocoderOnnx),
             accelerator);
 
+    /// <summary>
+    /// Run one of the three graphs, naming WHICH one - and with what input shapes - if it throws.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Without this, a shape error inside any of the three surfaces only as the failing operator
+    /// ("Shapes [106,432] and [106,432,1] are not broadcastable"), with nothing to say whether the encoder,
+    /// the decoder or the vocoder produced it. Three graphs deep, that is the difference between a bug
+    /// report you can act on and one you have to re-derive by bisection.
+    /// </remarks>
+    private static async Task<Dictionary<string, Tensor>> RunStageAsync(
+        InferenceSession session, string stage, Dictionary<string, Tensor> inputs)
+    {
+        try
+        {
+            return await session.RunAsync(inputs);
+        }
+        catch (Exception ex)
+        {
+            var shapes = string.Join(", ", inputs.Select(kv =>
+                $"{kv.Key}[{string.Join(",", kv.Value.Shape)}]"));
+            throw new InvalidOperationException(
+                $"ZipVoice {stage} graph failed with inputs {shapes}: {ex.Message}", ex);
+        }
+    }
+
     public async Task<ZipVoiceEncoding> RunEncoderAsync(
         long[] tokens, long[] promptTokens, long promptFeatureFrames, float speed)
     {
@@ -69,7 +94,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             ["speed"] = new Tensor(speedBuffer.View, Array.Empty<int>()),
         };
 
-        var outputs = await _encoder.RunAsync(Rename(inputs, _encoder));
+        var outputs = await RunStageAsync(_encoder, "ENCODER", Rename(inputs, _encoder));
         var condition = outputs[_encoder.OutputNames[0]];
 
         // [1, frames, features] - the frame count is the encoder's duration prediction, and everything
@@ -100,7 +125,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             ["guidance_scale"] = new Tensor(guidanceBuffer.View, Array.Empty<int>()),
         };
 
-        var outputs = await _decoder.RunAsync(Rename(inputs, _decoder));
+        var outputs = await RunStageAsync(_decoder, "DECODER", Rename(inputs, _decoder));
         return await ReadAsync(outputs[_decoder.OutputNames[0]]);
     }
 
@@ -112,7 +137,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             ["mels"] = new Tensor(melBuffer.View, new[] { 1, channels, frames }),
         };
 
-        var outputs = await _vocoder.RunAsync(Rename(inputs, _vocoder));
+        var outputs = await RunStageAsync(_vocoder, "VOCODER", Rename(inputs, _vocoder));
 
         // Three outputs, and their ORDER is not something to assume - "mag" is the magnitude and "x"/"y"
         // are the cosine and sine of the phase, so picking them by name is the only safe read.

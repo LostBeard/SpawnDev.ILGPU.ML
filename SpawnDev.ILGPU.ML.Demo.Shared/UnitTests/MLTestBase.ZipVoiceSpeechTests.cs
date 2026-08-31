@@ -109,7 +109,11 @@ public abstract partial class MLTestBase
     /// </remarks>
     private const string LibrivoxTranscript = "All LibriVox recordings are in the public domain.";
 
-    [TestMethod(Timeout = 1800000, Category = "HeavyModel")]
+    // "WasmHeavy" as well as "HeavyModel": this drives ~185 MB of models through a full TTS pipeline, which
+    // is exactly the shape the Wasm lane's interpreted-IL budget exists to keep out - it PASSES on every
+    // other backend and would only ever be a timeout there. Run it deliberately with
+    // PMT_EXCLUDE_CATEGORIES_WASM= plus a name filter.
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel,WasmHeavy")]
     public async Task Pipeline_ZipVoice_SpeaksInTheBrowser() => await RunTest(async accelerator =>
     {
         var assets = GetHttpClient();
@@ -187,5 +191,16 @@ public abstract partial class MLTestBase
                         + $"at {result.SampleRate} Hz in {speakMs / 1000:F2}s "
                         + $"({speakMs / 1000 / seconds:F2}x realtime, lower is better) "
                         + $"| peak {peak:F3} rms {rms:F4}");
+
+        // The SPLIT, not just the total. Where the time goes decides what is worth optimising, and the
+        // pipeline already measures it - printing only the total throws that away and invites the next
+        // person to guess. The decoder is the stage to watch: it runs Config.NumSteps Euler steps, and the
+        // integration between them happens on the HOST, so each step is a GPU round trip on the largest
+        // model in the pipeline (fm_decoder_int8, 124.7 MB). That is the same shape that cost the Silero
+        // VAD 22.8x before its readbacks were removed.
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] stage split: "
+                        + $"encoder {result.EncoderMs:F0} ms, decoder {result.DecoderMs:F0} ms, "
+                        + $"vocoder {result.VocoderMs:F0} ms, total {result.TotalMs:F0} ms "
+                        + $"| decoder is {100 * result.DecoderMs / Math.Max(1, result.TotalMs):F0}% of it");
     });
 }

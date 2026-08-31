@@ -1,0 +1,279 @@
+# ORT reference, 276 tensors matching 'nonlin_attention'
+# tokens=[[28, 120, 18, 74, 26, 32]] prompt=[[120, 54, 122, 24, 3, 24]] frames=57 speed=1.0
+# op                 shape                       min          max         mean  name
+  Constant           []                            0            0            0  /text_encoder/0/layers.0/nonlin_attention/Constant_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.0/nonlin_attention/Constant_1_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.0/nonlin_attention/Constant_2_output_0
+  Constant           [1]                           0            0            0  /text_encoder/0/layers.0/nonlin_attention/Constant_3_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.0/nonlin_attention/Constant_4_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.0/nonlin_attention/Constant_5_output_0
+  Constant           [1]                           1            1            1  /text_encoder/0/layers.0/nonlin_attention/Constant_6_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.0/nonlin_attention/Constant_7_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.0/nonlin_attention/Constant_8_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.0/nonlin_attention/Constant_9_output_0
+  Constant           [1]                         144          144          144  /text_encoder/0/layers.0/nonlin_attention/Constant_10_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.0/nonlin_attention/Constant_11_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.0/nonlin_attention/Constant_12_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.0/nonlin_attention/Constant_13_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.0/nonlin_attention/Constant_14_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.0/nonlin_attention/Constant_15_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.1/nonlin_attention/Constant_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.1/nonlin_attention/Constant_1_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.1/nonlin_attention/Constant_2_output_0
+  Constant           [1]                           0            0            0  /text_encoder/0/layers.1/nonlin_attention/Constant_3_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.1/nonlin_attention/Constant_4_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.1/nonlin_attention/Constant_5_output_0
+  Constant           [1]                           1            1            1  /text_encoder/0/layers.1/nonlin_attention/Constant_6_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.1/nonlin_attention/Constant_7_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.1/nonlin_attention/Constant_8_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.1/nonlin_attention/Constant_9_output_0
+  Constant           [1]                         144          144          144  /text_encoder/0/layers.1/nonlin_attention/Constant_10_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.1/nonlin_attention/Constant_11_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.1/nonlin_attention/Constant_12_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.1/nonlin_attention/Constant_13_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.1/nonlin_attention/Constant_14_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.1/nonlin_attention/Constant_15_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.2/nonlin_attention/Constant_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.2/nonlin_attention/Constant_1_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.2/nonlin_attention/Constant_2_output_0
+  Constant           [1]                           0            0            0  /text_encoder/0/layers.2/nonlin_attention/Constant_3_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.2/nonlin_attention/Constant_4_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.2/nonlin_attention/Constant_5_output_0
+  Constant           [1]                           1            1            1  /text_encoder/0/layers.2/nonlin_attention/Constant_6_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.2/nonlin_attention/Constant_7_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.2/nonlin_attention/Constant_8_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.2/nonlin_attention/Constant_9_output_0
+  Constant           [1]                         144          144          144  /text_encoder/0/layers.2/nonlin_attention/Constant_10_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.2/nonlin_attention/Constant_11_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.2/nonlin_attention/Constant_12_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.2/nonlin_attention/Constant_13_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.2/nonlin_attention/Constant_14_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.2/nonlin_attention/Constant_15_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.3/nonlin_attention/Constant_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.3/nonlin_attention/Constant_1_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.3/nonlin_attention/Constant_2_output_0
+  Constant           [1]                           0            0            0  /text_encoder/0/layers.3/nonlin_attention/Constant_3_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.3/nonlin_attention/Constant_4_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.3/nonlin_attention/Constant_5_output_0
+  Constant           [1]                           1            1            1  /text_encoder/0/layers.3/nonlin_attention/Constant_6_output_0
+  Constant           [1]                           2            2            2  /text_encoder/0/layers.3/nonlin_attention/Constant_7_output_0
+  Constant           [1]                           3            3            3  /text_encoder/0/layers.3/nonlin_attention/Constant_8_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.3/nonlin_attention/Constant_9_output_0
+  Constant           [1]                         144          144          144  /text_encoder/0/layers.3/nonlin_attention/Constant_10_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.3/nonlin_attention/Constant_11_output_0
+  Constant           []                            1            1            1  /text_encoder/0/layers.3/nonlin_attention/Constant_12_output_0
+  Constant           []                            0            0            0  /text_encoder/0/layers.3/nonlin_attention/Constant_13_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.3/nonlin_attention/Constant_14_output_0
+  Constant           [1]                          -1           -1           -1  /text_encoder/0/layers.3/nonlin_attention/Constant_15_output_0
+  Mul                []                  9.41125e-05  9.41125e-05  9.41125e-05  /text_encoder/0/layers.0/nonlin_attention/in_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 432]             -82731       115943      449.433  /text_encoder/0/layers.0/nonlin_attention/in_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 432]             -82731       115943      449.433  /text_encoder/0/layers.0/nonlin_attention/in_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 432]           -7.78602      10.9117    0.0422973  /text_encoder/0/layers.0/nonlin_attention/in_proj/MatMul_output_0
+  Add                [13, 1, 432]            -7.8369      10.2503    0.0380206  /text_encoder/0/layers.0/nonlin_attention/in_proj/Add_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.0/nonlin_attention/Shape_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.0/nonlin_attention/Shape_1_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.0/nonlin_attention/Shape_2_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.0/nonlin_attention/Gather_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.0/nonlin_attention/Gather_1_output_0
+  Gather             [1]                         432          432          432  /text_encoder/0/layers.0/nonlin_attention/Gather_2_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_1_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_2_output_0
+  Add                [1]                         434          434          434  /text_encoder/0/layers.0/nonlin_attention/Add_output_0
+  Concat             [3]                           1          144      52.6667  /text_encoder/0/layers.0/nonlin_attention/Concat_output_0
+  Div                [1]                         144          144          144  /text_encoder/0/layers.0/nonlin_attention/Div_output_0
+  Mul                [1]                         144          144          144  /text_encoder/0/layers.0/nonlin_attention/Mul_output_0
+  Mul                [1]                         288          288          288  /text_encoder/0/layers.0/nonlin_attention/Mul_1_output_0
+  Mul                [1]                         432          432          432  /text_encoder/0/layers.0/nonlin_attention/Mul_2_output_0
+  Slice              [13, 1, 144]           -6.06345      6.67806   -0.0205148  /text_encoder/0/layers.0/nonlin_attention/Slice_output_0
+  Slice              [13, 1, 144]            -7.8369      8.12745    0.0450899  /text_encoder/0/layers.0/nonlin_attention/Slice_1_output_0
+  Slice              [13, 1, 144]           -7.64986      10.2503    0.0894867  /text_encoder/0/layers.0/nonlin_attention/Slice_2_output_0
+  Tanh               [13, 1, 144]          -0.999989     0.999997   -0.0056428  /text_encoder/0/layers.0/nonlin_attention/tanh/Tanh_output_0
+  Unsqueeze          [13, 1, 144, 1]       -0.999989     0.999997   -0.0056428  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_output_0
+  Reshape            [13, 1, 144]          -0.999989     0.999997   -0.0056428  /text_encoder/0/layers.0/nonlin_attention/Reshape_output_0
+  Mul                [13, 1, 144]           -7.87838      7.33589   -0.0678719  /text_encoder/0/layers.0/nonlin_attention/Mul_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.0/nonlin_attention/Shape_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.0/nonlin_attention/Shape_4_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.0/nonlin_attention/Gather_3_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.0/nonlin_attention/Gather_4_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_3_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_6_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_4_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_7_output_0
+  Concat             [3]                          -1           13      4.33333  /text_encoder/0/layers.0/nonlin_attention/Concat_2_output_0
+  Shape              [4]                           1           13            7  /text_encoder/0/layers.0/nonlin_attention/Shape_5_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.0/nonlin_attention/Gather_5_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.0/nonlin_attention/Unsqueeze_5_output_0
+  Concat             [4]                          -1           13          3.5  /text_encoder/0/layers.0/nonlin_attention/Concat_1_output_0
+  Reshape            [13, 1, 1, 144]        -7.87838      7.33589   -0.0678719  /text_encoder/0/layers.0/nonlin_attention/Reshape_1_output_0
+  Transpose          [1, 1, 13, 144]        -7.87838      7.33589   -0.0678719  /text_encoder/0/layers.0/nonlin_attention/Transpose_output_0
+  MatMul             [1, 1, 13, 144]        -4.24763      3.43271    -0.114034  /text_encoder/0/layers.0/nonlin_attention/MatMul_output_0
+  Transpose          [13, 1, 1, 144]        -4.24763      3.43271    -0.114034  /text_encoder/0/layers.0/nonlin_attention/Transpose_1_output_0
+  Reshape            [13, 1, 144]           -4.24763      3.43271    -0.114034  /text_encoder/0/layers.0/nonlin_attention/Reshape_2_output_0
+  Mul                [13, 1, 144]           -20.8894      16.5694  -0.00300013  /text_encoder/0/layers.0/nonlin_attention/Mul_4_output_0
+  DynamicQuantizeLinear [13, 1, 144]                  0          255      141.989  /text_encoder/0/layers.0/nonlin_attention/Mul_4_output_0_quantized
+  DynamicQuantizeLinear []                     0.146897     0.146897     0.146897  /text_encoder/0/layers.0/nonlin_attention/Mul_4_output_0_scale
+  DynamicQuantizeLinear []                          142          142          142  /text_encoder/0/layers.0/nonlin_attention/Mul_4_output_0_zero_point
+  Mul                []                  5.05978e-05  5.05978e-05  5.05978e-05  /text_encoder/0/layers.0/nonlin_attention/out_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 192]             -31841        28254      17.9671  /text_encoder/0/layers.0/nonlin_attention/out_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 192]             -31841        28254      17.9671  /text_encoder/0/layers.0/nonlin_attention/out_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 192]           -1.61108      1.42959  0.000909097  /text_encoder/0/layers.0/nonlin_attention/out_proj/MatMul_output_0
+  Add                [13, 1, 192]           -1.61009       1.4177  0.000687638  /text_encoder/0/layers.0/nonlin_attention/out_proj/Add_output_0
+  Mul                []                   9.1665e-05   9.1665e-05   9.1665e-05  /text_encoder/0/layers.1/nonlin_attention/in_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 432]             -69998        72508     -128.399  /text_encoder/0/layers.1/nonlin_attention/in_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 432]             -69998        72508     -128.399  /text_encoder/0/layers.1/nonlin_attention/in_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 432]           -6.41637      6.64645   -0.0117697  /text_encoder/0/layers.1/nonlin_attention/in_proj/MatMul_output_0
+  Add                [13, 1, 432]            -6.3375      6.98931   -0.0171001  /text_encoder/0/layers.1/nonlin_attention/in_proj/Add_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.1/nonlin_attention/Shape_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.1/nonlin_attention/Shape_1_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.1/nonlin_attention/Shape_2_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.1/nonlin_attention/Gather_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.1/nonlin_attention/Gather_1_output_0
+  Gather             [1]                         432          432          432  /text_encoder/0/layers.1/nonlin_attention/Gather_2_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_1_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_2_output_0
+  Add                [1]                         434          434          434  /text_encoder/0/layers.1/nonlin_attention/Add_output_0
+  Concat             [3]                           1          144      52.6667  /text_encoder/0/layers.1/nonlin_attention/Concat_output_0
+  Div                [1]                         144          144          144  /text_encoder/0/layers.1/nonlin_attention/Div_output_0
+  Mul                [1]                         144          144          144  /text_encoder/0/layers.1/nonlin_attention/Mul_output_0
+  Mul                [1]                         288          288          288  /text_encoder/0/layers.1/nonlin_attention/Mul_1_output_0
+  Mul                [1]                         432          432          432  /text_encoder/0/layers.1/nonlin_attention/Mul_2_output_0
+  Shape              [4]                           1           13            7  /text_encoder/0/layers.1/nonlin_attention/Shape_5_output_0
+  Slice              [13, 1, 144]           -5.66545      5.33443  -0.00834878  /text_encoder/0/layers.1/nonlin_attention/Slice_output_0
+  Slice              [13, 1, 144]            -6.3375      5.73332  -0.00629047  /text_encoder/0/layers.1/nonlin_attention/Slice_1_output_0
+  Slice              [13, 1, 144]           -5.30771      6.98931    -0.036661  /text_encoder/0/layers.1/nonlin_attention/Slice_2_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.1/nonlin_attention/Gather_5_output_0
+  Tanh               [13, 1, 144]          -0.999976     0.999953  -0.00766117  /text_encoder/0/layers.1/nonlin_attention/tanh/Tanh_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_5_output_0
+  Unsqueeze          [13, 1, 144, 1]       -0.999976     0.999953  -0.00766117  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_output_0
+  Reshape            [13, 1, 144]          -0.999976     0.999953  -0.00766117  /text_encoder/0/layers.1/nonlin_attention/Reshape_output_0
+  Mul                [13, 1, 144]            -5.4977      5.86759    0.0247845  /text_encoder/0/layers.1/nonlin_attention/Mul_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.1/nonlin_attention/Shape_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.1/nonlin_attention/Shape_4_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.1/nonlin_attention/Gather_3_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.1/nonlin_attention/Gather_4_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_3_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_6_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_4_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.1/nonlin_attention/Unsqueeze_7_output_0
+  Concat             [4]                          -1           13          3.5  /text_encoder/0/layers.1/nonlin_attention/Concat_1_output_0
+  Concat             [3]                          -1           13      4.33333  /text_encoder/0/layers.1/nonlin_attention/Concat_2_output_0
+  Reshape            [13, 1, 1, 144]         -5.4977      5.86759    0.0247845  /text_encoder/0/layers.1/nonlin_attention/Reshape_1_output_0
+  Transpose          [1, 1, 13, 144]         -5.4977      5.86759    0.0247845  /text_encoder/0/layers.1/nonlin_attention/Transpose_output_0
+  MatMul             [1, 1, 13, 144]        -5.45437      4.74232    0.0216862  /text_encoder/0/layers.1/nonlin_attention/MatMul_output_0
+  Transpose          [13, 1, 1, 144]        -5.45437      4.74232    0.0216862  /text_encoder/0/layers.1/nonlin_attention/Transpose_1_output_0
+  Reshape            [13, 1, 144]           -5.45437      4.74232    0.0216862  /text_encoder/0/layers.1/nonlin_attention/Reshape_2_output_0
+  Mul                [13, 1, 144]           -15.5544      11.8625   -0.0490147  /text_encoder/0/layers.1/nonlin_attention/Mul_4_output_0
+  DynamicQuantizeLinear [13, 1, 144]                  0          255      144.549  /text_encoder/0/layers.1/nonlin_attention/Mul_4_output_0_quantized
+  DynamicQuantizeLinear []                     0.107517     0.107517     0.107517  /text_encoder/0/layers.1/nonlin_attention/Mul_4_output_0_scale
+  DynamicQuantizeLinear []                          145          145          145  /text_encoder/0/layers.1/nonlin_attention/Mul_4_output_0_zero_point
+  Mul                []                  4.05645e-05  4.05645e-05  4.05645e-05  /text_encoder/0/layers.1/nonlin_attention/out_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 192]             -27702        30950     -164.004  /text_encoder/0/layers.1/nonlin_attention/out_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 192]             -27702        30950     -164.004  /text_encoder/0/layers.1/nonlin_attention/out_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 192]           -1.12372      1.25547  -0.00665274  /text_encoder/0/layers.1/nonlin_attention/out_proj/MatMul_output_0
+  Add                [13, 1, 192]           -1.13253      1.25075  -0.00670641  /text_encoder/0/layers.1/nonlin_attention/out_proj/Add_output_0
+  Mul                []                  0.000240901  0.000240901  0.000240901  /text_encoder/0/layers.2/nonlin_attention/in_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 432]             -71268        61655     -132.545  /text_encoder/0/layers.2/nonlin_attention/in_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 432]             -71268        61655     -132.545  /text_encoder/0/layers.2/nonlin_attention/in_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 432]           -17.1686      14.8528   -0.0319302  /text_encoder/0/layers.2/nonlin_attention/in_proj/MatMul_output_0
+  Add                [13, 1, 432]            -17.521      15.0448   -0.0403988  /text_encoder/0/layers.2/nonlin_attention/in_proj/Add_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.2/nonlin_attention/Shape_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.2/nonlin_attention/Shape_1_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.2/nonlin_attention/Shape_2_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.2/nonlin_attention/Gather_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.2/nonlin_attention/Gather_1_output_0
+  Gather             [1]                         432          432          432  /text_encoder/0/layers.2/nonlin_attention/Gather_2_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_1_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_2_output_0
+  Add                [1]                         434          434          434  /text_encoder/0/layers.2/nonlin_attention/Add_output_0
+  Concat             [3]                           1          144      52.6667  /text_encoder/0/layers.2/nonlin_attention/Concat_output_0
+  Div                [1]                         144          144          144  /text_encoder/0/layers.2/nonlin_attention/Div_output_0
+  Mul                [1]                         144          144          144  /text_encoder/0/layers.2/nonlin_attention/Mul_output_0
+  Mul                [1]                         288          288          288  /text_encoder/0/layers.2/nonlin_attention/Mul_1_output_0
+  Mul                [1]                         432          432          432  /text_encoder/0/layers.2/nonlin_attention/Mul_2_output_0
+  Shape              [4]                           1           13            7  /text_encoder/0/layers.2/nonlin_attention/Shape_5_output_0
+  Slice              [13, 1, 144]           -10.9185      11.1869    -0.108918  /text_encoder/0/layers.2/nonlin_attention/Slice_output_0
+  Slice              [13, 1, 144]           -13.2192      13.5974     0.118484  /text_encoder/0/layers.2/nonlin_attention/Slice_1_output_0
+  Slice              [13, 1, 144]            -17.521      15.0448    -0.130762  /text_encoder/0/layers.2/nonlin_attention/Slice_2_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.2/nonlin_attention/Gather_5_output_0
+  Tanh               [13, 1, 144]                 -1            1   -0.0461602  /text_encoder/0/layers.2/nonlin_attention/tanh/Tanh_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_5_output_0
+  Unsqueeze          [13, 1, 144, 1]              -1            1   -0.0461602  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_output_0
+  Reshape            [13, 1, 144]                 -1            1   -0.0461602  /text_encoder/0/layers.2/nonlin_attention/Reshape_output_0
+  Mul                [13, 1, 144]           -12.4189      13.5939    0.0194265  /text_encoder/0/layers.2/nonlin_attention/Mul_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.2/nonlin_attention/Shape_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.2/nonlin_attention/Shape_4_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.2/nonlin_attention/Gather_3_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.2/nonlin_attention/Gather_4_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_3_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_6_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_4_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.2/nonlin_attention/Unsqueeze_7_output_0
+  Concat             [4]                          -1           13          3.5  /text_encoder/0/layers.2/nonlin_attention/Concat_1_output_0
+  Concat             [3]                          -1           13      4.33333  /text_encoder/0/layers.2/nonlin_attention/Concat_2_output_0
+  Reshape            [13, 1, 1, 144]        -12.4189      13.5939    0.0194265  /text_encoder/0/layers.2/nonlin_attention/Reshape_1_output_0
+  Transpose          [1, 1, 13, 144]        -12.4189      13.5939    0.0194265  /text_encoder/0/layers.2/nonlin_attention/Transpose_output_0
+  MatMul             [1, 1, 13, 144]         -9.7222      13.3173    0.0981961  /text_encoder/0/layers.2/nonlin_attention/MatMul_output_0
+  Transpose          [13, 1, 1, 144]         -9.7222      13.3173    0.0981961  /text_encoder/0/layers.2/nonlin_attention/Transpose_1_output_0
+  Reshape            [13, 1, 144]            -9.7222      13.3173    0.0981961  /text_encoder/0/layers.2/nonlin_attention/Reshape_2_output_0
+  Mul                [13, 1, 144]           -54.6069      66.8127    0.0532343  /text_encoder/0/layers.2/nonlin_attention/Mul_4_output_0
+  DynamicQuantizeLinear [13, 1, 144]                  0          255      115.119  /text_encoder/0/layers.2/nonlin_attention/Mul_4_output_0_quantized
+  DynamicQuantizeLinear []                     0.476155     0.476155     0.476155  /text_encoder/0/layers.2/nonlin_attention/Mul_4_output_0_scale
+  DynamicQuantizeLinear []                          115          115          115  /text_encoder/0/layers.2/nonlin_attention/Mul_4_output_0_zero_point
+  Mul                []                  0.000145136  0.000145136  0.000145136  /text_encoder/0/layers.2/nonlin_attention/out_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 192]             -30713        32323      109.493  /text_encoder/0/layers.2/nonlin_attention/out_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 192]             -30713        32323      109.493  /text_encoder/0/layers.2/nonlin_attention/out_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 192]           -4.45757      4.69124    0.0158914  /text_encoder/0/layers.2/nonlin_attention/out_proj/MatMul_output_0
+  Add                [13, 1, 192]            -4.4683      4.69464    0.0155186  /text_encoder/0/layers.2/nonlin_attention/out_proj/Add_output_0
+  Mul                []                   0.00022402   0.00022402   0.00022402  /text_encoder/0/layers.3/nonlin_attention/in_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 432]             -76095        80287      19.7626  /text_encoder/0/layers.3/nonlin_attention/in_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 432]             -76095        80287      19.7626  /text_encoder/0/layers.3/nonlin_attention/in_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 432]           -17.0468      17.9859   0.00442724  /text_encoder/0/layers.3/nonlin_attention/in_proj/MatMul_output_0
+  Add                [13, 1, 432]           -17.0417      17.9605  -0.00171862  /text_encoder/0/layers.3/nonlin_attention/in_proj/Add_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.3/nonlin_attention/Shape_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.3/nonlin_attention/Shape_1_output_0
+  Shape              [3]                           1          432      148.667  /text_encoder/0/layers.3/nonlin_attention/Shape_2_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.3/nonlin_attention/Gather_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.3/nonlin_attention/Gather_1_output_0
+  Gather             [1]                         432          432          432  /text_encoder/0/layers.3/nonlin_attention/Gather_2_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_1_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_2_output_0
+  Add                [1]                         434          434          434  /text_encoder/0/layers.3/nonlin_attention/Add_output_0
+  Concat             [3]                           1          144      52.6667  /text_encoder/0/layers.3/nonlin_attention/Concat_output_0
+  Div                [1]                         144          144          144  /text_encoder/0/layers.3/nonlin_attention/Div_output_0
+  Mul                [1]                         144          144          144  /text_encoder/0/layers.3/nonlin_attention/Mul_output_0
+  Mul                [1]                         288          288          288  /text_encoder/0/layers.3/nonlin_attention/Mul_1_output_0
+  Mul                [1]                         432          432          432  /text_encoder/0/layers.3/nonlin_attention/Mul_2_output_0
+  Shape              [4]                           1           13            7  /text_encoder/0/layers.3/nonlin_attention/Shape_5_output_0
+  Slice              [13, 1, 144]           -13.5301      12.8905   -0.0555833  /text_encoder/0/layers.3/nonlin_attention/Slice_output_0
+  Slice              [13, 1, 144]           -15.4299      15.9328   -0.0601656  /text_encoder/0/layers.3/nonlin_attention/Slice_1_output_0
+  Slice              [13, 1, 144]           -17.0417      17.9605     0.110593  /text_encoder/0/layers.3/nonlin_attention/Slice_2_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.3/nonlin_attention/Gather_5_output_0
+  Tanh               [13, 1, 144]                 -1            1    0.0171929  /text_encoder/0/layers.3/nonlin_attention/tanh/Tanh_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_5_output_0
+  Unsqueeze          [13, 1, 144, 1]              -1            1    0.0171929  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_output_0
+  Reshape            [13, 1, 144]                 -1            1    0.0171929  /text_encoder/0/layers.3/nonlin_attention/Reshape_output_0
+  Mul                [13, 1, 144]           -15.9093      14.6186   -0.0580877  /text_encoder/0/layers.3/nonlin_attention/Mul_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.3/nonlin_attention/Shape_3_output_0
+  Shape              [3]                           1          144      52.6667  /text_encoder/0/layers.3/nonlin_attention/Shape_4_output_0
+  Gather             []                           13           13           13  /text_encoder/0/layers.3/nonlin_attention/Gather_3_output_0
+  Gather             []                            1            1            1  /text_encoder/0/layers.3/nonlin_attention/Gather_4_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_3_output_0
+  Unsqueeze          [1]                          13           13           13  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_6_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_4_output_0
+  Unsqueeze          [1]                           1            1            1  /text_encoder/0/layers.3/nonlin_attention/Unsqueeze_7_output_0
+  Concat             [4]                          -1           13          3.5  /text_encoder/0/layers.3/nonlin_attention/Concat_1_output_0
+  Concat             [3]                          -1           13      4.33333  /text_encoder/0/layers.3/nonlin_attention/Concat_2_output_0
+  Reshape            [13, 1, 1, 144]        -15.9093      14.6186   -0.0580877  /text_encoder/0/layers.3/nonlin_attention/Reshape_1_output_0
+  Transpose          [1, 1, 13, 144]        -15.9093      14.6186   -0.0580877  /text_encoder/0/layers.3/nonlin_attention/Transpose_output_0
+  MatMul             [1, 1, 13, 144]        -15.0162      14.3952   -0.0712369  /text_encoder/0/layers.3/nonlin_attention/MatMul_output_0
+  Transpose          [13, 1, 1, 144]        -15.0162      14.3952   -0.0712369  /text_encoder/0/layers.3/nonlin_attention/Transpose_1_output_0
+  Reshape            [13, 1, 144]           -15.0162      14.3952   -0.0712369  /text_encoder/0/layers.3/nonlin_attention/Reshape_2_output_0
+  Mul                [13, 1, 144]           -85.4911      103.329    -0.706997  /text_encoder/0/layers.3/nonlin_attention/Mul_4_output_0
+  DynamicQuantizeLinear [13, 1, 144]                  0          255      114.045  /text_encoder/0/layers.3/nonlin_attention/Mul_4_output_0_quantized
+  DynamicQuantizeLinear []                     0.740473     0.740473     0.740473  /text_encoder/0/layers.3/nonlin_attention/Mul_4_output_0_scale
+  DynamicQuantizeLinear []                          115          115          115  /text_encoder/0/layers.3/nonlin_attention/Mul_4_output_0_zero_point
+  Mul                []                  0.000218983  0.000218983  0.000218983  /text_encoder/0/layers.3/nonlin_attention/out_proj/MatMul_quant_scales_mul:0
+  MatMulInteger      [13, 1, 192]             -32113        31073      525.384  /text_encoder/0/layers.3/nonlin_attention/out_proj/MatMul_output_0_output_quantized
+  Cast               [13, 1, 192]             -32113        31073      525.384  /text_encoder/0/layers.3/nonlin_attention/out_proj/MatMul_output_0_output_quantized_cast_output
+  Mul                [13, 1, 192]           -7.03219      6.80445      0.11505  /text_encoder/0/layers.3/nonlin_attention/out_proj/MatMul_output_0
+  Add                [13, 1, 192]           -7.05985       6.7895     0.109649  /text_encoder/0/layers.3/nonlin_attention/out_proj/Add_output_0
