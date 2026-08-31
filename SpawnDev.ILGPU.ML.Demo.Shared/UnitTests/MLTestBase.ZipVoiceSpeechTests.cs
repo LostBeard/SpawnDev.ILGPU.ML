@@ -173,6 +173,14 @@ public abstract partial class MLTestBase
         // The symbol table comes from CONTENT, not a path - the whole point of this test.
         var tokenizer = ZipVoiceTokenizer.CreateFromTokens(Encoding.UTF8.GetString(tokensBytes));
 
+        // ML_CF_CAPTURE=1 lifts the control-flow capture refusal for this run. Opt-in because the failure
+        // it guards against is not an exception: on CUDA an uncatchable 0xC0000005, on WebGPU a hung device.
+        if (Environment.GetEnvironmentVariable("ML_CF_CAPTURE") == "1")
+        {
+            Graph.SessionGraphCapture.RefuseControlFlow = false;
+            Console.WriteLine("[Benchmark] ZipVoice control-flow capture refusal LIFTED for this run");
+        }
+
         using var graphs = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);
         using var pipeline = new ZipVoicePipeline(graphs);
 
@@ -222,6 +230,8 @@ public abstract partial class MLTestBase
         // and that gap is far too large to be backend arithmetic. The Silero VAD had the same shape and the
         // cause was readbacks, not dispatch count: driving them 16 -> 0 took it from 177.9 to 7.81 ms/frame
         // (22.8x). Print the counters rather than guessing which it is this time.
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] capture LIVE: "
+                        + $"{graphs.DecoderCaptured}");
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] host cost: "
                         + $"{Graph.GraphExecutor.LastRunReadbackCount} readbacks "
                         + $"({Graph.GraphExecutor.LastRunReadbackMs:F0} ms), "

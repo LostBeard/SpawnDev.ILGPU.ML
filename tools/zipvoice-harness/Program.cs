@@ -210,6 +210,14 @@ int Synth(string fixturePath, string? outPath)
         if (Environment.GetEnvironmentVariable("ZIPVOICE_CF_CAPTURE") == "1")
         {
             SpawnDev.ILGPU.ML.Graph.SessionGraphCapture.RefuseControlFlow = false;
+            if (Environment.GetEnvironmentVariable("ZIPVOICE_CF_NODRAIN") == "1")
+            {
+                typeof(SpawnDev.ILGPU.ML.CudaGraphCapture)
+                    .GetField("ExperimentKeepDrainsSuppressed",
+                              System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+                    .SetValue(null, true);
+                Console.WriteLine("capture  : EXPERIMENT - drains stay suppressed after capture");
+            }
             Console.WriteLine("capture  : control-flow refusal LIFTED (ZIPVOICE_CF_CAPTURE=1)");
         }
         if (Environment.GetEnvironmentVariable("ZIPVOICE_NO_CAPTURE") == "1")

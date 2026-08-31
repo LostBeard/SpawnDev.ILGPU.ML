@@ -56,6 +56,10 @@ public sealed class CudaGraphCapture : IDisposable
     /// then records a third forward under capture. Returns null if the accelerator is not CUDA or the driver has
     /// no graph API. The <paramref name="inputs"/> device buffers become this capture's stable inputs.
     /// </summary>
+    /// <summary>DIAGNOSTIC ONLY: keep pool drains suppressed after capture, to test whether a
+    /// post-capture drain is what frees the buffers a replay then reads.</summary>
+    internal static bool ExperimentKeepDrainsSuppressed;
+
     public static async Task<CudaGraphCapture?> TryCaptureAsync(InferenceSession session, Dictionary<string, Tensor> inputs)
     {
         var acc = session.Accelerator;
@@ -212,7 +216,7 @@ public sealed class CudaGraphCapture : IDisposable
                     try { capStream.Dispose(); } catch { }
                     throw;
                 }
-                finally { GraphExecutor.SuppressDrains = false; }
+                finally { GraphExecutor.SuppressDrains = ExperimentKeepDrainsSuppressed; }
             }
         }
         finally
@@ -220,7 +224,7 @@ public sealed class CudaGraphCapture : IDisposable
             session.CacheShapeReadbacks = prevCacheReadbacks;
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
-            GraphExecutor.SuppressDrains = false;
+            GraphExecutor.SuppressDrains = ExperimentKeepDrainsSuppressed;
             GraphCompiler.ShapeSubgraphFoldEnabled = prevFold;
             GraphExecutor.ShapeInterpElideDispatch = prevElide;
             GraphExecutor.ShapeInterpValidate = prevValidate;
