@@ -77,6 +77,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// </para>
     /// </remarks>
     private SessionGraphCapture? _decoderCapture;
+    private string? _decoderCaptureShape;
 
     /// <summary>Enable capture/replay of the decoder. Off disables it entirely (plain RunAsync).</summary>
     public bool EnableGraphCapture { get; set; } = true;
@@ -167,7 +168,21 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             ["guidance_scale"] = new Tensor(guidanceBuffer.View, Array.Empty<int>()),
         };
 
-        _decoderCapture ??= new SessionGraphCapture(_decoder, _accelerator) { Enabled = EnableGraphCapture };
+        // ⚠️ ONE capture per UTTERANCE, not one per graphs instance. A captured graph is valid only at the
+        // shapes it recorded, and this decoder's shape is the utterance length - so a capture taken on
+        // "hello" is worthless for the next sentence and a single long-lived instance would either refuse
+        // it or replay the wrong thing.
+        //
+        // Within one utterance the shape is FIXED across all NumSteps Euler steps, which is exactly where
+        // capture/replay pays: record step 1, replay the rest. So the capture is rebuilt when the shape
+        // changes, which in practice means once per thing said.
+        var shapeKey = string.Join("x", shape);
+        if (_decoderCaptureShape != shapeKey)
+        {
+            _decoderCapture?.Dispose();
+            _decoderCapture = new SessionGraphCapture(_decoder, _accelerator);
+            _decoderCaptureShape = shapeKey;
+        }
         _decoderCapture.Enabled = EnableGraphCapture;
         var renamed = Rename(inputs, _decoder);
         Dictionary<string, Tensor> outputs;
@@ -249,7 +264,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
 
     public void Dispose()
     {
-        _decoderCapture?.Dispose(); _decoderCapture = null;
+        _decoderCapture?.Dispose(); _decoderCapture = null; _decoderCaptureShape = null;
         if (!_ownsSessions) return;
         _encoder.Dispose();
         _decoder.Dispose();

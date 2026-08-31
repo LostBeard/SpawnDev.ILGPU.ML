@@ -80,7 +80,15 @@ public sealed class SessionGraphCapture : IDisposable
         if (!eligible) return await _session.RunAsync(inputs).ConfigureAwait(false);
 
         var shapes = inputs.Values.Select(t => t.Shape).ToArray();
-        if (_capturedShapes != null)
+        // ⚠️ Only enforced when a capture is actually LIVE. The shapes are baked into a recorded graph, so
+        // they matter to a replay and to nothing else - and a wrapper that never captured must behave
+        // exactly like the plain session it is standing in for.
+        //
+        // This previously recorded the shapes on the FIRST call and enforced them forever, including when
+        // capture had been refused and every call was a direct forward. ZipVoice's decoder is shaped by the
+        // utterance length, so the second thing it said - being a different length - threw
+        // "input shape changed after capture" from a wrapper that had captured nothing.
+        if (_capturedShapes != null && IsCaptured)
         {
             if (shapes.Length != _capturedShapes.Length
                 || shapes.Where((s, i) => !s.AsSpan().SequenceEqual(_capturedShapes[i])).Any())
@@ -91,7 +99,6 @@ public sealed class SessionGraphCapture : IDisposable
         if (!_captureAttempted)
         {
             _captureAttempted = true;
-            _capturedShapes = shapes;
 
             // ⚠️ Control flow is refused HERE, for EVERY backend - not inside the CUDA path.
             //
@@ -143,6 +150,8 @@ public sealed class SessionGraphCapture : IDisposable
             }
         }
 
+        // Recorded only once a capture is live, so it describes a graph that actually exists.
+        if (IsCaptured) _capturedShapes ??= shapes;
         if (_cuda != null) return await _cuda.ReplayAsync(inputs).ConfigureAwait(false);
         if (_webGpu != null) return await _webGpu.ReplayAsync(inputs).ConfigureAwait(false);
         return await _session.RunAsync(inputs).ConfigureAwait(false);   // capture unavailable - direct
