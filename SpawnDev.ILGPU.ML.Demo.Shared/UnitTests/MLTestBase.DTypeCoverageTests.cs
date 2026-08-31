@@ -178,6 +178,14 @@ public abstract partial class MLTestBase
                  v => v.Select(x => ((global::ILGPU.Float8E4M3)x).RawValue).ToArray()),
             (19, "FP8E5M2",  new[] { 1.5f, -2.0f,  0f, 3.0f },
                  v => v.Select(x => ((global::ILGPU.Float8E5M2)x).RawValue).ToArray()),
+            // ⚠️ INT8 carries NEGATIVES and the extremes on purpose. Reading an int8 -1 as a byte yields
+            // 255, and a quantised weight off by 256 is not subtly wrong - it is noise. -128/127 pin the
+            // ends of the range where a sign error shows up largest.
+            (3,  "INT8",     new[] { -1f, 127f, -128f, 0f },    v => EncodeRaw(3, v)),
+            // ⚠️ UINT8 (2) is deliberately ABSENT. It was claimed briefly and this very test caught it
+            // returning 255 as -1 - the convert lowers as signed, wrapping the top half of the range. It
+            // materialises instead, so nothing is wrong today; when the lowering is fixed in ILGPU, add
+            // (2, "UINT8", new[] { 0f, 255f, 128f, 1f }, v => EncodeRaw(2, v)) here FIRST and let it fail.
         };
 
         using var pool = new BufferPool(accelerator);
@@ -208,7 +216,8 @@ public abstract partial class MLTestBase
             throw new Exception($"{failures.Count} of {cases.Length} claimed STREAMING dtypes failed: " +
                                 string.Join(" | ", failures));
 
-        Console.WriteLine($"[DType] all {cases.Length} claimed streaming dtypes load exactly (1,10,16,17,19)");
+        Console.WriteLine($"[DType] all {cases.Length} claimed streaming dtypes load exactly "
+                        + "(1,10,16,17,19,3)");
     });
 
     /// <summary>

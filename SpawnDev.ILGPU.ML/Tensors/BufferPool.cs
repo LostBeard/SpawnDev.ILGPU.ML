@@ -451,7 +451,26 @@ public class BufferPool : IDisposable
 
         // For small tensors, use the standard path (no chunking overhead)
         if (count <= 262144) // 1MB
-            return AllocatePermanent(tensor.ToFloatArray(), shape, name);
+        {
+            try
+            {
+                return AllocatePermanent(tensor.ToFloatArray(), shape, name);
+            }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("StrictHostCopyMaxBytes"))
+            {
+                // ⚠️ The other two host-copy paths already name the offending tensor; this one did not, and
+                // it is the path a 64 KB-1 MB weight takes. The guard's own message is a byte count and
+                // nothing else, so a violation here arrived as "147456 bytes exceeds 65536" with no way to
+                // tell WHICH tensor, of what dtype, out of thousands. Identifying it by byte count is
+                // guesswork; that is the whole reason the sibling paths wrap this.
+                throw new InvalidOperationException(
+                    $"Tensor '{name ?? tensor.Name}' (dtype={tensor.DataType}, {count} floats, " +
+                    $"{(long)count * 4:N0} B, rawData={(tensor.RawData != null ? "yes" : "no")}, " +
+                    $"rawSrc={(tensor.RawDataSource != null ? "yes" : "no")}) took the SMALL-tensor host-copy " +
+                    "path. Under 1 MB it is materialised and copied whole rather than streamed JS-side, so a " +
+                    "weight in that size band never reaches the zero-copy loader at all. " + ex.Message, ex);
+            }
+        }
 
         // Large tensor: allocate empty GPU buffer, then fill in chunks
         var buffer = _accelerator.Allocate1D<float>(count);
@@ -601,11 +620,28 @@ public class BufferPool : IDisposable
         // ⚠️ The FNUZ FP8 variants (18 = E4M3FNUZ, 20 = E5M2FNUZ) are deliberately NOT mapped onto the plain
         // types: they differ in NaN/zero encoding, so accepting them would silently mis-decode weights. Integer
         // and DOUBLE dtypes need a cast kernel rather than PrecisionConvert and are a separate change.
-        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, 16 => 2, 17 => 1, 19 => 1, 18 => 1, 20 => 1, _ => 0 };
+        // INT8 (3) and UINT8 (2) join the float formats here. They are QUANTISED WEIGHTS, not the small
+        // shape/index constants the integer exclusion was written for, and on an int8 export they are most
+        // of the model: ZipVoice's browser load died on one 147 KB int8 matrix taking the managed path
+        // ("147456 bytes exceeds StrictHostCopyMaxBytes=65536"), which is precisely the bulk data that rule
+        // exists to keep off the single-threaded WASM heap.
+        //
+        // They upcast exactly like the float formats because PrecisionConvert.ConvertToSingle<T> is
+        // float.CreateTruncating over INumber<T> - sbyte and byte satisfy it, and inside a kernel it lowers
+        // to a native convert. The resulting float values are identical to what ToFloatArray produced on
+        // the managed path, so MatMulInteger sees the same numbers it always did.
+        // ⚠️ INT8 (3) only - UINT8 (2) is NOT claimed. Streaming a uint8 weight returned 255 as -1 (caught
+        // by DType_AllClaimedStreamingDtypes_LoadExactly the moment it was claimed): the convert lowers as
+        // signed, so the top half of the range wraps negative. A quantised weight off by 256 is noise, not
+        // a rounding difference. uint8 keeps materialising, exactly as before, until that lowering is fixed
+        // in ILGPU - claiming a dtype this path decodes wrongly is worse than not claiming it.
+        int srcElemBytes = dataType switch { 1 => 4, 10 => 2, 16 => 2, 17 => 1, 19 => 1, 18 => 1, 20 => 1,
+                                             3 => 1, _ => 0 };
         if (srcElemBytes == 0)
             throw new NotSupportedException(
                 $"Streaming load supports FLOAT32 (1), FLOAT16 (10), BFLOAT16 (16), FLOAT8E4M3 (17), " +
-                $"FLOAT8E5M2 (19), FLOAT8E4M3FNUZ (18) and FLOAT8E5M2FNUZ (20) raw_data; got dtype " +
+                $"FLOAT8E5M2 (19), FLOAT8E4M3FNUZ (18), FLOAT8E5M2FNUZ (20) and INT8 (3) raw_data; " +
+                $"got dtype " +
                 $"{dataType} for '{name}'. " +
                 "Load this model via CreateFromOnnx(byte[]).");
 
@@ -632,7 +668,8 @@ public class BufferPool : IDisposable
         // ReadExact + CopyFromCPU loop below for the common SD-Turbo (fp16) weight case, which was pulling
         // every weight through .NET (Captain 2026-07-05). Works on all backends (browser gets true zero-copy;
         // desktop streams managed into the Half buffer, still a GPU convert not a CPU one).
-        bool hasNativeType = dataType is 10 or 16 or 17 or 19;   // FNUZ (18/20) has no ILGPU type - managed decode
+        // FNUZ (18/20) has no ILGPU type - managed decode. int8/uint8 map straight onto sbyte/byte.
+        bool hasNativeType = dataType is 10 or 16 or 17 or 19 or 3;
         if (hasNativeType && byteLength == (long)count * srcElemBytes && !DisableJsZeroCopyWeights)
         {
             // Every low-p float dtype takes the SAME shape: stream the raw bytes into a native temp of the
@@ -647,6 +684,9 @@ public class BufferPool : IDisposable
                 case 16: await StreamLowPUpcastAsync<global::ILGPU.BFloat16>(stream, buffer, count, ct).ConfigureAwait(false); break;
                 case 17: await StreamLowPUpcastAsync<global::ILGPU.Float8E4M3>(stream, buffer, count, ct).ConfigureAwait(false); break;
                 case 19: await StreamLowPUpcastAsync<global::ILGPU.Float8E5M2>(stream, buffer, count, ct).ConfigureAwait(false); break;
+                // ⚠️ SIGNEDNESS IS THE WHOLE POINT of keeping these separate: reading an INT8 -1 (0xFF) as
+                // a byte gives 255, and a quantised weight off by 256 is not subtly wrong, it is noise.
+                case 3: await StreamLowPUpcastAsync<sbyte>(stream, buffer, count, ct).ConfigureAwait(false); break;
                 default: throw new NotSupportedException($"no streaming branch for dtype {dataType} ('{name}')");
             }
             // The convert dispatch READS halfTmp, so halfTmp must survive until the convert runs. A per-weight

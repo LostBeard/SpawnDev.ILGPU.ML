@@ -226,7 +226,14 @@ public static partial class OnnxParser
                     // inference) — streaming it to GPU-only would lose that value and corrupt downstream
                     // shapes (a Conv saw rank-3 instead of rank-4, 2026-07-05). data_type + dims precede
                     // raw_data in standard ONNX, so both are known here; if unset we materialize (safe).
-                    if ((tensor.DataType == 1 || tensor.DataType == 10) && TensorElems(dims) > 64)
+                    // ⚠️ INT8(3)/UINT8(2) stream too. The "non-float raw_data materialises" rule above was
+                    // written for INT64/INT32 shape constants and bool masks - small metadata - and an int8
+                    // QUANTISED WEIGHT is the opposite of that: on an int8 export it is most of the model.
+                    // Excluding them sent every one through the managed heap, which is what the browser
+                    // bulk-data guard caught on ZipVoice. The >64-element rule still protects small integer
+                    // constants that CPU shape inference has to read.
+                    if ((tensor.DataType == 1 || tensor.DataType == 10 || tensor.DataType == 3)
+                        && TensorElems(dims) > 64)
                     {
                         tensor.RawDataStreamOffset = r.Position;      // absolute offset of the weight blob
                         tensor.RawDataLength = checked((int)rawLen);
