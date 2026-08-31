@@ -627,8 +627,33 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "MatMulInteger";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
-        // Same as MatMul: [M, K] × [K, N] → [M, N]
-        return new[] { new[] { inputs[0][0], inputs[1].Length > 1 ? inputs[1][1] : inputs[1][0] } };
+        // ⚠️ MatMulInteger is N-D in ONNX exactly as MatMul is, and this used to return a rank-2
+        // shape unconditionally: `[a[0], N]`. For a batched activation [S, 1, K] that yields [S, N] - the
+        // size-1 batch axis is DELETED, and the old code additionally read K from a[1] (= 1), so it
+        // contracted over a single element and produced wrong VALUES on top of the wrong shape.
+        //
+        // Nothing downstream notices a missing axis directly. What it does is poison the runtime shape
+        // arithmetic: a later Shape/Gather reads dim 1 and gets the feature count instead of the batch,
+        // so a Reshape target and a Slice bound both come out wrong, and the graph finally dies ~180 nodes
+        // later on a broadcast that has nothing to do with the cause. Measured on ZipVoice's int8 text
+        // encoder: node 28 produced [106,192] where onnxruntime gives [13,1,192], and node 222 failed with
+        // "Shapes [106,432] and [106,432,1] are not broadcastable".
+        //
+        // Rank-2 behaviour is byte-for-byte unchanged: for a rank-2 A, a[^2] == a[0] and a[^1] == a[1].
+        var a = inputs[0]; var b = inputs[1];
+        int M = a.Length >= 2 ? a[^2] : 1;
+        int N = b.Length >= 2 ? b[^1] : b[0];
+        var outShape = new List<int>();
+        int maxLeading = Math.Max(a.Length - 2, b.Length - 2);
+        for (int i = 0; i < maxLeading; i++)
+        {
+            int da = i < a.Length - 2 ? a[i] : 1;
+            int db = i < b.Length - 2 ? b[i] : 1;
+            outShape.Add(Math.Max(da, db));
+        }
+        outShape.Add(M);
+        outShape.Add(N);
+        return new[] { outShape.ToArray() };
     }
     public void Execute(OnnxOpContext ctx)
     {
@@ -636,8 +661,13 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
         // Inputs: A, B, [a_zero_point], [b_zero_point]
         var a = ctx.Inputs[0]; var b = ctx.Inputs[1];
         var aShape = a.Shape; var bShape = b.Shape;
-        int M = aShape[0], K = aShape.Length > 1 ? aShape[1] : aShape[0];
-        int N = bShape.Length > 1 ? bShape[1] : bShape[0];
+        // Read the contraction dim from the LAST axis, not axis 1 - they coincide only at rank 2.
+        int K = aShape[^1];
+        int M = aShape.Length >= 2 ? aShape[^2] : 1;
+        int N = bShape.Length > 1 ? bShape[^1] : bShape[0];
+        // Every leading axis is just more rows sharing the same weight, which is how MatMulOperator treats
+        // a batched activation against a 2-D weight. batch=1 collapses to rows == M.
+        int rows = K > 0 ? (int)(a.ElementCount / K) : M;
 
         // Subtract zero points if provided
         var aAdj = ctx.Pool.Rent(aShape, "_mmi_a");
@@ -657,12 +687,14 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
                 reg.ElementWise.Scale(ctx.Inputs[2].Data, zpBuf.Data, ctx.Inputs[2].ElementCount, -1f);
                 if (azp.Length == 1)
                     reg.ElementWise.AddBias(aAdj.Data, zpBuf.Data, a.ElementCount, 1);
-                else if (azp.Length == M && K > 0)
+                else if (azp.Length == rows && K > 0)
+                    // rows, not M: with a batched A every leading axis contributes rows, and a per-row
+                    // zero point has one value per row of the FLATTENED matrix.
                     reg.ElementWise.AddRowBias(aAdj.Data, zpBuf.Data, a.ElementCount, K);
                 else
                     throw new NotSupportedException(
                         $"MatMulInteger a_zero_point has {azp.Length} values; expected 1 (per-tensor) or " +
-                        $"{M} (per-row of A [{M},{K}]).");
+                        $"{rows} (per-row of A [{string.Join(",", aShape)}] flattened to [{rows},{K}]).");
                 ctx.Pool.Return(zpBuf);
             }
         }
@@ -692,7 +724,17 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
             }
         }
 
-        reg.MatMul.MatMul(aAdj.Data, bAdj.Data, ctx.Outputs[0].Data, M, K, N);
+        // A 2-D B is a shared weight: flatten all of A's rows into one [rows, K] @ [K, N]. Passing M here
+        // instead of rows computed only the FIRST batch slice and left the rest of the output untouched.
+        if (bShape.Length <= 2)
+        {
+            reg.MatMul.MatMul(aAdj.Data, bAdj.Data, ctx.Outputs[0].Data, rows, K, N);
+        }
+        else
+        {
+            int batch = (M > 0 && K > 0) ? (int)(a.ElementCount / ((long)M * K)) : 1;
+            reg.MatMul.BatchedMatMul(aAdj.Data, bAdj.Data, ctx.Outputs[0].Data, batch, M, K, N);
+        }
         ctx.Pool.Return(aAdj);
         ctx.Pool.Return(bAdj);
     }
@@ -811,8 +853,29 @@ public class QLinearMatMulOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         // Inputs: a, a_scale, a_zero, b, b_scale, b_zero, y_scale, y_zero
+        //
+        // ⚠️ N-D, like MatMul and MatMulInteger. This returned a rank-2 shape unconditionally, which
+        // DELETES a batch axis for the [seq, batch, features] activations every quantised transformer uses -
+        // the identical defect found and fixed in MatMulIntegerOperator (ZipVoice int8 text encoder, node
+        // 28: ours [106,192] vs onnxruntime [13,1,192]). Rank-2 behaviour is unchanged, since a[^2] == a[0]
+        // and b[^1] == b[1] at rank 2.
         if (inputs.Length >= 4)
-            return new[] { new[] { inputs[0][0], inputs[3].Length > 1 ? inputs[3][1] : inputs[3][0] } };
+        {
+            var a = inputs[0]; var b = inputs[3];
+            int M = a.Length >= 2 ? a[^2] : 1;
+            int N = b.Length >= 2 ? b[^1] : b[0];
+            var outShape = new List<int>();
+            int maxLeading = Math.Max(a.Length - 2, b.Length - 2);
+            for (int i = 0; i < maxLeading; i++)
+            {
+                int da = i < a.Length - 2 ? a[i] : 1;
+                int db = i < b.Length - 2 ? b[i] : 1;
+                outShape.Add(Math.Max(da, db));
+            }
+            outShape.Add(M);
+            outShape.Add(N);
+            return new[] { outShape.ToArray() };
+        }
         return new[] { inputs[0] };
     }
     public void Execute(OnnxOpContext ctx)
@@ -827,8 +890,12 @@ public class QLinearMatMulOperator(OperatorRegistry reg) : IOnnxOperator
 
         var a = ctx.Inputs[0]; var b = ctx.Inputs[3];
         var aShape = a.Shape; var bShape = b.Shape;
-        int M = aShape[0], K = aShape.Length > 1 ? aShape[1] : aShape[0];
-        int N = bShape.Length > 1 ? bShape[1] : bShape[0];
+        // Contraction dim is the LAST axis; it coincides with axis 1 only at rank 2.
+        int K = aShape[^1];
+        int M = aShape.Length >= 2 ? aShape[^2] : 1;
+        int N = bShape.Length > 1 ? bShape[^1] : bShape[0];
+        // Leading axes are just more rows sharing the same weight (see MatMulOperator).
+        int rows = K > 0 ? (int)(a.ElementCount / K) : M;
 
         // Dequantize a: (a - a_zero) * a_scale
         var aScale = ctx.TryGetInputValues(1);
@@ -860,8 +927,17 @@ public class QLinearMatMulOperator(OperatorRegistry reg) : IOnnxOperator
         if (bScale != null && bScale.Length > 0)
             reg.ElementWise.ScaleInPlace(bDequant.Data, b.ElementCount, bScale[0]);
 
-        // MatMul
-        reg.MatMul.MatMul(aDequant.Data, bDequant.Data, ctx.Outputs[0].Data, M, K, N);
+        // MatMul. A 2-D b is a shared weight: flatten every leading axis of a into rows. Passing M here
+        // computed only the first batch slice and left the remainder of the output untouched.
+        if (bShape.Length <= 2)
+        {
+            reg.MatMul.MatMul(aDequant.Data, bDequant.Data, ctx.Outputs[0].Data, rows, K, N);
+        }
+        else
+        {
+            int batch = (M > 0 && K > 0) ? (int)(a.ElementCount / ((long)M * K)) : 1;
+            reg.MatMul.BatchedMatMul(aDequant.Data, bDequant.Data, ctx.Outputs[0].Data, batch, M, K, N);
+        }
 
         // Requantize: round(y / y_scale) + y_zero
         var yScale = ctx.TryGetInputValues(6);

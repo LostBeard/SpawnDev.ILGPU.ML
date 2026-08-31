@@ -175,7 +175,23 @@ int Synth(string fixturePath, string? outPath)
         var mlCtxBuilder = MLContext.Create();
         mlCtxBuilder.AllAcceleratorsAsync().GetAwaiter().GetResult();
         var mlCtx = mlCtxBuilder.ToContext();
-        var accelerator = mlCtx.CreatePreferredAcceleratorAsync().GetAwaiter().GetResult()
+        // ZIPVOICE_ACCELERATOR=cpu|cuda|opencl pins the backend. Without it this always took the
+        // PREFERRED device (a real GPU), so a backend-specific failure could not be reproduced here at
+        // all - the CPU lane crashed under PMT and the only tool that runs our engine end-to-end could
+        // not be pointed at CPU to find out why.
+        var want = Environment.GetEnvironmentVariable("ZIPVOICE_ACCELERATOR");
+        Accelerator? accelerator = null;
+        if (!string.IsNullOrWhiteSpace(want))
+        {
+            var match = mlCtx.Devices.FirstOrDefault(d =>
+                string.Equals(d.AcceleratorType.ToString(), want, StringComparison.OrdinalIgnoreCase));
+            if (match == null)
+                throw new InvalidOperationException(
+                    $"ZIPVOICE_ACCELERATOR='{want}' matches no device. Available: "
+                  + string.Join(", ", mlCtx.Devices.Select(d => d.AcceleratorType.ToString())));
+            accelerator = match.CreateAccelerator(mlCtx);
+        }
+        accelerator ??= mlCtx.CreatePreferredAcceleratorAsync().GetAwaiter().GetResult()
             ?? throw new InvalidOperationException("no accelerator available");
         ourCtx = mlCtx; ourAccel = accelerator;
         var encPath = Path.Combine(graphDir, int8 ? "text_encoder_int8.onnx" : "text_encoder.onnx");
@@ -210,7 +226,67 @@ int Synth(string fixturePath, string? outPath)
     };
     Console.WriteLine($"tailPad  : {pipeline.ReferenceTailSilenceSeconds}s");
 
+    // ZIPVOICE_NODE_TIMING=1 attributes the time PER NODE instead of per stage. The stage split says the
+    // decoder is ~94% of a synthesis; it does not say whether that is a few heavy kernels (worth tuning) or
+    // thousands of cheap ones (worth capture/replay), and those lead to opposite work. Measure before cutting.
+    var timingMode = Environment.GetEnvironmentVariable("ZIPVOICE_NODE_TIMING");
+    bool nodeTiming = timingMode == "1" || timingMode == "2";
+    if (nodeTiming)
+    {
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+        // ⚠️ =1 times DISPATCH only. Kernels are async, so a node's Execute returns once the work is
+        // QUEUED and the real GPU time lands at the next periodic sync - which is why mode 1 accounted for
+        // only 2,097 ms of a 24,601 ms synthesis and proved nothing about where the time goes.
+        // =2 adds PerOpSync: a flush+wait after every node, so each measurement includes that node's GPU
+        // completion. It is slower in absolute terms and the total is NOT comparable to a normal run - but
+        // it is the only form that attributes GPU time per op, which is what decides between tuning a
+        // kernel and eliminating orchestration.
+        if (timingMode == "2")
+        {
+            SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = true;
+            Console.WriteLine("timing   : PerOpSync ON - per-node times include GPU completion; "
+                            + "TOTALS ARE INFLATED and only the ATTRIBUTION is meaningful");
+        }
+    }
+
     var result = pipeline.SynthesizeAsync(fixture.Tokens, fixture.PromptTokens, reference, referenceRate).GetAwaiter().GetResult();
+
+    if (nodeTiming)
+    {
+        var timings = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs;
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = null;   // static: never leave it armed
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.PerOpSync = false;
+        if (timings != null && timings.Count > 0)
+        {
+            double total = timings.Values.Sum();
+            Console.WriteLine($"nodes    : {timings.Count} timed, {total:F0}ms accounted");
+            // Per-OP totals answer "which kind of work dominates"; the top individual nodes answer "is it
+            // one kernel or the long tail". Both, because either alone can mislead.
+            Console.WriteLine("by op    :");
+            foreach (var g in timings.GroupBy(kv => kv.Key.Split('_')[1])
+                                     .Select(g => (Op: g.Key, Ms: g.Sum(x => x.Value), N: g.Count()))
+                                     .OrderByDescending(x => x.Ms).Take(12))
+                Console.WriteLine($"           {g.Ms,9:F1}ms  {100 * g.Ms / total,5:F1}%  {g.N,5} x {g.Op}");
+            Console.WriteLine("slowest  :");
+            foreach (var kv in timings.OrderByDescending(kv => kv.Value).Take(10))
+                Console.WriteLine($"           {kv.Value,9:F2}ms  {kv.Key}");
+            var cheap = timings.Values.Count(v => v < 1.0);
+            Console.WriteLine($"under 1ms: {cheap}/{timings.Count} nodes ({100.0 * cheap / timings.Count:F0}%)");
+            // ⚠️ The ACCOUNTED-vs-TOTAL gap is the orchestration signal, not the share of cheap nodes.
+            // An earlier version of this line asserted "a high share here means ORCHESTRATION" and printed
+            // it unconditionally - including on a run where ONE operator was 61% of GPU time and the real
+            // answer was a single pathological kernel. Report the gap and name both readings instead of
+            // deciding for the reader.
+            //
+            // Note the per-node keys are node NAMES, so a graph run more than once (the decoder runs
+            // NumSteps times) overwrites its own entries: 'accounted' is roughly ONE pass, not all of them.
+            double gap = result.TotalMs - total;
+            Console.WriteLine($"unacct'd : {gap:F0}ms of {result.TotalMs:F0}ms total is NOT inside any node's "
+                            + "Execute (host-side orchestration between nodes: shape interp, pool churn, "
+                            + "dispatch setup). A large gap favours capture/replay; a single dominant op "
+                            + "above favours fixing that kernel.");
+        }
+    }
 
     Console.WriteLine($"timing   : encoder {result.EncoderMs:F0}ms, decoder {result.DecoderMs:F0}ms " +
                       $"({config.NumSteps} steps), vocoder {result.VocoderMs:F0}ms, total {result.TotalMs:F0}ms");

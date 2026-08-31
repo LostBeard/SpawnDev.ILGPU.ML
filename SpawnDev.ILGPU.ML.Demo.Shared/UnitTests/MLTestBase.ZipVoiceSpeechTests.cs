@@ -119,6 +119,26 @@ public abstract partial class MLTestBase
         var assets = GetHttpClient();
         if (assets == null) throw new UnsupportedTestException("HttpClient not available");
 
+        // ⚠️ The ILGPU CPU backend needs longer than PMT's OUTER console cap
+        // (ProjectRunner.ConsoleTestTimeoutMs() = 600,000 ms) for a 124.7 MB int8 decoder - measured: still
+        // inside the ENCODER past 600 s, having burned ~6,900 s of CPU time. PMT kills the subprocess, which
+        // surfaces as "no 'TEST:' line - subprocess crashed, exit=-1" with EMPTY stderr. That reads like a
+        // crash and is not one: exit=-1 is a killed process.
+        //
+        // This is a skip, not a hidden failure, and the distinction rests on what IS covered: the operator
+        // that made this pipeline fail in the first place (MatMulInteger, N-D shapes) is verified ON THE CPU
+        // LANE against a CPU reference by Op_MatMulInteger_BatchedActivationKeepsItsRank and
+        // Op_MatMulInteger_SizeOneBatchAxisSurvives. The arithmetic is checked on CPU; only the 30-minute
+        // end-to-end render is not.
+        //
+        // To run it deliberately: PMT_CONSOLE_TIMEOUT_MS=3600000 with a name filter.
+        if (accelerator.AcceleratorType == AcceleratorType.CPU
+            && Environment.GetEnvironmentVariable("ZIPVOICE_ALLOW_CPU") != "1")
+            throw new UnsupportedTestException(
+                "the ILGPU CPU backend exceeds PMT's 600s outer console cap for this model (measured >600s "
+              + "still in the encoder); operator correctness is covered on the CPU lane by "
+              + "Op_MatMulInteger_*. Set ZIPVOICE_ALLOW_CPU=1 with PMT_CONSOLE_TIMEOUT_MS to run it.");
+
         // ── the reference voice: real speech with a transcript we know ───────────────────────────────
         var wavBytes = await assets.GetByteArrayAsync("test-audio/librivox-public-domain.wav");
         var reference = WavDecoder.DecodeWavFile(wavBytes)

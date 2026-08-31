@@ -1138,6 +1138,125 @@ public abstract partial class MLTestBase
             "MatMulInteger (per-row/per-col zp): "));
 
     /// <summary>
+    /// A BATCHED (rank-3) activation against a shared 2-D weight - <c>[S,M,K] x [K,N] -> [S,M,N]</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ <c>MatMulInteger</c> used to return a rank-2 shape unconditionally
+    /// (<c>[a[0], N]</c>) and read the contraction dim from <c>a[1]</c>. Those coincide with the correct
+    /// values ONLY at rank 2, so every existing test passed while any batched activation was doubly wrong:
+    /// the output lost a dimension, and K came out as the batch/middle axis so the product contracted over
+    /// the wrong extent entirely.
+    /// </para>
+    /// <para>
+    /// This is not a corner case - it is every int8-quantised transformer, whose activations are
+    /// <c>[seq, batch, features]</c>. It surfaced on ZipVoice's int8 text encoder, where node 28 produced
+    /// <c>[106,192]</c> against onnxruntime's <c>[13,1,192]</c>. The failure then travelled: a missing axis
+    /// is invisible until some later <c>Shape</c> reads dim 1, gets the feature count instead of the batch,
+    /// and a <c>Reshape</c> target and <c>Slice</c> bound both come out wrong - the graph finally died 194
+    /// nodes downstream on a broadcast that had nothing to do with the cause.
+    /// </para>
+    /// <para>
+    /// So this asserts the SHAPE as well as the values. A shape assertion is the cheap one and it is the
+    /// one that was missing: the values here would also have been wrong, but nothing in the pipeline
+    /// checks a quantised intermediate against a reference, and a deleted size-1 axis produces no error at
+    /// the node that deletes it.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public async Task Op_MatMulInteger_BatchedActivationKeepsItsRank() => await RunTest(async accelerator =>
+    {
+        const int S = 2, M = 3, K = 4, N = 5;
+        var reg = new OperatorRegistry(accelerator);
+        var op = reg.Resolve("MatMulInteger")!;
+
+        // The shape contract first - this alone is what the old code got wrong.
+        var inferred = op.InferOutputShapes(
+            new[] { new[] { S, M, K }, new[] { K, N } }, new Dictionary<string, object>());
+        var got = inferred[0];
+        if (got.Length != 3 || got[0] != S || got[1] != M || got[2] != N)
+            throw new Exception($"MatMulInteger inferred [{string.Join(",", got)}] for [{S},{M},{K}] x "
+                              + $"[{K},{N}]; expected [{S},{M},{N}]. A rank-2 answer DELETES the batch "
+                              + "axis, and nothing downstream reports it until shape arithmetic reads the "
+                              + "wrong dimension much later.");
+
+        // ...then the arithmetic, against a CPU reference. Zero points stay scalar so this isolates the
+        // batching from the zero-point handling the sibling tests already cover.
+        var rng = new Random(4321);
+        var a = new float[S * M * K];
+        var b = new float[K * N];
+        for (int i = 0; i < a.Length; i++) a[i] = rng.Next(0, 256);
+        for (int i = 0; i < b.Length; i++) b[i] = rng.Next(0, 256);
+        const float azp = 128f, bzp = 120f;
+
+        var expected = new float[S * M * N];
+        for (int sIdx = 0; sIdx < S; sIdx++)
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++)
+                {
+                    float sum = 0f;
+                    for (int k = 0; k < K; k++)
+                        sum += (a[sIdx * M * K + m * K + k] - azp) * (b[k * N + n] - bzp);
+                    expected[sIdx * M * N + m * N + n] = sum;
+                }
+
+        using var aBuf = accelerator.Allocate1D(a);
+        using var bBuf = accelerator.Allocate1D(b);
+        using var azpBuf = accelerator.Allocate1D(new[] { azp });
+        using var bzpBuf = accelerator.Allocate1D(new[] { bzp });
+        using var outBuf = accelerator.Allocate1D<float>(S * M * N);
+
+        var ctx = new OnnxOpContext
+        {
+            Inputs = new[]
+            {
+                new Tensor(aBuf.View, new[] { S, M, K }),
+                new Tensor(bBuf.View, new[] { K, N }),
+                new Tensor(azpBuf.View, new[] { 1 }),
+                new Tensor(bzpBuf.View, new[] { 1 }),
+            },
+            Outputs = new[] { new Tensor(outBuf.View, new[] { S, M, N }) },
+            Attributes = new Dictionary<string, object>(),
+            Pool = new BufferPool(accelerator),
+            InputNames = new[] { "A", "B", "a_zero_point", "b_zero_point" },
+            ConstantValues = new Dictionary<string, float[]>
+            {
+                ["A"] = a, ["B"] = b,
+                ["a_zero_point"] = new[] { azp }, ["b_zero_point"] = new[] { bzp },
+            },
+        };
+        op.Execute(ctx);
+        await accelerator.SynchronizeAsync();
+        await AssertCloseGpu(accelerator, outBuf.View, expected, K * 8f,
+            "MatMulInteger (batched [S,M,K] x [K,N]): ");
+    });
+
+    /// <summary>
+    /// The size-1 batch axis specifically - <c>[S,1,K] x [K,N]</c>, which is the exact shape every
+    /// quantised transformer feeds and the one that hid this bug.
+    /// </summary>
+    /// <remarks>
+    /// A middle axis of 1 is the most dangerous case: element COUNTS still match after it is dropped
+    /// (<c>S*1*N == S*N</c>), so nothing that checks sizes notices, and the tensor stays plausible right
+    /// up until a <c>Shape</c> reads it.
+    /// </remarks>
+    [TestMethod]
+    public async Task Op_MatMulInteger_SizeOneBatchAxisSurvives() => await RunTest(async accelerator =>
+    {
+        const int S = 6, K = 4, N = 5;
+        var reg = new OperatorRegistry(accelerator);
+        var inferred = reg.Resolve("MatMulInteger")!.InferOutputShapes(
+            new[] { new[] { S, 1, K }, new[] { K, N } }, new Dictionary<string, object>());
+        var got = inferred[0];
+        if (got.Length != 3 || got[0] != S || got[1] != 1 || got[2] != N)
+            throw new Exception($"MatMulInteger inferred [{string.Join(",", got)}] for [{S},1,{K}] x "
+                              + $"[{K},{N}]; expected [{S},1,{N}]. Element counts match either way "
+                              + $"({S}*1*{N} == {S}*{N}), which is precisely why dropping the axis went "
+                              + "unnoticed - assert the RANK, not the size.");
+        await Task.CompletedTask;
+    });
+
+    /// <summary>
     /// A per-row zero point must not be applied per-COLUMN. Uses a square matrix so both the correct and
     /// the incorrect indexing stay in bounds — only the VALUES differ, so this fails on a plausible-looking
     /// mix-up that no bounds check would catch.
