@@ -1064,10 +1064,11 @@ public class LessOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
             // Negate: output = 1.0 - Greater(a, b)
             reg.ElementWise.Greater(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
             reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, a.ElementCount, -1f);
-            var ones = ctx.Pool.Rent(new[] { 1 }, "_leq_one");
-            ones.Data.SubView(0, 1).CopyFromCPU(new float[] { 1f });
-            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ones.Data, a.ElementCount, 1);
-            ctx.Pool.Return(ones);
+            // +1 as a kernel ARGUMENT, not via a rented buffer and a per-call host->device copy. The old
+            // form issued one synchronous H2D transfer to deliver a single float, which on CUDA implicitly
+            // synchronises the stream and is ILLEGAL mid-graph-capture (it aborted the ZipVoice decoder
+            // capture with "operation not permitted when stream is capturing").
+            reg.ElementWise.AddScalarInPlace(ctx.Outputs[0].Data, a.ElementCount, 1f);
         }
         else
         {
@@ -1089,10 +1090,11 @@ public class GreaterOrEqualOperator(OperatorRegistry reg) : IOnnxOperator
             // a >= b is !(a < b)
             reg.ElementWise.Less(a.Data, b.Data, ctx.Outputs[0].Data, a.ElementCount);
             reg.ElementWise.ScaleInPlace(ctx.Outputs[0].Data, a.ElementCount, -1f);
-            var ones = ctx.Pool.Rent(new[] { 1 }, "_geq_one");
-            ones.Data.SubView(0, 1).CopyFromCPU(new float[] { 1f });
-            reg.ElementWise.AddBias(ctx.Outputs[0].Data, ones.Data, a.ElementCount, 1);
-            ctx.Pool.Return(ones);
+            // +1 as a kernel ARGUMENT, not via a rented buffer and a per-call host->device copy. The old
+            // form issued one synchronous H2D transfer to deliver a single float, which on CUDA implicitly
+            // synchronises the stream and is ILLEGAL mid-graph-capture (it aborted the ZipVoice decoder
+            // capture with "operation not permitted when stream is capturing").
+            reg.ElementWise.AddScalarInPlace(ctx.Outputs[0].Data, a.ElementCount, 1f);
         }
         else
         {

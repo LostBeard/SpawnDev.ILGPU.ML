@@ -30,6 +30,7 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _reluInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>>? _truncateInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _scaleInPlaceKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _addScalarInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _fillKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>>? _broadcastBinaryKernel;
     // Kept alive until next BroadcastBinaryOpND call to avoid synchronous Synchronize()
@@ -306,6 +307,13 @@ public class ElementWiseKernels : IDisposable
         float scalar)
     {
         data[idx] *= scalar;
+    }
+
+    private static void AddScalarInPlaceImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> data,
+        float scalar)
+    {
+        data[idx] += scalar;
     }
 
     /// <summary>In-place add: data[i] += other[i]. Two separate bindings.</summary>
@@ -772,6 +780,22 @@ public class ElementWiseKernels : IDisposable
     {
         EnsureLoaded();
         _scaleInPlaceKernel!(count, data, scalar);
+    }
+
+    /// <summary>Add a constant to every element, in place.</summary>
+    /// <remarks>
+    /// ⚠️ The additive sibling of <see cref="ScaleInPlace"/>, and it exists to remove a per-call
+    /// HOST-TO-DEVICE COPY. Adding a constant used to mean renting a 1-element buffer and doing
+    /// <c>CopyFromCPU(new[]{ value })</c> on every single call - one synchronous H2D transfer to deliver one
+    /// float. That is wasteful in a hot operator, and on CUDA it is worse than wasteful: a synchronous copy
+    /// implicitly synchronises the stream, which is ILLEGAL while a graph capture is recording. It aborted
+    /// the capture of ZipVoice's decoder with "operation not permitted when stream is capturing".
+    /// Passing the scalar as a kernel argument, exactly as ScaleInPlace does, has neither problem.
+    /// </remarks>
+    public void AddScalarInPlace(ArrayView1D<float, Stride1D.Dense> data, int count, float scalar)
+    {
+        EnsureLoaded();
+        _addScalarInPlaceKernel!(count, data, scalar);
     }
 
     /// <summary>
@@ -2047,6 +2071,8 @@ public class ElementWiseKernels : IDisposable
             ArrayView1D<float, Stride1D.Dense>>(TruncateInPlaceImpl);
         _scaleInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, float>(ScaleInPlaceImpl);
+        _addScalarInPlaceKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, float>(AddScalarInPlaceImpl);
         _fillKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, float>(FillImpl);
         _broadcastBinaryKernel ??= accelerator.LoadAutoGroupedStreamKernel<Index1D,

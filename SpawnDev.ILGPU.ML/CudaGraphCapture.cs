@@ -1,3 +1,4 @@
+using System.Linq;
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
@@ -60,6 +61,27 @@ public sealed class CudaGraphCapture : IDisposable
         var acc = session.Accelerator;
         if (acc is not CudaAccelerator) return null;
         if (!CudaStream.SupportsGraphCapture) return null;
+
+        // ⚠️ REFUSE control flow. If/Loop/Scan run their bodies through SubgraphRunner, which calls
+        // BuildExecutor on EVERY execution and allocates permanent buffers there - a device allocation
+        // inside the capture window. That is not a catchable failure: a mid-capture cuMemAlloc is an
+        // UNCATCHABLE 0xC0000005 that takes the process down, so the usual try/catch-and-degrade cannot
+        // save it. Measured on ZipVoice's decoder: segfault, exit 139, from
+        // BufferPool.AllocatePermanent <- SubgraphRunner.BuildExecutor <- IfOperator.ExecuteAsync.
+        //
+        // Refusing here degrades to the direct forward, which is the whole point of a best-effort capture.
+        // The real fix is for SubgraphRunner to build its executor ONCE and reuse it - that would remove a
+        // per-call allocation from every control-flow graph as well as unblocking capture - but a guard
+        // that turns a process crash into a graceful fallback should not wait on that work.
+        var controlFlow = new[] { "If", "Loop", "Scan" };
+        var present = session.OperatorTypes.Where(o => controlFlow.Contains(o)).ToArray();
+        if (present.Length > 0)
+        {
+            Console.WriteLine($"[CudaGraphCapture] graph contains control flow ({string.Join(", ", present)}), "
+                + "whose subgraph executors allocate per call - a mid-capture allocation is an uncatchable "
+                + "access violation; running direct forward.");
+            return null;
+        }
 
         // ⚠️ SAVED and restored in the finally below. This is not tidiness - leaving it on silently
         // CORRUPTS every later direct forward on this session.
