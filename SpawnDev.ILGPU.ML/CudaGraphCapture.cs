@@ -61,6 +61,21 @@ public sealed class CudaGraphCapture : IDisposable
         if (acc is not CudaAccelerator) return null;
         if (!CudaStream.SupportsGraphCapture) return null;
 
+        // ⚠️ SAVED and restored in the finally below. This is not tidiness - leaving it on silently
+        // CORRUPTS every later direct forward on this session.
+        //
+        // The readback cache auto-detects which captured tensors are safe to reuse by probing two runs and
+        // keeping only the values that MATCH across them. Its own documentation calls that "correct by
+        // construction", and it is - given two runs with DIFFERENT data. The capture path below runs its two
+        // warm passes with the SAME `inputs`, because that is what capturing a fixed-shape graph means. So
+        // every readback compares equal and gets cached as "stable", INCLUDING data-derived ones that
+        // genuinely change per call.
+        //
+        // While the flag stays on, those frozen values are seeded into runtimeConstants on every subsequent
+        // run. Measured: after a capture that FAILED and fell through to the direct forward, ZipVoice
+        // rendered at rms 0.0021 instead of 0.0761 - audio that is quietly wrong rather than absent, from a
+        // fallback whose entire purpose is to degrade safely.
+        bool prevCacheReadbacks = session.CacheShapeReadbacks;
         session.CacheShapeReadbacks = true;   // finalize a stable readback cache → the capture pass syncs nothing
         var capStream = (CudaStream)acc.CreateStream();
         Dictionary<string, Tensor> capOut;
@@ -127,6 +142,9 @@ public sealed class CudaGraphCapture : IDisposable
                     // fallback AVs on its next cuMemAlloc (0xC0000005). The invalidated EndCapture reports
                     // failure itself; swallow it - we only need the capture-mode reset. Mirrors the WebGPU path.
                     try { capStream.EndCapture(); } catch { /* expected: capture was invalidated */ }
+                    // The caller degrades to a direct forward and never sees this stream again, so it would
+                    // otherwise leak for the life of the accelerator - once per capture-incompatible graph.
+                    try { capStream.Dispose(); } catch { }
                     throw;
                 }
                 finally { GraphExecutor.SuppressDrains = false; }
@@ -134,6 +152,7 @@ public sealed class CudaGraphCapture : IDisposable
         }
         finally
         {
+            session.CacheShapeReadbacks = prevCacheReadbacks;
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
             GraphExecutor.SuppressDrains = false;

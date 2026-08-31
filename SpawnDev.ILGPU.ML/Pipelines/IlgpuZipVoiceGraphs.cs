@@ -1,4 +1,5 @@
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -50,6 +51,47 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             InferenceSession.CreateFromFile(accelerator, decoderOnnx),
             InferenceSession.CreateFromFile(accelerator, vocoderOnnx),
             accelerator);
+
+    /// <summary>
+    /// Capture-once/replay-many for the flow-matching decoder.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The decoder runs <c>NumSteps</c> times per utterance at IDENTICAL shapes - only the contents of
+    /// <c>t</c> and <c>x</c> change - which is exactly the shape capture/replay wants. It is also where the
+    /// time is: after the whole-tensor reduction fix, a synthesis is 8.1 s of which the decoder is 5.4 s,
+    /// and only ~3.1 s of the 8.2 s is inside any node's Execute. The remaining ~62% is per-node HOST work
+    /// - shape interpretation, pool churn, dispatch setup - which is precisely what a recorded plan skips.
+    /// </para>
+    /// <para>
+    /// ⚠️ A changing scalar input is safe here: <see cref="SessionGraphCapture"/> owns stable input
+    /// buffers and copies each call's tensors into them before replay, so <c>t</c> advancing per Euler step
+    /// is carried through. The real hazard is different and quieter - a small tensor promoted to a runtime
+    /// constant can have its dispatch ELIDED and then stays frozen at its capture-time value forever. That
+    /// failure produces confident, plausible audio, so it cannot be caught by listening; it is caught by
+    /// rendering with and without capture and comparing the samples. Done: bit-identical.
+    /// </para>
+    /// <para>
+    /// Capture is best-effort - only CUDA and WebGPU are eligible, and any failure falls through to the
+    /// direct forward rather than failing generation.
+    /// </para>
+    /// </remarks>
+    private SessionGraphCapture? _decoderCapture;
+
+    /// <summary>Enable capture/replay of the decoder. Off disables it entirely (plain RunAsync).</summary>
+    public bool EnableGraphCapture { get; set; } = true;
+
+    /// <summary>
+    /// Whether a decoder capture is actually LIVE - i.e. calls are replaying a recorded plan.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ "Enabled" is a request, not an outcome. <see cref="SessionGraphCapture"/> falls through to
+    /// the direct forward when capture is ineligible (non-CUDA/WebGPU) or when TryCapture returns null -
+    /// and the null path prints NOTHING. Without this property a caller measuring "capture on" cannot tell
+    /// a replay from a plain run, and would happily report that capture "did not help" when it never
+    /// engaged at all.
+    /// </remarks>
+    public bool DecoderCaptured => _decoderCapture?.IsCaptured ?? false;
 
     /// <summary>
     /// Run one of the three graphs, naming WHICH one - and with what input shapes - if it throws.
@@ -125,7 +167,20 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             ["guidance_scale"] = new Tensor(guidanceBuffer.View, Array.Empty<int>()),
         };
 
-        var outputs = await RunStageAsync(_decoder, "DECODER", Rename(inputs, _decoder));
+        _decoderCapture ??= new SessionGraphCapture(_decoder, _accelerator) { Enabled = EnableGraphCapture };
+        _decoderCapture.Enabled = EnableGraphCapture;
+        var renamed = Rename(inputs, _decoder);
+        Dictionary<string, Tensor> outputs;
+        try
+        {
+            outputs = await _decoderCapture.RunAsync(renamed);
+        }
+        catch (Exception ex)
+        {
+            var shapes = string.Join(", ", renamed.Select(kv => $"{kv.Key}[{string.Join(",", kv.Value.Shape)}]"));
+            throw new InvalidOperationException(
+                $"ZipVoice DECODER graph failed with inputs {shapes}: {ex.Message}", ex);
+        }
         return await ReadAsync(outputs[_decoder.OutputNames[0]]);
     }
 
@@ -194,6 +249,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
 
     public void Dispose()
     {
+        _decoderCapture?.Dispose(); _decoderCapture = null;
         if (!_ownsSessions) return;
         _encoder.Dispose();
         _decoder.Dispose();

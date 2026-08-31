@@ -202,7 +202,16 @@ int Synth(string fixturePath, string? outPath)
             InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(decPath)),
             InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(vocPath)),
             accelerator);
-        Console.WriteLine($"engine   : ILGPU ({accelerator.Name})");
+        // ZIPVOICE_NO_CAPTURE=1 forces the plain forward. Needed as the CONTROL: a capture that froze an
+        // elided dispatch still renders confident, plausible audio, so the only way to detect it is to
+        // render both ways and compare samples.
+        if (Environment.GetEnvironmentVariable("ZIPVOICE_NO_CAPTURE") == "1")
+            ((IlgpuZipVoiceGraphs)graphs).EnableGraphCapture = false;
+        // Print the accelerator TYPE, not just the device name. "NVIDIA GeForce RTX 4070" is the same
+        // string whether ILGPU reached it through CUDA or OpenCL, and graph capture is CUDA-only - so the
+        // name alone cannot tell you why a capture silently did not engage.
+        Console.WriteLine($"engine   : ILGPU {accelerator.AcceleratorType} ({accelerator.Name}), decoder capture "
+                        + $"{(((IlgpuZipVoiceGraphs)graphs).EnableGraphCapture ? "ON" : "OFF")}");
     }
     else
     {
@@ -288,6 +297,11 @@ int Synth(string fixturePath, string? outPath)
         }
     }
 
+    if (graphs is IlgpuZipVoiceGraphs ig)
+        Console.WriteLine($"capture  : requested={ig.EnableGraphCapture}, LIVE={ig.DecoderCaptured}"
+                        + (ig.EnableGraphCapture && !ig.DecoderCaptured
+                           ? "  <- capture was requested but did NOT engage; timings below are a plain forward"
+                           : ""));
     Console.WriteLine($"timing   : encoder {result.EncoderMs:F0}ms, decoder {result.DecoderMs:F0}ms " +
                       $"({config.NumSteps} steps), vocoder {result.VocoderMs:F0}ms, total {result.TotalMs:F0}ms");
     Console.WriteLine($"audio    : {result.Audio.Length} samples @ {result.SampleRate} Hz " +
