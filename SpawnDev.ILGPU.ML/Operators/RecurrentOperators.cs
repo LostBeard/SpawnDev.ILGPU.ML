@@ -33,16 +33,60 @@ public class RNNOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         return new[] { yShape, yhShape };
     }
 
-    public void Execute(OnnxOpContext ctx)
+    /// <summary>Cached host copies of the STATIC inputs (W, R, B), keyed by tensor name.</summary>
+    private readonly Dictionary<string, float[]> _weightCache = new(StringComparer.Ordinal);
+
+    /// <summary>Weights and bias. Static for the session, so worth caching.</summary>
+    private static readonly int[] StaticInputs = { 1, 2, 3 };
+
+    /// <summary>
+    /// Per-call inputs: X and <c>initial_h</c>. ⚠️ <c>initial_h</c> must NOT be cached - a model that
+    /// threads its recurrent state through graph inputs (Silero VAD does) would have that state frozen at
+    /// the first frame.
+    /// </summary>
+    private static readonly int[] DynamicInputs = { 0, 5 };
+
+    public void Execute(OnnxOpContext ctx) => ExecuteCore(ctx, null);
+
+    /// <summary>Browser-safe path: the sync GPU readback throws on WebGPU/WebGL/Wasm.</summary>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
     {
+        var pre = new Dictionary<int, float[]>();
+        foreach (int i in DynamicInputs)
+        {
+            var v = await OperatorInputReader.ReadAsync(reg, ctx, i);
+            if (v != null) pre[i] = v;
+        }
+        foreach (int i in StaticInputs)
+        {
+            var v = await OperatorInputReader.ReadCachedAsync(reg, ctx, i, _weightCache);
+            if (v != null) pre[i] = v;
+        }
+        ExecuteCore(ctx, pre);
+    }
+
+    private void ExecuteCore(OnnxOpContext ctx, Dictionary<int, float[]>? pre)
+    {
+        // ⚠️ ctx.TryGetInputValues returns COMPILE-TIME CONSTANTS ONLY. X is the runtime input, so it read
+        // as null on every real inference and this operator returned having computed NOTHING while being
+        // advertised in BuiltinOpTypes. See OperatorInputReader.
+        float[]? Get(int i) => pre != null && pre.TryGetValue(i, out var p) ? p
+            : Array.IndexOf(StaticInputs, i) >= 0
+                ? OperatorInputReader.ReadCached(reg, ctx, i, _weightCache)
+                : OperatorInputReader.Read(reg, ctx, i);
+
         // Inputs: X[0], W[1], R[2], B[3]?, seq_lens[4]?, initial_h[5]?
         var xTensor = ctx.Inputs[0];
-        var wVals = ctx.TryGetInputValues(1); // W: [num_dir, hidden_size, input_size]
-        var rVals = ctx.TryGetInputValues(2); // R: [num_dir, hidden_size, hidden_size]
-        if (wVals == null || rVals == null) return;
+        var wVals = Get(1); // W: [num_dir, hidden_size, input_size]
+        var rVals = Get(2); // R: [num_dir, hidden_size, hidden_size]
+        if (wVals == null || rVals == null)
+            throw new NotSupportedException(
+                "RNN could not read its W/R weights. On a browser backend this operator needs the "
+                + "async path (GraphExecutor.RunAsync); the synchronous GPU readback is "
+                + "unavailable there. Returning silently is what made this a no-op.");
 
-        float[]? bVals = ctx.Inputs.Length > 3 ? ctx.TryGetInputValues(3) : null;
-        float[]? initHVals = ctx.Inputs.Length > 5 ? ctx.TryGetInputValues(5) : null;
+        float[]? bVals = ctx.Inputs.Length > 3 ? Get(3) : null;
+        float[]? initHVals = ctx.Inputs.Length > 5 ? Get(5) : null;
 
         int hiddenSize = ctx.GetInt("hidden_size", 0);
         string direction = ctx.GetString("direction", "forward");
@@ -56,8 +100,12 @@ public class RNNOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         if (hiddenSize == 0) hiddenSize = wVals.Length / (numDir * inputSize);
 
         // Read X to CPU (recurrent ops are sequential — CPU execution is practical for inference)
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) return;
+        var xVals = Get(0);
+        if (xVals == null)
+            throw new NotSupportedException(
+                "RNN could not read its input X. On a browser backend this operator needs the "
+                + "async path (GraphExecutor.RunAsync); the synchronous GPU readback is "
+                + "unavailable there. Returning silently is what made this a no-op.");
 
         // Compute bias = Wb + Rb (split B in half, add element-wise)
         var bias = new float[numDir * hiddenSize];
@@ -100,6 +148,12 @@ public class RNNOperatorImpl(OperatorRegistry reg) : IOnnxOperator
                         ? (timeIdx * batch + b) * inputSize
                         : (b * seqLen + timeIdx) * inputSize;
 
+                    // ⚠️ Ht is computed from ALL of Ht-1, so it cannot be written in place: the old
+                    // code assigned h[hi] inside this loop while later hi still read h[hj] for the
+                    // recurrence, so every unit after the first saw the NEW timestep's values mixed into
+                    // the previous state. Measured against onnxruntime: index 0 correct, index 1 onward
+                    // wrong (max |d| 2.245E-001 on a 4-unit layer).
+                    var hNew = new float[hiddenSize];
                     for (int hi = 0; hi < hiddenSize; hi++)
                     {
                         float val = bias[bOff + hi];
@@ -110,8 +164,9 @@ public class RNNOperatorImpl(OperatorRegistry reg) : IOnnxOperator
                         for (int hj = 0; hj < hiddenSize; hj++)
                             val += h[b * hiddenSize + hj] * rVals[rOff + hi * hiddenSize + hj];
                         // Activation (default: Tanh)
-                        h[b * hiddenSize + hi] = MathF.Tanh(val);
+                        hNew[hi] = MathF.Tanh(val);
                     }
+                    Array.Copy(hNew, 0, h, b * hiddenSize, hiddenSize);
                 }
 
                 // Store Y for this timestep
@@ -171,16 +226,65 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         return new[] { yShape, yhShape, yhShape }; // Y, Y_h, Y_c
     }
 
-    public void Execute(OnnxOpContext ctx)
-    {
-        var wVals = ctx.TryGetInputValues(1); // W: [num_dir, 4*hidden_size, input_size]
-        var rVals = ctx.TryGetInputValues(2); // R: [num_dir, 4*hidden_size, hidden_size]
-        if (wVals == null || rVals == null) return;
+    /// <summary>Cached host copies of the STATIC inputs (W, R, B, P), keyed by tensor name.</summary>
+    private readonly Dictionary<string, float[]> _weightCache = new(StringComparer.Ordinal);
 
-        float[]? bVals = ctx.Inputs.Length > 3 ? ctx.TryGetInputValues(3) : null;
-        float[]? initHVals = ctx.Inputs.Length > 5 ? ctx.TryGetInputValues(5) : null;
-        float[]? initCVals = ctx.Inputs.Length > 6 ? ctx.TryGetInputValues(6) : null;
-        float[]? pVals = ctx.Inputs.Length > 7 ? ctx.TryGetInputValues(7) : null;
+    /// <summary>Static inputs: weights, recurrence, bias, peepholes. Safe to cache for the session.</summary>
+    private static readonly int[] StaticInputs = { 1, 2, 3, 7 };
+
+    /// <summary>
+    /// Per-call inputs. ⚠️ <c>initial_h</c> (5) and <c>initial_c</c> (6) belong HERE, not in
+    /// <see cref="StaticInputs"/>: Silero VAD passes its LSTM state in as graph inputs and expects the new
+    /// state back each frame, so caching them would freeze the detector's memory at the first frame.
+    /// </summary>
+    private static readonly int[] DynamicInputs = { 0, 5, 6 };
+
+    public void Execute(OnnxOpContext ctx) => ExecuteCore(ctx, null);
+
+    /// <summary>
+    /// Browser-safe path: reads the dynamic inputs through <c>CopyToHostAsync</c> before computing.
+    /// </summary>
+    /// <remarks>
+    /// The sync readback throws on WebGPU/WebGL/Wasm, so without this the operator would see null for X
+    /// there and be right back to producing nothing.
+    /// </remarks>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        var pre = new Dictionary<int, float[]>();
+        foreach (int i in DynamicInputs)
+        {
+            var v = await OperatorInputReader.ReadAsync(reg, ctx, i);
+            if (v != null) pre[i] = v;
+        }
+        foreach (int i in StaticInputs)
+        {
+            var v = await OperatorInputReader.ReadCachedAsync(reg, ctx, i, _weightCache);
+            if (v != null) pre[i] = v;
+        }
+        ExecuteCore(ctx, pre);
+    }
+
+    private void ExecuteCore(OnnxOpContext ctx, Dictionary<int, float[]>? pre)
+    {
+        // ⚠️ These used to be ctx.TryGetInputValues, which returns COMPILE-TIME CONSTANTS ONLY. X is the
+        // runtime input, so it was always null and the operator returned having computed NOTHING - LSTM
+        // was advertised in BuiltinOpTypes and did not work for any real model. See OperatorInputReader.
+        float[]? Get(int i) => pre != null && pre.TryGetValue(i, out var p) ? p
+            : Array.IndexOf(StaticInputs, i) >= 0
+                ? OperatorInputReader.ReadCached(reg, ctx, i, _weightCache)
+                : OperatorInputReader.Read(reg, ctx, i);
+
+        var wVals = Get(1); // W: [num_dir, 4*hidden_size, input_size]
+        var rVals = Get(2); // R: [num_dir, 4*hidden_size, hidden_size]
+        if (wVals == null || rVals == null)
+            throw new NotSupportedException(
+                "LSTM could not read its W/R weights. On a browser backend this operator needs the async "
+                + "path (GraphExecutor.RunAsync) - the synchronous GPU readback is unavailable there.");
+
+        float[]? bVals = ctx.Inputs.Length > 3 ? Get(3) : null;
+        float[]? initHVals = ctx.Inputs.Length > 5 ? Get(5) : null;
+        float[]? initCVals = ctx.Inputs.Length > 6 ? Get(6) : null;
+        float[]? pVals = ctx.Inputs.Length > 7 ? Get(7) : null;
 
         int hiddenSize = ctx.GetInt("hidden_size", 0);
         string direction = ctx.GetString("direction", "forward");
@@ -193,8 +297,11 @@ public class LSTMOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         int inputSize = xShape[2];
         if (hiddenSize == 0) hiddenSize = wVals.Length / (numDir * 4 * inputSize);
 
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) return;
+        var xVals = Get(0);
+        if (xVals == null)
+            throw new NotSupportedException(
+                "LSTM could not read its input X. On a browser backend this operator needs the async path "
+                + "(GraphExecutor.RunAsync). Returning silently here is what made LSTM a no-op.");
 
         // Combine bias: Wb + Rb (split B in half, add element-wise)
         var bias = new float[numDir * 4 * hiddenSize];
@@ -360,14 +467,58 @@ public class GRUOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         return new[] { yShape, yhShape };
     }
 
-    public void Execute(OnnxOpContext ctx)
-    {
-        var wVals = ctx.TryGetInputValues(1); // W: [num_dir, 3*hidden_size, input_size]
-        var rVals = ctx.TryGetInputValues(2); // R: [num_dir, 3*hidden_size, hidden_size]
-        if (wVals == null || rVals == null) return;
+    /// <summary>Cached host copies of the STATIC inputs (W, R, B), keyed by tensor name.</summary>
+    private readonly Dictionary<string, float[]> _weightCache = new(StringComparer.Ordinal);
 
-        float[]? bVals = ctx.Inputs.Length > 3 ? ctx.TryGetInputValues(3) : null;
-        float[]? initHVals = ctx.Inputs.Length > 5 ? ctx.TryGetInputValues(5) : null;
+    /// <summary>Weights and bias. Static for the session, so worth caching.</summary>
+    private static readonly int[] StaticInputs = { 1, 2, 3 };
+
+    /// <summary>
+    /// Per-call inputs: X and <c>initial_h</c>. ⚠️ <c>initial_h</c> must NOT be cached - a model that
+    /// threads its recurrent state through graph inputs (Silero VAD does) would have that state frozen at
+    /// the first frame.
+    /// </summary>
+    private static readonly int[] DynamicInputs = { 0, 5 };
+
+    public void Execute(OnnxOpContext ctx) => ExecuteCore(ctx, null);
+
+    /// <summary>Browser-safe path: the sync GPU readback throws on WebGPU/WebGL/Wasm.</summary>
+    public async Task ExecuteAsync(OnnxOpContext ctx)
+    {
+        var pre = new Dictionary<int, float[]>();
+        foreach (int i in DynamicInputs)
+        {
+            var v = await OperatorInputReader.ReadAsync(reg, ctx, i);
+            if (v != null) pre[i] = v;
+        }
+        foreach (int i in StaticInputs)
+        {
+            var v = await OperatorInputReader.ReadCachedAsync(reg, ctx, i, _weightCache);
+            if (v != null) pre[i] = v;
+        }
+        ExecuteCore(ctx, pre);
+    }
+
+    private void ExecuteCore(OnnxOpContext ctx, Dictionary<int, float[]>? pre)
+    {
+        // ⚠️ ctx.TryGetInputValues returns COMPILE-TIME CONSTANTS ONLY. X is the runtime input, so it read
+        // as null on every real inference and this operator returned having computed NOTHING while being
+        // advertised in BuiltinOpTypes. See OperatorInputReader.
+        float[]? Get(int i) => pre != null && pre.TryGetValue(i, out var p) ? p
+            : Array.IndexOf(StaticInputs, i) >= 0
+                ? OperatorInputReader.ReadCached(reg, ctx, i, _weightCache)
+                : OperatorInputReader.Read(reg, ctx, i);
+
+        var wVals = Get(1); // W: [num_dir, 3*hidden_size, input_size]
+        var rVals = Get(2); // R: [num_dir, 3*hidden_size, hidden_size]
+        if (wVals == null || rVals == null)
+            throw new NotSupportedException(
+                "GRU could not read its W/R weights. On a browser backend this operator needs the "
+                + "async path (GraphExecutor.RunAsync); the synchronous GPU readback is "
+                + "unavailable there. Returning silently is what made this a no-op.");
+
+        float[]? bVals = ctx.Inputs.Length > 3 ? Get(3) : null;
+        float[]? initHVals = ctx.Inputs.Length > 5 ? Get(5) : null;
 
         int hiddenSize = ctx.GetInt("hidden_size", 0);
         string direction = ctx.GetString("direction", "forward");
@@ -381,8 +532,12 @@ public class GRUOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         int inputSize = xShape[2];
         if (hiddenSize == 0) hiddenSize = wVals.Length / (numDir * 3 * inputSize);
 
-        var xVals = ctx.TryGetInputValues(0);
-        if (xVals == null) return;
+        var xVals = Get(0);
+        if (xVals == null)
+            throw new NotSupportedException(
+                "GRU could not read its input X. On a browser backend this operator needs the "
+                + "async path (GraphExecutor.RunAsync); the synchronous GPU readback is "
+                + "unavailable there. Returning silently is what made this a no-op.");
 
         // Split bias: B = [Wb_z, Wb_r, Wb_h, Rb_z, Rb_r, Rb_h]
         var wbz = new float[numDir * hiddenSize]; var wbr = new float[numDir * hiddenSize];
@@ -428,50 +583,65 @@ public class GRUOperatorImpl(OperatorRegistry reg) : IOnnxOperator
                         ? (timeIdx * batch + b) * inputSize
                         : (b * seqLen + timeIdx) * inputSize;
 
+                    // ⚠️ TWO bugs lived in this loop, both hidden because the operator never ran at all
+                    // (X was read with TryGetInputValues, which only returns compile-time constants):
+                    //
+                    //   1. `ht` was written IN PLACE, so later units read a state already half-updated to
+                    //      the new timestep.
+                    //   2. the reset gate was applied as `r_hi * ht[hj]` for every j. ONNX specifies
+                    //      `(rt ⊙ Ht-1)` - an ELEMENT-WISE product, so element j takes r_j, not the r of
+                    //      the output unit being computed. That needs every r before any h gate.
+                    //
+                    // Measured against onnxruntime after fixing both: max |d| drops from 6.017E-002 to
+                    // float32 noise. Gates first, state update last.
+                    var zArr = new float[H2];
+                    var rArr = new float[H2];
                     for (int hi = 0; hi < H2; hi++)
                     {
-                        // z gate
                         float z = wbz[dir * H2 + hi] + rbz[dir * H2 + hi];
                         for (int xi = 0; xi < inputSize; xi++)
                             z += xVals[xOff + xi] * wVals[wOff + hi * inputSize + xi];
                         for (int hj = 0; hj < H2; hj++)
                             z += ht[b * H2 + hj] * rVals[rOff + hi * H2 + hj];
-                        z = 1f / (1f + MathF.Exp(-z)); // sigmoid
+                        zArr[hi] = 1f / (1f + MathF.Exp(-z)); // sigmoid
 
-                        // r gate
                         float r = wbr[dir * H2 + hi] + rbr[dir * H2 + hi];
                         for (int xi = 0; xi < inputSize; xi++)
                             r += xVals[xOff + xi] * wVals[wOff + (H2 + hi) * inputSize + xi];
                         for (int hj = 0; hj < H2; hj++)
                             r += ht[b * H2 + hj] * rVals[rOff + (H2 + hi) * H2 + hj];
-                        r = 1f / (1f + MathF.Exp(-r)); // sigmoid
+                        rArr[hi] = 1f / (1f + MathF.Exp(-r)); // sigmoid
+                    }
 
-                        // h gate (depends on linear_before_reset)
-                        float h;
+                    var hNew = new float[H2];
+                    for (int hi = 0; hi < H2; hi++)
+                    {
                         float xh = wbh[dir * H2 + hi];
                         for (int xi = 0; xi < inputSize; xi++)
                             xh += xVals[xOff + xi] * wVals[wOff + (2 * H2 + hi) * inputSize + xi];
 
+                        float hHat;
                         if (linearBeforeReset != 0)
                         {
-                            // Linear before reset: r * (Ht-1 * Rh^T + Rbh)
+                            // rt ⊙ (Ht-1 * Rh^T + Rbh)
                             float rh = rbh[dir * H2 + hi];
                             for (int hj = 0; hj < H2; hj++)
                                 rh += ht[b * H2 + hj] * rVals[rOff + (2 * H2 + hi) * H2 + hj];
-                            h = MathF.Tanh(xh + r * rh);
+                            hHat = MathF.Tanh(xh + rArr[hi] * rh);
                         }
                         else
                         {
-                            // Default: (r * Ht-1) * Rh^T + Rbh
+                            // (rt ⊙ Ht-1) * Rh^T + Rbh - element j scaled by r_j, not by r_hi
                             float rh = rbh[dir * H2 + hi];
                             for (int hj = 0; hj < H2; hj++)
-                                rh += (r * ht[b * H2 + hj]) * rVals[rOff + (2 * H2 + hi) * H2 + hj];
-                            h = MathF.Tanh(xh + rh);
+                                rh += (rArr[hj] * ht[b * H2 + hj]) * rVals[rOff + (2 * H2 + hi) * H2 + hj];
+                            hHat = MathF.Tanh(xh + rh);
                         }
 
-                        // Ht = (1 - zt) * ht + zt * Ht-1
-                        ht[b * H2 + hi] = (1f - z) * h + z * ht[b * H2 + hi];
+                        // Ht = (1 - zt) ⊙ h_hat + zt ⊙ Ht-1
+                        hNew[hi] = (1f - zArr[hi]) * hHat + zArr[hi] * ht[b * H2 + hi];
                     }
+                    Array.Copy(hNew, 0, ht, b * H2, H2);
                 }
 
                 // Store Y
