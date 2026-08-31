@@ -218,6 +218,15 @@ public abstract partial class MLTestBase
         // integration between them happens on the HOST, so each step is a GPU round trip on the largest
         // model in the pipeline (fm_decoder_int8, 124.7 MB). That is the same shape that cost the Silero
         // VAD 22.8x before its readbacks were removed.
+        // ⚠️ Readbacks and sync drains, because the browser is 23x slower than CUDA on IDENTICAL code
+        // and that gap is far too large to be backend arithmetic. The Silero VAD had the same shape and the
+        // cause was readbacks, not dispatch count: driving them 16 -> 0 took it from 177.9 to 7.81 ms/frame
+        // (22.8x). Print the counters rather than guessing which it is this time.
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] host cost: "
+                        + $"{Graph.GraphExecutor.LastRunReadbackCount} readbacks "
+                        + $"({Graph.GraphExecutor.LastRunReadbackMs:F0} ms), "
+                        + $"{Graph.GraphExecutor.LastRunSyncDrainCount} sync drains "
+                        + $"({Graph.GraphExecutor.LastRunSyncDrainMs:F0} ms) on the LAST graph run");
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] stage split: "
                         + $"encoder {result.EncoderMs:F0} ms, decoder {result.DecoderMs:F0} ms, "
                         + $"vocoder {result.VocoderMs:F0} ms, total {result.TotalMs:F0} ms "
