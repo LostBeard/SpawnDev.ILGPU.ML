@@ -3639,6 +3639,36 @@ public class GraphExecutor : IDisposable
     private static bool ReadbackNeedsValueAt(string op, int index)
         => !ReadbackValueNeedingInputs.TryGetValue(op, out var idx) || Array.IndexOf(idx, index) >= 0;
 
+    /// <summary>
+    /// Ops that never read a host value THEMSELVES, but whose own output value - if something downstream
+    /// needs it - can only be produced by the CPU shape interpreter from their inputs' values.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// These are the ops for which "does this input need a readback" is not answerable locally: it depends
+    /// on whether anything downstream reads the RESULT. <c>Concat</c> is the motivating case and the only
+    /// verified entry - <c>ConcatOperator.Execute</c> works entirely on GPU tensors (copies plus shape
+    /// metadata) and never calls <c>TryGetInputValues</c> or <c>OperatorInputReader</c>. But a Concat is
+    /// also how a Reshape's target shape gets built, and THAT one genuinely needs its inputs' values.
+    /// </para>
+    /// <para>
+    /// Listing it per-op forced the pessimistic answer everywhere. MEASURED on Silero VAD: after the
+    /// per-position fix, all TEN remaining per-frame readbacks were pinned by Concat alone - both LSTM
+    /// nodes' Y_h/Y_c feeding the Concats that build new_h/new_c (graph outputs), and the
+    /// adaptive_normalization slices feeding a Concat whose only consumer is a Conv. Not one of those ten
+    /// values is ever read on the host.
+    /// </para>
+    /// <para>
+    /// ⚠️ Adding an op here is the DANGEROUS direction - it can remove a readback something needed. Only
+    /// add one whose <c>Execute</c> you have read and confirmed touches no host value, and remember the
+    /// propagation below still keeps the readback whenever the output IS needed.
+    /// </para>
+    /// </remarks>
+    private static readonly HashSet<string> ReadbackValuePropagators = new(StringComparer.Ordinal)
+    {
+        "Concat",
+    };
+
     /// <summary>Ops that read at least one input's runtime-constant VALUE and have NO correct GPU-only
     /// fallback for it — i.e. they GENUINELY need the readback (shape/index/param resolution). If an
     /// output feeds any of these, it is NEVER skipped. Over-inclusion here is safe (it only keeps a
@@ -3683,16 +3713,50 @@ public class GraphExecutor : IDisposable
             }
         }
 
+        // Which tensors are genuinely read as a host VALUE, computed backwards to a fixed point.
+        //
+        // The seed is local: a tensor consumed at a position a requires-value op really reads. The
+        // propagation is what the local test could not express - a Concat needs its inputs' values ONLY if
+        // its own output value is needed (it is how a Reshape's target shape gets built), and needs
+        // nothing when it is just concatenating data. Without this, Concat pinned every readback left on
+        // Silero VAD.
+        var needsValue = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in graph.Nodes)
+        {
+            if (!ReadbackRequiresValueConsumers.Contains(node.OpType)) continue;
+            if (ReadbackValuePropagators.Contains(node.OpType)) continue;   // seeded by propagation instead
+            for (int ii = 0; ii < node.InputNames.Length; ii++)
+            {
+                var inp = node.InputNames[ii];
+                if (!string.IsNullOrEmpty(inp) && ReadbackNeedsValueAt(node.OpType, ii))
+                    needsValue.Add(inp);
+            }
+        }
+        // Propagate backwards through the propagators until nothing new is marked. The graph is a DAG and
+        // each pass can only add, so this terminates; models here are small enough that the simple loop is
+        // not worth replacing with a worklist.
+        bool grew = true;
+        while (grew)
+        {
+            grew = false;
+            foreach (var node in graph.Nodes)
+            {
+                if (!ReadbackValuePropagators.Contains(node.OpType)) continue;
+                bool outputNeeded = node.OutputNames.Any(o => !string.IsNullOrEmpty(o) && needsValue.Contains(o));
+                if (!outputNeeded) continue;
+                foreach (var inp in node.InputNames)
+                    if (!string.IsNullOrEmpty(inp) && needsValue.Add(inp)) grew = true;
+            }
+        }
+
         foreach (var node in graph.Nodes)
         {
             foreach (var o in node.OutputNames)
             {
                 if (string.IsNullOrEmpty(o)) continue;
                 var cons = consumerOps.GetValueOrDefault(o);
-                // Any consumer that genuinely needs the value AT THE POSITION IT READS THIS TENSOR must
-                // keep the readback. A Squeeze consuming a data tensor at input 0 does not qualify.
-                if (cons != null && cons.Any(c => ReadbackRequiresValueConsumers.Contains(c.Op)
-                                                  && ReadbackNeedsValueAt(c.Op, c.Index))) continue;
+                // Something downstream really reads this as a host value → the readback stays.
+                if (needsValue.Contains(o)) continue;
                 bool featureProducer = ReadbackFeatureOnlyProducers.Contains(node.OpType);
                 // Rule B: every consumer is itself a feature-only op (which never reads a value). Vacuously
                 // true for a dead/graph-output tensor (nothing reads its value either).
