@@ -116,6 +116,9 @@ public class GraphCompiler
         var integerConstNames = new HashSet<string>();
 
         // Optional shape tracing, see the SHAPE_TRACE line below.
+        // Hoisted: this is consulted per Gather NODE, and an env lookup per node at compile time is a
+        // syscall the compiler does not need.
+        bool _traceScalars = Environment.GetEnvironmentVariable("ML_TRACE_SCALARS") == "1";
         var _traceShapes = Environment.GetEnvironmentVariable("ML_TRACE_SHAPES");
         if (string.IsNullOrEmpty(_traceShapes)) _traceShapes = null;
         if (_traceShapes != null) Console.WriteLine($"[SHAPE_TRACE] enabled, matching '{_traceShapes}', {sorted.Count} nodes");
@@ -222,6 +225,37 @@ public class GraphCompiler
                     outputShapes = new[] { new[] { 1 } };
             }
 
+            // ── ONNX Gather rank rule for a RANK-0 index ──
+            // out rank = data.rank - 1 + indices.rank, so a rank-0 index DROPS the gathered axis. The
+            // operator cannot see this itself: every scalar is stored as rank-1 [1], so it receives [1] for
+            // both a true scalar and a 1-element vector and has to keep the axis to stay safe for the
+            // vector case. ScalarTensorNames carries the distinction the storage format loses.
+            //
+            // ⚠️ Only the compile-time SHAPE changes; the buffer is still one element. Without this,
+            // Gather(Shape[R], scalarIdx) reported rank 1, the following Unsqueeze produced [1,1] instead
+            // of [1], and the Concat assembling a dim list got [[1,1];[1]] - see ScalarTensorNames for the
+            // ZipVoice measurement.
+            if (node.OpType == "Gather" && node.Inputs.Count >= 2 && _traceScalars)
+                Console.WriteLine($"[scalars] Gather '{node.Outputs[0]}' idx='{node.Inputs[1]}' "
+                    + $"isScalar={graph.ScalarTensorNames?.Contains(node.Inputs[1])} "
+                    + $"dataKnown={knownShapes.ContainsKey(node.Inputs[0])} "
+                    + $"dataShape=[{(knownShapes.TryGetValue(node.Inputs[0], out var _dbg) ? string.Join(",", _dbg) : "?")}]");
+
+            if (node.OpType == "Gather" && node.Inputs.Count >= 2
+                && graph.ScalarTensorNames != null && graph.ScalarTensorNames.Contains(node.Inputs[1])
+                && knownShapes.TryGetValue(node.Inputs[0], out var gDataShape) && gDataShape.Length > 0)
+            {
+                int gAxis = attrs.TryGetValue("axis", out var gAxObj) ? Convert.ToInt32(gAxObj) : 0;
+                if (gAxis < 0) gAxis += gDataShape.Length;
+                if (gAxis >= 0 && gAxis < gDataShape.Length)
+                {
+                    var dropped = new List<int>();
+                    for (int gd = 0; gd < gDataShape.Length; gd++)
+                        if (gd != gAxis) dropped.Add(gDataShape[gd]);
+                    outputShapes = new[] { dropped.ToArray() };   // rank-0 when data was rank-1
+                }
+            }
+
             // Compile-time evaluation of Shape nodes: output = input's known shape as a 1D tensor.
             // Skip folding for graph inputs with dynamic dims — their compile-time shapes
             // (with d<=0 replaced by 1) produce wrong values for downstream Reshape/Resize.
@@ -274,7 +308,16 @@ public class GraphCompiler
                 if (gIdx < 0) gIdx += gatherSrc.Length;
                 if (gIdx >= 0 && gIdx < gatherSrc.Length)
                 {
-                    outputShapes = new[] { new[] { 1 } }; // scalar as 1D
+                    // ⚠️ "scalar as 1D" is the STORAGE shape, and it used to be the inferred shape too -
+                    // which silently discarded the ONNX rank rule on the constant-folded path. A rank-0
+                    // index makes this Gather rank-0 (data.rank - 1 + 0), and the fold has to say so or the
+                    // following Unsqueeze adds an axis to a rank it should not have had. The uncorrected
+                    // block above is reached only when the fold does not apply, so both paths need it.
+                    outputShapes = new[] {
+                        graph.ScalarTensorNames != null && graph.ScalarTensorNames.Contains(node.Inputs[1])
+                            && knownShapes.TryGetValue(node.Inputs[0], out var gfData) && gfData.Length == 1
+                            ? Array.Empty<int>()
+                            : new[] { 1 } };
                     if (node.Outputs.Count > 0)
                     {
                         graph.ConstantData[node.Outputs[0]] = new[] { gatherSrc[gIdx] };
@@ -1198,6 +1241,7 @@ public class GraphCompiler
             OutputShapes = graph.Outputs.ToDictionary(o => o.Name, o => knownShapes.TryGetValue(o.Name, out var s) ? s : Array.Empty<int>()),
             InitializerNames = graph.Initializers.Keys.ToHashSet(),
             InitializerDataTypes = graph.InitializerDataTypes,
+            ScalarTensorNames = graph.ScalarTensorNames,
             FoldedShapeConstants = foldedConstants,
         };
       }
@@ -1293,6 +1337,11 @@ public class CompiledGraph
     /// to seed integer-tensor dataflow propagation. Null when the source model didn't
     /// supply dtype information (e.g., TFLite / CoreML paths).</summary>
     public Dictionary<string, int>? InitializerDataTypes { get; init; }
+
+    /// <summary>ONNX rank-0 tensor names - see <see cref="ModelGraph.ScalarTensorNames"/>.
+    /// The RUNTIME shape overrides need this too: they recompute Gather's output from live tensor
+    /// shapes, where a scalar is indistinguishable from a [1] vector for exactly the same reason.</summary>
+    public HashSet<string>? ScalarTensorNames { get; init; }
     /// <summary>Compile-time-constant node outputs (&lt;=64 elem, name -&gt; fp32) proven by the compiler
     /// (Shape/Gather/Concat/Unsqueeze/Slice/Cast/Mul/Add/Sub/Div on non-dynamic inputs). The producing nodes
     /// STILL execute (graph unchanged) - the executor seeds runtimeConstants from these and SKIPS their per-node

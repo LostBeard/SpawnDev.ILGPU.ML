@@ -48,6 +48,29 @@ public class ModelGraph
     public Dictionary<string, float[]>? FloatConstantData { get; set; }
 
     /// <summary>
+    /// Names of tensors whose ONNX shape is RANK-0 (a true scalar, dims <c>()</c>).
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Every scalar in this pipeline is STORED as a 1-element rank-1 buffer, because a shape is an
+    /// <c>int[]</c> and "scalar as 1D" keeps allocation simple. That is fine for storage and wrong for
+    /// SHAPE INFERENCE, because ONNX distinguishes rank-0 from rank-1: <c>Gather</c>'s output rank is
+    /// <c>data.rank - 1 + indices.rank</c>, so a rank-0 index REMOVES the gathered axis while a rank-1
+    /// <c>[1]</c> index KEEPS it as a size-1 dim. Collapsing both to <c>[1]</c> makes those two cases
+    /// indistinguishable, and the length of the folded value cannot recover it - both have length 1.
+    ///
+    /// MEASURED on ZipVoice's fm_decoder positional-table branch: <c>Gather(Shape_1[rank 1], idx rank 0)</c>
+    /// must be rank 0, so the following <c>Unsqueeze(axes=[0])</c> is <c>[1]</c> and the <c>Concat</c> that
+    /// builds the table's dims is <c>[2]</c>. Reported as rank 1, the Unsqueeze became <c>[1,1]</c> and the
+    /// Concat got <c>[[1,1];[1]]</c> - which the shape interpreter papered over with correct CPU VALUES
+    /// while the GPU tensors carried the wrong rank, so the table came out subtly wrong (and only on some
+    /// executions, depending on what the pool handed back).
+    ///
+    /// Storage is unchanged - only inference consults this.
+    /// </remarks>
+    [JsonIgnore]
+    public HashSet<string>? ScalarTensorNames { get; set; }
+
+    /// <summary>
     /// ONNX-declared data type per initializer / Constant-node output
     /// (see <see cref="Onnx.OnnxDataType"/> codes). Lets the runtime apply
     /// integer-vs-float semantic differences (e.g. ONNX Div truncates toward

@@ -355,7 +355,13 @@ public class GraphExecutor : IDisposable
     /// what would otherwise be a batched submission. Only enable for kernel-bisection
     /// debugging on small models.
     /// </summary>
+    /// <remarks>
+    /// Settable with <c>ML_PER_OP_SYNC=1</c> so it can be turned on for a host process that is already
+    /// built - a CUDA illegal-memory-access is reported at the next SYNC, not at the kernel that caused
+    /// it, so without this the fault lands on whatever node happens to sync next and names an innocent op.
+    /// </remarks>
     public static bool PerOpSync { get; set; }
+        = Environment.GetEnvironmentVariable("ML_PER_OP_SYNC") is "1" or "true";
 
     /// <summary>
     /// CUDA-GRAPH CAPTURE: when true, <see cref="RunAsync"/> skips ALL periodic + final
@@ -1010,6 +1016,27 @@ public class GraphExecutor : IDisposable
                 if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
             }
 
+            // Runtime ScatterND / ScatterElements: output shape = the DATA input's shape. ONNX defines a
+            // scatter as "a copy of data with some positions overwritten", so the output is data-shaped by
+            // construction and never depends on the indices.
+            //
+            // ⚠️ The compile-time inference already returns inputs[0] - and that is exactly the trap. When
+            // data comes from an op whose shape is only knowable at RUNTIME, inputs[0] is a PLACEHOLDER at
+            // compile time, so the scatter faithfully copies a [1] shape forward and every consumer inherits
+            // it. ConstantOfShape and Range are resolved just above for the same reason; a scatter sitting
+            // downstream of one silently was not.
+            //
+            // MEASURED, ZipVoice fm_decoder encoder_pos (the branch that BUILDS the positional table, taken
+            // by any utterance long enough to miss the precomputed [1999,48] one): data was a correct
+            // [3191,48] ConstantOfShape at runtime, but ScatterND's output tensor was allocated [1]. Both
+            // `Range` bounds downstream read Shape(scatter)[0] and [1], so both collapsed to 1, one Slice
+            // came back EMPTY, and the Add consuming it dispatched a broadcast against a zero-length buffer -
+            // an illegal memory access reported at whatever node happened to synchronize NEXT (an innocent
+            // Add, 1-2 nodes later), which is what made this look like a fault in elementwise code.
+            if (node.OpType is "ScatterND" or "ScatterElements" or "Scatter"
+                && nodeInputs.Length > 0 && nodeInputs[0] != null)
+                runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
+
             // Runtime Expand: output = broadcast(input shape, target-shape VALUES) (input[1] is runtime).
             if (node.OpType == "Expand" && node.InputNames.Length >= 2 && nodeInputs.Length > 0 && nodeInputs[0] != null
                 && !string.IsNullOrEmpty(node.InputNames[1])
@@ -1083,12 +1110,24 @@ public class GraphExecutor : IDisposable
                 if (gAxis >= 0 && gAxis < gData.Length)
                 {
                     // A [1] index on multi-dim data collapses to a scalar (drops the axis) — matches the operator.
-                    var gEff = (gData.Length > 1 && gIdx.Length == 1 && gIdx[0] == 1) ? Array.Empty<int>() : gIdx;
+                    // ⚠️ A TRUE ONNX rank-0 index drops the axis on ANY rank, including rank-1 data, where the
+                    // result is rank-0. Storage cannot express that (every scalar is a 1-element [1] buffer), so
+                    // the declared rank is carried alongside - see CompiledGraph.ScalarTensorNames. Without it a
+                    // Gather over a Shape vector reported rank 1, and the Unsqueeze after it produced [1,1].
+                    bool gIdxScalar = _graph.ScalarTensorNames != null
+                        && node.InputNames.Length > 1 && !string.IsNullOrEmpty(node.InputNames[1])
+                        && _graph.ScalarTensorNames.Contains(node.InputNames[1]);
+                    var gEff = (gIdxScalar || (gData.Length > 1 && gIdx.Length == 1 && gIdx[0] == 1))
+                        ? Array.Empty<int>() : gIdx;
                     var gOut = new List<int>();
                     for (int i = 0; i < gAxis; i++) gOut.Add(gData[i]);
                     gOut.AddRange(gEff);
                     for (int i = gAxis + 1; i < gData.Length; i++) gOut.Add(gData[i]);
-                    if (gOut.Count > 0 && gOut.All(d => d > 0)) runtimeOutputShapes = new[] { gOut.ToArray() };
+                    // Count == 0 is a legitimate RANK-0 result and must not fall back to the compiled shape;
+                    // it is accepted only when the index really is a declared scalar, so an unresolved dim
+                    // still falls through to the proven path.
+                    if (gOut.All(d => d > 0) && (gOut.Count > 0 || gIdxScalar))
+                        runtimeOutputShapes = new[] { gOut.ToArray() };
                 }
             }
 
@@ -1374,7 +1413,11 @@ public class GraphExecutor : IDisposable
     /// (DA3Small_Pipeline_5D_ElideDispatch) + SD-Turbo WebGPU (SDTurbo_WebGPU_ElideAB, 0.00% pixel-diff, 1.9x)
     /// after the CLIP Range INT64_MAX-sentinel fix AND the MoveNet integer-floordiv fix (truncating integer Div
     /// in TryComputeShapeOnCpu). Validated by the standard 6-backend PMT sweep.</summary>
-    public static bool ShapeInterpElideDispatch = true;
+    // ML_NO_SHAPE_ELIDE=1 turns the dispatch-elide OFF for an already-built binary. The elide path
+    // materialises an elided value on demand AS RANK-1, so when it is wrong the symptom is a corrupt
+    // TENSOR far from the elided node - being able to flip it is how you attribute that in one run.
+    public static bool ShapeInterpElideDispatch =
+        Environment.GetEnvironmentVariable("ML_NO_SHAPE_ELIDE") is not ("1" or "true");
     /// <summary>DIAGNOSTIC (Tuvok 2026-07-11): log every shape op the CPU interpreter resolves to an EMPTY value,
     /// with each input's resolved value + tensor shape. The FIRST such line whose inputs are all non-empty is the
     /// root op that collapses a real shape to empty (the CLIP text_model Range-limit keystone). Console-only.</summary>
@@ -2179,7 +2222,12 @@ public class GraphExecutor : IDisposable
                     // diagnostic: elidedThisRun=True inRuntimeConstants=True constLen=0).
                     && cpuShapeVal.Length > 0
                     && cpuShapeVal.Length <= 64
-                    && node.OutputShapes.Length > 0 && node.OutputShapes[0].Length <= 1
+                    // == 1, not <= 1: the on-demand materializer above rebuilds an elided value AS RANK-1
+                    // [len], so a RANK-0 output would come back rank-1 and silently undo its own rank. Nothing
+                    // produced a rank-0 compiled shape until Gather started honouring a scalar index (see
+                    // CompiledGraph.ScalarTensorNames), so this excludes exactly those and nothing else - they
+                    // keep their GPU dispatch and therefore their real shape.
+                    && node.OutputShapes.Length > 0 && node.OutputShapes[0].Length == 1
                     && !ElideBlockedOutputs().Contains(node.OutputNames[0]);   // path-c: no GPU-tensor consumer
                 if (ShapeInterpElideDispatch && elideSafe)
                 {
@@ -2636,6 +2684,27 @@ public class GraphExecutor : IDisposable
                 if (resolved.All(d => d > 0)) runtimeOutputShapes = new[] { resolved };
             }
 
+            // Runtime ScatterND / ScatterElements: output shape = the DATA input's shape. ONNX defines a
+            // scatter as "a copy of data with some positions overwritten", so the output is data-shaped by
+            // construction and never depends on the indices.
+            //
+            // ⚠️ The compile-time inference already returns inputs[0] - and that is exactly the trap. When
+            // data comes from an op whose shape is only knowable at RUNTIME, inputs[0] is a PLACEHOLDER at
+            // compile time, so the scatter faithfully copies a [1] shape forward and every consumer inherits
+            // it. ConstantOfShape and Range are resolved just above for the same reason; a scatter sitting
+            // downstream of one silently was not.
+            //
+            // MEASURED, ZipVoice fm_decoder encoder_pos (the branch that BUILDS the positional table, taken
+            // by any utterance long enough to miss the precomputed [1999,48] one): data was a correct
+            // [3191,48] ConstantOfShape at runtime, but ScatterND's output tensor was allocated [1]. Both
+            // `Range` bounds downstream read Shape(scatter)[0] and [1], so both collapsed to 1, one Slice
+            // came back EMPTY, and the Add consuming it dispatched a broadcast against a zero-length buffer -
+            // an illegal memory access reported at whatever node happened to synchronize NEXT (an innocent
+            // Add, 1-2 nodes later), which is what made this look like a fault in elementwise code.
+            if (node.OpType is "ScatterND" or "ScatterElements" or "Scatter"
+                && nodeInputs.Length > 0 && nodeInputs[0] != null)
+                runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
+
             // Runtime Expand: output = broadcast(input shape, target-shape VALUES) (input[1] is runtime).
             if (node.OpType == "Expand" && node.InputNames.Length >= 2 && nodeInputs.Length > 0 && nodeInputs[0] != null
                 && !string.IsNullOrEmpty(node.InputNames[1])
@@ -2709,12 +2778,24 @@ public class GraphExecutor : IDisposable
                 if (gAxis >= 0 && gAxis < gData.Length)
                 {
                     // A [1] index on multi-dim data collapses to a scalar (drops the axis) — matches the operator.
-                    var gEff = (gData.Length > 1 && gIdx.Length == 1 && gIdx[0] == 1) ? Array.Empty<int>() : gIdx;
+                    // ⚠️ A TRUE ONNX rank-0 index drops the axis on ANY rank, including rank-1 data, where the
+                    // result is rank-0. Storage cannot express that (every scalar is a 1-element [1] buffer), so
+                    // the declared rank is carried alongside - see CompiledGraph.ScalarTensorNames. Without it a
+                    // Gather over a Shape vector reported rank 1, and the Unsqueeze after it produced [1,1].
+                    bool gIdxScalar = _graph.ScalarTensorNames != null
+                        && node.InputNames.Length > 1 && !string.IsNullOrEmpty(node.InputNames[1])
+                        && _graph.ScalarTensorNames.Contains(node.InputNames[1]);
+                    var gEff = (gIdxScalar || (gData.Length > 1 && gIdx.Length == 1 && gIdx[0] == 1))
+                        ? Array.Empty<int>() : gIdx;
                     var gOut = new List<int>();
                     for (int i = 0; i < gAxis; i++) gOut.Add(gData[i]);
                     gOut.AddRange(gEff);
                     for (int i = gAxis + 1; i < gData.Length; i++) gOut.Add(gData[i]);
-                    if (gOut.Count > 0 && gOut.All(d => d > 0)) runtimeOutputShapes = new[] { gOut.ToArray() };
+                    // Count == 0 is a legitimate RANK-0 result and must not fall back to the compiled shape;
+                    // it is accepted only when the index really is a declared scalar, so an unresolved dim
+                    // still falls through to the proven path.
+                    if (gOut.All(d => d > 0) && (gOut.Count > 0 || gIdxScalar))
+                        runtimeOutputShapes = new[] { gOut.ToArray() };
                 }
             }
 

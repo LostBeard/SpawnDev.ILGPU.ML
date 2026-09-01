@@ -1297,9 +1297,14 @@ internal static class SubgraphRunner
             });
         }
 
+        // ONNX rank-0 is recorded, never flattened away - see ModelGraph.ScalarTensorNames. Storage stays
+        // 1-element rank-1; only shape inference needs to tell a scalar from a [1] vector.
+        graph.ScalarTensorNames = new HashSet<string>(StringComparer.Ordinal);
+
         foreach (var init in onnxGraph.Initializers)
         {
             graph.Initializers[init.Name] = init.Dims.Select(d => (int)d).ToArray();
+            if (!init.Dims.Any()) graph.ScalarTensorNames.Add(init.Name);
         }
 
         // Fold Constant NODES holding a real tensor into initializers: BuildExecutor supplies their data,
@@ -1312,10 +1317,20 @@ internal static class SubgraphRunner
             var valueAttr = n.Attributes.FirstOrDefault(a => a.Name == "value");
             if (valueAttr?.T == null) continue;
             var dims = valueAttr.T.Dims.Select(d => (int)d).ToArray();
-            if (dims.Length == 0) dims = new[] { Math.Max(1, (int)valueAttr.T.ElementCount) };
+            // A rank-0 Constant is STORED as [1] (a pool buffer cannot be rank-0), but its true rank is
+            // remembered so Gather can apply the ONNX rule instead of guessing from the value's length.
+            if (dims.Length == 0)
+            {
+                dims = new[] { Math.Max(1, (int)valueAttr.T.ElementCount) };
+                if (valueAttr.T.ElementCount <= 1) graph.ScalarTensorNames.Add(n.Outputs[0]);
+            }
             graph.Initializers[n.Outputs[0]] = dims;
             foldedConstants.Add(n.Outputs[0]);
         }
+
+        if (Environment.GetEnvironmentVariable("ML_TRACE_SCALARS") == "1")
+            Console.WriteLine($"[scalars] subgraph '{onnxGraph.Name}': {graph.ScalarTensorNames.Count} rank-0 of "
+                + $"{onnxGraph.Nodes.Count} nodes -> {string.Join(", ", graph.ScalarTensorNames.Where(n => n.Contains("Constant_13") || n.Contains("Constant_1_")))}");
 
         // Convert node attributes to the typed dictionary format expected by GraphNode
         graph.Nodes = onnxGraph.Nodes.Where(n => !(n.OpType == "Constant" && n.Outputs.Count > 0
@@ -1438,17 +1453,11 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
             var result = SubgraphRunner.Execute(ctx, subgraph, subInputs);
             if (result != null)
             {
-                // Copy subgraph outputs to our outputs
-                int outIdx = 0;
-                foreach (var (name, tensor) in result)
-                {
-                    if (outIdx < ctx.Outputs.Length)
-                    {
-                        int c = Math.Min(tensor.ElementCount, ctx.Outputs[outIdx].ElementCount);
-                        if (c > 0) reg.ElementWise.Scale(tensor.Data.SubView(0, c), ctx.Outputs[outIdx].Data.SubView(0, c), c, 1f);
-                        outIdx++;
-                    }
-                }
+                // ⚠️ Was a foreach over the result DICTIONARY, assigning outputs by enumeration order. The
+                // contract is the branch's DECLARED output order, which a dictionary does not preserve, so a
+                // multi-output If could map results to the wrong slots. Shares the async path's copy, which
+                // walks subgraph.Outputs and adopts the executed branch's shape.
+                SubgraphOutputCopy.Apply(reg, ctx, subgraph, result);
                 return;
             }
         }
@@ -2028,10 +2037,51 @@ internal static class SubgraphOutputCopy
         {
             var name = subgraph.Outputs[d].Name;
             if (string.IsNullOrEmpty(name) || !result.TryGetValue(name, out var tensor)) { outIdx++; continue; }
-            int c = Math.Min(tensor.ElementCount, ctx.Outputs[outIdx].ElementCount);
-            if (c > 0)
-                reg.ElementWise.Scale(tensor.Data.SubView(0, c), ctx.Outputs[outIdx].Data.SubView(0, c), c, 1f);
+            CopyOrAdopt(reg, ctx, outIdx, tensor, name);
             outIdx++;
         }
+    }
+
+    /// <summary>
+    /// Write one branch/body output into <c>ctx.Outputs[outIdx]</c>, ADOPTING the branch's shape when it
+    /// differs from the buffer that was preallocated at compile time.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This used to be <c>Math.Min(tensor.ElementCount, ctx.Outputs[outIdx].ElementCount)</c>, which
+    /// silently TRUNCATES a branch that produced more than the compile-time shape - and leaves the stale
+    /// compile-time shape visible to every downstream consumer, so nothing reports a problem.
+    ///
+    /// An If cannot be sized statically in general: ONNX requires the branches to agree on rank and dtype,
+    /// NOT on dims. <c>InferOutputShapes</c> therefore has to pick one branch's declaration (the only
+    /// statically usable one), and whenever the OTHER branch runs and its dims differ, the buffer is the
+    /// wrong size. Only the executed branch knows the answer, so the shape has to be adopted here.
+    ///
+    /// MEASURED on ZipVoice's fm_decoder relative positional encoding. then_branch is a constant
+    /// <c>[1999,48]</c> table; else_branch RECOMPUTES it as <c>[2*T-1, 48]</c> and runs for any utterance
+    /// past T=1000. At T=1197 the branch produced <c>[2393,48]</c> = 114,864 values into a 95,952-element
+    /// buffer: 18,912 dropped, the table reported as <c>[1999,48]</c>, and the decoder diverged from
+    /// onnxruntime by 104% of peak (max |d| 5.675) while every shape downstream still looked plausible.
+    /// Long replies were audibly wrong rather than broken, which is the worst way for this to fail.
+    ///
+    /// Rented under a stable per-output name, so this is one buffer reused per If output rather than an
+    /// allocation per call - a per-call device allocation is what makes a graph uncapturable.
+    /// </remarks>
+    private static void CopyOrAdopt(OperatorRegistry reg, OnnxOpContext ctx, int outIdx,
+        Tensor tensor, string name)
+    {
+        var dst = ctx.Outputs[outIdx];
+        if (tensor.ElementCount <= 0) return;
+
+        if (dst == null || !dst.Shape.AsSpan().SequenceEqual(tensor.Shape))
+        {
+            var adopted = ctx.Pool.Rent(tensor.Shape, "_branchout_" + name);
+            reg.ElementWise.Scale(tensor.Data.SubView(0, tensor.ElementCount),
+                                  adopted.Data.SubView(0, tensor.ElementCount), tensor.ElementCount, 1f);
+            ctx.Outputs[outIdx] = adopted;   // aliases the executor's nodeOutputs - see OnnxOpContext.Outputs
+            return;
+        }
+
+        reg.ElementWise.Scale(tensor.Data.SubView(0, tensor.ElementCount),
+                              dst.Data.SubView(0, tensor.ElementCount), tensor.ElementCount, 1f);
     }
 }

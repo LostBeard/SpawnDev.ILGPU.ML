@@ -1251,6 +1251,12 @@ public static class GraphOptimizer
             InitializerDataTypes = src.InitializerDataTypes != null
                 ? new Dictionary<string, int>(src.InitializerDataTypes)
                 : null,
+            // Same trap as InitializerDataTypes above: the optimizer rebuilds the graph, so anything not
+            // copied here is silently NULL by the time GraphCompiler runs - and a null set reads exactly
+            // like "no scalars", so the ONNX Gather rank rule just stops applying with no error anywhere.
+            ScalarTensorNames = src.ScalarTensorNames != null
+                ? new HashSet<string>(src.ScalarTensorNames, StringComparer.Ordinal)
+                : null,
         };
     }
 }
