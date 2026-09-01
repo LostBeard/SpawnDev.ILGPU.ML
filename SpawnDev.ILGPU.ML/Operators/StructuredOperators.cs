@@ -1861,6 +1861,11 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
     /// param-resolution divergence (path/params differ per backend) from a kernel execution bug
     /// (identical params, wrong output). Off by default; zero cost when null.</summary>
     public static Dictionary<string, string>? CaptureResolvedParams { get; set; }
+
+    /// <summary>Print each Slice's resolved params + resolution path (<c>ML_TRACE_SLICE=1</c>).</summary>
+    private static readonly bool _traceSlice =
+        Environment.GetEnvironmentVariable("ML_TRACE_SLICE") is "1" or "true";
+
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         // Try to compute output shape from attributes (opset < 10)
@@ -1928,7 +1933,14 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
         var resolvedStarts = ctx.GetInts("_resolved_starts");
         var resolvedEnds = ctx.GetInts("_resolved_ends");
 
-        if (resolvedStarts.Length > 0 && resolvedEnds.Length > 0)
+        // ⚠️ The RUNTIME values (path 2) outrank the compile-time ones (path 1) whenever they are present.
+        // Getting the output SHAPE right in the executor's cascade is not enough on its own - if the operator
+        // then slices with the compile-time window it fills that correct buffer from the wrong place. Both
+        // have to agree on which source is authoritative, and the answer is: this run's values.
+        // See the cascade in GraphExecutor for the ZipVoice fm_decoder measurement behind this.
+        bool runtimeParamsAvailable = ctx.TryGetInputValues(1) is not null && ctx.TryGetInputValues(2) is not null;
+
+        if (resolvedStarts.Length > 0 && resolvedEnds.Length > 0 && !runtimeParamsAvailable)
         {
             resolutionPath = 1;
             // Path 1: compiler resolved at compile time — handles opset >= 10 with constant params
@@ -1971,6 +1983,17 @@ public class SliceOperator(OperatorRegistry reg) : IOnnxOperator
             axes = attrAxes.Length > 0 ? attrAxes : Enumerable.Range(0, starts.Length).ToArray();
             steps = attrSteps.Length > 0 ? attrSteps : Enumerable.Repeat(1, starts.Length).ToArray();
         }
+
+        // DIAGNOSTIC (ML_TRACE_SLICE=1): which resolution path produced these params, and what they are,
+        // against the RUNTIME input shape. Path 1 is compile-time resolution, and a Slice downstream of an
+        // If cannot be resolved at compile time - the branch, and therefore the input's length, is a runtime
+        // fact. Printing the path beside the shape is what separates "resolved from the wrong branch" from
+        // "kernel wrote nothing".
+        if (_traceSlice)
+            Console.WriteLine($"[slice] {(ctx.InputNames.Length > 0 ? ctx.InputNames[0] : "?")} path={resolutionPath} "
+                + $"in=[{string.Join(",", inShape)}] starts=[{string.Join(",", starts)}] ends=[{string.Join(",", ends)}] "
+                + $"axes=[{string.Join(",", axes)}] steps=[{string.Join(",", steps)}] "
+                + $"out=[{string.Join(",", ctx.Outputs.Length > 0 && ctx.Outputs[0] != null ? ctx.Outputs[0].Shape : Array.Empty<int>())}]");
 
         // Normalize negative indices and clamp
         var sliceStarts = new int[rank];

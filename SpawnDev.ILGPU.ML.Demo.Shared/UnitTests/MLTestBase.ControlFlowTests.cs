@@ -131,6 +131,25 @@ public abstract partial class MLTestBase
         });
     }
 
+    /// <summary>
+    /// A Slice whose input LENGTH depends on which If branch ran. Gates the 2026-09-01 defect: the compiler
+    /// resolved this Slice's window at COMPILE time from the only branch it can see, the runtime cascade
+    /// preferred those stale params, the window collapsed to an EMPTY output - and a zero-element output
+    /// SKIPS the operator, leaving every downstream consumer reading a pooled buffer nobody wrote.
+    /// The fixture deliberately takes the LONGER branch, which is the one no compiler can fold.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task ControlFlow_BranchSlice_MatchesOnnxRuntime() => await ControlFlowMatchesOnnxRuntime("branch_slice");
+
+    /// <summary>
+    /// Sign and Abs over the SAME runtime-shaped [N,1] vector. Gates the 2026-09-01 defect where the
+    /// executor's allowlist of unary ops permitted to adopt their input's RUNTIME shape contained Abs but
+    /// not Sign, so Sign kept a compile-time [1] and collapsed the vector to a single scalar. Both outputs
+    /// are checked, so the test fails on the LENGTH disagreement rather than on a value that looks plausible.
+    /// </summary>
+    [TestMethod(Timeout = 180000)]
+    public async Task ControlFlow_BranchUnary_MatchesOnnxRuntime() => await ControlFlowMatchesOnnxRuntime("branch_unary");
+
     [TestMethod(Timeout = 180000)]
     public async Task ControlFlow_If_MatchesOnnxRuntime() => await ControlFlowMatchesOnnxRuntime("tiny_if");
 

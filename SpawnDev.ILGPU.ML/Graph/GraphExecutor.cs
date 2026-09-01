@@ -666,6 +666,10 @@ public class GraphExecutor : IDisposable
                 if (string.IsNullOrEmpty(name)) continue; // Optional inputs
                 if (!tensors.TryGetValue(name, out var tensor))
                     throw new InvalidOperationException($"Tensor '{name}' not found (needed by {node.OpType})");
+                // Pool-ownership diagnostic — see the identical check on the async path. Both paths carry the
+                // same node loop, and instrumenting only one is how a fix here gets believed twice.
+                if (Tensors.BufferPool.TracePoolOwnership && _pool.IsReturnedToPool(tensor))
+                    _pool.NoteUseAfterReturn($"node {nodeIdx} {node.OpType} input {i}", name);
                 nodeInputs[i] = tensor;
             }
 
@@ -681,10 +685,42 @@ public class GraphExecutor : IDisposable
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
             {
                 var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
-                float[]? starts = ResolvedShapeAttr(node, "_resolved_starts") ?? (node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null);
-                float[]? ends = ResolvedShapeAttr(node, "_resolved_ends") ?? (node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null);
-                float[]? axes = ResolvedShapeAttr(node, "_resolved_axes") ?? (node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null);
-                float[]? steps = ResolvedShapeAttr(node, "_resolved_steps") ?? (node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null);
+                // ⚠️ RUNTIME VALUES WIN, compiler-resolved attrs are the FALLBACK - and the four params are
+                // taken as ONE GROUP so a runtime `starts` can never be paired with a compile-time `axes`.
+                //
+                // Seven's fix (preferring the attrs) was for values that are ABSENT at cascade time on WebGPU
+                // async / under dispatch-elide, and the fallback below still covers exactly that. But when the
+                // runtime values ARE present they are this run's truth, and the compile-time ones are only a
+                // prediction - which is wrong whenever the sliced length is not knowable at compile time.
+                //
+                // MEASURED on ZipVoice's fm_decoder (2026-09-01): the relative-position table comes out of an
+                // `If`. The compiler can only see the then_branch's [1999,48] constant, so it resolved this
+                // Slice's window for a 1999-row table; at runtime the else_branch RECOMPUTES the table as
+                // [2443,48] and the true window is [0,2443). The stale attrs clamped that to 222 rows (and to
+                // an EMPTY [0,48] one node later), the zero-element output skipped the operator entirely, and
+                // everything downstream read a buffer nobody wrote - NaN under ML_POISON_RENT, plausible
+                // garbage without it. A branch is a runtime fact; a Slice downstream of one cannot be resolved
+                // at compile time.
+                float[]? rtStarts = node.InputNames.Length > 1 ? runtimeConstants.GetValueOrDefault(node.InputNames[1]) : null;
+                float[]? rtEnds = node.InputNames.Length > 2 ? runtimeConstants.GetValueOrDefault(node.InputNames[2]) : null;
+                // ⚠️ The runtime group is only usable if EVERY param the node actually declares has a runtime
+                // value. starts+ends alone is not enough: if the node declares an `axes` input whose value is
+                // not available this run, falling back to the positional default would slice a DIFFERENT
+                // dimension than the model asked for - silently, and with a plausible shape. Absent inputs are
+                // fine (ONNX defines defaults for them); a DECLARED-but-unavailable one is not.
+                bool rtDeclaredAvailable(int idx) =>
+                    node.InputNames.Length <= idx || string.IsNullOrEmpty(node.InputNames[idx])
+                    || runtimeConstants.ContainsKey(node.InputNames[idx]);
+                bool useRuntime = rtStarts != null && rtEnds != null
+                    && rtDeclaredAvailable(3) && rtDeclaredAvailable(4);
+                float[]? starts = useRuntime ? rtStarts : ResolvedShapeAttr(node, "_resolved_starts");
+                float[]? ends = useRuntime ? rtEnds : ResolvedShapeAttr(node, "_resolved_ends");
+                float[]? axes = useRuntime
+                    ? (node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? runtimeConstants.GetValueOrDefault(node.InputNames[3]) : null)
+                    : ResolvedShapeAttr(node, "_resolved_axes");
+                float[]? steps = useRuntime
+                    ? (node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? runtimeConstants.GetValueOrDefault(node.InputNames[4]) : null)
+                    : ResolvedShapeAttr(node, "_resolved_steps");
                 if (starts != null && ends != null)
                 {
                     var resolved = inShape.ToArray();
@@ -1215,7 +1251,21 @@ public class GraphExecutor : IDisposable
             if (nodeInputs.Length > 0 && nodeInputs[0] != null && (
                 node.OpType is "Softmax" or "LogSoftmax" or "Relu" or "Gelu" or "Sigmoid" or "Tanh"
                 or "Erf" or "Exp" or "Sqrt" or "Neg" or "Reciprocal" or "Softplus" or "Elu" or "LeakyRelu"
-                or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"))
+                or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"
+                // ⚠️ This list is an ALLOWLIST of unary shape-preserving ops, and anything missing from it
+                // silently keeps its COMPILE-TIME output shape. MEASURED 2026-09-01 on ZipVoice's fm_decoder:
+                // `Abs` and `Sign` read the SAME [2443,1] input; Abs was on the list and resolved correctly,
+                // Sign was not and kept a compile-time [1] - collapsing the whole relative-position lane to a
+                // single scalar (`Mul_1 = [-6.9282]`), which then fed the position table. Nothing errored: a
+                // rank-1 one-element tensor is legal everywhere downstream.
+                // The graph that exposed it also uses Atan and Log, which had exactly the same gap.
+                // Membership must follow the OP's semantics (output shape == input[0]'s), never which models
+                // happened to be tested, so every supported unary shape-preserving op is listed here.
+                or "Sign" or "Round" or "Log" or "Tan" or "Asin" or "Acos" or "Atan"
+                or "Sinh" or "Cosh" or "Asinh" or "Acosh" or "Atanh"
+                or "Softsign" or "HardSigmoid" or "HardSwish" or "Selu" or "Celu"
+                or "ThresholdedRelu" or "Shrink" or "Not" or "IsNaN" or "IsInf"
+                or "BitwiseNot" or "Identity" or "PRelu"))
                 runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
 
             // Runtime Reduce (ReduceMax/Min/Mean/Sum/...): output = input shape with the reduced axes removed
@@ -2326,6 +2376,14 @@ public class GraphExecutor : IDisposable
                             $"elideBlocked={ElideBlockedOutputs().Contains(name)}");
                     }
                 }
+                // Pool-ownership diagnostic (ML_TRACE_POOL=1): is this input's buffer already back in the free
+                // bucket? A Returned buffer still READS fine - it just holds whatever Rented that bucket next -
+                // so a use-after-return leaves no trace at the Return site and shows up only as values that
+                // change between otherwise identical executions. Naming the consuming NODE is what localises it.
+                if (Tensors.BufferPool.TracePoolOwnership && tensor != null && !string.IsNullOrEmpty(name)
+                    && _pool.IsReturnedToPool(tensor))
+                    _pool.NoteUseAfterReturn($"node {nodeIdx} {node.OpType} input {i}", name);
+
                 nodeInputs[i] = tensor;
             }
 
@@ -2347,10 +2405,42 @@ public class GraphExecutor : IDisposable
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
             {
                 var inShape = nodeInputs[0]?.Shape ?? runtimeOutputShapes[0];
-                float[]? starts = ResolvedShapeAttr(node, "_resolved_starts") ?? (node.InputNames.Length > 1 ? (runtimeConstants.GetValueOrDefault(node.InputNames[1])) : null);
-                float[]? ends = ResolvedShapeAttr(node, "_resolved_ends") ?? (node.InputNames.Length > 2 ? (runtimeConstants.GetValueOrDefault(node.InputNames[2])) : null);
-                float[]? axes = ResolvedShapeAttr(node, "_resolved_axes") ?? (node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[3])) : null);
-                float[]? steps = ResolvedShapeAttr(node, "_resolved_steps") ?? (node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? (runtimeConstants.GetValueOrDefault(node.InputNames[4])) : null);
+                // ⚠️ RUNTIME VALUES WIN, compiler-resolved attrs are the FALLBACK - and the four params are
+                // taken as ONE GROUP so a runtime `starts` can never be paired with a compile-time `axes`.
+                //
+                // Seven's fix (preferring the attrs) was for values that are ABSENT at cascade time on WebGPU
+                // async / under dispatch-elide, and the fallback below still covers exactly that. But when the
+                // runtime values ARE present they are this run's truth, and the compile-time ones are only a
+                // prediction - which is wrong whenever the sliced length is not knowable at compile time.
+                //
+                // MEASURED on ZipVoice's fm_decoder (2026-09-01): the relative-position table comes out of an
+                // `If`. The compiler can only see the then_branch's [1999,48] constant, so it resolved this
+                // Slice's window for a 1999-row table; at runtime the else_branch RECOMPUTES the table as
+                // [2443,48] and the true window is [0,2443). The stale attrs clamped that to 222 rows (and to
+                // an EMPTY [0,48] one node later), the zero-element output skipped the operator entirely, and
+                // everything downstream read a buffer nobody wrote - NaN under ML_POISON_RENT, plausible
+                // garbage without it. A branch is a runtime fact; a Slice downstream of one cannot be resolved
+                // at compile time.
+                float[]? rtStarts = node.InputNames.Length > 1 ? runtimeConstants.GetValueOrDefault(node.InputNames[1]) : null;
+                float[]? rtEnds = node.InputNames.Length > 2 ? runtimeConstants.GetValueOrDefault(node.InputNames[2]) : null;
+                // ⚠️ The runtime group is only usable if EVERY param the node actually declares has a runtime
+                // value. starts+ends alone is not enough: if the node declares an `axes` input whose value is
+                // not available this run, falling back to the positional default would slice a DIFFERENT
+                // dimension than the model asked for - silently, and with a plausible shape. Absent inputs are
+                // fine (ONNX defines defaults for them); a DECLARED-but-unavailable one is not.
+                bool rtDeclaredAvailable(int idx) =>
+                    node.InputNames.Length <= idx || string.IsNullOrEmpty(node.InputNames[idx])
+                    || runtimeConstants.ContainsKey(node.InputNames[idx]);
+                bool useRuntime = rtStarts != null && rtEnds != null
+                    && rtDeclaredAvailable(3) && rtDeclaredAvailable(4);
+                float[]? starts = useRuntime ? rtStarts : ResolvedShapeAttr(node, "_resolved_starts");
+                float[]? ends = useRuntime ? rtEnds : ResolvedShapeAttr(node, "_resolved_ends");
+                float[]? axes = useRuntime
+                    ? (node.InputNames.Length > 3 && !string.IsNullOrEmpty(node.InputNames[3]) ? runtimeConstants.GetValueOrDefault(node.InputNames[3]) : null)
+                    : ResolvedShapeAttr(node, "_resolved_axes");
+                float[]? steps = useRuntime
+                    ? (node.InputNames.Length > 4 && !string.IsNullOrEmpty(node.InputNames[4]) ? runtimeConstants.GetValueOrDefault(node.InputNames[4]) : null)
+                    : ResolvedShapeAttr(node, "_resolved_steps");
                 if (starts != null && ends != null)
                 {
                     var resolved = inShape.ToArray();
@@ -2883,7 +2973,21 @@ public class GraphExecutor : IDisposable
             if (nodeInputs.Length > 0 && nodeInputs[0] != null && (
                 node.OpType is "Softmax" or "LogSoftmax" or "Relu" or "Gelu" or "Sigmoid" or "Tanh"
                 or "Erf" or "Exp" or "Sqrt" or "Neg" or "Reciprocal" or "Softplus" or "Elu" or "LeakyRelu"
-                or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"))
+                or "Abs" or "Sin" or "Cos" or "Clip" or "Mish"
+                // ⚠️ This list is an ALLOWLIST of unary shape-preserving ops, and anything missing from it
+                // silently keeps its COMPILE-TIME output shape. MEASURED 2026-09-01 on ZipVoice's fm_decoder:
+                // `Abs` and `Sign` read the SAME [2443,1] input; Abs was on the list and resolved correctly,
+                // Sign was not and kept a compile-time [1] - collapsing the whole relative-position lane to a
+                // single scalar (`Mul_1 = [-6.9282]`), which then fed the position table. Nothing errored: a
+                // rank-1 one-element tensor is legal everywhere downstream.
+                // The graph that exposed it also uses Atan and Log, which had exactly the same gap.
+                // Membership must follow the OP's semantics (output shape == input[0]'s), never which models
+                // happened to be tested, so every supported unary shape-preserving op is listed here.
+                or "Sign" or "Round" or "Log" or "Tan" or "Asin" or "Acos" or "Atan"
+                or "Sinh" or "Cosh" or "Asinh" or "Acosh" or "Atanh"
+                or "Softsign" or "HardSigmoid" or "HardSwish" or "Selu" or "Celu"
+                or "ThresholdedRelu" or "Shrink" or "Not" or "IsNaN" or "IsInf"
+                or "BitwiseNot" or "Identity" or "PRelu"))
                 runtimeOutputShapes = new[] { (int[])nodeInputs[0]!.Shape.Clone() };
 
             // Runtime Reduce (ReduceMax/Min/Mean/Sum/...): output = input shape with the reduced axes removed
