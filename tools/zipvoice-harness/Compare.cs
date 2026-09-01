@@ -197,6 +197,26 @@ public static class Compare
             return 1;
         }
 
+        // ⚠️ NaN FIRST, and as its own verdict. `Math.Abs(x - NaN)` is NaN, and EVERY comparison against NaN
+        // is false - so `diff > maxAbs` never fires, maxAbs stays 0, and an output that is ENTIRELY NaN scores
+        // a perfect max |d| of 0.000E+000 and reports OK. MEASURED 2026-09-01: an all-NaN decoder stage printed
+        // "max |d| 0.000E+000 ... OK" and the run summarised as RESULT: PASS. A grader that cannot see the
+        // worst failure there is has to be fixed before any number it prints can be trusted.
+        int nonFinite = 0;
+        int firstNonFinite = -1;
+        for (int i = 0; i < actual.Length; i++)
+            if (float.IsNaN(actual[i]) || float.IsInfinity(actual[i]))
+            {
+                nonFinite++;
+                if (firstNonFinite < 0) firstNonFinite = i;
+            }
+        if (nonFinite > 0)
+        {
+            Console.WriteLine($"{stage,-12}: {nonFinite} of {actual.Length} values are NaN/Infinity "
+                            + $"(first at {firstNonFinite}, ORT there = {expected[firstNonFinite]:F5})  NOT FINITE");
+            return 1;
+        }
+
         double maxAbs = 0, sumAbs = 0, maxMagnitude = 0;
         int worst = 0;
         for (int i = 0; i < expected.Length; i++)

@@ -116,6 +116,115 @@ public class BufferPool : IDisposable
     /// path, rather than inferring it from a byte count in a guard message.
     /// </summary>
     public static bool LogProtoResidentTensors = false;
+
+    // ── Pool OWNERSHIP diagnostics (ZipVoice long-utterance buffer-aliasing hunt, 2026-09-01) ──
+    //
+    // Rent/Return key ownership on the tensor NAME alone, so the pool's record of "which buffer is named X"
+    // is whatever was Rented under X most recently. That is sound for a straight-line graph run once, and
+    // unsound the moment a name is Rented twice while an earlier tensor of that name is still LIVE — which
+    // is exactly what a CACHED subgraph executor does when its plan re-runs (ZipVoice's Euler sampler runs
+    // the same If-branch plan 4x per utterance and hands its outputs out to the caller). Then:
+    //   • REBIND-LIVE  - Rent('X') overwrites the record while the previous buffer of X is still live.
+    //   • ALIEN-RETURN - Return(tensor named 'X') pools whatever _namedBuffers['X'] now holds, which is a
+    //                    DIFFERENT, still-live buffer. That buffer is now in the free bucket AND live, so
+    //                    the next Rent of its size bucket hands out a second view of it: two live tensors
+    //                    aliasing one buffer, and the smaller one's values get clobbered.
+    // Both are OBSERVATIONS, not repairs — they print what happened and change nothing.
+    /// <summary>Opt-in (<c>ML_TRACE_POOL=1</c>): report Rent/Return ownership violations - a name re-Rented
+    /// while its previous buffer is still live, and a Return that pools a buffer the returned tensor does not
+    /// view. Off by default (a library never logs unconditionally).</summary>
+    public static bool TracePoolOwnership
+        = Environment.GetEnvironmentVariable("ML_TRACE_POOL") is "1" or "true";
+    /// <summary>Every ownership violation seen since the last <see cref="ResetPoolOwnershipTrace"/>, in order.
+    /// Non-empty after a run = the pool handed the same buffer to two live tensors.</summary>
+    public static readonly List<string> PoolOwnershipViolations = new();
+    /// <summary>Clear <see cref="PoolOwnershipViolations"/> before a measured run.</summary>
+    public static void ResetPoolOwnershipTrace() { lock (PoolOwnershipViolations) PoolOwnershipViolations.Clear(); }
+
+    /// <summary>
+    /// Pool a buffer on <see cref="Return"/> ONLY when the returned tensor is the one the pool recorded under
+    /// that name (<c>ML_STRICT_RETURN=1</c>). A mismatch becomes a no-op instead of pooling a buffer this
+    /// tensor never owned - which may still be in use.
+    /// </summary>
+    /// <remarks>
+    /// A switch rather than a silent behaviour change because it trades a correctness risk for a reuse loss:
+    /// every mismatched Return stops recycling its buffer, so the pool's high-water can rise. Kept separable
+    /// so the two can be measured against each other on the same graph rather than argued about.
+    /// </remarks>
+    public static bool StrictReturnIdentity
+        = Environment.GetEnvironmentVariable("ML_STRICT_RETURN") is "1" or "true";
+
+    /// <summary>
+    /// Fill every rented buffer with <c>0xFF</c> bytes - which is NaN for float32 - before handing it out
+    /// (<c>ML_POISON_RENT=1</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A pooled buffer arrives holding the LAST tensor's values, so a node that reads memory it did not write
+    /// reads plausible numbers instead of garbage, and the graph runs to completion with a wrong answer. That
+    /// is invisible to every value gate whose reference happens to be close, and it is why changing the pool's
+    /// recycling pattern (e.g. <see cref="StrictReturnIdentity"/>) MOVES the error instead of removing it -
+    /// the tell that a read is unwritten rather than miscomputed.
+    /// </para>
+    /// <para>
+    /// Poisoning makes that deterministic and LOUD: NaN propagates through arithmetic, so the first node whose
+    /// output turns NaN is the node that read what nobody wrote. Diagnostic only - it costs a MemSet per Rent.
+    /// </para>
+    /// </remarks>
+    public static bool PoisonRentedBuffers
+        = Environment.GetEnvironmentVariable("ML_POISON_RENT") is "1" or "true";
+
+    private static void PoolViolation(string message)
+    {
+        lock (PoolOwnershipViolations)
+        {
+            // Cap the list: a violating graph can repeat this thousands of times and the first few name it.
+            if (PoolOwnershipViolations.Count < 200) PoolOwnershipViolations.Add(message);
+            else if (PoolOwnershipViolations.Count == 200) PoolOwnershipViolations.Add("... (further violations suppressed)");
+        }
+        Console.WriteLine($"[POOL] {message}");
+    }
+
+    /// <summary>Short stable identity for a buffer, for the ownership trace.</summary>
+    private static string Bid(object? buffer) =>
+        buffer == null ? "none" : "#" + (System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(buffer) & 0xFFFFFF).ToString("x6");
+
+    /// <summary>The <see cref="MemoryBuffer"/> a view actually points into. The generic struct constraint makes
+    /// this a constrained call, so it does NOT box the view (<c>(IArrayView)view</c> would, on every Return).</summary>
+    private static MemoryBuffer? BufferOf<TView>(TView view) where TView : struct, IArrayView
+    {
+        try { return view.Buffer; } catch { return null; }
+    }
+
+    /// <summary>
+    /// USE-AFTER-RETURN check (diagnostic): is this tensor's buffer sitting in a FREE bucket right now?
+    /// </summary>
+    /// <remarks>
+    /// A tensor whose buffer has been Returned is still perfectly readable - it just holds whatever the next
+    /// Rent of that size bucket wrote. That is the other way one live 1-element value reads correctly on some
+    /// executions and as another tensor's data on others, and unlike an aliasing Rent it leaves NO trace at
+    /// the Return site. Checked at input-gather, it names the consuming node instead.
+    /// Only meaningful with <see cref="TracePoolOwnership"/> on: the bucket scan is O(free buffers).
+    /// </remarks>
+    public bool IsReturnedToPool(Tensor tensor)
+    {
+        var actual = BufferOf(tensor.Data);
+        return actual != null && IsBufferFree(actual);
+    }
+
+    /// <summary>Is this buffer sitting in a free bucket right now? O(free buffers) - diagnostic paths only.</summary>
+    private bool IsBufferFree(MemoryBuffer buffer)
+    {
+        foreach (var stack in _buckets.Values)
+            foreach (var b in stack)
+                if (ReferenceEquals(b, buffer)) return true;
+        return false;
+    }
+
+    /// <summary>Report a consuming node reading a tensor whose buffer is already back in the free pool.</summary>
+    public void NoteUseAfterReturn(string where, string tensorName)
+        => PoolViolation($"USE-AFTER-RETURN '{tensorName}' read by {where}: its buffer is in the FREE bucket, " +
+                         "so its contents belong to whatever Rented that bucket next");
     /// <summary>Max total fp32+fp16 bytes ever allocated by ANY pool at one Rent (sum of all live buffers).</summary>
     public static long PeakTotalBytes;
     /// <summary>Max simultaneously-RENTED (named/live, not yet Returned) bytes at one Rent — the true working set.</summary>
@@ -199,8 +308,11 @@ public class BufferPool : IDisposable
         if (_buckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
         {
             var buffer = stack.Pop();
+            // 0xFF bytes = NaN as float32. Only the REUSED path needs this: a fresh allocation holds no
+            // previous tensor's values, and it is precisely the plausible leftovers that hide an unwritten read.
+            if (PoisonRentedBuffers) { try { buffer.View.MemSet(0xFF); } catch { } }
             var tensor = new Tensor(buffer.View, shape, name);
-            if (name != null) _namedBuffers[name] = buffer;
+            if (name != null) { NoteRebind(name, buffer); _namedBuffers[name] = buffer; }
             UpdatePeaks();
             return tensor;
         }
@@ -239,7 +351,7 @@ public class BufferPool : IDisposable
             && newBuffer.LengthInBytes >= LargeRunAllocThresholdBytes)
             Console.WriteLine($"[NEW-ALLOC] node {Graph.GraphExecutor.CurrentRunNodeIndex} {newBuffer.LengthInBytes / 1048576.0:F1}MiB name='{name}' bucket={bucketSize}");
         var newTensor = new Tensor(newBuffer.View, shape, name);
-        if (name != null) _namedBuffers[name] = newBuffer;
+        if (name != null) { NoteRebind(name, newBuffer); _namedBuffers[name] = newBuffer; }
         UpdatePeaks();
         return newTensor;
     }
@@ -308,12 +420,55 @@ public class BufferPool : IDisposable
         return freed;
     }
 
+    /// <summary>A name is about to be re-bound to <paramref name="incoming"/>. If the record it replaces is a
+    /// DIFFERENT buffer, the replaced one is still live with nothing left pointing at it - see the
+    /// <see cref="TracePoolOwnership"/> notes. Observation only.</summary>
+    private void NoteRebind(string name, object incoming)
+    {
+        if (!TracePoolOwnership) return;
+        if (_namedBuffers.TryGetValue(name, out var prev) && !ReferenceEquals(prev, incoming))
+            PoolViolation($"REBIND-LIVE '{name}': record {Bid(prev)} -> {Bid(incoming)} while {Bid(prev)} is still live " +
+                          $"(node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+    }
+
     /// <summary>Return a tensor's buffer to the pool for reuse by name.</summary>
     public void Return(Tensor tensor)
     {
         var name = tensor.Name;
         if (name != null && _namedBuffers.TryGetValue(name, out var buffer))
         {
+            if (StrictReturnIdentity)
+            {
+                var own = BufferOf(tensor.Data);
+                if (own != null && !ReferenceEquals(own, buffer))
+                {
+                    if (TracePoolOwnership)
+                        PoolViolation($"STRICT-SKIP '{name}': record {Bid(buffer)} != this tensor's {Bid(own)}, " +
+                                      $"not pooling (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+                    return;
+                }
+            }
+            if (TracePoolOwnership)
+            {
+                var actual = BufferOf(tensor.Data);
+                if (actual != null && !ReferenceEquals(actual, buffer))
+                    // ownAlreadyFree DISCRIMINATES the two ways the record can diverge from the tensor:
+                    //   true  - this exact tensor was ALREADY Returned once; the name was then re-Rented, and
+                    //           this second Return pools the new, live buffer. A double Return.
+                    //   false - this tensor's buffer was never pooled under this name at all (an alias built
+                    //           outside Rent - a zero-copy reshape/slice view carrying the same name).
+                    // ⚠️ WORDING IS DELIBERATE. This reports ONLY what is observed: the buffer recorded under
+                    // this name is not the one the returned tensor views. It does NOT establish that the
+                    // pooled buffer is still in use, and an earlier version of this message claimed exactly
+                    // that ("goes into the free bucket while STILL LIVE"). MEASURED 2026-09-01: it fires 21x
+                    // on tiny_loop and 23x on tiny_scan, both of which match onnxruntime exactly - so on this
+                    // evidence it is usually BENIGN (a view or handoff carrying a name it never Rented).
+                    // Do not read a count of these as a count of corruptions. USE-AFTER-RETURN is the
+                    // unambiguous one; this is a lead, not a verdict.
+                    PoolViolation($"ALIEN-RETURN '{name}': pooling {Bid(buffer)} but this tensor views {Bid(actual)} " +
+                                  $"- the name's record is not this tensor's buffer (often benign; see notes) " +
+                                  $"(node {Graph.GraphExecutor.CurrentRunNodeIndex}, ownAlreadyFree={IsBufferFree(actual)})");
+            }
             _namedBuffers.Remove(name);
             int bucketSize = (int)buffer.Length;
             if (!_buckets.TryGetValue(bucketSize, out var stack))
@@ -351,7 +506,7 @@ public class BufferPool : IDisposable
         if (_halfBuckets.TryGetValue(bucketSize, out var stack) && stack.Count > 0)
         {
             var buffer = stack.Pop();
-            if (name != null) _halfNamedBuffers[name] = buffer;
+            if (name != null) { NoteRebindHalf(name, buffer); _halfNamedBuffers[name] = buffer; }
             UpdatePeaks();
             return new HalfTensor(buffer.View, shape, name);
         }
@@ -362,9 +517,19 @@ public class BufferPool : IDisposable
             reclaimed => $"GPU out of memory renting fp16 '{name}' (+{bucketSize * 2L / 1048576}MB) after reclaiming " +
                          $"{reclaimed / 1048576}MB of pooled buffers; {_allHalfBuffers.Count} fp16 + {_allBuffers.Count} fp32 live. Exceeds VRAM.");
         _allHalfBuffers.Add(newBuffer);
-        if (name != null) _halfNamedBuffers[name] = newBuffer;
+        if (name != null) { NoteRebindHalf(name, newBuffer); _halfNamedBuffers[name] = newBuffer; }
         UpdatePeaks();
         return new HalfTensor(newBuffer.View, shape, name);
+    }
+
+    /// <summary>fp16 counterpart of <see cref="NoteRebind"/>. The half activation pool keys ownership on the
+    /// name exactly as the fp32 pool does, so it carries the same defect and needs the same detector.</summary>
+    private void NoteRebindHalf(string name, object incoming)
+    {
+        if (!TracePoolOwnership) return;
+        if (_halfNamedBuffers.TryGetValue(name, out var prev) && !ReferenceEquals(prev, incoming))
+            PoolViolation($"REBIND-LIVE (fp16) '{name}': record {Bid(prev)} -> {Bid(incoming)} while {Bid(prev)} is still live " +
+                          $"(node {Graph.GraphExecutor.CurrentRunNodeIndex})");
     }
 
     /// <summary>Return an fp16 (Half) tensor's buffer to the pool for reuse by name.</summary>
@@ -373,6 +538,13 @@ public class BufferPool : IDisposable
         var name = tensor.Name;
         if (name != null && _halfNamedBuffers.TryGetValue(name, out var buffer))
         {
+            if (TracePoolOwnership)
+            {
+                var actual = BufferOf(tensor.Data);
+                if (actual != null && !ReferenceEquals(actual, buffer))
+                    PoolViolation($"ALIEN-RETURN (fp16) '{name}': pooling {Bid(buffer)} but this tensor views {Bid(actual)} " +
+                                  $"- {Bid(buffer)} goes into the free bucket while STILL LIVE (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
+            }
             _halfNamedBuffers.Remove(name);
             int bucketSize = (int)buffer.Length;
             if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
