@@ -288,16 +288,26 @@ public class InferenceSession : IDisposable
         await weightLoader.LoadAsync(basePath, onProgress);
         onProgress?.Invoke("weights", 100);
 
-        // For Wasm/WebGL, pre-fetch master weight buffer to CPU once.
-        // Avoids GPU→GPU SubView copies that cause Wasm OOB and WebGL peer-to-peer issues.
+        // Wasm/WebGL stage weights through the HOST, because a GPU->GPU SubView copy hits Wasm OOB and
+        // WebGL peer-to-peer issues. Staging is still required; staging the WHOLE MODEL AT ONCE is not.
+        //
+        // ⚠️ This used to pre-fetch the entire master weight buffer into one float[] - the complete model
+        // on the single-threaded WASM managed heap - and then use it only to slice out individual tensors,
+        // plus a few hundred constants of <=64 elements each. MEASURED: it threw
+        // "System.OutOfMemoryException at TypedArray.ReadBytes" loading SqueezeNet at the end of the 801-test
+        // Wasm lane. It is the exact pattern the browser bulk-data rule exists to forbid: peak managed heap
+        // scaled with MODEL SIZE, so it was a latent OOM for every larger model, not a lane flake.
+        //
+        // Each tensor is now read back on demand through the view overload, whose contract is a REAL partial
+        // readback - only the view's byte range crosses the boundary (Wasm: a SharedArrayBuffer slice).
+        // Peak managed heap becomes the LARGEST SINGLE TENSOR instead of the whole model.
+        //
+        // ⚠️ It must be the ArrayView overload. `CopyToHostAsync(buffer, offset, count)` reads the whole
+        // buffer and then slices it on the host, which is the very thing being removed here.
         bool useCpuStaging = accelerator.AcceleratorType == AcceleratorType.Wasm ||
                              accelerator.AcceleratorType == AcceleratorType.WebGL;
-        float[]? cpuWeightsAll = null;
         if (useCpuStaging)
-        {
             await accelerator.SynchronizeAsync();
-            cpuWeightsAll = await weightLoader.CopyAllToHostAsync();
-        }
 
         // Extract small constant values for shape inference AND runtime operator use.
         // Use ONE shared read buffer to avoid allocating hundreds of tiny GPU buffers.
@@ -324,16 +334,12 @@ public class InferenceSession : IDisposable
                         var view = weightLoader.TryGetView(name);
                         if (view != null)
                         {
-                            if (useCpuStaging && cpuWeightsAll != null)
+                            if (useCpuStaging)
                             {
-                                var slice = weightLoader.GetSlice(name);
-                                if (slice != null)
-                                {
-                                    var hostBuf = new float[elems];
-                                    Array.Copy(cpuWeightsAll, slice.Value.offset, hostBuf, 0, elems);
-                                    constantFloatValues[name] = hostBuf;
-                                    modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
-                                }
+                                // <=64 elements: at most 256 bytes cross the boundary per tensor.
+                                var hostBuf = await view.Value.SubView(0, elems).CopyToHostAsync<float, Stride1D.Dense>();
+                                constantFloatValues[name] = hostBuf;
+                                modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
                             }
                             else
                             {
@@ -382,16 +388,12 @@ public class InferenceSession : IDisposable
                 // same GPUBuffer to multiple storage slots in one kernel dispatch.
                 int count = Tensors.TensorHelpers.ElementCount(shape);
                 var ownBuf = accelerator.Allocate1D<float>(count);
-                if (useCpuStaging && cpuWeightsAll != null)
+                if (useCpuStaging)
                 {
-                    // CPU staging: slice from the pre-fetched master buffer
-                    var slice = weightLoader.GetSlice(name);
-                    if (slice != null)
-                    {
-                        var weightSlice = new float[count];
-                        Array.Copy(cpuWeightsAll, slice.Value.offset, weightSlice, 0, count);
-                        ownBuf.CopyFromCPU(weightSlice);
-                    }
+                    // Host staging, ONE TENSOR AT A TIME: only this tensor's bytes cross the boundary, and
+                    // the array is collectable as soon as the upload completes.
+                    var weightSlice = await view.Value.SubView(0, count).CopyToHostAsync<float, Stride1D.Dense>();
+                    ownBuf.CopyFromCPU(weightSlice);
                 }
                 else
                 {

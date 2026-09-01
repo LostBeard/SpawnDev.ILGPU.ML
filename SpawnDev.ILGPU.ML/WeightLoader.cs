@@ -1,5 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
+using System.Net.Http;
+using System.IO;
 using System.Text.Json;
 
 namespace SpawnDev.ILGPU.ML;
@@ -59,10 +61,23 @@ public class WeightLoader
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Manifest: {manifest.Count} tensors");
         onProgress?.Invoke("manifest", 100);
 
-        // Fetch binary blob — chunked streaming to avoid OOM and keep UI responsive
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Downloading weight blob...");
-        var blob = await InferenceSession.DownloadBytesChunkedAsync(_http, $"{basePath}/weights_fp16.bin", onProgress);
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Blob: {blob.Length / (1024.0 * 1024.0):F1} MB");
+        // ⚠️ The weight blob is NEVER materialised as one managed byte[]. It used to be
+        // (`DownloadBytesChunkedAsync` returns the whole file), which put a model-sized CONTIGUOUS array on
+        // the single-threaded WASM heap - the allocation that still threw OutOfMemoryException after the
+        // fp32 copy below was removed. It is the standing "browser bulk bytes stay in JS, never the .NET
+        // managed heap" rule; a model-sized managed array has no business existing here at all.
+        //
+        // Tensors are read in FILE ORDER straight off the response stream and uploaded into their slice of
+        // the GPU buffer as they arrive, so peak managed heap is ONE TENSOR - independent of model size.
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Streaming weight blob...");
+        using var blobRequest = new HttpRequestMessage(HttpMethod.Get, $"{basePath}/weights_fp16.bin");
+        // Without this the browser fetch handler buffers the ENTIRE body into the managed heap before the
+        // first byte is readable, which defeats the streaming below. Same raw option key
+        // DownloadBytesChunkedAsync uses, and a no-op off-browser.
+        blobRequest.Options.Set(new HttpRequestOptionsKey<bool>("WebAssemblyEnableStreamingResponse"), true);
+        using var blobResponse = await _http.SendAsync(blobRequest, HttpCompletionOption.ResponseHeadersRead);
+        blobResponse.EnsureSuccessStatusCode();
+        using var blobStream = await blobResponse.Content.ReadAsStreamAsync();
 
         // Convert all weights to one contiguous FP32 array, track offsets.
         // Each tensor is aligned to 64 floats (256 bytes) so SubViews don't
@@ -71,25 +86,61 @@ public class WeightLoader
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Converting FP16 → FP32...");
         onProgress?.Invoke("convert", 0);
         int totalElements = manifest.Values.Sum(v => ((v.elements + ALIGN_FLOATS - 1) / ALIGN_FLOATS) * ALIGN_FLOATS);
-        var allWeights = new float[totalElements];
+
+        // ⚠️ The whole model used to be expanded into ONE `new float[totalElements]` here and uploaded at the
+        // end, which meant the fp16 `blob` AND its fp32 expansion - about 3x the model - were live on the
+        // single-threaded WASM managed heap AT THE SAME TIME. MEASURED: OutOfMemoryException loading
+        // SqueezeNet in the Wasm lane. Peak heap scaled with MODEL SIZE, so it was a latent OOM for every
+        // larger model, not a lane flake.
+        //
+        // The GPU buffer is now allocated up front and each tensor is converted and uploaded into its own
+        // slice, so peak managed heap is `blob` + ONE TENSOR. Zeroed first because the 64-float alignment
+        // leaves padding between tensors that no longer gets written; a zeroed device buffer keeps that
+        // padding deterministic (it was implicitly zero when the host array was allocated) without costing
+        // any host memory.
+        _weightBuffer = accelerator.Allocate1D<float>(totalElements);
+        _weightBuffer.MemSetToZero();
         int currentOffset = 0;
         int tensorsDone = 0;
         int tensorCount = manifest.Count;
         int lastConvertPct = -1;
 
-        foreach (var (name, info) in manifest)
+        // FILE ORDER, so the response stream is read strictly forward - a stream cannot seek backwards, and
+        // the manifest's dictionary order is not its byte order.
+        long streamPos = 0;
+        var skipScratch = new byte[64 * 1024];
+        foreach (var (name, info) in manifest.OrderBy(kv => kv.Value.offset))
         {
             // Ensure offset is 256-byte aligned (64 floats)
             currentOffset = ((currentOffset + ALIGN_FLOATS - 1) / ALIGN_FLOATS) * ALIGN_FLOATS;
 
+            // Discard any padding between the previous tensor and this one.
+            while (streamPos < info.offset)
+            {
+                int want = (int)Math.Min(skipScratch.Length, info.offset - streamPos);
+                int got = await blobStream.ReadAsync(skipScratch.AsMemory(0, want));
+                if (got <= 0) throw new EndOfStreamException(
+                    $"Weight blob ended while skipping to '{name}' at byte {info.offset} (read {streamPos}).");
+                streamPos += got;
+            }
+
+            // Exact-size staging, uploaded immediately and collectable straight after - the established
+            // SubView(...).CopyFromCPU(...) pattern used throughout this library.
+            var raw = new byte[info.bytes];
+            await blobStream.ReadExactlyAsync(raw.AsMemory(0, info.bytes));
+            streamPos += info.bytes;
+
+            var tensorFloats = new float[info.elements];
             if (info.dtype == "fp16")
             {
-                ConvertFp16ToFp32InPlace(blob, info.offset, info.elements, allWeights, currentOffset);
+                ConvertFp16ToFp32InPlace(raw, 0, info.elements, tensorFloats, 0);
             }
             else
             {
-                Buffer.BlockCopy(blob, info.offset, allWeights, currentOffset * 4, info.bytes);
+                Buffer.BlockCopy(raw, 0, tensorFloats, 0, info.bytes);
             }
+            if (info.elements > 0)
+                _weightBuffer.View.SubView(currentOffset, info.elements).CopyFromCPU(tensorFloats);
 
             _tensorSlices[name] = (currentOffset, info.elements);
             Shapes[name] = info.shape;
@@ -107,10 +158,10 @@ public class WeightLoader
                 await Task.Yield();
         }
 
-        // Single GPU allocation + upload (avoids 340 separate Allocate1D calls)
-        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Uploading {totalElements:N0} params ({totalElements * 4 / (1024.0 * 1024.0):F1} MB FP32) as single buffer...");
+        // Still ONE GPU buffer (not 340 Allocate1D calls) - it was allocated before the loop and filled
+        // slice by slice, so there is nothing left to upload here beyond draining the queued writes.
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[WeightLoader] Uploaded {totalElements:N0} params ({totalElements * 4 / (1024.0 * 1024.0):F1} MB FP32) as single buffer...");
         onProgress?.Invoke("upload", 0);
-        _weightBuffer = accelerator.Allocate1D(allWeights);
         await accelerator.SynchronizeAsync();
         onProgress?.Invoke("upload", 100);
 
@@ -149,12 +200,15 @@ public class WeightLoader
     public (long offset, long length)? GetSlice(string name)
         => _tensorSlices.TryGetValue(name, out var slice) ? (slice.offset, slice.length) : null;
 
-    /// <summary>Copy the entire master weight buffer to CPU. One-time operation for bulk weight extraction.</summary>
-    public async Task<float[]> CopyAllToHostAsync()
-    {
-        if (_weightBuffer == null) throw new InvalidOperationException("Weights not loaded.");
-        return await _weightBuffer.CopyToHostAsync<float>();
-    }
+    // ⚠️ REMOVED: CopyAllToHostAsync() - "copy the entire master weight buffer to CPU".
+    //
+    // Its only caller staged Wasm/WebGL weights through it, which put THE WHOLE MODEL on the single-threaded
+    // WASM managed heap and threw OutOfMemoryException in TypedArray.ReadBytes on a model as small as
+    // SqueezeNet. Peak heap scaled with model size, so it was a latent OOM for every larger model.
+    //
+    // There is no safe caller for a whole-model host copy in this library. Read the slice you need instead -
+    // `GetView(name).CopyToHostAsync()` is a real partial readback on every backend (Wasm: a
+    // SharedArrayBuffer slice), so peak heap is one tensor rather than one model.
 
     /// <summary>Get shape of a tensor.</summary>
     public int[] GetShape(string name) => Shapes[name];
