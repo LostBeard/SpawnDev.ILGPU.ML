@@ -151,7 +151,14 @@ public class SpeechRecognitionPipeline : IDisposable
         audioSamples = AudioPreprocessor.PadOrTrim(audioSamples, AudioPreprocessor.WhisperSampleRate * 30);
 
         // 3. Compute log-mel spectrogram [80, 3000]
+        // ⚠️ TIMED SEPARATELY. This is a CPU STFT in the middle of a GPU pipeline, and it runs over the
+        // PADDED 30 s regardless of how long the utterance actually was - so it is a fixed per-call cost
+        // that endpointing cannot reduce. The graph executor's counters cannot see it, because it never
+        // reaches the executor.
+        var melSw = Stopwatch.StartNew();
         var mel = AudioPreprocessor.ComputeLogMelSpectrogram(audioSamples);
+        melSw.Stop();
+        var melMs = melSw.Elapsed.TotalMilliseconds;
 
         // 4. Run encoder
         using var melBuf = _accelerator.Allocate1D(mel);
@@ -223,6 +230,8 @@ public class SpeechRecognitionPipeline : IDisposable
             Text = text.Trim(),
             Language = Language,
             InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
+            MelTimeMs = melMs,
+            ModelTimeMs = sw.Elapsed.TotalMilliseconds - melMs,
         };
     }
 

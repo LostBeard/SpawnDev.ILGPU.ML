@@ -494,6 +494,46 @@ public class GraphExecutor : IDisposable
     /// <summary>DIAGNOSTIC: total wall-clock ms spent in those periodic + final GPU sync-drains. Reset per RunAsync.</summary>
     public static double LastRunSyncDrainMs;
 
+    // ── Cumulative counters, across MANY RunAsync calls ────────────────────────────────────────────────
+    //
+    // ⚠️ WHY THESE EXIST. Every LastRun* field above is overwritten by the NEXT RunAsync, so for a pipeline
+    // that runs the graph more than once they describe only the final call. That is most of what we run:
+    // Whisper is one encoder pass plus N decoder steps, ZipVoice is NumSteps Euler iterations. Reading
+    // LastRunTotalMs after a 13.6 s transcription reports one decode step and looks reassuringly small,
+    // which is worse than no number at all - it is a measurement that invites the wrong conclusion.
+    //
+    // Usage: CumulativeReset() before the pipeline call, read the Cumulative* fields after. They are
+    // deliberately caller-driven rather than auto-resetting, because only the caller knows where one
+    // logical operation begins and ends.
+    //
+    // ⚠️ Static and NOT thread-safe, exactly like the LastRun* fields they extend. One inference at a time
+    // per process is the existing contract here (the engines each hold a load gate); if that ever changes
+    // these need to move onto the executor instance along with everything above them.
+
+    /// <summary>Number of <see cref="RunAsync"/> calls since <see cref="CumulativeReset"/>.</summary>
+    public static int CumulativeRunCount;
+    /// <summary>Summed <see cref="LastRunTotalMs"/> since <see cref="CumulativeReset"/>.</summary>
+    public static double CumulativeTotalMs;
+    /// <summary>Summed <see cref="LastRunReadbackCount"/> since <see cref="CumulativeReset"/>.</summary>
+    public static int CumulativeReadbackCount;
+    /// <summary>Summed <see cref="LastRunReadbackMs"/> since <see cref="CumulativeReset"/>.</summary>
+    public static double CumulativeReadbackMs;
+    /// <summary>Summed <see cref="LastRunSyncDrainCount"/> since <see cref="CumulativeReset"/>.</summary>
+    public static int CumulativeSyncDrainCount;
+    /// <summary>Summed <see cref="LastRunSyncDrainMs"/> since <see cref="CumulativeReset"/>.</summary>
+    public static double CumulativeSyncDrainMs;
+
+    /// <summary>Zero the cumulative counters. Call immediately before the operation being measured.</summary>
+    public static void CumulativeReset()
+    {
+        CumulativeRunCount = 0;
+        CumulativeTotalMs = 0;
+        CumulativeReadbackCount = 0;
+        CumulativeReadbackMs = 0;
+        CumulativeSyncDrainCount = 0;
+        CumulativeSyncDrainMs = 0;
+    }
+
     /// <summary>DIAGNOSTIC (VAE-decode "external Instance reference no longer exists" hunt): the node index the
     /// executor is CURRENTLY at, published every node so <see cref="Tensors.BufferPool"/> can name the node an
     /// under-pressure <c>AllocateWithReclaim</c> reclaim (buffer dispose) fired at. -1 when no run is active.</summary>
@@ -3704,6 +3744,16 @@ public class GraphExecutor : IDisposable
             _captureRuntimeSeed = new Dictionary<string, float[]>(runtimeConstants);
 
         _runSw.Stop(); LastRunTotalMs = _runSw.Elapsed.TotalMilliseconds;
+
+        // Roll this run into the cumulative totals, so a caller measuring a whole multi-run pipeline
+        // (Whisper's decode loop, ZipVoice's Euler steps) gets the sum rather than only the last step.
+        CumulativeRunCount++;
+        CumulativeTotalMs += LastRunTotalMs;
+        CumulativeReadbackCount += LastRunReadbackCount;
+        CumulativeReadbackMs += LastRunReadbackMs;
+        CumulativeSyncDrainCount += LastRunSyncDrainCount;
+        CumulativeSyncDrainMs += LastRunSyncDrainMs;
+
         return results;
     }
 

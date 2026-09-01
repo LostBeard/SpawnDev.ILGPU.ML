@@ -140,10 +140,10 @@ public static partial class AudioPreprocessor
     }
 
     /// <summary>Sinc lobes kept either side of an output sample. More lobes = sharper transition band.</summary>
-    private const int ResampleLobes = 8;
+    internal const int ResampleLobes = 8;
 
     /// <summary>Largest kernel table worth precomputing, in distinct phases.</summary>
-    private const int MaxResamplePhases = 4096;
+    internal const int MaxResamplePhases = 4096;
 
     /// <summary>Greatest common divisor, used to reduce a sample-rate pair to its smallest ratio.</summary>
     private static int Gcd(int a, int b)
@@ -153,7 +153,7 @@ public static partial class AudioPreprocessor
     }
 
     /// <summary>Normalised sinc, sin(pi x) / (pi x), with the removable singularity at 0 filled in.</summary>
-    private static double Sinc(double x)
+    internal static double Sinc(double x)
     {
         if (Math.Abs(x) < 1e-9) return 1.0;
         double px = Math.PI * x;
@@ -161,7 +161,7 @@ public static partial class AudioPreprocessor
     }
 
     /// <summary>Blackman window over u in [-1, 1]; zero outside, which bounds the kernel.</summary>
-    private static double BlackmanWindow(double u)
+    internal static double BlackmanWindow(double u)
     {
         if (u <= -1.0 || u >= 1.0) return 0.0;
         return 0.42 + 0.5 * Math.Cos(Math.PI * u) + 0.08 * Math.Cos(2.0 * Math.PI * u);
@@ -355,13 +355,39 @@ public static partial class AudioPreprocessor
         var melFilters = GenerateMelFilterbankSlaney(nMels, freqBins, 16000);
 
         // Apply mel filterbank: [nMels, numFrames]
+        //
+        // ⚠️ SPARSE BOUNDS, and they are why this is not 48 million multiply-adds. A Slaney mel filter is a
+        // TRIANGLE: filter m rises from one frequency bin to a peak and falls back to zero, touching a
+        // handful of the 201 bins and leaving the rest exactly 0. The dense loop still walked all 201 for
+        // every one of 80 mels x 3000 frames, so ~95% of the work multiplied by zero and added it.
+        //
+        // MEASURED before this: the CPU mel STFT was 4786 ms of a 14432 ms browser transcription - a third
+        // of it - and it is a FIXED cost, because the audio is padded to a flat 30 s before any of this
+        // runs. That is why endpointing shortened the RECORDING from 30 s to 3.7 s without shortening the
+        // transcription at all.
+        //
+        // ⚠️ Skipping the zeros is BIT-IDENTICAL, not an approximation: melFilters[m,k] == 0 contributes
+        // 0 * power == 0, and x + 0 == x exactly in IEEE 754. Gated by
+        // Mel_SparseFilterbank_MatchesDenseExactly.
+        var melLow = new int[nMels];
+        var melHigh = new int[nMels];
+        for (int m = 0; m < nMels; m++)
+        {
+            int lo = freqBins, hi = -1;
+            for (int k = 0; k < freqBins; k++)
+                if (melFilters[m, k] != 0f) { if (k < lo) lo = k; hi = k; }
+            melLow[m] = lo;
+            melHigh[m] = hi;   // hi < lo marks an all-zero filter, which the loop below skips entirely
+        }
+
         var melSpec = new float[nMels * numFrames];
         for (int m = 0; m < nMels; m++)
         {
+            int kLo = melLow[m], kHi = melHigh[m];
             for (int f = 0; f < numFrames; f++)
             {
                 float sum = 0;
-                for (int k = 0; k < freqBins; k++)
+                for (int k = kLo; k <= kHi; k++)
                 {
                     sum += melFilters[m, k] * power[f, k];
                 }

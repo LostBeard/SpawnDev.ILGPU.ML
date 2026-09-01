@@ -212,6 +212,21 @@ public class TranscriptionResult
 
     /// <summary>Per-segment timestamps (if available).</summary>
     public TranscriptionSegment[] Segments { get; init; } = Array.Empty<TranscriptionSegment>();
+
+    /// <summary>
+    /// Wall time computing the log-mel spectrogram, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Broken out because it is a CPU cost inside an otherwise GPU pipeline, and because it is FIXED
+    /// rather than proportional to the utterance: the audio is padded to a flat 30 s before the STFT runs,
+    /// so a four-word turn pays exactly what a full half-minute does. That is why endpointing shortened the
+    /// RECORDING without shortening the transcription, and attributing it needs its own number - the
+    /// executor counters cannot see work that never reaches the executor.
+    /// </remarks>
+    public double MelTimeMs { get; init; }
+
+    /// <summary>Wall time in the encoder + decoder, in milliseconds.</summary>
+    public double ModelTimeMs { get; init; }
 }
 
 /// <summary>A segment of transcribed text with timing.</summary>

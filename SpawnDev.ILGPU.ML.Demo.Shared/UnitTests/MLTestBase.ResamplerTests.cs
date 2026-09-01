@@ -172,4 +172,249 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// <see cref="StreamingResampler"/> must produce EXACTLY what the whole-buffer call produces.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ THE DEFECT THIS GUARDS. <c>Resample</c> renormalises the kernel where the window overruns the
+    /// SIGNAL EDGE, so applying it per chunk of a live stream declares every chunk boundary an edge. A
+    /// microphone delivers a frame every ~10 ms, so that is an artifact 100 times a second - a steady
+    /// broadband tick, which is exactly what a voice-activity detector reports as speech.
+    /// <c>MediaInterop.FromAudioDataAsync(data, targetRate)</c> did this on every frame, so ANY caller
+    /// asking capture for a target rate got it.
+    /// </para>
+    /// <para>
+    /// ⚠️ Chunk sizes here deliberately do NOT divide the 3:1 decimation factor or each other. A chunk
+    /// size that lands on a phase boundary can be correct by accident, so testing only 480-sample frames
+    /// would let a genuinely broken streamer pass.
+    /// </para>
+    /// <para>
+    /// ⚠️ EXACT equality, not a tolerance. A near-miss here means the boundary artifact is still present
+    /// at reduced amplitude - harder to see, no less wrong - and a tolerance is how it would ship.
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 120000)]
+    public Task Streaming_MatchesWholeBufferResample()
+    {
+        // Content ABOVE the destination Nyquist plus content below it: the high tone is what makes an
+        // edge artifact visible at all, per the file header.
+        var source = Tone(48000, 10000, 0.75, 0.4);
+        var speechish = Tone(48000, 1200, 0.75, 0.4);
+        for (int i = 0; i < source.Length; i++) source[i] += speechish[i];
+
+        foreach (var chunkSize in new[] { 1, 7, 128, 480, 1024, 4099 })
+        {
+            var expected = AudioPreprocessor.Resample(source, 48000, 16000);
+
+            var streamer = new StreamingResampler(48000, 16000);
+            var got = new System.Collections.Generic.List<float>();
+            for (int off = 0; off < source.Length; off += chunkSize)
+            {
+                int n = Math.Min(chunkSize, source.Length - off);
+                var chunk = new float[n];
+                Array.Copy(source, off, chunk, 0, n);
+                got.AddRange(streamer.Process(chunk));
+            }
+            got.AddRange(streamer.Flush());
+
+            if (got.Count != expected.Length)
+                throw new Exception($"chunk {chunkSize}: streamed {got.Count} samples, whole-buffer "
+                                  + $"produced {expected.Length}");
+
+            for (int i = 0; i < expected.Length; i++)
+                if (got[i] != expected[i])
+                    throw new Exception($"chunk {chunkSize}: sample {i} is {got[i]} streamed vs "
+                                      + $"{expected[i]} whole-buffer. The streamer is treating a chunk "
+                                      + "boundary as a signal edge.");
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The coprime FALLBACK path streams exactly too - it computes kernels per sample rather than from
+    /// the phase table, so it is a separate implementation and needs its own equality proof.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public Task Streaming_CoprimeFallback_MatchesWholeBufferResample()
+    {
+        var source = Tone(48000, 3000, 0.3, 0.4);
+        var expected = AudioPreprocessor.Resample(source, 48000, 16001);   // gcd 1 -> fallback
+
+        var streamer = new StreamingResampler(48000, 16001);
+        var got = new System.Collections.Generic.List<float>();
+        const int chunkSize = 997;
+        for (int off = 0; off < source.Length; off += chunkSize)
+        {
+            int n = Math.Min(chunkSize, source.Length - off);
+            var chunk = new float[n];
+            Array.Copy(source, off, chunk, 0, n);
+            got.AddRange(streamer.Process(chunk));
+        }
+        got.AddRange(streamer.Flush());
+
+        if (got.Count != expected.Length)
+            throw new Exception($"streamed {got.Count} samples, whole-buffer produced {expected.Length}");
+        for (int i = 0; i < expected.Length; i++)
+            if (got[i] != expected[i])
+                throw new Exception($"sample {i} is {got[i]} streamed vs {expected[i]} whole-buffer");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The sparse mel filterbank must produce EXACTLY what the dense one produced.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ WHY THE OPTIMISATION IS SAFE, and why that still needs proving. A Slaney mel filter is a triangle:
+    /// filter m touches a handful of the 201 frequency bins and is exactly 0 everywhere else. The dense loop
+    /// walked all 201 for every one of 80 mels x 3000 frames - about 48 million multiply-adds, ~95% of them
+    /// multiplying by zero. Restricting each mel to its non-zero span is bit-identical because
+    /// <c>0 * power == 0</c> and <c>x + 0 == x</c> exactly in IEEE 754.
+    /// </para>
+    /// <para>
+    /// ⚠️ EXACT equality, deliberately, and for the reason the streaming-resampler gate exists: a tolerance
+    /// here would also accept a bound that clipped a genuinely non-zero edge coefficient, which is a real
+    /// mistake this refactor could make (an off-by-one on <c>kHi</c>) and which would shift the spectrum
+    /// slightly - the kind of error that degrades a transcript without ever failing anything.
+    /// </para>
+    /// <para>
+    /// Driven with SPEECH-LIKE content rather than a pure tone: a single sine excites almost no mel bins, so
+    /// a bound bug could sit in the untouched ones and never show.
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 300000)]
+    public Task Mel_SparseFilterbank_MatchesDenseExactly()
+    {
+        // ── 1. THE INVARIANT, at the REAL production geometry (80 mels, 201 bins). ──
+        // This is what actually makes skipping safe, and asserting it directly is both cheaper and
+        // STRONGER than comparing one fixture's values: it holds for every possible input, not just this
+        // one. The realistic bug - an off-by-one on the upper bound clipping a genuinely non-zero edge
+        // coefficient - is caught here exactly.
+        const int nMels = 80, freqBins = 201;
+        var filters = AudioPreprocessor.GenerateMelFilterbankSlaney(nMels, freqBins, 16000);
+        int widest = 0;
+        for (int m = 0; m < nMels; m++)
+        {
+            int lo = freqBins, hi = -1;
+            for (int k = 0; k < freqBins; k++)
+                if (filters[m, k] != 0f) { if (k < lo) lo = k; hi = k; }
+
+            for (int k = 0; k < freqBins; k++)
+            {
+                bool inside = k >= lo && k <= hi;
+                if (!inside && filters[m, k] != 0f)
+                    throw new Exception($"mel {m}: filters[{m},{k}] = {filters[m, k]} lies OUTSIDE the "
+                                      + $"non-zero span [{lo},{hi}] the production loop derives, so the "
+                                      + "sparse bounds would drop a real coefficient");
+            }
+            if (hi >= lo) widest = Math.Max(widest, hi - lo + 1);
+        }
+
+        // The optimisation is only worth its complexity if the filters really are narrow. If a future
+        // filterbank change made them dense, this should stop claiming a win.
+        if (widest >= freqBins)
+            throw new Exception($"the widest mel filter spans all {freqBins} bins - the sparse path saves "
+                              + "nothing and the dense loop should come back");
+
+        // ── 2. END-TO-END value equality, at a REDUCED mel count. ──
+        // ⚠️ nMels is reduced ONLY to keep the runtime sane, and the reason matters: the dense oracle is
+        // 80 x 3000 x 201 = ~48 MILLION multiply-adds on the single WASM thread - the very work this
+        // change removes - and the test body is synchronous, so it runs inside PMT's Run-button click.
+        // MEASURED: at full size it blew Playwright's 30 s click timeout in a full sweep (it passed when
+        // run scoped, which is exactly how a too-slow test hides). Frame count is fixed at 3000 by
+        // Whisper's padding and cannot be reduced, so mels are the only lever.
+        // Step 1 above is what covers the production geometry; this covers the plumbing.
+        const int rate = 16000;
+        var n = (int)(rate * 1.2);
+        var audio = new float[n];
+        var rng = new Random(4242);
+        for (int i = 0; i < n; i++)
+        {
+            double t = i / (double)rate;
+            double v = 0;
+            for (int h = 1; h <= 12; h++) v += Math.Sin(2 * Math.PI * 110 * h * t) / h;   // broadband
+            audio[i] = (float)(0.3 * v + 0.02 * (rng.NextDouble() - 0.5));
+        }
+
+        const int smallMels = 8;
+        var got = AudioPreprocessor.ComputeLogMelSpectrogram(audio, smallMels);
+        var expected = DenseReferenceLogMel(audio, smallMels);
+
+        if (got.Length != expected.Length)
+            throw new Exception($"sparse produced {got.Length} values, dense reference {expected.Length}");
+        for (int i = 0; i < expected.Length; i++)
+            if (got[i] != expected[i])
+                throw new Exception($"mel[{i}] is {got[i]} sparse vs {expected[i]} dense - the non-zero span "
+                                  + "for some mel filter is wrong, which shifts the spectrum without "
+                                  + "failing anything downstream");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The DENSE filterbank, kept here as the oracle the optimised path is measured against.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Deliberately a duplicate of the pre-optimisation loop rather than a call into the library. An
+    /// oracle that shares the code under test cannot detect a change in that code - the whole point is that
+    /// this walks all 201 bins unconditionally, forever, however the production path evolves.
+    /// </remarks>
+    private static float[] DenseReferenceLogMel(float[] samples, int nMels = 80, int fftSize = 400,
+        int hopSize = 160)
+    {
+        samples = AudioPreprocessor.PadOrTrim(samples, AudioPreprocessor.WhisperMaxSamples);
+        var stft = AudioPreprocessor.ComputeSTFT(samples, fftSize, hopSize, center: true);
+        int numFrames = Math.Max(0, stft.GetLength(0) - 1);
+        int freqBins = stft.GetLength(1);
+
+        var power = new float[numFrames, freqBins];
+        for (int f = 0; f < numFrames; f++)
+            for (int k = 0; k < freqBins; k++)
+                power[f, k] = stft[f, k] * stft[f, k];
+
+        var melFilters = AudioPreprocessor.GenerateMelFilterbankSlaney(nMels, freqBins, 16000);
+
+        var melSpec = new float[nMels * numFrames];
+        for (int m = 0; m < nMels; m++)
+            for (int f = 0; f < numFrames; f++)
+            {
+                float sum = 0;
+                for (int k = 0; k < freqBins; k++) sum += melFilters[m, k] * power[f, k];
+                melSpec[m * numFrames + f] = MathF.Log10(MathF.Max(sum, 1e-10f));
+            }
+
+        float maxVal = float.MinValue;
+        for (int i = 0; i < melSpec.Length; i++) if (melSpec[i] > maxVal) maxVal = melSpec[i];
+        for (int i = 0; i < melSpec.Length; i++)
+        {
+            melSpec[i] = MathF.Max(melSpec[i], maxVal - 8.0f);
+            melSpec[i] = (melSpec[i] + 4.0f) / 4.0f;
+        }
+        return melSpec;
+    }
+
+    /// <summary>Equal rates stream through untouched, and must not buffer or delay.</summary>
+    [TestMethod(Timeout = 120000)]
+    public Task Streaming_EqualRates_IsIdentity()
+    {
+        var source = Tone(16000, 440, 0.2);
+        var streamer = new StreamingResampler(16000, 16000);
+        var got = new System.Collections.Generic.List<float>();
+        for (int off = 0; off < source.Length; off += 333)
+        {
+            int n = Math.Min(333, source.Length - off);
+            var chunk = new float[n];
+            Array.Copy(source, off, chunk, 0, n);
+            got.AddRange(streamer.Process(chunk));
+        }
+        got.AddRange(streamer.Flush());
+
+        if (got.Count != source.Length)
+            throw new Exception($"identity stream changed length: {source.Length} -> {got.Count}");
+        for (int i = 0; i < source.Length; i++)
+            if (got[i] != source[i])
+                throw new Exception($"sample {i} changed from {source[i]} to {got[i]}");
+        return Task.CompletedTask;
+    }
+
 }

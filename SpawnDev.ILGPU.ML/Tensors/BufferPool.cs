@@ -174,6 +174,21 @@ public class BufferPool : IDisposable
     public static bool PoisonRentedBuffers
         = Environment.GetEnvironmentVariable("ML_POISON_RENT") is "1" or "true";
 
+    /// <summary>
+    /// Log every NAMED rent as <c>name=bufferId</c> (<c>ML_TRACE_RENTS=1</c>).
+    /// </summary>
+    /// <remarks>
+    /// For graph capture/replay. A captured CUDA graph is a fixed list of kernel launches at FIXED device
+    /// pointers, and replay re-runs NO C# - so every buffer the recorded work touches must be the SAME
+    /// buffer on the replay pass. Pool reuse is order-dependent, so if anything perturbs the rent order
+    /// between the capture pass and a later pass, the recorded pointers go stale and replay reads freed or
+    /// foreign memory ("an illegal memory access was encountered" on CUDA, DXGI_ERROR_DEVICE_HUNG on
+    /// WebGPU). Diffing this trace across the two passes answers whether that is what is happening, rather
+    /// than inferring it from a crash address.
+    /// </remarks>
+    public static bool TraceRents
+        = Environment.GetEnvironmentVariable("ML_TRACE_RENTS") is "1" or "true";
+
     private static void PoolViolation(string message)
     {
         lock (PoolOwnershipViolations)
@@ -313,6 +328,7 @@ public class BufferPool : IDisposable
             if (PoisonRentedBuffers) { try { buffer.View.MemSet(0xFF); } catch { } }
             var tensor = new Tensor(buffer.View, shape, name);
             if (name != null) { NoteRebind(name, buffer); _namedBuffers[name] = buffer; }
+            if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(buffer)} reuse");
             UpdatePeaks();
             return tensor;
         }
@@ -352,6 +368,7 @@ public class BufferPool : IDisposable
             Console.WriteLine($"[NEW-ALLOC] node {Graph.GraphExecutor.CurrentRunNodeIndex} {newBuffer.LengthInBytes / 1048576.0:F1}MiB name='{name}' bucket={bucketSize}");
         var newTensor = new Tensor(newBuffer.View, shape, name);
         if (name != null) { NoteRebind(name, newBuffer); _namedBuffers[name] = newBuffer; }
+        if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(newBuffer)} fresh");
         UpdatePeaks();
         return newTensor;
     }

@@ -2,6 +2,71 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.7 (unreleased)
+
+### Fixed - the Whisper mel filterbank multiplied by zero ~95% of the time
+
+`ComputeLogMelSpectrogram` applied the mel filterbank densely: for each of 80 mels and 3000 frames it
+walked all 201 frequency bins, about **48 million multiply-adds** on the single WASM thread. A Slaney mel
+filter is a TRIANGLE - it rises to a peak and falls back to zero, touching a handful of those bins - so the
+overwhelming majority of that work multiplied by zero and added it. Each mel now runs only over its
+non-zero span.
+
+⚠️ **Bit-identical, not an approximation**: `melFilters[m,k] == 0` contributes `0 * power == 0`, and
+`x + 0 == x` exactly in IEEE 754. Gated by `Mel_SparseFilterbank_MatchesDenseExactly`, which compares
+against a **deliberately duplicated** dense loop rather than calling back into the library - an oracle that
+shares the code under test cannot detect a change in that code. Exact equality rather than a tolerance,
+because the realistic mistake here is an off-by-one on the upper bound clipping a genuinely non-zero edge
+coefficient: that shifts the spectrum slightly and degrades transcripts without failing anything.
+
+⚠️ **Why this was worth finding.** MEASURED in the browser demo: the CPU mel STFT was **4786 ms of a
+14432 ms transcription** - a third of it - and it is a FIXED cost, because the audio is padded to a flat
+30 s before any of it runs. That is the missing explanation for why adding a voice-activity endpointer cut
+the RECORDING from 30 s to 3.7 s without cutting the transcription at all.
+
+`TranscriptionResult` now carries `MelTimeMs` and `ModelTimeMs` so this stays visible: the graph executor's
+counters cannot see work that never reaches the executor.
+
+### Added - `GraphExecutor` cumulative counters, for pipelines that run the graph more than once
+
+`CumulativeReset()` plus `CumulativeRunCount` / `CumulativeTotalMs` / `CumulativeReadbackCount` /
+`CumulativeReadbackMs` / `CumulativeSyncDrainCount` / `CumulativeSyncDrainMs`.
+
+⚠️ **Why the existing `LastRun*` fields were not enough, and were actively misleading.** Every one of them
+is overwritten by the next `RunAsync`. Most of what we run is not one call: Whisper is one encoder pass
+plus N decoder steps, ZipVoice is `NumSteps` Euler iterations. Reading `LastRunTotalMs` after a 13-second
+transcription therefore reports the FINAL DECODE STEP - a reassuringly small number that describes a
+fraction of a percent of the work. That is worse than having no instrumentation, because it invites a
+confident wrong conclusion about where the time went.
+
+Caller-driven rather than auto-resetting, because only the caller knows where one logical operation begins
+and ends. Static and not thread-safe, exactly like the `LastRun*` fields they extend - one inference at a
+time per process is the existing contract.
+
+### Added - `StreamingResampler`: rate conversion for a LIVE stream
+
+`Preprocessing/StreamingResampler.cs` converts a microphone stream chunk by chunk and produces output
+**bit-identical** to what `AudioPreprocessor.Resample` produces for the whole signal at once.
+
+⚠️ **The defect it exists to prevent.** `Resample` is a windowed-sinc conversion, and at the SIGNAL EDGES
+it truncates the kernel window and renormalises the weights so the edge does not produce a gain step. That
+is correct for one complete clip and wrong applied per chunk of a stream - it declares every chunk boundary
+a signal edge. A microphone hands over a frame roughly every 10 ms, so resampling frame by frame
+manufactures an edge artifact 100 times a second: a steady broadband tick, which is exactly the kind of
+thing a voice-activity detector reports as speech.
+
+⚠️ **`MediaInterop.FromAudioDataAsync(audioData, targetSampleRate)` did precisely this on every frame**, so
+any caller that asked `MediaStreamCapture` for a target sample rate got it. Callers doing live endpointing
+should hold a `StreamingResampler` per stream instead.
+
+Gated by `Streaming_MatchesWholeBufferResample` (exact equality across chunk sizes that do not divide the
+decimation factor), `Streaming_CoprimeFallback_MatchesWholeBufferResample` (the per-sample kernel path is a
+separate implementation and needs its own proof), and `Streaming_EqualRates_IsIdentity`.
+
+`AudioPreprocessor`'s kernel constants and helpers (`ResampleLobes`, `MaxResamplePhases`, `Sinc`,
+`BlackmanWindow`) are now `internal` rather than `private` so the streaming path shares the exact same
+maths. If one changes without the other, the equality test fails - which is the intended alarm.
+
 ## 5.2.6 (2026-08-31)
 
 ### Fixed - the rest of the per-call device allocations that blocked CUDA graph capture
