@@ -25,6 +25,8 @@ public class MediaStreamCapture : IDisposable
     private CancellationTokenSource? _captureCts;
     private bool _isCapturing;
     private MediaStream? _audioStream;
+    /// <summary>True when this instance opened <see cref="_audioStream"/> and must stop its tracks.</summary>
+    private bool _ownsAudioStream;
     private MediaStreamTrackProcessor? _audioProcessor;
     private ReadableStreamDefaultReader? _audioReader;
     private CancellationTokenSource? _audioCts;
@@ -173,17 +175,73 @@ public class MediaStreamCapture : IDisposable
         if (targetSampleRate < 0) throw new ArgumentOutOfRangeException(nameof(targetSampleRate));
 
         LastAudioError = null;
-        _audioTargetRate = targetSampleRate;
         try
         {
             using var navigator = _js.Get<Navigator>("navigator");
             using var mediaDevices = navigator.MediaDevices;
-            _audioStream = await mediaDevices.GetUserMedia(video: false, audio: true);
-            if (_audioStream == null) return false;
+            var stream = await mediaDevices.GetUserMedia(video: false, audio: true);
+            if (stream == null) return false;
+            // The mic stream is OURS, so stopping capture stops its tracks and releases the device.
+            return await StartFromAudioStreamAsync(stream, targetSampleRate, maxBufferedFrames, ownsStream: true);
+        }
+        catch (Exception ex)
+        {
+            LastAudioError = ex;
+            StopMicrophone();
+            return false;
+        }
+    }
 
+    /// <summary>
+    /// Capture audio frames from an EXISTING <see cref="MediaStream"/> - a WebRTC remote track, a screen
+    /// share, a synthetic test source - instead of opening the microphone.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is what lets the hands-free loop move off this machine. <see cref="StartMicrophoneAsync"/> calls
+    /// <c>getUserMedia</c> itself, which is right for a browser demo and useless for a robot: Gemineachy
+    /// hears through a WebRTC track arriving from Rose, and there is no microphone on this side of the link
+    /// at all. Everything downstream - the frame loop, the native-rate handling, the buffering, the VAD and
+    /// the recogniser - is identical, so the loop is written once and fed from either end.
+    /// </para>
+    /// <para>
+    /// ⚠️ <paramref name="ownsStream"/> decides whether <see cref="StopMicrophone"/> STOPS the tracks. For a
+    /// stream we opened (the mic) it must, or the device stays hot and the browser keeps showing the
+    /// recording indicator. For a stream the CALLER owns - a live WebRTC connection carrying the
+    /// conversation - it must not: stopping their track would kill the call to stop listening to it.
+    /// </para>
+    /// </remarks>
+    /// <param name="stream">The stream to read audio frames from. Must carry at least one audio track.</param>
+    /// <param name="targetSampleRate">As <see cref="StartMicrophoneAsync"/>; 0 keeps the native rate.</param>
+    /// <param name="maxBufferedFrames">As <see cref="StartMicrophoneAsync"/>.</param>
+    /// <param name="ownsStream">
+    /// True to stop and dispose the stream's tracks on stop. Default FALSE - a caller-supplied stream is
+    /// assumed to be owned by the caller, which is the safe default for a shared WebRTC connection.
+    /// </param>
+    public async Task<bool> StartFromAudioStreamAsync(MediaStream stream, int targetSampleRate = 0,
+        int maxBufferedFrames = 3000, bool ownsStream = false)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (_audioProcessor != null) return false;
+        if (targetSampleRate < 0) throw new ArgumentOutOfRangeException(nameof(targetSampleRate));
+
+        LastAudioError = null;
+        _audioTargetRate = targetSampleRate;
+        _ownsAudioStream = ownsStream;
+        try
+        {
+            _audioStream = stream;
             using var tracks = _audioStream.GetAudioTracks();
             var track = tracks.ToArray().FirstOrDefault();
-            if (track == null) { StopMicrophone(); return false; }
+            if (track == null)
+            {
+                // Report it rather than returning a bare false: "no audio track" and "the browser refused
+                // the microphone" are different problems and the caller cannot tell them apart otherwise.
+                LastAudioError = new InvalidOperationException(
+                    "the MediaStream carries no audio track, so there is nothing to capture");
+                StopMicrophone();
+                return false;
+            }
 
             _audioProcessor = new MediaStreamTrackProcessor(new MediaStreamTrackProcessorOptions
             {
@@ -219,10 +277,16 @@ public class MediaStreamCapture : IDisposable
 
         if (_audioStream != null)
         {
-            using var tracks = _audioStream.GetAudioTracks();
-            tracks.ToArray().UsingEach(t => t.Stop());
-            _audioStream.Dispose();
+            // Only stop tracks we opened. A caller-supplied stream (a live WebRTC track carrying the
+            // conversation) belongs to the caller - stopping it here would end their call.
+            if (_ownsAudioStream)
+            {
+                using var tracks = _audioStream.GetAudioTracks();
+                tracks.ToArray().UsingEach(t => t.Stop());
+                _audioStream.Dispose();
+            }
             _audioStream = null;
+            _ownsAudioStream = false;
         }
     }
 
