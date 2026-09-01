@@ -58,7 +58,8 @@ public abstract partial class MLTestBase : IDisposable
     private Accelerator? _prevAccelerator;
     private Context? _prevContext;
 
-    protected async Task RunTest(Func<Accelerator, Task> testBody)
+    protected async Task RunTest(Func<Accelerator, Task> testBody,
+        [System.Runtime.CompilerServices.CallerMemberName] string? testName = null)
     {
         // Each invocation OWNS its context + accelerator as LOCALS - never a shared
         // cache. The runner abandons a timed-out test and moves on, but the abandoned
@@ -127,8 +128,60 @@ public abstract partial class MLTestBase : IDisposable
             }
             GC.Collect();
             GC.WaitForPendingFinalizers();
+            // Second pass: the finalizers above only QUEUE their objects' memory for reclaim, so a single
+            // collect reports them as still live and the trend line below would over-read by a whole test's
+            // worth of finalizable interop wrappers.
+            GC.Collect();
+
+            // ── MANAGED-HEAP TREND (one line per test, always on) ──
+            // The Wasm lane dies ~800 tests in with "Garbage collector could not allocate 16384u bytes of
+            // memory for major heap section" - the MONO GC failing to grow the .NET managed heap. That heap
+            // is invisible to `performance.memory.usedJSHeapSize` (V8 objects) and to a CDP JS-heap snapshot,
+            // which is why the 2026-06-15 investigation - which chased exactly those - could not see it.
+            // C# objects/byte[]/strings live HERE.
+            //
+            // ⚠️ This is the LIVE set after a full collect, deliberately, not a cumulative total: a monotonic
+            // counter always climbs and can never evidence accumulation. See the 2026-06-14/15 day lost to
+            // reading `TotalKernelsCompiled` (a next-id) as cache growth while the only real memory signal
+            // was flat. If this number is flat, there is no managed leak, whatever else is rising.
+            //
+            // PMT drops ordinary browser console lines, so read it with PMT_CONSOLE_LOG=ML-HEAP.
+            try
+            {
+                // ⚠️ LIVE-OBJECT census, not an event counter. Each test's Context+Accelerator are registered
+                // as WEAK references AFTER they are disposed and collected; anything still reported alive is
+                // being ROOTED by something. A climbing alive-count is direct evidence of what is retained,
+                // where a "created so far" total would climb no matter what and prove nothing (2026-06-14/15).
+                _ctxRefs.Add(new WeakReference(context));
+                _accelRefs.Add(new WeakReference(accelerator));
+                // ⚠️ NEGATIVE CONTROL. A plain object allocated here and referenced by nothing MUST be
+                // collected. If ctlAlive climbs alongside ctxAlive then the census is measuring the WASM GC's
+                // reluctance to clear weak references, not a leak - and every conclusion drawn from it is
+                // void. Without this the instrument cannot tell "rooted" from "not collected yet".
+                _controlRefs.Add(new WeakReference(new object()));
+                int ctxAlive = 0; foreach (var w in _ctxRefs) if (w.IsAlive) ctxAlive++;
+                int accAlive = 0; foreach (var w in _accelRefs) if (w.IsAlive) accAlive++;
+                int ctlAlive = 0; foreach (var w in _controlRefs) if (w.IsAlive) ctlAlive++;
+
+                long live = GC.GetTotalMemory(forceFullCollection: false);
+                var gcInfo = GC.GetGCMemoryInfo();
+                Console.WriteLine($"[ML-HEAP] {BackendName} #{++_heapTraceIndex} {testName ?? "?"} "
+                    + $"live={live / 1048576.0:F1}MiB committed={gcInfo.TotalCommittedBytes / 1048576.0:F1}MiB "
+                    + $"heap={gcInfo.HeapSizeBytes / 1048576.0:F1}MiB gen2={GC.CollectionCount(2)} "
+                    + $"ctxAlive={ctxAlive}/{_ctxRefs.Count} accelAlive={accAlive}/{_accelRefs.Count} ctlAlive={ctlAlive}/{_controlRefs.Count}");
+            }
+            catch { /* a diagnostic must never fail a test */ }
         }
     }
+
+    /// <summary>Sequence number for the <c>[ML-HEAP]</c> trend line - the x-axis of the growth curve.</summary>
+    private int _heapTraceIndex;
+
+    // Weak references to every disposed Context/Accelerator, for the alive-census above. Weak, so holding
+    // them cannot itself be the leak; a WeakReference is a few bytes against a ~0.9 MiB/test growth rate.
+    private static readonly List<WeakReference> _ctxRefs = new();
+    private static readonly List<WeakReference> _accelRefs = new();
+    private static readonly List<WeakReference> _controlRefs = new();
 
     public virtual void Dispose()
     {
