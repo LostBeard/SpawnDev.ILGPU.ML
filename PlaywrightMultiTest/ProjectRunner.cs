@@ -22,12 +22,46 @@ namespace PlaywrightMultiTest
         /// Returns an initialized ProjectRunner singleton
         /// </summary>
         /// <returns></returns>
-        static Task<ProjectRunner> GetRunner() => _projectRunner ??= new Func<Task<ProjectRunner>>(async () =>
+        private static readonly object _projectRunnerLock = new();
+
+        /// <summary>
+        /// Returns the singleton's initialization task, creating it EXACTLY ONCE.
+        /// </summary>
+        /// <remarks>
+        /// ⚠️ This used to be a bare <c>_projectRunner ??= …()</c>, which is NOT atomic: two threads can both
+        /// read null and both start <see cref="Init"/>. NUnit reaches this from two places - test DISCOVERY
+        /// (<c>TestCases</c>) and <c>OneTimeSetUp</c> (<see cref="StartUp"/>) - so the race is reachable in a
+        /// normal run.
+        ///
+        /// ⚠️ WHAT IT COST, from PMT's own init_status.log on 2026-09-02:
+        /// <code>
+        ///   12:11:31.843  Init() complete. Total projects=2, total tests=2505   &lt;-- console project only
+        ///   12:11:32.047  Phase A desktop lane 'cpu': ...                       &lt;-- scheduler runs off THIS
+        ///   12:11:39.527  Publish SpawnDev.ILGPU.ML.Demo: exit=0                &lt;-- Blazor still publishing
+        ///   12:11:45.463  Init() complete. Total projects=2, total tests=5005   &lt;-- the real set, too late
+        /// </code>
+        /// The scheduler started 0.2 s after the FIRST Init finished, when the Blazor project had not yet
+        /// been published, served or opened - so <c>blazor?.Page</c> was null, the browser lane was skipped
+        /// silently, and the sweep ran 2,500 desktop tests and NO browser tests. From the outside it is
+        /// indistinguishable from a hang: lanes scheduled, no Chromium, no output. It cost most of a morning
+        /// and TJ spotted it from the absence of a browser window, twice.
+        ///
+        /// Locking here is safe and cheap: it is contended once per process, and the lambda only STARTS the
+        /// task (the await happens outside the lock, at each caller).
+        /// </remarks>
+        static Task<ProjectRunner> GetRunner()
         {
-            var ret = new ProjectRunner();
-            await ret.Init().ConfigureAwait(false);
-            return ret;
-        })();
+            if (_projectRunner != null) return _projectRunner;
+            lock (_projectRunnerLock)
+            {
+                return _projectRunner ??= new Func<Task<ProjectRunner>>(async () =>
+                {
+                    var ret = new ProjectRunner();
+                    await ret.Init().ConfigureAwait(false);
+                    return ret;
+                })();
+            }
+        }
 
         /// <summary>
         /// Private consturoctor to prevent external instantiation. The runner should only be created through the GetRunner property which ensures proper initialization.
@@ -1303,6 +1337,21 @@ namespace PlaywrightMultiTest
                         phaseA.Add(RunLaneConcurrentAsync(tests, cap, null));
                     }
                 }
+            }
+
+            // ⚠️ A Blazor project that exists but has NO PAGE is a hard failure, not a lane to skip.
+            // Skipping it silently is what made a startup race look like a hang for a whole morning: the
+            // desktop lanes scheduled and ran, no Chromium ever appeared, and the sweep would have reported
+            // ~2,500 desktop results and zero browser results as though that were a normal run. Say it.
+            if (blazor != null && blazor.Page == null)
+            {
+                LogStatus("*** NO BROWSER PAGE. A Blazor WASM project was discovered but its page is null, so "
+                        + "EVERY browser test (WebGPU/WebGL/Wasm) would be silently skipped. This is a setup "
+                        + "failure, not a passing run - check init_status.log for the Publish / Launching "
+                        + "Chromium / Test table ready sequence.");
+                throw new InvalidOperationException(
+                    "PlaywrightMultiTest: the Blazor WASM project has no browser page, so no browser test can "
+                    + "run. Refusing to report a sweep that silently omits every browser backend.");
             }
 
             if (blazor?.Page != null)
