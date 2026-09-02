@@ -79,7 +79,7 @@ public abstract partial class MLTestBase
     /// the untouched inputs, whose lengths differ by four seconds, and this fails on the first assertion.
     /// </remarks>
     [TestMethod]
-    public async Task ZipVoice_ReferenceTrim_IsImmuneToSurroundingSilence() => await RunTest(_ =>
+    public async Task ZipVoice_ReferenceTrim_IsImmuneToSurroundingSilence() => await RunPureTest(() =>
     {
         var speech = TrimConcat(TrimRoomTone(0.10), TrimTone(1.5), TrimRoomTone(0.10));
         var buried = TrimConcat(TrimRoomTone(2.0), speech, TrimRoomTone(2.0));
@@ -107,7 +107,7 @@ public abstract partial class MLTestBase
 
     /// <summary>Leading and trailing dead air goes, and the speech itself survives intact.</summary>
     [TestMethod]
-    public async Task ZipVoice_ReferenceTrim_KeepsTheSpeechItTrimsAround() => await RunTest(_ =>
+    public async Task ZipVoice_ReferenceTrim_KeepsTheSpeechItTrimsAround() => await RunPureTest(() =>
     {
         var tone = TrimTone(1.0);
         var clip = TrimConcat(TrimRoomTone(1.5), tone, TrimRoomTone(1.5));
@@ -139,7 +139,7 @@ public abstract partial class MLTestBase
     /// would clone a speaker who never pauses, which is a different wrong voice rather than a right one.
     /// </remarks>
     [TestMethod]
-    public async Task ZipVoice_ReferenceTrim_CapsAnInternalPauseRatherThanDeletingIt() => await RunTest(_ =>
+    public async Task ZipVoice_ReferenceTrim_CapsAnInternalPauseRatherThanDeletingIt() => await RunPureTest(() =>
     {
         // "hello ... hello" - the shape that failed in the demo.
         var clip = TrimConcat(TrimTone(0.5), TrimRoomTone(2.0), TrimTone(0.5));
@@ -170,7 +170,7 @@ public abstract partial class MLTestBase
     /// say about it.
     /// </remarks>
     [TestMethod]
-    public async Task ZipVoice_ReferenceTrim_HandsBackWhatItCannotImprove() => await RunTest(_ =>
+    public async Task ZipVoice_ReferenceTrim_HandsBackWhatItCannotImprove() => await RunPureTest(() =>
     {
         var silence = new float[TrimRate];                       // digital zero: no peak to be relative to
         var same = ZipVoiceFeatures.TrimReferenceSilence(silence, TrimRate);
@@ -201,7 +201,7 @@ public abstract partial class MLTestBase
     /// gate decides.
     /// </remarks>
     [TestMethod]
-    public async Task ZipVoice_ReferenceTrim_ScalesWithTheClipNotWithAFixedLevel() => await RunTest(_ =>
+    public async Task ZipVoice_ReferenceTrim_ScalesWithTheClipNotWithAFixedLevel() => await RunPureTest(() =>
     {
         var clip = TrimConcat(TrimRoomTone(1.0), TrimTone(1.0), TrimRoomTone(1.0));
         var quiet = clip.Select(v => v * 0.05f).ToArray();       // the same recording, 26 dB down

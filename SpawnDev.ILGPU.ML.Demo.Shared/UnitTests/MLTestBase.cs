@@ -58,6 +58,44 @@ public abstract partial class MLTestBase : IDisposable
     private Accelerator? _prevAccelerator;
     private Context? _prevContext;
 
+    /// <summary>
+    /// Run a test that needs NO GPU - it creates no Context and no Accelerator.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ WHY THIS EXISTS, and it is not tidiness. <b>61 tests</b> in this suite are written
+    /// <c>RunTest(_ =&gt; ...)</c> - the discard PROVES the body cannot touch the accelerator - and every one
+    /// of them still built a full Context + Accelerator pair. Phonemizer, text normalisation,
+    /// letter-to-sound, homographs, tokenizers, word decomposition, the ZipVoice reference trim: string and
+    /// array work, no device involved.
+    /// </para>
+    /// <para>
+    /// ⚠️ That is not free, because the browser backends RETAIN every Context and Accelerator ever created
+    /// (MEASURED by the census in <see cref="RunTest"/>: <c>ctxAlive</c> tracks the test count 1:1, with the
+    /// negative control collecting normally). At the ~13 MiB per test that census reports, 61 unnecessary
+    /// pairs is on the order of <b>hundreds of MiB</b> of managed heap spent on tests that never dispatch a
+    /// kernel - on the lane whose ceiling is ~630 MiB, where the run dies with "Garbage collector could not
+    /// allocate 16384u bytes of memory for major heap section".
+    /// </para>
+    /// <para>
+    /// ⚠️ Use this ONLY where the body genuinely needs no accelerator. It deliberately takes no
+    /// <see cref="Accelerator"/>, so misuse cannot compile. The heap trend line is skipped too: a test that
+    /// allocates no device pair contributes nothing to the curve, and printing a flat line per pure test
+    /// would bury the tests that do.
+    /// </para>
+    /// </remarks>
+    protected async Task RunPureTest(Func<Task> testBody)
+    {
+        // Still evicts a previous invocation's zombie pair, for the same reason RunTest does: a timed-out
+        // predecessor must not keep a full accelerator alive alongside the next test.
+        try { _prevAccelerator?.Dispose(); } catch { }
+        try { _prevContext?.Dispose(); } catch { }
+        _prevAccelerator = null;
+        _prevContext = null;
+        ResetStaticCaptureState();
+        await testBody();
+    }
+
     protected async Task RunTest(Func<Accelerator, Task> testBody,
         [System.Runtime.CompilerServices.CallerMemberName] string? testName = null)
     {

@@ -3827,7 +3827,11 @@ public class GraphExecutor : IDisposable
         _readbackProbe = null;
         _readbackStable = null;
         _priorRunOutputs = null;
-        _weights.Clear();
+        // ⚠️ NOT _weights. That dictionary belongs to the InferenceSession and is handed to EVERY executor
+        // it builds (the base one plus up to MaxShapeExecutors shape-specialised ones) BY REFERENCE.
+        // Clearing it here empties it for the session and for every sibling executor still in use -
+        // MEASURED as "Tensor 'c1w' not found (needed by Conv)" on all six backends. Dispose releases what
+        // this object OWNS; a reference it was handed is not that.
     }
 
     /// <summary>Lazily create the fp32↔low-precision convert kernels (used only in mixed-precision mode).</summary>

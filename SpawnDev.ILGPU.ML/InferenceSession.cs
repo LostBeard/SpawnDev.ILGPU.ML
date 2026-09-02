@@ -2603,7 +2603,10 @@ public class InferenceSession : IDisposable
         _recompileGraph = null;
         _recompileConstSeed = null;
         _recompileFloatSeed = null;
-        _weights.Clear();
+        // ⚠️ NOT _weights, for the same reason as GraphExecutor.Dispose: the executors were handed this
+        // exact dictionary and a caller may still hold a session-derived object. The three fields above are
+        // session-OWNED and are the large ones anyway - the weight seed is the model, the graph carries its
+        // initializers. Emptying the shared map bought nothing and broke every backend.
     }
 
     // Pre-extract pads tensors (Pad opset >= 11) into runtime constants at session init.

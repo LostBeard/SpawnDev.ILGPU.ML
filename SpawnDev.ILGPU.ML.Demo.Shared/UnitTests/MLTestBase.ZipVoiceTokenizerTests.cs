@@ -34,7 +34,7 @@ public abstract partial class MLTestBase
     }
 
     [TestMethod]
-    public async Task ZipVoiceTokenizer_EncodesTextToTokenIds() => await RunTest(_ =>
+    public async Task ZipVoiceTokenizer_EncodesTextToTokenIds() => await RunPureTest(() =>
     {
         var ids = MakeTokenizer().Encode("the cat");
         // ð ə ␣ k ˈ æ t  - the word separator is a real token, and the stress mark rides with the vowel.
@@ -45,7 +45,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task ZipVoiceTokenizer_RefusesAPhonemeTheModelCannotSpeak() => await RunTest(_ =>
+    public async Task ZipVoiceTokenizer_RefusesAPhonemeTheModelCannotSpeak() => await RunPureTest(() =>
     {
         // A symbol with no token must be loud. Skipping it would render audio quietly missing a sound,
         // and nothing downstream could ever point at the cause.
@@ -62,7 +62,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task ReferenceOverrides_AreSingleSymbolsTheModelCanTokenize() => await RunTest(_ =>
+    public async Task ReferenceOverrides_AreSingleSymbolsTheModelCanTokenize() => await RunPureTest(() =>
     {
         // An override is hand-written IPA, and a two-character entry like "uː" LOOKS right while being
         // TWO tokens to the model. One such entry made a whole sentence unrenderable - the tokenizer
@@ -83,7 +83,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task ZipVoiceTokenizer_ReportsWordsTheDictionaryLacked() => await RunTest(_ =>
+    public async Task ZipVoiceTokenizer_ReportsWordsTheDictionaryLacked() => await RunPureTest(() =>
     {
         // Worth surfacing all the way up: a name that was sounded out rather than looked up is the
         // difference between a pronunciation and a guess, and the caller may want to know.

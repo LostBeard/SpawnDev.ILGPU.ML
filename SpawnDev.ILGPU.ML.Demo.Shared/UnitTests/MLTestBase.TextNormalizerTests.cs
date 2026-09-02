@@ -15,7 +15,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     [TestMethod]
-    public async Task Normalizer_ReadsYearsAsYears() => await RunTest(_ =>
+    public async Task Normalizer_ReadsYearsAsYears() => await RunPureTest(() =>
     {
         // "one thousand nine hundred ninety-nine" is correct English for 1999 and sounds nothing like a
         // year. Four digits in this range are overwhelmingly dates.
@@ -30,7 +30,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_ReadsPlainNumbers() => await RunTest(_ =>
+    public async Task Normalizer_ReadsPlainNumbers() => await RunPureTest(() =>
     {
         var n = new EnglishTextNormalizer();
         ExpectText(n.Normalize("0 apples"), "zero apples");
@@ -46,7 +46,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_ReadsMoneyAsMoney() => await RunTest(_ =>
+    public async Task Normalizer_ReadsMoneyAsMoney() => await RunPureTest(() =>
     {
         // The order of the rules is what makes this work: currency has to be handled before the plain
         // decimal rule, or $1.50 becomes "one point five zero dollars".
@@ -58,7 +58,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_ReadsOrdinalsFractionsAndPercent() => await RunTest(_ =>
+    public async Task Normalizer_ReadsOrdinalsFractionsAndPercent() => await RunPureTest(() =>
     {
         var n = new EnglishTextNormalizer();
         ExpectText(n.Normalize("the 1st of May"), "the first of May");
@@ -70,7 +70,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_ExpandsAbbreviations() => await RunTest(_ =>
+    public async Task Normalizer_ExpandsAbbreviations() => await RunPureTest(() =>
     {
         // Whole-word and case-insensitive, longest first so "drs" is not eaten by "dr".
         var n = new EnglishTextNormalizer();
@@ -87,7 +87,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_NumbersAreOrdinalAware() => await RunTest(_ =>
+    public async Task Normalizer_NumbersAreOrdinalAware() => await RunPureTest(() =>
     {
         // Only the final word takes the ordinal form, and the irregulars are irregular.
         ExpectText(NumberToWords.Ordinal(1), "first");
@@ -101,7 +101,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_GroupedNumbersAreQuantitiesNotYears() => await RunTest(_ =>
+    public async Task Normalizer_GroupedNumbersAreQuantitiesNotYears() => await RunPureTest(() =>
     {
         // "I have 1,234 of them" was read as "twelve thirty-four". The commas were stripped before the
         // year heuristic ran, so a quantity arrived looking exactly like a year - and the one piece of
@@ -126,7 +126,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_ReadsClockTimes() => await RunTest(_ =>
+    public async Task Normalizer_ReadsClockTimes() => await RunPureTest(() =>
     {
         // "3:30" left the colon in the output, where it reaches the phonemizer as punctuation and is
         // spoken as a pause: "three, thirty".
@@ -141,7 +141,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_SaysSymbolsThatStandForWords() => await RunTest(_ =>
+    public async Task Normalizer_SaysSymbolsThatStandForWords() => await RunPureTest(() =>
     {
         // Left alone these reach the phonemizer as punctuation and are spoken as a pause or dropped,
         // so "Mr. & Mrs." simply loses the "and".
@@ -153,7 +153,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_TellsAStreetFromASaint() => await RunTest(_ =>
+    public async Task Normalizer_TellsAStreetFromASaint() => await RunPureTest(() =>
     {
         // Every "st" mapped to "saint", so "123 Main St." was read as "Main saint". A saint's name
         // FOLLOWS the abbreviation and a street's name PRECEDES it, so what comes before decides.
@@ -170,7 +170,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_SpellsOutUnitsAfterANumber() => await RunTest(_ =>
+    public async Task Normalizer_SpellsOutUnitsAfterANumber() => await RunPureTest(() =>
     {
         // Units were left as letters - "5km" was spoken as "five km" - and "6 ft" was worse, because
         // the abbreviation table read it as "six FORT".
@@ -194,7 +194,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_ReadsArithmeticAndHyphenatedForms() => await RunTest(_ =>
+    public async Task Normalizer_ReadsArithmeticAndHyphenatedForms() => await RunPureTest(() =>
     {
         var n = new EnglishTextNormalizer();
 
@@ -215,7 +215,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Normalizer_AbbreviationsThatAreAlsoWordsNeedTheirPeriod() => await RunTest(_ =>
+    public async Task Normalizer_AbbreviationsThatAreAlsoWordsNeedTheirPeriod() => await RunPureTest(() =>
     {
         // These matched on a word boundary alone, and a hyphen is a word boundary - so "co-op" was read
         // as "COMPANY op". The same route turns "rev the engine" into "reverend the engine".

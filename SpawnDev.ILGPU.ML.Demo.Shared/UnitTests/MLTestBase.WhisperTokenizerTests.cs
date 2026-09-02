@@ -41,7 +41,7 @@ public abstract partial class MLTestBase
         "\"merges\":[\"h e\",\"l l\",\"he ll\",\"hell o\"]}}";
 
     [TestMethod]
-    public async Task WhisperTokenizer_ResolvesMultilingualSpecialTokens() => await RunTest(_ =>
+    public async Task WhisperTokenizer_ResolvesMultilingualSpecialTokens() => await RunPureTest(() =>
     {
         var tok = BPETokenizer.LoadFromTokenizerJson(WhisperTokenizerJson(MultilingualSpecials));
 
@@ -54,7 +54,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task WhisperTokenizer_ResolvesEnglishOnlySpecialTokens() => await RunTest(_ =>
+    public async Task WhisperTokenizer_ResolvesEnglishOnlySpecialTokens() => await RunPureTest(() =>
     {
         var tok = BPETokenizer.LoadFromTokenizerJson(WhisperTokenizerJson(EnglishOnlySpecials));
 
@@ -68,7 +68,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task WhisperTokenizer_EndOfTextIdentifiesTheModelFamily() => await RunTest(_ =>
+    public async Task WhisperTokenizer_EndOfTextIdentifiesTheModelFamily() => await RunPureTest(() =>
     {
         // SpeechRecognitionPipeline picks its decoder prompt from this one signal, so it gets its own
         // test: English-only checkpoints were trained WITHOUT the language and task tokens, and priming
@@ -90,7 +90,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task WhisperTokenizer_SpecialTokensDoNotDisturbOrdinaryText() => await RunTest(_ =>
+    public async Task WhisperTokenizer_SpecialTokensDoNotDisturbOrdinaryText() => await RunPureTest(() =>
     {
         // Special tokens are BPE-unreachable - no merge rule produces them - so adding them to the vocab
         // must not change how ordinary text encodes. Without this guard, the fix could quietly corrupt

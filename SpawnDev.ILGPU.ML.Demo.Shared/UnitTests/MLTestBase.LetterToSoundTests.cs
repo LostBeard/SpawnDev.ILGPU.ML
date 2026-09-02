@@ -29,7 +29,7 @@ public abstract partial class MLTestBase
         """;
 
     [TestMethod]
-    public async Task LetterToSound_EveryVowelCarriesAStressDigit() => await RunTest(_ =>
+    public async Task LetterToSound_EveryVowelCarriesAStressDigit() => await RunPureTest(() =>
     {
         // A vowel without a digit is not valid ARPAbet, and downstream it is dropped as unknown. This is
         // the exact defect that turned a name into its consonants.
@@ -48,7 +48,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task LetterToSound_SilentLettersProduceNothing() => await RunTest(_ =>
+    public async Task LetterToSound_SilentLettersProduceNothing() => await RunPureTest(() =>
     {
         // "-" means the letter is silent, which is how the model spells the e in "cate".
         var lts = LetterToSound.Parse(TinyLtsModel.Split('\n'));
@@ -60,7 +60,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task LetterToSound_MarksExactlyOnePrimaryStress() => await RunTest(_ =>
+    public async Task LetterToSound_MarksExactlyOnePrimaryStress() => await RunPureTest(() =>
     {
         // English words have one primary stress. The per-letter model can mark several - "Tuvok" came
         // back with two - and stress is what the downstream model punishes hardest, so emitting two is
@@ -76,7 +76,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task LetterToSound_AlwaysStressesSomething() => await RunTest(_ =>
+    public async Task LetterToSound_AlwaysStressesSomething() => await RunPureTest(() =>
     {
         // With no stress rule at all, the fallback has to stress the first vowel - a word with no
         // stressed syllable leaves a hole where a beat belongs.
@@ -88,7 +88,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task LetterToSound_NeverReturnsAWordWithNoVowelAtAll() => await RunTest(_ =>
+    public async Task LetterToSound_NeverReturnsAWordWithNoVowelAtAll() => await RunPureTest(() =>
     {
         // The failure this guards is the one that turned "Aubriella" into "bɹl" - a word spelled with
         // vowels coming back as bare consonants. It is unambiguous, because no English word is all
@@ -114,7 +114,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task LetterToSound_LastResortDoesNotFireOnAWordThatAlreadySpeaks() => await RunTest(_ =>
+    public async Task LetterToSound_LastResortDoesNotFireOnAWordThatAlreadySpeaks() => await RunPureTest(() =>
     {
         // The narrowness IS the feature. Letting the fallback fire whenever a letter came back silent
         // cost 19.5 points on held-out words, because a silent letter is usually CORRECT - English is
@@ -129,7 +129,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_SoundsOutWordsTheDictionaryLacks() => await RunTest(_ =>
+    public async Task Phonemizer_SoundsOutWordsTheDictionaryLacks() => await RunPureTest(() =>
     {
         // The whole point: an unknown word still gets spoken, and is still REPORTED as unknown, because
         // "the dictionary did not have this" is the difference between a pronunciation and a guess.

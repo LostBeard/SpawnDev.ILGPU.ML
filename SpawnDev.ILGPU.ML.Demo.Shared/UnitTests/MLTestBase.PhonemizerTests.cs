@@ -35,7 +35,7 @@ public abstract partial class MLTestBase
     }));
 
     [TestMethod]
-    public async Task Phonemizer_PutsStressBeforeTheVowelAndTapsT() => await RunTest(_ =>
+    public async Task Phonemizer_PutsStressBeforeTheVowelAndTapsT() => await RunPureTest(() =>
     {
         // Reference: better is b-STRESS-E-tap-schwar. Two rules at once - the stress mark sits before the
         // VOWEL rather than before the syllable, and an intervocalic T becomes a tap.
@@ -45,7 +45,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_TapsTButNeverD() => await RunTest(_ =>
+    public async Task Phonemizer_TapsTButNeverD() => await RunPureTest(() =>
     {
         // The reference frontend taps T and leaves D alone: ladder keeps a plain d. Flapping D as well
         // was a real defect here, caught by the accuracy probe against captured reference output.
@@ -54,7 +54,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_DestressesFunctionWords() => await RunTest(_ =>
+    public async Task Phonemizer_DestressesFunctionWords() => await RunPureTest(() =>
     {
         // THE most important rule in the phonemizer. A dictionary stores citation forms, so function
         // words arrive carrying a stress they lose in running speech. Measured cost of getting this
@@ -69,7 +69,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_GivesAStresslessContentWordItsStress() => await RunTest(_ =>
+    public async Task Phonemizer_GivesAStresslessContentWordItsStress() => await RunPureTest(() =>
     {
         // The dictionary stores "in" as IH0 N, with no stressed vowel at all. Emitted that way it leaves
         // a hole where a beat belongs; the reference frontend marks it. Any word that is not a weak form
@@ -80,7 +80,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_KeepsSecondaryStress() => await RunTest(_ =>
+    public async Task Phonemizer_KeepsSecondaryStress() => await RunPureTest(() =>
     {
         // understand is SECONDARY-uh-n-d-schwar-s-t-PRIMARY-ae-n-d. Dropping the secondary mark barely
         // touches the words but moves the audio, which is the difference between intelligible and
@@ -90,7 +90,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_WritesPunctuationTheWayTheModelWasTrainedOn() => await RunTest(_ =>
+    public async Task Phonemizer_WritesPunctuationTheWayTheModelWasTrainedOn() => await RunPureTest(() =>
     {
         // The reference frontend writes "roses ,understand" - a space BEFORE the pause mark, which then
         // leads the clause it opens. Getting this backwards desynchronised every word-level comparison
@@ -101,7 +101,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_ReportsWordsItDoesNotKnow() => await RunTest(_ =>
+    public async Task Phonemizer_ReportsWordsItDoesNotKnow() => await RunPureTest(() =>
     {
         // An unknown word is the one failure a caller must hear about: it is the difference between
         // speaking a name and silently skipping it. "aubriella" is genuinely absent from CMUdict, which
@@ -119,7 +119,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_ReducesPluralAndPastEndingsButOnlyRealOnes() => await RunTest(_ =>
+    public async Task Phonemizer_ReducesPluralAndPastEndingsButOnlyRealOnes() => await RunPureTest(() =>
     {
         // "roses" and "waited" take the reduced ending vowel. "hundred" looks identical to the phone
         // rule - unstressed vowel, then D, spelled -ed - and must NOT take it, because there is no word
@@ -133,7 +133,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_LoadsItsOwnDataInTheBrowser() => await RunTest(_ =>
+    public async Task Phonemizer_LoadsItsOwnDataInTheBrowser() => await RunPureTest(() =>
     {
         // The library claims to be browser-capable, and its data is embedded gzipped in the assembly.
         // That path - manifest resource plus GZipStream - had only ever run on the desktop. This test
@@ -153,7 +153,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_DefineBeatsGuessingAndSurvivesASentence() => await RunTest(_ =>
+    public async Task Phonemizer_DefineBeatsGuessingAndSurvivesASentence() => await RunPureTest(() =>
     {
         // A name you KNOW should never be guessed at. Letter-to-sound is right about half the time,
         // and the words an application says most are exactly the ones CMUdict lacks.
@@ -192,7 +192,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_DefineRejectsPhonesItCannotSpeak() => await RunTest(_ =>
+    public async Task Phonemizer_DefineRejectsPhonesItCannotSpeak() => await RunPureTest(() =>
     {
         // A bad phone must fail HERE. Left unchecked it travels into the symbol stream and comes out
         // as a missing or wrong sound, which is far harder to trace back to the typo that caused it.
@@ -220,7 +220,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_SpellsOutAcronymsInsteadOfGuessingThem() => await RunTest(_ =>
+    public async Task Phonemizer_SpellsOutAcronymsInsteadOfGuessingThem() => await RunPureTest(() =>
     {
         // The dictionary's own notes say its misses at the common end are "almost entirely abbreviations
         // and acronyms... which want expanding or spelling out rather than guessing", and nothing did it.
@@ -265,7 +265,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Phonemizer_PossessivesResolveTheirStem() => await RunTest(_ =>
+    public async Task Phonemizer_PossessivesResolveTheirStem() => await RunPureTest(() =>
     {
         // "Aubriella's" is a different string from "Aubriella", so it missed the dictionary and went to
         // letter-to-sound as one long unknown word. That defeats Define outright - you could teach it a
@@ -300,7 +300,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Vocabulary_MapsSymbolsToTokenIdsAndBack() => await RunTest(_ =>
+    public async Task Vocabulary_MapsSymbolsToTokenIdsAndBack() => await RunPureTest(() =>
     {
         // ⚠️ The third line is a SPACE as a symbol, which a real ZipVoice vocabulary genuinely lists.
         // Splitting on whitespace loses it, and it is the token that separates words - so the file must

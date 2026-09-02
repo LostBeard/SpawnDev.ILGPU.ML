@@ -37,7 +37,7 @@ public abstract partial class MLTestBase
     { Normalizer = null };
 
     [TestMethod]
-    public async Task Homograph_ReadsTheNounAndTheVerbDifferently() => await RunTest(_ =>
+    public async Task Homograph_ReadsTheNounAndTheVerbDifferently() => await RunPureTest(() =>
     {
         var p = HomographPhonemizer();
 
@@ -52,7 +52,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Homograph_ChoosesAnEntryRatherThanMovingStress() => await RunTest(_ =>
+    public async Task Homograph_ChoosesAnEntryRatherThanMovingStress() => await RunPureTest(() =>
     {
         // The noun reading must be the dictionary's OTHER entry, vowels and all. Re-stressing the first
         // entry would give "ɹˈʌkɔːɹd" - right beat, wrong word - which is what the first attempt did.
@@ -62,7 +62,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Homograph_ReadsVowelHomographsToo() => await RunTest(_ =>
+    public async Task Homograph_ReadsVowelHomographsToo() => await RunPureTest(() =>
     {
         // Not every homograph is a stress shift. "The WIND blows" and "WIND the clock" differ by a
         // VOWEL, and the dictionary's FIRST entry is the rarer verb - so left alone, "the way the wind
@@ -81,7 +81,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Homograph_LeavesOrdinaryWordsAlone() => await RunTest(_ =>
+    public async Task Homograph_LeavesOrdinaryWordsAlone() => await RunPureTest(() =>
     {
         // A word that is not a stress-shifting homograph must come back exactly as the dictionary has it,
         // whatever precedes it.
@@ -94,7 +94,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Homograph_FallsBackWhenTheDictionaryOffersNoChoice() => await RunTest(_ =>
+    public async Task Homograph_FallsBackWhenTheDictionaryOffersNoChoice() => await RunPureTest(() =>
     {
         // Only one pronunciation on file means there is nothing to choose between, and inventing one
         // would be worse than the ambiguity.

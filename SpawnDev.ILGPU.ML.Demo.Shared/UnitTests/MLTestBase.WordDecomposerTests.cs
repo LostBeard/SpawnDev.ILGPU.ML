@@ -31,7 +31,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Decomposer_PluralTakesTheSoundTheStemDemands() => await RunTest(_ =>
+    public async Task Decomposer_PluralTakesTheSoundTheStemDemands() => await RunPureTest(() =>
     {
         var dictionary = StemDictionary();
         ExpectPhones(dictionary, "cats", "K AE1 T S");            // voiceless stem -> S
@@ -41,7 +41,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Decomposer_PastTenseTakesTheSoundTheStemDemands() => await RunTest(_ =>
+    public async Task Decomposer_PastTenseTakesTheSoundTheStemDemands() => await RunPureTest(() =>
     {
         var dictionary = StemDictionary();
         ExpectPhones(dictionary, "walked", "W AO1 K T");          // voiceless stem -> T
@@ -51,7 +51,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Decomposer_FindsStemsEnglishSpellingHides() => await RunTest(_ =>
+    public async Task Decomposer_FindsStemsEnglishSpellingHides() => await RunPureTest(() =>
     {
         var dictionary = StemDictionary();
         // "hoped" is hope + d, with the e swallowed. "running" is run + ing, with the n doubled.
@@ -61,7 +61,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task Decomposer_HandlesPrefixes() => await RunTest(_ =>
+    public async Task Decomposer_HandlesPrefixes() => await RunPureTest(() =>
     {
         ExpectPhones(StemDictionary(), "unfriendly", "AH0 N F R EH1 N D L IY0");
         return Task.CompletedTask;

@@ -18,7 +18,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     [TestMethod]
-    public async Task SpokenTextCheck_ScoresAGoodRenderAsClean() => await RunTest(_ =>
+    public async Task SpokenTextCheck_ScoresAGoodRenderAsClean() => await RunPureTest(() =>
     {
         // A real transcript of a good render. The leading "Others call me Mother Nature" is the model
         // regenerating its own reference clip ahead of the line, which happens whatever frontend is used
@@ -31,7 +31,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task SpokenTextCheck_CatchesTheGarbledRender() => await RunTest(_ =>
+    public async Task SpokenTextCheck_CatchesTheGarbledRender() => await RunPureTest(() =>
     {
         // The actual failure this whole mechanism exists for, at seed 1234.
         var error = SpokenTextCheck.WordErrorRate(
@@ -42,7 +42,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task SpokenTextCheck_ChargesForWordsInsideTheSentence() => await RunTest(_ =>
+    public async Task SpokenTextCheck_ChargesForWordsInsideTheSentence() => await RunPureTest(() =>
     {
         // The free skips are at the ENDS only. A word lost in the middle is the thing being measured and
         // must cost, or the check would pass renders that dropped half the line.
@@ -57,7 +57,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task SpokenTextCheck_IgnoresPunctuationAndCase() => await RunTest(_ =>
+    public async Task SpokenTextCheck_IgnoresPunctuationAndCase() => await RunPureTest(() =>
     {
         // A recogniser punctuates however it likes; that is not a pronunciation error.
         var error = SpokenTextCheck.WordErrorRate("Take two shares as a fair profit.",
@@ -67,7 +67,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
-    public async Task SpokenTextCheck_HandlesSilence() => await RunTest(_ =>
+    public async Task SpokenTextCheck_HandlesSilence() => await RunPureTest(() =>
     {
         // A render that produced nothing must score as total failure, not as a clean pass - an empty
         // transcript is the shape of the worst possible outcome.
