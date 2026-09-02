@@ -221,6 +221,223 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     });
 
+    /// <summary>
+    /// Create a Context with <paramref name="build"/>, dispose it, and return a weak ref to it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ <c>NoInlining</c> and a separate method on purpose: the Context must not be reachable from a live
+    /// frame when the caller collects. Belt and braces - the local-vs-inline probe shows a local alone does
+    /// not retain here - but this removes the question entirely.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference MakeAndDisposeContext(Func<Context> build)
+    {
+        var ctx = build();
+        ctx.Dispose();
+        return new WeakReference(ctx);
+    }
+
+    /// <summary>
+    /// The construction ladder: WHICH builder step installs the root?
+    /// </summary>
+    /// <remarks>
+    /// One run, four variants, so the answer does not cost four sweeps. <c>MLContext.Create()</c> is
+    /// <c>Context.Create().AllAccelerators().EnableAlgorithms()</c>, and the previous probes showed the root
+    /// is present with device probing removed. This isolates each remaining step:
+    /// <list type="bullet">
+    ///   <item><description><b>bare</b> - <c>Context.Create().ToContext()</c>, nothing enabled at all.</description></item>
+    ///   <item><description><b>algorithms</b> - plus <c>EnableAlgorithms()</c> (registers CL/IL/PTX intrinsics).</description></item>
+    ///   <item><description><b>allAccel</b> - plus <c>AllAccelerators()</c> (browser device probing).</description></item>
+    ///   <item><description><b>both</b> - exactly what <c>MLContext.Create()</c> does.</description></item>
+    /// </list>
+    /// The first variant that reports alive is the step that installs the root. If even <b>bare</b> is
+    /// alive, ILGPU's Context is retained under WASM with no extensions whatsoever.
+    /// </remarks>
+    [TestMethod(Timeout = 300000)]
+    public async Task Accelerator_ContextConstructionLadder() => await RunPureTest(() =>
+    {
+        var bare      = MakeAndDisposeContext(() => Context.Create().ToContext());
+        var algo      = MakeAndDisposeContext(() => Context.Create().EnableAlgorithms().ToContext());
+        var allAccel  = MakeAndDisposeContext(() => Context.Create().AllAccelerators().ToContext());
+        var both      = MakeAndDisposeContext(() => Context.Create().AllAccelerators().EnableAlgorithms().ToContext());
+        var control   = new WeakReference(new FatControl());
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        var line = $"LADDER {BackendName}: bare={bare.IsAlive} algorithms={algo.IsAlive} "
+                 + $"allAccelerators={allAccel.IsAlive} both={both.IsAlive} control={control.IsAlive}";
+        Console.WriteLine($"[AccelLifetime] {line}");
+
+        // ⚠️ DIAGNOSTIC: throw so the reading is SURFACED on every lane. PMT prints a browser test's
+        // console but only a DESKTOP test's output when it FAILS - so a passing desktop probe reports
+        // nothing, which is why there was no desktop data for this leak at all. Failing on purpose is the
+        // cheapest way to read the same number on all six backends in one run.
+        throw new Exception(line);
+    });
+
+    /// <summary>A control with a FINALIZER, and one without, to test whether finalization is the difference.</summary>
+    private sealed class FinalizableControl
+    {
+        public byte[] Buffer = new byte[64 * 1024];
+        ~FinalizableControl() { }        // the ONLY difference from FatControl
+    }
+
+    /// <summary>
+    /// Is "still alive" actually "still awaiting finalization"?
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ THE HYPOTHESIS THIS TESTS. Every control that has collected so far - small object, 1 MiB fat
+    /// graph, fat graph in a local - has NO FINALIZER. ILGPU's <c>Context</c> derives from
+    /// <c>DisposeBase</c> and is finalizable. If Mono's WASM runtime defers finalization (the browser is one
+    /// long-lived thread and there is no separate finalizer thread to schedule), then a finalizable object
+    /// sits on the finalization queue and reads as reachable through a <c>WeakReference</c> forever - with
+    /// nothing rooting it at all.
+    ///
+    /// That single difference would explain EVERY observation: contexts alive, controls collected, browser
+    /// affected, desktop not (a real finalizer thread runs there), and the count tracking the test count
+    /// 1:1. It would mean the retention is not a reference root, and the fix is
+    /// <c>GC.SuppressFinalize</c>-on-Dispose rather than hunting a reference that does not exist.
+    ///
+    /// ⚠️ If the finalizable control DOES collect, this hypothesis is dead and Context is genuinely rooted -
+    /// which is equally valuable to know before spending hours on the wrong one.
+    /// </remarks>
+    [TestMethod(Timeout = 300000)]
+    public async Task Accelerator_ProbeControl_FinalizableObjectAlsoCollects() => await RunPureTest(() =>
+    {
+        var plain = MakePlain();
+        var finalizable = MakeFinalizable();
+        var suppressed = MakeFinalizableButSuppressed();
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Console.WriteLine($"[AccelLifetime] {BackendName} finalizer-test: plainAlive={plain.IsAlive} "
+                        + $"finalizableAlive={finalizable.IsAlive} suppressedAlive={suppressed.IsAlive}");
+        return Task.CompletedTask;
+    });
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference MakePlain() => new WeakReference(new FatControl());
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference MakeFinalizable() => new WeakReference(new FinalizableControl());
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference MakeFinalizableButSuppressed()
+    {
+        var f = new FinalizableControl();
+        GC.SuppressFinalize(f);          // if THIS collects and the one above does not, finalization is the cause
+        return new WeakReference(f);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference MakeContextWithoutDisposing()
+    {
+        var ctx = Context.Create().ToContext();
+        return new WeakReference(ctx);          // deliberately NOT disposed
+    }
+
+    /// <summary>
+    /// Does DISPOSE install the root, or CONSTRUCTION?
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ A short experiment that splits the remaining space in half. If an undisposed Context is collected
+    /// while a disposed one is not, then <c>Dispose</c> itself installs the reference - which is a small,
+    /// searchable amount of code (Context.Dispose disposes CPUAccelerator, IRContext, ILFrontend,
+    /// DefaultILBackend, DebugInformationManager, TypeContext). If BOTH survive, construction is
+    /// responsible and Dispose is innocent.
+    ///
+    /// Ruled out already, by measurement rather than reading: object size, a live interpreter frame local,
+    /// finalization, ILGPU's DisposeBase (no registry), EnableAlgorithms, AllAccelerators device probing,
+    /// and ILFrontend's worker threads (WasmEnableThreads is off, so it takes the zero-thread path).
+    /// </remarks>
+    [TestMethod(Timeout = 300000)]
+    public async Task Accelerator_ContextDisposedVsNot() => await RunPureTest(() =>
+    {
+        var disposed = MakeAndDisposeContext(() => Context.Create().ToContext());
+        var notDisposed = MakeContextWithoutDisposing();
+        var control = new WeakReference(new FatControl());
+
+        GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+
+        var line = $"DISPOSE-SPLIT {BackendName}: disposed={disposed.IsAlive} "
+                 + $"undisposed={notDisposed.IsAlive} control={control.IsAlive}";
+        Console.WriteLine($"[AccelLifetime] {line}");
+        throw new Exception(line);      // surface it on desktop lanes too - PMT only prints failures there
+    });
+
+    /// <summary>Count the entries in SpawnJS's JS-side object table.</summary>
+    /// <remarks>
+    /// The table is <c>SpawnJSInterop.spawnJSObjects</c> - the JS side holds the real value, .NET addresses
+    /// it by a numeric id, and the entry is released only when the owning .NET wrapper is DISPOSED. So a
+    /// climbing count across create/dispose cycles is direct evidence of interop objects being abandoned.
+    /// </remarks>
+    private static int CountJSSlots(SpawnDev.SpawnJS.SpawnJSRuntime js)
+    {
+        using var interop = js.Get<SpawnDev.SpawnJS.SpawnJSObjectReference>("SpawnJSInterop");
+        using var table = interop.Get<SpawnDev.SpawnJS.SpawnJSObjectReference>("spawnJSObjects");
+        using var objectCtor = js.Get<SpawnDev.SpawnJS.SpawnJSObjectReference>("Object");
+        // ⚠️ Call<TArg, TResult>: the ARGUMENT type comes first and the result LAST.
+        using var keys = objectCtor.Call<SpawnDev.SpawnJS.SpawnJSObjectReference,
+                                         SpawnDev.SpawnJS.SpawnJSObjectReference>("keys", table);
+        return keys.Get<int>("length");
+    }
+
+    /// <summary>
+    /// Does creating and disposing a bare Context leak SpawnJS interop slots?
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Captain's steer, and the right instrument. The census proves a bare
+    /// <c>Context.Create().ToContext()</c> is rooted after Dispose, with the probe validated five ways
+    /// (small control, 1 MiB control, control in a local, finalizable control, suppressed-finalizer control
+    /// - all collected). Nothing in ILGPU core statically registers a Context, so the reference is likely
+    /// coming from the interop layer.
+    ///
+    /// SpawnJS's slot table is the place to look: an entry is released only when its .NET wrapper is
+    /// Disposed, and the .NET side keeps callbacks alive in a static registry. If the slot count climbs per
+    /// Context, the interop objects created during construction are being abandoned - and whatever holds
+    /// them holds the Context.
+    ///
+    /// <see cref="SpawnDev.SpawnJS.SpawnJSRuntime.EnableIDisposableWatcher"/> is switched on for the
+    /// duration so any SpawnJSObject that IS collected without being disposed reports the .NET stack that
+    /// created it - the only instrument that names the call site (a JS-side probe bottoms out at the wasm
+    /// boundary and can only name the type).
+    /// </remarks>
+    [TestMethod(Timeout = 300000)]
+    public async Task Accelerator_BareContext_DoesNotLeakInteropSlots() => await RunPureTest(() =>
+    {
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (js == null || !js.IsBrowser)
+            throw new UnsupportedTestException("SpawnJSRuntime not available (not a browser lane)");
+
+        bool prevWatcher = SpawnDev.SpawnJS.SpawnJSRuntime.EnableIDisposableWatcher;
+        SpawnDev.SpawnJS.SpawnJSRuntime.EnableIDisposableWatcher = true;
+        try
+        {
+            // Warm once: the first Context may populate one-time caches that are not a leak.
+            MakeAndDisposeContext(() => Context.Create().ToContext());
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+
+            int before = CountJSSlots(js);
+
+            const int rounds = 5;
+            for (int i = 0; i < rounds; i++)
+                MakeAndDisposeContext(() => Context.Create().ToContext());
+
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            int after = CountJSSlots(js);
+
+            Console.WriteLine($"[AccelLifetime] {BackendName} slots: before={before} after={after} "
+                            + $"delta={after - before} over {rounds} bare Context create/dispose cycles "
+                            + $"({(after - before) / (double)rounds:F1} per Context)");
+        }
+        finally { SpawnDev.SpawnJS.SpawnJSRuntime.EnableIDisposableWatcher = prevWatcher; }
+        return Task.CompletedTask;
+    });
+
     /// <summary>A control that is BIG, to test whether the probe is measuring size rather than roots.</summary>
     private sealed class FatControl
     {
