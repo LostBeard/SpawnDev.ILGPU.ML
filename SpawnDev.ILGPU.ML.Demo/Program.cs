@@ -13,7 +13,11 @@ using System.Reflection;
 Console.WriteLine($"[SpawnDev.ILGPU.ML.Demo] Build: {BuildTimestamp.Value}");
 
 var builder = WebAssemblyHostBuilder.CreateDefault(args);
-builder.Services.AddSpawnJSRuntime();
+builder.Services.AddSpawnJSRuntime(out var JS);
+JS.Verbose = true;
+
+
+JS.Set("_gcCollect", () => GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true));
 
 // Cross-platform persistent file system (OPFS in browser, native on desktop)
 builder.Services.AddSingleton<IAsyncFS, AsyncFSFileSystemDirectoryHandle>();

@@ -45,8 +45,19 @@
 
     private void HandleKeyDown(KeyboardEvent e)
     {
-        // Don't trigger shortcuts when typing in inputs
-        var tagName = e.Target?.JSRef?.Get<string>("tagName") ?? "";
+        // Don't trigger shortcuts when typing in inputs.
+        // ⚠️ `using`: e.Target mints a NEW wrapper holding its own slot in SpawnJSInterop.spawnJSObjects
+        // every time it is read. Observed 2026-09-02 by dumping that table from the demo console - `body`
+        // entries appearing on every keydown. The event `e` itself is already disposed on both paths
+        // below; its Target was the one that was not.
+        //
+        // ⚠️ NOT a permanent leak, and the distinction is worth keeping: SpawnJSObjectReference's
+        // finalizer calls Dispose(false), which releases the slot regardless of `disposing` - so these DO
+        // drain once the GC runs. What it costs is a slot per key event until then, i.e. allocation
+        // outrunning a lazy WASM GC, which is pressure rather than an unbounded leak. Disposing here is
+        // still right: it is one deterministic release instead of garbage on a hot input path.
+        using var target = e.Target;
+        var tagName = target?.JSRef?.Get<string>("tagName") ?? "";
         if (tagName == "INPUT" || tagName == "TEXTAREA" || tagName == "SELECT")
         {
             e.Dispose();
