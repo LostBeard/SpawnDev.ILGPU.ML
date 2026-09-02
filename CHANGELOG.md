@@ -119,6 +119,25 @@ inheriting the default. A test comparing against another implementation's fixtur
 parameter that moves a boundary, or it stops being a comparison - and a justified change to a product
 default would otherwise surface there as a phantom segmentation failure.
 
+### Changed - consume SpawnDev.ILGPU 5.2.8 and SpawnJS 2.1.10
+
+ILGPU 5.2.8 carries two disposal fixes that matter directly to a long browser test run or a long-lived
+page. A disposed ILGPU `Context` used to keep its entire IR graph and interned type universe - its
+`Dispose` released only the internal locks - and a disposed `Accelerator` kept its compiled-kernel cache.
+On desktop that is invisible because the Context is collected immediately; in a browser the Context is
+rooted, so the graph was pinned for the life of the page. MEASURED here: steady-state managed growth per
+test **0.73 MiB -> 0.20 MiB**, which is the difference between ~700 MiB and ~160 MiB by the ~800th test -
+the point where the Wasm lane used to die with `Garbage collector could not allocate 16384u bytes of
+memory for major heap section`. 5.2.8 also releases the `GPUAdapter` that every `Context.Create()` used
+to abandon.
+
+⚠️ The underlying browser-only Context rooting is NOT fixed, only made cheap. Do not read a green sweep
+as that being resolved.
+
+⚠️ SpawnJS moves off a `-local` suffix to **2.1.10**, and it had to: `2.1.10-local.2` sorts BELOW
+`2.1.10`, so once ILGPU required the stable version NuGet reported a package DOWNGRADE (NU1605) and the
+build failed outright. A `-local` suffix is a PRERELEASE of a version, never "that version plus a bit".
+
 ### Changed - consume SpawnDev.ILGPU 5.2.7
 
 Was 5.2.5. That release is dependency-only on its side (SpawnJS 2.1.8 -> 2.1.9), and it matters here
