@@ -2,7 +2,7 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## 5.2.7 (unreleased)
+## 5.2.7 (2026-09-01)
 
 ### Fixed - the Whisper mel filterbank multiplied by zero ~95% of the time
 
