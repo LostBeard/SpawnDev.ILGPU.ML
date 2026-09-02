@@ -119,6 +119,14 @@ inheriting the default. A test comparing against another implementation's fixtur
 parameter that moves a boundary, or it stops being a comparison - and a justified change to a product
 default would otherwise surface there as a phantom segmentation failure.
 
+### Changed - consume SpawnDev.ILGPU 5.2.7
+
+Was 5.2.5. That release is dependency-only on its side (SpawnJS 2.1.8 -> 2.1.9), and it matters here
+because a consumer of ILGPU 5.2.5 transitively resolved the old SpawnJS and never saw its app-root fix:
+`AppBaseUri` came back as the framework folder itself when an app renames that folder, so worker
+entrypoints resolved one level too deep, and a 404 worker presents as a crashed renderer rather than a
+clean error.
+
 ### Added - the gates for all three, and two new measurement tools
 
 - `Vad_SpeechPad_MovesTheSegmentStartEarlier` - runs the SAME audio at 30 ms and 150 ms and asserts the

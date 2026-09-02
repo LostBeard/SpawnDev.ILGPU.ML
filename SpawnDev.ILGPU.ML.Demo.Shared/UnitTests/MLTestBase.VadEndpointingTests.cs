@@ -229,9 +229,17 @@ public abstract partial class MLTestBase
         for (int i = 0; i < rate; i++) audio[i] = (float)(rng.NextDouble() * 2 - 1) * 0.0005f;
         Array.Copy(speech, 0, audio, rate, speech.Length);
 
+        // ⚠️ ONE SileroVad for all three passes, reset between them, rather than one per pass. Three
+        // sessions of a 643 KB model is not much on a desktop and IS too much at the tail of the Wasm
+        // lane: this test passed on Wasm in isolation and failed in the full sweep, where ~819 tests of
+        // retained Contexts and Accelerators have already strained the managed heap
+        // (see the retention note in the ML repo). Reusing the session also exercises the Reset() the
+        // sibling tests gate, so the cheaper shape is the better one.
+        using var vad = SileroVad.Create(accelerator, modelBytes);
+
         async Task<long> FirstStartAsync(VadOptions options)
         {
-            using var vad = SileroVad.Create(accelerator, modelBytes);
+            vad.Reset();
             using var detector = new VoiceActivityDetector(vad, options);
             long first = -1;
             detector.OnSegment += seg => { if (first < 0) first = seg.StartSample; };
