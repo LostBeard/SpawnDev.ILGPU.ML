@@ -16,7 +16,7 @@ var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddSpawnJSRuntime(out var JS);
 JS.Verbose = true;
 
-
+// allow firing the gc collection from JS (for debugging purposes)
 JS.Set("_gcCollect", () => GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true));
 
 // Cross-platform persistent file system (OPFS in browser, native on desktop)
