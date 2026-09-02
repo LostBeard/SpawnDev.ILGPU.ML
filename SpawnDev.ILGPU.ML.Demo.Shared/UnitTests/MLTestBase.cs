@@ -197,6 +197,18 @@ public abstract partial class MLTestBase : IDisposable
                 // reluctance to clear weak references, not a leak - and every conclusion drawn from it is
                 // void. Without this the instrument cannot tell "rooted" from "not collected yet".
                 _controlRefs.Add(new WeakReference(new object()));
+                // ⚠️ WEIGHT-MATCHED CONTROL. The 24-byte control above proves the WASM GC clears weak
+                // references promptly, but it CANNOT prove a large graph would be collected: Mono's
+                // collector is conservative, and a conservative collector falsely retains a big object
+                // graph far more readily than a tiny one. A Context IS a big graph. Without this,
+                // "ctxAlive=N/N while ctlAlive=1/N" is equally consistent with a real root and with
+                // size-dependent GC behaviour - and those have completely different fixes.
+                //   fatAlive ~ 1/N  => the collector DOES free large unreferenced graphs, so ctxAlive=N/N
+                //                      is a REAL root and worth hunting.
+                //   fatAlive ~ N/N  => the census cannot distinguish, and every "leak" it has reported
+                //                      is uninterpretable until the instrument is replaced.
+                _fatControlRefs.Add(new WeakReference(new HeapCensusFatControl()));
+                int fatAlive = 0; foreach (var w in _fatControlRefs) if (w.IsAlive) fatAlive++;
                 int ctxAlive = 0; foreach (var w in _ctxRefs) if (w.IsAlive) ctxAlive++;
                 int accAlive = 0; foreach (var w in _accelRefs) if (w.IsAlive) accAlive++;
                 int ctlAlive = 0; foreach (var w in _controlRefs) if (w.IsAlive) ctlAlive++;
@@ -206,7 +218,9 @@ public abstract partial class MLTestBase : IDisposable
                 Console.WriteLine($"[ML-HEAP] {BackendName} #{++_heapTraceIndex} {testName ?? "?"} "
                     + $"live={live / 1048576.0:F1}MiB committed={gcInfo.TotalCommittedBytes / 1048576.0:F1}MiB "
                     + $"heap={gcInfo.HeapSizeBytes / 1048576.0:F1}MiB gen2={GC.CollectionCount(2)} "
-                    + $"ctxAlive={ctxAlive}/{_ctxRefs.Count} accelAlive={accAlive}/{_accelRefs.Count} ctlAlive={ctlAlive}/{_controlRefs.Count}");
+                    + $"ctxAlive={ctxAlive}/{_ctxRefs.Count} accelAlive={accAlive}/{_accelRefs.Count} "
+                    + $"ctlAlive={ctlAlive}/{_controlRefs.Count} fatAlive={fatAlive}/{_fatControlRefs.Count}");
+                Console.WriteLine($"[ML-REG] {BackendName} #{_heapTraceIndex} {InteropRegistrySizes()}");
             }
             catch { /* a diagnostic must never fail a test */ }
         }
@@ -220,6 +234,157 @@ public abstract partial class MLTestBase : IDisposable
     private static readonly List<WeakReference> _ctxRefs = new();
     private static readonly List<WeakReference> _accelRefs = new();
     private static readonly List<WeakReference> _controlRefs = new();
+    private static readonly List<WeakReference> _fatControlRefs = new();
+
+    /// <summary>
+    /// Sizes every static collection in the SpawnJS assembly, so a registry that GROWS PER TEST names
+    /// itself.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ The retention is browser-only across WebGPU, WebGL and Wasm running IDENTICAL managed code, and
+    /// the one layer that exists only there is SpawnJS interop. SpawnJS keeps delegates in static
+    /// registries (<c>Callback._callbacks</c>, <c>EventTarget.CallBackInfos</c>,
+    /// <c>ActionExtensions._callbacks</c>, <c>FuncExtensions._callbacks</c>) and a delegate captures its
+    /// target - so a subscription that is never released roots the Accelerator and, through it, the
+    /// Context. That is a hypothesis; this measures it instead of arguing about it.
+    ///
+    /// Scanned by reflection rather than named explicitly: naming them means guessing the four that
+    /// matter, and the point is to let the data pick. A count that tracks the test index IS the holder.
+    /// Diagnostics must never fail a test, so every step is guarded.
+    /// </remarks>
+    /// <summary>
+    /// Every static collection that could hold a reference, sized once per test, so a registry that GROWS
+    /// PER TEST names itself.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Scanned by reflection rather than named explicitly - naming them means guessing which ones
+    /// matter, and the point is to let the data pick. A count that tracks the test index IS the holder.
+    ///
+    /// MEASURED 2026-09-02: this cleanly EXONERATED SpawnJS. Across six WebGPU tests every SpawnJS static
+    /// was flat (<c>Callback._callbacks=2</c> throughout), which killed the standing hypothesis that a
+    /// static delegate registry was rooting the Accelerator. Scope now includes the ILGPU assemblies,
+    /// because that hypothesis is dead and the holder is still unidentified.
+    ///
+    /// The member list is built ONCE - ILGPU is thousands of types and re-scanning per test would show up
+    /// as a slowdown that looks like a leak in its own right. Diagnostics must never fail a test, so every
+    /// step is guarded.
+    /// </remarks>
+    private static List<(string Label, Func<int> Count)>? _registryProbes;
+    private static string _scannedAssemblies = "";
+
+    private static List<(string Label, Func<int> Count)> BuildRegistryProbes()
+    {
+        var probes = new List<(string, Func<int>)>();
+        var flags = System.Reflection.BindingFlags.Static
+                  | System.Reflection.BindingFlags.Public
+                  | System.Reflection.BindingFlags.NonPublic;
+
+        // ⚠️ EVERY loaded assembly, not a hand-picked list. Naming assemblies is the same guess as naming
+        // fields: SpawnJS was the obvious suspect and measured FLAT, and the retention is browser-only
+        // (MEASURED 2026-09-02: a desktop probe collects 0/10 Contexts while every browser lane holds
+        // N/N). The browser runtime is Mono with its own JS-interop tables in
+        // System.Runtime.InteropServices.JavaScript, which root .NET objects handed to JS - and that is
+        // exactly the kind of holder a curated list would miss.
+        // ⚠️ BOUNDED. Scanning every loaded assembly HUNG the Wasm runtime outright - System.Private.CoreLib
+        // alone is tens of thousands of members and the first test sat at "running" forever. Restricted to
+        // the assemblies that can plausibly hold a reference to a Context: ours, plus Mono's JS-interop
+        // assembly, which roots .NET objects handed to JS and is the reason this is browser-only.
+        var wanted = new[]
+        {
+            "SpawnDev", "ILGPU", "System.Runtime.InteropServices.JavaScript",
+        };
+        var assemblies = new List<System.Reflection.Assembly>();
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var name = asm.GetName().Name ?? "";
+                if (wanted.Any(w => name.StartsWith(w, StringComparison.OrdinalIgnoreCase)))
+                    assemblies.Add(asm);
+            }
+        }
+        catch { }
+        // ⚠️ Report WHAT WAS SCANNED. The scope was widened specifically to reach Mono's JS-interop
+        // assembly; concluding "nothing roots it" while that assembly was silently absent would be a
+        // false negative dressed as a result.
+        _scannedAssemblies = string.Join(",", assemblies.Select(a => a.GetName().Name));
+
+        foreach (var asm in assemblies)
+        {
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (System.Reflection.ReflectionTypeLoadException ex) { types = ex.Types.Where(t => t != null).ToArray()!; }
+            catch { continue; }
+
+            foreach (var t in types)
+            {
+                if (t == null || t.IsGenericTypeDefinition) continue;
+                // ⚠️ FIELDS ONLY. Reading a static PROPERTY invokes its getter, which is arbitrary code -
+                // it can block, throw, or do real work. An earlier version of this probe read properties
+                // too and HUNG the Wasm runtime: the first test sat at "running" indefinitely. A field read
+                // is inert and cannot have side effects.
+                foreach (var f in t.GetFields(flags))
+                {
+                    if (f.FieldType.IsValueType || f.FieldType == typeof(string)) continue;
+                    bool isDelegate = typeof(Delegate).IsAssignableFrom(f.FieldType);
+                    bool isCollection = typeof(System.Collections.ICollection).IsAssignableFrom(f.FieldType)
+                                     || f.FieldType == typeof(object);
+                    if (!isDelegate && !isCollection) continue;
+                    var label = $"{t.Name}.{f.Name}";
+                    probes.Add((label, () =>
+                    {
+                        try
+                        {
+                            var v = f.GetValue(null);
+                            // ⚠️ A MULTICAST DELEGATE IS NOT AN ICollection. A static event accumulates
+                            // handlers in a delegate field and EACH HANDLER ROOTS ITS TARGET, so a
+                            // collection-only probe is blind to exactly the shape that leaks here. Counting
+                            // the invocation list is what makes a never-unsubscribed handler visible.
+                            if (v is Delegate d) return d.GetInvocationList().Length;
+                            if (v is System.Collections.ICollection c) return c.Count;
+                            return -1;
+                        }
+                        catch { return -1; }
+                    }));
+                }
+            }
+        }
+        return probes;
+    }
+
+    /// <summary>Only reports collections that are NON-EMPTY, so the line stays readable.</summary>
+    private static string InteropRegistrySizes()
+    {
+        try
+        {
+            _registryProbes ??= BuildRegistryProbes();
+            var parts = new List<string>();
+            foreach (var (label, count) in _registryProbes)
+            {
+                int n;
+                try { n = count(); } catch { continue; }
+                if (n > 0) parts.Add($"{label}={n}");
+            }
+            parts.Sort();
+            return $"asm=[{_scannedAssemblies}] " + string.Join(" ", parts);
+        }
+        catch (Exception ex) { return $"(registry scan failed: {ex.GetType().Name})"; }
+    }
+
+
+    /// <summary>
+    /// A control of comparable WEIGHT to a Context, referenced by nothing, so the census can tell a real
+    /// root from a conservative collector declining to free a large graph.
+    /// </summary>
+    private sealed class HeapCensusFatControl
+    {
+        public byte[] Buffer = new byte[1024 * 1024];
+        public object?[] Chain = new object?[2000];
+        public HeapCensusFatControl()
+        {
+            for (int i = 0; i < Chain.Length; i++) Chain[i] = new int[16];
+        }
+    }
 
     public virtual void Dispose()
     {
