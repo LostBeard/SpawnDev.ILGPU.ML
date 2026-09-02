@@ -38,6 +38,39 @@ public class ProjectTest
 
     /// <summary>Console text proving the runtime exited - quoted verbatim into the failure message.</summary>
     private const string RuntimeExitedMarker = ".NET runtime already exited";
+
+    /// <summary>
+    /// Every console signature that means the page's .NET runtime is DEAD.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ <see cref="RuntimeExitedMarker"/> alone is not enough, and the gap is expensive. That string is
+    /// the text of the FOLLOW-ON asserts ("MONO_WASM: Assert failed: .NET runtime already exited with 1"),
+    /// which only appear once something tries to call into the corpse. The lines the runtime emits when it
+    /// ACTUALLY dies are different:
+    /// <code>
+    ///   Error: Garbage collector could not allocate 16384u bytes of memory for major heap section.
+    ///   Uncaught ExitStatus
+    /// </code>
+    /// Neither contains the old marker. MEASURED 2026-09-02: the Wasm lane died at test #709 of 819 and PMT
+    /// did not notice, so every remaining test sat out the full 600,000 ms done-timeout against a page that
+    /// could never answer - hours of a sweep spent waiting, looking exactly like work. It is also why the
+    /// death-dump below never fired on the run that most needed it.
+    ///
+    /// Matching the FIRST fatal line instead means the page is replaced immediately and the console that
+    /// explains the death is captured while it still exists.
+    /// </remarks>
+    private static readonly string[] RuntimeDeadMarkers =
+    {
+        RuntimeExitedMarker,                        // the follow-on asserts
+        "Garbage collector could not allocate",      // managed heap exhausted - the real first line
+        "ExitStatus",                                // dotnet.native.js when the runtime calls exit()
+        "MONO_WASM: Assert failed",                  // any mono-level assert takes the runtime with it
+        "Aborted(",                                  // emscripten abort
+    };
+
+    private static bool IsRuntimeDeadMessage(string? text) =>
+        text != null && Array.Exists(RuntimeDeadMarkers,
+            m => text.Contains(m, StringComparison.Ordinal));
     public Func<IPage, Task> TestFunc { get; set; }
     public ProjectTest(TestableProject testableProject, string name)
     {
@@ -155,7 +188,7 @@ public class ProjectTest
 
                 // The runtime announces its own death. Catch it here rather than waiting out the
                 // done-timeout on a page that can no longer run anything - see PageRuntimeDied.
-                if (msg.Type == "error" && msg.Text != null && msg.Text.Contains(RuntimeExitedMarker, StringComparison.Ordinal))
+                if (msg.Type == "error" && IsRuntimeDeadMessage(msg.Text))
                 {
                     PageRuntimeDied = true;
 
@@ -260,7 +293,10 @@ public class ProjectTest
                 if (!reachedDone)
                 {
                     Result = TestResult.Error;
-                    var firstFatal = consoleErrors.FirstOrDefault(e => e.Contains(RuntimeExitedMarker, StringComparison.Ordinal));
+                    // The FIRST fatal line, not the follow-on asserts: on a heap death that is
+                    // "Garbage collector could not allocate ..." and the "already exited" flood comes
+                    // after it. Reporting the flood names a symptom; reporting the first line names the cause.
+                    var firstFatal = consoleErrors.FirstOrDefault(IsRuntimeDeadMessage);
                     ResultMessage = "the page's .NET WASM runtime EXITED during this test, so it could never "
                                   + "report a result. An unhandled exception on a runtime callback (async "
                                   + "continuation, finalizer, or JS interop resolve) kills the runtime - look "

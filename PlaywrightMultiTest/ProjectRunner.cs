@@ -148,7 +148,29 @@ namespace PlaywrightMultiTest
             // would run everything. PMT_FILTER (substring match, this testhost CAN read it) lets
             // dev runs scope the scheduled set: e.g. `PMT_FILTER=VectorAddTest dotnet test ...`.
             filter ??= Environment.GetEnvironmentVariable("PMT_FILTER");
-            if (!string.IsNullOrEmpty(filter)) LogStatus($"Test filter active: '{filter}' (substring match)");
+            if (!string.IsNullOrEmpty(filter))
+            {
+                LogStatus($"Test filter active: '{filter}' (substring match)");
+            }
+            else
+            {
+                // ⚠️ SAY SO WHEN THE RUN IS UNSCOPED, EVERY TIME.
+                //
+                // The note above has explained this to source-readers for a long time and the mistake kept
+                // being made anyway - `dotnet test --filter <x>` three separate times, each burning a full
+                // multi-hour sweep, because the run LOOKS scoped and says nothing to the contrary. NUnit
+                // selects wrapper cases AFTER PMT has already enumerated and scheduled the whole set, so
+                // --filter changes almost nothing about the work done.
+                //
+                // A comment cannot warn anybody at 2am. This line can: it appears within seconds of start,
+                // right where "did I actually scope this?" gets decided, and it costs one line of output on
+                // a deliberate full sweep.
+                LogStatus("Test filter: NONE - this run is UNSCOPED and will schedule EVERY test.");
+                LogStatus("  NOTE: `dotnet test --filter ...` does NOT scope this work. NUnit applies it to "
+                        + "PMT's wrapper cases only, after PMT has already enumerated and scheduled the full "
+                        + "set. To actually scope a run use PMT_FILTER=<substring> (and PMT_CONSOLE_LOG=1 to "
+                        + "keep the browser console for it).");
+            }
 
 
             LogStatus("Discovering projects...");
