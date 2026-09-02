@@ -2,6 +2,150 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.8 (2026-09-02)
+
+### Fixed - a ZipVoice reference clip's SILENCE was being cloned as slow speech
+
+The hands-free demo cloned the Captain's voice and spoke back at about a third of natural speed - his
+words, "something out of a sci-fi movie", not a voice.
+
+The cause is in the encoder's duration prediction, and it is exact rather than a tendency. Walking the
+forward cone of `prompt_features_len` through `text_encoder.onnx`:
+
+```
+Cast -> Div(by len(prompt_tokens)) -> Mul(by len(prompt_tokens) + len(tokens)) -> Div(by speed) -> Ceil
+```
+
+The model measures **frames per prompt token** from the reference clip and multiplies it by the total token
+count. That ratio IS the entire duration prediction. Copying the speaker's rate is deliberate - it is how
+ZipVoice clones delivery - but `prompt_features_len` counts every mel frame of the reference, and silence
+has mel frames too. A reference that is half dead air declares a speaking rate half of the speaker's real
+one, and every generated syllable is stretched to match.
+
+⚠️ **Nothing downstream could notice.** The tensor shapes are right, the output is speech, the transcript
+still matches. The end-to-end ZipVoice test passed throughout, because its fixture is already tightly
+trimmed - so this only ever appeared on a real microphone.
+
+MEASURED with the new `tools/zipvoice-ref-rate` (CUDA, a 4.00 s reference, a 45-token line):
+
+| reference | generated |
+|---|---|
+| as recorded | 3.20 s |
+| +2 s of silence at each end | **6.20 s - 1.94x slower** |
+| +2 s of silence in the middle | 4.69 s |
+| +2 s at each end AND 2 s in the middle | (worse still) |
+| any of the above, through the new trim | **3.06 - 3.23 s** |
+
+New `ZipVoiceFeatures.TrimReferenceSilence` removes leading, trailing and excess internal dead air, and
+`ZipVoicePipeline.TrimReferenceSilence` (default **on**) applies it to every clip handed in. Internal pauses
+are CAPPED rather than deleted (`ReferenceMaxPauseSeconds`, 0.20 s): a pause is rhythm and the model clones
+rhythm, so splicing every gap to zero would clone a speaker who never breathes.
+
+⚠️ **An energy gate rather than Silero, and the reason is not the obvious one.** This library ships Silero
+and Silero is the better instrument in general. But a TTS pipeline that cannot clone at the right speed
+without a second 643 KB model download is one every consumer gets wrong by default - and MEASURED on the
+same fixture, the energy gate was the MORE stable of the two: 382 prompt frames whether the clip arrived
+clean, +2 s padded or +4 s padded, where the Silero trim gave 393/391/388 because its own 512-sample
+framing shifts with the padding. The gate is relative to the clip's own loudest FRAME, never an absolute
+level, so it does not carry a threshold tuned in one room into the next one. A caller that already holds a
+detector can trim itself and set `TrimReferenceSilence = false`.
+
+`ZipVoiceResult` now carries `ReferenceSeconds` and `ReferenceSpeechSeconds`, because "the voice sounds
+slow" needs a number attached to it rather than another round of guessing.
+
+Gated by `MLTestBase.ZipVoiceReferenceTrimTests` - synthetic signals, no model, milliseconds on every
+backend. The load-bearing assertion is that trimming a clip and trimming the SAME clip surrounded by
+silence give a **byte-identical** result: that property is what makes the predicted duration independent of
+how much dead air the microphone happened to catch. Proven RED before GREEN (18 of 32 failing across the
+six backends without the fix, 32 of 32 with it).
+
+### Fixed - `VoiceActivityDetector.Reset()` never put its sample clock back to zero
+
+`Reset()` cleared the model state and the retained audio but carried `_currentSample` forward, so every
+span it returned afterwards was offset by everything the detector had ever seen. `OnSegment` hands back
+OFFSETS INTO THE CALLER'S BUFFER, and a reset is the only point at which the two sides agree where zero is.
+
+⚠️ **This is worse than it sounds and it shipped.** Two distinct consumer-visible failures, both of which
+were being blamed on the detector "going deaf":
+
+- **A consumer that WARMS the detector paid on the very first turn.** SpawnDev.AI pushes 12 frames of
+  silence through to force kernel compilation and then resets - so its clock began every session at
+  **6,144 samples**, and turn one was sliced **384 ms late**, cutting the front off the utterance before
+  any recogniser saw it. That is more than ten times the onset loss the `SpeechPad` fix below addresses.
+- **Later turns failed outright.** The caller restarts its buffer each turn while the clock kept climbing,
+  so by turn two the offsets pointed past the end of a fresh recording, the slice came back EMPTY, and the
+  turn was discarded as "too short to transcribe" - a conversation that stops working after the first
+  thing you say.
+
+⚠️ **Why nothing caught it.** The detector's own accounting stayed self-CONSISTENT - `_bufferStart` moved
+with the clock - so no assertion *inside* the class could be wrong, and the existing endpointing gates all
+run a single pass over a single fixture. It takes a test that resets and then compares the SECOND pass
+against the first, which is what `Vad_DetectorReset_FindsTheSameUtteranceOnASecondTurn` now does. It fails
+on all six backends without this fix. `AiVadEngine.ResetStreamAsync` had documented this exact contract
+("puts the sample clock back to zero") for as long as it has existed; the library simply did not implement
+it, and the doc was the only place the intended behaviour was written down.
+
+To pause and resume against a CONTINUOUS caller buffer, do not call `Reset()` - just stop feeding it.
+
+### Fixed - `VadOptions.SpeechPad` was 30 ms, and it was eating the first word
+
+A segment opens on the frame whose probability crosses `Threshold`, and that frame is not where the word
+started: a low-energy onset - an /h/, an unreleased plosive - does not cross until the vowel arrives. The
+detector's total reach-back was 30 ms plus one 32 ms frame, against the 100-300 ms an ASR front-end wants.
+
+That is not a subtle degradation, it is a lost WORD, and it shipped: the hands-free demo transcribed
+"Hello. What is a chicken?" as **"Oh, what is it chicken?"**.
+
+MEASURED with the new `tools/vad-onset-check`, which endpoints a phonetically-balanced Harvard recording at
+a range of pads and scores each transcript against transcribing the same audio uncut:
+
+| SpeechPad | WER |
+|---|---|
+| 30 ms (the old default) | **0.123** - "Paint" heard as "to" |
+| 60 ms | 0.053 |
+| 100 ms | 0.035 |
+| **150 ms (the new default)** | **0.000** |
+| 200 / 300 / 500 ms | 0.000 - no further gain |
+
+So 150 ms is not a preference, it is the smallest pad that costs nothing. Larger pads only buy silence, and
+silence is not free downstream - which is the fix above.
+
+⚠️ Segments cannot start overlapping because of this: a segment only closes after `MinSilenceDuration`
+(500 ms) of silence, so two 150 ms pads sit inside that gap with room to spare. Confirmed by the sweep,
+which found the same 7 spans at every pad from 30 to 500 ms.
+
+`Vad_Endpointing_MatchesSherpaOnnxSegments` now PINS `SpeechPad` to the oracle's 30 ms rather than
+inheriting the default. A test comparing against another implementation's fixture has to fix every
+parameter that moves a boundary, or it stops being a comparison - and a justified change to a product
+default would otherwise surface there as a phantom segmentation failure.
+
+### Added - the gates for all three, and two new measurement tools
+
+- `Vad_SpeechPad_MovesTheSegmentStartEarlier` - runs the SAME audio at 30 ms and 150 ms and asserts the
+  starts differ by 120 ms, plus that the DEFAULT matches the padded one. ⚠️ The first version of this test
+  asserted against a known onset in a synthetic TONE, which Silero correctly refuses to call speech - so it
+  found no segment and asserted nothing, on every backend. Real speech has no exact onset sample to assert
+  against; running two pads over one clip removes the need for one. Without the default check it would pass
+  just as happily on a library whose default had drifted back to 30 ms, which is the regression it exists
+  to stop.
+- `Vad_Reset_ReproducesTheStreamExactly` and `Vad_DetectorReset_FindsTheSameUtteranceOnASecondTurn` - run
+  frames, reset, run the identical frames again. The first is bit-identical everywhere and rules the MODEL
+  out; the second is what found the clock bug above.
+
+  ⚠️ These were written to chase the browser (speech probability decaying 0.999 -> 0.978 -> 0.760 -> 0.504
+  across a four-turn session): `tools/vad-reset-check` already answered it on CUDA, but a desktop tool
+  cannot reach a browser backend, so the one lane that could confirm or kill it was the one lane nothing
+  was running it on. **The bug they found is not browser-specific at all** - it fails identically on all
+  six. Building the browser instrument was still what surfaced it; the lesson is that the gap was in
+  COVERAGE SHAPE (nobody tested a second turn) rather than in any one backend.
+
+- `tools/zipvoice-ref-rate` - sweeps reference-clip silence against the encoder's predicted duration. One
+  encoder run per variant is enough for the arithmetic, since `NumFrames` IS the prediction; `--render`
+  adds full synthesis and writes a single self-contained A/B listening page.
+- `tools/vad-onset-check` - endpoints a Harvard recording at a range of `SpeechPad` values, transcribes
+  what the detector handed over, and scores each against transcribing the same audio uncut. The WER column
+  is the endpointer's cost, isolated from the recogniser's.
+
 ## 5.2.7 (2026-09-01)
 
 ### Fixed - the Whisper mel filterbank multiplied by zero ~95% of the time

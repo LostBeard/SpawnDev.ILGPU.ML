@@ -75,12 +75,21 @@ public abstract partial class MLTestBase
 
         using var vad = SileroVad.Create(accelerator, modelBytes);
         // The same numbers RoseEars runs, and the same ones the oracle was given.
+        //
+        // ⚠️ SpeechPad is PINNED here rather than inherited, and that is the point of this test being a
+        // comparison. The fixture's boundaries were produced by sherpa-onnx at silero's own 30 ms pad, so
+        // every parameter that MOVES a boundary has to be fixed to the oracle's value or the comparison
+        // stops being one. What this test is for is the state machine - hysteresis, min-silence, when a
+        // turn opens and closes - not the padding, which is a deliberate product choice measured against
+        // a recogniser instead (see VadOptions.SpeechPad, now 150 ms by default). Leaving it inherited
+        // meant a justified change to that default would surface here as a phantom segmentation failure.
         using var detector = new VoiceActivityDetector(vad, new VadOptions
         {
             Threshold = 0.5f,
             MinSilenceDuration = TimeSpan.FromMilliseconds(500),
             MinSpeechDuration = TimeSpan.FromMilliseconds(250),
             MaxSpeechDuration = TimeSpan.FromSeconds(20),
+            SpeechPad = TimeSpan.FromMilliseconds(30),
         });
 
         var got = new List<(long Start, long End)>();
@@ -170,5 +179,94 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[Vad] flush: held a turn open through {samples.Length / 16000.0:F2}s of speech, "
                         + $"emitted {seconds:F2}s on flush");
+    });
+
+    /// <summary>
+    /// A bigger <see cref="VadOptions.SpeechPad"/> must actually move the segment start earlier.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ THE DEFECT THIS EXISTS TO FIX. Silero opens a segment on the frame whose probability crosses
+    /// <see cref="VadOptions.Threshold"/>, and that frame is not where the word began - a low-energy onset
+    /// (an /h/, an unreleased plosive) does not cross until the vowel arrives. With the old 30 ms default
+    /// the detector handed over utterances with their first phoneme already cut, and the hands-free demo
+    /// transcribed "Hello. What is a chicken?" as <b>"Oh, what is it chicken?"</b>. MEASURED afterwards at
+    /// <b>WER 0.123</b> on a Harvard recording, falling to 0.000 at 150 ms - the table is on
+    /// <see cref="VadOptions.SpeechPad"/>, and the sweep is <c>tools/vad-onset-check</c>.
+    /// </para>
+    /// <para>
+    /// ⚠️ A DIFFERENTIAL assertion, on purpose. Comparing the segment start against a known onset needs
+    /// ground truth for where speech begins, and the first version of this test manufactured that with a
+    /// synthetic tone - which Silero correctly refused to call speech, so it found no segment at all and
+    /// asserted nothing on any backend. Real speech has no exact onset sample to assert against. Running
+    /// the SAME audio at two pads removes the need for one: the difference between the two starts is the
+    /// property under test, and it is exact.
+    /// </para>
+    /// <para>
+    /// ⚠️ Also asserts that the DEFAULT is the padded one. Without that this passes just as happily on a
+    /// library whose default has quietly gone back to 30 ms, which is exactly the regression it exists to
+    /// stop - the WER sweep is what establishes that 150 ms is enough, and nothing else would notice it
+    /// being given back.
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 600000)]
+    public async Task Vad_SpeechPad_MovesTheSegmentStartEarlier() => await RunTest(async accelerator =>
+    {
+        var assets = GetHttpClient();
+        if (assets == null) throw new UnsupportedTestException("HttpClient not available");
+        var modelBytes = await assets.GetByteArrayAsync("references/vad/silero_vad.onnx");
+
+        // Real speech: Silero is trained on voices and will not trigger on a tone, however loud.
+        var wavBytes = await assets.GetByteArrayAsync("test-audio/librivox-public-domain.wav");
+        var speech = WavDecoder.DecodeWavFile(wavBytes)
+            ?? throw new Exception("could not decode test-audio/librivox-public-domain.wav");
+
+        // Lead-in of room tone, so the detector has somewhere to reach BACK into. Without it a segment
+        // would clamp at sample 0 and both pads would give the same answer for the wrong reason.
+        const int rate = SileroVad.SampleRate;
+        var rng = new Random(20260902);
+        var audio = new float[rate + speech.Length];
+        for (int i = 0; i < rate; i++) audio[i] = (float)(rng.NextDouble() * 2 - 1) * 0.0005f;
+        Array.Copy(speech, 0, audio, rate, speech.Length);
+
+        async Task<long> FirstStartAsync(VadOptions options)
+        {
+            using var vad = SileroVad.Create(accelerator, modelBytes);
+            using var detector = new VoiceActivityDetector(vad, options);
+            long first = -1;
+            detector.OnSegment += seg => { if (first < 0) first = seg.StartSample; };
+            await detector.AcceptWaveformAsync(audio);
+            await detector.FlushAsync();
+            return first;
+        }
+
+        long tight = await FirstStartAsync(new VadOptions { SpeechPad = TimeSpan.FromMilliseconds(30) });
+        long padded = await FirstStartAsync(new VadOptions { SpeechPad = TimeSpan.FromMilliseconds(150) });
+        long shipped = await FirstStartAsync(new VadOptions());          // the DEFAULT is on trial too
+
+        if (tight < 0 || padded < 0)
+            throw new Exception("no segment found on real speech - nothing about reach-back can be "
+                              + "concluded from this run");
+
+        double movedMs = (tight - padded) / (double)rate * 1000;
+        // The pads differ by 120 ms and the detector triggers on the same frame either way, so the starts
+        // must differ by 120 ms. Allow one frame of slack rather than demanding the exact sample.
+        const double expectedMs = 120, slackMs = 32;
+        if (Math.Abs(movedMs - expectedMs) > slackMs)
+            throw new Exception(
+                $"raising SpeechPad from 30 ms to 150 ms moved the segment start by {movedMs:F0} ms, "
+              + $"expected {expectedMs:F0}. A segment that starts at the trigger starts AFTER the word did "
+              + "and hands the recogniser an utterance missing its first phoneme - MEASURED at WER 0.123 "
+              + "with a 30 ms pad, which is where \"Hello\" became \"Oh\".");
+
+        if (shipped != padded)
+            throw new Exception(
+                $"the DEFAULT VadOptions started the segment at {shipped} but a 150 ms pad starts it at "
+              + $"{padded}. The shipped default is 150 ms because that is the smallest pad measured to "
+              + "cost a recogniser nothing (WER 0.000 against 0.123 at 30 ms); a default that has drifted "
+              + "back down gives that away with nothing else to notice it.");
+
+        Console.WriteLine($"[Vad] pad: 30 ms starts at {tight / (double)rate:F3}s, 150 ms at "
+                        + $"{padded / (double)rate:F3}s - {movedMs:F0} ms earlier, default matches 150 ms");
     });
 }

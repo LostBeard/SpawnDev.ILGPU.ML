@@ -71,6 +71,22 @@ public record ZipVoiceResult(
 {
     /// <summary>Length of the generated audio in seconds.</summary>
     public double DurationSeconds => SampleRate > 0 ? (double)Audio.Length / SampleRate : 0;
+
+    /// <summary>Length of the reference clip as the caller supplied it, in seconds.</summary>
+    /// <remarks>
+    /// Zero when the caller supplied features rather than audio, so there was no clip to measure.
+    /// </remarks>
+    public double ReferenceSeconds { get; init; }
+
+    /// <summary>Length of the reference clip after dead air was removed, in seconds.</summary>
+    /// <remarks>
+    /// ⚠️ Reported because the gap between this and <see cref="ReferenceSeconds"/> IS the speaking-rate
+    /// error the clone would otherwise have inherited - see
+    /// <see cref="Preprocessing.ZipVoiceFeatures.TrimReferenceSilence"/>. A caller wondering why speech
+    /// came out slow can read the ratio instead of guessing, and a caller who trims for itself can check
+    /// that this engine then found nothing left to take.
+    /// </remarks>
+    public double ReferenceSpeechSeconds { get; init; }
 }
 
 /// <summary>Speech that was checked against the text it was meant to say.</summary>
@@ -121,6 +137,44 @@ public sealed class ZipVoicePipeline : IDisposable
     /// against implementations that do not pad.
     /// </remarks>
     public float ReferenceTailSilenceSeconds { get; set; } = 0.25f;
+
+    /// <summary>
+    /// Remove dead air from the reference clip before analysing it. Default ON.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ ON by default because silence in the reference is not a cosmetic flaw, it is a speaking-rate
+    /// error: the encoder derives frames-per-token from the reference and stretches every generated
+    /// syllable to match. MEASURED at 1.94x too slow for a reference with 4 s of silence added, and the
+    /// full mechanism, numbers and design rationale are on
+    /// <see cref="Preprocessing.ZipVoiceFeatures.TrimReferenceSilence"/>. That is the file to read before
+    /// changing any of this.
+    /// </para>
+    /// <para>
+    /// Turn it OFF to compare against an implementation that does not trim, or when the caller has already
+    /// trimmed with a better instrument of its own - a caller holding a live Silero detector, say. Trimming
+    /// twice is harmless but the caller's own bounds are the ones it can reason about.
+    /// </para>
+    /// <para>
+    /// ⚠️ This applies only where a clip is handed in. <see cref="SynthesizeFromFeaturesAsync"/> takes mel
+    /// features that are already computed, so nothing can be trimmed there - a caller that pre-computes
+    /// features for a voice it reuses must trim the audio itself, and
+    /// <see cref="Preprocessing.ZipVoiceFeatures.TrimReferenceSilence"/> is public for exactly that.
+    /// </para>
+    /// </remarks>
+    public bool TrimReferenceSilence { get; set; } = true;
+
+    /// <summary>How far below the reference's loudest frame still counts as speech, in dB.</summary>
+    public double ReferenceSilenceGateDb { get; set; } = 35;
+
+    /// <summary>How much of an over-long pause inside the reference survives the trim, in seconds.</summary>
+    /// <remarks>
+    /// Capped rather than removed on purpose: a pause is rhythm and the model clones rhythm. This is the
+    /// line between a breath and dead air. A little more than this is retained in practice - the trim also
+    /// holds a short margin either side of the speech around the pause; see
+    /// <see cref="Preprocessing.ZipVoiceFeatures.TrimReferenceSilence"/>.
+    /// </remarks>
+    public double ReferenceMaxPauseSeconds { get; set; } = 0.20;
 
     /// <summary>
     /// Extra mel frames discarded from the START of the generated audio, beyond the reference itself.
@@ -223,13 +277,30 @@ public sealed class ZipVoicePipeline : IDisposable
     /// <param name="promptTokens">Token ids of the reference clip's exact transcript.</param>
     /// <param name="referenceAudio">Reference clip, mono, in [-1, 1].</param>
     /// <param name="referenceSampleRate">Sample rate of the reference clip.</param>
-    public Task<ZipVoiceResult> SynthesizeAsync(
+    public async Task<ZipVoiceResult> SynthesizeAsync(
         long[] tokens, long[] promptTokens, float[] referenceAudio, int referenceSampleRate)
     {
+        // ⚠️ ORDER MATTERS. Dead air comes out FIRST, then the deliberate quarter-second tail goes on.
+        // Reversed, the trim would take back the pad that ReferenceTailSilenceSeconds exists to add, and
+        // the last word of the reference would bleed into the start of the generated line again.
+        var speech = TrimReferenceSilence
+            ? ZipVoiceFeatures.TrimReferenceSilence(
+                referenceAudio, referenceSampleRate, ReferenceSilenceGateDb,
+                maxPauseSeconds: ReferenceMaxPauseSeconds)
+            : referenceAudio;
+
         var promptFeatures = ZipVoiceFeatures.ComputePromptFeatures(
-            PadReferenceTail(referenceAudio, referenceSampleRate),
+            PadReferenceTail(speech, referenceSampleRate),
             referenceSampleRate, Config, out int promptFrames);
-        return SynthesizeFromFeaturesAsync(tokens, promptTokens, promptFeatures, promptFrames);
+
+        var result = await SynthesizeFromFeaturesAsync(tokens, promptTokens, promptFeatures, promptFrames)
+            .ConfigureAwait(false);
+
+        return result with
+        {
+            ReferenceSeconds = referenceAudio.Length / (double)referenceSampleRate,
+            ReferenceSpeechSeconds = speech.Length / (double)referenceSampleRate,
+        };
     }
 
     /// <summary>

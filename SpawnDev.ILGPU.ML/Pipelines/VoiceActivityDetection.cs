@@ -264,7 +264,42 @@ public sealed class VadOptions
     public TimeSpan MaxSpeechDuration { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>Audio kept either side of a segment, so the first and last phoneme survive.</summary>
-    public TimeSpan SpeechPad { get; set; } = TimeSpan.FromMilliseconds(30);
+    /// <remarks>
+    /// <para>
+    /// ⚠️ 150 ms, and it was 30 ms until it was MEASURED. A segment opens on the frame whose probability
+    /// crosses <see cref="Threshold"/>, and that frame is not where the word started: a low-energy onset -
+    /// an /h/, an unreleased plosive - does not cross until the vowel arrives. The reach-back is this pad
+    /// plus one 32 ms frame, so at 30 ms the detector handed over an utterance with its first phoneme
+    /// already gone.
+    /// </para>
+    /// <para>
+    /// ⚠️ That is not a subtle degradation, it is a lost WORD, and it shipped. The hands-free demo
+    /// transcribed "Hello. What is a chicken?" as "Oh, what is it chicken?". MEASURED afterwards with
+    /// <c>tools/vad-onset-check</c>, which endpoints a phonetically-balanced Harvard recording at a range
+    /// of pads and scores each transcript against transcribing the same audio uncut:
+    /// </para>
+    /// <list type="table">
+    ///   <item><term>30 ms (the old default)</term><description>WER 0.123 - "Paint" heard as "to"</description></item>
+    ///   <item><term>60 ms</term><description>WER 0.053</description></item>
+    ///   <item><term>100 ms</term><description>WER 0.035</description></item>
+    ///   <item><term><b>150 ms</b></term><description><b>WER 0.000</b></description></item>
+    ///   <item><term>200 / 300 / 500 ms</term><description>WER 0.000 - no further gain</description></item>
+    /// </list>
+    /// <para>
+    /// So 150 ms is not a preference, it is the smallest pad that costs nothing. Larger pads only buy
+    /// silence, and silence is not free downstream: a ZipVoice reference clip carries its dead air into
+    /// the cloned speaking rate (see
+    /// <see cref="Preprocessing.ZipVoiceFeatures.TrimReferenceSilence"/>, which is what now absorbs it).
+    /// </para>
+    /// <para>
+    /// ⚠️ Segments cannot start overlapping because of this. A segment only closes after
+    /// <see cref="MinSilenceDuration"/> of silence, so two pads of 150 ms sit inside a 500 ms gap with room
+    /// to spare - confirmed by the sweep above, which found the same 7 spans at every pad from 30 to
+    /// 500 ms. Raising <see cref="SpeechPad"/> above half of <see cref="MinSilenceDuration"/> would change
+    /// that, and neither default goes near it.
+    /// </para>
+    /// </remarks>
+    public TimeSpan SpeechPad { get; set; } = TimeSpan.FromMilliseconds(150);
 
     internal float ResolvedNegativeThreshold => NegativeThreshold ?? MathF.Max(Threshold - 0.15f, 0.01f);
 }
@@ -428,12 +463,53 @@ public sealed class VoiceActivityDetector : IDisposable
         TrimBuffer(_currentSample);
     }
 
-    /// <summary>Drops all state and buffered audio - use when muting, or between sessions.</summary>
+    /// <summary>
+    /// Drops all state and buffered audio, and puts the sample clock back to zero - a NEW stream.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ THE CLOCK GOES BACK TO ZERO, and it did not until 5.2.8. This is the whole contract of the
+    /// method, because <see cref="OnSegment"/> hands back OFFSETS into the caller's buffer and a reset is
+    /// the only point at which the two sides agree where zero is. Reset already clears the retained audio,
+    /// so it is a start-over rather than a pause: a caller whose buffer starts again and a detector whose
+    /// clock does not are describing two different recordings.
+    /// </para>
+    /// <para>
+    /// ⚠️ WHAT THE OLD BEHAVIOUR DID, because it is worse than it sounds and it shipped. The clock was
+    /// carried forward, so every span came back offset by everything the detector had ever seen:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     A consumer that WARMS the detector paid immediately. SpawnDev.AI pushes 12 frames of silence
+    ///     through to force kernel compilation and then resets - so its clock began every session at
+    ///     6,144 samples, and the FIRST turn was sliced <b>384 ms late</b>, cutting the front off the
+    ///     utterance before any recogniser saw it.
+    ///   </description></item>
+    ///   <item><description>
+    ///     Later turns failed outright. The caller restarts its buffer per turn while the clock kept
+    ///     climbing, so by turn two the returned offsets pointed past the end of a fresh recording, the
+    ///     slice came back EMPTY, and the turn was discarded as "too short to transcribe" - a
+    ///     conversation that simply stops working after the first thing you say.
+    ///   </description></item>
+    /// </list>
+    /// <para>
+    /// ⚠️ It was invisible to every existing test, and the reason is worth keeping: the detector's own
+    /// accounting stayed self-CONSISTENT (<c>_bufferStart</c> moved with the clock), so nothing inside this
+    /// class was wrong. Only a test that resets and then compares the SECOND pass against the first can see
+    /// it - <c>Vad_DetectorReset_FindsTheSameUtteranceOnASecondTurn</c>, which fails on all six backends
+    /// without this.
+    /// </para>
+    /// <para>
+    /// To pause and resume against a CONTINUOUS caller buffer, do not call this - just stop feeding it.
+    /// This method is for starting over.
+    /// </para>
+    /// </remarks>
     public void Reset()
     {
         _vad.Reset();
         _buffer.Clear();
-        _bufferStart = _currentSample;
+        _currentSample = 0;
+        _bufferStart = 0;
         _framed = 0;
         _triggered = false;
         _tempEnd = 0;

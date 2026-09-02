@@ -130,6 +130,133 @@ public static class ZipVoiceFeatures
     }
 
     /// <summary>
+    /// Remove dead air from a reference clip, because to ZipVoice dead air is SLOW SPEECH.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ THE DEFECT THIS EXISTS TO FIX, and it is worth understanding before touching any of the numbers,
+    /// because nothing about the symptom points at silence. Walking the forward cone of the encoder's
+    /// <c>prompt_features_len</c> input in <c>text_encoder.onnx</c>:
+    /// </para>
+    /// <code>
+    /// Cast -> Div(by len(prompt_tokens)) -> Mul(by len(prompt_tokens) + len(tokens)) -> Div(by speed) -> Ceil
+    /// </code>
+    /// <para>
+    /// The model measures FRAMES PER PROMPT TOKEN from the reference and multiplies it by the total token
+    /// count. That ratio is the entire duration prediction. Copying the speaker's rate is deliberate - it
+    /// is how ZipVoice clones delivery - but <c>prompt_features_len</c> counts every mel frame of the
+    /// reference and silence has mel frames too. A reference clip that is half silence declares a speaking
+    /// rate half of what the speaker used, and every generated syllable is stretched to match.
+    /// </para>
+    /// <para>
+    /// ⚠️ Nothing downstream can notice. The shapes are right, the output is speech, the transcript still
+    /// matches; it simply sounds like a slur. MEASURED (tools/zipvoice-ref-rate, CUDA, a 4.00 s reference
+    /// and a 45-token line):
+    /// </para>
+    /// <list type="table">
+    ///   <item><term>reference as recorded</term><description>3.20 s generated</description></item>
+    ///   <item><term>+2 s of silence at each end</term><description>6.20 s - <b>1.94x slower</b></description></item>
+    ///   <item><term>+2 s of silence in the middle</term><description>4.69 s</description></item>
+    ///   <item><term>any of those, through this method</term><description>3.06 - 3.23 s</description></item>
+    /// </list>
+    /// <para>
+    /// ⚠️ Internal pauses are CAPPED, not deleted, and the distinction is the design. A pause carries
+    /// rhythm and the model clones rhythm, so splicing every gap to zero would clone a speaker who never
+    /// breathes. A two-second think in the middle of a two-word reference is not rhythm, it is dead air
+    /// being counted as speech. <paramref name="maxPauseSeconds"/> is the line between them.
+    /// </para>
+    /// <para>
+    /// ⚠️ The gate is RELATIVE to the clip's own loudest frame, never an absolute level. A reference comes
+    /// off whatever microphone is in whatever room, and an absolute threshold that works in one room is a
+    /// threshold that silently mis-trims in the next. It is also frame RMS rather than sample peak, so one
+    /// click cannot set the reference level for the whole clip.
+    /// </para>
+    /// <para>
+    /// ⚠️ An energy gate rather than Silero, deliberately, even though this library ships Silero and Silero
+    /// is the better instrument in general. Two reasons, and the second is the one that decided it. A TTS
+    /// pipeline that cannot clone at the right speed without a second 643 KB model download is a pipeline
+    /// every consumer gets wrong by default. And MEASURED on the same fixture, this gate was the MORE
+    /// stable of the two: 382 prompt frames whether the clip arrived clean, +2 s padded or +4 s padded,
+    /// where the Silero trim gave 393/391/388 because its own 512-sample framing shifts with the padding.
+    /// A caller that already holds a detector is free to trim first and set
+    /// <c>ZipVoicePipeline.TrimReferenceSilence</c> to false.
+    /// </para>
+    /// </remarks>
+    /// <param name="samples">The reference clip, mono, in [-1, 1].</param>
+    /// <param name="sampleRate">Sample rate of <paramref name="samples"/>.</param>
+    /// <param name="gateDbBelowPeak">How far below the loudest frame still counts as speech.</param>
+    /// <param name="keepSeconds">Audio kept either side of speech, so a soft onset survives the gate.</param>
+    /// <param name="maxPauseSeconds">
+    /// How much of an over-long internal pause survives, on top of the <paramref name="keepSeconds"/>
+    /// margin already held either side of the speech around it - so a long pause is reduced to roughly
+    /// <c>maxPauseSeconds + 2 * keepSeconds</c>, not to <paramref name="maxPauseSeconds"/> exactly. Pauses
+    /// shorter than that are untouched.
+    /// </param>
+    /// <returns>
+    /// The trimmed clip, or <paramref name="samples"/> unchanged when the gate found nothing it could act
+    /// on - a clip too short to frame, digital silence, or a result so short the gate has clearly misfired.
+    /// Returning the input is the right failure: a gutted reference clones badly and does it silently.
+    /// </returns>
+    public static float[] TrimReferenceSilence(
+        float[] samples, int sampleRate,
+        double gateDbBelowPeak = 35, double keepSeconds = 0.06, double maxPauseSeconds = 0.20)
+    {
+        if (samples == null) throw new ArgumentNullException(nameof(samples));
+        if (sampleRate <= 0) throw new ArgumentOutOfRangeException(nameof(sampleRate));
+
+        int win = Math.Max(1, sampleRate / 100);            // 10 ms analysis frames
+        int frames = samples.Length / win;
+        if (frames < 3) return samples;
+
+        var rms = new double[frames];
+        double peak = 0;
+        for (int f = 0; f < frames; f++)
+        {
+            double sum = 0;
+            int end = (f + 1) * win;
+            for (int i = f * win; i < end; i++) sum += (double)samples[i] * samples[i];
+            rms[f] = Math.Sqrt(sum / win);
+            if (rms[f] > peak) peak = rms[f];
+        }
+        if (peak <= 0) return samples;                      // digital silence: nothing to be right about
+
+        double gate = peak * Math.Pow(10, -gateDbBelowPeak / 20.0);
+        int keep = (int)Math.Round(keepSeconds * 100);
+        int cap = (int)Math.Round(maxPauseSeconds * 100);
+
+        // Widen every loud frame by the keep margin, so a low-energy onset - an /h/, a trailing fricative -
+        // is inside the kept region rather than shaved off it.
+        var take = new bool[frames];
+        for (int f = 0; f < frames; f++)
+        {
+            if (rms[f] < gate) continue;
+            int lo = Math.Max(0, f - keep), hi = Math.Min(frames - 1, f + keep);
+            for (int k = lo; k <= hi; k++) take[k] = true;
+        }
+
+        int first = Array.IndexOf(take, true);
+        if (first < 0) return samples;                      // gate found no speech at all: leave it alone
+        int last = Array.LastIndexOf(take, true);
+
+        // Everything before `first` and after `last` is leading and trailing dead air and goes entirely.
+        // Between them, a run of quiet frames longer than the cap is truncated to the cap.
+        var kept = new List<float>(samples.Length);
+        int run = 0;
+        for (int f = first; f <= last; f++)
+        {
+            if (take[f]) run = 0;
+            else if (++run > cap) continue;
+            int end = (f + 1) * win;
+            for (int i = f * win; i < end; i++) kept.Add(samples[i]);
+        }
+
+        // A result this short means the gate misfired on something it does not understand. Hand back what
+        // we were given: a wrong speaking rate is a bad clone, an empty reference is no clone at all.
+        if (kept.Count < win * 10) return samples;
+        return kept.ToArray();
+    }
+
+    /// <summary>
     /// Compute the mel features of the reference clip, level-matched first.
     /// </summary>
     /// <remarks>
