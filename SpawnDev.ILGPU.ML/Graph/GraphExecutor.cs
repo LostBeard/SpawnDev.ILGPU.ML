@@ -3808,6 +3808,26 @@ public class GraphExecutor : IDisposable
         _precisionAware.Dispose();
         _normalization.Dispose();
         _convert?.Dispose();
+
+        // ── And the MANAGED heap, which on Blazor WASM is the scarce one ─────────────────────────────
+        // ⚠️ Everything above frees DEVICE memory. These are .NET dictionaries of model constants as
+        // float[] - a session builds one executor plus up to MaxShapeExecutors more, so whatever this
+        // holds is held several times over per model.
+        //
+        // ⚠️ It matters because a disposed executor does not necessarily become unreachable: the browser
+        // backends RETAIN Contexts and Accelerators (measured, never collected), so anything reachable
+        // from one keeps its constants alive for the life of the page. Nulling turns a leaked executor
+        // into an empty shell instead of a copy of the model's constants. MEASURED cost of not doing it:
+        // a six-backend sweep died in the Wasm lane on "Garbage collector could not allocate 16384u bytes
+        // of memory for major heap section", which kills the .NET runtime and the page with it.
+        //
+        // Nothing may read an executor after Dispose, so dropping these is safe.
+        _cleanConstants = null;
+        _captureRuntimeSeed = null;
+        _readbackProbe = null;
+        _readbackStable = null;
+        _priorRunOutputs = null;
+        _weights.Clear();
     }
 
     /// <summary>Lazily create the fp32↔low-precision convert kernels (used only in mixed-precision mode).</summary>

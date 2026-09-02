@@ -129,12 +129,51 @@ public class ProjectTest
             var captureLogs = !string.IsNullOrEmpty(logFilter);
             var consoleLogs = new List<string>();
 
+            // ⚠️ A ROLLING TAIL OF EVERY CONSOLE LINE, kept regardless of PMT_CONSOLE_LOG.
+            //
+            // The console repeatedly turns out to hold the one fact that explains a failure, and the
+            // filter above cannot help you find it, because it makes you GUESS THE SUBSTRING BEFORE THE
+            // RUN. MEASURED 2026-09-02: a sweep died in the Wasm lane on
+            //     Uncaught ExitStatus
+            //     Error: Garbage collector could not allocate 16384u bytes of memory for major heap section
+            // and the run that was supposed to catch it used PMT_CONSOLE_LOG=Exception. Neither line
+            // contains the word "Exception", so the harness captured the answer and printed nothing. The
+            // Captain read it off the browser window instead.
+            //
+            // 200 strings is nothing; losing the cause of a runtime death costs an hour and a wrong theory.
+            const int recentConsoleMax = 200;
+            var recentConsole = new Queue<string>(recentConsoleMax);
+            bool deathDumped = false;
+
             void OnConsole(object? sender, IConsoleMessage msg)
             {
+                if (msg.Text != null)
+                {
+                    if (recentConsole.Count == recentConsoleMax) recentConsole.Dequeue();
+                    recentConsole.Enqueue($"[{msg.Type}] {msg.Text}");
+                }
+
                 // The runtime announces its own death. Catch it here rather than waiting out the
                 // done-timeout on a page that can no longer run anything - see PageRuntimeDied.
                 if (msg.Type == "error" && msg.Text != null && msg.Text.Contains(RuntimeExitedMarker, StringComparison.Ordinal))
+                {
                     PageRuntimeDied = true;
+
+                    // ⚠️ DUMP NOW, not in the reporting block below. From this instant the page cannot be
+                    // evaluated, so `row.EvaluateAsync(...)` further down THROWS and the normal console
+                    // dump is never reached - which is exactly why the sweep above reported zero console
+                    // errors on the very test that killed the runtime. This is the last safe moment.
+                    if (!deathDumped)
+                    {
+                        deathDumped = true;
+                        Console.Error.WriteLine($"[{Name}] *** .NET WASM RUNTIME DIED - console tail follows "
+                                              + "(unfiltered; the FIRST error is the cause, the rest are "
+                                              + "'already exited' noise) ***");
+                        foreach (var line in recentConsole)
+                            Console.Error.WriteLine($"  DEATH: {line}");
+                    }
+                }
+
                 if (msg.Type == "error")
                     consoleErrors.Add(msg.Text);
                 else if (msg.Type == "warning")

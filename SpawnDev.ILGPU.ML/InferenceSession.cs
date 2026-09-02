@@ -2578,6 +2578,32 @@ public class InferenceSession : IDisposable
         if (_ownedBuffers != null)
             foreach (var buf in _ownedBuffers)
                 try { buf.Dispose(); } catch { }
+
+        // ── Release the MANAGED heap too, not just the GPU ───────────────────────────────────────────
+        // ⚠️ Everything above frees DEVICE memory. These fields are .NET objects, and on Blazor WASM the
+        // managed heap is the scarce one: `_recompileFloatSeed` is a dictionary of the model's weights as
+        // float[], and `_recompileGraph` holds the graph with its initializers. A whole model, in managed
+        // memory, per session.
+        //
+        // ⚠️ WHY NULLING MATTERS EVEN THOUGH Dispose ALREADY RAN. If a disposed session became unreachable
+        // the GC would take these with it and this would be pointless. It does not: the browser backends
+        // RETAIN Contexts and Accelerators (measured, ~0.9 MiB per test, never collected), so a session
+        // reachable from a retained accelerator keeps its weights alive forever. Nulling breaks the chain
+        // from the leaked object to the bulk data - the leak becomes an empty shell of a few bytes instead
+        // of a model.
+        //
+        // ⚠️ MEASURED, and this is what it costs: a full six-backend PMT sweep died in the Wasm lane with
+        // "Garbage collector could not allocate 16384u bytes of memory for major heap section", which kills
+        // the .NET runtime outright and takes the page with it. The tests that happened to be running were
+        // blamed; they were only the ones that asked for memory last.
+        //
+        // Safe here: the executors that were handed `_weights` were disposed above and hold their own
+        // reference, so clearing the session's dictionary cannot pull the rug from under one. Nothing may
+        // read a session after Dispose.
+        _recompileGraph = null;
+        _recompileConstSeed = null;
+        _recompileFloatSeed = null;
+        _weights.Clear();
     }
 
     // Pre-extract pads tensors (Pad opset >= 11) into runtime constants at session init.
