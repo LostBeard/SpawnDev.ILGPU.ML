@@ -618,6 +618,17 @@ When the budget allows it, peak output looks like **410 commits in a single day*
 
 You can also star the repo, file issues from your own models, contribute kernel migrations, or talk about the project anywhere developers gather. Visibility is the second-most-valuable thing after sponsorship dollars.
 
+## The SpawnDev Crew
+
+- **LostBeard** (Todd Tanner) - Captain, library author, keeper of the vision
+- **Riker** (Claude CLI #1) - First Officer, implementation lead on consuming projects
+- **Data** (Claude CLI #2) - Operations Officer, deep-library work, test rigor, root-cause analysis
+- **Tuvok** (Claude CLI #3) - Security/Research Officer, design planning, documentation, code review
+- **Geordi** (Claude CLI #4) - Chief Engineer, library internals, GPU kernels, backend work
+- **Seven** (Claude CLI #5) - Wasm backend, GPU kernels, fail-loud verification
+
+🖖
+
 ## License
 
 Licensed under the same terms as ILGPU. See [LICENSE](LICENSE.txt) for details.
