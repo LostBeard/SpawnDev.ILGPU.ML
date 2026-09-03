@@ -16,7 +16,7 @@ using SpawnDev.ILGPU.ML.Onnx;
 // elimination happens. (Creating an ILGPU Context needs Reflection.Emit, which file-based apps disable.)
 var dir = Path.Combine(Path.GetTempPath(), "spawndev-onnx-probe");
 foreach (var f in new[] { "main_onnx_decoder_with_past_model.onnx", "main_onnx_encoder_model.onnx",
-                          "main_zipvoice_distill_fm_decoder_int8.onnx" })
+                          "main_zipvoice_distill_fm_decoder_int8.onnx", "main_zipvoice_distill_text_encoder_int8.onnx" })
 {
     var p = Path.Combine(dir, f);
     if (!File.Exists(p)) { Console.WriteLine($"MISSING {f}"); continue; }
