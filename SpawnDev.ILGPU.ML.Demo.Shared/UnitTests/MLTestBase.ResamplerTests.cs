@@ -462,6 +462,14 @@ public abstract partial class MLTestBase
             audio[i] = (float)(0.3 * v + 0.05 * (rng.NextDouble() - 0.5));
         }
 
+        // ⚠️ The signal is deliberately followed by SILENCE, because that is the shape Whisper always
+        // produces - it pads every utterance to a flat 30 s - and the STFT skips frames whose window is
+        // entirely zeros. The oracle below computes every frame regardless, so this fixture is what proves
+        // the skipped rows equal the computed ones rather than merely being absent.
+        var padded = new float[audio.Length * 3];
+        Array.Copy(audio, padded, audio.Length);
+        audio = padded;
+
         foreach (var (fftSize, hopSize) in new[] { (400, 160), (512, 160) })
         {
             var got = AudioPreprocessor.ComputeSTFT(audio, fftSize, hopSize, center: true);

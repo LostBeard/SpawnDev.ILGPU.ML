@@ -300,9 +300,28 @@ public static partial class AudioPreprocessor
         var scratchRe = new float[fftSize];
         var scratchIm = new float[fftSize];
 
+        // ⚠️ SKIP THE ALL-ZERO TAIL, exactly. Whisper pads every utterance to a flat 30 s, so a 4 s turn
+        // hands this 26 s of literal zeros - and an FFT of an all-zero frame is all zeros, so ~2,600 of
+        // 3,001 frames were being computed to produce rows the array already contains.
+        //
+        // Exactness, not approximation: a window of zeros times any window function is zeros, a DFT of
+        // zeros is zeros, and `stft` is already zero-initialised - so a skipped row holds precisely the
+        // values the loop would have written. Nothing about the spectrum changes; only frames that could
+        // not have contained anything are not computed.
+        //
+        // The bound is the last non-zero sample of the (already reflect-padded) signal: a frame covers
+        // [offset, offset + fftSize), so it is entirely zero exactly when `offset > lastNonZero`. The end
+        // reflection mirrors the tail, which is zeros too, so it cannot reintroduce signal.
+        //
+        // MEASURED before this: the CPU mel STFT was 3,008 ms of a 14,213 ms browser transcription.
+        int lastNonZero = -1;
+        for (int i = samples.Length - 1; i >= 0; i--)
+            if (samples[i] != 0f) { lastNonZero = i; break; }
+
         for (int f = 0; f < numFrames; f++)
         {
             int offset = f * hopSize;
+            if (offset > lastNonZero) continue;   // window is entirely zeros; the row is already zeros
 
             // Extract windowed frame
             for (int i = 0; i < fftSize; i++)
