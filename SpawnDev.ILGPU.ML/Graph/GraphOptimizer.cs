@@ -86,12 +86,16 @@ public static class GraphOptimizer
         // Pass 6: Re-run identity elimination (strength reduction may create new Identity nodes)
         eliminated += EliminateIdentityNodes(optimized);
 
-        // Pass 7: Remove dead nodes (outputs never consumed)
+        // Pass 7: Drop Constant nodes the loader already turned into initializers - a third of every graph
+        // measured here, all of it walked by the executor for an empty Execute. See EliminateConstantNodes.
+        int constNodes = EliminateConstantNodes(optimized);
+
+        // Pass 8: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
-        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced;
+        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
-            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {reduced} strength-reduced, {dead} dead");
+            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
 
         return optimized;
     }
@@ -1287,6 +1291,58 @@ public static class GraphOptimizer
     /// These are "dead" nodes — the result of fusion or other optimizations
     /// leaving orphaned intermediate nodes.
     /// </summary>
+    /// <summary>
+    /// Drop <c>Constant</c> nodes whose output the loader already registered as an initializer.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ A THIRD OF EVERY GRAPH, MEASURED. <c>ConstantOperator.Execute</c> is an empty method - the value
+    /// is served from the weights, because <c>OnnxLoader</c> registers each Constant node's output as an
+    /// initializer at load and <c>ExtractWeights</c> puts its tensor in the weight map. The node itself
+    /// therefore computes nothing, yet it stays in the compiled graph and the executor walks it every
+    /// single run: shape interpretation, refcount bookkeeping, pool traffic, a readback eligibility test.
+    /// </para>
+    /// <para>
+    /// MEASURED 2026-09-03, compiled node counts after every other optimization:
+    /// Whisper <c>decoder_with_past</c> 749 nodes of which <b>271 are Constant (36%)</b>; Whisper encoder
+    /// 463 of which 164 (35%); ZipVoice <c>fm_decoder</c> 8,616 of which <b>2,421 (28%)</b>. This engine
+    /// costs roughly 0.87-1.0 ms per node in a browser - Whisper's decode step is 1,223 ms over ~749 nodes,
+    /// ZipVoice's Euler step 8,578 ms over ~8,616 - so this is ~236 ms and ~2.4 s per step respectively,
+    /// spent walking no-ops.
+    /// </para>
+    /// <para>
+    /// ⚠️ THE GUARD IS THE INITIALIZER, not the op type. ONNX also allows <c>value_float</c>,
+    /// <c>value_int</c>, <c>value_ints</c> and <c>sparse_value</c> forms, and the loader only registers the
+    /// <c>value</c>-tensor form. A Constant carrying one of the others has NO weight behind it, so removing
+    /// it would leave its consumers reading nothing - a silent wrong answer rather than a failure. Requiring
+    /// the output to be present in <see cref="ModelGraph.Initializers"/> is exactly the condition under
+    /// which the loader also populated the data.
+    /// </para>
+    /// <para>
+    /// Runs before <see cref="EliminateDeadNodes"/> so anything left unconsumed by this pass is collected
+    /// in the same fixpoint rather than surviving to the next compile.
+    /// </para>
+    /// </remarks>
+    private static int EliminateConstantNodes(ModelGraph graph)
+    {
+        var graphOutputNames = new HashSet<string>(graph.Outputs.Select(o => o.Name), StringComparer.Ordinal);
+        var remove = new List<int>();
+        for (int i = 0; i < graph.Nodes.Count; i++)
+        {
+            var node = graph.Nodes[i];
+            if (node.OpType != "Constant" || node.Outputs.Count != 1) continue;
+            var outName = node.Outputs[0];
+            if (string.IsNullOrEmpty(outName)) continue;
+            // A graph OUTPUT must keep a producing node - the executor resolves results from node outputs.
+            if (graphOutputNames.Contains(outName)) continue;
+            // The value must already be available as a weight; see the remarks above.
+            if (!graph.Initializers.ContainsKey(outName)) continue;
+            remove.Add(i);
+        }
+        foreach (var idx in remove.OrderByDescending(i => i)) graph.Nodes.RemoveAt(idx);
+        return remove.Count;
+    }
+
     private static int EliminateDeadNodes(ModelGraph graph)
     {
         var graphOutputNames = new HashSet<string>(graph.Outputs.Select(o => o.Name));

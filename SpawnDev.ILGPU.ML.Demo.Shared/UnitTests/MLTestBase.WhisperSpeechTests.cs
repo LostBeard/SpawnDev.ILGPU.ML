@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.UnitTesting;
+using ILGPU.Runtime;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -194,6 +195,20 @@ public abstract partial class MLTestBase
             // async kernel work surfaces at the next sync point rather than at its real producer, so the
             // profile names an innocent node. It makes the run slower, which is the correct trade for
             // attribution - the number to act on is the RANKING, not this run's wall time.
+            // ⚠️ WebGPU and CUDA ONLY. PerOpSync forces a full device sync after every node, so this is a
+            // THIRD transcription at a deliberately pessimal cost - and on the CPU and OpenCL lanes that
+            // blew the test's 900 s budget outright (MEASURED: both timed out while the four other backends
+            // passed). The question this profile answers - where per-node dispatch time goes - is a
+            // question about the dispatch-bound backends anyway; on CPU there is no dispatch to attribute.
+            //
+            // ⚠️ An `if` and not an early return: the transcripts are compared AFTER this using-block, so
+            // returning here would skip the actual assertion and leave CPU and OpenCL passing vacuously.
+            bool profile = accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.Cuda;
+            if (!profile)
+                Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] node timing SKIPPED "
+                                + "(PerOpSync is a third full transcription; WebGPU/CUDA only)");
+            if (profile)
+            {
             Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
             Graph.GraphExecutor.PerOpSync = true;
             try { await pipeline.TranscribeAsync(samples, 16000); }
@@ -217,6 +232,7 @@ public abstract partial class MLTestBase
             foreach (var (op, total, count) in byOp.Take(12))
                 Console.WriteLine($"[Benchmark]   {op,-22} {total,8:F0}ms  {count,5} nodes  "
                     + $"{total / Math.Max(1, count),6:F2}ms/node  {100 * total / Math.Max(1, grand),5:F1}%");
+            }
         }
 
         Console.WriteLine($"[Whisper] full   : \"{full}\"");
