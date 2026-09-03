@@ -259,25 +259,46 @@ public abstract partial class MLTestBase
         // flow (If)" on WebGPU. The env var survives only as a way to turn it OFF for a desktop A/B.
 
         using var graphs = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);
-        // 🔴 ML_CF_CAPTURE=1 HANGS THE GPU on WebGPU. MEASURED 2026-09-03: DXGI_ERROR_DEVICE_HUNG on the
-        // first attempt, a D3D12 TDR that resets the display driver - the test died after fetching the
-        // models and before speaking a line. Left reachable because the refusal costs ~20x on the stage
-        // that is 82% of a synthesis, so it will be worth another attempt once something explains what
-        // still allocates inside the recording window; see IlgpuZipVoiceGraphs.AllowControlFlowCapture.
-        // Do not set this expecting it to work.
-        if (Environment.GetEnvironmentVariable("ML_CF_CAPTURE") == "1")
-        {
-            graphs.AllowControlFlowCapture = true;
-            Console.WriteLine("[Benchmark] ZipVoice control-flow capture FORCED ON - this hung the GPU when "
-                            + "last measured (DXGI_ERROR_DEVICE_HUNG)");
-        }
+        // ⚠️ Capture is exercised HERE even though it defaults OFF in production, because the sample-level
+        // A/B below is the thing that decides when that default may flip. A gate that only ran the shipping
+        // configuration could never tell us whether replay had become faithful - it would just keep
+        // reporting that capture was refused. ML_CF_CAPTURE=0 turns it off for a before/after control.
+        graphs.AllowControlFlowCapture = Environment.GetEnvironmentVariable("ML_CF_CAPTURE") != "0";
+        Console.WriteLine($"[Benchmark] ZipVoice control-flow capture requested: "
+                        + $"{graphs.AllowControlFlowCapture}");
         using var pipeline = new ZipVoicePipeline(graphs);
+
+        // 🔴 PIN THE NOISE SEED, or every sample comparison below is meaningless.
+        //
+        // ⚠️ This is not a workaround for a defect - it is the documented contract. Zero-shot flow matching
+        // starts its ODE from FRESH noise every call (NoiseSeed defaults to null -> Random.Shared), so two
+        // renders of the same sentence legitimately differ, and differ audibly. MEASURED 2026-09-03 before
+        // this line existed: two uncaptured renders of the same line differed in ALL 73,216 samples, worst
+        // 0.551049.
+        //
+        // ⚠️ That nearly cost a wrong conclusion. The capture A/B below reported "replaying the captured
+        // decoder changed the audio: 73216 of 73216 samples differ" and it was believed - but the control
+        // it compared against was itself different every time, so the comparison indicted capture for
+        // something capture had nothing to do with. A null result from an uncalibrated instrument is worse
+        // than no result, because it is believable. The determinism check below now proves the instrument
+        // before the verdict is read.
+        pipeline.NoiseSeed = 20260903;
 
         // ── speak ────────────────────────────────────────────────────────────────────────────────────
         // ⚠️ Census the If branches over this one utterance. fm_decoder has FIVE Ifs whose else branch is
         // 254 nodes against a then branch of ONE Constant, so which side runs is worth thousands of node
         // executions per Euler step - on the stage that is 82% of a synthesis.
         Operators.IfOperator.ResetBranchCensus();
+        // ⚠️ CUMULATIVE, not LastRun. A synthesis is one encoder pass plus NumSteps decoder passes plus a
+        // vocoder pass, and every LastRun* field is overwritten by the next RunAsync - so reading them
+        // afterwards reports the VOCODER and makes the decoder look free. That is why the older "0
+        // readbacks" line here was never evidence about the decoder at all.
+        //
+        // Readbacks are what decides whether a captured plan can be faithful: a value read to the host lets
+        // the executor compute on the CPU and ELIDE the dispatch, and a recorded plan replays dispatches
+        // only - so an elided computation freezes at its capture-time value forever. Driving readbacks to
+        // zero is the documented precondition for capturing anything.
+        Graph.GraphExecutor.CumulativeReset();
         const string line = "Paint the sockets in the wall dull green.";
         sw.Restart();
         var result = await pipeline.SpeakAsync(line, LibrivoxTranscript, reference, 16000, tokenizer);
@@ -325,6 +346,14 @@ public abstract partial class MLTestBase
         // (22.8x). Print the counters rather than guessing which it is this time.
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] capture LIVE: "
                         + $"{graphs.DecoderCaptured} - {graphs.DecoderCaptureStatus}");
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] WHOLE synthesis: "
+            + $"{Graph.GraphExecutor.CumulativeRunCount} graph runs, "
+            + $"{Graph.GraphExecutor.CumulativeReadbackCount} readbacks "
+            + $"({Graph.GraphExecutor.CumulativeReadbackMs:F0} ms), "
+            + $"{Graph.GraphExecutor.CumulativeSyncDrainCount} drains "
+            + $"({Graph.GraphExecutor.CumulativeSyncDrainMs:F0} ms) "
+            + "| a readback lets the executor compute host-side and ELIDE the dispatch, which a replayed "
+            + "plan cannot reproduce - non-zero here is the reason to suspect a frozen value");
         int thenN = Operators.IfOperator.ThenBranchCount, elseN = Operators.IfOperator.ElseBranchCount;
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] If branches this "
                         + $"utterance: then={thenN} (1 node each) else={elseN} (254 nodes each) "
@@ -370,6 +399,39 @@ public abstract partial class MLTestBase
                         + $"total {third.TotalMs:F0} ms | decoder first step {third.DecoderFirstStepMs:F0} ms, "
                         + $"remaining {third.DecoderRemainingStepsMs:F0} ms | {third.NumFrames} frames "
                         + $"| capture LIVE {third.DecoderCaptured}");
+
+        // ── CALIBRATE THE INSTRUMENT FIRST: is this pipeline even deterministic? ─────────────────────
+        //
+        // ⚠️ The capture A/B below concludes "replay changed the audio" from a sample comparison, and that
+        // conclusion is only worth anything if two renders of the SAME line agree in the first place. If
+        // the pipeline is non-deterministic, that comparison would report a difference no matter what
+        // capture did - a null result from an uncalibrated instrument, which is worse than no result
+        // because it is believable.
+        //
+        // The ODE starts from a SEEDED noise vector and every graph is deterministic, so this should hold;
+        // asserting it is what makes the capture verdict admissible rather than assumed.
+        graphs.EnableGraphCapture = false;
+        var det1 = await pipeline.SpeakAsync(line, LibrivoxTranscript, reference, 16000, tokenizer);
+        var det2 = await pipeline.SpeakAsync(line, LibrivoxTranscript, reference, 16000, tokenizer);
+        graphs.EnableGraphCapture = true;
+        int detDiff = 0; float detWorst = 0f;
+        if (det1.Audio.Length != det2.Audio.Length)
+            throw new Exception($"two uncaptured renders of the same line differ in LENGTH "
+                              + $"({det1.Audio.Length} vs {det2.Audio.Length}) - the pipeline is not "
+                              + "deterministic, so no sample-level comparison here means anything");
+        for (int i = 0; i < det1.Audio.Length; i++)
+        {
+            float d = MathF.Abs(det1.Audio[i] - det2.Audio[i]);
+            if (d != 0f) { detDiff++; detWorst = MathF.Max(detWorst, d); }
+        }
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] determinism: "
+                        + $"{detDiff} of {det1.Audio.Length} samples differ between two uncaptured renders "
+                        + $"(worst {detWorst:F6})");
+        if (detDiff != 0)
+            throw new Exception($"the pipeline is NOT deterministic: two uncaptured renders of the same "
+                              + $"line differ in {detDiff} of {det1.Audio.Length} samples (worst "
+                              + $"{detWorst:F6}). Fix that before reading anything into the capture A/B - "
+                              + "a comparison against a moving target cannot indict capture.");
 
         // ── CAPTURE MUST NOT CHANGE THE AUDIO ────────────────────────────────────────────────────────
         //

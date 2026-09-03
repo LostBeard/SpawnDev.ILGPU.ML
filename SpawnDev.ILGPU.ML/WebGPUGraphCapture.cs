@@ -84,6 +84,16 @@ public sealed class WebGPUGraphCapture : IDisposable
         var acc = session.Accelerator;
         if (acc is not WebGPUAccelerator webGpu) return null;
 
+        // 🔴 SAVED AND RESTORED, like the CUDA path - it was set here and never put back, and the CUDA
+        // path's own remarks already measured what that costs.
+        //
+        // While the flag stays on, the frozen readback values are seeded into runtimeConstants on EVERY
+        // subsequent run of this session - including a plain direct forward. So a capture that failed and
+        // fell through, or any later uncaptured call, silently inherits capture-time constants. MEASURED on
+        // CUDA: ZipVoice then rendered at rms 0.0021 instead of 0.0761 - audio that is quietly wrong rather
+        // than absent, from a fallback whose entire purpose is to degrade safely. The WebGPU path had the
+        // same set with no restore, which is the asymmetry this fixes.
+        bool prevCacheReadbacks = session.CacheShapeReadbacks;
         session.CacheShapeReadbacks = true;   // finalize a stable readback cache → the capture pass syncs nothing
 
         // Same regime as the CUDA capture: dispatch-elide keeps shape ops CPU-resolved so the captured plan
@@ -168,6 +178,7 @@ public sealed class WebGPUGraphCapture : IDisposable
             GraphExecutor.ShapeInterpValidate = prevValidate;
             WebGPUBackend.EnableBindGroupCaching = prevBgCache;
             GraphExecutor.MaxPendingReleaseBytes = prevReleaseCap;
+            session.CacheShapeReadbacks = prevCacheReadbacks;
         }
     }
 

@@ -42,6 +42,22 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
         _vocoder = vocoder ?? throw new ArgumentNullException(nameof(vocoder));
         _accelerator = accelerator ?? throw new ArgumentNullException(nameof(accelerator));
         _ownsSessions = ownsSessions;
+
+        // ⚠️ THE DECODER IS A DECODE LOOP, which is exactly what this flag is for - and it was never turned
+        // on here. MEASURED on WebGPU 2026-09-03, one whole synthesis: 6 graph runs, **1,905 readbacks
+        // costing 18,657 ms** against a 42 s total. Nearly half the time is GPU->host round trips for
+        // <=64-element shape and scalar tensors that a shape-specialised executor re-reads every single
+        // call.
+        //
+        // ⚠️ That number was invisible until today because the pipeline reported `LastRun*` counters, which
+        // are overwritten by the next RunAsync - so the line that read "0 readbacks" was describing the
+        // VOCODER, the last graph to run, and not the decoder at all.
+        //
+        // Correct by construction rather than by assumption: the cache probes the first two runs with full
+        // readback and caches ONLY values that were IDENTICAL across them, re-reading the rest every call.
+        // The Euler steps feed genuinely different `t` and `x`, so a data-derived value cannot be mistaken
+        // for a stable one - which is precisely the mistake to fear here.
+        _decoder.CacheShapeReadbacks = true;
     }
 
     /// <summary>Load the three graphs from raw ONNX bytes.</summary>
@@ -64,12 +80,20 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// - shape interpretation, pool churn, dispatch setup - which is precisely what a recorded plan skips.
     /// </para>
     /// <para>
-    /// ⚠️ A changing scalar input is safe here: <see cref="SessionGraphCapture"/> owns stable input
-    /// buffers and copies each call's tensors into them before replay, so <c>t</c> advancing per Euler step
-    /// is carried through. The real hazard is different and quieter - a small tensor promoted to a runtime
-    /// constant can have its dispatch ELIDED and then stays frozen at its capture-time value forever. That
-    /// failure produces confident, plausible audio, so it cannot be caught by listening; it is caught by
-    /// rendering with and without capture and comparing the samples. Done: bit-identical.
+    /// ⚠️ A changing scalar input is carried correctly at the INPUT boundary:
+    /// <see cref="SessionGraphCapture"/> owns stable input buffers and <c>ReplayAsync</c> copies each
+    /// call's tensors into them, so <c>t</c> advancing per Euler step does reach the plan. The hazard is
+    /// quieter - a small tensor promoted to a runtime constant can have its dispatch ELIDED, and then stays
+    /// frozen at its capture-time value forever. That failure produces confident, plausible audio, so it
+    /// cannot be caught by listening; only rendering with and without capture and comparing SAMPLES finds it.
+    /// <para>
+    /// 🔴 THIS DEFECT IS REAL AND CURRENTLY OPEN. An older note here read "Done: bit-identical", which was
+    /// never true of this graph - capture on this decoder was refused for control flow and so had never
+    /// actually run. The first time it did run, MEASURED 2026-09-03:
+    /// <b>all 73,216 samples differed, worst 0.502935</b> - a completely different utterance, still fluent
+    /// enough to pass every amplitude, RMS and duration check in the gate. Replaying this plan is NOT
+    /// faithful yet, which is why <see cref="AllowControlFlowCapture"/> defaults OFF.
+    /// </para>
     /// </para>
     /// <para>
     /// Capture is best-effort - only CUDA and WebGPU are eligible, and any failure falls through to the
@@ -94,27 +118,35 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// replayed plan does in microseconds the per-node interop crossings the walk does in ~4.5 ms.
     /// </para>
     /// <para>
-    /// 🔴 DEFAULT FALSE, AND THAT IS A MEASUREMENT, NOT CAUTION. I turned this on and ran it on WebGPU
-    /// 2026-09-03. It <b>HUNG THE GPU on the first attempt</b>:
-    /// <c>ID3D12Device::GetDeviceRemovedReason failed with DXGI_ERROR_DEVICE_HUNG (0x887A0006)</c>,
-    /// "Device removed reason: DXGI_ERROR_DEVICE_HUNG" - a D3D12 TDR that resets the display driver, felt
-    /// outside the browser and outside the process. The test died after fetching the models and before
-    /// speaking a single line.
+    /// ⚠️ THE HISTORY MATTERS, because the first attempt at this was wrong in an instructive way. Turning
+    /// it on naively on 2026-09-03 <b>HUNG THE GPU on the first attempt</b> -
+    /// <c>DXGI_ERROR_DEVICE_HUNG (0x887A0006)</c>, a D3D12 TDR that resets the display driver - even though
+    /// <c>SubgraphRunner</c> caches its compiled plans and <c>WebGPUGraphCapture</c> proves its pool is
+    /// primed. Those two facts read like enough. They were not.
     /// </para>
     /// <para>
-    /// ⚠️ The argument for lifting it was wrong, and it is worth writing down BECAUSE it was plausible:
-    /// <c>SubgraphRunner</c> caches the compiled subgraph plan on the async path the control-flow
-    /// operators actually use, so the allocation it guards against was supposed to happen during capture's
-    /// two warm forwards rather than inside the recording window - and <c>WebGPUGraphCapture</c> refuses to
-    /// record at all if its second warm pass tripped a pool reclaim, which reads like positive proof of
-    /// priming. The device hung anyway. So the plan cache is NOT sufficient for this graph, and the
-    /// reclaim guard does not see whatever allocates: something inside the recording window still touches
-    /// the device. That is the open question, and it needs an answer before this is turned on again.
+    /// What settled it was a measurement rather than an argument. With the branch body skipped entirely
+    /// (a deliberate diagnostic producing wrong audio), the same decoder recorded <b>8,197 dispatches with
+    /// no device hang</b>, and its steady-state Euler step went <b>8,578 ms -> 147 ms (58x)</b>. So it is
+    /// executing a BODY inside the recording window that is fatal, not the presence of an If.
     /// </para>
     /// <para>
-    /// The knob stays because the cost of the refusal is real and large - the decoder is 82% of a
-    /// synthesis and a replay is worth ~20x on the per-node crossings - so this WILL be worth revisiting.
-    /// It is per-instance rather than global for the same reason: the verdict is a property of one graph.
+    /// ⚠️ WHAT IS NOW SOLVED, AND WHAT IS NOT. Capture is REACHABLE: a branch that is a single
+    /// <c>Constant</c> is written directly and never reaches SubgraphRunner - a census over a real
+    /// utterance says <c>then=21, else=0</c>, so all five of this decoder's Ifs take exactly that path -
+    /// and <c>SessionGraphCapture</c> no longer refuses on sight, it runs one forward with the body counter
+    /// zeroed and records only if NOTHING ran. The device survives and the plan records 8,197 dispatches.
+    /// <para>
+    /// 🔴 It still defaults OFF because REPLAY IS NOT FAITHFUL - see the decoder-capture remarks above.
+    /// Speed was never the blocker; correctness is. Turning this on today would ship confident, wrong
+    /// speech. It flips to on the day the sample-level A/B in
+    /// <c>Pipeline_ZipVoice_SpeaksInTheBrowser</c> passes, and not before.
+    /// </para>
+    /// <para>
+    /// ⚠️ The condition here is shape-determined - every leaf of its subtree is an initializer or a
+    /// <c>Shape</c> (checked with <c>tools/probe-control-flow.cs</c>, not assumed) - which is what makes a
+    /// per-shape capture valid: the branch choice cannot change while the plan is. A data-dependent
+    /// condition would not qualify, and that is the caller's obligation, not something capture can verify.
     /// </para>
     /// </remarks>
     public bool AllowControlFlowCapture { get; set; }

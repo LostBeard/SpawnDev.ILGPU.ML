@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
+using SpawnDev.ILGPU.ML.Operators;
 
 namespace SpawnDev.ILGPU.ML.Graph;
 
@@ -21,6 +22,8 @@ public sealed class SessionGraphCapture : IDisposable
     private CudaGraphCapture? _cuda;
     private WebGPUGraphCapture? _webGpu;
     private bool _captureAttempted;
+    private bool _controlFlowObserved;
+    private int _observedBodyRuns;
     private int[][]? _capturedShapes;
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _ownedInputs = new();
 
@@ -148,7 +151,52 @@ public sealed class SessionGraphCapture : IDisposable
             // backend this project actually ships to - hanging the device instead. The eligibility decision
             // is made in this class, so the guard belongs in this class.
             bool refuseControlFlow = AllowControlFlow is bool allow ? !allow : RefuseControlFlow;
-            if (refuseControlFlow && _session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
+            bool hasControlFlow = _session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan");
+
+            // ── Control flow: OBSERVE before deciding, when the caller has opted in ──────────────────
+            //
+            // ⚠️ The hazard is a device allocation inside the recording window, and MEASURED 2026-09-03 it
+            // comes from EXECUTING A BODY there, not from an If existing. With the body removed, the same
+            // ZipVoice decoder recorded 8,197 dispatches with no device hang and its steady-state Euler
+            // step went 8,578 ms -> 147 ms (58x). A branch that is a single Constant is now written
+            // directly and never reaches SubgraphRunner, so such a graph runs no body at all.
+            //
+            // "Runs no body" is a fact about this graph at these shapes, so it is MEASURED rather than
+            // assumed: one direct forward with the counter zeroed, and capture is attempted on the next
+            // call only if nothing ran. A body execution refuses permanently, exactly as before.
+            //
+            // ⚠️ THE CALLER OWES ONE THING THIS CANNOT CHECK: the branch choice must be a function of the
+            // SHAPES, not of the data. A capture is bound to fixed input shapes, so a shape-determined
+            // condition cannot change while the plan is valid - but a data-dependent one could flip on a
+            // later call, and a replayed plan would not re-evaluate it. The output would then be confidently
+            // wrong rather than broken. ZipVoice qualifies and it was checked, not assumed: every leaf of
+            // its condition is an initializer or a Shape (tools/probe-control-flow.cs). Anything else must
+            // leave AllowControlFlow alone.
+            if (hasControlFlow && !refuseControlFlow && !_controlFlowObserved)
+            {
+                _controlFlowObserved = true;
+                _captureAttempted = false;                 // decide on the NEXT call, once observed
+                SubgraphRunner.ResetExecutionCount();
+                var observed = await _session.RunAsync(inputs).ConfigureAwait(false);
+                _observedBodyRuns = SubgraphRunner.ExecutionCount;
+                if (_observedBodyRuns == 0)
+                {
+                    CaptureStatus = "observing: a full forward ran NO control-flow body, so recording is "
+                                  + "safe; capture is attempted on the next call";
+                }
+                else
+                {
+                    _captureAttempted = true;              // permanent refusal, same as the old behaviour
+                    CaptureStatus = $"refused: {_observedBodyRuns} control-flow body execution(s) in one "
+                                  + "forward - a body allocates inside the recording window, which is "
+                                  + "unrecoverable (0xC0000005 on CUDA, a hung device on WebGPU)";
+                    Console.WriteLine($"[SessionGraphCapture] {_observedBodyRuns} control-flow body "
+                        + "execution(s) observed; running direct forward.");
+                }
+                return observed;
+            }
+
+            if (refuseControlFlow && hasControlFlow)
             {
                 var cf = string.Join(", ", _session.OperatorTypes.Where(o => o is "If" or "Loop" or "Scan"));
                 CaptureStatus = $"refused: graph contains control flow ({cf}); "

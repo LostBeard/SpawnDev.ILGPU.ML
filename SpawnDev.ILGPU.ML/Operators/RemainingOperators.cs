@@ -1056,6 +1056,18 @@ internal static class OuterScope
 
 internal static class SubgraphRunner
 {
+    /// <summary>Control-flow BODY executions - every If/Loop/Scan body, not just If.</summary>
+    /// <remarks>
+    /// ⚠️ Counted HERE rather than in IfOperator on purpose. The hazard capture guards against is a device
+    /// allocation inside the recording window, and it comes from executing a body - any body. Counting only
+    /// If would report zero for a graph whose Loop ran every call, and a capture decision made on that
+    /// number would be exactly wrong.
+    /// </remarks>
+    public static int ExecutionCount;
+
+    /// <summary>Zero the body-execution counter, so a capture decision covers a known window.</summary>
+    public static void ResetExecutionCount() => ExecutionCount = 0;
+
     /// <summary>
     /// Execute a subgraph (OnnxGraphProto) with the given input tensors.
     /// Returns output tensors. The caller is responsible for copying results to their output buffers.
@@ -1064,6 +1076,7 @@ internal static class SubgraphRunner
         OnnxOpContext ctx, Onnx.OnnxGraphProto subgraph,
         Dictionary<string, Tensor> subgraphInputs)
     {
+        System.Threading.Interlocked.Increment(ref ExecutionCount);
         var plan = GetOrBuildPlan(ctx, subgraph, subgraphInputs);
         if (plan == null) return null;
         return MergeDeclaredOutputs(subgraph, plan.Executor.Run(subgraphInputs), plan.Constants);
@@ -1106,6 +1119,7 @@ internal static class SubgraphRunner
         // ⚠️ The SAME cached plan as the sync path. This is the entry point the control-flow operators
         // actually use (IfOperator.ExecuteAsync -> here), so caching only the sync path left every real
         // execution rebuilding - and the crash it was meant to prevent still fired, from this line.
+        System.Threading.Interlocked.Increment(ref ExecutionCount);
         var plan = GetOrBuildPlan(ctx, subgraph, subgraphInputs);
         if (plan == null) return null;
         return MergeDeclaredOutputs(subgraph, await plan.Executor.RunAsync(subgraphInputs), plan.Constants);
@@ -1431,6 +1445,101 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
     /// </remarks>
     public static bool BypassSubgraphForCaptureProbe { get; set; }
 
+    /// <summary>
+    /// How many times a control-flow body has actually been run through <see cref="SubgraphRunner"/>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ This is what makes capture decidable by OBSERVATION rather than by a blanket refusal. The hazard
+    /// capture guards against is a device allocation inside the recording window, and that comes from
+    /// executing a subgraph there - MEASURED 2026-09-03: with the subgraph execution removed, the same
+    /// decoder captured 8,197 dispatches with no device hang, and its steady-state Euler step went
+    /// 8,578 ms -> 147 ms. The mere PRESENCE of an If is not the problem; running a body is.
+    /// <para>
+    /// So <see cref="Graph.SessionGraphCapture"/> watches this counter across a warm forward: zero means no
+    /// body ran and recording is safe, non-zero means refuse exactly as before. A branch that is a single
+    /// <c>Constant</c> never touches SubgraphRunner (see <see cref="TryWriteConstantBranch"/>), which is
+    /// what takes ZipVoice's five Ifs out of the window.
+    /// </para>
+    /// </remarks>
+    /// <summary>Zero the subgraph-execution counter, so a capture decision covers a known window.</summary>
+    // Materialised single-Constant branches. Keyed by the branch proto, which is long-lived and
+    // reference-stable for the life of the session.
+    private static readonly Dictionary<Onnx.OnnxGraphProto, (float[] Values, int[] Shape)> _constBranchValues = new();
+    private static readonly object _constBranchLock = new();
+
+    /// <summary>
+    /// Write a branch that is exactly ONE <c>Constant</c> node straight into the output, without
+    /// <see cref="SubgraphRunner"/>. Returns false for anything else, leaving the normal path to run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ WHY IT MATTERS FAR MORE THAN IT LOOKS. This is the entire reason ZipVoice's decoder can be
+    /// captured. Its five Ifs each choose between a cached positional table (ONE Constant) and a 254-node
+    /// recomputation, and a census over a real utterance says <c>then=21, else=0</c> - the big branch never
+    /// runs. Sending that trivial case through a subgraph executor is what put an allocation inside the
+    /// capture window and hung the device; writing it directly removes the body entirely.
+    /// </para>
+    /// <para>
+    /// ⚠️ The buffer is rented under a STABLE name and written ONCE. That is deliberate on two counts. A
+    /// per-call rent is an allocation, which is precisely what makes a graph uncapturable. And the upload
+    /// is a <c>queue.writeBuffer</c>, not a dispatch, so a recorded plan would not replay it - writing once
+    /// into a buffer nothing else touches means the value is already correct on every replay, rather than
+    /// depending on a write that the plan cannot contain.
+    /// </para>
+    /// <para>
+    /// ⚠️ Conservative on size: it declines unless the output buffer's element count matches the constant
+    /// exactly. An If cannot be sized statically in general - ONNX requires branches to agree on rank, not
+    /// dims - so a mismatch means the compile-time shape came from the OTHER branch, and
+    /// <see cref="SubgraphOutputCopy"/>'s adoption path must handle it. Declining is always safe.
+    /// </para>
+    /// </remarks>
+    private static bool TryWriteConstantBranch(OnnxOpContext ctx, Onnx.OnnxGraphProto sub)
+    {
+        if (sub.Nodes.Count != 1 || sub.Outputs.Count != 1 || ctx.Outputs.Length < 1) return false;
+        var only = sub.Nodes[0];
+        if (only.OpType != "Constant" || only.Outputs.Count < 1) return false;
+        if (!string.Equals(only.Outputs[0], sub.Outputs[0].Name, StringComparison.Ordinal)) return false;
+
+        float[] values; int[] shape;
+        lock (_constBranchLock)
+        {
+            if (!_constBranchValues.TryGetValue(sub, out var cached))
+            {
+                var valueAttr = only.Attributes.FirstOrDefault(a => a.Name == "value");
+                if (valueAttr?.T == null) return false;
+                cached = (valueAttr.T.ToFloatArray(), valueAttr.T.Dims.Select(d => (int)d).ToArray());
+                _constBranchValues[sub] = cached;
+            }
+            (values, shape) = cached;
+        }
+        if (values.Length == 0) return false;
+        if (shape.Length == 0 || TensorHelpers.ElementCount(shape) != values.Length)
+            shape = new[] { values.Length };
+
+        // 🔴 A STABLE, NAMED buffer - not ctx.Outputs[0]. This is the difference between correct and
+        // confidently wrong, and it was MEASURED the wrong way round first.
+        //
+        // Writing into the node's own output buffer works right up until the graph is CAPTURED. A replayed
+        // plan re-executes recorded DISPATCHES only, so this operator never runs again - while the buffer it
+        // wrote into is an ordinary pooled intermediate that the pool recycles to other tensors between
+        // runs. The plan then reads whatever landed there. MEASURED 2026-09-03 on the first attempt:
+        // replaying the captured decoder changed ALL 73,216 samples, worst 0.452549 - a completely
+        // different utterance, still fluent enough to pass every amplitude and duration check. Only the
+        // sample-level A/B against a direct forward caught it.
+        //
+        // A NAMED rent is retained by the pool under that name (BufferPool._namedBuffers) and handed back
+        // for the same name every time, so nothing else is ever given this memory and the value survives
+        // for the life of the plan. Same mechanism SubgraphOutputCopy uses, for the same reason.
+        var stable = ctx.Pool.Rent(shape, "_ifconst_" + sub.Outputs[0].Name);
+
+        // Uploaded on every real execution rather than once. A queue write is cheap, a stale table is not,
+        // and "write once" would need to prove the pool never rebound the name - which this does not need
+        // to know. Replays skip this entirely and read the value the last real execution left.
+        stable.Data.SubView(0, values.Length).CopyFromCPU(values);
+        ctx.Outputs[0] = stable;   // aliases the executor's nodeOutputs, exactly as SubgraphOutputCopy does
+        return true;
+    }
+
     private static void CountBranch(bool condition)
     {
         if (condition) System.Threading.Interlocked.Increment(ref ThenBranchCount);
@@ -1497,6 +1606,9 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         string branchKey = condition ? "then_branch" : "else_branch";
         if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
         {
+            // A branch that is one Constant is written directly - no SubgraphRunner, so nothing
+            // allocates inside a capture window. See TryWriteConstantBranch.
+            if (TryWriteConstantBranch(ctx, subgraph)) return;
             // Subgraph inputs reference outer graph tensors — pass all available tensors
             var subInputs = new Dictionary<string, Tensor>();
             OuterScope.Add(ctx, subgraph, subInputs);
@@ -1547,6 +1659,9 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
         string branchKey = condition ? "then_branch" : "else_branch";
         if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
         {
+            // A branch that is one Constant is written directly - no SubgraphRunner, so nothing
+            // allocates inside a capture window. See TryWriteConstantBranch.
+            if (TryWriteConstantBranch(ctx, subgraph)) return;
             var subInputs = new Dictionary<string, Tensor>();
             OuterScope.Add(ctx, subgraph, subInputs);
             for (int i = 0; i < ctx.InputNames.Length; i++)
