@@ -674,8 +674,23 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
         reg.ElementWise.Scale(a.Data, aAdj.Data, a.ElementCount, 1f);
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
         {
-            var azp = ctx.TryGetInputValues(2);
-            if (azp != null && azp.Length > 0)
+            // ⚠️ THE COUNT COMES FROM THE SHAPE, NOT FROM A READBACK. This used to call
+            // TryGetInputValues(2) and branch on `azp.Length` - but every VALUE used below is read from
+            // ctx.Inputs[2].Data on the GPU; the host array was only ever consulted for its LENGTH, which
+            // is by definition ctx.Inputs[2].ElementCount.
+            //
+            // Two things that cost. First, it forced the executor to keep the eager <=64-element readback of
+            // every DynamicQuantizeLinear zero-point: MEASURED on ZipVoice's fm_decoder, ONE Euler step did
+            // 593 readbacks of which 566 were DynamicQuantizeLinear - 95% - and a whole synthesis spent
+            // 19,217 ms of ~42 s in readbacks. Each one is a full GPU sync for a number the shape already
+            // knew.
+            //
+            // ⚠️ Second, and worse: `azp != null` meant that when no host value was available the zero-point
+            // subtraction was SKIPPED ENTIRELY, silently, and the matmul returned unshifted arithmetic. A
+            // missing correction does not throw - it just produces wrong numbers. Reading the count from the
+            // shape cannot fail, so the correction now always runs.
+            int azpCount = ctx.Inputs[2].ElementCount;
+            if (azpCount > 0)
             {
                 // a_zero_point is scalar, or PER-ROW of A [M, K] (one value per row of the M axis).
                 // ⚠️ The per-row branch used to call the raw `Add`, which indexes BOTH operands by the
@@ -685,15 +700,15 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
                 // the column form runs happily and computes the wrong number.
                 var zpBuf = ctx.Pool.Rent(ctx.Inputs[2].Shape, "_mmi_azp");
                 reg.ElementWise.Scale(ctx.Inputs[2].Data, zpBuf.Data, ctx.Inputs[2].ElementCount, -1f);
-                if (azp.Length == 1)
+                if (azpCount == 1)
                     reg.ElementWise.AddBias(aAdj.Data, zpBuf.Data, a.ElementCount, 1);
-                else if (azp.Length == rows && K > 0)
+                else if (azpCount == rows && K > 0)
                     // rows, not M: with a batched A every leading axis contributes rows, and a per-row
                     // zero point has one value per row of the FLATTENED matrix.
                     reg.ElementWise.AddRowBias(aAdj.Data, zpBuf.Data, a.ElementCount, K);
                 else
                     throw new NotSupportedException(
-                        $"MatMulInteger a_zero_point has {azp.Length} values; expected 1 (per-tensor) or " +
+                        $"MatMulInteger a_zero_point has {azpCount} values; expected 1 (per-tensor) or " +
                         $"{rows} (per-row of A [{string.Join(",", aShape)}] flattened to [{rows},{K}]).");
                 ctx.Pool.Return(zpBuf);
             }
@@ -703,8 +718,10 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
         reg.ElementWise.Scale(b.Data, bAdj.Data, b.ElementCount, 1f);
         if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
         {
-            var bzp = ctx.TryGetInputValues(3);
-            if (bzp != null && bzp.Length > 0)
+            // Same as a_zero_point above: the count is the SHAPE, and reading it back only forced a GPU
+            // sync and made a missing value silently skip the correction.
+            int bzpCount = ctx.Inputs[3].ElementCount;
+            if (bzpCount > 0)
             {
                 // b_zero_point is scalar, or PER-COLUMN of B [K, N]. Row-major element i sits in column
                 // i % N, so this one genuinely IS AddBias's bias[i % C] shape - unlike a_zero_point above.
@@ -712,13 +729,13 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
                 // buffer.
                 var zpBuf = ctx.Pool.Rent(ctx.Inputs[3].Shape, "_mmi_bzp");
                 reg.ElementWise.Scale(ctx.Inputs[3].Data, zpBuf.Data, ctx.Inputs[3].ElementCount, -1f);
-                if (bzp.Length == 1)
+                if (bzpCount == 1)
                     reg.ElementWise.AddBias(bAdj.Data, zpBuf.Data, b.ElementCount, 1);
-                else if (bzp.Length == N)
+                else if (bzpCount == N)
                     reg.ElementWise.AddBias(bAdj.Data, zpBuf.Data, b.ElementCount, N);
                 else
                     throw new NotSupportedException(
-                        $"MatMulInteger b_zero_point has {bzp.Length} values; expected 1 (per-tensor) or " +
+                        $"MatMulInteger b_zero_point has {bzpCount} values; expected 1 (per-tensor) or " +
                         $"{N} (per-column of B [{K},{N}]).");
                 ctx.Pool.Return(zpBuf);
             }

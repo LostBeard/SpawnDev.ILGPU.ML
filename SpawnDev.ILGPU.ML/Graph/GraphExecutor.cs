@@ -3885,6 +3885,33 @@ public class GraphExecutor : IDisposable
         // needsValue fixed point below decides. Being in both is the accurate description.
         // MEASURED on Silero VAD: these five entries are what let the last five per-frame readbacks go.
         "Concat", "Transpose", "Squeeze", "Unsqueeze", "Reshape",
+        // ⭐ MatMulInteger, and it is here as a CONSUMER above all. Its Execute was READ and, since the
+        // zero-point counts were switched from a host readback to ctx.Inputs[i].ElementCount, it touches no
+        // host value at all - every operand is used as a GPU tensor.
+        //
+        // That is what lets DynamicQuantizeLinear's 1-element y_scale / y_zero_point outputs be skipped by
+        // the allConsumersFeatureOnly rule, WITHOUT naming DynamicQuantizeLinear itself as a feature-only
+        // producer. The distinction matters: QLinearMatMul genuinely reads its scales as host values
+        // (ScaleInPlace takes the scalar as a kernel argument), so a producer-side skip would starve it and
+        // return silence. Letting the consumer analysis decide keeps that case correct automatically.
+        //
+        // MEASURED on ZipVoice's fm_decoder, ONE Euler step: 593 readbacks, 566 of them
+        // DynamicQuantizeLinear - 95% - and 19,217 ms of a ~42 s synthesis spent in readbacks overall.
+        "MatMulInteger",
+        // ⭐ Mul, on the same grounds as Slice below: its host-value path is OPPORTUNISTIC, not required.
+        // ElementWiseOperators' binary path reads `bVals` to build a scalar/expanded operand, but the
+        // else-branch is "General N-D broadcast on GPU - handles arbitrary shape combinations", taking
+        // b.Data directly. So losing the promotion costs a fast path, not correctness.
+        //
+        // This is what releases the OTHER half of DynamicQuantizeLinear's readbacks: y_zero_point is
+        // consumed by MatMulInteger (above), while y_scale feeds the dequantising Mul. MEASURED after the
+        // MatMulInteger change alone, ONE Euler step went 566 -> 283 DynamicQuantizeLinear readbacks -
+        // exactly half, one output freed and one still pinned.
+        //
+        // ⚠️ Its own output stays protected: rule (a) keeps the readback whenever ANY consumer is in
+        // ReadbackRequiresValueConsumers, so a Mul that really is computing a dimension for a Reshape is
+        // untouched.
+        "Mul",
         // Slice is here as a PRODUCER, and it is the subtle one. Its Execute does opportunistically read
         // input 0's value for a small-tensor CPU path - but that path FALLS THROUGH correctly to the GPU
         // kernel when no host value is available, so losing the promotion costs a fast path, not

@@ -354,6 +354,8 @@ public abstract partial class MLTestBase
             + $"({Graph.GraphExecutor.CumulativeSyncDrainMs:F0} ms) "
             + "| a readback lets the executor compute host-side and ELIDE the dispatch, which a replayed "
             + "plan cannot reproduce - non-zero here is the reason to suspect a frozen value");
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] ONE decoder step: "
+                        + $"{result.DecoderReadbacks} readbacks | {result.DecoderReadbackByOp}");
         int thenN = Operators.IfOperator.ThenBranchCount, elseN = Operators.IfOperator.ElseBranchCount;
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] If branches this "
                         + $"utterance: then={thenN} (1 node each) else={elseN} (254 nodes each) "

@@ -132,6 +132,12 @@ public record ZipVoiceResult(
 
     /// <summary>WHY the decoder capture is or is not live - the ways it can be false differ.</summary>
     public string DecoderCaptureStatus { get; init; } = "";
+
+    /// <summary>Readbacks during ONE decoder step - the term that must reach zero before a plan can replay faithfully.</summary>
+    public int DecoderReadbacks { get; init; }
+
+    /// <summary>Which operators caused those readbacks, most frequent first.</summary>
+    public string DecoderReadbackByOp { get; init; } = "";
 }
 
 /// <summary>Speech that was checked against the text it was meant to say.</summary>
@@ -392,6 +398,8 @@ public sealed class ZipVoicePipeline : IDisposable
         // the first step. Folding it into one decoder total hides which of two opposite problems is in
         // front of you.
         double firstStepMs = 0;
+        int decoderReadbacks = 0;
+        string decoderReadbackByOp = "";
         for (int step = 0; step < Config.NumSteps; step++)
         {
             float t = timesteps[step];
@@ -399,7 +407,26 @@ public sealed class ZipVoicePipeline : IDisposable
             var v = await _graphs.RunDecoderAsync(
                 t, x, encoding.TextCondition, speechCondition, Config.GuidanceScale, numFrames, featDim);
             for (int i = 0; i < count; i++) x[i] += v[i] * dt;
-            if (step == 0) firstStepMs = sw.Elapsed.TotalMilliseconds;
+            if (step == 0)
+            {
+                firstStepMs = sw.Elapsed.TotalMilliseconds;
+                // ⚠️ Snapshot the DECODER's readbacks here, because LastRun* is overwritten by the next
+                // RunAsync - reading it after a synthesis reports the VOCODER and makes the decoder look
+                // free. That is exactly how "0 readbacks" was reported for years while a synthesis was
+                // actually doing 1,905 of them at 18,657 ms, 44% of the wall time.
+                //
+                // Readbacks are the thing to drive to zero: each one lets the executor resolve a value on
+                // the host and ELIDE the dispatch, which is both the cost here and the reason a recorded
+                // plan cannot replay this graph faithfully.
+                var names = Graph.GraphExecutor.LastRunReadbackNames;
+                decoderReadbacks = names.Count;
+                decoderReadbackByOp = string.Join(", ", names
+                    .Select(n => n.Split(':')[0])
+                    .GroupBy(o => o)
+                    .OrderByDescending(g => g.Count())
+                    .Take(8)
+                    .Select(g => $"{g.Key}x{g.Count()}"));
+            }
         }
         double decoderMs = sw.Elapsed.TotalMilliseconds;
 
@@ -441,6 +468,8 @@ public sealed class ZipVoicePipeline : IDisposable
             NumFrames = numFrames,
             DecoderCaptured = _graphs.DecoderCaptured,
             DecoderCaptureStatus = _graphs.DecoderCaptureStatus,
+            DecoderReadbacks = decoderReadbacks,
+            DecoderReadbackByOp = decoderReadbackByOp,
         };
     }
 
