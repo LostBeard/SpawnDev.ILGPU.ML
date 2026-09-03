@@ -14,7 +14,7 @@ Console.WriteLine($"[SpawnDev.ILGPU.ML.Demo] Build: {BuildTimestamp.Value}");
 
 var builder = WebAssemblyHostBuilder.CreateDefault(args);
 builder.Services.AddSpawnJSRuntime(out var JS);
-JS.Verbose = true;
+JS.Verbose = false;
 
 // allow firing the gc collection from JS (for debugging purposes)
 JS.Set("_gcCollect", () => GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true));
