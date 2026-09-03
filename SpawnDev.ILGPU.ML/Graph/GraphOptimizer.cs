@@ -88,21 +88,10 @@ public static class GraphOptimizer
 
         // Pass 7: Drop Constant nodes the loader already turned into initializers - a third of every graph
         // measured here, all of it walked by the executor for an empty Execute. See EliminateConstantNodes.
-        // 🔴 DISABLED 2026-09-03 - it BREAKS ZipVoice. Enabling it crashed the text encoder at compile:
-        // "Node 46/1567 Reshape crashed. Inputs=[/Cast_5_output_0,/Constant_23_output_0] shapes=([1]; [0])"
-        // - a Reshape whose target-shape input became a 0-element tensor.
-        //
-        // WHY: ConstantOperator.InferOutputShapes reports [1] UNCONDITIONALLY, so while the node is present
-        // every Constant output is a 1-element tensor as far as the compiler is concerned. Remove the node
-        // and the shape comes from the initializer instead - the raw ONNX dims - and the two do not agree.
-        // Removal is therefore NOT shape-neutral, and a guard on rank-0 alone did not close the gap.
-        // The honest fix is to make ConstantOperator report the tensor's REAL shape so that removing the
-        // node changes nothing; until then this stays off.
-        //
-        // ⚠️ AND THE SWEEP DID NOT CATCH IT. Six backends, 4,980 tests, green - because ZipVoice and every
-        // other big model is Category=HeavyModel, which is EXCLUDED from every sweep. A green sweep is not
-        // evidence about the models that matter most; a core graph change needs an explicit HeavyModel run.
-        int constNodes = 0;   // EliminateConstantNodes(optimized);
+        // ⚠️ Restricted to Constants whose initializer is exactly [1] - the only case where removal is
+        // provably shape-neutral. An earlier unrestricted version crashed ZipVoice's text encoder, and a
+        // green six-backend sweep did NOT catch it (HeavyModel is excluded from sweeps). See the method.
+        int constNodes = EliminateConstantNodes(optimized);
 
         // Pass 8: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
@@ -1351,15 +1340,28 @@ public static class GraphOptimizer
             if (graphOutputNames.Contains(outName)) continue;
             // The value must already be available as a weight; see the remarks above.
             if (!graph.Initializers.TryGetValue(outName, out var initShape)) continue;
-            // 🔴 RANK-0 CONSTANTS STAY. ConstantOperator.InferOutputShapes reports [1] unconditionally, so
-            // while the node is present a scalar Constant is a 1-element tensor. Its INITIALIZER shape is
-            // the raw ONNX dims, which for rank-0 is an EMPTY array - so removing the node changes what the
-            // compiler sees from 1 element to 0. MEASURED 2026-09-03: ZipVoice text_encoder then died at
-            // compile, "Node 46/1567 Reshape crashed. Inputs=[/Cast_5_output_0,/Constant_23_output_0]
-            // shapes=([1]; [0])" - a Reshape whose target-shape input had become empty.
-            // ⚠️ The full six-backend sweep was GREEN when this shipped: ZipVoice is a HeavyModel test and
-            // HeavyModel is excluded from every sweep, so the sweep was never evidence about the big models.
-            if (initShape == null || initShape.Length == 0) continue;
+            // 🔴 REMOVE ONLY WHAT IS PROVABLY SHAPE-NEUTRAL: an initializer of exactly [1].
+            //
+            // ConstantOperator.InferOutputShapes returns [1] UNCONDITIONALLY, so while the node is present
+            // the compiler sees [1] whatever the tensor really is. Removing it makes the shape come from
+            // the initializer, and the two agree ONLY for a rank-1 single-element tensor.
+            //
+            // MEASURED on ZipVoice's text_encoder, 632 Constant nodes: 2 are 0-ELEMENT (shape [0], genuinely
+            // empty tensors), 4 are multi-element, 250 are RANK-0 (shape []), 378 are exactly [1]. The first
+            // attempt removed all of them and crashed the compile - "Node 46/1567 Reshape ...
+            // shapes=([1]; [0])" - because a Reshape's target-shape input became a 0-element tensor.
+            //
+            // ⚠️ Rank-0 is excluded even though it is also ONE element. ONNX distinguishes rank-0 from [1],
+            // and that difference changes Gather's output RANK - the failure recorded in
+            // reference-onnx-rank0-scalar-is-not-a-one-element-vector, which surfaced ~200 nodes downstream
+            // of its cause. Which of [1] or [] is the truer shape here is a real question and a separate
+            // one; this pass removes only nodes whose removal changes NOTHING.
+            //
+            // ⚠️ AND A GREEN SWEEP IS NOT EVIDENCE FOR THIS. The six-backend sweep passed 4,980 tests with
+            // the broken version in the tree, because ZipVoice and every other real model is
+            // Category=HeavyModel, which every sweep excludes by default. Re-verify a change to this pass
+            // with an explicit HeavyModel run.
+            if (initShape == null || initShape.Length != 1 || initShape[0] != 1) continue;
             remove.Add(i);
         }
         foreach (var idx in remove.OrderByDescending(i => i)) graph.Nodes.RemoveAt(idx);
