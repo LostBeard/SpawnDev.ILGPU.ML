@@ -220,7 +220,13 @@ public abstract partial class MLTestBase : IDisposable
                     + $"heap={gcInfo.HeapSizeBytes / 1048576.0:F1}MiB gen2={GC.CollectionCount(2)} "
                     + $"ctxAlive={ctxAlive}/{_ctxRefs.Count} accelAlive={accAlive}/{_accelRefs.Count} "
                     + $"ctlAlive={ctlAlive}/{_controlRefs.Count} fatAlive={fatAlive}/{_fatControlRefs.Count}");
-                Console.WriteLine($"[ML-REG] {BackendName} #{_heapTraceIndex} {InteropRegistrySizes()}");
+                // ⚠️ OPT-IN. This does 353 reflection field reads per test and reflection is slow on the
+                // WASM interpreter, so leaving it always-on taxes EVERY test of EVERY sweep - a diagnostic
+                // has no business slowing the release gate once it has done its job. It earned its keep
+                // (it exonerated SpawnJS and every other static holder in one run) and stays available:
+                //     ML_REGISTRY_CENSUS=1   in the environment, or set RegistryCensusEnabled.
+                if (RegistryCensusEnabled)
+                    Console.WriteLine($"[ML-REG] {BackendName} #{_heapTraceIndex} {InteropRegistrySizes()}");
             }
             catch { /* a diagnostic must never fail a test */ }
         }
@@ -271,6 +277,17 @@ public abstract partial class MLTestBase : IDisposable
     /// </remarks>
     private static List<(string Label, Func<int> Count)>? _registryProbes;
     private static string _scannedAssemblies = "";
+
+    /// <summary>
+    /// Size every static collection and delegate per test, to find a registry that grows. Opt-in.
+    /// </summary>
+    /// <remarks>
+    /// Off unless <c>ML_REGISTRY_CENSUS</c> is set, because the scan is not free: hundreds of reflection
+    /// reads per test on a runtime where reflection is interpreted. Turn it on when hunting a retention,
+    /// not by default.
+    /// </remarks>
+    public static bool RegistryCensusEnabled { get; set; } =
+        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("ML_REGISTRY_CENSUS"));
 
     private static List<(string Label, Func<int> Count)> BuildRegistryProbes()
     {
