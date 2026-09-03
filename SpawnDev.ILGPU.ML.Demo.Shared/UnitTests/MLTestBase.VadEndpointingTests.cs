@@ -243,8 +243,25 @@ public abstract partial class MLTestBase
             using var detector = new VoiceActivityDetector(vad, options);
             long first = -1;
             detector.OnSegment += seg => { if (first < 0) first = seg.StartSample; };
-            await detector.AcceptWaveformAsync(audio);
-            await detector.FlushAsync();
+
+            // ⚠️ STOP AT THE FIRST SEGMENT. Every assertion below reads `first` and nothing else, so once
+            // it is set the remaining audio is measured waste - and this runs THREE times, on every
+            // backend. That is not free where a VAD frame is expensive: MEASURED at 3,109 ms per frame on
+            // the Wasm lane, where feeding the whole clip three times is ~468 frames and blows through a
+            // 600 s timeout. Chunks are whole 512-sample windows so the framing, and therefore the
+            // reported start sample, is identical to feeding the buffer in one call.
+            const int chunkFrames = 16;
+            int chunk = SileroVad.WindowSize * chunkFrames;
+            for (int off = 0; off < audio.Length && first < 0; off += chunk)
+            {
+                int take = Math.Min(chunk, audio.Length - off);
+                await detector.AcceptWaveformAsync(audio.AsSpan(off, take).ToArray());
+            }
+
+            // Only needed if no segment closed on its own: Flush emits speech still in progress. Skipped
+            // once `first` is set, because flushing after an early exit would report a second span that
+            // this test has no use for.
+            if (first < 0) await detector.FlushAsync();
             return first;
         }
 
