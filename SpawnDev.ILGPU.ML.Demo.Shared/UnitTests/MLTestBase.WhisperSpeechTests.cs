@@ -179,7 +179,10 @@ public abstract partial class MLTestBase
                 + $"encoder {kvResult.EncoderMs:F0}ms ({kvResult.EncoderCaptureStatus}) | "
                 + $"prefill {kvResult.PrefillMs:F0}ms | {kvResult.DecodeSteps} decode steps "
                 + $"{kvResult.DecodeStepsMs:F0}ms | mel {kvResult.MelTimeMs:F0}ms");
-            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] per decode step: "
+            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] COMPILED nodes: "
+                + $"encoder {kvResult.EncoderNodeCount}, decode step {kvResult.DecoderNodeCount} "
+                + "(from the session, not the offline probe)");
+        Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] per decode step: "
                 + $"setup {kvResult.DecodeSetupMs / Math.Max(1, kvResult.DecodeSteps):F1}ms + graph "
                 + $"{kvResult.DecodeGraphMs / Math.Max(1, kvResult.DecodeSteps):F1}ms + argmax "
                 + $"{kvResult.DecodeArgmaxMs / Math.Max(1, kvResult.DecodeSteps):F1}ms");

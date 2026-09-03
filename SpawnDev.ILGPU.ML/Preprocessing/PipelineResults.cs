@@ -253,6 +253,26 @@ public class TranscriptionResult
     /// <summary>Time in the per-token GPU argmax, which is one GPU-to-host round trip per token.</summary>
     public double DecodeArgmaxMs { get; init; }
 
+    /// <summary>Nodes in the COMPILED encoder and decode-step graphs, as the runtime actually walks them.</summary>
+    /// <remarks>
+    /// ⚠️ THIS EXISTS BECAUSE THE OFFLINE PROBE LIED. <c>tools/probe-compiled-nodes.cs</c> replicates the
+    /// parse -> ModelGraph -> GraphOptimizer path and predicted Whisper's decoder compiling 749 -> 478
+    /// nodes after Constant-node elimination. MEASURED in the demo on the same build: the decode step was
+    /// 1,058.9 ms of graph time against 1,148 ms before - essentially unchanged. The probe had already
+    /// disagreed with the runtime once, reporting 1,579 nodes for ZipVoice's text encoder where the app
+    /// reported 1,567.
+    /// <para>
+    /// A tool that reproduces part of the pipeline MODELS it; it does not observe it. Per-node cost is the
+    /// dominant term in this engine (~1 ms/node in a browser), so any claim of the form "N% fewer nodes
+    /// therefore N% faster" has to be anchored to the count the session actually compiled - which is what
+    /// this reports.
+    /// </para>
+    /// </remarks>
+    public int EncoderNodeCount { get; init; }
+
+    /// <summary>Nodes in the compiled decode-step graph (<c>decoder_with_past</c> where present).</summary>
+    public int DecoderNodeCount { get; init; }
+
     /// <summary>
     /// Wall time computing the log-mel spectrogram, in milliseconds.
     /// </summary>

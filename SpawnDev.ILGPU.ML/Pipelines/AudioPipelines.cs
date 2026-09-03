@@ -289,6 +289,9 @@ public class SpeechRecognitionPipeline : IDisposable
             DecodeSetupMs = stepSetupMs,
             DecodeGraphMs = stepRunMs,
             DecodeArgmaxMs = stepArgmaxMs,
+            // From the SESSION, not from a model of it - see the remarks on these properties.
+            EncoderNodeCount = _encoderSession.NodeCount,
+            DecoderNodeCount = (_decoderWithPastSession ?? _decoderSession).NodeCount,
         };
     }
 
