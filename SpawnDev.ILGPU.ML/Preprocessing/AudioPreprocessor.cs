@@ -1,3 +1,6 @@
+using System.Collections.Concurrent;
+using System.Numerics;
+
 namespace SpawnDev.ILGPU.ML.Preprocessing;
 
 /// <summary>
@@ -562,11 +565,13 @@ public static partial class AudioPreprocessor
     /// <param name="scratchIm">Second scratch buffer, same size.</param>
     private static void FFT(float[] real, float[] imag, int n, float[]? scratchRe = null, float[]? scratchIm = null)
     {
+        var plan = FftPlan.For(n);
+
         if ((n & (n - 1)) != 0)
         {
             var outRe = scratchRe is { } sr && sr.Length >= n ? sr : new float[n];
             var outIm = scratchIm is { } si && si.Length >= n ? si : new float[n];
-            FFTAny(real, imag, 0, 1, outRe, outIm, 0, n);
+            FFTAny(real, imag, 0, 1, outRe, outIm, 0, n, plan);
             Array.Copy(outRe, real, n);
             Array.Copy(outIm, imag, n);
             return;
@@ -588,14 +593,18 @@ public static partial class AudioPreprocessor
         for (int size = 2; size <= n; size *= 2)
         {
             int halfSize = size / 2;
-            float angle = -2f * MathF.PI / size;
+            // Twiddles are a function of (size, j) alone, so they are read from the plan's table rather
+            // than recomputed - and they were previously recomputed inside the `i` loop as well, which
+            // multiplied the trig count by the number of blocks per stage.
+            var stageCos = plan.RadixCos[BitOperations.Log2((uint)size)];
+            var stageSin = plan.RadixSin[BitOperations.Log2((uint)size)];
 
             for (int i = 0; i < n; i += size)
             {
                 for (int j = 0; j < halfSize; j++)
                 {
-                    float cos = MathF.Cos(angle * j);
-                    float sin = MathF.Sin(angle * j);
+                    float cos = stageCos[j];
+                    float sin = stageSin[j];
 
                     int even = i + j;
                     int odd = i + j + halfSize;
@@ -617,7 +626,7 @@ public static partial class AudioPreprocessor
     /// Reads the input with a stride so the even/odd interleave costs no copying.
     /// </summary>
     private static void FFTAny(float[] inRe, float[] inIm, int inOff, int stride,
-                               float[] outRe, float[] outIm, int outOff, int n)
+                               float[] outRe, float[] outIm, int outOff, int n, FftPlan plan)
     {
         if (n == 1)
         {
@@ -625,17 +634,20 @@ public static partial class AudioPreprocessor
             outIm[outOff] = inIm[inOff];
             return;
         }
-        if ((n & 1) != 0) { DFT(inRe, inIm, inOff, stride, outRe, outIm, outOff, n); return; }
+        if ((n & 1) != 0) { DFT(inRe, inIm, inOff, stride, outRe, outIm, outOff, n, plan); return; }
 
         int half = n / 2;
         // Even-indexed samples land in the first half of the output, odd-indexed in the second.
-        FFTAny(inRe, inIm, inOff, stride * 2, outRe, outIm, outOff, half);
-        FFTAny(inRe, inIm, inOff + stride, stride * 2, outRe, outIm, outOff + half, half);
+        FFTAny(inRe, inIm, inOff, stride * 2, outRe, outIm, outOff, half, plan);
+        FFTAny(inRe, inIm, inOff + stride, stride * 2, outRe, outIm, outOff + half, half, plan);
 
+        // The combine twiddles depend only on (n, k), and n here is BaseN << level - identical for every
+        // frame of the STFT, so they are tabulated once instead of ~1,600 sin/cos per frame.
+        var combineCos = plan.CombineCos[BitOperations.Log2((uint)(n / plan.BaseN))];
+        var combineSin = plan.CombineSin[BitOperations.Log2((uint)(n / plan.BaseN))];
         for (int k = 0; k < half; k++)
         {
-            float angle = -2f * MathF.PI * k / n;
-            float cos = MathF.Cos(angle), sin = MathF.Sin(angle);
+            float cos = combineCos[k], sin = combineSin[k];
             float er = outRe[outOff + k], ei = outIm[outOff + k];
             float or_ = outRe[outOff + half + k], oi = outIm[outOff + half + k];
             float tr = or_ * cos - oi * sin;
@@ -649,21 +661,131 @@ public static partial class AudioPreprocessor
 
     /// <summary>Direct O(n^2) DFT - the base case for an odd length (25 for Whisper's 400).</summary>
     private static void DFT(float[] inRe, float[] inIm, int inOff, int stride,
-                            float[] outRe, float[] outIm, int outOff, int n)
+                            float[] outRe, float[] outIm, int outOff, int n, FftPlan plan)
     {
+        // ⚠️ THIS is where the mel STFT's time went. The base case is O(n^2) - fine at n=25 - but every
+        // one of those 625 iterations called MathF.Cos AND MathF.Sin, and the base case runs 16 times per
+        // frame across 3000 frames. That is ~60 million transcendental calls on a single WASM thread for
+        // ONE transcription, against a table of 625 values that is the same every time.
+        var dftCos = plan.DftCos;
+        var dftSin = plan.DftSin;
         for (int k = 0; k < n; k++)
         {
             float sumRe = 0f, sumIm = 0f;
+            int row = k * n;
             for (int t = 0; t < n; t++)
             {
-                float angle = -2f * MathF.PI * k * t / n;
-                float cos = MathF.Cos(angle), sin = MathF.Sin(angle);
+                float cos = dftCos[row + t], sin = dftSin[row + t];
                 float xr = inRe[inOff + t * stride], xi = inIm[inOff + t * stride];
                 sumRe += xr * cos - xi * sin;
                 sumIm += xr * sin + xi * cos;
             }
             outRe[outOff + k] = sumRe;
             outIm[outOff + k] = sumIm;
+        }
+    }
+
+    /// <summary>
+    /// Precomputed twiddle factors for one transform length. Built once per length and cached forever.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY THIS EXISTS. The STFT calls <see cref="FFT"/> once per frame - 3,000 times for Whisper's
+    /// fixed 30 s window - and every call recomputed the same sines and cosines from scratch. At n=400
+    /// (= 2^4 x 25) that is ~1,600 combine twiddles plus 16 base-case DFTs of 625 iterations each, both
+    /// trig pairs: roughly 21,600 <c>MathF.Cos</c>/<c>MathF.Sin</c> calls per frame, ~65 MILLION per
+    /// transcription, on ONE WASM thread with no hardware transcendental. MEASURED at 3,301 ms of a
+    /// 13,926 ms browser transcription - a quarter of it, and a FIXED cost that endpointing cannot touch
+    /// because the audio is padded to 30 s before the STFT runs.
+    /// <para>
+    /// ⚠️ BIT-IDENTICAL, not an approximation. Each table entry is built with the SAME expression, in the
+    /// same association order, that the inner loop used to evaluate - <c>-2f * MathF.PI * k * t / n</c> and
+    /// <c>-2f * MathF.PI * k / n</c> - so the stored float carries the same bits the call site would have
+    /// produced. <c>MathF.Cos</c> is deterministic for a given input, so tabulating it changes when the
+    /// value is computed and nothing else. Gated by <c>Stft_TwiddleTables_MatchInlineTrigExactly</c>.
+    /// </para>
+    /// </remarks>
+    private sealed class FftPlan
+    {
+        private static readonly ConcurrentDictionary<int, FftPlan> Cache = new();
+
+        /// <summary>The odd length the even-splitting recursion bottoms out at (25 for Whisper's 400).</summary>
+        public int BaseN { get; }
+
+        /// <summary>Base-case DFT twiddles, row-major [k * BaseN + t].</summary>
+        public float[] DftCos { get; }
+        public float[] DftSin { get; }
+
+        /// <summary>Combine twiddles for the odd-base path, indexed by level: length BaseN &lt;&lt; level.</summary>
+        public float[][] CombineCos { get; }
+        public float[][] CombineSin { get; }
+
+        /// <summary>Radix-2 stage twiddles for the power-of-two path, indexed by Log2(stage size).</summary>
+        public float[][] RadixCos { get; }
+        public float[][] RadixSin { get; }
+
+        public static FftPlan For(int n) => Cache.GetOrAdd(n, static len => new FftPlan(len));
+
+        private FftPlan(int n)
+        {
+            int baseN = n;
+            while (baseN > 1 && (baseN & 1) == 0) baseN >>= 1;
+            BaseN = baseN;
+
+            // Base-case DFT table. Only meaningful when the recursion actually reaches an odd base; for a
+            // power-of-two length baseN is 1 and this is a single trivial entry.
+            DftCos = new float[baseN * baseN];
+            DftSin = new float[baseN * baseN];
+            for (int k = 0; k < baseN; k++)
+                for (int t = 0; t < baseN; t++)
+                {
+                    float angle = -2f * MathF.PI * k * t / baseN;
+                    DftCos[k * baseN + t] = MathF.Cos(angle);
+                    DftSin[k * baseN + t] = MathF.Sin(angle);
+                }
+
+            // Combine tables, one per even level on the way back up: BaseN*2, BaseN*4, ... n.
+            int levels = 0;
+            for (int len = baseN; len < n; len <<= 1) levels++;
+            CombineCos = new float[levels + 1][];
+            CombineSin = new float[levels + 1][];
+            for (int j = 0; j <= levels; j++)
+            {
+                int len = baseN << j;
+                int half = len / 2;
+                var c = new float[Math.Max(1, half)];
+                var s = new float[Math.Max(1, half)];
+                for (int k = 0; k < half; k++)
+                {
+                    float angle = -2f * MathF.PI * k / len;
+                    c[k] = MathF.Cos(angle);
+                    s[k] = MathF.Sin(angle);
+                }
+                CombineCos[j] = c;
+                CombineSin[j] = s;
+            }
+
+            // Radix-2 stage tables for the power-of-two path. The call site evaluated MathF.Cos(angle * j)
+            // where angle = -2f * MathF.PI / size, so that is exactly how these are built.
+            int stages = (n & (n - 1)) == 0 ? BitOperations.Log2((uint)n) : 0;
+            RadixCos = new float[stages + 1][];
+            RadixSin = new float[stages + 1][];
+            RadixCos[0] = Array.Empty<float>();
+            RadixSin[0] = Array.Empty<float>();
+            for (int b = 1; b <= stages; b++)
+            {
+                int size = 1 << b;
+                int halfSize = size / 2;
+                float angle = -2f * MathF.PI / size;
+                var c = new float[halfSize];
+                var s = new float[halfSize];
+                for (int j = 0; j < halfSize; j++)
+                {
+                    c[j] = MathF.Cos(angle * j);
+                    s[j] = MathF.Sin(angle * j);
+                }
+                RadixCos[b] = c;
+                RadixSin[b] = s;
+            }
         }
     }
 

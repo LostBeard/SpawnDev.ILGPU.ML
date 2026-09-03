@@ -94,6 +94,9 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     /// </remarks>
     public bool DecoderCaptured => _decoderCapture?.IsCaptured ?? false;
 
+    /// <summary>WHY the decoder capture is or is not live - see <see cref="SessionGraphCapture.CaptureStatus"/>.</summary>
+    public string DecoderCaptureStatus => _decoderCapture?.CaptureStatus ?? "no capture constructed yet";
+
     /// <summary>
     /// Run one of the three graphs, naming WHICH one - and with what input shapes - if it throws.
     /// </summary>

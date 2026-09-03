@@ -417,4 +417,203 @@ public abstract partial class MLTestBase
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// The STFT's tabulated twiddle factors produce BIT-IDENTICAL output to computing the trig inline.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ WHAT THIS GUARDS. The STFT runs one FFT per frame - 3,000 times for Whisper's fixed 30 s window -
+    /// and used to call <c>MathF.Cos</c>/<c>MathF.Sin</c> inside the innermost loops, recomputing the same
+    /// values every frame. At n=400 (= 2^4 x 25) that is ~21,600 transcendental calls per frame and roughly
+    /// 65 MILLION per transcription on a single WASM thread. MEASURED: 3,301 ms of a 13,926 ms browser
+    /// transcription. Tabulating them removes the calls entirely.
+    /// </para>
+    /// <para>
+    /// ⚠️ EXACT equality, not a tolerance, and the reason is specific: tabulation is only legitimate if the
+    /// stored float carries the SAME BITS the call site would have produced, which requires building the
+    /// table with the same expression in the same association order. A tolerance would happily accept a
+    /// table built from, say, <c>-2πk/n</c> reassociated - numerically "close", and a silent change to the
+    /// spectrum the mel filterbank sees and therefore to what Whisper is handed.
+    /// </para>
+    /// <para>
+    /// ⚠️ The oracle below is a DELIBERATE DUPLICATE of the pre-tabulation algorithm. It must not call back
+    /// into <c>AudioPreprocessor</c>'s FFT, because an oracle that calls the code under test cannot detect a
+    /// change in it - the same trap <c>Mel_SparseFilterbank_MatchesDenseExactly</c> avoids.
+    /// </para>
+    /// <para>
+    /// Both transform lengths are covered because they take different code paths: 400 is even-split down to
+    /// an odd base with a direct DFT, 512 is the iterative radix-2 path, and each has its own table.
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 300000)]
+    public Task Stft_TwiddleTables_MatchInlineTrigExactly()
+    {
+        // Broadband, speech-like content. A pure tone leaves most bins near zero, where a wrong twiddle
+        // would not show up in the magnitude.
+        const int rate = 16000;
+        var n = (int)(rate * 1.2);
+        var audio = new float[n];
+        var rng = new Random(9182);
+        for (int i = 0; i < n; i++)
+        {
+            double t = i / (double)rate;
+            double v = 0;
+            for (int h = 1; h <= 12; h++) v += Math.Sin(2 * Math.PI * 110 * h * t) / h;
+            audio[i] = (float)(0.3 * v + 0.05 * (rng.NextDouble() - 0.5));
+        }
+
+        foreach (var (fftSize, hopSize) in new[] { (400, 160), (512, 160) })
+        {
+            var got = AudioPreprocessor.ComputeSTFT(audio, fftSize, hopSize, center: true);
+            var expected = InlineTrigStft(audio, fftSize, hopSize);
+
+            if (got.GetLength(0) != expected.GetLength(0) || got.GetLength(1) != expected.GetLength(1))
+                throw new Exception(
+                    $"n={fftSize}: tabulated STFT is [{got.GetLength(0)},{got.GetLength(1)}], "
+                  + $"inline-trig reference is [{expected.GetLength(0)},{expected.GetLength(1)}]");
+
+            for (int f = 0; f < got.GetLength(0); f++)
+                for (int k = 0; k < got.GetLength(1); k++)
+                    if (got[f, k] != expected[f, k])
+                        throw new Exception(
+                            $"n={fftSize}: frame {f} bin {k} is {got[f, k]} with tabulated twiddles and "
+                          + $"{expected[f, k]} computing the trig inline. The tables must reproduce the "
+                          + "call site's bits exactly, not merely approximate them.");
+        }
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The STFT exactly as it was before twiddle tabulation: every sine and cosine computed inline.
+    /// </summary>
+    /// <remarks>
+    /// Duplicated on purpose - see the remarks on <see cref="Stft_TwiddleTables_MatchInlineTrigExactly"/>.
+    /// The window comes from the library because the window is not what is under test here.
+    /// </remarks>
+    private static float[,] InlineTrigStft(float[] samples, int fftSize, int hopSize)
+    {
+        int pad = fftSize / 2;
+        var padded = new float[samples.Length + 2 * pad];
+        Array.Copy(samples, 0, padded, pad, samples.Length);
+        for (int i = 0; i < pad; i++)
+        {
+            padded[pad - 1 - i] = samples[Math.Min(i + 1, samples.Length - 1)];
+            padded[pad + samples.Length + i] = samples[Math.Max(samples.Length - 2 - i, 0)];
+        }
+        samples = padded;
+
+        var window = AudioPreprocessor.GenerateHannWindow(fftSize);
+        int numFrames = (samples.Length - fftSize) / hopSize + 1;
+        int freqBins = fftSize / 2 + 1;
+        var stft = new float[numFrames, freqBins];
+
+        var frame = new float[fftSize];
+        var real = new float[fftSize];
+        var imag = new float[fftSize];
+        var scratchRe = new float[fftSize];
+        var scratchIm = new float[fftSize];
+
+        for (int f = 0; f < numFrames; f++)
+        {
+            int offset = f * hopSize;
+            for (int i = 0; i < fftSize; i++)
+            {
+                int idx = offset + i;
+                frame[i] = idx < samples.Length ? samples[idx] * window[i] : 0;
+            }
+            Array.Copy(frame, real, fftSize);
+            Array.Clear(imag, 0, fftSize);
+            RefFft(real, imag, fftSize, scratchRe, scratchIm);
+            for (int k = 0; k < freqBins; k++)
+                stft[f, k] = MathF.Sqrt(real[k] * real[k] + imag[k] * imag[k]);
+        }
+        return stft;
+    }
+
+    private static void RefFft(float[] real, float[] imag, int n, float[] scratchRe, float[] scratchIm)
+    {
+        if ((n & (n - 1)) != 0)
+        {
+            RefFftAny(real, imag, 0, 1, scratchRe, scratchIm, 0, n);
+            Array.Copy(scratchRe, real, n);
+            Array.Copy(scratchIm, imag, n);
+            return;
+        }
+
+        int bits = (int)MathF.Log2(n);
+        for (int i = 0; i < n; i++)
+        {
+            int j = 0, v = i;
+            for (int b = 0; b < bits; b++) { j = (j << 1) | (v & 1); v >>= 1; }
+            if (j > i)
+            {
+                (real[i], real[j]) = (real[j], real[i]);
+                (imag[i], imag[j]) = (imag[j], imag[i]);
+            }
+        }
+
+        for (int size = 2; size <= n; size *= 2)
+        {
+            int halfSize = size / 2;
+            float angle = -2f * MathF.PI / size;
+            for (int i = 0; i < n; i += size)
+                for (int j = 0; j < halfSize; j++)
+                {
+                    float cos = MathF.Cos(angle * j);
+                    float sin = MathF.Sin(angle * j);
+                    int even = i + j, odd = i + j + halfSize;
+                    float tr = real[odd] * cos - imag[odd] * sin;
+                    float ti = real[odd] * sin + imag[odd] * cos;
+                    real[odd] = real[even] - tr;
+                    imag[odd] = imag[even] - ti;
+                    real[even] += tr;
+                    imag[even] += ti;
+                }
+        }
+    }
+
+    private static void RefFftAny(float[] inRe, float[] inIm, int inOff, int stride,
+                                  float[] outRe, float[] outIm, int outOff, int n)
+    {
+        if (n == 1) { outRe[outOff] = inRe[inOff]; outIm[outOff] = inIm[inOff]; return; }
+        if ((n & 1) != 0) { RefDft(inRe, inIm, inOff, stride, outRe, outIm, outOff, n); return; }
+
+        int half = n / 2;
+        RefFftAny(inRe, inIm, inOff, stride * 2, outRe, outIm, outOff, half);
+        RefFftAny(inRe, inIm, inOff + stride, stride * 2, outRe, outIm, outOff + half, half);
+
+        for (int k = 0; k < half; k++)
+        {
+            float angle = -2f * MathF.PI * k / n;
+            float cos = MathF.Cos(angle), sin = MathF.Sin(angle);
+            float er = outRe[outOff + k], ei = outIm[outOff + k];
+            float or_ = outRe[outOff + half + k], oi = outIm[outOff + half + k];
+            float tr = or_ * cos - oi * sin;
+            float ti = or_ * sin + oi * cos;
+            outRe[outOff + k] = er + tr;
+            outIm[outOff + k] = ei + ti;
+            outRe[outOff + half + k] = er - tr;
+            outIm[outOff + half + k] = ei - ti;
+        }
+    }
+
+    private static void RefDft(float[] inRe, float[] inIm, int inOff, int stride,
+                               float[] outRe, float[] outIm, int outOff, int n)
+    {
+        for (int k = 0; k < n; k++)
+        {
+            float sumRe = 0f, sumIm = 0f;
+            for (int t = 0; t < n; t++)
+            {
+                float angle = -2f * MathF.PI * k * t / n;
+                float cos = MathF.Cos(angle), sin = MathF.Sin(angle);
+                float xr = inRe[inOff + t * stride], xi = inIm[inOff + t * stride];
+                sumRe += xr * cos - xi * sin;
+                sumIm += xr * sin + xi * cos;
+            }
+            outRe[outOff + k] = sumRe;
+            outIm[outOff + k] = sumIm;
+        }
+    }
+
 }

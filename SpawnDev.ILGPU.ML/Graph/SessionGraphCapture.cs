@@ -52,6 +52,18 @@ public sealed class SessionGraphCapture : IDisposable
     /// <summary>True once a capture is live (calls replay instead of a full graph walk).</summary>
     public bool IsCaptured => _cuda != null || _webGpu != null;
 
+    /// <summary>WHY capture is or is not live, in words.</summary>
+    /// <remarks>
+    /// ⚠️ <see cref="IsCaptured"/> alone is a dead end when the answer is "false": there are five separate
+    /// ways to get there - disabled by the caller, an ineligible backend, the control-flow refusal, a
+    /// TryCapture that returned null, and a thrown capture - and they call for completely different work.
+    /// MEASURED 2026-09-03: the ZipVoice decoder reported <c>capture LIVE: False</c> on WebGPU while
+    /// costing 8.4 s per Euler step, of which the class docs put ~62% in per-node HOST work that a
+    /// recorded plan skips. Knowing it was false cost a whole measurement cycle that knowing WHY would
+    /// have saved. Two of those five reasons print nothing at all on their own.
+    /// </remarks>
+    public string CaptureStatus { get; private set; } = "not attempted";
+
     /// <summary>
     /// The WebGPU replay's own split of the last frame - input copies, the single plan crossing, and the
     /// wait for GPU completion. Null on CUDA or before a capture is live.
@@ -77,7 +89,13 @@ public sealed class SessionGraphCapture : IDisposable
         bool eligible = Enabled
             && (_accelerator.AcceleratorType == AcceleratorType.Cuda
                 || _accelerator.AcceleratorType == AcceleratorType.WebGPU);
-        if (!eligible) return await _session.RunAsync(inputs).ConfigureAwait(false);
+        if (!eligible)
+        {
+            CaptureStatus = Enabled
+                ? $"ineligible backend {_accelerator.AcceleratorType} (capture is CUDA and WebGPU only)"
+                : "disabled by the caller";
+            return await _session.RunAsync(inputs).ConfigureAwait(false);
+        }
 
         var shapes = inputs.Values.Select(t => t.Shape).ToArray();
         // ⚠️ Only enforced when a capture is actually LIVE. The shapes are baked into a recorded graph, so
@@ -114,6 +132,9 @@ public sealed class SessionGraphCapture : IDisposable
             if (RefuseControlFlow && _session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
             {
                 var cf = string.Join(", ", _session.OperatorTypes.Where(o => o is "If" or "Loop" or "Scan"));
+                CaptureStatus = $"refused: graph contains control flow ({cf}); "
+                              + "set SessionGraphCapture.RefuseControlFlow = false to lift, after verifying "
+                              + "the subgraph bodies do not allocate per call";
                 Console.WriteLine($"[SessionGraphCapture] graph contains control flow ({cf}), whose subgraph "
                     + "executors allocate per call - a mid-capture allocation is unrecoverable on both CUDA "
                     + "and WebGPU; running direct forward.");
@@ -146,8 +167,17 @@ public sealed class SessionGraphCapture : IDisposable
             {
                 // Capture is BEST-EFFORT: an over-VRAM model (pool reclaim is forbidden mid-capture)
                 // or a capture-unsafe op must degrade to the direct forward, not fail generation.
+                CaptureStatus = $"capture threw {ex.GetType().Name}: {ex.Message}";
                 Console.WriteLine($"[SessionGraphCapture] capture failed - running direct: {ex.Message}");
             }
+
+            // ⚠️ TryCapture returning NULL is the one outcome that prints nothing and throws nothing, so
+            // without this line the loudest signal for the commonest silent failure is no signal at all.
+            if (CaptureStatus == "not attempted")
+                CaptureStatus = IsCaptured
+                    ? $"live on {_accelerator.AcceleratorType} ({DispatchCount} dispatches)"
+                    : $"TryCapture returned null on {_accelerator.AcceleratorType} "
+                    + "(no exception, no message - the graph was ineligible to record)";
         }
 
         // Recorded only once a capture is live, so it describes a graph that actually exists.

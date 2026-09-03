@@ -37,6 +37,18 @@ public interface IZipVoiceGraphs : IDisposable
     /// Classifier-free guidance is applied INSIDE this graph - it takes the guidance scale as an input
     /// rather than requiring two passes and a blend outside.
     /// </remarks>
+    /// <summary>Whether a decoder capture is LIVE - i.e. steps are replaying a recorded plan.</summary>
+    /// <remarks>
+    /// Defaulted to false so an implementation with no capture of its own (the test doubles) needs no
+    /// change. It is on the interface rather than the concrete class because the pipeline reports it on
+    /// every result: reading a decoder step split without knowing whether capture engaged invites exactly
+    /// the wrong conclusion - "capture did not help" when capture never ran.
+    /// </remarks>
+    bool DecoderCaptured => false;
+
+    /// <summary>WHY the decoder capture is or is not live, in words.</summary>
+    string DecoderCaptureStatus => "this implementation does not capture";
+
     Task<float[]> RunDecoderAsync(
         float t, float[] x, float[] textCondition, float[] speechCondition,
         float guidanceScale, int numFrames, int featDim);
@@ -87,6 +99,39 @@ public record ZipVoiceResult(
     /// that this engine then found nothing left to take.
     /// </remarks>
     public double ReferenceSpeechSeconds { get; init; }
+
+    /// <summary>Wall time of the FIRST Euler step alone, in ms.</summary>
+    /// <remarks>
+    /// ⚠️ Split out from <see cref="DecoderMs"/> because the two halves have completely different causes
+    /// and only one of them is fixable by making the pipeline faster. Every Euler step runs the decoder at
+    /// IDENTICAL shapes, so step 1 pays the one-off setup for that shape - kernel compilation and, where
+    /// eligible, the capture pass - and steps 2..N are the steady-state cost. A single
+    /// <see cref="DecoderMs"/> total cannot tell an 80 s compile followed by fast steps from a decoder
+    /// that is uniformly slow, and those call for opposite work.
+    /// <para>
+    /// ⚠️ The shape is the UTTERANCE LENGTH (see <see cref="NumFrames"/>), so a first-step cost is paid
+    /// again for every new length, not once per process. That is why this is reported alongside the frame
+    /// count rather than on its own.
+    /// </para>
+    /// </remarks>
+    public double DecoderFirstStepMs { get; init; }
+
+    /// <summary>Wall time of Euler steps 2..N together, in ms - the steady-state decoder cost.</summary>
+    public double DecoderRemainingStepsMs { get; init; }
+
+    /// <summary>Total frames the encoder asked for, reference frames included. This IS the decoder shape.</summary>
+    public int NumFrames { get; init; }
+
+    /// <summary>Whether a decoder capture was actually live for this utterance.</summary>
+    /// <remarks>
+    /// "Capture enabled" is a request, not an outcome - it falls through to a direct forward on an
+    /// ineligible backend or a failed capture, and the failure path prints nothing. Without this a reading
+    /// of the step split cannot tell a replay from a plain run.
+    /// </remarks>
+    public bool DecoderCaptured { get; init; }
+
+    /// <summary>WHY the decoder capture is or is not live - the ways it can be false differ.</summary>
+    public string DecoderCaptureStatus { get; init; } = "";
 }
 
 /// <summary>Speech that was checked against the text it was meant to say.</summary>
@@ -342,6 +387,11 @@ public sealed class ZipVoicePipeline : IDisposable
         var timesteps = ZipVoiceFeatures.Timesteps(Config);
 
         sw.Restart();
+        // ⚠️ Step 1 is timed on its own. All NumSteps run at the SAME shape, so whatever setup that shape
+        // needs - kernel compilation, and the capture pass where capture is eligible - lands entirely in
+        // the first step. Folding it into one decoder total hides which of two opposite problems is in
+        // front of you.
+        double firstStepMs = 0;
         for (int step = 0; step < Config.NumSteps; step++)
         {
             float t = timesteps[step];
@@ -349,6 +399,7 @@ public sealed class ZipVoicePipeline : IDisposable
             var v = await _graphs.RunDecoderAsync(
                 t, x, encoding.TextCondition, speechCondition, Config.GuidanceScale, numFrames, featDim);
             for (int i = 0; i < count; i++) x[i] += v[i] * dt;
+            if (step == 0) firstStepMs = sw.Elapsed.TotalMilliseconds;
         }
         double decoderMs = sw.Elapsed.TotalMilliseconds;
 
@@ -383,7 +434,14 @@ public sealed class ZipVoicePipeline : IDisposable
 
         total.Stop();
         return new ZipVoiceResult(
-            audio, Config.SampleRate, encoderMs, decoderMs, vocoderMs, total.Elapsed.TotalMilliseconds);
+            audio, Config.SampleRate, encoderMs, decoderMs, vocoderMs, total.Elapsed.TotalMilliseconds)
+        {
+            DecoderFirstStepMs = firstStepMs,
+            DecoderRemainingStepsMs = decoderMs - firstStepMs,
+            NumFrames = numFrames,
+            DecoderCaptured = _graphs.DecoderCaptured,
+            DecoderCaptureStatus = _graphs.DecoderCaptureStatus,
+        };
     }
 
     /// <summary>

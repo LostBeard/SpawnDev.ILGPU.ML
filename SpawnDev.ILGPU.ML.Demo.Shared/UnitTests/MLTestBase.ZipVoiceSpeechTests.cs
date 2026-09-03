@@ -231,7 +231,7 @@ public abstract partial class MLTestBase
         // cause was readbacks, not dispatch count: driving them 16 -> 0 took it from 177.9 to 7.81 ms/frame
         // (22.8x). Print the counters rather than guessing which it is this time.
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] capture LIVE: "
-                        + $"{graphs.DecoderCaptured}");
+                        + $"{graphs.DecoderCaptured} - {graphs.DecoderCaptureStatus}");
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] host cost: "
                         + $"{Graph.GraphExecutor.LastRunReadbackCount} readbacks "
                         + $"({Graph.GraphExecutor.LastRunReadbackMs:F0} ms), "
@@ -241,5 +241,51 @@ public abstract partial class MLTestBase
                         + $"encoder {result.EncoderMs:F0} ms, decoder {result.DecoderMs:F0} ms, "
                         + $"vocoder {result.VocoderMs:F0} ms, total {result.TotalMs:F0} ms "
                         + $"| decoder is {100 * result.DecoderMs / Math.Max(1, result.TotalMs):F0}% of it");
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] decoder steps: "
+                        + $"first {result.DecoderFirstStepMs:F0} ms, remaining "
+                        + $"{result.DecoderRemainingStepsMs:F0} ms over the remaining "
+                        + $"steps | {result.NumFrames} frames");
+
+        // ── SPEAKING MORE THAN ONCE, which is what a conversation actually needs ─────────────────────
+        //
+        // ⚠️ WHY THIS IS PART OF THE GATE. Every Euler step runs at the same shape, so a first-step cost is
+        // one-off FOR THAT SHAPE - and the decoder's shape IS the utterance length. A test that speaks one
+        // line can never distinguish "the pipeline pays a one-off setup" from "the pipeline pays that setup
+        // again for every new thing it says", and those are completely different products: the second one
+        // cannot hold a conversation no matter how warm it is.
+        //
+        // MEASURED in the SpawnDev.AI demo, 2026-09-03, before this existed: a hands-free turn spent 172.5 s
+        // in the voice - a background warm synthesis of "Hello." followed by a real reply of a DIFFERENT
+        // length, each costing ~85 s. The warm bought nothing, which is precisely the reading this section
+        // makes visible.
+        //
+        // Three renders: a different length, then a REPEAT of the first line. The repeat is the control -
+        // if setup is cached per shape, the repeat is cheap; if nothing is cached, all three are equal.
+        const string secondLine = "The quick brown fox jumps over the lazy dog while the kettle boils.";
+        var second = await pipeline.SpeakAsync(secondLine, LibrivoxTranscript, reference, 16000, tokenizer);
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] utterance 2 (new length): "
+                        + $"total {second.TotalMs:F0} ms | decoder first step {second.DecoderFirstStepMs:F0} ms, "
+                        + $"remaining {second.DecoderRemainingStepsMs:F0} ms | {second.NumFrames} frames "
+                        + $"| capture LIVE {second.DecoderCaptured}");
+
+        var third = await pipeline.SpeakAsync(line, LibrivoxTranscript, reference, 16000, tokenizer);
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] utterance 3 (repeat of 1): "
+                        + $"total {third.TotalMs:F0} ms | decoder first step {third.DecoderFirstStepMs:F0} ms, "
+                        + $"remaining {third.DecoderRemainingStepsMs:F0} ms | {third.NumFrames} frames "
+                        + $"| capture LIVE {third.DecoderCaptured}");
+
+        // Both later renders must still be SPEECH, not just fast. A shape-caching change that returns
+        // stale or silent audio would otherwise look like a win.
+        foreach (var (label, r) in new[] { ("utterance 2", second), ("utterance 3", third) })
+        {
+            var a = r.Audio;
+            if (a == null || a.Length == 0)
+                throw new Exception($"ZipVoice {label} produced NO audio.");
+            float p = 0f; double e = 0;
+            foreach (var v in a) { p = MathF.Max(p, MathF.Abs(v)); e += (double)v * v; }
+            if (p < 0.01f || Math.Sqrt(e / a.Length) < 0.005)
+                throw new Exception($"ZipVoice {label} is effectively silence (peak {p:F5}) - speaking a "
+                                  + "second time must still produce speech, not just return quickly.");
+        }
     });
 }
