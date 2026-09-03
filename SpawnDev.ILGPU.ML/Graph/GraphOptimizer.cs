@@ -1015,6 +1015,56 @@ public static class GraphOptimizer
                         }
                     }
 
+                    // ── Scalar arithmetic / comparison EVALUATION ────────────────────────────────────
+                    //
+                    // ⚠️ NOT the same thing as the generic propagation below, and the distinction is the
+                    // whole reason this is safe. Propagation copies an input's data to the output, which is
+                    // correct only for identity-like ops - the comment below is right that Add/Sub/Mul must
+                    // never do that. This EVALUATES them instead, so the output data is what the op would
+                    // actually have produced.
+                    //
+                    // ⚠️ WHY IT EARNS ITS KEEP. ZipVoice's fm_decoder contains FIVE `If` nodes, one per
+                    // block, each the standard "reuse the cached positional table if it is long enough,
+                    // else rebuild it". SessionGraphCapture must refuse any graph containing control flow -
+                    // a device allocation inside a capture window is unrecoverable - so the decoder is
+                    // NEVER captured, and MEASURED 2026-09-03 that decoder is 82% of a synthesis at ~8.4 s
+                    // per Euler step. Lifting the refusal instead HUNG THE GPU (DXGI_ERROR_DEVICE_HUNG).
+                    //
+                    // The whole condition subtree is `Cast <- GreaterOrEqual <- [initializer, Sub <- Mul <-
+                    // Gather <- Shape]`: every leaf is an initializer or a Shape, so it is decidable the
+                    // moment input shapes are known - and a GraphExecutor is already shape-specialised.
+                    // Every op in that chain was foldable EXCEPT the arithmetic (marked foldable but never
+                    // evaluated) and the comparison (excluded outright). This closes both gaps, which is
+                    // what lets the If itself fold and the graph become capture-eligible legitimately,
+                    // rather than by overriding a guard that exists for a real reason.
+                    //
+                    // ⚠️ Comparisons stay excluded for TENSORS. The original exclusion is sound: Equal /
+                    // Greater / Less on real tensors produce attention masks and boolean masks that
+                    // generic folding cannot evaluate and would register as shape [1], destroying
+                    // downstream shape inference and crashing the NLP models. The guard here is SIZE - only
+                    // small (<= 64 element) constant operands, which is a shape scalar, never a mask.
+                    if (TryEvaluateConstantOp(node, graph.ConstantData, out var evalData))
+                    {
+                        var outputName = node.Outputs.Count > 0 ? node.Outputs[0] : null;
+                        if (outputName != null)
+                        {
+                            graph.ConstantData[outputName] = evalData;
+                            graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                            graph.FloatConstantData[outputName] = evalData.Select(v => (float)v).ToArray();
+                            // Preserve an existing scalar [] vs [1] distinction, exactly as the generic
+                            // path does - overriding it breaks Gather index dimensions.
+                            if (!graph.Initializers.ContainsKey(outputName))
+                                graph.Initializers[outputName] = new[] { evalData.Length };
+                            if (!knownShapes.ContainsKey(outputName))
+                                knownShapes[outputName] = new[] { evalData.Length };
+                        }
+                        foreach (var output in node.Outputs) constants.Add(output);
+                        nodesToRemove.Add(i);
+                        folded++;
+                        changed = true;
+                        continue;
+                    }
+
                     // Generic folding: ONLY for identity-like ops that pass through data unchanged.
                     // Arithmetic ops (Add, Sub, Mul, Div, Sqrt, etc.) MUST NOT blindly propagate
                     // input data — they transform values. Wrong constants cascade through shape
@@ -1059,6 +1109,103 @@ public static class GraphOptimizer
     }
 
     /// <summary>
+    /// Evaluate an elementwise arithmetic or comparison op over KNOWN CONSTANT operands.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns false - leaving the node to run at runtime - unless every input has known constant data,
+    /// every operand is small, and the op is one this can compute exactly. Refusing is always safe; a
+    /// wrong constant is not, and cascades silently through shape inference.
+    /// </para>
+    /// <para>
+    /// ⚠️ SIZE IS THE GUARD, and it is what keeps the original exclusion of comparisons intact. Equal /
+    /// Greater / Less over real tensors are attention and boolean MASKS - large, and not shape values at
+    /// all. The 64-element ceiling (the same one the generic path uses) admits shape scalars and nothing
+    /// else.
+    /// </para>
+    /// <para>
+    /// ⚠️ Integer semantics deliberately. <c>ConstantData</c> is int by design because these are shape
+    /// values; evaluating in int is exact for them, and anything fractional has no business deciding a
+    /// tensor dimension. Div refuses on a zero divisor rather than producing a plausible wrong number.
+    /// </para>
+    /// </remarks>
+    private static bool TryEvaluateConstantOp(
+        GraphNode node, Dictionary<string, int[]> constantData, out int[] result)
+    {
+        result = Array.Empty<int>();
+        if (node.Outputs.Count == 0) return false;
+
+        bool IsCmp = node.OpType is "Greater" or "GreaterOrEqual" or "Less" or "LessOrEqual"
+                                 or "Equal" or "And" or "Or";
+        bool IsBin = node.OpType is "Add" or "Sub" or "Mul" or "Div" or "Min" or "Max";
+        bool IsUn = node.OpType is "Cast" or "Neg" or "Abs" or "Not";
+        if (!IsCmp && !IsBin && !IsUn) return false;
+
+        int need = IsUn ? 1 : 2;
+        if (node.Inputs.Count < need) return false;
+
+        var ops = new int[need][];
+        for (int k = 0; k < need; k++)
+        {
+            var nm = node.Inputs[k];
+            if (string.IsNullOrEmpty(nm) || !constantData.TryGetValue(nm, out var d)) return false;
+            if (d.Length == 0 || d.Length > 64) return false;
+            ops[k] = d;
+        }
+
+        if (IsUn)
+        {
+            var a0 = ops[0];
+            var outU = new int[a0.Length];
+            for (int k = 0; k < a0.Length; k++)
+                outU[k] = node.OpType switch
+                {
+                    "Cast" => a0[k],          // int -> int is exact; shape values are what reach here
+                    "Neg" => -a0[k],
+                    "Abs" => Math.Abs(a0[k]),
+                    "Not" => a0[k] != 0 ? 0 : 1,
+                    _ => a0[k],
+                };
+            result = outU;
+            return true;
+        }
+
+        var a = ops[0];
+        var b = ops[1];
+        // Numpy-style scalar broadcast only. Anything else is not a shape expression and is left alone.
+        int n = Math.Max(a.Length, b.Length);
+        if (a.Length != n && a.Length != 1) return false;
+        if (b.Length != n && b.Length != 1) return false;
+        if (node.OpType == "Div" && b.Any(v => v == 0)) return false;
+
+        var outB = new int[n];
+        for (int k = 0; k < n; k++)
+        {
+            int x = a[a.Length == 1 ? 0 : k];
+            int y = b[b.Length == 1 ? 0 : k];
+            outB[k] = node.OpType switch
+            {
+                "Add" => x + y,
+                "Sub" => x - y,
+                "Mul" => x * y,
+                "Div" => x / y,
+                "Min" => Math.Min(x, y),
+                "Max" => Math.Max(x, y),
+                "Greater" => x > y ? 1 : 0,
+                "GreaterOrEqual" => x >= y ? 1 : 0,
+                "Less" => x < y ? 1 : 0,
+                "LessOrEqual" => x <= y ? 1 : 0,
+                "Equal" => x == y ? 1 : 0,
+                "And" => (x != 0 && y != 0) ? 1 : 0,
+                "Or" => (x != 0 || y != 0) ? 1 : 0,
+                _ => 0,
+            };
+        }
+        result = outB;
+        return true;
+    }
+
+    /// <summary>
     /// Check if an operator type is safe to constant-fold.
     /// Only shape-manipulation and simple math ops that produce small outputs.
     /// </summary>
@@ -1069,8 +1216,14 @@ public static class GraphOptimizer
         "Shape" or "Gather" or "GatherND" or "Cast" or "Floor" or "Ceil" or
         "Unsqueeze" or "Squeeze" or "Concat" or "Reshape" or "Slice" or
         "Add" or "Sub" or "Mul" or "Div" or "Neg" or "Abs" or "Sqrt" or
-        "Identity";
-        // NOT foldable: Range, ConstantOfShape, Expand, Equal, Greater, Less, Not, Where
+        "Identity" or
+        // ⚠️ Comparisons are admitted ONLY because TryEvaluateConstantOp computes them exactly and
+        // refuses anything above 64 elements. The original exclusion below still holds for the case it
+        // was written about: a mask-sized Equal/Greater/Less has no constant data here, so the evaluator
+        // returns false, no other handler matches, and the node is left to run at runtime untouched.
+        "Greater" or "GreaterOrEqual" or "Less" or "LessOrEqual" or "Equal" or "Not" or
+        "And" or "Or" or "Min" or "Max";
+        // NOT foldable: Range, ConstantOfShape, Expand, Where
         // These produce large runtime tensors (attention masks, fill tensors, boolean masks)
         // that generic folding can't evaluate — it registers them as shape [1], destroying
         // downstream shape inference. NLP models (DistilBERT, GPT-2) crash without this fix.

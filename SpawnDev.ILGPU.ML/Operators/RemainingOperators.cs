@@ -1383,6 +1383,60 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
 {
     public string OpType => "If";
 
+    /// <summary>How many times each branch has been taken since <see cref="ResetBranchCensus"/>.</summary>
+    /// <remarks>
+    /// ⚠️ WHY THESE EXIST. Which branch an <c>If</c> takes is not a detail - it can be most of a model's
+    /// cost. MEASURED 2026-09-03: ZipVoice's <c>fm_decoder</c> is 8,621 nodes with FIVE <c>If</c> nodes,
+    /// each the standard "reuse the cached positional table if it is long enough, else rebuild it". The
+    /// then branch is a SINGLE <c>Constant</c>; the else branch is <b>254 nodes</b>. So if the else branch
+    /// is being taken, every Euler step runs 1,270 extra nodes to rebuild a table that depends only on the
+    /// sequence length - which does not change across the steps of one utterance - and at the ~4.3 ms per
+    /// node this engine costs in a browser that is seconds per step, on the stage that is 82% of a
+    /// synthesis.
+    /// <para>
+    /// Two interlocked ints, incremented per execution: no allocation, no reflection, no logging, so this
+    /// is not the kind of always-on diagnostic that taxes a sweep. A boolean "does it have control flow"
+    /// cannot answer the question that decides the work.
+    /// </para>
+    /// </remarks>
+    public static int ThenBranchCount;
+    /// <summary>Times the else branch has been taken. See <see cref="ThenBranchCount"/>.</summary>
+    public static int ElseBranchCount;
+
+    /// <summary>Zero the branch census, so a measurement covers a known window.</summary>
+    public static void ResetBranchCensus() { ThenBranchCount = 0; ElseBranchCount = 0; }
+
+    /// <summary>
+    /// 🔴 DIAGNOSTIC ONLY - skip the branch subgraph entirely, leaving the output UNWRITTEN.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ THIS PRODUCES WRONG RESULTS BY DESIGN. It exists to answer one question that cannot be answered
+    /// by reasoning: <b>is executing a branch subgraph inside a capture window what hangs the device?</b>
+    /// </para>
+    /// <para>
+    /// MEASURED 2026-09-03: <c>SessionGraphCapture</c> refuses any graph containing control flow, so
+    /// ZipVoice's decoder - 80% of a synthesis, ~8,621 nodes at roughly 1 ms per node in a browser - is
+    /// never captured. Lifting the refusal hung the GPU outright (DXGI_ERROR_DEVICE_HUNG) even though
+    /// <c>SubgraphRunner</c> caches its compiled plans and <c>WebGPUGraphCapture</c> proves its pool is
+    /// primed. Census in the same run: <c>then=21, else=0</c> - every If takes the single-<c>Constant</c>
+    /// branch, so the 254-node branch is not involved at all.
+    /// </para>
+    /// <para>
+    /// With this set, an If does no subgraph work whatsoever. If capture then goes LIVE and the device
+    /// survives, the subgraph execution is the cause and folding these Ifs away is worth building. If it
+    /// still hangs, folding would not have helped and the cause is elsewhere - which is exactly the thing
+    /// worth knowing BEFORE writing a constant-folding pass, a weight-hoisting path and a compiler stage.
+    /// </para>
+    /// </remarks>
+    public static bool BypassSubgraphForCaptureProbe { get; set; }
+
+    private static void CountBranch(bool condition)
+    {
+        if (condition) System.Threading.Interlocked.Increment(ref ThenBranchCount);
+        else System.Threading.Interlocked.Increment(ref ElseBranchCount);
+    }
+
     /// <summary>
     /// Output shapes come from the BRANCH SUBGRAPHS, which declare them, and never from the inputs.
     /// </summary>
@@ -1438,6 +1492,8 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
                 + "(GraphExecutor.RunAsync); defaulting to the else branch silently picks the wrong one.");
 
         // Select branch subgraph
+        CountBranch(condition);
+        if (BypassSubgraphForCaptureProbe) return;   // DIAGNOSTIC: leaves the output unwritten
         string branchKey = condition ? "then_branch" : "else_branch";
         if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
         {
@@ -1486,6 +1542,8 @@ public class IfOperator(OperatorRegistry reg) : IOnnxOperator
                 "If could not read its condition. Defaulting to a branch would silently pick the wrong one.");
         bool condition = condVals[0] != 0f;
 
+        CountBranch(condition);
+        if (BypassSubgraphForCaptureProbe) return;   // DIAGNOSTIC: leaves the output unwritten
         string branchKey = condition ? "then_branch" : "else_branch";
         if (ctx.Attributes.TryGetValue(branchKey, out var branchObj) && branchObj is Onnx.OnnxGraphProto subgraph)
         {

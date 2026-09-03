@@ -109,6 +109,84 @@ public abstract partial class MLTestBase
     /// </remarks>
     private const string LibrivoxTranscript = "All LibriVox recordings are in the public domain.";
 
+    /// <summary>
+    /// 🔴 DIAGNOSTIC, not a correctness test: is executing a branch subgraph what hangs the device
+    /// during capture?
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ THE AUDIO FROM THIS TEST IS DELIBERATELY WRONG. <c>IfOperator.BypassSubgraphForCaptureProbe</c>
+    /// leaves every If's output unwritten, so nothing here asserts anything about sound. The single
+    /// question is whether <c>SessionGraphCapture</c> can then record the decoder without
+    /// DXGI_ERROR_DEVICE_HUNG.
+    /// </para>
+    /// <para>
+    /// WHY IT IS WORTH A TEST OF ITS OWN. The decoder is 80% of a synthesis and costs roughly 1 ms per node
+    /// across ~8,621 nodes; a replayed plan does per-node dispatch in microseconds, so capture is the single
+    /// largest lever in the pipeline. It is refused because the graph contains control flow, and lifting
+    /// that refusal hung the GPU on the first attempt - even though SubgraphRunner caches its plans and the
+    /// branch census says <c>then=21, else=0</c>, i.e. every If takes a branch that is ONE Constant node.
+    /// Removing those Ifs by constant folding would need a compiler stage, a weight-hoisting path and a
+    /// shape-time evaluator. This says whether that work would pay, for the price of one run.
+    /// </para>
+    /// <para>
+    /// ⚠️ Run it deliberately - it can reset the display driver:
+    /// <c>PMT_FILTER=ZipVoice_CaptureEligibility PMT_EXCLUDE_CATEGORIES= </c>
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 1800000, Category = "HeavyModel,WasmHeavy,Diagnostic")]
+    public async Task Pipeline_ZipVoice_CaptureEligibilityProbe() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU
+            && accelerator.AcceleratorType != AcceleratorType.Cuda)
+            throw new UnsupportedTestException("capture is CUDA and WebGPU only; nothing to probe here");
+
+        var assets = GetHttpClient();
+        if (assets == null) throw new UnsupportedTestException("HttpClient not available");
+        var wavBytes = await assets.GetByteArrayAsync("test-audio/librivox-public-domain.wav");
+        var reference = WavDecoder.DecodeWavFile(wavBytes)
+            ?? throw new Exception("could not decode the reference clip");
+
+        using var http = CreateHuggingFaceHttpClient();
+        var encoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/text_encoder_int8.onnx"));
+        var decoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/fm_decoder_int8.onnx"));
+        await WarmArchiveAsync(http, VocoderArchive);
+        var vocoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, ArchiveMemberUrl(VocoderArchive, VocoderMember));
+        var tokensBytes = await InferenceSession.DownloadBytesChunkedAsync(
+            http, HuggingFaceClient.GetDownloadUrl(ZipVoiceRepo, "zipvoice_distill/tokens.txt"));
+        var tokenizer = ZipVoiceTokenizer.CreateFromTokens(Encoding.UTF8.GetString(tokensBytes));
+
+        using var graphs = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);
+        using var pipeline = new ZipVoicePipeline(graphs);
+
+        graphs.AllowControlFlowCapture = true;                       // the thing under test
+        Operators.IfOperator.BypassSubgraphForCaptureProbe = true;   // no subgraph runs at all
+        Operators.IfOperator.ResetBranchCensus();
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var r = await pipeline.SpeakAsync("Paint the sockets in the wall dull green.",
+                LibrivoxTranscript, reference, 16000, tokenizer);
+            sw.Stop();
+            Console.WriteLine($"[Benchmark] ZipVoice PROBE [{accelerator.AcceleratorType}] SURVIVED: "
+                + $"capture LIVE={graphs.DecoderCaptured} ({graphs.DecoderCaptureStatus}) | "
+                + $"{sw.Elapsed.TotalSeconds:F1}s | decoder {r.DecoderMs:F0}ms "
+                + $"(first step {r.DecoderFirstStepMs:F0}ms, rest {r.DecoderRemainingStepsMs:F0}ms) | "
+                + $"If then={Operators.IfOperator.ThenBranchCount} else={Operators.IfOperator.ElseBranchCount}");
+            Console.WriteLine($"[Benchmark] ZipVoice PROBE verdict: "
+                + (graphs.DecoderCaptured
+                    ? "capture RECORDS once the subgraph is out of the window - folding the Ifs away WOULD pay"
+                    : "capture still did not engage - folding the Ifs away would NOT have been enough"));
+        }
+        finally
+        {
+            Operators.IfOperator.BypassSubgraphForCaptureProbe = false;
+        }
+    });
+
     // "WasmHeavy" as well as "HeavyModel": this drives ~185 MB of models through a full TTS pipeline, which
     // is exactly the shape the Wasm lane's interpreted-IL budget exists to keep out - it PASSES on every
     // other backend and would only ever be a timeout there. Run it deliberately with
@@ -196,6 +274,10 @@ public abstract partial class MLTestBase
         using var pipeline = new ZipVoicePipeline(graphs);
 
         // ── speak ────────────────────────────────────────────────────────────────────────────────────
+        // ⚠️ Census the If branches over this one utterance. fm_decoder has FIVE Ifs whose else branch is
+        // 254 nodes against a then branch of ONE Constant, so which side runs is worth thousands of node
+        // executions per Euler step - on the stage that is 82% of a synthesis.
+        Operators.IfOperator.ResetBranchCensus();
         const string line = "Paint the sockets in the wall dull green.";
         sw.Restart();
         var result = await pipeline.SpeakAsync(line, LibrivoxTranscript, reference, 16000, tokenizer);
@@ -243,6 +325,10 @@ public abstract partial class MLTestBase
         // (22.8x). Print the counters rather than guessing which it is this time.
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] capture LIVE: "
                         + $"{graphs.DecoderCaptured} - {graphs.DecoderCaptureStatus}");
+        int thenN = Operators.IfOperator.ThenBranchCount, elseN = Operators.IfOperator.ElseBranchCount;
+        Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] If branches this "
+                        + $"utterance: then={thenN} (1 node each) else={elseN} (254 nodes each) "
+                        + $"=> {elseN * 254} extra node executions from the else branch");
         Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] host cost: "
                         + $"{Graph.GraphExecutor.LastRunReadbackCount} readbacks "
                         + $"({Graph.GraphExecutor.LastRunReadbackMs:F0} ms), "
