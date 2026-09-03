@@ -3129,13 +3129,28 @@ public class GraphExecutor : IDisposable
                 var srcName = node.InputNames[0];
                 var outName = node.OutputNames[0];
                 if (!string.IsNullOrEmpty(srcName) && !string.IsNullOrEmpty(outName) && !src.IsHalf
-                    && src.ElementCount >= 256                                   // skip only trivial/shape-ish reshapes;
-                                                                                // 256 (was 4096) captures the GGUF DECODE
-                                                                                // q/k/v + head-merge reshapes (seq=1 →
-                                                                                // ~512-3584 elems, 112/step) → zero-copy
-                                                                                // view, dropping 112 CopyFrom dispatches/
-                                                                                // step (biggest on WebGPU). Single-consumer
-                                                                                // gate below keeps it safe (the memory win);
+                    && src.ElementCount > 0                                      // ⚠️ NO SIZE FLOOR - see below.
+                                                                                // Was 4096, then 256 for the GGUF decode
+                                                                                // q/k/v + head-merge reshapes. Both of
+                                                                                // those floors priced this as a COPY-SIZE
+                                                                                // decision; on WebGPU it is a DISPATCH
+                                                                                // decision, and a dispatch costs the same
+                                                                                // whether it moves four floats or four
+                                                                                // million. MEASURED 2026-09-03, whisper-
+                                                                                // tiny decode with PerOpSync: Unsqueeze
+                                                                                // cost 3.43 ms/node over 205 nodes (702 ms,
+                                                                                // 23.4% of all node time) - the SAME
+                                                                                // per-node price as FusedLinear's 4.09 ms,
+                                                                                // which is what a flat profile across ops
+                                                                                // that do no arithmetic means. At seq=1
+                                                                                // every decode tensor is small, so the
+                                                                                // floor excluded precisely the cases where
+                                                                                // dispatching a copy is most absurd.
+                                                                                // Safety is unchanged: it rests on the
+                                                                                // single-consumer refcount, the
+                                                                                // runtimeConstants exclusion and the
+                                                                                // graph-output exclusion below, none of
+                                                                                // which involve size.
                     && !runtimeConstants.ContainsKey(outName)                    // not a value a downstream reads on CPU
                     && tensors.TryGetValue(srcName, out var srcT) && ReferenceEquals(srcT, src)
                     && refCounts.TryGetValue(srcName, out var srcRc) && srcRc == 1

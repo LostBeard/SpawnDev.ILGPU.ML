@@ -223,6 +223,36 @@ public class TranscriptionResult
     /// </remarks>
     public string EncoderCaptureStatus { get; init; } = "";
 
+    /// <summary>Wall time in the encoder, in ms - ONE run at a fixed shape, and capturable.</summary>
+    public double EncoderMs { get; init; }
+
+    /// <summary>Wall time in the decoder prefill (the whole prompt, once), in ms.</summary>
+    public double PrefillMs { get; init; }
+
+    /// <summary>Wall time in the autoregressive decode steps together, in ms.</summary>
+    /// <remarks>
+    /// ⚠️ Split from <see cref="EncoderMs"/> because the two are different KINDS of cost and only one is
+    /// addressable the same way. The encoder is one fixed-shape run, so a recorded dispatch plan serves
+    /// every transcription for the life of the pipeline. Each decode step's past-K/V is one position longer
+    /// than the last, so its shapes change on every call and no <c>SessionGraphCapture</c> recording is
+    /// valid twice - that case needs a cursor-patching plan of the kind <c>WebGPUDecodeCapture</c> records
+    /// for GGUF decode. Which of the two dominates therefore decides the next piece of work, and an
+    /// executor total across all runs cannot say.
+    /// </remarks>
+    public double DecodeStepsMs { get; init; }
+
+    /// <summary>How many autoregressive decode steps ran.</summary>
+    public int DecodeSteps { get; init; }
+
+    /// <summary>Per-token HOST setup inside the decode loop: the ids buffer allocation and input dictionary.</summary>
+    public double DecodeSetupMs { get; init; }
+
+    /// <summary>Time inside the decoder graph itself, summed over the decode steps.</summary>
+    public double DecodeGraphMs { get; init; }
+
+    /// <summary>Time in the per-token GPU argmax, which is one GPU-to-host round trip per token.</summary>
+    public double DecodeArgmaxMs { get; init; }
+
     /// <summary>
     /// Wall time computing the log-mel spectrogram, in milliseconds.
     /// </summary>

@@ -171,7 +171,52 @@ public abstract partial class MLTestBase
             if (!pipeline.UsesKVCache)
                 throw new Exception("a decoder_with_past session was supplied but UsesKVCache is false - "
                                   + "the KV path is not actually being taken, so this test proves nothing");
-            cached = ((await pipeline.TranscribeAsync(samples, 16000)).Text ?? "").Trim();
+            var kvResult = await pipeline.TranscribeAsync(samples, 16000);
+            cached = (kvResult.Text ?? "").Trim();
+
+            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] kv split: "
+                + $"encoder {kvResult.EncoderMs:F0}ms ({kvResult.EncoderCaptureStatus}) | "
+                + $"prefill {kvResult.PrefillMs:F0}ms | {kvResult.DecodeSteps} decode steps "
+                + $"{kvResult.DecodeStepsMs:F0}ms | mel {kvResult.MelTimeMs:F0}ms");
+            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] per decode step: "
+                + $"setup {kvResult.DecodeSetupMs / Math.Max(1, kvResult.DecodeSteps):F1}ms + graph "
+                + $"{kvResult.DecodeGraphMs / Math.Max(1, kvResult.DecodeSteps):F1}ms + argmax "
+                + $"{kvResult.DecodeArgmaxMs / Math.Max(1, kvResult.DecodeSteps):F1}ms");
+
+            // ── WHICH OPERATORS the decode step actually spends its time in ─────────────────────────
+            //
+            // ⚠️ MEASURED in the SpawnDev.AI demo 2026-09-03: a decode step of whisper-TINY, producing ONE
+            // token, cost 1,132 ms - setup 0.5 ms, graph 1,061.7 ms, argmax 69.8 ms. So it is neither host
+            // bookkeeping nor the argmax round trip; effectively all of it is inside the graph walk. This
+            // section names WHICH nodes, because "the graph is slow" is not something anyone can act on.
+            //
+            // ⚠️ PerOpSync is REQUIRED for this to mean anything. Without it the timing is sync-blocking:
+            // async kernel work surfaces at the next sync point rather than at its real producer, so the
+            // profile names an innocent node. It makes the run slower, which is the correct trade for
+            // attribution - the number to act on is the RANKING, not this run's wall time.
+            Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+            Graph.GraphExecutor.PerOpSync = true;
+            try { await pipeline.TranscribeAsync(samples, 16000); }
+            finally { Graph.GraphExecutor.PerOpSync = false; }
+
+            var timings = Graph.GraphExecutor.CapturedNodeTimingsMs ?? new Dictionary<string, double>();
+            Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+
+            // Aggregated by OP TYPE. Per-node keys are too many to read and the actionable question is
+            // which KIND of operator dominates - one expensive op type is a kernel to fix, while a flat
+            // spread across every type is per-node dispatch overhead and needs a recorded plan instead.
+            var byOp = timings
+                .Select(kv => (Op: kv.Key.Split('_') is var p && p.Length > 1 ? p[1] : "?", Ms: kv.Value))
+                .GroupBy(x => x.Op)
+                .Select(g => (Op: g.Key, Total: g.Sum(x => x.Ms), Count: g.Count()))
+                .OrderByDescending(x => x.Total)
+                .ToList();
+            double grand = byOp.Sum(x => x.Total);
+            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] node timing "
+                + $"(PerOpSync, {timings.Count} nodes, {grand:F0}ms total):");
+            foreach (var (op, total, count) in byOp.Take(12))
+                Console.WriteLine($"[Benchmark]   {op,-22} {total,8:F0}ms  {count,5} nodes  "
+                    + $"{total / Math.Max(1, count),6:F2}ms/node  {100 * total / Math.Max(1, grand),5:F1}%");
         }
 
         Console.WriteLine($"[Whisper] full   : \"{full}\"");

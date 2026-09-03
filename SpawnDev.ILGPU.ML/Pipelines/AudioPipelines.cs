@@ -198,6 +198,12 @@ public class SpeechRecognitionPipeline : IDisposable
         var melMs = melSw.Elapsed.TotalMilliseconds;
 
         // 4. Run encoder
+        // ⚠️ TIMED SEPARATELY from the decoder, because they are now different KINDS of cost and only one
+        // of them is addressable the same way. The encoder is ONE run at a fixed shape and is capturable;
+        // the decoder is N runs whose past-K/V grow a position each step, so no recorded plan is valid
+        // twice. An executor total of "11 graph runs" cannot be apportioned between them by eye, and
+        // guessing which dominates would pick the next piece of work.
+        var encSw = Stopwatch.StartNew();
         using var melBuf = _accelerator.Allocate1D(mel);
         var melTensor = new Tensor(melBuf.View, new[] { 1, 80, 3000 });
         _encoderCapture ??= new Graph.SessionGraphCapture(_encoderSession, _accelerator);
@@ -207,6 +213,8 @@ public class SpeechRecognitionPipeline : IDisposable
             [_encoderSession.InputNames[0]] = melTensor
         });
         var encoderHidden = encoderOutputs[_encoderSession.OutputNames[0]];
+        encSw.Stop();
+        double encoderMs = encSw.Elapsed.TotalMilliseconds;
 
         // 5. Autoregressive decoder
         var tokens = IsEnglishOnlyModel
@@ -217,9 +225,11 @@ public class SpeechRecognitionPipeline : IDisposable
         // Greedy next-token selection stays GPU-side: read back one index per token, not the whole vocab.
         using var argmax = new GpuArgMax(_accelerator);
 
+        double prefillMs = 0, stepsMs = 0, stepSetupMs = 0, stepRunMs = 0, stepArgmaxMs = 0;
+        int decodeSteps = 0;
         if (_decoderWithPastSession != null)
         {
-            await DecodeWithKVCacheAsync(tokens, encoderHidden, argmax);
+            (prefillMs, stepsMs, decodeSteps, stepSetupMs, stepRunMs, stepArgmaxMs) = await DecodeWithKVCacheAsync(tokens, encoderHidden, argmax);
         }
         else
         for (int step = 0; step < MaxTokens; step++)
@@ -272,6 +282,13 @@ public class SpeechRecognitionPipeline : IDisposable
             MelTimeMs = melMs,
             ModelTimeMs = sw.Elapsed.TotalMilliseconds - melMs,
             EncoderCaptureStatus = EncoderCaptureStatus,
+            EncoderMs = encoderMs,
+            PrefillMs = prefillMs,
+            DecodeStepsMs = stepsMs,
+            DecodeSteps = decodeSteps,
+            DecodeSetupMs = stepSetupMs,
+            DecodeGraphMs = stepRunMs,
+            DecodeArgmaxMs = stepArgmaxMs,
         };
     }
 
@@ -295,11 +312,13 @@ public class SpeechRecognitionPipeline : IDisposable
     /// This is also a large MEMORY win, not just a speed one: the quadratic path materialises full-sequence
     /// logits ([1, seq, 51865] ~ 13 MB) on every single step, where this materialises one position (~0.2 MB).
     /// </remarks>
-    private async Task DecodeWithKVCacheAsync(List<int> tokens, Tensor encoderHidden, GpuArgMax argmax)
+    private async Task<(double PrefillMs, double StepsMs, int Steps, double SetupMs, double RunMs, double ArgmaxMs)> DecodeWithKVCacheAsync(
+        List<int> tokens, Tensor encoderHidden, GpuArgMax argmax)
     {
         var withPast = _decoderWithPastSession!;
 
         // ── Prefill: the whole prompt, once, on the plain decoder. ──
+        var prefillSw = Stopwatch.StartNew();
         var promptIds = tokens.Select(t => (float)t).ToArray();
         using var promptBuf = _accelerator.Allocate1D(promptIds);
         var prefill = await _decoderSession.RunAsync(new Dictionary<string, Tensor>
@@ -313,7 +332,9 @@ public class SpeechRecognitionPipeline : IDisposable
         int nextToken = await argmax.ArgMaxAsync(
             logits.Data.SubView((tokens.Count - 1) * vocabSize, vocabSize), vocabSize);
         OnTokenGenerated?.Invoke(0, nextToken);
-        if (nextToken == EOT) return;
+        prefillSw.Stop();
+        double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
+        if (nextToken == EOT) return (prefillMs, 0, 0, 0, 0, 0);
         tokens.Add(nextToken);
 
         // present.X -> past_key_values.X, for both the decoder and the encoder families. Built from the
@@ -324,8 +345,18 @@ public class SpeechRecognitionPipeline : IDisposable
                 past["past_key_values." + name.Substring("present.".Length)] = prefill[name];
 
         // ── Steps 1..n: one token at a time. ──
+        var stepsSw = Stopwatch.StartNew();
+        int stepsRun = 0;
+        double setupMs = 0, runMs = 0, argmaxMs = 0;
         for (int step = 1; step < MaxTokens; step++)
         {
+            stepsRun++;
+            // ⚠️ Timed in three parts. A decode step measured at 1,131 ms (whisper-TINY, one token) and the
+            // executor's cumulative counters can only say what all eleven graph runs did together - they
+            // cannot separate the per-token host setup from the graph itself from the argmax round trip,
+            // and those are three different fixes. Cutting before knowing which one is most of it is how a
+            // day gets spent on the wrong one.
+            var setupSw = Stopwatch.StartNew();
             var stepIds = new[] { (float)nextToken };
             using var idsBuf = _accelerator.Allocate1D(stepIds);
             var inputs = new Dictionary<string, Tensor>();
@@ -334,12 +365,20 @@ public class SpeechRecognitionPipeline : IDisposable
                 if (past.TryGetValue(name, out var t)) inputs[name] = t;
                 else inputs[name] = new Tensor(idsBuf.View, new[] { 1, 1 });   // input_ids
             }
+            setupSw.Stop();
+            setupMs += setupSw.Elapsed.TotalMilliseconds;
 
+            var runSw = Stopwatch.StartNew();
             var outputs = await withPast.RunAsync(inputs);
+            runSw.Stop();
+            runMs += runSw.Elapsed.TotalMilliseconds;
             var stepLogits = outputs[withPast.OutputNames[0]];
 
             // One position in, one position out - the winning logits start at offset 0.
+            var amSw = Stopwatch.StartNew();
             nextToken = await argmax.ArgMaxAsync(stepLogits.Data.SubView(0, vocabSize), vocabSize);
+            amSw.Stop();
+            argmaxMs += amSw.Elapsed.TotalMilliseconds;
             OnTokenGenerated?.Invoke(step, nextToken);
             if (nextToken == EOT) break;
             tokens.Add(nextToken);
@@ -352,6 +391,8 @@ public class SpeechRecognitionPipeline : IDisposable
                 if (name.StartsWith("present.", StringComparison.Ordinal))
                     past["past_key_values." + name.Substring("present.".Length)] = outputs[name];
         }
+        stepsSw.Stop();
+        return (prefillMs, stepsSw.Elapsed.TotalMilliseconds, stepsRun, setupMs, runMs, argmaxMs);
     }
 
     public async Task<TranscriptionResult> RunAsync(float[] audioSamples) =>
