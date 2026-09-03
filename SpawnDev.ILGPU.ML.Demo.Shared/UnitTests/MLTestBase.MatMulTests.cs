@@ -26,7 +26,16 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, cBuf.View.SubView(0, M * N), expected, K * 2e-6f, $"QKV MatMul [{M}x{K}]x[{K}x{N}]: ");
     });
 
-    [TestMethod]
+    // ⚠️ 180 s, not the 30 s default, and the cost is the CPU REFERENCE rather than the GPU.
+    // CpuMatMul(1370 x 1536 x 384) is ~808 MILLION multiply-adds executed in the browser on the WASM
+    // interpreter; the kernel it checks finishes in milliseconds. MEASURED 2026-09-03: this test and
+    // MatMul_BatchedAttentionScores below each failed ONE of two consecutive full sweeps - a different
+    // one each time, both "exceeded timeout of 30000ms", both passing 6/6 when run scoped. They sit on
+    // the boundary and tip over under whole-sweep contention.
+    // ⚠️ Raising the budget is the honest fix here, not a workaround: the ASSERTION is the CPU-reference
+    // comparison and it is unchanged. Shrinking the dimensions would be the workaround - these are real
+    // DAv3 shapes, and a MatMul gate that only runs small matrices is the one that misses tiling bugs.
+    [TestMethod(Timeout = 180000)]
     public async Task MatMul_MlpFc2Dimensions() => await RunTest(async accelerator =>
     {
         int M = 1370, K = 1536, N = 384;
@@ -45,7 +54,9 @@ public abstract partial class MLTestBase
         await AssertCloseGpu(accelerator, cBuf.View.SubView(0, M * N), expected, K * 2e-6f, $"MLP fc2 [{M}x{K}]x[{K}x{N}]: ");
     });
 
-    [TestMethod]
+    // Same reasoning as MatMul_MlpFc2Dimensions above: the CPU reference is 6 x (1370 x 64 x 1370) =
+    // ~720 million multiply-adds, computed slice by slice in the browser.
+    [TestMethod(Timeout = 180000)]
     public async Task MatMul_BatchedAttentionScores() => await RunTest(async accelerator =>
     {
         int batch = 6, M = 1370, K = 64, N = 1370;
