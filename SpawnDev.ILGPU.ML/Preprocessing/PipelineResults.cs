@@ -213,6 +213,16 @@ public class TranscriptionResult
     /// <summary>Per-segment timestamps (if available).</summary>
     public TranscriptionSegment[] Segments { get; init; } = Array.Empty<TranscriptionSegment>();
 
+    /// <summary>WHY the encoder's dispatch-plan capture is or is not live.</summary>
+    /// <remarks>
+    /// ⚠️ Reported for the same reason the ZipVoice decoder reports it: "capture enabled" is a request, not
+    /// an outcome. It falls through silently on an ineligible backend, on a control-flow refusal, and on a
+    /// TryCapture that returns null - and two of those print nothing at all. Without this, a transcription
+    /// that is still slow cannot be told apart from one where capture never engaged, and those call for
+    /// opposite work.
+    /// </remarks>
+    public string EncoderCaptureStatus { get; init; } = "";
+
     /// <summary>
     /// Wall time computing the log-mel spectrogram, in milliseconds.
     /// </summary>

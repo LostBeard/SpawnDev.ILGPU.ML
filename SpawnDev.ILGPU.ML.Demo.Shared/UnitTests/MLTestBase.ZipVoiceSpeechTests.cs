@@ -173,15 +173,26 @@ public abstract partial class MLTestBase
         // The symbol table comes from CONTENT, not a path - the whole point of this test.
         var tokenizer = ZipVoiceTokenizer.CreateFromTokens(Encoding.UTF8.GetString(tokensBytes));
 
-        // ML_CF_CAPTURE=1 lifts the control-flow capture refusal for this run. Opt-in because the failure
-        // it guards against is not an exception: on CUDA an uncatchable 0xC0000005, on WebGPU a hung device.
-        if (Environment.GetEnvironmentVariable("ML_CF_CAPTURE") == "1")
-        {
-            Graph.SessionGraphCapture.RefuseControlFlow = false;
-            Console.WriteLine("[Benchmark] ZipVoice control-flow capture refusal LIFTED for this run");
-        }
+        // ⚠️ The control-flow opt-in is a PROPERTY on the graphs (AllowControlFlowCapture), not an
+        // environment variable. It used to be ML_CF_CAPTURE=1, which could never work where it matters:
+        // environment variables do not reach the Blazor WASM runtime, so in a browser lane it read as unset
+        // no matter what was exported - and the browser is the only place the refusal costs ~20x. MEASURED
+        // 2026-09-03: a run with ML_CF_CAPTURE=1 exported still reported "refused: graph contains control
+        // flow (If)" on WebGPU. The env var survives only as a way to turn it OFF for a desktop A/B.
 
         using var graphs = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);
+        // 🔴 ML_CF_CAPTURE=1 HANGS THE GPU on WebGPU. MEASURED 2026-09-03: DXGI_ERROR_DEVICE_HUNG on the
+        // first attempt, a D3D12 TDR that resets the display driver - the test died after fetching the
+        // models and before speaking a line. Left reachable because the refusal costs ~20x on the stage
+        // that is 82% of a synthesis, so it will be worth another attempt once something explains what
+        // still allocates inside the recording window; see IlgpuZipVoiceGraphs.AllowControlFlowCapture.
+        // Do not set this expecting it to work.
+        if (Environment.GetEnvironmentVariable("ML_CF_CAPTURE") == "1")
+        {
+            graphs.AllowControlFlowCapture = true;
+            Console.WriteLine("[Benchmark] ZipVoice control-flow capture FORCED ON - this hung the GPU when "
+                            + "last measured (DXGI_ERROR_DEVICE_HUNG)");
+        }
         using var pipeline = new ZipVoicePipeline(graphs);
 
         // ── speak ────────────────────────────────────────────────────────────────────────────────────
@@ -273,6 +284,53 @@ public abstract partial class MLTestBase
                         + $"total {third.TotalMs:F0} ms | decoder first step {third.DecoderFirstStepMs:F0} ms, "
                         + $"remaining {third.DecoderRemainingStepsMs:F0} ms | {third.NumFrames} frames "
                         + $"| capture LIVE {third.DecoderCaptured}");
+
+        // ── CAPTURE MUST NOT CHANGE THE AUDIO ────────────────────────────────────────────────────────
+        //
+        // ⚠️ THE FAILURE THIS CATCHES CANNOT BE HEARD. A recorded plan can ELIDE the dispatch that fills a
+        // small tensor, promoting it to a runtime constant frozen at its capture-time value - which then
+        // never updates again. The Euler timestep `t` is exactly such a tensor. The result is not silence
+        // and not noise: it is confident, plausible speech that is subtly wrong, so every other assertion
+        // in this test would pass it. Only comparing samples against a render that did NOT replay a plan
+        // can tell.
+        //
+        // Utterance 3 is re-rendered with capture off. Same text, same reference, same noise seed, so the
+        // two renders must agree EXACTLY - the ODE is deterministic and a replay is meant to be the same
+        // arithmetic in a different envelope, not an approximation of it.
+        if (third.DecoderCaptured)
+        {
+            graphs.EnableGraphCapture = false;
+            var control = await pipeline.SpeakAsync(line, LibrivoxTranscript, reference, 16000, tokenizer);
+            graphs.EnableGraphCapture = true;
+
+            if (control.Audio.Length != third.Audio.Length)
+                throw new Exception(
+                    $"replayed capture produced {third.Audio.Length} samples, the direct forward "
+                  + $"{control.Audio.Length}. A capture must reproduce the graph, not reshape it.");
+
+            int differing = 0;
+            float worst = 0f;
+            for (int i = 0; i < control.Audio.Length; i++)
+            {
+                float d = MathF.Abs(control.Audio[i] - third.Audio[i]);
+                if (d != 0f) { differing++; worst = MathF.Max(worst, d); }
+            }
+            if (differing != 0)
+                throw new Exception(
+                    $"replaying the captured decoder changed the audio: {differing} of "
+                  + $"{control.Audio.Length} samples differ, worst {worst:F6}. The likeliest cause is a "
+                  + "dispatch elided into a capture-time constant - the Euler timestep is the obvious "
+                  + "candidate - which produces plausible speech and would pass every other check here.");
+
+            Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] capture A/B: "
+                            + $"replay is BIT-IDENTICAL to the direct forward over {control.Audio.Length} "
+                            + $"samples | direct {control.TotalMs:F0} ms vs replayed {third.TotalMs:F0} ms");
+        }
+        else
+        {
+            Console.WriteLine($"[Benchmark] ZipVoice [{accelerator.AcceleratorType}] capture A/B SKIPPED: "
+                            + $"capture is not live ({graphs.DecoderCaptureStatus})");
+        }
 
         // Both later renders must still be SPEECH, not just fast. A shape-caching change that returns
         // stale or silent audio would otherwise look like a win.

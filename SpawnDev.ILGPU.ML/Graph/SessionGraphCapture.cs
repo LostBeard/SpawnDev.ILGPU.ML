@@ -43,6 +43,24 @@ public sealed class SessionGraphCapture : IDisposable
     /// </remarks>
     public static bool RefuseControlFlow { get; set; } = true;
 
+    /// <summary>
+    /// Per-instance override of <see cref="RefuseControlFlow"/>. Null follows the static default.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY PER INSTANCE. The refusal is a property of ONE graph - whether ITS subgraph bodies allocate
+    /// per call - so a global switch is the wrong shape twice over: it cannot express "this graph is
+    /// verified and that one is not", and flipping it for one pipeline silently changes every other
+    /// pipeline in the process, including ones nobody has checked.
+    /// <para>
+    /// ⚠️ It also has to be a PROPERTY rather than an environment variable. The old opt-in was
+    /// <c>ML_CF_CAPTURE=1</c>, which cannot work where it matters: environment variables do not reach the
+    /// Blazor WASM runtime, so in a browser lane that switch was read as unset no matter what was exported
+    /// - and the browser is the only place the refusal costs ~20x. MEASURED 2026-09-03: a run with
+    /// <c>ML_CF_CAPTURE=1</c> exported still reported <c>refused: graph contains control flow (If)</c>.
+    /// </para>
+    /// </remarks>
+    public bool? AllowControlFlow { get; set; }
+
     public SessionGraphCapture(InferenceSession session, Accelerator accelerator)
     {
         _session = session;
@@ -129,7 +147,8 @@ public sealed class SessionGraphCapture : IDisposable
             // I first put this guard in CudaGraphCapture alone. That fixed CUDA and left WebGPU - the one
             // backend this project actually ships to - hanging the device instead. The eligibility decision
             // is made in this class, so the guard belongs in this class.
-            if (RefuseControlFlow && _session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
+            bool refuseControlFlow = AllowControlFlow is bool allow ? !allow : RefuseControlFlow;
+            if (refuseControlFlow && _session.OperatorTypes.Any(o => o is "If" or "Loop" or "Scan"))
             {
                 var cf = string.Join(", ", _session.OperatorTypes.Where(o => o is "If" or "Loop" or "Scan"));
                 CaptureStatus = $"refused: graph contains control flow ({cf}); "

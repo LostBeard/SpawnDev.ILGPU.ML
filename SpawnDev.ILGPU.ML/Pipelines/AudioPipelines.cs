@@ -24,6 +24,43 @@ public class SpeechRecognitionPipeline : IDisposable
     private readonly InferenceSession _decoderSession;
     /// <summary>Optional `decoder_with_past_model.onnx` session; null = the O(n^2) full-recompute path.</summary>
     private readonly InferenceSession? _decoderWithPastSession;
+
+    /// <summary>
+    /// Capture-once/replay-many for the ENCODER, which is the ideal candidate in this pipeline.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ Whisper's encoder input is <c>[1, 80, 3000]</c> - a FIXED shape, because the audio is padded to
+    /// 30 s before the mel. Unlike ZipVoice's decoder, whose shape is the utterance length and whose
+    /// capture must therefore be rebuilt per utterance, one capture here serves every transcription for the
+    /// life of the pipeline. It also runs exactly once per transcription, so nothing else in the graph gets
+    /// to amortise its per-node host cost.
+    /// </para>
+    /// <para>
+    /// ⚠️ The cost this targets is DISPATCH, not compute. MEASURED in the SpawnDev.AI demo, 2026-09-03,
+    /// transcribing a 4.0 s utterance in 13,926 ms: 12 graph runs, executor 9,465 ms, of which
+    /// <b>residual 7,726 ms was dispatch + CPU + alloc</b> against just 531 ms of readbacks. A recorded
+    /// plan replaces per-node dispatch encoding with one crossing, which is exactly that term.
+    /// </para>
+    /// <para>
+    /// The decoder deliberately gets no capture: <c>decoder_with_past</c>'s past-K/V grow by one position
+    /// every step, so its shapes change on every single call and a recording would be invalid immediately.
+    /// </para>
+    /// <para>
+    /// Capture is best-effort - ineligible backends and failed captures fall through to the direct forward,
+    /// and <see cref="Graph.SessionGraphCapture.CaptureStatus"/> says which.
+    /// </para>
+    /// </remarks>
+    private Graph.SessionGraphCapture? _encoderCapture;
+
+    /// <summary>Enable capture/replay of the encoder. Off runs a plain forward.</summary>
+    public bool EnableGraphCapture { get; set; } = true;
+
+    /// <summary>WHY the encoder capture is or is not live.</summary>
+    public string EncoderCaptureStatus => _encoderCapture?.CaptureStatus ?? "no capture constructed yet";
+
+    /// <summary>Whether the encoder is actually replaying a recorded plan.</summary>
+    public bool EncoderCaptured => _encoderCapture?.IsCaptured ?? false;
     private BPETokenizer? _tokenizer;
 
     // Whisper special tokens, as verified against the model's own tokenizer.json (Xenova/whisper-tiny).
@@ -163,7 +200,9 @@ public class SpeechRecognitionPipeline : IDisposable
         // 4. Run encoder
         using var melBuf = _accelerator.Allocate1D(mel);
         var melTensor = new Tensor(melBuf.View, new[] { 1, 80, 3000 });
-        var encoderOutputs = await _encoderSession.RunAsync(new Dictionary<string, Tensor>
+        _encoderCapture ??= new Graph.SessionGraphCapture(_encoderSession, _accelerator);
+        _encoderCapture.Enabled = EnableGraphCapture;
+        var encoderOutputs = await _encoderCapture.RunAsync(new Dictionary<string, Tensor>
         {
             [_encoderSession.InputNames[0]] = melTensor
         });
@@ -232,6 +271,7 @@ public class SpeechRecognitionPipeline : IDisposable
             InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
             MelTimeMs = melMs,
             ModelTimeMs = sw.Elapsed.TotalMilliseconds - melMs,
+            EncoderCaptureStatus = EncoderCaptureStatus,
         };
     }
 
@@ -319,6 +359,7 @@ public class SpeechRecognitionPipeline : IDisposable
 
     public void Dispose()
     {
+        _encoderCapture?.Dispose();
         _encoderSession?.Dispose();
         _decoderSession?.Dispose();
         _decoderWithPastSession?.Dispose();

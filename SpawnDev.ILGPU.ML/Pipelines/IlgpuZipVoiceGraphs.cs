@@ -83,6 +83,43 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
     public bool EnableGraphCapture { get; set; } = true;
 
     /// <summary>
+    /// Let the decoder be captured even though its graph contains an <c>If</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠️ Without this the decoder is NEVER captured, on any backend, and that is the single largest cost
+    /// in a spoken reply. MEASURED on WebGPU 2026-09-03: <c>capture LIVE: False - refused: graph contains
+    /// control flow (If)</c>, with the decoder taking 8.4 s per Euler step x 4 steps - 82% of a 48.6 s
+    /// synthesis. <c>SubgraphRunner</c>'s own remarks put the refusal's browser cost at ~20x, because a
+    /// replayed plan does in microseconds the per-node interop crossings the walk does in ~4.5 ms.
+    /// </para>
+    /// <para>
+    /// 🔴 DEFAULT FALSE, AND THAT IS A MEASUREMENT, NOT CAUTION. I turned this on and ran it on WebGPU
+    /// 2026-09-03. It <b>HUNG THE GPU on the first attempt</b>:
+    /// <c>ID3D12Device::GetDeviceRemovedReason failed with DXGI_ERROR_DEVICE_HUNG (0x887A0006)</c>,
+    /// "Device removed reason: DXGI_ERROR_DEVICE_HUNG" - a D3D12 TDR that resets the display driver, felt
+    /// outside the browser and outside the process. The test died after fetching the models and before
+    /// speaking a single line.
+    /// </para>
+    /// <para>
+    /// ⚠️ The argument for lifting it was wrong, and it is worth writing down BECAUSE it was plausible:
+    /// <c>SubgraphRunner</c> caches the compiled subgraph plan on the async path the control-flow
+    /// operators actually use, so the allocation it guards against was supposed to happen during capture's
+    /// two warm forwards rather than inside the recording window - and <c>WebGPUGraphCapture</c> refuses to
+    /// record at all if its second warm pass tripped a pool reclaim, which reads like positive proof of
+    /// priming. The device hung anyway. So the plan cache is NOT sufficient for this graph, and the
+    /// reclaim guard does not see whatever allocates: something inside the recording window still touches
+    /// the device. That is the open question, and it needs an answer before this is turned on again.
+    /// </para>
+    /// <para>
+    /// The knob stays because the cost of the refusal is real and large - the decoder is 82% of a
+    /// synthesis and a replay is worth ~20x on the per-node crossings - so this WILL be worth revisiting.
+    /// It is per-instance rather than global for the same reason: the verdict is a property of one graph.
+    /// </para>
+    /// </remarks>
+    public bool AllowControlFlowCapture { get; set; }
+
+    /// <summary>
     /// Whether a decoder capture is actually LIVE - i.e. calls are replaying a recorded plan.
     /// </summary>
     /// <remarks>
@@ -187,6 +224,7 @@ public sealed class IlgpuZipVoiceGraphs : IZipVoiceGraphs
             _decoderCaptureShape = shapeKey;
         }
         _decoderCapture.Enabled = EnableGraphCapture;
+        _decoderCapture.AllowControlFlow = AllowControlFlowCapture;
         var renamed = Rename(inputs, _decoder);
         Dictionary<string, Tensor> outputs;
         try
