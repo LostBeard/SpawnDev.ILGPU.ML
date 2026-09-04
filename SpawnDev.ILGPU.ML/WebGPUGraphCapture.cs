@@ -47,6 +47,19 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// check when a replay does not reproduce its own capture.</remarks>
     public static int HostWritesDuringCapture { get; private set; }
 
+    /// <summary>
+    /// The subset of <see cref="HostWritesDuringCapture"/> that is the per-dispatch packed scalar-params
+    /// upload. See <c>WebGPUDispatchPlan.ScalarParamWriteCount</c>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Reported separately because until 2026-09-04 it was reported NOWHERE. The scalar-params
+    /// <c>queue.writeBuffer</c> is issued once per dispatch and was invisible to the host-write census,
+    /// which only hooked <c>WebGPUBuffer</c>'s upload paths - so this class printed "0 host writes" for a
+    /// capture window containing one per dispatch, and that zero was cited as evidence the plan was
+    /// complete while the replay disagreed with its own capture in every value.
+    /// </remarks>
+    public static int ScalarParamWritesDuringCapture { get; private set; }
+
     /// <summary>The stable output tensors the captured plan writes (also returned by ReplayAsync).</summary>
     public IReadOnlyDictionary<string, Tensor> Outputs => _outputs;
 
@@ -201,10 +214,15 @@ public sealed class WebGPUGraphCapture : IDisposable
             // HERE, with a count, is the difference between a number and two days of hypotheses.
             if (plan.HostWriteCount > 0)
                 Console.WriteLine($"[WebGPUGraphCapture] ⚠️ {plan.HostWriteCount} host write(s) "
-                    + $"({plan.HostWriteBytes / 1024.0:F1} KiB) happened INSIDE the capture window. A "
+                    + $"({plan.HostWriteBytes / 1024.0:F1} KiB) happened INSIDE the capture window, of which "
+                    + $"{plan.ScalarParamWriteCount} are the PER-DISPATCH packed scalar-params upload. A "
                     + "queue.writeBuffer is not part of a dispatch plan, so a replay does not repeat it - "
-                    + "any of these carrying per-call data makes the replay wrong.");
+                    + "any of these carrying per-call data makes the replay wrong. ⚠️ READ THE SUBTRACTION, "
+                    + "NOT THE TOTAL: the scalar-params writes are BENIGN (the plan retains each dispatch's "
+                    + "scalar buffer via RetainScalarBuffers, so it is never recycled and the recorded bind "
+                    + $"group keeps its own parameters). Unreplayable work here = {plan.HostWriteCount - plan.ScalarParamWriteCount}.");
             HostWritesDuringCapture = plan.HostWriteCount;
+            ScalarParamWritesDuringCapture = plan.ScalarParamWriteCount;
 
             var shapes = new Dictionary<string, int[]>();
             foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();

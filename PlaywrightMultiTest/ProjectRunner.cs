@@ -184,7 +184,7 @@ namespace PlaywrightMultiTest
             filter ??= Environment.GetEnvironmentVariable("PMT_FILTER");
             if (!string.IsNullOrEmpty(filter))
             {
-                LogStatus($"Test filter active: '{filter}' (substring match)");
+                LogStatus($"Test filter active: '{filter}' (substring match; comma-separated = OR)");
             }
             else
             {
@@ -1250,10 +1250,27 @@ namespace PlaywrightMultiTest
             foreach (var l in kept) Console.Error.WriteLine($"  LOG: {l}");
         }
 
-        private static bool MatchesFilter(string filter, ProjectTest t) =>
-            (t.Name?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)
-            || (t.TestTypeName?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)
-            || (t.TestMethodName?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false);
+        // PMT_FILTER accepts a COMMA-SEPARATED list of substrings; a row matches if ANY of them
+        // matches (OR, not AND). A filter with no comma behaves exactly as it always did.
+        //
+        // Why: a release gate frequently has to cover two unrelated pipelines - e.g. Whisper AND
+        // ZipVoice - and with a single substring there is no string that selects both without also
+        // dragging in the other 20 Pipeline_* tests. The alternative was two full PMT invocations,
+        // each paying the publish + static-server + Chromium-launch cost again, which is exactly the
+        // kind of tax that gets a gate skipped at 2am.
+        private static bool MatchesFilter(string filter, ProjectTest t)
+        {
+            foreach (var term in filter.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            {
+                if ((t.Name?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false)
+                    || (t.TestTypeName?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false)
+                    || (t.TestMethodName?.Contains(term, StringComparison.OrdinalIgnoreCase) ?? false))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
 
         // Test categories ([TestMethod(Category="...")]) skipped by default in routine runs.
         // "HeavyModel" = slow big-model end-to-end tests (minutes each via per-node shape

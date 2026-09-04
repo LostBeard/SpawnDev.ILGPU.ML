@@ -274,9 +274,17 @@ public abstract partial class MLTestBase
         // ⚠️ THE FIRST NUMBER TO READ when a replay does not reproduce its own capture. A plan records
         // command-encoder work only; a queue.writeBuffer inside the window is work the replay silently
         // skips. Non-zero here names the cause instead of leaving it to be deduced.
+        //
+        // ⚠️ AND READ THE SECOND NUMBER TOO. This line printed 0 on 2026-09-03 and that zero was taken as
+        // evidence the plan was complete. It was not: the census hooked WebGPUBuffer's upload paths and
+        // NOT the packed scalar-params queue.writeBuffer that the dispatch path issues once PER DISPATCH,
+        // so the busiest CPU->GPU path in the engine was invisible to the instrument that was supposed to
+        // find it. Counting it is what turns "the plan is missing work" from a deduction into a number.
         Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] host writes inside "
                         + $"the capture window: {WebGPUGraphCapture.HostWritesDuringCapture} "
-                        + "(a replay repeats none of them)");
+                        + $"(of which {WebGPUGraphCapture.ScalarParamWritesDuringCapture} are per-dispatch "
+                        + "packed scalar params, which the plan RETAINS and are therefore benign) => "
+                        + $"unreplayable work = {WebGPUGraphCapture.HostWritesDuringCapture - WebGPUGraphCapture.ScalarParamWritesDuringCapture}");
         if (!graphs.DecoderCaptured)
             throw new Exception("capture never went live, so there is no replay to check: "
                               + graphs.DecoderCaptureStatus);
