@@ -109,7 +109,8 @@ public sealed class CaptureParamArena : IDisposable
             { try { System.IO.File.AppendAllText(GraphExecutor.CaptureTraceFile, $"   -> ARENA-ALLOC int slot={i} len={data.Length}  (capture sizing gap)\n"); } catch { } }
             // First time this cursor is used, or a longer params array than the slot was sized for.
             slot = _accelerator.Allocate1D<int>(data.Length);
-            if (i < _slots.Count) { _slots[i].Dispose(); _slots[i] = slot; }
+            // RETIRE, DO NOT DISPOSE - see _retired.
+            if (i < _slots.Count) { Retire(_slots[i]); _slots[i] = slot; }
             else _slots.Add(slot);
         }
 
@@ -140,7 +141,8 @@ public sealed class CaptureParamArena : IDisposable
             if (GraphExecutor.SuppressDrains && GraphExecutor.CaptureTraceFile != null)
             { try { System.IO.File.AppendAllText(GraphExecutor.CaptureTraceFile, $"   -> ARENA-ALLOC float slot={i} len={data.Length}  (capture sizing gap)\n"); } catch { } }
             slot = _accelerator.Allocate1D<float>(data.Length);
-            if (i < _floatSlots.Count) { _floatSlots[i].Dispose(); _floatSlots[i] = slot; }
+            // RETIRE, DO NOT DISPOSE - see _retired.
+            if (i < _floatSlots.Count) { Retire(_floatSlots[i]); _floatSlots[i] = slot; }
             else _floatSlots.Add(slot);
         }
 
@@ -153,11 +155,37 @@ public sealed class CaptureParamArena : IDisposable
         return view;
     }
 
+    /// <summary>
+    /// Slots that have been GROWN out of use but must stay alive until this arena is disposed.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 A GROWN SLOT'S OLD BUFFER IS STILL INSIDE SOMEONE'S RECORDED PLAN. This arena is a per-
+    /// accelerator SINGLETON (<see cref="Shared"/>), shared by every pipeline on that device, and a
+    /// captured WebGPU dispatch plan holds raw <c>GPUBuffer</c> references in its bind groups. Disposing
+    /// the old buffer when a later, longer params array grows the slot therefore destroys memory a
+    /// previously recorded plan still binds - and WebGPU reports that only at the NEXT submit, as
+    /// "[Buffer ...] used in submit while destroyed", from whichever innocent caller happens to
+    /// synchronize next.
+    /// <para>
+    /// MEASURED 2026-09-04 in the SpawnDev.AI demo: Whisper's encoder capture recorded a plan against
+    /// float slot i (669 floats, "Storage#5888:2676B"); a ZipVoice synthesis then rented the same cursor
+    /// with a longer array, the old buffer was disposed here, and the next transcription's replay failed
+    /// with that error - which is why turning Whisper's capture off appeared to "fix" it. The stack that
+    /// finally named this came from <c>WebGPUBackend.TraceBufferDestroy</c>.
+    /// </para>
+    /// Retiring costs a handful of small buffers per process; freeing one early costs correctness.
+    /// </remarks>
+    private readonly List<IDisposable> _retired = new();
+
+    private void Retire(IDisposable slot) => _retired.Add(slot);
+
     public void Dispose()
     {
         foreach (var s in _slots) s.Dispose();
         _slots.Clear();
         foreach (var s in _floatSlots) s.Dispose();
         _floatSlots.Clear();
+        foreach (var s in _retired) { try { s.Dispose(); } catch { } }
+        _retired.Clear();
     }
 }

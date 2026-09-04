@@ -144,7 +144,38 @@ public sealed class WebGPUGraphCapture : IDisposable
         _inputBuffers = inputBuffers;
         _outputs = outputs;
         InputShapes = inputShapes;
+        ReclaimGenerationAtCapture = Tensors.BufferPool.ReclaimFireCount;
     }
+
+    /// <summary>
+    /// <see cref="Tensors.BufferPool.ReclaimFireCount"/> as it stood when this plan was recorded.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE PLAN'S BIND GROUPS REFERENCE POOLED BUFFERS, AND THE POOL CAN FREE THEM. This class's own
+    /// summary says the captured plan reads and writes the SAME device buffers and that the caller must
+    /// "keep them alive" - but a pooled intermediate goes back to the pool when the capture run ends, and
+    /// <c>BufferPool.DisposeBucketedBuffers</c> (the under-pressure <c>AllocateWithReclaim</c> path, also
+    /// reachable deterministically via <c>BufferPool.ForceReclaimEveryNRents</c>) then DESTROYS it. The
+    /// recorded bind group still points at it, and the next replay submits a command buffer referencing
+    /// destroyed memory.
+    /// <para>
+    /// MEASURED 2026-09-04 in the SpawnDev.AI demo: <c>/api/speak</c> returned 500 with
+    /// "[Buffer (unlabeled)] used in submit while destroyed. - While calling [Queue].Submit(...)", thrown
+    /// from <c>WebGPUGraphCapture.ReplayAsync</c> under
+    /// <c>SpeechRecognitionPipeline.TranscribeAsync</c> - Whisper's encoder capture - as soon as a
+    /// transcription was run in the middle of a ZipVoice synthesis. Disabling that capture made it go
+    /// away, which is a diagnosis, not a fix.
+    /// </para>
+    /// Comparing this against the live count says whether a reclaim happened since the recording, which
+    /// is the difference between "the plan is stale" and some other cause.
+    /// </remarks>
+    public int ReclaimGenerationAtCapture { get; }
+
+    /// <summary>
+    /// True when the pool has freed buffers since this plan was recorded, so replaying it may submit
+    /// against destroyed memory. See <see cref="ReclaimGenerationAtCapture"/>.
+    /// </summary>
+    public bool InvalidatedByReclaim => Tensors.BufferPool.ReclaimFireCount != ReclaimGenerationAtCapture;
 
     /// <summary>
     /// Capture the session's forward for <paramref name="inputs"/> into a replayable WebGPU dispatch plan.
@@ -328,6 +359,15 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// </summary>
     public async Task<Dictionary<string, Tensor>> ReplayAsync(Dictionary<string, Tensor> newInputs)
     {
+        // Say it BEFORE the submit that would fail. A replay against a pool that has freed buffers since
+        // the recording surfaces as "[Buffer (unlabeled)] used in submit while destroyed", which names
+        // neither the buffer nor the reason; this names the reason. See ReclaimGenerationAtCapture.
+        if (InvalidatedByReclaim)
+            Console.WriteLine("[WebGPUGraphCapture] ⚠️ replaying a plan recorded before "
+                + $"{Tensors.BufferPool.ReclaimFireCount - ReclaimGenerationAtCapture} pool reclaim(s) "
+                + $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed since process start) - "
+                + "its bind groups may reference destroyed buffers.");
+
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         foreach (var (name, t) in newInputs)
         {

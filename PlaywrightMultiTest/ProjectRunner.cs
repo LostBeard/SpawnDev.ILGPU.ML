@@ -567,10 +567,18 @@ namespace PlaywrightMultiTest
                                 // context-free "Test run failed".
                                 static string Tail(string? s, int n) => string.IsNullOrEmpty(s) ? "(empty)"
                                     : (s!.Length <= n ? s : "..." + s.Substring(s.Length - n));
+
+                                // ⚠️ THE STDERR TAIL MUST REACH THE EXCEPTION MESSAGE, NOT JUST THE ASYNC
+                                // PLUMBING BELOW IT. At 1400 chars a .NET unhandled-exception dump spends
+                                // the whole budget on ThreadPool/AsyncStateMachine frames and the LINE THAT
+                                // NAMES THE FAILURE scrolls off the top - MEASURED 2026-09-04 on
+                                // DirectOnnxLoading_MobileNetV2, where the report contained fifteen frames of
+                                // AsyncTaskMethodBuilder and not one word of what threw. A crash report that
+                                // cannot name the crash is not a report.
                                 throw new Exception(
                                     $"Test run failed (no 'TEST:' line - subprocess crashed). exit={result.ExitCode}\n"
                                     + $"stdout tail:\n{Tail(result.StdOut, 2200)}\n"
-                                    + $"stderr tail:\n{Tail(result.StdErr, 1400)}");
+                                    + $"stderr tail:\n{Tail(result.StdErr, 12000)}");
                             }
                             var stateMessage = unitTest.ResultText;
                             rowTest.Result = unitTest.Result;

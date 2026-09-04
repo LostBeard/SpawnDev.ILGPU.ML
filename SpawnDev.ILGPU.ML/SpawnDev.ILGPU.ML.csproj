@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.9-local.11</Version>
+		<Version>5.2.9</Version>
 		<PackageReleaseNotes>v5.2.8 - Three defects between a microphone and a cloned voice. (1) ZipVoice cloned the reference clip's SILENCE as slow speech: the encoder derives frames-per-token from prompt_features_len and multiplies by the total token count, so a reference that is half dead air declares a speaking rate half the speaker's real one - MEASURED 1.94x too slow with 4s of silence added. New ZipVoiceFeatures.TrimReferenceSilence, on by default; internal pauses are CAPPED rather than deleted, because a cloned voice that never breathes is its own defect. (2) VoiceActivityDetector.Reset() never zeroed its sample clock, while the spans it returns are offsets into the caller's buffer - a consumer that warms the detector had its FIRST turn sliced 384 ms late, and later turns pointed past the end of a fresh recording and came back empty. (3) VadOptions.SpeechPad was 30 ms against a 32 ms frame, so a segment started after the word did - MEASURED WER 0.123 on a Harvard recording, 0.000 at the new 150 ms default. Also consumes SpawnDev.ILGPU 5.2.7 so the SpawnJS 2.1.9 app-root fix reaches browser consumers.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
@@ -35,7 +35,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.10" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.9-local.5" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.9" />
 		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.2" />
 	</ItemGroup>
 

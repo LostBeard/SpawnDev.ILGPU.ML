@@ -1224,6 +1224,7 @@ public class GraphCompiler
                 OutputNames = node.Outputs.ToArray(),
                 Attributes = attrs,
                 OutputShapes = outputShapes,
+                CompileTimeInputShapes = inputShapes,
             });
           }
           catch (Exception nodeEx)
@@ -1399,4 +1400,26 @@ public class CompiledNode
     public required string[] OutputNames { get; init; }
     public required Dictionary<string, object> Attributes { get; init; }
     public required int[][] OutputShapes { get; init; }
+
+    /// <summary>
+    /// The INPUT shapes <see cref="OutputShapes"/> was inferred from, so the executor can tell whether
+    /// this run's shapes still match the ones the compiler predicted.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 WHY. <see cref="OutputShapes"/> is a COMPILE-TIME prediction - <c>op.InferOutputShapes</c> run
+    /// once, on the shapes the compiler could see. The executor then uses it as the runtime truth, with
+    /// per-op special cases (Slice, Reshape, Expand, Pad, Conv...) patching the ones known to move. Every
+    /// other operator silently keeps the prediction, which is wrong the moment a real input shape differs.
+    /// <para>
+    /// MEASURED 2026-09-04 on ZipVoice's <c>fm_decoder</c> at 1210 frames: <c>Unsqueeze</c> correctly
+    /// produced the relative-position tensor <c>[1,2419,48]</c> (116,112 elements), and the
+    /// <c>DynamicQuantizeLinear</c> consuming it - an ELEMENTWISE op that cannot change shape, and which
+    /// has no special case here - kept its compile-time <c>[1,210,48]</c> (10,080). Its 38,704-element
+    /// consumer then read 35,344 elements nobody wrote: an illegal memory access on CUDA, and on WebGPU
+    /// (whose spec clamps out-of-bounds reads) 8.82 s of confident nonsense that Whisper read back as
+    /// "[MUSIC PLAYING]". Storing what the prediction was BASED on is what lets the executor re-infer
+    /// only when the basis has actually changed, leaving every static-shape model bit-identical.
+    /// </para>
+    /// </remarks>
+    public int[][]? CompileTimeInputShapes { get; init; }
 }

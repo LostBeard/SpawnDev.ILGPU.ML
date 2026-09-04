@@ -94,10 +94,41 @@ public class GraphExecutor : IDisposable
     /// </remarks>
     private MemoryBuffer1D<float, Stride1D.Dense>? _readbackStaging;
 
+    /// <summary>Older, smaller staging buffers kept alive until this executor is disposed.</summary>
+    /// <remarks>
+    /// ⚠️ NOT disposed at the moment they are replaced. A staging buffer is the DESTINATION of a
+    /// <c>Scale</c> dispatch, and on the browser backends a dispatch that has been encoded but not yet
+    /// submitted still references it - freeing it there is the documented "never dispose buffers before
+    /// flush" defect that made every transformer weight above 1 MB silently zero. Growth is rare and each
+    /// buffer is a few KB, so they are simply retained and released with the executor.
+    /// </remarks>
+    private List<MemoryBuffer1D<float, Stride1D.Dense>>? _retiredReadbackStaging;
+
     /// <summary>The shared staging buffer, allocated on first use. See <see cref="_readbackStaging"/>.</summary>
+    /// <remarks>
+    /// 🔴 IT MUST FIT WHAT THE CALLER ASKS FOR. This was a fixed <see cref="MaxSmallReadbackElements"/>
+    /// (64) buffer, while the SYNC <c>Run</c> path's runtime-constant capture guards on
+    /// <c>ElementCount &lt;= 2048</c> - so every node output between 65 and 2048 elements requested a
+    /// <c>SubView</c> larger than the buffer and threw, killing the process. MEASURED 2026-09-04: this is
+    /// the whole of <c>IntegrationTests.DirectOnnxLoading_MobileNetV2</c>,
+    /// <c>FullExecution_MobileNetV2_WithRealWeights</c> and <c>FullExecution_SqueezeNet_WithRealWeights</c>
+    /// - three PMT failures that predate the shape work and had been carried as "pre-existing". The async
+    /// path clamps to 64 and never noticed; the two paths disagreed from the day the shared staging buffer
+    /// replaced the per-readback allocation.
+    /// <para>
+    /// Growing (rather than clamping the caller) keeps the sync path's runtime-constant capture working for
+    /// the shape tensors it was written to fetch - clamping would have "fixed" the crash by silently
+    /// dropping the values those models resolve their shapes from.
+    /// </para>
+    /// </remarks>
     private ArrayView1D<float, Stride1D.Dense> ReadbackStagingView(int elementCount)
     {
-        _readbackStaging ??= _accelerator.Allocate1D<float>(MaxSmallReadbackElements);
+        if (_readbackStaging == null || _readbackStaging.Length < elementCount)
+        {
+            if (_readbackStaging != null)
+                (_retiredReadbackStaging ??= new()).Add(_readbackStaging);
+            _readbackStaging = _accelerator.Allocate1D<float>(Math.Max(MaxSmallReadbackElements, elementCount));
+        }
         return _readbackStaging.View.SubView(0, elementCount);
     }
 
@@ -548,6 +579,74 @@ public class GraphExecutor : IDisposable
     /// </summary>
     public static string? LastPadReadbackFallbackInfo;
 
+    /// <summary>
+    /// DIAGNOSTIC: times a <c>Slice</c> resolved its window from COMPILE-TIME attributes because the
+    /// runtime values were absent this run.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THIS IS THE SILENT WRONG-ANSWER PATH, AND IT HAS NO OTHER SYMPTOM. A compile-time window is a
+    /// PREDICTION made from the branch the compiler could see. Downstream of an <c>If</c> that prediction
+    /// can be wrong, and being wrong costs no error: ZipVoice's <c>fm_decoder</c> resolves this Slice for
+    /// the then_branch's <c>[1999,48]</c> relative-position table, the else_branch recomputes it as
+    /// <c>[2443,48]</c>, and the stale window clamps to 222 rows and then to an EMPTY <c>[0,48]</c> - a
+    /// zero-element output SKIPS its operator, so everything downstream reads a buffer nobody wrote.
+    /// <para>
+    /// MEASURED 2026-09-04 in the SpawnDev.AI demo on WebGPU: utterances that took only the then_branch
+    /// (<c>else=0</c>) read back at 100% word overlap, and the first one to take the else_branch
+    /// (<c>then=39 else=24</c>) read back at 0% - Whisper reported "[MUSIC PLAYING]". Count this to find
+    /// out whether the runtime values were actually available on the branch that matters, instead of
+    /// inferring it from the audio.
+    /// </para>
+    /// Reset manually before a run; see <see cref="ResetSliceAttrFallbackDiagnostics"/>.
+    /// </remarks>
+    public static int SliceAttrFallbackCount;
+
+    /// <summary>
+    /// DIAGNOSTIC: which Slice last fell back, the shape it was slicing, and WHICH runtime params were
+    /// missing - the missing one names the producer whose readback did not happen.
+    /// </summary>
+    public static string? LastSliceAttrFallbackInfo;
+
+    /// <summary>Zero the Slice compile-time-fallback census. See <see cref="SliceAttrFallbackCount"/>.</summary>
+    public static void ResetSliceAttrFallbackDiagnostics()
+    {
+        SliceAttrFallbackCount = 0;
+        LastSliceAttrFallbackInfo = null;
+    }
+
+    /// <summary>
+    /// DIAGNOSTIC: read every node output back and NAME the first one that contains NaN or Infinity.
+    /// Set with <c>ML_FIND_NAN=1</c>. Off by default - it reads back every tensor, so it is a hunt, not
+    /// a monitor.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 PAIR IT WITH <c>ML_POISON_RENT=1</c>. Reading a buffer nobody wrote is this engine's
+    /// characteristic silent failure: pooled memory still holds the PREVIOUS tensor's plausible values,
+    /// so the graph completes, the amplitudes look right, and the answer is quietly wrong. Poisoning
+    /// turns that read into NaN/Infinity, and this finds the first node it reaches - which is the node
+    /// downstream of the real defect, and the first fact worth having.
+    /// <para>
+    /// MEASURED 2026-09-04 on ZipVoice's <c>fm_decoder</c> at <c>x[1,1210,100]</c> (past the 1000 frames
+    /// the precomputed <c>[1999,48]</c> relative-position table covers, so the <c>If</c> takes its
+    /// else_branch): plain CUDA raised "an illegal memory access was encountered"; under
+    /// <c>ML_POISON_RENT=1</c> the same synthesis COMPLETED and shipped infinities all the way out to the
+    /// audio samples. On WebGPU, whose spec clamps out-of-bounds accesses, neither happens - it just
+    /// speaks 8.82 s of confident nonsense that Whisper reads back as "[MUSIC PLAYING]".
+    /// </para>
+    /// </remarks>
+    public static bool FindFirstNonFinite { get; set; }
+        = Environment.GetEnvironmentVariable("ML_FIND_NAN") is "1" or "true";
+
+    /// <summary>The first node whose output went non-finite. See <see cref="FindFirstNonFinite"/>.</summary>
+    public static string? FirstNonFiniteNodeInfo;
+
+    /// <summary>
+    /// The first node whose output tensor DECLARES more elements in its shape than its buffer actually
+    /// holds - the origin of a read-past-the-data, where <see cref="FirstNonFiniteNodeInfo"/> only names
+    /// the first consumer that trips over it. Gated by <see cref="FindFirstNonFinite"/>.
+    /// </summary>
+    public static string? FirstShortBufferNodeInfo;
+
     /// <summary>Data layout format (NCHW for ONNX, NHWC for TFLite).</summary>
     public DataFormat Format { get; set; } = DataFormat.NCHW;
 
@@ -860,6 +959,65 @@ public class GraphExecutor : IDisposable
             // the actual shape, so the executor always runs a graph compiled for THESE dims.
             int[][] runtimeOutputShapes = node.OutputShapes;
 
+            // 🔴 RE-INFER WHEN THIS RUN'S INPUT SHAPES ARE NOT THE ONES THE COMPILER PREDICTED FROM.
+            // node.OutputShapes is op.InferOutputShapes() evaluated ONCE at compile time. The per-op
+            // special cases below patch the operators known to move at runtime (Slice, Reshape, Expand,
+            // Pad, Conv, Resize, Squeeze, Range); every OTHER operator keeps the compile-time prediction,
+            // and a shape-preserving op fed a bigger tensor than the compiler saw then declares an output
+            // SMALLER than its own input - which nothing downstream can detect, because the buffer is
+            // allocated to the declared size and the surplus is simply never written.
+            // See CompiledNode.CompileTimeInputShapes for the ZipVoice measurement that found this.
+            // This is a NO-OP whenever the shapes match compile time (same function, same inputs), so
+            // static-shape models are bit-identical; it only fires on genuinely dynamic shapes.
+            // ⚠️ ONE INPUT ONLY, AND ONLY WHEN THE OPERATOR ALREADY PROVED IT PRESERVES SHAPE.
+            // The first attempt at this re-inferred EVERY node through InferOutputShapes with runtime
+            // shapes, on the theory that it could not be worse than the compile-time answer. MEASURED:
+            // that broke 8 PMT tests - MobileNetV2, SqueezeNet, GPT-2, the Whisper encoder/decoder and
+            // TurboQuant KV-cache captures - with `DivideByZeroException` inside ElementWiseKernels.Scale
+            // under AddOperator, i.e. a zero-element output. For an operator whose output depends on more
+            // than its first input (broadcast Add, MatMul, Conv), re-inferring from shapes alone is NOT
+            // safely better than the prediction.
+            //
+            // So the rule claims only what it can prove. If, at COMPILE time, this operator returned
+            // exactly its single input's shape, it is shape-preserving by its own account - and a
+            // shape-preserving op's output is its input's shape at runtime too, whatever that is. That is
+            // the entire DynamicQuantizeLinear case (one input; output[0] == input[0]; outputs 1 and 2 are
+            // the scalar scale/zero-point and stay as predicted), and it cannot touch a multi-input op.
+            if (node.CompileTimeInputShapes is { } ctIn && nodeInputs.Length > 0)
+            {
+                bool basisChanged = false, allKnown = true;
+                var runIn = new int[nodeInputs.Length][];
+                for (int k = 0; k < nodeInputs.Length; k++)
+                {
+                    var t = nodeInputs[k];
+                    if (t == null) { allKnown = false; break; }
+                    runIn[k] = t.Shape;
+                    if (k >= ctIn.Length || ctIn[k] == null || !ctIn[k].AsSpan().SequenceEqual(t.Shape))
+                        basisChanged = true;
+                }
+                if (allKnown && basisChanged)
+                {
+                    try
+                    {
+                        var reInferred = node.Operator.InferOutputShapes(runIn, node.Attributes);
+                        // ⚠️ EVERY DIMENSION MUST BE > 0, NOT >= 0. A zero anywhere makes a zero-ELEMENT
+                        // output, whose operator is then skipped entirely and whose consumers read a buffer
+                        // nobody wrote - the same class of defect this re-inference exists to remove.
+                        // MEASURED 2026-09-04: accepting `d >= 0` here broke 8 PMT tests (MobileNetV2,
+                        // SqueezeNet, GPT-2, Whisper encoder/decoder, TurboQuant KV-cache captures) with
+                        // DivideByZeroException inside ElementWiseKernels.Scale under AddOperator - a
+                        // broadcast whose re-inferred output had collapsed to zero elements. An operator
+                        // that cannot infer a usable shape from shapes alone keeps the compile-time
+                        // prediction, which is exactly what it had before.
+                        if (reInferred != null && reInferred.Length >= node.OutputNames.Length
+                            && reInferred.Take(node.OutputNames.Length).All(s => s != null && s.Length > 0
+                                                                                && s.All(d => d > 0)))
+                            runtimeOutputShapes = reInferred;
+                    }
+                    catch { /* an operator that cannot infer from shapes alone keeps the prediction */ }
+                }
+            }
+
             // Runtime Slice: resolve output shape from compiler-resolved attrs (backend/elide-independent),
             // falling back to runtimeConstants. See the async-path copy for the root cause (Seven's Slice_4).
             if (node.OpType == "Slice" && node.InputNames.Length >= 3)
@@ -893,6 +1051,20 @@ public class GraphExecutor : IDisposable
                     || runtimeConstants.ContainsKey(node.InputNames[idx]);
                 bool useRuntime = rtStarts != null && rtEnds != null
                     && rtDeclaredAvailable(3) && rtDeclaredAvailable(4);
+                if (!useRuntime)
+                {
+                    // See SliceAttrFallbackCount: this is the silent wrong-answer path, so it gets counted
+                    // and NAMED. The missing param identifies the producer whose readback did not happen,
+                    // which is the actual thing to fix - the fallback itself is only where it surfaces.
+                    System.Threading.Interlocked.Increment(ref SliceAttrFallbackCount);
+                    LastSliceAttrFallbackInfo =
+                        $"{node.OpType} -> {(node.OutputNames.Length > 0 ? node.OutputNames[0] : "?")} "
+                        + $"in[{string.Join(",", inShape)}] missing:"
+                        + (rtStarts == null ? $" starts({(node.InputNames.Length > 1 ? node.InputNames[1] : "-")})" : "")
+                        + (rtEnds == null ? $" ends({(node.InputNames.Length > 2 ? node.InputNames[2] : "-")})" : "")
+                        + (!rtDeclaredAvailable(3) ? $" axes({(node.InputNames.Length > 3 ? node.InputNames[3] : "-")})" : "")
+                        + (!rtDeclaredAvailable(4) ? $" steps({(node.InputNames.Length > 4 ? node.InputNames[4] : "-")})" : "");
+                }
                 float[]? starts = useRuntime ? rtStarts : ResolvedShapeAttr(node, "_resolved_starts");
                 float[]? ends = useRuntime ? rtEnds : ResolvedShapeAttr(node, "_resolved_ends");
                 float[]? axes = useRuntime
@@ -2597,6 +2769,65 @@ public class GraphExecutor : IDisposable
             // for the actual shape, so this executor always runs a graph compiled for THESE dims.
             int[][] runtimeOutputShapes = node.OutputShapes;
 
+            // 🔴 RE-INFER WHEN THIS RUN'S INPUT SHAPES ARE NOT THE ONES THE COMPILER PREDICTED FROM.
+            // node.OutputShapes is op.InferOutputShapes() evaluated ONCE at compile time. The per-op
+            // special cases below patch the operators known to move at runtime (Slice, Reshape, Expand,
+            // Pad, Conv, Resize, Squeeze, Range); every OTHER operator keeps the compile-time prediction,
+            // and a shape-preserving op fed a bigger tensor than the compiler saw then declares an output
+            // SMALLER than its own input - which nothing downstream can detect, because the buffer is
+            // allocated to the declared size and the surplus is simply never written.
+            // See CompiledNode.CompileTimeInputShapes for the ZipVoice measurement that found this.
+            // This is a NO-OP whenever the shapes match compile time (same function, same inputs), so
+            // static-shape models are bit-identical; it only fires on genuinely dynamic shapes.
+            // ⚠️ ONE INPUT ONLY, AND ONLY WHEN THE OPERATOR ALREADY PROVED IT PRESERVES SHAPE.
+            // The first attempt at this re-inferred EVERY node through InferOutputShapes with runtime
+            // shapes, on the theory that it could not be worse than the compile-time answer. MEASURED:
+            // that broke 8 PMT tests - MobileNetV2, SqueezeNet, GPT-2, the Whisper encoder/decoder and
+            // TurboQuant KV-cache captures - with `DivideByZeroException` inside ElementWiseKernels.Scale
+            // under AddOperator, i.e. a zero-element output. For an operator whose output depends on more
+            // than its first input (broadcast Add, MatMul, Conv), re-inferring from shapes alone is NOT
+            // safely better than the prediction.
+            //
+            // So the rule claims only what it can prove. If, at COMPILE time, this operator returned
+            // exactly its single input's shape, it is shape-preserving by its own account - and a
+            // shape-preserving op's output is its input's shape at runtime too, whatever that is. That is
+            // the entire DynamicQuantizeLinear case (one input; output[0] == input[0]; outputs 1 and 2 are
+            // the scalar scale/zero-point and stay as predicted), and it cannot touch a multi-input op.
+            if (node.CompileTimeInputShapes is { } ctIn && nodeInputs.Length > 0)
+            {
+                bool basisChanged = false, allKnown = true;
+                var runIn = new int[nodeInputs.Length][];
+                for (int k = 0; k < nodeInputs.Length; k++)
+                {
+                    var t = nodeInputs[k];
+                    if (t == null) { allKnown = false; break; }
+                    runIn[k] = t.Shape;
+                    if (k >= ctIn.Length || ctIn[k] == null || !ctIn[k].AsSpan().SequenceEqual(t.Shape))
+                        basisChanged = true;
+                }
+                if (allKnown && basisChanged)
+                {
+                    try
+                    {
+                        var reInferred = node.Operator.InferOutputShapes(runIn, node.Attributes);
+                        // ⚠️ EVERY DIMENSION MUST BE > 0, NOT >= 0. A zero anywhere makes a zero-ELEMENT
+                        // output, whose operator is then skipped entirely and whose consumers read a buffer
+                        // nobody wrote - the same class of defect this re-inference exists to remove.
+                        // MEASURED 2026-09-04: accepting `d >= 0` here broke 8 PMT tests (MobileNetV2,
+                        // SqueezeNet, GPT-2, Whisper encoder/decoder, TurboQuant KV-cache captures) with
+                        // DivideByZeroException inside ElementWiseKernels.Scale under AddOperator - a
+                        // broadcast whose re-inferred output had collapsed to zero elements. An operator
+                        // that cannot infer a usable shape from shapes alone keeps the compile-time
+                        // prediction, which is exactly what it had before.
+                        if (reInferred != null && reInferred.Length >= node.OutputNames.Length
+                            && reInferred.Take(node.OutputNames.Length).All(s => s != null && s.Length > 0
+                                                                                && s.All(d => d > 0)))
+                            runtimeOutputShapes = reInferred;
+                    }
+                    catch { /* an operator that cannot infer from shapes alone keeps the prediction */ }
+                }
+            }
+
             // Runtime Slice (same as sync Run). Prefer compiler-resolved attrs over runtimeConstants (Seven's
             // root cause: on WebGPU async / under dispatch-elide the runtimeConstants values are not present at
             // cascade time, the override silently no-ops, and the compile-time OutputShapes garbage stands -
@@ -2632,6 +2863,20 @@ public class GraphExecutor : IDisposable
                     || runtimeConstants.ContainsKey(node.InputNames[idx]);
                 bool useRuntime = rtStarts != null && rtEnds != null
                     && rtDeclaredAvailable(3) && rtDeclaredAvailable(4);
+                if (!useRuntime)
+                {
+                    // See SliceAttrFallbackCount: this is the silent wrong-answer path, so it gets counted
+                    // and NAMED. The missing param identifies the producer whose readback did not happen,
+                    // which is the actual thing to fix - the fallback itself is only where it surfaces.
+                    System.Threading.Interlocked.Increment(ref SliceAttrFallbackCount);
+                    LastSliceAttrFallbackInfo =
+                        $"{node.OpType} -> {(node.OutputNames.Length > 0 ? node.OutputNames[0] : "?")} "
+                        + $"in[{string.Join(",", inShape)}] missing:"
+                        + (rtStarts == null ? $" starts({(node.InputNames.Length > 1 ? node.InputNames[1] : "-")})" : "")
+                        + (rtEnds == null ? $" ends({(node.InputNames.Length > 2 ? node.InputNames[2] : "-")})" : "")
+                        + (!rtDeclaredAvailable(3) ? $" axes({(node.InputNames.Length > 3 ? node.InputNames[3] : "-")})" : "")
+                        + (!rtDeclaredAvailable(4) ? $" steps({(node.InputNames.Length > 4 ? node.InputNames[4] : "-")})" : "");
+                }
                 float[]? starts = useRuntime ? rtStarts : ResolvedShapeAttr(node, "_resolved_starts");
                 float[]? ends = useRuntime ? rtEnds : ResolvedShapeAttr(node, "_resolved_ends");
                 float[]? axes = useRuntime
@@ -3552,6 +3797,100 @@ public class GraphExecutor : IDisposable
 
             if (_dumpMatch != null) await DumpNodeOutputsAsync(nodeIdx, node, nodeOutputs);
 
+            // DIAGNOSTIC: name the FIRST node whose output goes non-finite. See FindFirstNonFinite.
+            if (FindFirstNonFinite && FirstNonFiniteNodeInfo == null)
+            {
+                // SHORT BUFFER FIRST, and it is the more useful of the two. A tensor whose SHAPE claims
+                // more elements than its BUFFER actually holds is the origin; the NaN scan below only
+                // finds the first CONSUMER that reads past the real data. Costs no readback - both
+                // numbers are already here - so it runs ahead of the expensive scan.
+                for (int i = 0; i < nodeOutputs.Length; i++)
+                {
+                    var st = nodeOutputs[i];
+                    if (st == null) continue;
+                    long declared = st.ElementCount, actual = st.Data.Length;
+                    if (declared > actual && FirstShortBufferNodeInfo == null)
+                    {
+                        FirstShortBufferNodeInfo =
+                            $"node {nodeIdx} '{node.OpType}' -> "
+                            + $"{(i < node.OutputNames.Length ? node.OutputNames[i] : "?")} "
+                            + $"shape[{string.Join(",", st.Shape)}] declares {declared} elements but the "
+                            + $"buffer holds {actual} ({declared - actual} short) "
+                            + $"| inputs: {string.Join(", ", node.InputNames)}";
+                        Console.WriteLine($"[GraphExecutor] FIRST SHORT BUFFER: {FirstShortBufferNodeInfo}");
+                    }
+                }
+
+                for (int i = 0; i < nodeOutputs.Length; i++)
+                {
+                    var t = nodeOutputs[i];
+                    if (t == null || t.ElementCount <= 0 || t.ElementCount > 8_000_000) continue;
+                    try
+                    {
+                        var host = t.Data.SubView(0, (int)t.ElementCount).GetAsArray1D();
+                        int bad = 0; int firstAt = -1;
+                        for (int k = 0; k < host.Length; k++)
+                            if (float.IsNaN(host[k]) || float.IsInfinity(host[k]))
+                            { bad++; if (firstAt < 0) firstAt = k; }
+                        if (bad > 0)
+                        {
+                            // The node's INPUTS with real element counts. An op that cannot change
+                            // element count (Transpose, Reshape) whose input holds fewer elements than
+                            // its output shape declares IS the shape-inference bug, and the input count
+                            // is the number that says so.
+                            var inInfo = new List<string>();
+                            for (int k = 0; k < nodeInputs.Length; k++)
+                            {
+                                var it = nodeInputs[k];
+                                var nm = k < node.InputNames.Length ? node.InputNames[k] : "?";
+                                inInfo.Add(it == null ? $"{nm}=null"
+                                    : $"{nm} shape[{string.Join(",", it.Shape)}] declared={it.ElementCount} buffer={it.Data.Length}");
+                            }
+                            FirstNonFiniteNodeInfo =
+                                $"node {nodeIdx} '{node.OpType}' -> "
+                                + $"{(i < node.OutputNames.Length ? node.OutputNames[i] : "?")} "
+                                + $"shape[{string.Join(",", t.Shape)}] declared={t.ElementCount} "
+                                + $"buffer={t.Data.Length} :: {bad}/{host.Length} non-finite "
+                                + $"(first at {firstAt})\n    INPUTS: {string.Join("\n            ", inInfo)}";
+                            Console.WriteLine($"[GraphExecutor] FIRST NON-FINITE: {FirstNonFiniteNodeInfo}");
+
+                            // The PRODUCER CHAIN, not the neighbours. Index adjacency is execution order,
+                            // which interleaves unrelated branches - the first attempt printed the time
+                            // embedding sitting between two attention nodes and said nothing. Walking
+                            // InputNames backwards follows the actual dataflow to the origin.
+                            Console.WriteLine("[GraphExecutor] producer chain (dataflow, nearest first):");
+                            var producerOf = new Dictionary<string, int>();
+                            for (int n = 0; n < _graph.Nodes.Length; n++)
+                                foreach (var on in _graph.Nodes[n].OutputNames)
+                                    if (!string.IsNullOrEmpty(on)) producerOf.TryAdd(on, n);
+
+                            var seen = new HashSet<string>();
+                            var queue = new Queue<string>();
+                            foreach (var nm in node.InputNames) if (!string.IsNullOrEmpty(nm)) queue.Enqueue(nm);
+                            for (int printed = 0; printed < 24 && queue.Count > 0; )
+                            {
+                                var nm = queue.Dequeue();
+                                if (!seen.Add(nm)) continue;
+                                var shp = tensors.TryGetValue(nm, out var pt) && pt != null
+                                    ? $"[{string.Join(",", pt.Shape)}] n={pt.ElementCount}"
+                                    : "(released)";
+                                if (producerOf.TryGetValue(nm, out var pIdx))
+                                {
+                                    var pn = _graph.Nodes[pIdx];
+                                    Console.WriteLine($"    {pIdx,4} {pn.OpType,-22} {nm} {shp}");
+                                    printed++;
+                                    foreach (var inNm in pn.InputNames)
+                                        if (!string.IsNullOrEmpty(inNm)) queue.Enqueue(inNm);
+                                }
+                                else { Console.WriteLine($"    init/input           {nm} {shp}"); printed++; }
+                            }
+                            break;
+                        }
+                    }
+                    catch { /* a tensor we cannot read back tells us nothing; keep scanning */ }
+                }
+            }
+
             // First step (or shape changed): retain this Shape output buffer so later steps reuse it.
             // refCounts=MaxValue keeps it out of the pool's return path for the rest of this run AND
             // marks it retained; it's freed when the pool is disposed (BufferPool tracks _allBuffers).
@@ -4032,6 +4371,11 @@ public class GraphExecutor : IDisposable
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _readbackStaging?.Dispose(); _readbackStaging = null;
+        if (_retiredReadbackStaging != null)
+        {
+            foreach (var b in _retiredReadbackStaging) { try { b.Dispose(); } catch { } }
+            _retiredReadbackStaging = null;
+        }
         _ew.Dispose();
         _precisionAware.Dispose();
         _normalization.Dispose();

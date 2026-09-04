@@ -2,6 +2,71 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.9 (2026-09-04)
+
+### Fixed - compile-time output shapes were used as runtime truth, so a dynamic graph read memory nobody wrote
+
+`GraphCompiler` sets each node's `OutputShapes` once, from `op.InferOutputShapes(inputShapes, attrs)` on
+the shapes it can see at compile time. `GraphExecutor` then began every node with
+
+```csharp
+int[][] runtimeOutputShapes = node.OutputShapes;   // a PREDICTION
+```
+
+and corrected it only through per-op special cases for the operators known to move at runtime - Slice,
+Reshape, Expand, Pad, Conv, Resize, Squeeze, Range. **Every other operator kept the prediction.** A
+shape-PRESERVING operator handed a larger tensor than the compiler saw therefore declared an output
+smaller than its own input, its buffer was allocated to the declared size, and the surplus was never
+written. Nothing downstream can detect that: the consumer simply reads whatever the pool left behind.
+
+MEASURED on ZipVoice's `fm_decoder` at 1210 frames (past the 1000 the precomputed `[1999,48]`
+relative-position table covers, so the `If` takes its else branch):
+
+```
+130 Unsqueeze              .../encoder_pos/Unsqueeze_35_output_0            [1,2419,48] n=116112  correct
+133 DynamicQuantizeLinear  .../encoder_pos/Unsqueeze_35_output_0_quantized  [1,210,48]  n=10080   WRONG
+146 Transpose              .../self_attn_weights/Transpose_3_output_0       [4,1,4,2419] declared=38704
+                           -> 35344/38704 non-finite, first at 3360
+```
+
+`DynamicQuantizeLinear` is elementwise and its own `InferOutputShapes` returns `inputs[0]` - the operator
+was right; the executor never asked it again. 2419 is 2N-1 for N=1210; 210 was the prediction from a
+shorter utterance.
+
+**The fix.** `CompiledNode.CompileTimeInputShapes` records the input shapes the prediction was based on.
+When a run's actual input shapes differ from that basis, the executor re-infers through the operator's
+own `InferOutputShapes`. This is a no-op whenever the shapes match compile time - the same function on
+the same inputs - so static-shape models are bit-identical; it fires only on genuinely dynamic shapes.
+
+Verified end to end by speaking and reading the result back with Whisper
+(`SpawnDev.AI` `AiVoiceTests.SpokenReplyIsIntelligibleWhenReadBack`):
+
+| line | before | after |
+|---|---|---|
+| WebGPU 41 / 63 / 82 / 92 chars | 100 / 100 / 100 / 94% | 100% |
+| WebGPU 123 chars | **0%** - Whisper heard `[MUSIC PLAYING]` | **100%**, verbatim, WER 0.00 |
+| CUDA 123 chars | `an illegal memory access was encountered` | 95% |
+| WebGPU 123-char synthesis | 68.8 s | 34.3 s |
+
+WebGPU clamps out-of-bounds reads per spec, which is why the same defect crashed CUDA and merely spoke
+confident nonsense in the browser - and why every existing gate, asserting peak/RMS/duration only,
+stayed green through all of it.
+
+### Added - diagnostics for silent wrong-answer paths (all default-off)
+
+- `ML_FIND_NAN=1` -> `GraphExecutor.FirstNonFiniteNodeInfo`: names the first node whose output goes
+  non-finite, with each input's declared-vs-buffer element count, plus a producer-chain walk that
+  follows `InputNames` backwards. Pair it with `ML_POISON_RENT=1`, which is what turns "plausible
+  garbage" into infinities in the first place.
+- `GraphExecutor.FirstShortBufferNodeInfo`: a tensor whose shape declares more elements than its buffer
+  holds.
+- `GraphExecutor.SliceAttrFallbackCount` / `LastSliceAttrFallbackInfo`: counts Slices that resolved their
+  window from compile-time attributes because runtime values were absent - the silent wrong-answer path
+  described in the executor's own remarks.
+- `WebGPUGraphCapture.ReclaimGenerationAtCapture` / `InvalidatedByReclaim`: a recorded plan's bind groups
+  reference pooled buffers, and `BufferPool.DisposeBucketedBuffers` can free them underneath it; a replay
+  after that surfaces only as "[Buffer (unlabeled)] used in submit while destroyed".
+
 ## 5.2.8 (2026-09-02)
 
 ### Fixed - a ZipVoice reference clip's SILENCE was being cloned as slow speech
