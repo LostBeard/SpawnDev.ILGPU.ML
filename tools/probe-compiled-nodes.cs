@@ -14,6 +14,21 @@ using SpawnDev.ILGPU.ML.Onnx;
 //
 // No accelerator needed: this runs the parse -> ModelGraph -> GraphOptimizer path, which is where node
 // elimination happens. (Creating an ILGPU Context needs Reflection.Emit, which file-based apps disable.)
+//
+// 🔴 THIS PROBE IS A MODEL OF THE COMPILE PATH, NOT AN OBSERVATION OF IT. It has been wrong three times:
+//   * it reported 1,579 nodes for ZipVoice's text encoder where the running app reported 1,567;
+//   * it predicted Whisper's decoder at 478 nodes where the session compiled 465;
+//   * it reported "Pow exponent not a known 2" for EVERY LayerNorm candidate, concluding the fusion could
+//     not fire - and at runtime it fires on all of them.
+//
+// The last one is the instructive failure and it is structural, not a bug here: InferenceSession populates
+// ModelGraph.ConstantData by READING SMALL INITIALIZERS OFF THE GPU before it calls Compile. This probe
+// never loads weights, so ConstantData is empty and every constant-dependent decision in the optimizer
+// takes its "value unknown" branch.
+//
+// USE THIS FOR STRUCTURE ONLY - op histograms, which patterns exist, how many candidates there are. For
+// any claim about node COUNT or about whether a constant-dependent pass fires, read
+// TranscriptionResult.EncoderNodeCount / DecoderNodeCount from a real run instead.
 var dir = Path.Combine(Path.GetTempPath(), "spawndev-onnx-probe");
 foreach (var f in new[] { "main_onnx_decoder_with_past_model.onnx", "main_onnx_encoder_model.onnx",
                           "main_zipvoice_distill_fm_decoder_int8.onnx", "main_zipvoice_distill_text_encoder_int8.onnx" })
@@ -29,6 +44,8 @@ foreach (var f in new[] { "main_onnx_decoder_with_past_model.onnx", "main_onnx_e
     Console.WriteLine($"  nodes {before} -> {opt.Nodes.Count}");
     Console.WriteLine($"  before: {beforeHist}");
     Console.WriteLine($"  after : {Hist(opt)}");
+    Console.WriteLine("  layernorm rejects: " + string.Join(", ",
+        GraphOptimizer.LastLayerNormRejects.OrderByDescending(k => k.Value).Select(k => $"{k.Key} x{k.Value}")));
 }
 
 static string Hist(ModelGraph g) => string.Join("  ", g.Nodes.GroupBy(n => n.OpType)

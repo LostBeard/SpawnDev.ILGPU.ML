@@ -58,6 +58,11 @@ public static class GraphOptimizer
         int eliminated = EliminateIdentityNodes(optimized);
 
         // Pass 3: Fuse MatMul → Add (bias) → Activation into FusedLinear
+        // LayerNorm FIRST: it matches a nine-node primitive chain, and the later passes rewrite some of
+        // those same nodes (FuseLinearLayers claims Add, strength reduction rewrites Mul/Div). Matching
+        // before they run keeps the pattern intact.
+        int fusedLayerNorm = FuseLayerNorm(optimized);
+
         int fusedLinear = FuseLinearLayers(optimized);
 
         // Pass 3b: Fuse a full decomposed self-attention subgraph (Q·Kᵀ → scale → [+zero-bias] → Softmax →
@@ -96,11 +101,202 @@ public static class GraphOptimizer
         // Pass 8: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
-        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes;
+        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
-            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
+            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {fusedLayerNorm} fused-layernorm, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
 
         return optimized;
+    }
+
+    /// <summary>
+    /// Fuse the nine-node LayerNorm formula back into one <c>LayerNormalization</c> node.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Opset 14 has no <c>LayerNormalization</c> operator, so exporters emit the whole formula as
+    /// primitives. MEASURED on Whisper's <c>decoder_with_past</c>: the chain below appears 13 times, so
+    /// <b>117 of the 465 nodes a decode step walks - 25% - are one operator written out longhand</b>. This
+    /// engine already has both a <c>LayerNormOperator</c> and a row-wise <c>LayerNormKernel</c>; the
+    /// optimizer fused Linear, Attention and ScaledMatMul and had no LayerNorm pass at all.
+    /// </para>
+    /// <para>
+    /// The exact shape, read off the graph rather than assumed (tools/probe-layernorm-pattern.cs):
+    /// <code>
+    ///   mean = ReduceMean(x)          d   = Sub(x, mean)      d2  = Pow(d, 2)
+    ///   var  = ReduceMean(d2)         ve  = Add(var, eps)     std = Sqrt(ve)
+    ///   n    = Div(d, std)            s   = Mul(n, weight)    y   = Add(s, bias)
+    /// </code>
+    /// </para>
+    /// <para>
+    /// ⚠️ WHY THIS IS WORTH MORE THAN THE NODE COUNT SUGGESTS, and why Constant elimination was not:
+    /// Constants are ~36% of the node count and almost none of the node TIME - an empty Execute, nothing
+    /// rented, nothing dispatched - so removing 284 of them moved a decode step by 4%. These nine are all
+    /// REAL work: nine dispatches, nine sets of pool traffic and shape interpretation, replaced by one.
+    /// At the ~1 ms per real node this engine costs in a browser, that is the difference.
+    /// </para>
+    /// <para>
+    /// ⚠️ Every link is single-consumer checked. A partially-shared chain is not this pattern - some
+    /// exports reuse the mean or the normalised value elsewhere - and fusing one would silently drop a
+    /// consumer's input.
+    /// </para>
+    /// </remarks>
+    /// <summary>Where FuseLayerNorm declined, by reason - a fusion that silently does nothing must say why.</summary>
+    public static Dictionary<string, int> LastLayerNormRejects = new();
+
+    private static int FuseLayerNorm(ModelGraph graph)
+    {
+        var rej = new Dictionary<string, int>();
+        void No(string why) { rej[why] = rej.GetValueOrDefault(why) + 1; }
+        LastLayerNormRejects = rej;
+        int fused = 0;
+        var remove = new HashSet<int>();
+
+        var producer = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < graph.Nodes.Count; i++)
+            foreach (var o in graph.Nodes[i].Outputs)
+                if (!string.IsNullOrEmpty(o)) producer[o] = i;
+
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp))
+                    consumers[inp] = consumers.GetValueOrDefault(inp, 0) + 1;
+
+        // The single consumer of `name`, or -1 when it is shared, dead, or already claimed.
+        int SoleConsumer(string name, string expectedOp)
+        {
+            if (consumers.GetValueOrDefault(name, 0) != 1) return -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j)) continue;
+                if (graph.Nodes[j].Inputs.Contains(name))
+                    return graph.Nodes[j].OpType == expectedOp ? j : -1;
+            }
+            return -1;
+        }
+
+        for (int i = 0; i < graph.Nodes.Count; i++)
+        {
+            if (remove.Contains(i)) continue;
+            var meanNode = graph.Nodes[i];
+            if (meanNode.OpType != "ReduceMean" || meanNode.Inputs.Count < 1) continue;
+            No("candidates");
+            var x = meanNode.Inputs[0];
+            var meanOut = meanNode.Outputs.Count > 0 ? meanNode.Outputs[0] : null;
+            if (string.IsNullOrEmpty(x) || string.IsNullOrEmpty(meanOut)) continue;
+
+            // mean -> Sub(x, mean)
+            int subIdx = SoleConsumer(meanOut, "Sub");
+            if (subIdx < 0) { No("mean not solely consumed by Sub"); continue; }
+            var sub = graph.Nodes[subIdx];
+            if (sub.Inputs.Count != 2 || sub.Inputs[0] != x || sub.Inputs[1] != meanOut) { No("Sub is not (x, mean)"); continue; }
+            var d = sub.Outputs[0];
+
+            // d feeds exactly two consumers: Pow (variance branch) and Div (normalise branch).
+            if (consumers.GetValueOrDefault(d, 0) != 2) { No("d consumers != 2 (=" + consumers.GetValueOrDefault(d, 0) + ")"); continue; }
+            int powIdx = -1, divIdx = -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j) || !graph.Nodes[j].Inputs.Contains(d)) continue;
+                if (graph.Nodes[j].OpType == "Pow") powIdx = j;
+                else if (graph.Nodes[j].OpType == "Div") divIdx = j;
+            }
+            if (powIdx < 0 || divIdx < 0) { No("d does not feed Pow and Div"); continue; }
+
+            // Pow's exponent must be 2 - anything else is not a variance.
+            var pow = graph.Nodes[powIdx];
+            if (pow.Inputs.Count != 2 || pow.Inputs[0] != d) continue;
+            if (!TryConstScalar(graph, pow.Inputs[1], out var exponent) || Math.Abs(exponent - 2f) > 1e-6f)
+            { No("Pow exponent not a known 2"); continue; }
+
+            int varIdx = SoleConsumer(pow.Outputs[0], "ReduceMean");
+            if (varIdx < 0) { No("Pow not solely consumed by ReduceMean"); continue; }
+            int epsIdx = SoleConsumer(graph.Nodes[varIdx].Outputs[0], "Add");
+            if (epsIdx < 0) { No("var not solely consumed by Add"); continue; }
+            var epsAdd = graph.Nodes[epsIdx];
+            if (epsAdd.Inputs.Count != 2) continue;
+            var epsName = epsAdd.Inputs[0] == graph.Nodes[varIdx].Outputs[0] ? epsAdd.Inputs[1] : epsAdd.Inputs[0];
+            if (!TryConstScalar(graph, epsName, out var epsilon)) { No("epsilon not a known constant"); continue; }
+
+            int sqrtIdx = SoleConsumer(epsAdd.Outputs[0], "Sqrt");
+            if (sqrtIdx < 0) { No("eps-Add not solely consumed by Sqrt"); continue; }
+
+            // Div must be d / std, in that order - std / d is a different function entirely.
+            var div = graph.Nodes[divIdx];
+            if (div.Inputs.Count != 2 || div.Inputs[0] != d
+                || div.Inputs[1] != graph.Nodes[sqrtIdx].Outputs[0]) { No("Div is not (d, std)"); continue; }
+
+            // Tail: Mul by the weight, then Add the bias. Both must be initializers - a runtime scale is
+            // not a LayerNorm parameter and the kernel takes them as weights.
+            int mulIdx = SoleConsumer(div.Outputs[0], "Mul");
+            if (mulIdx < 0) { No("Div not solely consumed by Mul"); continue; }
+            var mul = graph.Nodes[mulIdx];
+            if (mul.Inputs.Count != 2) continue;
+            var weight = mul.Inputs[0] == div.Outputs[0] ? mul.Inputs[1] : mul.Inputs[0];
+            if (!graph.Initializers.ContainsKey(weight)) { No("weight not an initializer"); continue; }
+
+            int biasIdx = SoleConsumer(mul.Outputs[0], "Add");
+            if (biasIdx < 0) { No("Mul not solely consumed by Add"); continue; }
+            var biasAdd = graph.Nodes[biasIdx];
+            if (biasAdd.Inputs.Count != 2) continue;
+            var bias = biasAdd.Inputs[0] == mul.Outputs[0] ? biasAdd.Inputs[1] : biasAdd.Inputs[0];
+            if (!graph.Initializers.ContainsKey(bias)) { No("bias not an initializer"); continue; }
+
+            // The normalised axis comes from the ReduceMean that produced the mean. ONNX allows `axes` as
+            // an attribute (opset < 18) or as input 1; only the attribute form is handled, and a chain
+            // whose axes cannot be read is left alone rather than guessed at.
+            int axis;
+            if (meanNode.Attributes != null && meanNode.Attributes.TryGetValue("axes", out var axesEl))
+            {
+                var axes = ReadIntList(axesEl);
+                if (axes.Count != 1) continue;     // LayerNorm normalises one trailing axis
+                axis = axes[0];
+            }
+            else { No("ReduceMean has no axes attribute"); continue; }
+
+            var lnNode = new GraphNode
+            {
+                OpType = "LayerNormalization",
+                Inputs = new List<string> { x, weight, bias },
+                Outputs = new List<string> { biasAdd.Outputs[0] },
+                Attributes = new Dictionary<string, JsonElement>
+                {
+                    ["axis"] = JsonSerializer.SerializeToElement(axis),
+                    ["epsilon"] = JsonSerializer.SerializeToElement(epsilon),
+                },
+            };
+
+            graph.Nodes[i] = lnNode;
+            foreach (var idx in new[] { subIdx, powIdx, varIdx, epsIdx, sqrtIdx, divIdx, mulIdx, biasIdx })
+                remove.Add(idx);
+            fused++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(v => v)) graph.Nodes.RemoveAt(idx);
+        return fused;
+    }
+
+    /// <summary>Read a 1-element constant (initializer or folded value) as a float, if it is known.</summary>
+    private static bool TryConstScalar(ModelGraph graph, string name, out float value)
+    {
+        value = 0f;
+        if (string.IsNullOrEmpty(name)) return false;
+        if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(name, out var f)
+            && f.Length == 1) { value = f[0]; return true; }
+        if (graph.ConstantData != null && graph.ConstantData.TryGetValue(name, out var iv)
+            && iv.Length == 1) { value = iv[0]; return true; }
+        return false;
+    }
+
+    /// <summary>Read an attribute that is a single int or a list of ints.</summary>
+    private static List<int> ReadIntList(JsonElement el)
+    {
+        var list = new List<int>();
+        if (el.ValueKind == JsonValueKind.Number) list.Add(el.GetInt32());
+        else if (el.ValueKind == JsonValueKind.Array)
+            foreach (var item in el.EnumerateArray())
+                if (item.ValueKind == JsonValueKind.Number) list.Add(item.GetInt32());
+        return list;
     }
 
     /// <summary>
