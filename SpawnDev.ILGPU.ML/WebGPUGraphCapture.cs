@@ -60,6 +60,35 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// </remarks>
     public static int ScalarParamWritesDuringCapture { get; private set; }
 
+    /// <summary>
+    /// When set, <see cref="TryCaptureAsync"/> copies the capture pass's FIRST output to the host before
+    /// anything else can touch it, into <see cref="CapturePassOutput"/>. Diagnostic; default off.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 WHY THIS HAD TO EXIST. Nothing could observe the capture pass's own result. The obvious way to
+    /// look at it - call the session and read what comes back - does NOT return it:
+    /// <c>SessionGraphCapture.RunAsync</c> ends with
+    /// <c>if (_webGpu != null) return await _webGpu.ReplayAsync(inputs)</c>, so the call that performs the
+    /// capture returns a REPLAY. Every value anyone has called "the capture pass" since 2026-09-03 was a
+    /// replay result, including the one the fidelity test prints under the heading "both are ordinary
+    /// forwards, so a difference here is not about replay at all". It is entirely about replay.
+    /// <para>
+    /// The consequence was a whole day spent looking for arithmetic that goes wrong under the capture
+    /// regime. It does not: MEASURED 2026-09-04, all 4,873 probed node outputs of the real capture pass
+    /// match a plain forward, and its LAST node agrees to the digit
+    /// (<c>[0.238362,0.349662,0.372184,0.181907]</c>) while the value handed back differs
+    /// (<c>[-0.797333,0.443003,0.288282,-0.534283]</c>). The capture pass computes the right answer.
+    /// </para>
+    /// <para>
+    /// Read here, between the capture forward and the <c>finally</c> that lifts SuppressDrains, so the
+    /// sample cannot be blamed on pool recycling afterwards.
+    /// </para>
+    /// </remarks>
+    public static bool RecordCapturePassOutput { get; set; }
+
+    /// <summary>The capture pass's own first output, host-side. See <see cref="RecordCapturePassOutput"/>.</summary>
+    public static float[]? CapturePassOutput { get; private set; }
+
     /// <summary>The stable output tensors the captured plan writes (also returned by ReplayAsync).</summary>
     public IReadOnlyDictionary<string, Tensor> Outputs => _outputs;
 
@@ -202,6 +231,31 @@ public sealed class WebGPUGraphCapture : IDisposable
             }
             webGpu.EndDispatchCapture();
             await acc.SynchronizeAsync();
+
+            // Read the capture pass's OWN result while it is still the only thing that has run. See
+            // RecordCapturePassOutput for why no caller can otherwise see this value: the enclosing
+            // SessionGraphCapture.RunAsync returns a REPLAY, not this.
+            CapturePassOutput = null;
+            if (RecordCapturePassOutput && capOut.Count > 0)
+            {
+                try
+                {
+                    var first = capOut.Values.First();
+                    int n = first.ElementCount;
+                    if (n > 0)
+                    {
+                        using var sample = acc.Allocate1D<float>(n);
+                        await sample.View.CopyFromAsync(first.Data.SubView(0, n));
+                        await acc.SynchronizeAsync();
+                        CapturePassOutput = await sample.CopyToHostAsync<float>(0, n);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // A diagnostic must never decide whether a capture succeeds.
+                    Console.WriteLine($"[WebGPUGraphCapture] capture-pass output sample failed: {ex.Message}");
+                }
+            }
 
             // ⚠️ HOST WRITES INSIDE THE WINDOW ARE MISSING WORK, and they are silent. A plan records
             // dispatches, buffer-to-buffer copies and clears - all command-encoder work. A

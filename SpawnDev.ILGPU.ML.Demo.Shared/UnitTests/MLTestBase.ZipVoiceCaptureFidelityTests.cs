@@ -163,6 +163,77 @@ public abstract partial class MLTestBase
                             + $"'{label}': {d} of {count} differ (worst {w:F6})");
         }
 
+        // ── 0a2. IS THE RECORDING ITSELF THE VARIABLE? ───────────────────────────────────────────────
+        //
+        // ⚠️ THIS IS THE ONE DIFFERENCE THE BISECT ABOVE STRUCTURALLY CANNOT SEE. Every regime above is a
+        // plain forward with flags flipped, and 0b's window sweep is a hand-rolled emulation of the capture
+        // regime - warm x2 + the arena + SuppressDrains - which is CLEAN at every window. Meanwhile the
+        // REAL WebGPUGraphCapture.TryCaptureAsync pass disagrees with a plain forward in all 16,900 values.
+        // Something the real path does is not in the emulation, and the candidates are exactly three:
+        // MaxPendingReleaseBytes = 64 MiB, a SynchronizeAsync after each warm pass, and an ACTIVE
+        // BeginDispatchCapture around the forward. The first two are cheap to add; the third cannot be
+        // expressed as a flag, so it needs this.
+        //
+        // The experiment: run the SAME forward under the SAME regime, once with a plan recording and once
+        // without, and compare. Recording is supposed to be a passive observer - it appends pipeline and
+        // bind-group handles to a JS array - so a difference here means it is not passive, and that is the
+        // whole bug. The plan is discarded either way; nothing is replayed, so a difference cannot be
+        // blamed on replay.
+        //
+        // ⚠️ 8,141 host writes happen inside this window and ALL of them are the benign retained
+        // scalar-params upload (unreplayable work = 0, MEASURED 2026-09-04). So this is NOT re-testing the
+        // missing-work theory - that one is already dead, and this is what is left.
+        if (accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator webGpuProbe)
+        {
+            Graph.GraphExecutor.UseCaptureParamSlots = true;
+            Kernels.FusedAttentionKernel.UseStableCaptureSlots = true;
+            var prevRelease = Graph.GraphExecutor.MaxPendingReleaseBytes;
+            Graph.GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
+            try
+            {
+                // Prime exactly as TryCaptureAsync does - warm A, sync, warm B, sync - so the arena slots
+                // and pool buckets are in the state the real capture pass finds them in.
+                await graphs.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+                await accelerator.SynchronizeAsync();
+                await graphs.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+                await accelerator.SynchronizeAsync();
+
+                // (i) the regime WITHOUT a recording - the emulation, which is known clean.
+                Graph.GraphExecutor.SuppressDrains = true;
+                float[] noRecord;
+                try { noRecord = await graphs.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim); }
+                finally { Graph.GraphExecutor.SuppressDrains = false; }
+
+                // (ii) the identical regime WITH a recording active. Plan discarded, never replayed.
+                Graph.GraphExecutor.SuppressDrains = true;
+                float[] recorded;
+                var probePlan = webGpuProbe.BeginDispatchCapture();
+                try { recorded = await graphs.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim); }
+                finally
+                {
+                    Graph.GraphExecutor.SuppressDrains = false;
+                    try { webGpuProbe.EndDispatchCapture().Dispose(); } catch { }
+                }
+                await accelerator.SynchronizeAsync();
+
+                var (nrD, nrW) = Compare(directCapture, noRecord);
+                var (rD, rW) = Compare(directCapture, recorded);
+                var (rvD, rvW) = Compare(noRecord, recorded);
+                Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] RECORDING ISOLATION: "
+                    + $"same regime, plan discarded | without recording {nrD} of {count} differ (worst {nrW:F6}) "
+                    + $"| WITH recording {rD} differ (worst {rW:F6}) | the two against each other {rvD} differ "
+                    + $"(worst {rvW:F6}) | plan saw {probePlan.DispatchCount} dispatch(es), "
+                    + $"{probePlan.HostWriteCount} host write(s) of which {probePlan.ScalarParamWriteCount} scalar-params "
+                    + $"=> unreplayable {probePlan.HostWriteCount - probePlan.ScalarParamWriteCount}");
+            }
+            finally
+            {
+                Graph.GraphExecutor.MaxPendingReleaseBytes = prevRelease;
+                Graph.GraphExecutor.UseCaptureParamSlots = false;
+                Kernels.FusedAttentionKernel.UseStableCaptureSlots = false;
+            }
+        }
+
         // ── 0b. WHERE does the capture regime first diverge? ─────────────────────────────────────────
         //
         // ⚠️ ARMING THE PROBE EVERYWHERE MAKES THE FAILING RUN PASS. It synchronizes after every node, and
@@ -257,18 +328,116 @@ public abstract partial class MLTestBase
         // and only the third is "a replay". If the CAPTURE PASS itself already disagrees with the direct
         // forward, the plan is a recording of the wrong computation and the replay is faithfully repeating
         // it, which is a completely different bug from a replay that loses work.
+        // ⚠️ PROBE THE **REAL** CAPTURE PASS, NOT AN EMULATION OF IT. Everything the emulation above can
+        // express is now CLEAN by measurement - each regime flag alone, all of them together, the warm
+        // priming, the runtime-constant seed (the warm passes DO snapshot it: the condition is
+        // UseCaptureParamSlots && !SuppressDrains), an active recording, and unreplayable host writes
+        // (0 of 8,141). Yet TryCaptureAsync's capture pass still disagrees with a plain forward in all
+        // 16,900 values. So the difference is inside the real path, and the per-node probe - which named
+        // Range_1_output_0 on 2026-09-03 - had only ever been pointed at the emulation.
+        //
+        // The reference is re-recorded here rather than reused from 0b so this block stands alone.
+        Graph.GraphExecutor.NodeProbeFromIndex = 0;
+        Graph.GraphExecutor.NodeProbeFirst64 = new System.Collections.Generic.Dictionary<string, float[]>();
+        Graph.GraphExecutor.NodeProbeOrder = new System.Collections.Generic.List<string>();
+        graphs.EnableGraphCapture = false;
+        await graphs.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+        var realRefProbe = Graph.GraphExecutor.NodeProbeFirst64!;
+        var realRefOrder = Graph.GraphExecutor.NodeProbeOrder!;
+        Graph.GraphExecutor.NodeProbeOrder = null;
+        WebGPUGraphCapture.RecordCapturePassOutput = true;
+        graphs.EnableGraphCapture = true;
+
         var observePass = await graphs.RunDecoderAsync(
             tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+
+        // Armed across the capture call. TryCaptureAsync runs warm A, warm B and then the capture pass, so
+        // the surviving values are the CAPTURE pass's (last writer wins) - which is exactly the pass under
+        // suspicion. ⚠️ If probing everything HEALS the real capture the way it heals the emulation, that
+        // is itself the finding: the fault is an ordering hazard, and the window has to be walked back.
+        Graph.GraphExecutor.NodeProbeFirst64 = new System.Collections.Generic.Dictionary<string, float[]>();
         var capturePass = await graphs.RunDecoderAsync(
             tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+        var realCapProbe = Graph.GraphExecutor.NodeProbeFirst64!;
+        Graph.GraphExecutor.NodeProbeFirst64 = null;
+        Graph.GraphExecutor.NodeProbeFromIndex = 0;
+        {
+            int idx = -1; string nm = ""; string detail = "";
+            for (int i = 0; i < realRefOrder.Count; i++)
+            {
+                var n = realRefOrder[i];
+                if (!realCapProbe.TryGetValue(n, out var b) || !realRefProbe.TryGetValue(n, out var a)) continue;
+                bool same = a.Length == b.Length;
+                for (int k = 0; same && k < a.Length; k++) if (a[k] != b[k]) same = false;
+                if (same) continue;
+                idx = i; nm = n;
+                detail = $"plain [{string.Join(",", a.Take(4).Select(v => v.ToString("G6")))}] vs capture "
+                       + $"[{string.Join(",", b.Take(4).Select(v => v.ToString("G6")))}]";
+                break;
+            }
+            Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] REAL CAPTURE probe: "
+                + $"{realRefOrder.Count} reference nodes, {realCapProbe.Count} probed in the capture call; "
+                + (idx < 0 ? "NO probed node differs"
+                           : $"first differing node #{idx} '{nm}' {detail}"));
+
+            // ⚠️ THE CONTRADICTION THIS RESOLVES. "No probed node differs" and "the returned output differs
+            // in ALL 16,900 values" cannot both be about the same numbers unless the output the CALLER gets
+            // is not the output the last node WROTE. The probe reads only the first
+            // MaxSmallReadbackElements (64) of each node - but the output differs everywhere, first 64
+            // included, and the graph's own output IS one of the probed nodes. So the two readings are of
+            // DIFFERENT things, and the difference is introduced after the node loop, when the result is
+            // extracted.
+            //
+            // Prime suspect: under SuppressDrains the pool's release is DEFERRED, so the buffer backing the
+            // returned tensor can be recycled and rewritten before the caller copies it out. That would
+            // corrupt the whole tensor while leaving every node's own write correct - exactly this shape.
+            //
+            // Printing the same four values from three places is what separates them. If TAIL matches PLAIN
+            // and RETURNED does not, the computation is right and the extraction is wrong.
+            var lastNode = realRefOrder.Count > 0 ? realRefOrder[^1] : null;
+            string tailRef = lastNode != null && realRefProbe.TryGetValue(lastNode, out var tr)
+                ? string.Join(",", tr.Take(4).Select(v => v.ToString("G6"))) : "(none)";
+            string tailCap = lastNode != null && realCapProbe.TryGetValue(lastNode, out var tc)
+                ? string.Join(",", tc.Take(4).Select(v => v.ToString("G6"))) : "(none)";
+            Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] OUTPUT EXTRACTION: "
+                + $"last node '{lastNode}' | plain-tail [{tailRef}] | capture-tail [{tailCap}] | "
+                + $"plain-RETURNED [{string.Join(",", directCapture.Take(4).Select(v => v.ToString("G6")))}] | "
+                + $"capture-RETURNED [{string.Join(",", capturePass.Take(4).Select(v => v.ToString("G6")))}]");
+        }
+
         var replaySame = await graphs.RunDecoderAsync(
             tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
         var (obsDiff, obsWorst) = Compare(directCapture, observePass);
         var (capDiff, capWorst) = Compare(directCapture, capturePass);
+        // 🔴 THIS LINE USED TO SAY "both are ordinary forwards, so a difference here is not about replay at
+        // all", AND THAT WAS EXACTLY BACKWARDS. `capturePass` is the value returned by the call that
+        // performs the capture - and SessionGraphCapture.RunAsync ends with
+        //     if (_webGpu != null) return await _webGpu.ReplayAsync(inputs);
+        // so that call returns a REPLAY. Naming it the capture pass sent 2026-09-03 and most of 2026-09-04
+        // looking for arithmetic that goes wrong under the capture regime; there is none. MEASURED: all
+        // 4,873 probed node outputs of the real capture pass match a plain forward, and the true capture
+        // output read inside TryCaptureAsync (below) is the thing to compare.
         Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] "
                         + $"observe pass: {obsDiff} differ (worst {obsWorst:F6}) | "
-                        + $"CAPTURE pass: {capDiff} differ (worst {capWorst:F6}) "
-                        + "- both are ordinary forwards, so a difference here is not about replay at all");
+                        + $"post-capture call (⚠️ A REPLAY, not the capture pass): {capDiff} differ "
+                        + $"(worst {capWorst:F6})");
+        // The capture pass's OWN output, read between the capture forward and the pool releases.
+        if (WebGPUGraphCapture.CapturePassOutput is { } capOwn)
+        {
+            var (ownDiff, ownWorst) = Compare(directCapture, capOwn);
+            Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] TRUE CAPTURE "
+                + $"PASS output ({capOwn.Length} values, read inside TryCaptureAsync): {ownDiff} differ "
+                + $"(worst {ownWorst:F6}) => "
+                + (ownDiff == 0
+                    ? "the capture pass is CORRECT; the fault is in REPLAY, and it is not missing host writes "
+                      + "(unreplayable work measured 0)"
+                    : "the capture pass itself is wrong - the regime bisect above is the place to look"));
+        }
+        else
+        {
+            Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] TRUE CAPTURE "
+                + "PASS output: NOT RECORDED (RecordCapturePassOutput was off, or capture never went live)");
+        }
         Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] capture LIVE: "
                         + $"{graphs.DecoderCaptured} - {graphs.DecoderCaptureStatus}");
         // ⚠️ THE FIRST NUMBER TO READ when a replay does not reproduce its own capture. A plan records
