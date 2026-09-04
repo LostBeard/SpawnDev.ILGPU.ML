@@ -454,6 +454,43 @@ public abstract partial class MLTestBase
                         + $"(of which {WebGPUGraphCapture.ScalarParamWritesDuringCapture} are per-dispatch "
                         + "packed scalar params, which the plan RETAINS and are therefore benign) => "
                         + $"unreplayable work = {WebGPUGraphCapture.HostWritesDuringCapture - WebGPUGraphCapture.ScalarParamWritesDuringCapture}");
+        // ── 1b. IS THE MISSING WORK THE ELIDED DISPATCHES? ───────────────────────────────────────────
+        //
+        // The capture pass is correct and unreplayable host writes are zero, so the replay is missing work
+        // that is neither bad arithmetic nor a queue.writeBuffer. Dispatch-elide is the one mechanism that
+        // removes work from the plan BY DESIGN - a CPU-resolved shape op emits no dispatch, so the plan
+        // records nothing for it and its buffer keeps whatever an earlier pass left there.
+        //
+        // A fresh graphs instance, because capture is attempted once per session.
+        // ⚠️ This costs a second decoder session and ~1200 extra dispatches per replay. It is a DIAGNOSTIC
+        // A/B, not a proposed setting.
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
+        {
+            WebGPUGraphCapture.ElideDispatchDuringCapture = false;
+            try
+            {
+                using var noElide = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);
+                noElide.EnableGraphCapture = true;
+                noElide.AllowControlFlowCapture = true;
+                await noElide.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+                var neReplay = await noElide.RunDecoderAsync(
+                    tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+                var (neDiff, neWorst) = Compare(directCapture, neReplay);
+                Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] ELIDE A/B: "
+                    + $"captured with dispatch-elide OFF -> replay {neDiff} of {count} differ (worst {neWorst:F6}) "
+                    + $"| capture {(noElide.DecoderCaptured ? "LIVE" : "NOT live: " + noElide.DecoderCaptureStatus)} => "
+                    + (neDiff == 0
+                        ? "ELIDED DISPATCHES ARE THE MISSING WORK - record a write for each elided value "
+                          + "(the CaptureParamArena.CaptureConstWrite pattern)"
+                        : "elide is NOT the cause - look at buffers a WARM pass populated that the plan never rewrites"));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] ELIDE A/B failed: {ex.Message}");
+            }
+            finally { WebGPUGraphCapture.ElideDispatchDuringCapture = true; }
+        }
+
         if (!graphs.DecoderCaptured)
             throw new Exception("capture never went live, so there is no replay to check: "
                               + graphs.DecoderCaptureStatus);

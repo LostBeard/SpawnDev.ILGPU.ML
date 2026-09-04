@@ -89,6 +89,30 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// <summary>The capture pass's own first output, host-side. See <see cref="RecordCapturePassOutput"/>.</summary>
     public static float[]? CapturePassOutput { get; private set; }
 
+    /// <summary>
+    /// Whether the capture pass runs with <see cref="GraphExecutor.ShapeInterpElideDispatch"/> ON.
+    /// Default true (the shipping behaviour). Set false to A/B whether ELIDED dispatches are the work a
+    /// replay is missing.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY THIS IS THE NEXT EXPERIMENT. As of 2026-09-04 the capture pass is PROVEN correct (0 of
+    /// 16,900) and unreplayable host writes are PROVEN zero, so the replay is missing work that is neither
+    /// a host write nor bad arithmetic. Dispatch-elide is the one mechanism that removes work from the
+    /// plan BY DESIGN: a CPU-resolved shape op does not dispatch, so nothing is recorded for it, and its
+    /// buffer holds a value some earlier pass put there. That is fine for the capture pass - the value is
+    /// still sitting in the buffer - and it is exactly what a replay cannot reproduce once the pool has
+    /// handed that memory to something else.
+    /// <para>
+    /// Turning it off makes the captured plan the FULL forward (~1200 more dispatches per frame on
+    /// ZipVoice, so it costs replay speed). If the replay becomes faithful with it off, elided dispatches
+    /// are the missing work and the fix is to record a write for each elided value - the pattern
+    /// <c>CaptureParamArena.CaptureConstWrite</c> already implements for Range and Einsum. If the replay
+    /// is STILL wrong, elide is exonerated and the remaining suspects are the named/pooled buffers a
+    /// warm pass populated.
+    /// </para>
+    /// </remarks>
+    public static bool ElideDispatchDuringCapture { get; set; } = true;
+
     /// <summary>The stable output tensors the captured plan writes (also returned by ReplayAsync).</summary>
     public IReadOnlyDictionary<string, Tensor> Outputs => _outputs;
 
@@ -161,7 +185,7 @@ public sealed class WebGPUGraphCapture : IDisposable
         // (The old WebGPU gap - "Tensor not found" when a GPU consumer read an elided EMPTY value -
         // was fixed 2026-07-03: zero-length values are excluded from elide in GraphExecutor.elideSafe
         // and dispatch normally; gate = DA3_WebGPU_ElideOn_Forward.)
-        GraphExecutor.ShapeInterpElideDispatch = true;
+        GraphExecutor.ShapeInterpElideDispatch = ElideDispatchDuringCapture;
         GraphExecutor.ShapeInterpValidate = false;
         WebGPUBackend.EnableBindGroupCaching = false;
         // ⚠️ THE STABLE-SLOT ARENA IS A CUDA REQUIREMENT, NOT A WEBGPU ONE, and it is not free here.
