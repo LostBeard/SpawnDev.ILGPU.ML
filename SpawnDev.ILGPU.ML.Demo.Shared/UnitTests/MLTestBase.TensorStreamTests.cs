@@ -1,5 +1,6 @@
 using ILGPU;
 using System.Collections.Generic;
+using System.Threading;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
@@ -109,9 +110,44 @@ public abstract partial class MLTestBase
         for (int rep = 0; rep < 24; rep++)
             matMul.MatMul(a.View, b.View, c.View, M, K, N);
 
+        // 🔴 GC PRESSURE IS THE POINT, not device load. The defect this gates against was NOT an
+        // unfinished queue: MemoryBuffer.CopyToRawAsync handed clEnqueueReadBuffer (non-blocking) the raw
+        // address of a MOVABLE managed byte[] via Unsafe.AsPointer, which does not pin. Every await inside
+        // the chunk loop is a point where the GC may compact the heap and relocate that array, after which
+        // the DMA lands on the old address and the caller reads a clean run of zeros.
+        //
+        // MEASURED before the fix: "1024 of 5000 values wrong (1024 of them ZERO), chunks affected [2] of
+        // 5" - exactly ONE chunk zeroed with the chunks after it intact, which is the signature of a moved
+        // destination rather than a late one.
+        //
+        // So this hammers the allocator DURING the copy. Collections are forced rather than hoped for,
+        // because "it usually reproduces" is how this survived in the first place.
+        using var gcPressure = new CancellationTokenSource();
+        var churn = Task.Run(async () =>
+        {
+            var rnd = new Random(4242);
+            while (!gcPressure.IsCancellationRequested)
+            {
+                // Gen-0 churn plus periodic compacting collections - what actually moves a pinned-less
+                // buffer. The arrays are deliberately kept briefly so they survive into gen 1.
+                var keep = new List<byte[]>();
+                for (int k = 0; k < 64; k++) keep.Add(new byte[rnd.Next(4096, 65536)]);
+                GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                await Task.Yield();
+            }
+        });
+
         using var ms = new System.IO.MemoryStream();
-        await tensor.CopyToStreamAsync(ms, chunkSizeInBytes: 4096);
-        await accelerator.SynchronizeAsync();
+        try
+        {
+            await tensor.CopyToStreamAsync(ms, chunkSizeInBytes: 4096);
+            await accelerator.SynchronizeAsync();
+        }
+        finally
+        {
+            gcPressure.Cancel();
+            try { await churn; } catch { /* cancellation is the expected exit */ }
+        }
 
         var bytes = ms.ToArray();
         int expectedBytes = n * sizeof(float);
