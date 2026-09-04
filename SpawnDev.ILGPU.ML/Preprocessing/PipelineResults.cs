@@ -274,6 +274,16 @@ public class TranscriptionResult
     public int DecoderNodeCount { get; init; }
 
     /// <summary>
+    /// The decode step's compiled graph by op type, most numerous first. See
+    /// <see cref="InferenceSession.CompiledOpHistogram"/>.
+    /// </summary>
+    /// <remarks>⚠️ Carried on the RESULT so a caller measuring a transcription reports the graph the
+    /// session actually compiled, rather than the offline probe's model of it - the two are known to
+    /// disagree, and the probe never loads weights so it cannot fold anything constant-dependent.</remarks>
+    public IReadOnlyList<(string OpType, int Count)> DecoderOpHistogram { get; init; }
+        = System.Array.Empty<(string, int)>();
+
+    /// <summary>
     /// Wall time computing the log-mel spectrogram, in milliseconds.
     /// </summary>
     /// <remarks>

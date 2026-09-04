@@ -102,6 +102,30 @@ public class InferenceSession : IDisposable
     /// <summary>Number of nodes in the compiled graph.</summary>
     public int NodeCount => _compiled.Nodes.Length;
 
+    /// <summary>
+    /// How many nodes of each op type survive into the COMPILED graph, most numerous first.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY IT IS NOT ENOUGH TO KNOW THE TOTAL. <see cref="NodeCount"/> says the decode step of
+    /// whisper-tiny is 374 nodes; it cannot say whether the 271 <c>Constant</c> nodes the raw model carries
+    /// are among them, and per-node orchestration is what this engine's browser cost IS. The offline probe
+    /// (<c>tools/probe-compiled-nodes.cs</c>) can only model that, and its own remarks record three
+    /// occasions where its answer disagreed with the running session - it never loads weights, so every
+    /// constant-dependent decision in the optimizer takes its "value unknown" branch.
+    /// <para>
+    /// ⚠️ It also settles a question a PerOpSync profile cannot. That profile forces a device sync after
+    /// every node, so every op type lands at the same ~4.3 ms and the ranking degenerates into a node
+    /// COUNT wearing a millisecond label - which is how "Unsqueeze is 32.8% of the decode step" got read
+    /// as a cost rather than as a census. This IS the census, exactly.
+    /// </para>
+    /// </remarks>
+    public IReadOnlyList<(string OpType, int Count)> CompiledOpHistogram =>
+        _compiled.Nodes.GroupBy(n => n.OpType)
+            .Select(g => (OpType: g.Key, Count: g.Count()))
+            .OrderByDescending(x => x.Count)
+            .ThenBy(x => x.OpType, StringComparer.Ordinal)
+            .ToArray();
+
     /// <summary>Number of weight tensors loaded.</summary>
     public int WeightCount => _weights.Count;
 

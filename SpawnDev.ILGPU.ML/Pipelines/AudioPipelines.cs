@@ -292,6 +292,7 @@ public class SpeechRecognitionPipeline : IDisposable
             // From the SESSION, not from a model of it - see the remarks on these properties.
             EncoderNodeCount = _encoderSession.NodeCount,
             DecoderNodeCount = (_decoderWithPastSession ?? _decoderSession).NodeCount,
+            DecoderOpHistogram = (_decoderWithPastSession ?? _decoderSession).CompiledOpHistogram,
         };
     }
 

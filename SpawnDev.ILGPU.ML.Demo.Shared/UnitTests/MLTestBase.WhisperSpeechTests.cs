@@ -197,6 +197,15 @@ public abstract partial class MLTestBase
             Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] COMPILED nodes: "
                 + $"encoder {kvResult.EncoderNodeCount}, decode step {kvResult.DecoderNodeCount} "
                 + "(from the session, not the offline probe)");
+            // ⚠️ THE CENSUS, not a timing. A PerOpSync profile forces a device sync after every node, so
+            // every op type lands at the same ~4.3 ms and its "percentages" are really a node COUNT wearing
+            // a millisecond label - which is how "Unsqueeze is 32.8% of the decode step" got read as a cost.
+            // This says outright how many nodes of each type the session compiled, and in particular whether
+            // Constant nodes (271 of the raw model's 801) survive into the graph the executor walks.
+            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] decode-step graph by op: "
+                + string.Join(", ", kvResult.DecoderOpHistogram.Take(12).Select(x => $"{x.OpType} {x.Count}"))
+                + $" (of {kvResult.DecoderNodeCount} total, "
+                + $"{kvResult.DecoderOpHistogram.Count} distinct op types)");
         Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] per decode step: "
                 + $"setup {kvResult.DecodeSetupMs / Math.Max(1, kvResult.DecodeSteps):F1}ms + graph "
                 + $"{kvResult.DecodeGraphMs / Math.Max(1, kvResult.DecodeSteps):F1}ms + argmax "
