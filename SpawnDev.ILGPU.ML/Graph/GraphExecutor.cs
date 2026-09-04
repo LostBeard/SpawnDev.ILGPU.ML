@@ -37,6 +37,73 @@ public class GraphExecutor : IDisposable
     // !SuppressDrains). Seeded into the capture pass so it needs no readbacks yet elides identically to warm.
     private Dictionary<string, float[]>? _captureRuntimeSeed;
 
+    /// <summary>
+    /// Outputs whose VALUE depends, transitively, on the DATA of a graph input.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 🔴 WHY THIS EXISTS. Two mechanisms in this executor turn a small tensor into a host-side constant and
+    /// stop dispatching the node that produced it: the readback cache (<see cref="CacheShapeReadbacks"/>) and
+    /// dispatch-elide (<see cref="ShapeInterpElideDispatch"/>). Both are correct for a SHAPE-derived value,
+    /// which cannot change while the input shapes are fixed. Both are WRONG for a value derived from input
+    /// DATA, which changes on every call.
+    /// </para>
+    /// <para>
+    /// The readback cache tried to tell them apart empirically - "identical across two probe runs" - and that
+    /// test is sound only when the two runs carry DIFFERENT data. A graph capture runs its warm passes with
+    /// the SAME inputs (<c>WebGPUGraphCapture.TryCaptureAsync</c>: two warm forwards, then a recorded third),
+    /// so under capture every data-derived value looks perfectly stable and is cached as a constant.
+    /// </para>
+    /// <para>
+    /// MEASURED 2026-09-03 on ZipVoice's <c>fm_decoder</c>: the Euler timestep <c>t</c> is a rank-0 INPUT, so
+    /// every node in the time-embedding chain has a &lt;=64-element output and is read back. Replaying the
+    /// captured plan produced audio in which <b>all 73,216 samples differed</b> from the direct forward -
+    /// fluent, confident, and a different utterance, because <c>t</c> was frozen at its capture-time value
+    /// and the four Euler steps all integrated the same instant.
+    /// </para>
+    /// <para>
+    /// ⚠️ <c>Shape</c> and <c>Size</c> BREAK the taint: they read their input's shape, never its data. That is
+    /// what keeps the whole shape-interpreter fast path alive - the entire Shape/Gather/Concat family stays
+    /// eligible - and it is sound here because a capture is already bound to fixed input shapes
+    /// (<c>SessionGraphCapture.RunAsync</c> throws if they change).
+    /// </para>
+    /// </remarks>
+    private HashSet<string>? _inputTaintedOutputs;
+
+    /// <summary>True when <paramref name="name"/>'s value depends on graph-input DATA. See <see cref="_inputTaintedOutputs"/>.</summary>
+    private bool IsInputTainted(string? name)
+        => name != null && _inputTaintedOutputs != null && _inputTaintedOutputs.Contains(name);
+
+    /// <summary>
+    /// One reusable 64-element staging buffer for the per-node small-value readback.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ The readback path used to <c>Allocate1D</c> a fresh device buffer PER READBACK and dispose it.
+    /// MEASURED 2026-09-03 on ZipVoice's decoder: 25 readbacks per Euler step, so 25 device allocations and
+    /// 25 disposals per step, on every backend. Two costs, and the second is the expensive one:
+    /// <list type="bullet">
+    /// <item>a WebGPU <c>createBuffer</c>/<c>destroy</c> pair per readback, which is not free;</item>
+    /// <item>on CUDA, every allocation is an ILGPU CHILD-OBJECT REGISTRATION, and registrations are what
+    /// pulse ILGPU's background collector - the thread whose <c>cuModuleUnload</c> inside a capture window is
+    /// an uncatchable 0xC0000005. CudaGraphCapture warms "until nothing new registers" and MEASURED
+    /// 2026-09-03 it never converged: +14 objects on every warm pass, so ZipVoice's decoder capture was
+    /// refused on CUDA for a reason the readback loop was manufacturing.</item>
+    /// </list>
+    /// The readback is strictly sequential - Scale, synchronize, copy back - so one buffer is enough, and the
+    /// cap is the same 64 elements the readback path itself enforces.
+    /// </remarks>
+    private MemoryBuffer1D<float, Stride1D.Dense>? _readbackStaging;
+
+    /// <summary>The shared staging buffer, allocated on first use. See <see cref="_readbackStaging"/>.</summary>
+    private ArrayView1D<float, Stride1D.Dense> ReadbackStagingView(int elementCount)
+    {
+        _readbackStaging ??= _accelerator.Allocate1D<float>(MaxSmallReadbackElements);
+        return _readbackStaging.View.SubView(0, elementCount);
+    }
+
+    /// <summary>Largest output the per-node small-value readback will fetch (elements).</summary>
+    private const int MaxSmallReadbackElements = 64;
+
     private void EnsureRunTemplates()
     {
         if (_baseRefCounts != null) return;
@@ -60,6 +127,24 @@ public class GraphExecutor : IDisposable
                 if (!constantNodeOutputs.Contains(outName))
                     clean.Remove(outName);
         }
+
+        // Input-data taint (see _inputTaintedOutputs). The nodes are in topological order, so one forward
+        // pass propagates it: an output is tainted when any input is, except through Shape/Size.
+        var tainted = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in _graph.InputNames)
+            if (!string.IsNullOrEmpty(name) && !_weights.ContainsKey(name))
+                tainted.Add(name);
+        foreach (var node in _graph.Nodes)
+        {
+            if (node.OpType is "Shape" or "Size") continue;   // reads the shape, never the data
+            bool any = false;
+            foreach (var inName in node.InputNames)
+                if (!string.IsNullOrEmpty(inName) && tainted.Contains(inName)) { any = true; break; }
+            if (!any) continue;
+            foreach (var outName in node.OutputNames)
+                if (!string.IsNullOrEmpty(outName)) tainted.Add(outName);
+        }
+        _inputTaintedOutputs = tainted;
 
         _cleanConstants = clean;
         _baseRefCounts = rc; // set LAST so the null-check above is the completion signal
@@ -384,6 +469,61 @@ public class GraphExecutor : IDisposable
     /// so the browser backends (WebGPU/Wasm) are byte-identical to today. CUDA-only capability.
     /// </summary>
     public static bool UseCaptureParamSlots;
+
+    /// <summary>
+    /// Under <see cref="SuppressDrains"/>, return a consumed buffer to the pool IMMEDIATELY instead of
+    /// deferring it to the next drain. Default true - the behaviour a capture pass has always had.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY IT IS A SWITCH. The capture pass runs a forward that must be BIT-IDENTICAL to a plain one, and
+    /// MEASURED 2026-09-03 on ZipVoice's fm_decoder it is not: with <c>SuppressDrains</c> alone, and no
+    /// capture or replay anywhere near it, the forward disagreed with a plain forward in 16,900 of 16,900
+    /// values (worst 0.716364), while the other three regime flags each changed nothing
+    /// (<c>Pipeline_ZipVoice_CaptureReplayFidelity</c>). <c>SuppressDrains</c> does two separable things -
+    /// it skips the per-node small-value readbacks, and it recycles buffers immediately rather than at a
+    /// drain - and telling them apart by reading the code has been tried and did not settle it.
+    /// </remarks>
+    public static bool CaptureImmediateReturn = true;
+
+
+    /// <summary>
+    /// DIAGNOSTIC: when non-null, records the first up-to-64 floats of every node's first output, keyed by
+    /// output name, in execution order (<see cref="NodeProbeOrder"/>).
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY A PROBE AND NOT MORE REASONING. Two forwards of the same graph can disagree in every output
+    /// value, and the only thing that localises it is knowing WHICH NODE first differs. MEASURED 2026-09-03
+    /// on ZipVoice's fm_decoder, a forward with <see cref="SuppressDrains"/> set disagreed with a plain
+    /// forward in all 16,900 values; four separate hypotheses about which part of the capture regime caused
+    /// it were each tested and each was wrong. A first-divergent-node report ends that.
+    /// <para>
+    /// It SYNCHRONIZES and reads back per node, so it is pessimal by construction and deliberately ignores
+    /// <see cref="SuppressDrains"/> - the point is to observe, not to be fast. Never leave it on.
+    /// </para>
+    /// </remarks>
+    public static Dictionary<string, float[]>? NodeProbeFirst64;
+
+    /// <summary>Node output names in execution order, for the run that filled <see cref="NodeProbeFirst64"/>.</summary>
+    public static List<string>? NodeProbeOrder;
+
+    /// <summary>
+    /// Probe only nodes at or after this index, so the run before it is UNPERTURBED.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ WHY IT IS NEEDED. MEASURED 2026-09-03 on ZipVoice's fm_decoder: under the full capture regime the
+    /// forward disagrees with a plain one in all 16,900 output values, yet with the per-node probe armed for
+    /// EVERY node not one of the 4,873 node outputs differed. The probe synchronizes per node, so arming it
+    /// everywhere fixes the very thing it is trying to observe - which by itself says the fault is an
+    /// ORDERING hazard rather than wrong arithmetic. Windowing keeps the suspect region unperturbed while
+    /// still reading values out of it.
+    /// </remarks>
+    public static int NodeProbeFromIndex;
+
+    /// <summary>Element count of each probed node's first output. Filled alongside <see cref="NodeProbeFirst64"/>.</summary>
+    /// <remarks>⚠️ The SIZE is half the evidence. A value that differs because the buffer was never written
+    /// looks identical to one that differs because the arithmetic was wrong - until you see that the two
+    /// runs allocated different element counts for the same node.</remarks>
+    public static Dictionary<string, long>? NodeProbeCounts;
 
     /// <summary>
     /// CUDA-GRAPH CAPTURE: bumped once at the start of every <see cref="RunAsync"/>. Per-node operators
@@ -1081,6 +1221,21 @@ public class GraphExecutor : IDisposable
                     int count = Math.Max(0, (int)MathF.Ceiling((limitV[0] - startV[0]) / deltaV[0]));
                     if (count > 0) runtimeOutputShapes = new[] { new[] { count } };
                 }
+                // ⚠️ FAIL LOUD instead of emitting stale memory. Falling through here leaves the
+                // compile-time placeholder shape ([1] whenever the bounds are runtime-derived), the operator
+                // writes nothing, and the consumer reads whatever the pooled buffer held. That is a silent
+                // wrong answer - it cost two days on ZipVoice, read the whole time as an unfaithful capture
+                // replay (see the readback note above). If the bounds are genuinely unavailable, that is a
+                // defect in whatever was supposed to provide them, and it must say so here.
+                else if (!SuppressDrains && node.OutputShapes.Length > 0
+                         && node.OutputShapes[0].Length == 1 && node.OutputShapes[0][0] <= 1)
+                    throw new InvalidOperationException(
+                        $"Range '{node.OutputNames.FirstOrDefault()}' cannot resolve its bounds at runtime "
+                      + $"(start='{node.InputNames[0]}'={(startV == null ? "MISSING" : string.Join(",", startV))}, "
+                      + $"limit='{node.InputNames[1]}'={(limitV == null ? "MISSING" : string.Join(",", limitV))}, "
+                      + $"delta='{node.InputNames[2]}'={(deltaV == null ? "MISSING" : string.Join(",", deltaV))}) "
+                      + "and its compile-time shape is the [1] placeholder. Emitting a 1-element output here "
+                      + "would leave the buffer UNWRITTEN and the consumer reading stale pool memory.");
             }
 
             // Runtime ConstantOfShape: output shape = input shape-tensor VALUES (e.g. [77,77]). Placeholder
@@ -1440,10 +1595,10 @@ public class GraphExecutor : IDisposable
                         try
                         {
                             int elCount = outTensor.ElementCount;
-                            using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
-                            _ew.Scale(outTensor.Data.SubView(0, elCount), tmpBuf.View, elCount, 1f);
+                            var stage = ReadbackStagingView(elCount);   // pooled - see _readbackStaging
+                            _ew.Scale(outTensor.Data.SubView(0, elCount), stage, elCount, 1f);
                             _accelerator.Synchronize();
-                            runtimeConstants[outName] = tmpBuf.GetAsArray1D();
+                            runtimeConstants[outName] = _readbackStaging!.View.SubView(0, elCount).GetAsArray1D();
                         }
                         catch (NotSupportedException) { /* Browser/WASM backend — skip sync copy */ }
                     }
@@ -2128,12 +2283,12 @@ public class GraphExecutor : IDisposable
                         if (halfTensors.TryGetValue(inputName, out var hrel))
                         {
                             halfTensors.Remove(inputName);
-                            if (SuppressDrains) _pool.ReturnHalf(hrel);
+                            if (SuppressDrains && CaptureImmediateReturn) _pool.ReturnHalf(hrel);
                             else { pendingHalfReleases.Add(hrel); pendingReleaseBytes += (long)hrel.ElementCount * 2; }
                         }
                         else if (tensors.TryGetValue(inputName, out var releaseTensor))
                         {
-                            if (SuppressDrains) _pool.Return(releaseTensor);
+                            if (SuppressDrains && CaptureImmediateReturn) _pool.Return(releaseTensor);
                             else { pendingReleases.Add(releaseTensor); pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float); }
                         }
                     }
@@ -2318,6 +2473,10 @@ public class GraphExecutor : IDisposable
                     // CompiledGraph.ScalarTensorNames), so this excludes exactly those and nothing else - they
                     // keep their GPU dispatch and therefore their real shape.
                     && node.OutputShapes.Length > 0 && node.OutputShapes[0].Length == 1
+                    // Never elide a value derived from input DATA. Eliding removes the dispatch, and under
+                    // capture the recorded plan then has no way to recompute it - the buffer keeps whatever
+                    // the capture pass left in it, forever. See _inputTaintedOutputs.
+                    && !IsInputTainted(node.OutputNames[0])
                     && !ElideBlockedOutputs().Contains(node.OutputNames[0]);   // path-c: no GPU-tensor consumer
                 if (ShapeInterpElideDispatch && elideSafe)
                 {
@@ -3111,7 +3270,7 @@ public class GraphExecutor : IDisposable
                     var dimVals = new float[curDims.Length];
                     for (int d = 0; d < curDims.Length; d++) dimVals[d] = curDims[d];
                     runtimeConstants[sName] = dimVals;
-                    if (readbackThisRun != null) readbackThisRun[sName] = dimVals;
+                    if (readbackThisRun != null && !IsInputTainted(sName)) readbackThisRun[sName] = dimVals;
                 }
             }
 
@@ -3405,6 +3564,29 @@ public class GraphExecutor : IDisposable
                 refCounts[sName] = int.MaxValue;
             }
 
+            // DIAGNOSTIC probe: first-divergent-node hunt. See NodeProbeFirst64.
+            if (NodeProbeFirst64 != null && nodeIdx >= NodeProbeFromIndex
+                && nodeOutputs.Length > 0 && nodeOutputs[0] != null
+                && node.OutputNames.Length > 0 && !string.IsNullOrEmpty(node.OutputNames[0]))
+            {
+                var probeT = nodeOutputs[0]!;
+                int probeN = (int)Math.Min(MaxSmallReadbackElements, probeT.ElementCount);
+                if (probeN > 0 && probeT.Data.Length > 0)
+                {
+                    try
+                    {
+                        var pstage = ReadbackStagingView(probeN);
+                        _ew.Scale(probeT.Data.SubView(0, probeN), pstage, probeN, 1f);
+                        await _accelerator.SynchronizeAsync();
+                        NodeProbeFirst64[node.OutputNames[0]] =
+                            await _readbackStaging!.CopyToHostAsync<float>(0, probeN);
+                        if (NodeProbeCounts != null) NodeProbeCounts[node.OutputNames[0]] = probeT.ElementCount;
+                        NodeProbeOrder?.Add(node.OutputNames[0]);
+                    }
+                    catch { /* a probe must never change whether the run succeeds */ }
+                }
+            }
+
             // Capture small intermediate outputs as runtime constants.
             // Only sync+readback for truly small shape tensors (≤64 elements) that downstream
             // operators need for parameter resolution (Slice starts/ends, Reshape dims, Expand shapes).
@@ -3457,7 +3639,7 @@ public class GraphExecutor : IDisposable
                             int elCount = outTensor.ElementCount;
                             if (CaptureTraceFile != null) { try { System.IO.File.AppendAllText(CaptureTraceFile, $"   -> READBACK-alloc[{elCount}] out={outName}\n"); } catch { } }
                             captureStage = $"alloc[{elCount}]";
-                            using var tmpBuf = _accelerator.Allocate1D<float>(elCount);
+                            var stage = ReadbackStagingView(elCount);   // pooled - see _readbackStaging
                             captureStage = $"data-subview[{elCount}]";
                             if (outTensor.Data.Length == 0)
                                 throw new InvalidOperationException("outTensor.Data has zero length");
@@ -3465,12 +3647,12 @@ public class GraphExecutor : IDisposable
                             captureStage = $"scale[{elCount}]";
                             // GPU→GPU copy via Scale kernel (works on all backends),
                             // then async readback via CopyToHostAsync(offset, count).
-                            _ew.Scale(srcView, tmpBuf.View, elCount, 1f);
+                            _ew.Scale(srcView, stage, elCount, 1f);
                             captureStage = $"sync[{elCount}]";
                             var _rbSw = System.Diagnostics.Stopwatch.StartNew();
                             await _accelerator.SynchronizeAsync();
                             captureStage = $"copy-back[{elCount}]";
-                            runtimeConstants[outName] = await tmpBuf.CopyToHostAsync<float>(0, elCount);
+                            runtimeConstants[outName] = await _readbackStaging!.CopyToHostAsync<float>(0, elCount);
                             // Validation: the CPU shape interpreter claimed this value — confirm it matches the GPU
                             // truth. Any mismatch is a bug in TryComputeShapeOnCpu; log the first few loud.
                             if (ShapeInterpValidate && shapeInterpVals.TryGetValue(outName, out var cpuCheck))
@@ -3491,7 +3673,11 @@ public class GraphExecutor : IDisposable
                             LastRunReadbackMs += _rbSw.Elapsed.TotalMilliseconds;
                             LastRunReadbackNames.Add($"{node.OpType}:{outName}");
                             // Probing: record this run's value for cross-run stability comparison.
-                            if (readbackThisRun != null) readbackThisRun[outName] = runtimeConstants[outName];
+                            // ⚠️ A tainted value must never become a stability candidate. The probe's test is
+                            // "identical across two runs", which a capture's identical warm passes satisfy for
+                            // data-derived values too - that is exactly how ZipVoice's Euler `t` froze.
+                            if (readbackThisRun != null && !IsInputTainted(outName))
+                                readbackThisRun[outName] = runtimeConstants[outName];
                         }
                         catch (NotSupportedException) { /* Backend doesn't support async readback */ }
                         catch (NullReferenceException) {
@@ -3621,10 +3807,26 @@ public class GraphExecutor : IDisposable
         // yield (and the drains) suppressed, the whole captured forward runs synchronously on one thread.
         if (!SuppressDrains)
             await Task.Yield();
-        // CUDA-graph capture: skip the final synchronize (illegal during capture) AND the buffer
-        // returns. The captured forward is warm + single-pass, so leaving these pending is safe; the
-        // caller resets SuppressDrains right after EndCapture and the normal drain path resumes.
-        if (!SuppressDrains)
+        // ⚠️ THE FINAL SYNCHRONIZE IS SKIPPED FOR CUDA ONLY - see below.
+        //
+        // The rule it encodes is CUDA's: a host synchronize during `cuStreamBeginCapture` aborts the capture.
+        // WebGPU has no such rule - a submit-and-wait mid-recording is legal, and the dispatch plan records
+        // pipeline/bind-group/dimensions rather than encoder boundaries, so flushing between them changes
+        // nothing about what is recorded.
+        //
+        // 🔴 APPLYING THE CUDA RULE TO WEBGPU CORRUPTED THE CAPTURE PASS. MEASURED 2026-09-03 on ZipVoice's
+        // fm_decoder (Pipeline_ZipVoice_CaptureReplayFidelity): with SuppressDrains set and nothing else -
+        // no capture, no replay - a forward disagreed with a plain forward in 16,900 of 16,900 values
+        // (worst 0.716364), while each of the other capture-regime flags changed nothing, the missing
+        // MID-forward synchronizes changed nothing, and the immediate buffer return changed nothing. What
+        // was left is this: without the final SynchronizeAsync the caller reads the outputs before the
+        // GPU has finished producing them. On WebGPU `Synchronize()` only FLUSHES; only the async form
+        // awaits completion (Docs/async.md).
+        //
+        // The consequence was two days of "replay is unfaithful": the replay was faithful all along - it
+        // was faithfully replaying a plan recorded from a forward that had been read too early.
+        bool cudaCapture = SuppressDrains && _accelerator.AcceleratorType == AcceleratorType.Cuda;
+        if (!cudaCapture)
         {
             _drainSw.Restart();
             try { await _accelerator.SynchronizeAsync(); }
@@ -3755,6 +3957,16 @@ public class GraphExecutor : IDisposable
 
         // CUDA-graph capture: snapshot this warm pass's full runtimeConstants so the capture pass can seed it
         // (see the seed at RunAsync start) and thus skip every readback while eliding identically.
+        // ⚠️ THE SEED MUST BE COMPLETE - do NOT filter it. An earlier attempt stripped input-tainted entries
+        // here on the reasoning that a data-derived constant must not be frozen into a plan. That reasoning
+        // is right about ELIDING and wrong about SEEDING, and the two are opposite in effect:
+        //   * eliding a tainted node removes its dispatch, so a replay cannot recompute it   -> excluded
+        //     (see IsInputTainted at the elide site);
+        //   * the seed exists to make the CAPTURE PASS take the same decisions as the warm pass, which ran
+        //     with readbacks enabled. Removing an entry makes the capture pass diverge from warm, which
+        //     shifts the CaptureParamArena cursor and hands broadcast kernels another node's strides.
+        // MEASURED 2026-09-03 with the filtered seed: the capture PASS itself (not the replay) disagreed
+        // with a plain forward in 16,900 of 16,900 values.
         if (UseCaptureParamSlots && !SuppressDrains)
             _captureRuntimeSeed = new Dictionary<string, float[]>(runtimeConstants);
 
@@ -3819,6 +4031,7 @@ public class GraphExecutor : IDisposable
         _pool.Dispose();
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
+        _readbackStaging?.Dispose(); _readbackStaging = null;
         _ew.Dispose();
         _precisionAware.Dispose();
         _normalization.Dispose();

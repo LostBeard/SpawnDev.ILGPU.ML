@@ -35,7 +35,10 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.10" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.8" />
+		<!-- ⚠️ TEMPORARY (Tuvok 2026-09-03): a ProjectReference while the WebGPU capture host-write census
+		     is being developed in SpawnDev.ILGPU. Revert to the PackageReference below before shipping.
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.8" /> -->
+		<ProjectReference Include="..\..\..\SpawnDev.ILGPU\SpawnDev.ILGPU\SpawnDev.ILGPU\SpawnDev.ILGPU.csproj" />
 		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.2" />
 	</ItemGroup>
 

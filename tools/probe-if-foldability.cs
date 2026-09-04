@@ -23,7 +23,11 @@ using var accelerator = ctxIL.GetPreferredDevice(preferCPU: true).CreateAccelera
 Console.WriteLine($"accelerator: {accelerator.AcceleratorType}");
 
 var cacheDir = Path.Combine(Path.GetTempPath(), "spawndev-onnx-probe");
-var path = Path.Combine(cacheDir, "main_zipvoice_distill_text_encoder_int8.onnx");
+// ⚠️ Which model is the point. The TEXT ENCODER's `If` nodes were the first ones found, but the decoder is
+// 82% of a synthesis (MEASURED 2026-09-03: 51,697 ms of a 62,221 ms speak) and it is the decoder's control
+// flow that costs the capture. Default to the decoder; pass a file name to look at another.
+var modelName = args.FirstOrDefault(a => a.EndsWith(".onnx")) ?? "main_zipvoice_distill_fm_decoder_int8.onnx";
+var path = Path.Combine(cacheDir, modelName);
 if (!File.Exists(path)) { Console.WriteLine($"MISSING {path} - run probe-control-flow.cs first"); return; }
 
 using var session = InferenceSession.CreateFromFile(accelerator, File.ReadAllBytes(path));

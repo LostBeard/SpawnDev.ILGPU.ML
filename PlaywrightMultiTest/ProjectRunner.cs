@@ -540,6 +540,22 @@ namespace PlaywrightMultiTest
                             // restores the contract: "PMT respects test-method timeouts."
                             var result = await ProcessRunner.Run(publishedBinary, rowTest.Name, timeout: ConsoleTestTimeoutMs()).ConfigureAwait(false);
                             var resultLines = result.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                            // ⚠️ PMT_CONSOLE_LOG applies to the DESKTOP lanes too. It was browser-only, so a
+                            // Console.WriteLine benchmark line printed by a CUDA/OpenCL/CPU test was thrown
+                            // away on success and the switch silently did nothing - which reads as "the test
+                            // printed nothing" rather than "the harness dropped it". MEASURED 2026-09-03: a
+                            // scoped CudaTests run with PMT_CONSOLE_LOG=Benchmark produced not one line, so
+                            // the desktop half of a browser-vs-desktop comparison could not be obtained.
+                            // ⚠️ StdOut, not Text. `Text` is the harness's protocol channel between the
+                            // stream-EOF sentinels; a test's own Console.WriteLine lands in StdOut, and
+                            // echoing `Text` printed nothing at all on the first attempt.
+                            // ⚠️ StdOut FIRST, `Text` as the fallback. `Text` is the harness's protocol
+                            // channel between the stream-EOF sentinels and does not always carry the test's
+                            // own Console.WriteLine; whichever of the two has the lines, echo those.
+                            var stdoutLines = (result.StdOut ?? "").Split(new[] { '\n', '\r' },
+                                StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                            EchoMatchingConsoleLines(rowTest.Name,
+                                stdoutLines.Length > 0 ? stdoutLines : resultLines);
                             var testResltTest = resultLines.LastOrDefault(o => o.StartsWith("TEST: "))?.Substring(6);
                             var unitTest = testResltTest != null ? JsonSerializer.Deserialize<UnitTest>(testResltTest) : null;
                             if (unitTest == null)
@@ -1210,6 +1226,30 @@ namespace PlaywrightMultiTest
         private static bool IsWasm(ProjectTest t) => (t.TestTypeName ?? "").Contains("Wasm", StringComparison.OrdinalIgnoreCase);
 
         // Substring, case-insensitive match against a test's full name / type / method.
+        /// <summary>
+        /// Echo a desktop subprocess's own console lines under <c>PMT_CONSOLE_LOG</c>, the same way the
+        /// browser lane echoes <c>console.log</c>. <c>1</c> or <c>*</c> keeps everything; anything else is a
+        /// case-insensitive substring filter. The harness's own protocol lines are never echoed.
+        /// </summary>
+        private static void EchoMatchingConsoleLines(string testName, string[] lines)
+        {
+            var logFilter = Environment.GetEnvironmentVariable("PMT_CONSOLE_LOG");
+            if (string.IsNullOrEmpty(logFilter)) return;
+            bool all = logFilter is "1" or "*";
+            var kept = lines.Where(l =>
+                    !l.StartsWith("TEST: ", StringComparison.Ordinal)
+                    && !l.StartsWith("RESULTS:", StringComparison.Ordinal)
+                    && !l.StartsWith("READY:", StringComparison.Ordinal)
+                    && (all || l.Contains(logFilter, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+            if (kept.Count == 0) return;
+            // ⚠️ Console.ERROR, like the browser lane's echo. `dotnet test` does not surface a testhost's
+            // stdout written from inside a test body; stderr it does. Writing these to stdout printed
+            // nothing at all, which reads as "the test logged nothing".
+            Console.Error.WriteLine($"[{testName}] Console: {kept.Count} matched log(s)");
+            foreach (var l in kept) Console.Error.WriteLine($"  LOG: {l}");
+        }
+
         private static bool MatchesFilter(string filter, ProjectTest t) =>
             (t.Name?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)
             || (t.TestTypeName?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)

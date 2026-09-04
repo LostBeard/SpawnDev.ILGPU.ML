@@ -60,7 +60,21 @@ public sealed class CudaGraphCapture : IDisposable
     /// post-capture drain is what frees the buffers a replay then reads.</summary>
     internal static bool ExperimentKeepDrainsSuppressed;
 
-    public static async Task<CudaGraphCapture?> TryCaptureAsync(InferenceSession session, Dictionary<string, Tensor> inputs)
+    /// <param name="allowControlFlow">
+    /// The CALLER's decision, when it has one. <see cref="Graph.SessionGraphCapture"/> can establish by
+    /// OBSERVATION that a full forward runs no control-flow body (see its remarks), and that observation is
+    /// strictly better evidence than the blanket refusal below - so when it passes true, honour it.
+    /// </param>
+    /// <remarks>
+    /// ⚠️ WHY THE PARAMETER EXISTS. This guard used to read the STATIC
+    /// <c>SessionGraphCapture.RefuseControlFlow</c>, while the opt-in ZipVoice actually uses is the
+    /// PER-INSTANCE <c>SessionGraphCapture.AllowControlFlow</c>. So the session-level capture would announce
+    /// "observing: a full forward ran NO control-flow body, so recording is safe" and this method would then
+    /// refuse anyway - MEASURED 2026-09-03 on CUDA, where the sample-level capture A/B consequently reported
+    /// "SKIPPED: capture is not live" and had never once run.
+    /// </remarks>
+    public static async Task<CudaGraphCapture?> TryCaptureAsync(InferenceSession session,
+        Dictionary<string, Tensor> inputs, bool? allowControlFlow = null)
     {
         var acc = session.Accelerator;
         if (acc is not CudaAccelerator) return null;
@@ -78,7 +92,8 @@ public sealed class CudaGraphCapture : IDisposable
         // per-call allocation from every control-flow graph as well as unblocking capture - but a guard
         // that turns a process crash into a graceful fallback should not wait on that work.
         var controlFlow = new[] { "If", "Loop", "Scan" };
-        var present = Graph.SessionGraphCapture.RefuseControlFlow
+        bool refuse = allowControlFlow is bool allow ? !allow : Graph.SessionGraphCapture.RefuseControlFlow;
+        var present = refuse
             ? session.OperatorTypes.Where(o => controlFlow.Contains(o)).ToArray()
             : Array.Empty<string>();
         if (present.Length > 0)

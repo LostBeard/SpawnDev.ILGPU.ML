@@ -786,11 +786,27 @@ public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
         if (startVals == null || limitVals == null || deltaVals == null
             || startVals.Length == 0 || limitVals.Length == 0 || deltaVals.Length == 0)
         {
-            // Mid-capture the scalar runtime constants can be UNAVAILABLE/EMPTY (readbacks
-            // suppressed) - startVals[0] threw IndexOutOfRange under WebGPU capture (SD-Turbo CLIP,
-            // 2026-07-03). Range is deterministic per shape and the output buffer already holds the
-            // warm-pass value; the H2D upload below is capture-skipped anyway - nothing to do.
-            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains) return;
+            // Mid-capture the scalar runtime constants can be UNAVAILABLE/EMPTY (readbacks suppressed) -
+            // startVals[0] threw IndexOutOfRange under WebGPU capture (SD-Turbo CLIP, 2026-07-03).
+            //
+            // 🔴 RETURNING HERE IS NOT "NOTHING TO DO" - it leaves the output buffer holding whatever the
+            // pool last put in it. The warm pass staged this Range's values into a stable arena slot at a
+            // deterministic cursor, so the capture pass copies them GPU->GPU: that copy IS recorded in the
+            // plan, so a replay reproduces it. Same pattern as EinsumOperator's capture path.
+            //
+            // MEASURED 2026-09-03 with the plain `return` here (ZipVoice fm_decoder, WebGPU): the first
+            // divergent node of 4,873 was '/fm_decoder/0/0/self_attn_weights/Range_1_output_0' -
+            // [0,1,2,3] on a plain forward, [138,157,173,187] under the capture regime, both correctly
+            // sized at 169 elements. Every attention position downstream was wrong, and it surfaced as
+            // "replaying the captured decoder changed the audio: 73216 of 73216 samples differ".
+            if (SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
+            {
+                int outSz = ctx.Outputs[0].ElementCount;
+                var staged = Kernels.CaptureParamArena.Shared(reg.Accelerator)
+                    .RentStableSlotFloat(new float[outSz]);
+                ctx.Outputs[0].Data.SubView(0, outSz).CopyFrom(staged);
+                return;
+            }
             static string D(float[]? v) => v == null ? "null" : v.Length == 0 ? "EMPTY" : $"[{v[0]}]";
             throw new NotSupportedException(
                 $"Range: scalar inputs not available as runtime constants: "
@@ -811,14 +827,19 @@ public class RangeOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < count; i++)
             data[i] = start + i * delta;
 
-        // Upload to output GPU buffer. During CUDA-graph capture a synchronous CopyFromCPU (H2D) is illegal;
-        // Range is deterministic for a fixed input shape and the pool is deterministic, so the buffer already
-        // holds this value from the warm pass — skip the re-upload during the capture pass.
+        // Write the values into the output buffer.
+        //
+        // 🔴 THE CAPTURE PASS MUST STILL WRITE. This used to skip the upload entirely while drains were
+        // suppressed, on the reasoning that "Range is deterministic for a fixed shape and the pool is
+        // deterministic, so the buffer already holds the warm value". That rests on the pool handing this
+        // node the SAME buffer it did during warm, and MEASURED 2026-09-03 it does not: the output came
+        // back as stale pool memory (see the note above). CaptureConstWrite does the right thing on both
+        // paths - a host upload when warm, and a GPU->GPU copy from the warm-staged arena slot during a
+        // capture, which the dispatch plan records so a replay reproduces it.
         var output = ctx.Outputs[0];
-        if (output.ElementCount >= count && !SpawnDev.ILGPU.ML.Graph.GraphExecutor.SuppressDrains)
-        {
-            output.Data.SubView(0, count).CopyFromCPU(data);
-        }
+        if (output.ElementCount >= count)
+            Kernels.CaptureParamArena.CaptureConstWrite(
+                reg.Accelerator, output.Data.SubView(0, count), data);
     }
 }
 

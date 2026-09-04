@@ -815,6 +815,47 @@ public class GraphCompiler
                 }
             }
 
+            // Compile-time ORDERING comparisons on known constants (boolean 0/1), the family `Equal` above
+            // was missing.
+            //
+            // ⚠️ WHY IT MATTERS OUT OF ALL PROPORTION TO ITS SIZE. Every `If` in ZipVoice's decoder and text
+            // encoder is guarded by exactly this shape: `GreaterOrEqual(<initializer>, <Shape-derived>)` -
+            // "is the cached positional table long enough?". `Shape`, `Gather`, `Mul` and `Sub` all fold at
+            // compile time already, so the whole subtree collapses to two constants and stops one node short.
+            // MEASURED 2026-09-03 on CUDA: `ONE decoder step: 25 readbacks | Shapex18, GreaterOrEqualx5,
+            // Expandx2` - five GPU round trips per Euler step to evaluate a comparison whose operands are both
+            // known before the model runs, on the stage that is 82% of a synthesis in the browser.
+            //
+            // ⚠️ FLOAT operands, not the int mirror. ConstantData is int, and these conditions compare
+            // sequence arithmetic where truncation would silently change which branch is taken; FloatConstantData
+            // holds the same values without that risk. Fall back to the int copy only when no float one exists.
+            if (node.OpType is "Greater" or "GreaterOrEqual" or "Less" or "LessOrEqual"
+                && node.Inputs.Count >= 2 && graph.ConstantData != null)
+            {
+                float[]? cmpA = graph.FloatConstantData!.TryGetValue(node.Inputs[0], out var fa) ? fa
+                    : graph.ConstantData.TryGetValue(node.Inputs[0], out var ia) ? ia.Select(v => (float)v).ToArray() : null;
+                float[]? cmpB = graph.FloatConstantData!.TryGetValue(node.Inputs[1], out var fb) ? fb
+                    : graph.ConstantData.TryGetValue(node.Inputs[1], out var ib) ? ib.Select(v => (float)v).ToArray() : null;
+                if (cmpA != null && cmpB != null && cmpA.Length > 0 && cmpB.Length > 0 && node.Outputs.Count > 0)
+                {
+                    int len = Math.Max(cmpA.Length, cmpB.Length);
+                    var result = new int[len];
+                    for (int j = 0; j < len; j++)
+                    {
+                        float a = cmpA[j % cmpA.Length], b = cmpB[j % cmpB.Length];
+                        result[j] = node.OpType switch
+                        {
+                            "Greater" => a > b,
+                            "GreaterOrEqual" => a >= b,
+                            "Less" => a < b,
+                            _ => a <= b,
+                        } ? 1 : 0;
+                    }
+                    graph.ConstantData[node.Outputs[0]] = result;
+                    graph.FloatConstantData![node.Outputs[0]] = result.Select(v => (float)v).ToArray();
+                }
+            }
+
             // Compile-time Floor/Ceil on known constants
             if (node.OpType is "Floor" or "Ceil" && node.Inputs.Count >= 1
                 && graph.ConstantData != null

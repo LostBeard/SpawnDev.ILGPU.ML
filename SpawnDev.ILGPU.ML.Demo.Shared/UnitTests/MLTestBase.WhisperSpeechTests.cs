@@ -172,8 +172,23 @@ public abstract partial class MLTestBase
             if (!pipeline.UsesKVCache)
                 throw new Exception("a decoder_with_past session was supplied but UsesKVCache is false - "
                                   + "the KV path is not actually being taken, so this test proves nothing");
+            // ⚠️ CUMULATIVE counters around the whole transcription, so this test reports the SAME split
+            // the SpawnDev.AI demo prints. MEASURED 2026-09-03: the demo's decode step costs 900 ms where
+            // this test's costs 400 ms for the byte-identical compiled graph (enc 227 / dec 374), and the
+            // window-vs-worker hypothesis was DISPROVEN by measurement (managed 0.92x, JS crossings 1.09x,
+            // scheduler 0.58-1.00x - the worker is not slower at any of them). Without the readback and
+            // drain counts on BOTH sides there is nothing left to compare but the total, which is how that
+            // wrong hypothesis survived a day.
+            Graph.GraphExecutor.CumulativeReset();
             var kvResult = await pipeline.TranscribeAsync(samples, 16000);
             cached = (kvResult.Text ?? "").Trim();
+            Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] host cost: "
+                + $"{Graph.GraphExecutor.CumulativeRunCount} graph runs, "
+                + $"{Graph.GraphExecutor.CumulativeReadbackCount} readbacks "
+                + $"({Graph.GraphExecutor.CumulativeReadbackMs:F0} ms), "
+                + $"{Graph.GraphExecutor.CumulativeSyncDrainCount} drains "
+                + $"({Graph.GraphExecutor.CumulativeSyncDrainMs:F0} ms), "
+                + $"executor {Graph.GraphExecutor.CumulativeTotalMs:F0} ms");
 
             Console.WriteLine($"[Benchmark] Whisper [{accelerator.AcceleratorType}] kv split: "
                 + $"encoder {kvResult.EncoderMs:F0}ms ({kvResult.EncoderCaptureStatus}) | "

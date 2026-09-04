@@ -226,7 +226,11 @@ public sealed class SessionGraphCapture : IDisposable
             try
             {
                 if (_accelerator.AcceleratorType == AcceleratorType.Cuda)
-                    _cuda = await CudaGraphCapture.TryCaptureAsync(_session, stable).ConfigureAwait(false);
+                    // ⚠️ Hand DOWN the decision this class just made. The backend guard cannot see the
+                    // per-instance opt-in or the observed body count, and without this it refused every
+                    // control-flow graph regardless of what was observed here.
+                    _cuda = await CudaGraphCapture.TryCaptureAsync(_session, stable, !refuseControlFlow)
+                        .ConfigureAwait(false);
                 else
                     _webGpu = await WebGPUGraphCapture.TryCaptureAsync(_session, stable).ConfigureAwait(false);
             }

@@ -40,6 +40,13 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// <summary>Number of GPU dispatches the captured plan replays.</summary>
     public int DispatchCount => _plan.DispatchCount;
 
+    /// <summary>
+    /// CPU-&gt;GPU writes that happened inside the most recent capture window - work a replay cannot repeat.
+    /// </summary>
+    /// <remarks>See the note at the end of <see cref="TryCaptureAsync"/>. Non-zero is the first thing to
+    /// check when a replay does not reproduce its own capture.</remarks>
+    public static int HostWritesDuringCapture { get; private set; }
+
     /// <summary>The stable output tensors the captured plan writes (also returned by ReplayAsync).</summary>
     public IReadOnlyDictionary<string, Tensor> Outputs => _outputs;
 
@@ -115,6 +122,25 @@ public sealed class WebGPUGraphCapture : IDisposable
         GraphExecutor.ShapeInterpElideDispatch = true;
         GraphExecutor.ShapeInterpValidate = false;
         WebGPUBackend.EnableBindGroupCaching = false;
+        // ⚠️ THE STABLE-SLOT ARENA IS A CUDA REQUIREMENT, NOT A WEBGPU ONE, and it is not free here.
+        //
+        // On CUDA a per-call parameter buffer means a cuMemAlloc, which is ILLEGAL inside a capture window,
+        // so kernel parameters are staged into arena slots by the warm passes and the capture pass re-reads
+        // them without uploading. That works only while the warm and capture passes rent the SAME cursor
+        // sequence. WebGPU has no allocation restriction inside a recording - the plan simply retains the
+        // bind groups, and a per-call parameter buffer is retained with them - so the arena buys nothing and
+        // adds a cross-pass invariant that has to hold exactly.
+        //
+        // MEASURED 2026-09-03 on ZipVoice's fm_decoder: with the arena OFF, a forward under the rest of the
+        // capture regime is bit-identical to a plain forward at every one of 4,873 node outputs and in all
+        // 16,900 output values; with it ON, the capture pass disagreed in all 16,900
+        // (Pipeline_ZipVoice_CaptureReplayFidelity's regime bisect).
+        // ⚠️ KEEP THE ARENA ON. It looks like a CUDA-only device (it exists so a capture window contains no
+        // cuMemAlloc), but on WebGPU it is doing a second job that IS needed here: with the arena off,
+        // kernel parameters are uploaded per call with `queue.writeBuffer`, and a host write is not ordered
+        // against command-encoder work that has not been submitted yet. MEASURED 2026-09-03 with the arena
+        // off under this regime: the capture pass produced NaN. With it on, every one of 4,873 node outputs
+        // matches a plain forward.
         FusedAttentionKernel.UseStableCaptureSlots = true;
         GraphExecutor.UseCaptureParamSlots = true;
         // Bound the warm passes' deferred-release backlog (default 512MB) so warm's pool footprint stays
@@ -163,6 +189,22 @@ public sealed class WebGPUGraphCapture : IDisposable
             }
             webGpu.EndDispatchCapture();
             await acc.SynchronizeAsync();
+
+            // ⚠️ HOST WRITES INSIDE THE WINDOW ARE MISSING WORK, and they are silent. A plan records
+            // dispatches, buffer-to-buffer copies and clears - all command-encoder work. A
+            // `queue.writeBuffer` is none of those: it moves bytes the CPU is holding, so a replay never
+            // performs it and the destination keeps whatever the capture pass last left there. Constant
+            // bytes are harmless; input-dependent ones make the replay confidently wrong.
+            //
+            // MEASURED 2026-09-03 on ZipVoice's fm_decoder: a replay did not reproduce the forward it
+            // recorded AT THE INPUTS IT CAPTURED - 16,900 of 16,900 values differ, worst 0.711702. Saying so
+            // HERE, with a count, is the difference between a number and two days of hypotheses.
+            if (plan.HostWriteCount > 0)
+                Console.WriteLine($"[WebGPUGraphCapture] ⚠️ {plan.HostWriteCount} host write(s) "
+                    + $"({plan.HostWriteBytes / 1024.0:F1} KiB) happened INSIDE the capture window. A "
+                    + "queue.writeBuffer is not part of a dispatch plan, so a replay does not repeat it - "
+                    + "any of these carrying per-call data makes the replay wrong.");
+            HostWritesDuringCapture = plan.HostWriteCount;
 
             var shapes = new Dictionary<string, int[]>();
             foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();
