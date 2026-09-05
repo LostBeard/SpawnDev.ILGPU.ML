@@ -175,6 +175,25 @@ public class BufferPool : IDisposable
         = Environment.GetEnvironmentVariable("ML_POISON_RENT") is "1" or "true";
 
     /// <summary>
+    /// The byte <see cref="PoisonRentedBuffers"/> fills with. Default <c>0xFF</c> = NaN as float32.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE VALUE IS THE EXPERIMENT, not a detail. NaN and a large FINITE value fail in OPPOSITE
+    /// directions through a comparison: <c>max(NaN, x)</c> generally yields <c>x</c>, so NaN silently
+    /// LOSES and a reduction over unwritten padding still returns the right answer - while
+    /// <c>0x7F7F7F7F</c> (3.4e38) WINS and destroys it.
+    /// <para>
+    /// MEASURED 2026-09-04 on WebGPU, ZipVoice at 296 characters: with poison OFF the synthesis was
+    /// NONDETERMINISTIC and wrong (two different audio hashes, 67% / 73% read-back) while CUDA was
+    /// bit-identical and 100%; with poison ON (0xFF/NaN) it became bit-identical and 100% - and NO NaN
+    /// reached the output. Stale pooled values are harmful, NaN is harmless, nothing reads poison as
+    /// arithmetic. Setting this to <c>0x7F</c> distinguishes "a reduction reads beyond the valid region"
+    /// (output goes garbage) from "the fill is merely acting as a barrier" (output stays correct).
+    /// </para>
+    /// </remarks>
+    public static byte PoisonRentByte = 0xFF;
+
+    /// <summary>
     /// Log every NAMED rent as <c>name=bufferId</c> (<c>ML_TRACE_RENTS=1</c>).
     /// </summary>
     /// <remarks>
@@ -325,7 +344,7 @@ public class BufferPool : IDisposable
             var buffer = stack.Pop();
             // 0xFF bytes = NaN as float32. Only the REUSED path needs this: a fresh allocation holds no
             // previous tensor's values, and it is precisely the plausible leftovers that hide an unwritten read.
-            if (PoisonRentedBuffers) { try { buffer.View.MemSet(0xFF); } catch { } }
+            if (PoisonRentedBuffers) { try { buffer.View.MemSet(PoisonRentByte); } catch { } }
             var tensor = new Tensor(buffer.View, shape, name);
             if (name != null) { NoteRebind(name, buffer); _namedBuffers[name] = buffer; }
             if (TraceRents && name != null) Console.WriteLine($"[RENT] {name}={Bid(buffer)} reuse");
