@@ -2,6 +2,47 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.10 (2026-09-04)
+
+### Fixed - a cached subgraph plan outlived the pool its constants were allocated from
+
+`SubgraphRunner` caches each compiled `If`/`Loop` branch plan on the REGISTRY, which lives for the whole
+session. The plan's `Constants` are allocated with `ctx.Pool.AllocatePermanent` - from whichever
+SHAPE-SPECIALISED executor happened to be running when the plan was built. `InferenceSession
+.ResolveExecutor` LRU-evicts and DISPOSES those executors as input shapes change, taking their
+`BufferPool` with them, so a cached plan's constants become freed GPU memory while the plan itself stays
+cached and reusable.
+
+⚠️ **The cache key makes the collision certain rather than unlikely.** The signature is the SUBGRAPH's
+own input shapes, and for ZipVoice's relative-position `If` those are `[1]` scalars - identical at every
+utterance length. So the plan built while speaking one sentence is reused verbatim for the next,
+pointing at buffers the shape change already freed.
+
+**Fix:** `BufferPool.IsDisposed` plus `SubgraphPlan.ConstantsPool` let `GetOrBuildPlan` reject and
+rebuild a plan whose pool is gone. Validating at USE rather than wiring into every disposal path keeps
+it correct for any other route to disposal.
+
+MEASURED 2026-09-04 on WebGPU: a 250-character utterance died inside the else branch with
+`Failed to execute 'createBindGroup' ... Failed to convert value to 'GPUBuffer'` - a disposed 4-byte
+constant. The destroy stack (from SpawnDev.ILGPU 5.2.10's `WebGPUBackend.TraceBufferDestroy`) pointed
+straight at `BufferPool.Dispose <- GraphExecutor.Dispose <- InferenceSession.ResolveExecutor`.
+
+| | before | after |
+|---|---|---|
+| WebGPU, 250 chars | hard failure in `createBindGroup` | **100%** word overlap (47/47) |
+| CUDA, 343 chars | 61% | **100 / 100 / 98%** across three runs |
+
+The CUDA row is the important one: the same defect was **silently degrading** long utterances on a
+backend where it never crashed.
+
+### ⚠️ Known, not fixed - WebGPU alone degrades past ~250 characters
+
+With the above fixed, WebGPU still falls off past roughly 250 characters and varies widely between
+draws - 296 chars: 55 / 67 / 85%, 343 chars: 30 / 39 / 55% - while CUDA holds 98-100% at the SAME
+lengths and the same fixture. Below 250 both are 100%. ZipVoice draws fresh noise per synthesis, so
+some spread is expected (`ZipVoicePipeline.SpeakVerifiedAsync` documents draws that produce the wrong
+sentence outright), but the backend gap is not explained by that. Characterised, not fixed.
+
 ## 5.2.9 (2026-09-04)
 
 ### Fixed - compile-time output shapes were used as runtime truth, so a dynamic graph read memory nobody wrote
