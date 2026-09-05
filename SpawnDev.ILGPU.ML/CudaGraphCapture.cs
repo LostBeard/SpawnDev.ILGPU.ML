@@ -1,4 +1,4 @@
-using System.Linq;
+﻿using System.Linq;
 using ILGPU;
 using ILGPU.Runtime;
 using ILGPU.Runtime.Cuda;
@@ -34,17 +34,19 @@ public sealed class CudaGraphCapture : IDisposable
     private readonly CudaGraphExec _exec;
     private readonly Dictionary<string, Tensor> _inputBuffers;   // stable device inputs the graph reads
     private readonly Dictionary<string, Tensor> _outputs;        // stable device outputs the graph writes
+    private readonly Kernels.CaptureParamArena _arena;           // kernel-params slots THIS graph binds
 
     /// <summary>The input shapes this graph was captured for. A replay is only valid at the SAME shapes.</summary>
     public IReadOnlyDictionary<string, int[]> InputShapes { get; }
 
     private CudaGraphCapture(Accelerator accelerator, CudaStream stream, CudaGraphExec exec,
         Dictionary<string, Tensor> inputBuffers, Dictionary<string, Tensor> outputs,
-        Dictionary<string, int[]> inputShapes)
+        Dictionary<string, int[]> inputShapes, Kernels.CaptureParamArena arena)
     {
         _accelerator = accelerator;
         _stream = stream;
         _exec = exec;
+        _arena = arena;
         _inputBuffers = inputBuffers;
         _outputs = outputs;
         InputShapes = inputShapes;
@@ -144,6 +146,11 @@ public sealed class CudaGraphCapture : IDisposable
         // cap = frequent warm drains = buckets returned promptly = primed to the real peak. One-time
         // warm cost; the provable guard below refuses capture if a warm reclaim fired anyway.
         GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
+        // 🔴 THIS CAPTURE GETS ITS OWN PARAM ARENA. The graph baked below holds DEVICE POINTERS into the
+        // arena's slots and reads them at every replay, so a later capture's warm passes must not upload
+        // their own params into those same buffers. See CaptureParamArena.BeginCaptureScope.
+        var arena = Kernels.CaptureParamArena.BeginCaptureScope(acc);
+        bool arenaHandedOff = false;
         try
         {
             using (acc.WithDefaultStream(capStream))   // reroute *StreamKernel launches → capStream
@@ -217,6 +224,8 @@ public sealed class CudaGraphCapture : IDisposable
                 {
                     capOut = await session.RunAsync(inputs);
                     graph = capStream.EndCapture();
+                    // A graph now exists and bakes pointers into the arena's slots → it owns the arena.
+                    arenaHandedOff = true;
                 }
                 catch
                 {
@@ -236,6 +245,14 @@ public sealed class CudaGraphCapture : IDisposable
         }
         finally
         {
+            Kernels.CaptureParamArena.EndCaptureScope();
+            // No graph was instantiated (guard tripped, or the capture threw) → nothing binds these slots.
+            // DRAIN FIRST: the warm/probe passes' dispatches read these slots.
+            if (!arenaHandedOff)
+            {
+                try { await acc.SynchronizeAsync(); } catch { }
+                try { arena.Dispose(); } catch { }
+            }
             session.CacheShapeReadbacks = prevCacheReadbacks;
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
@@ -251,7 +268,7 @@ public sealed class CudaGraphCapture : IDisposable
 
         var shapes = new Dictionary<string, int[]>();
         foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();
-        return new CudaGraphCapture(acc, capStream, exec, inputs, capOut, shapes);
+        return new CudaGraphCapture(acc, capStream, exec, inputs, capOut, shapes, arena);
     }
 
     /// <summary>
@@ -280,5 +297,7 @@ public sealed class CudaGraphCapture : IDisposable
     {
         try { _exec.Dispose(); } catch { }
         try { _stream.Dispose(); } catch { }
+        // Only now: the baked graph reads these slots on every replay.
+        try { _arena.Dispose(); } catch { }
     }
 }

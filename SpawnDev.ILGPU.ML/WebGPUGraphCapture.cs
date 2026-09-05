@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML.Graph;
@@ -33,6 +33,7 @@ public sealed class WebGPUGraphCapture : IDisposable
     private readonly WebGPUDispatchPlan _plan;
     private readonly Dictionary<string, Tensor> _inputBuffers;   // stable device inputs the plan reads
     private readonly Dictionary<string, Tensor> _outputs;        // stable device outputs the plan writes
+    private readonly CaptureParamArena _arena;                   // kernel-params slots THIS plan binds
 
     /// <summary>The input shapes this plan was captured for. A replay is only valid at the SAME shapes.</summary>
     public IReadOnlyDictionary<string, int[]> InputShapes { get; }
@@ -137,10 +138,11 @@ public sealed class WebGPUGraphCapture : IDisposable
 
     private WebGPUGraphCapture(Accelerator accelerator, WebGPUDispatchPlan plan,
         Dictionary<string, Tensor> inputBuffers, Dictionary<string, Tensor> outputs,
-        Dictionary<string, int[]> inputShapes)
+        Dictionary<string, int[]> inputShapes, CaptureParamArena arena)
     {
         _accelerator = accelerator;
         _plan = plan;
+        _arena = arena;
         _inputBuffers = inputBuffers;
         _outputs = outputs;
         InputShapes = inputShapes;
@@ -244,6 +246,15 @@ public sealed class WebGPUGraphCapture : IDisposable
         // near the true live set and doesn't trip AllocateWithReclaim mid-warm, which would leave the
         // capture pass under-primed. Mirror of the CUDA capture fix; the guard below is the safety gate.
         GraphExecutor.MaxPendingReleaseBytes = 64L * 1024 * 1024;
+        // 🔴 THIS CAPTURE GETS ITS OWN PARAM ARENA. The plan recorded below binds the arena's slot buffers
+        // and reads them at every REPLAY. While the arena was shared per-accelerator, the warm passes of
+        // the NEXT capture - a different shape, or a different model entirely, since Whisper and ZipVoice
+        // share one accelerator - rented the same cursors and uploaded their own params straight into
+        // those buffers, so every earlier plan silently replayed with someone else's shapes and strides.
+        // See CaptureParamArena.BeginCaptureScope. The arena is disposed with this capture, below.
+        int overwritesBefore = CaptureParamArena.CrossCaptureSlotOverwrites;
+        var arena = CaptureParamArena.BeginCaptureScope(acc);
+        bool arenaHandedOff = false;
         try
         {
             // Warm A: shader JIT + populate stable attention/param slots + finalize the readback cache +
@@ -335,10 +346,33 @@ public sealed class WebGPUGraphCapture : IDisposable
 
             var shapes = new Dictionary<string, int[]>();
             foreach (var (name, t) in inputs) shapes[name] = (int[])t.Shape.Clone();
-            return new WebGPUGraphCapture(acc, plan, inputs, capOut, shapes);
+            arenaHandedOff = true;
+            return new WebGPUGraphCapture(acc, plan, inputs, capOut, shapes, arena);
         }
         finally
         {
+            CaptureParamArena.EndCaptureScope();
+            // What the per-capture arena actually bought, on THIS sequence. Non-zero = the warm passes of
+            // THIS attempt wrote params that, under the old per-accelerator arena, would have landed in
+            // buffers the PREVIOUS capture's plan still reads on every replay - a silently wrong replay
+            // from then on. ⚠️ NOT the cause of the history-dependent ZipVoice audio - see the note on
+            // CaptureParamArena.BeginCaptureScope; that pipeline captures nothing.
+            // ⚠️ Reported on EVERY exit, including the refused/failed ones: an attempt that ends up
+            // returning null still ran two full warm forwards through the arena, so it did just as much
+            // damage as a successful capture.
+            int wouldHaveCorrupted = CaptureParamArena.CrossCaptureSlotOverwrites - overwritesBefore;
+            if (wouldHaveCorrupted > 0)
+                Console.WriteLine($"[WebGPUGraphCapture] param arena: {wouldHaveCorrupted} slot write(s) in "
+                    + "this capture attempt would have overwritten the previous capture's live plan params "
+                    + "(per-capture arena prevented it).");
+            // No plan was recorded (guard tripped, or the capture threw) → nothing binds these slots.
+            // DRAIN FIRST: the warm passes' dispatches read them, and an unsubmitted command encoder
+            // referencing a destroyed buffer is the very failure this class documents.
+            if (!arenaHandedOff)
+            {
+                try { await acc.SynchronizeAsync(); } catch { }
+                try { arena.Dispose(); } catch { }
+            }
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
             GraphExecutor.SuppressDrains = false;
@@ -405,5 +439,7 @@ public sealed class WebGPUGraphCapture : IDisposable
     public void Dispose()
     {
         try { _plan.Dispose(); } catch { }
+        // Only now: the plan's bind groups read these slots on every replay.
+        try { _arena.Dispose(); } catch { }
     }
 }

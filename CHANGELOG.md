@@ -1,6 +1,51 @@
-# SpawnDev.ILGPU.ML Changelog
+﻿# SpawnDev.ILGPU.ML Changelog
 
 Notable changes per release. Pre-stable; API will change between preview drops.
+
+## 5.2.11 (unreleased)
+
+### Fixed - a cached subgraph plan was reused across DIFFERENT shape executors
+
+`SubgraphRunner`'s plan cache lives on the session's `OperatorRegistry` and is keyed on the SUBGRAPH's own
+input shapes. For ZipVoice's relative-position `If` those are `[1]` scalars - identical at every utterance
+length - so one entry serves every sentence the session ever speaks. The entry is not just constants: it
+holds a shape-specialised `GraphExecutor` built against one particular executor's context, with
+`Constants` allocated from that executor's pool.
+
+5.2.10 dropped such a plan when its pool had been DISPOSED, which stopped it binding freed memory. It did
+nothing about the commoner case: the pool is alive and belongs to a DIFFERENT, still-cached executor.
+`InferenceSession` keeps `MaxShapeExecutors = 3` alive at once, so a plan built while speaking one
+sentence was handed to sentences of other lengths for as long as its own executor stayed cached.
+
+**Fix:** a cached plan is a candidate only when `ReferenceEquals(candidate.ConstantsPool, ctx.Pool)` -
+valid for the executor it was built in, and rebuilt otherwise.
+
+### Fixed - one param arena per ACCELERATOR let each capture rewrite every earlier plan's parameters
+
+`CaptureParamArena` stages the tiny `int[]`/`float[]` params arrays kernels upload per dispatch into
+STABLE device slots, so a capture window contains no allocation and a recorded plan can bind a buffer that
+does not move. It was a per-accelerator singleton with one global per-forward cursor - and a recorded plan
+reads those slots at every REPLAY, long after the capture that staged them. So the warm passes of the NEXT
+capture rented the same cursors and uploaded their own params straight into buffers every earlier plan
+still reads. Silent: overwriting a live buffer is legal. A capture ATTEMPT that returns null did the same
+damage, having already run two warm forwards through the arena.
+
+**Fix:** `CaptureParamArena.BeginCaptureScope` gives each capture its OWN arena, owned and disposed by the
+capture object (`WebGPUGraphCapture`, `CudaGraphCapture`, `WebGPUDecodeCapture`). `FusedAttentionKernel`'s
+stable capture slots take a fresh set per scope and retire the old one; `NormalizationKernels`' capture
+scratch RETIRES on grow instead of disposing memory an earlier plan binds.
+
+⚠️ Same defect class as 5.2.10's `_retired` fix, which handled only the half where a GROWN slot's old
+buffer was DISPOSED.
+
+⚠️ **This is NOT the cause of the history-dependent ZipVoice audio**, though it has the same signature and
+was fixed believing it was. MEASURED 2026-09-05: the seven-line voice gate was bit-for-bit unchanged by
+it, because ZipVoice's decoder capture is REFUSED on every synthesis (control flow) - that pipeline
+performs no capture, no replay and no arena rent. The defect is real and worth fixing on its own evidence:
+the 2026-09-04 `[Buffer ...] used in submit while destroyed` failure.
+
+`CaptureParamArena.CrossCaptureSlotOverwrites` counts what the old scheme would have corrupted;
+`WebGPUGraphCapture` prints it on every capture exit, refusals included.
 
 ## 5.2.10 (2026-09-04)
 

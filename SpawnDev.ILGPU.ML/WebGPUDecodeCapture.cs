@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU;
 using SpawnDev.ILGPU.ML.Graph;
@@ -37,6 +37,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
     private readonly InferenceSession _session;
     private readonly WebGPUDispatchPlan _plan;
     private readonly MemoryBuffer1D<float, Stride1D.Dense> _inputBuf;
+    /// <summary>Kernel-params slots THIS plan binds and patches. Disposed with the capture, never before.</summary>
+    private CaptureParamArena? _arena;
     private readonly Dictionary<string, Tensor> _inputDict;
     private readonly Dictionary<string, Tensor> _outputs;
     private readonly int _p0;
@@ -148,6 +150,12 @@ public sealed class WebGPUDecodeCapture : IDisposable
         WebGPUBackend.EnableBindGroupCaching = false;
         FusedAttentionKernel.UseStableCaptureSlots = true;
         GraphExecutor.UseCaptureParamSlots = true;
+        // 🔴 THIS CAPTURE GETS ITS OWN PARAM ARENA. The plan binds the arena's slots and this class also
+        // PATCHES them per replay, so sharing one arena per accelerator meant a later capture's warm pass
+        // (or this class's own patches) wrote over parameters another live plan reads.
+        // See CaptureParamArena.BeginCaptureScope.
+        var arena = CaptureParamArena.BeginCaptureScope(acc);
+        bool arenaHandedOff = false;
 
         var inputBuf = acc.Allocate1D(new[] { tokenId });
         var inputDict = new Dictionary<string, Tensor> { ["input_ids"] = new Tensor(inputBuf.View, new[] { 1, 1 }, "input_ids") };
@@ -337,6 +345,8 @@ public sealed class WebGPUDecodeCapture : IDisposable
             session.SetGGUFDecodePastLen(p0 + 1);
             var cap = new WebGPUDecodeCapture(acc, session, planA, inputBuf, inputDict, capOut, p0,
                 scalarPatches, copyPatches, slotPatches);
+            cap._arena = arena;
+            arenaHandedOff = true;
             cap._argmax = argmax;
             var (lastView, lastVocab) = LastLogits(capOut);
             cap._vocab = lastVocab;
@@ -350,6 +360,14 @@ public sealed class WebGPUDecodeCapture : IDisposable
         }
         finally
         {
+            CaptureParamArena.EndCaptureScope();
+            // No plan survived → nothing binds these slots.
+            // DRAIN FIRST: the warm/probe passes' dispatches read these slots.
+            if (!arenaHandedOff)
+            {
+                try { await acc.SynchronizeAsync(); } catch { }
+                try { arena.Dispose(); } catch { }
+            }
             SlotProbe.Detach();
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
@@ -507,5 +525,7 @@ public sealed class WebGPUDecodeCapture : IDisposable
     {
         try { _plan.Dispose(); } catch { }
         try { _inputBuf.Dispose(); } catch { }
+        // Only now: the plan's bind groups read these slots on every replay.
+        try { _arena?.Dispose(); } catch { }
     }
 }

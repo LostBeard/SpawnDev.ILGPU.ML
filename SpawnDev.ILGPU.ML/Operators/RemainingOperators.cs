@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
@@ -1201,6 +1201,16 @@ internal static class SubgraphRunner
                     bucket.RemoveAt(c);
                     continue;
                 }
+                // 🔴 AND IT IS ONLY VALID FOR THE EXECUTOR IT WAS BUILT IN. Dropping a plan whose pool was
+                // DISPOSED (above) stops it binding freed memory; it does nothing about the far commoner
+                // case where the pool is alive and simply belongs to a DIFFERENT, still-cached executor.
+                // `Executor` here is a shape-specialised GraphExecutor built by BuildExecutor against THIS
+                // context, and `Constants` were allocated from THIS pool - while the key is the subgraph's
+                // own input shapes, which for ZipVoice's relative-position If are [1] scalars, identical at
+                // every utterance length. So one plan built while speaking one sentence was handed to every
+                // later sentence of every other length, and the demo's InferenceSession keeps three shape
+                // executors alive at once, so the pool-disposed check misses it entirely.
+                if (!ReferenceEquals(candidate.ConstantsPool, ctx.Pool)) continue;
                 return candidate;
             }
 

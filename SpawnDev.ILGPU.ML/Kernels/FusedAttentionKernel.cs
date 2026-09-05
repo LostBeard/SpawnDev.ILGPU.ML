@@ -79,16 +79,36 @@ public class FusedAttentionKernel : IDisposable
     /// <see cref="CaptureParamArena.IntSlotObserver"/>. Static - null in production.</summary>
     public static Action<int, int[], ArrayView1D<int, Stride1D.Dense>>? CaptureSlotObserver;
     private const int CaptureSlotMax = 512;   // >= attention nodes per forward (28-layer qwen = 28)
-    private readonly MemoryBuffer1D<int, Stride1D.Dense>?[] _captureSlots
+    private MemoryBuffer1D<int, Stride1D.Dense>?[] _captureSlots
         = new MemoryBuffer1D<int, Stride1D.Dense>?[CaptureSlotMax];
     private int _captureSlotNext;
     private long _captureSlotGen = -1;
+
+    // 🔴 A CAPTURED PLAN READS THESE BUFFERS AT REPLAY TIME, so a slot a plan binds must never be written
+    // again. This kernel lives on the session's OperatorRegistry, so one instance serves every capture the
+    // session makes: without this, the warm passes of the SECOND capture CopyFromCPU'd different window /
+    // kvOffset / seqKV params straight into the buffers the FIRST plan reads, and that plan replayed with
+    // the wrong attention parameters from then on - silently, since overwriting a live buffer is legal.
+    // Same defect the per-capture CaptureParamArena scope fixes; see CaptureParamArena.BeginCaptureScope.
+    // A new capture scope therefore takes a FRESH slot array and RETIRES the old one (alive for the life of
+    // the kernel - a few hundred 64-byte buffers per capture, against a wrong answer).
+    private long _captureSlotScope = -1;
+    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _retiredCaptureSlots = new();
 
     // Lazily allocate ring slot `_ringNext` and upload paramsData into it, returning the exact-length view.
     private ArrayView1D<int, Stride1D.Dense> RentParamsSlot(int[] paramsData)
     {
         if (UseStableCaptureSlots)
         {
+            // New capture scope → fresh slots; the previous scope's plan still reads the old ones.
+            long scope = CaptureParamArena.ScopeId;
+            if (scope != _captureSlotScope)
+            {
+                _captureSlotScope = scope;
+                foreach (var b in _captureSlots) if (b != null) _retiredCaptureSlots.Add(b);
+                _captureSlots = new MemoryBuffer1D<int, Stride1D.Dense>?[CaptureSlotMax];
+                _captureSlotGen = -1;
+            }
             long gen = SpawnDev.ILGPU.ML.Graph.GraphExecutor.ForwardGeneration;
             if (gen != _captureSlotGen) { _captureSlotGen = gen; _captureSlotNext = 0; }
             int slot = _captureSlotNext++;
@@ -1259,6 +1279,12 @@ public class FusedAttentionKernel : IDisposable
     {
         foreach (var buf in _paramsRing) buf?.Dispose();
         Array.Clear(_paramsRing);
+        // The capture slots outlive individual captures on purpose (a recorded plan binds them); they die
+        // with the kernel, i.e. with the session that owns every plan holding them.
+        foreach (var buf in _captureSlots) buf?.Dispose();
+        Array.Clear(_captureSlots);
+        foreach (var buf in _retiredCaptureSlots) { try { buf.Dispose(); } catch { } }
+        _retiredCaptureSlots.Clear();
         _dummySinks?.Dispose();
         _dummySinks = null;
     }

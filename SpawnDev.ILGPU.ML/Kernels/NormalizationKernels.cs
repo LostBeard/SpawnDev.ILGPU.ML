@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 
 namespace SpawnDev.ILGPU.ML.Kernels;
@@ -558,6 +558,13 @@ public class NormalizationKernels : IDisposable
     private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _allTempBufs = new();
     private MemoryBuffer1D<float, Stride1D.Dense>? _capMeans, _capInvStds;
 
+    // 🔴 RETIRE, DO NOT DISPOSE. A captured plan (WebGPU bind groups / a CUDA graph's baked pointers) binds
+    // whichever scratch buffer was live when it was recorded, and reads it at every replay. Freeing it
+    // because a LATER capture needed a bigger one destroys memory an earlier plan still uses - WebGPU
+    // reports that at the next submit as "[Buffer ...] used in submit while destroyed", naming whichever
+    // innocent caller synchronizes next. Same defect the CaptureParamArena's _retired list documents.
+    private readonly List<IDisposable> _capRetired = new();
+
     /// <summary>Per-call InstanceNorm mean/invStd scratch. Normal mode: fresh buffers (Wasm
     /// async-safety - a reused pair races pending dispatches), held in _allTempBufs until Dispose.
     /// Capture mode (UseCaptureParamSlots): ONE reused pair sized during the warm passes - a
@@ -572,7 +579,8 @@ public class NormalizationKernels : IDisposable
                 if (Graph.GraphExecutor.SuppressDrains)
                     throw new InvalidOperationException(
                         $"InstanceNorm scratch would grow to {numSlices} mid-capture - warm passes must cover the largest shape first.");
-                _capMeans?.Dispose(); _capInvStds?.Dispose();
+                if (_capMeans != null) _capRetired.Add(_capMeans);
+                if (_capInvStds != null) _capRetired.Add(_capInvStds);
                 _capMeans = _accelerator.Allocate1D<float>(numSlices);
                 _capInvStds = _accelerator.Allocate1D<float>(numSlices);
             }
@@ -618,6 +626,8 @@ public class NormalizationKernels : IDisposable
         try { _capMeans?.Dispose(); } catch { }
         try { _capInvStds?.Dispose(); } catch { }
         _capMeans = null; _capInvStds = null;
+        foreach (var b in _capRetired) { try { b.Dispose(); } catch { } }
+        _capRetired.Clear();
         foreach (var b in _invRmsRing) try { b?.Dispose(); } catch { }
         try { _dummyRmsWeight?.Dispose(); } catch { }
         _dummyRmsWeight = null;

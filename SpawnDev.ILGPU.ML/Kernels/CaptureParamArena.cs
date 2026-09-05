@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Graph;
@@ -26,8 +26,11 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 /// launch-prep win even independent of capture. When capture is NOT in use the arena is untouched, so the
 /// kernels' normal fresh-alloc + defer-dispose path (and thus the WebGPU/Wasm backends) is byte-identical.
 ///
-/// ONE shared arena per accelerator (<see cref="Shared"/>) → a single global per-forward cursor across every
-/// operator. The forward executes nodes in a fixed order and each operator rents its params in a fixed order,
+/// ONE arena PER CAPTURE (<see cref="BeginCaptureScope"/>; <see cref="Shared"/> falls back to a
+/// per-accelerator arena outside a capture) → a single per-forward cursor across every operator, private to
+/// the plan that stages it. 🔴 It used to be one arena per ACCELERATOR, and that silently corrupted every
+/// earlier plan the moment a second capture's warm pass rented the same cursor - see
+/// <see cref="BeginCaptureScope"/>. The forward executes nodes in a fixed order and each operator rents its params in a fixed order,
 /// so for a given input shape the k-th rent is always the same (op, call) → the same stable slot every forward.
 /// Kernels add a one-line capture branch; no per-kernel slot state. CUDA-only capability; harmless elsewhere.
 /// </summary>
@@ -35,9 +38,113 @@ public sealed class CaptureParamArena : IDisposable
 {
     private static readonly ConditionalWeakTable<Accelerator, CaptureParamArena> _perAccelerator = new();
 
-    /// <summary>The shared arena for <paramref name="accelerator"/> (one global capture cursor across all ops).</summary>
+    /// <summary>The arena the innermost open capture scope owns; null outside a capture. See
+    /// <see cref="BeginCaptureScope"/>.</summary>
+    private static CaptureParamArena? _active;
+
+    /// <summary>
+    /// The arena to rent from: the open capture scope's arena when there is one, else the per-accelerator
+    /// fallback (one global cursor across all ops).
+    /// </summary>
     public static CaptureParamArena Shared(Accelerator accelerator)
-        => _perAccelerator.GetValue(accelerator, a => new CaptureParamArena(a));
+    {
+        var active = _active;
+        if (active != null && ReferenceEquals(active._accelerator, accelerator)) return active;
+        return _perAccelerator.GetValue(accelerator, a => new CaptureParamArena(a));
+    }
+
+    /// <summary>
+    /// Open a capture scope with its OWN arena, so a later capture cannot write over the slots a recorded
+    /// plan binds. Returns the arena; the CALLER OWNS IT and must dispose it when - and not before - the
+    /// plan it staged is disposed. Pair with <see cref="EndCaptureScope"/> in a <c>finally</c>.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 A SLOT A RECORDED PLAN BINDS MUST NEVER BE WRITTEN AGAIN. A captured plan (WebGPU bind groups,
+    /// a CUDA graph's baked device pointers) reads these buffers at REPLAY time, long after the capture
+    /// that staged them. While one arena was shared per ACCELERATOR, the next capture's warm passes rented
+    /// the same cursors and <c>CopyFromCPU</c>'d DIFFERENT params straight into buffers that every earlier
+    /// plan still reads - silently, with no error anywhere, because overwriting a live buffer is a
+    /// perfectly legal thing to do. The earlier plan then replays with the later capture's shapes/strides.
+    /// <para>
+    /// ⚠️ THIS IS NOT THE CAUSE OF THE 2026-09-04 HISTORY-DEPENDENT AUDIO, though it looks exactly like
+    /// it and I fixed it believing it was. MEASURED 2026-09-05 on the SpawnDev.AI seven-line voice gate:
+    /// the fix changed nothing (100/100/100/67/48/73/48, identical to the run before it), and the browser
+    /// console says why - ZipVoice's decoder capture is REFUSED on every synthesis
+    /// ("graph contains control flow (If) ... running direct forward"), so a synthesis performs no capture,
+    /// no replay and no arena rent at all. The only live capture in that process is Whisper's encoder, one
+    /// plan, 176 dispatches, captured once. Fix a defect because it is a defect; do not let it inherit
+    /// another bug's evidence.
+    /// </para>
+    /// <para>
+    /// What it IS: the measured 2026-09-04 "[Buffer ...] used in submit while destroyed" failure, where
+    /// Whisper's encoder plan and a ZipVoice forward shared one accelerator's arena.
+    /// </para>
+    /// <para>
+    /// ⚠️ This is the same defect class as the <see cref="_retired"/> note below, which fixed only the
+    /// half where a GROWN slot's old buffer was DISPOSED. Retiring stopped the buffer being destroyed; it
+    /// did nothing about the far more common case where the slot is big enough and is simply overwritten.
+    /// </para>
+    /// </remarks>
+    public static CaptureParamArena BeginCaptureScope(Accelerator accelerator)
+    {
+        var arena = new CaptureParamArena(accelerator) { _previous = _lastScoped };
+        _lastScoped = new WeakReference<CaptureParamArena>(arena);
+        _active = arena;
+        ScopeId++;
+        return arena;
+    }
+
+    /// <summary>
+    /// Monotonic id of the most recently opened capture scope. Other holders of stable capture slots
+    /// (<c>FusedAttentionKernel</c>) watch this to take a fresh slot set per capture, for the same reason
+    /// this arena is now per-capture.
+    /// </summary>
+    public static long ScopeId { get; private set; }
+
+    /// <summary>Close the scope opened by <see cref="BeginCaptureScope"/>. Does NOT dispose the arena.</summary>
+    public static void EndCaptureScope() => _active = null;
+
+    /// <summary>The previous capture scope's arena, weakly - only so the diagnostic below can count.</summary>
+    private static WeakReference<CaptureParamArena>? _lastScoped;
+    private WeakReference<CaptureParamArena>? _previous;
+
+    /// <summary>
+    /// How many slot writes this process has made that WOULD have landed in a buffer the previous
+    /// capture's plan still binds, had the arena still been shared per-accelerator. Every one of these is
+    /// a silently corrupted replay under the old scheme; zero means the sequence never re-captured.
+    /// </summary>
+    /// <remarks>Counted, not prevented - the per-scope arena already prevents it. This exists so the fix
+    /// can be shown to have had something to fix, on the exact sequence that reproduced the defect.</remarks>
+    public static int CrossCaptureSlotOverwrites { get; private set; }
+
+    /// <summary>Reset <see cref="CrossCaptureSlotOverwrites"/> (call before a measured sequence).</summary>
+    public static void ResetCrossCaptureTrace() => CrossCaptureSlotOverwrites = 0;
+
+    // Last host data written to each slot, kept only to answer the question above.
+    private readonly List<int[]?> _slotData = new();
+    private readonly List<float[]?> _floatSlotData = new();
+
+    private void NoteIntWrite(int slot, int[] data)
+    {
+        while (_slotData.Count <= slot) _slotData.Add(null);
+        if (_previous != null && _previous.TryGetTarget(out var prev)
+            && slot < prev._slotData.Count && prev._slotData[slot] is { } pd
+            && slot < prev._slots.Count && prev._slots[slot].Length >= data.Length
+            && !pd.AsSpan().SequenceEqual(data))
+            CrossCaptureSlotOverwrites++;
+        _slotData[slot] = (int[])data.Clone();
+    }
+
+    private void NoteFloatWrite(int slot, float[] data)
+    {
+        while (_floatSlotData.Count <= slot) _floatSlotData.Add(null);
+        if (_previous != null && _previous.TryGetTarget(out var prev)
+            && slot < prev._floatSlotData.Count && prev._floatSlotData[slot] is { } pd
+            && slot < prev._floatSlots.Count && prev._floatSlots[slot].Length >= data.Length
+            && !pd.AsSpan().SequenceEqual(data))
+            CrossCaptureSlotOverwrites++;
+        _floatSlotData[slot] = (float[])data.Clone();
+    }
 
     /// <summary>
     /// Capture-safe write of a CONSTANT CPU-computed result into a GPU node-output view. Ops that write a
@@ -118,6 +225,7 @@ public sealed class CaptureParamArena : IDisposable
         // Skip the synchronizing H2D during the capture pass; the warm pass already populated this slot.
         if (!GraphExecutor.SuppressDrains)
         {
+            NoteIntWrite(i, data);
             view.CopyFromCPU(data);
             IntSlotObserver?.Invoke(i, data, view);
         }
@@ -149,6 +257,7 @@ public sealed class CaptureParamArena : IDisposable
         var view = slot.View.SubView(0, data.Length);
         if (!GraphExecutor.SuppressDrains)
         {
+            NoteFloatWrite(i, data);
             view.CopyFromCPU(data);
             FloatSlotObserver?.Invoke(i, data, view);
         }
