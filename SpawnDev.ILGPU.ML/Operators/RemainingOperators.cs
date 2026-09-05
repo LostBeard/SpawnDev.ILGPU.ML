@@ -1184,9 +1184,25 @@ internal static class SubgraphRunner
             .Select(kv => $"{kv.Key}:{string.Join(",", kv.Value.Shape)}"));
 
         if (ctx.Registry.SubgraphPlans.TryGetValue(sig, out var bucket))
-            foreach (var candidate in bucket)
-                if (ReferenceEquals(candidate.Subgraph, subgraph))
-                    return candidate;
+            for (int c = bucket.Count - 1; c >= 0; c--)
+            {
+                var candidate = bucket[c];
+                if (!ReferenceEquals(candidate.Subgraph, subgraph)) continue;
+
+                // 🔴 A CACHED PLAN WHOSE POOL IS GONE IS DEAD. Its Constants were allocated with
+                // ctx.Pool.AllocatePermanent from whichever SHAPE-SPECIALISED executor was running when
+                // it was built, and InferenceSession.ResolveExecutor LRU-evicts and DISPOSES those as
+                // input shapes change - while this cache lives on the registry, for the whole session.
+                // The signature makes the collision certain rather than unlikely: it is the SUBGRAPH's
+                // input shapes, and for ZipVoice's relative-position If those are [1] scalars, identical
+                // at every utterance length. Rebuild instead of binding freed GPU memory.
+                if (candidate.ConstantsPool is { IsDisposed: true })
+                {
+                    bucket.RemoveAt(c);
+                    continue;
+                }
+                return candidate;
+            }
 
         var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var constants);
         if (executor == null) return null;
@@ -1194,6 +1210,7 @@ internal static class SubgraphRunner
         var plan = new OperatorRegistry.SubgraphPlan
         {
             Subgraph = subgraph, Executor = executor, Constants = constants,
+            ConstantsPool = ctx.Pool,
         };
         if (bucket == null) ctx.Registry.SubgraphPlans[sig] = bucket = new List<OperatorRegistry.SubgraphPlan>();
         bucket.Add(plan);

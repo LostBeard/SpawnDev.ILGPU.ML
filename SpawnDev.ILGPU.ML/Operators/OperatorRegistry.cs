@@ -424,6 +424,27 @@ public class OperatorRegistry : IDisposable
         public Graph.GraphExecutor Executor = null!;
         /// <summary>Initializers and Constant-node tables, allocated ONCE instead of per execution.</summary>
         public Dictionary<string, Tensors.Tensor> Constants = null!;
+
+        /// <summary>
+        /// The pool <see cref="Constants"/> were allocated from. A plan whose pool has been disposed is
+        /// DEAD and must be rebuilt - see the check in <c>SubgraphRunner.GetOrBuildPlan</c>.
+        /// </summary>
+        /// <remarks>
+        /// 🔴 THIS CACHE OUTLIVES THE POOL IT BORROWED FROM. Plans are cached on the REGISTRY (session
+        /// lifetime), while the constants come from <c>ctx.Pool</c> - the pool owned by whichever
+        /// SHAPE-SPECIALISED executor happened to be running. <c>InferenceSession.ResolveExecutor</c>
+        /// LRU-evicts and disposes those executors as input shapes change, so the constants are freed
+        /// while the plan stays cached and reusable.
+        /// <para>
+        /// ⚠️ And the cache key makes it certain rather than unlikely: the signature is the SUBGRAPH's
+        /// own input shapes, which for ZipVoice's relative-position <c>If</c> are <c>[1]</c> scalars -
+        /// IDENTICAL for every utterance length. So a plan built while speaking one sentence is reused
+        /// verbatim for the next, pointing at buffers that the shape change already freed. MEASURED
+        /// 2026-09-04: a 250-character utterance bound a disposed 4-byte constant and died in
+        /// <c>createBindGroup</c> with "Failed to convert value to 'GPUBuffer'".
+        /// </para>
+        /// </remarks>
+        public Tensors.BufferPool? ConstantsPool;
         // See OperatorRegistry.Dispose: these are dropped rather than disposed, because a GraphExecutor
         // unloads kernel modules that the registry's own kernels share.
         public void Dispose() { }

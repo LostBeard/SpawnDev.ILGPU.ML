@@ -1161,8 +1161,23 @@ public class BufferPool : IDisposable
         return new Tensor(buffer.View, shape, name);
     }
 
+    /// <summary>
+    /// True once <see cref="Dispose"/> has run, so anything CACHING tensors allocated from this pool can
+    /// tell that they are dead rather than binding freed GPU memory.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 A shape-specialised <c>GraphExecutor</c> owns a pool, and <c>InferenceSession.ResolveExecutor</c>
+    /// LRU-EVICTS and disposes it when the input shapes change. Anything that outlives the executor and
+    /// still holds tensors from its pool - notably <c>SubgraphRunner</c>'s cached branch plans, which live
+    /// on the REGISTRY - is holding freed memory from that moment on. MEASURED 2026-09-04: a 250-character
+    /// ZipVoice utterance bound a disposed 4-byte constant inside the relative-position else branch and
+    /// died in <c>createBindGroup</c>.
+    /// </remarks>
+    public bool IsDisposed { get; private set; }
+
     public void Dispose()
     {
+        IsDisposed = true;
         foreach (var buffer in _allBuffers)
         {
             try { buffer.Dispose(); }
