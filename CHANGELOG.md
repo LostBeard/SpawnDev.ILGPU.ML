@@ -47,7 +47,67 @@ the 2026-09-04 `[Buffer ...] used in submit while destroyed` failure.
 `CaptureParamArena.CrossCaptureSlotOverwrites` counts what the old scheme would have corrupted;
 `WebGPUGraphCapture` prints it on every capture exit, refusals included.
 
-## 5.2.10 (2026-09-04)
+### Fixed - `SpeechRecognitionPipeline.Language` was settable and completely ignored
+
+The property was decoration. The decoder prompt hard-coded `<|en|>` (`AudioPipelines.cs`), the only language
+token ever resolved from the tokenizer was `<|en|>`, and the property was echoed straight into
+`TranscriptionResult.Language` - so `Language = "fr"` returned an English-prompted transcript that CLAIMED
+to be French, with nothing anywhere reporting a problem.
+
+`Language` now resolves `<|{lang}|>` through the loaded tokenizer and drives the prompt. It THROWS rather
+than falling back to English: an unrecognised language that quietly became English would be
+indistinguishable from a correct run, which is the failure mode this file has paid for repeatedly. Asking an
+English-only (`.en`) checkpoint for any other language throws too - those models were trained without
+language tokens and cannot honour it. `TranscriptionResult.Language` now reports the language actually
+prompted, normalized, instead of echoing the request.
+
+⚠️ Behaviour is UNCHANGED for every existing caller: `"en"` resolves to the same token the prompt already
+hard-coded, and nothing in this repo or SpawnDev.AI sets any other value.
+
+### Added - a gate for `If` branches that capture a dynamic outer-scope tensor
+
+`ControlFlow_IfOuterScopeCapture_AcrossExecutorEviction` runs ONE session over an `If` whose branch reads an
+outer-scope tensor, at five distinct outer shapes (forcing four LRU evictions), asserting each case against
+onnxruntime AND asserting that a repeated shape reproduces its own first reading BIT-FOR-BIT. Fixture:
+`tools/gen_subgraph_plan_cache_reference.py`, a few kilobytes, no download.
+
+🔴 **It does NOT gate the plan-cache fix above, and it was written believing it did.** MEASURED 2026-09-06:
+with `if (!ReferenceEquals(candidate.ConstantsPool, ctx.Pool)) continue;` DISABLED, this test still passed
+8 of 8. The premise was that the cache key covers only the subgraph's declared inputs, so a branch reading a
+dynamic outer-scope tensor would collide across shapes. That is wrong: `IfOperator.ExecuteAsync` calls
+`OuterScope.Add` - "every tensor the subgraph references but does not itself produce" - BEFORE
+`SubgraphRunner.ExecuteAsync`, so the captured tensor's shape IS in the signature and the plan is correctly
+rebuilt per outer shape. **A branch that captures a varying-shape tensor can never collide.**
+
+Reproducing the real defect needs the opposite fixture: a branch whose captures are ALL shape-INVARIANT
+(ZipVoice's relative-position `If` captures `[1]` scalars, which is exactly why one entry served every
+utterance length) while the OUTER graph shape varies, so executors churn and evict while the subgraph
+signature stays constant. **Until that exists, the plan-cache fix is gated only at the SpawnDev.AI level, by
+audio hashes in the voice gate.** Recorded as open rather than quietly left as a green test that guards
+nothing.
+
+The test is kept on its own merits: an `If` capturing a dynamic outer-scope tensor across executor eviction
+had no coverage at all, and it would catch a regression that dropped outer-scope tensors from the cache key.
+
+⚠️ Two properties of the fixture are load-bearing, and the test asserts both rather than trusting them.
+**FIVE distinct shapes, not four** - `ResolveExecutor` returns the BASE executor whenever a run matches the
+shapes the session was CREATED with, and the base executor is never in the LRU (`InferenceSession.cs:245`),
+so `[2,3,5,7,2]` fills the LRU to exactly 3 and never evicts. **And the data must depend on N** - with a
+plain `arange`, row *i* holds the same values at every shape, so a stale read of a larger shape's leading
+rows would return exactly the right numbers.
+
+### Engine
+
+Requires **SpawnDev.ILGPU 5.2.10**, which carries the WebGPU buffer labels and `DestroyStack` recording that
+made the 5.2.10/5.2.11 use-after-free diagnosable at all.
+
+## 5.2.10 (2026-09-04) - LOCAL FEED ONLY, never published to nuget.org
+
+⚠️ No `5.2.10` stable package exists anywhere: this version shipped only as `5.2.10-local.1` .. `-local.7`
+on `D:\users\SpawnDevPackages`, and nuget.org goes 5.2.9 -> 5.2.11. Everything below is INCLUDED in 5.2.11,
+so a consumer moving 5.2.9 -> 5.2.11 gets both sections. Kept as its own entry because the fixes were
+developed, gated and described separately, and because 5.2.11's first fix only makes sense as the sequel to
+this one.
 
 ### Fixed - a cached subgraph plan outlived the pool its constants were allocated from
 

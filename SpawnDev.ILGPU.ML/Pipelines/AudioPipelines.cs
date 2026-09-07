@@ -123,7 +123,43 @@ public class SpeechRecognitionPipeline : IDisposable
     /// </remarks>
     public int MaxTargetPositions { get; set; } = 448;
 
+    /// <summary>
+    /// The language Whisper is prompted to transcribe, as a short code ("en", "fr", "de", ...).
+    /// </summary>
+    /// <remarks>
+    /// This DRIVES the prompt's language token. It used to be decoration: the prompt hard-coded
+    /// <c>&lt;|en|&gt;</c> and this property was only echoed back into
+    /// <see cref="TranscriptionResult.Language"/>, so setting "fr" produced an English-prompted
+    /// transcript that CLAIMED to be French. Resolution now fails loudly rather than silently falling
+    /// back to English - a wrong prompt does not throw inside Whisper, it just returns confident text,
+    /// which is the one failure mode this pipeline has no way to notice.
+    /// </remarks>
     public string Language { get; set; } = "en";
+
+    /// <summary>
+    /// The token id for <see cref="Language"/>, resolved from the loaded tokenizer.
+    /// </summary>
+    /// <remarks>
+    /// Accepts "en" or "&lt;|en|&gt;" and is case-insensitive. Throws rather than defaulting, because
+    /// every silent failure in this file has cost a day: an unrecognised language that quietly became
+    /// English would be indistinguishable from a correct run.
+    /// </remarks>
+    private int ResolveLanguageToken()
+    {
+        var lang = (Language ?? string.Empty).Trim().Trim('<', '>', '|').ToLowerInvariant();
+        if (lang.Length == 0) lang = "en";
+        if (lang == "en") return LANG_EN;
+        if (_tokenizer == null)
+            throw new InvalidOperationException(
+                $"Language '{Language}' needs a tokenizer to resolve <|{lang}|>; call LoadTokenizer first. " +
+                "Only \"en\" has a compiled-in default.");
+        if (!_tokenizer.TryGetTokenId($"<|{lang}|>", out var id))
+            throw new InvalidOperationException(
+                $"The loaded tokenizer has no token <|{lang}|>, so language '{Language}' cannot be " +
+                "requested of this model. Multilingual Whisper checkpoints list one token per language; " +
+                "the English-only (.en) checkpoints have none.");
+        return id;
+    }
 
     /// <summary>True when a with-past decoder was supplied, so decoding is O(n) rather than O(n^2).</summary>
     public bool UsesKVCache => _decoderWithPastSession != null;
@@ -217,9 +253,20 @@ public class SpeechRecognitionPipeline : IDisposable
         double encoderMs = encSw.Elapsed.TotalMilliseconds;
 
         // 5. Autoregressive decoder
+        // The .en checkpoints carry no language token at all, so asking one for a language other than
+        // English cannot be honoured - and honouring it silently as English is exactly the failure this
+        // pipeline cannot detect from the outside.
+        var requestedLanguage = (Language ?? string.Empty).Trim().Trim('<', '>', '|').ToLowerInvariant();
+        if (requestedLanguage.Length == 0) requestedLanguage = "en";
+        if (IsEnglishOnlyModel && requestedLanguage != "en")
+            throw new InvalidOperationException(
+                $"Language '{Language}' was requested, but the loaded model is an English-only (.en) " +
+                "Whisper checkpoint, which was trained without language tokens. Load a multilingual " +
+                "checkpoint or set Language = \"en\".");
+
         var tokens = IsEnglishOnlyModel
             ? new List<int> { SOT, NO_TIMESTAMPS }
-            : new List<int> { SOT, LANG_EN, TRANSCRIBE, NO_TIMESTAMPS };
+            : new List<int> { SOT, ResolveLanguageToken(), TRANSCRIBE, NO_TIMESTAMPS };
         int promptLength = tokens.Count;
 
         // Greedy next-token selection stays GPU-side: read back one index per token, not the whole vocab.
@@ -277,7 +324,10 @@ public class SpeechRecognitionPipeline : IDisposable
         return new TranscriptionResult
         {
             Text = text.Trim(),
-            Language = Language,
+            // The language the decoder was actually PROMPTED with, normalized - not the raw property.
+            // An .en checkpoint is prompted with no language token at all, which is English by
+            // construction.
+            Language = IsEnglishOnlyModel ? "en" : requestedLanguage,
             InferenceTimeMs = sw.Elapsed.TotalMilliseconds,
             MelTimeMs = melMs,
             ModelTimeMs = sw.Elapsed.TotalMilliseconds - melMs,

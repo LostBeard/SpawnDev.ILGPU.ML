@@ -1183,14 +1183,40 @@ namespace PlaywrightMultiTest
         // moves execution into OneTimeSetUp (StartUp) and runs backend "lanes" in
         // parallel, then NUnit's RunTest just reports the cached per-test outcome.
         //
-        // Lane model (v1):
-        //   Phase A (parallel): browser non-Wasm rows (sequential on the one page) ‖
-        //     CPU subprocesses (cap N) ‖ CUDA subprocesses (cap 1, GPU) ‖
-        //     OpenCL subprocesses (cap 1, GPU).
-        //   Phase B (isolated): Wasm rows alone — Wasm sort kernels spawn
+        // Lane model (v2 — LIGHT EVERYWHERE, THEN HEAVY ALONE):
+        //   Phase A (parallel): LIGHT browser non-Wasm rows (sequential on the one page) ‖
+        //     LIGHT CPU subprocesses (cap N) ‖ LIGHT CUDA (cap 1, GPU) ‖ LIGHT OpenCL (cap 1, GPU).
+        //   Phase B (isolated): LIGHT Wasm rows alone — Wasm sort kernels spawn
         //     hardwareConcurrency pure-spin barrier workers that STARVE under CPU
         //     oversubscription, so Wasm never overlaps any other CPU-heavy lane.
+        //   Phase C (serial): EVERY heavy row, one at a time, ONE BACKEND AT A TIME.
+        //
+        // 🔴 WHY PHASE C EXISTS (Captain's design, 2026-09-06). The concern is FALSE FAILURES FROM
+        // RESOURCE STARVATION, not wall-clock. Three things forced it:
+        //
+        //   1. CPU and Wasm are BOTH CPU backends. Phase B already isolates Wasm for that reason, but
+        //      nothing stopped a CPU-lane heavy test from overlapping the browser and GPU lanes.
+        //   2. The CPU lane's light/heavy split keyed on "HeavyCpu" ONLY, so a "HeavyModel" test landed
+        //      in the LIGHT bucket. MEASURED 2026-09-06: CPUTests.SDTurbo_Generate_E2E (HeavyModel,
+        //      30-minute timeout, ~2.5 GB of sub-models) ran as a "light" CPU row holding 6.8 GB while
+        //      three other lanes ran — free RAM fell to 585 MB and recovered to 7,014 MB the instant it
+        //      finished. The whole dip was ONE test.
+        //   3. A global one-at-a-time semaphore (the first attempt) fixed overlap but caused HEAD-OF-LINE
+        //      BLOCKING: the browser lane is sequential on one page, so a browser row waiting on the gate
+        //      also stalls every LIGHT row behind it. 1,881 browser rows sat idle behind one CPU test,
+        //      with no "running" row and an enabled Run button — indistinguishable from a wedged sweep.
+        //
+        // Splitting by PHASE removes all three: nothing ever waits mid-list, heavy rows never overlap
+        // anything, and peak memory becomes max(single heavy test) rather than sum(whatever overlapped).
+        //
+        // Phase C runs backends in the project's standing FAST-FIRST order (CLAUDE.md: verify on fast
+        // backends first, WebGL/Wasm last) and groups by backend so model weights stay warm rather than
+        // thrashing. The browser page is RECREATED before each browser group: browser lanes retain every
+        // Context/Accelerator (~0.9 MiB/test measured), so after a full light sweep the heap carries
+        // ~1.7 GB of retained contexts — exactly the wrong state to start a 2.5 GB model load from.
+        //
         // Set PMT_PARALLEL=off to fall back to the original sequential per-case path.
+        // PMT_HEAVY_GATE_CATEGORIES still selects what counts as heavy (see IsHeavyGated).
 
         public sealed record ScheduledOutcome(string Status, string? Message, double DurationMs);
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ScheduledOutcome> _outcomes = new();
@@ -1367,7 +1393,10 @@ namespace PlaywrightMultiTest
                 foreach (var t in proj.Tests.Where(t => t.TestTypeName == null))
                     await ExecuteAndCaptureAsync(t, null).ConfigureAwait(false);
 
-            // ── Phase A: non-Wasm browser lane ‖ desktop lanes ──────────────────────
+            // Every heavy row from every lane, collected here and run ALONE in Phase C.
+            var heavyGroups = new List<(string Key, List<ProjectTest> Tests, bool Browser)>();
+
+            // ── Phase A: LIGHT non-Wasm browser lane ‖ LIGHT desktop lanes ──────────
             var phaseA = new List<Task>();
 
             foreach (var console in TestableProjects.OfType<TestableConsole>())
@@ -1376,7 +1405,12 @@ namespace PlaywrightMultiTest
                              .Where(t => t.TestTypeName != null)
                              .GroupBy(t => DesktopLaneOf(t.TestTypeName)))
                 {
-                    var tests = laneGroup.ToList();
+                    // Heavy rows leave the lane entirely - they run in Phase C, alone.
+                    var laneHeavy = laneGroup.Where(IsHeavyGated).ToList();
+                    if (laneHeavy.Count > 0) heavyGroups.Add((laneGroup.Key, laneHeavy, false));
+
+                    var tests = laneGroup.Where(t => !IsHeavyGated(t)).ToList();
+                    if (tests.Count == 0) continue;
                     var cap = CapFor(laneGroup.Key);
 
                     // CPU lane only: the ILGPU CPU accelerator already saturates ALL cores per
@@ -1390,6 +1424,10 @@ namespace PlaywrightMultiTest
                     // browser lane is single-page-sequential, so only the cpu lane needs this.
                     if (laneGroup.Key == "cpu")
                     {
+                        // Normally EMPTY now: HeavyCpu is a Phase C category, so those rows already left.
+                        // Kept because PMT_HEAVY_GATE_CATEGORIES can narrow what Phase C claims - if
+                        // someone drops HeavyCpu from it, this lane still serializes its own heavy rows
+                        // rather than silently oversubscribing every core.
                         var heavy = tests.Where(IsCpuHeavy).ToList();
                         var light = tests.Where(t => !IsCpuHeavy(t)).ToList();
                         int heavyCap = EnvInt("PMT_CPU_HEAVY_PARALLELISM", 1);
@@ -1421,8 +1459,12 @@ namespace PlaywrightMultiTest
 
             if (blazor?.Page != null)
             {
-                var nonWasm = blazor.Tests.Where(t => t.TestTypeName != null && !IsWasm(t)).ToList();
-                LogStatus($"Phase A browser non-Wasm lane: {nonWasm.Count} tests (sequential on shared page)");
+                var nonWasmAll = blazor.Tests.Where(t => t.TestTypeName != null && !IsWasm(t)).ToList();
+                foreach (var g in nonWasmAll.Where(IsHeavyGated).GroupBy(t => t.TestTypeName ?? "browser"))
+                    heavyGroups.Add((g.Key, g.ToList(), true));
+
+                var nonWasm = nonWasmAll.Where(t => !IsHeavyGated(t)).ToList();
+                LogStatus($"Phase A browser non-Wasm lane: {nonWasm.Count} light tests (sequential on shared page)");
                 phaseA.Add(RunLaneSequentialAsync(nonWasm, blazor.Page));
             }
 
@@ -1432,7 +1474,11 @@ namespace PlaywrightMultiTest
             // ── Phase B: Wasm lane alone (no other CPU-heavy lane running) ──────────
             if (blazor?.Page != null)
             {
-                var wasm = blazor.Tests.Where(t => t.TestTypeName != null && IsWasm(t)).ToList();
+                var wasmAll = blazor.Tests.Where(t => t.TestTypeName != null && IsWasm(t)).ToList();
+                foreach (var g in wasmAll.Where(IsHeavyGated).GroupBy(t => t.TestTypeName ?? "wasm"))
+                    heavyGroups.Add((g.Key, g.ToList(), true));
+
+                var wasm = wasmAll.Where(t => !IsHeavyGated(t)).ToList();
                 var nonWasmBrowser = blazor.Tests
                     .Where(t => t.TestTypeName != null && !IsWasm(t))
                     .ToList();
@@ -1444,12 +1490,88 @@ namespace PlaywrightMultiTest
                         blazor.Page = await RecreateTestPageAsync(blazor, reloadUrl).ConfigureAwait(false);
                 }
 
-                LogStatus($"Phase B Wasm lane: {wasm.Count} tests (isolated, sequential)");
+                LogStatus($"Phase B Wasm lane: {wasm.Count} light tests (isolated, sequential)");
                 await RunLaneSequentialAsync(wasm, blazor.Page).ConfigureAwait(false);
             }
 
+            // ── Phase C: every heavy row, alone, one backend at a time ──────────────
+            await RunHeavyPhaseAsync(heavyGroups, blazor, swAll).ConfigureAwait(false);
+
             LogStatus($"All scheduled tests complete in {swAll.Elapsed:hh\\:mm\\:ss} ({_outcomes.Count} outcomes cached).");
         }
+
+        /// <summary>
+        /// Phase C: every heavy row, strictly serialized, ONE BACKEND AT A TIME.
+        /// </summary>
+        /// <remarks>
+        /// Nothing else runs during this phase, so peak memory is max(single heavy test) rather than
+        /// sum(whatever happened to overlap). Groups run in the project's standing FAST-FIRST order and a
+        /// backend's heavy rows run together, so model weights stay warm instead of thrashing.
+        /// </remarks>
+        private async Task RunHeavyPhaseAsync(
+            List<(string Key, List<ProjectTest> Tests, bool Browser)> groups,
+            TestableBlazorWasm? blazor, Stopwatch swAll)
+        {
+            var total = groups.Sum(g => g.Tests.Count);
+            if (total == 0)
+            {
+                LogStatus("Phase C: no heavy tests in this run (excluded by category, or none matched).");
+                return;
+            }
+
+            LogStatus($"Phase A+B complete in {swAll.Elapsed:hh\\:mm\\:ss}. Starting Phase C: {total} heavy "
+                    + $"tests across {groups.Count} backend group(s), serialized, one backend at a time.");
+
+            foreach (var g in groups
+                         .OrderBy(x => HeavyPhaseOrder(x.Key))
+                         .ThenBy(x => x.Key, StringComparer.Ordinal)
+                         .ToList())
+            {
+                var swGroup = Stopwatch.StartNew();
+                LogStatus($"Phase C heavy group '{g.Key}': {g.Tests.Count} test(s), serial, nothing else running.");
+
+                if (g.Browser)
+                {
+                    var page = blazor?.Page;
+                    if (blazor == null || page == null)
+                    {
+                        LogStatus($"*** Phase C group '{g.Key}' SKIPPED: the Blazor project has no page.");
+                        continue;
+                    }
+                    // A FRESH PAGE per heavy browser group. Browser lanes retain every Context and
+                    // Accelerator (~0.9 MiB/test measured), so a full light sweep leaves well over a
+                    // gigabyte of retained contexts on the heap - the worst possible state to start a
+                    // multi-gigabyte model load from, and a prime source of false OOM failures.
+                    var url = g.Tests[0].TestPageUrl;
+                    if (!string.IsNullOrEmpty(url))
+                    {
+                        page = await RecreateTestPageAsync(blazor, url).ConfigureAwait(false);
+                        blazor.Page = page;
+                    }
+                    await RunLaneSequentialAsync(g.Tests, page).ConfigureAwait(false);
+                }
+                else
+                {
+                    await RunLaneConcurrentAsync(g.Tests, 1, null).ConfigureAwait(false);
+                }
+
+                LogStatus($"Phase C heavy group '{g.Key}' done in {swGroup.Elapsed:hh\\:mm\\:ss}.");
+            }
+        }
+
+        /// <summary>
+        /// Phase C backend order. The project's standing rule is FAST BACKENDS FIRST (CLAUDE.md), so a real
+        /// defect surfaces early; WebGL and Wasm run last because they are the slow lanes.
+        /// </summary>
+        private static int HeavyPhaseOrder(string key) => key switch
+        {
+            "cuda" => 0,
+            "opencl" => 1,
+            "WebGPUTests" => 2,
+            "cpu" => 3,
+            "WebGLTests" => 4,
+            _ => 5,   // Wasm, and anything unrecognised, last
+        };
 
         private async Task RunLaneSequentialAsync(List<ProjectTest> tests, IPage page)
         {
@@ -1524,6 +1646,45 @@ namespace PlaywrightMultiTest
             return newPage;
         }
 
+        // ───────────────────── Global heavy gate: ONE heavy test at a time ─────────────────────
+        // 🔴 THE LANES OVERLAP BY DESIGN and each can hold its own model. Phase A runs
+        // browser ‖ CPU ‖ CUDA ‖ OpenCL, so a heavy browser GGUF test can coincide with heavy CUDA and
+        // OpenCL subprocesses. MEASURED 2026-09-05 on a 16 GB box, HeavyModel enabled: free physical RAM
+        // dived from 8,583 MB to a floor of 289 MB and then RECOVERED to 5,550 MB - a transient spike, not
+        // a leak. Commit was never tight (CommitFree ~50 GB), so Windows logged no resource-exhaustion
+        // event and the pressure was invisible to every check except a sampler.
+        //
+        // That spike is what kills sweeps: a watchdog either samples during one or it does not, which is
+        // exactly why two runs in a row died and the third completed. Serializing HEAVY tests across ALL
+        // lanes removes the spike while leaving the light tests parallel, which is where the parallelism
+        // actually pays (it hides per-process JIT/startup). PMT_PARALLEL=off remains the blunt fallback.
+        //
+        // Acquired INSIDE the per-lane cap and released in a finally, so the lock order is always
+        // lane-semaphore then heavy-gate - consistent everywhere, so no deadlock.
+        /// <remarks>
+        /// ⚠️ Since Phase C, this is a BELT-AND-BRACES assertion, not the primary mechanism. Phase C runs
+        /// every heavy row serially with nothing else in flight, so this semaphore should never actually
+        /// block - if the "is WAITING" line below ever appears, the SCHEDULER has let two heavy rows
+        /// overlap and that is the bug to fix, not this gate.
+        /// </remarks>
+        private static readonly SemaphoreSlim _heavyGate = new(1, 1);
+
+        /// <summary>Categories that may not run concurrently with each other or with any other heavy test.
+        /// Override with PMT_HEAVY_GATE_CATEGORIES (comma-separated); set to a name matching nothing to
+        /// disable the gate.</summary>
+        private static readonly string[] DefaultHeavyGateCategories = { "HeavyModel", "HeavyCpu", "WasmHeavy" };
+        private static string[] HeavyGateCategories()
+        {
+            var env = Environment.GetEnvironmentVariable("PMT_HEAVY_GATE_CATEGORIES");
+            if (env == null) return DefaultHeavyGateCategories;
+            return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        private static bool IsHeavyGated(ProjectTest t) =>
+            !string.IsNullOrEmpty(t.Category)
+            && t.Category.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .Any(c => HeavyGateCategories().Contains(c, StringComparer.OrdinalIgnoreCase));
+
         // Categories whose tests must run serialized on the CPU lane (one all-core CPU-accelerator
         // process at a time). NOT an exclusion list — HeavyCpu tests run normally on every other
         // lane (browser/WebGPU/WebGL/Wasm/CUDA/OpenCL), where they are fast; they are only slow on
@@ -1580,7 +1741,37 @@ namespace PlaywrightMultiTest
         /// </summary>
         private bool _pageRuntimeDied;
 
+        /// <summary>
+        /// Every lane funnels through here, so this is the one place a global heavy gate can cover
+        /// browser, CPU, CUDA and OpenCL at once. See <see cref="_heavyGate"/>.
+        /// </summary>
         private async Task ExecuteAndCaptureAsync(ProjectTest test, IPage? page)
+        {
+            if (!IsHeavyGated(test))
+            {
+                await ExecuteAndCaptureCoreAsync(test, page).ConfigureAwait(false);
+                return;
+            }
+
+            // 🔴 SAY SO WHEN WE BLOCK. Waiting here is INVISIBLE from outside: the test has not been
+            // dispatched to the page yet, so the browser test list shows no "running" row and its Run
+            // button stays ENABLED - indistinguishable from a wedged sweep, which is exactly how it was
+            // read the first time this fired (2026-09-06: the browser lane sat behind a 30-minute
+            // CPU-backend SDTurbo_Generate_E2E holding the gate, and the run looked hung).
+            if (!_heavyGate.Wait(0))
+            {
+                Console.WriteLine($"[PlaywrightMultiTest] heavy gate: {test.Name} is WAITING (another lane "
+                                + "holds it; this is the one-heavy-test-at-a-time gate, not a hang)");
+                var gateSw = Stopwatch.StartNew();
+                await _heavyGate.WaitAsync().ConfigureAwait(false);
+                Console.WriteLine($"[PlaywrightMultiTest] heavy gate: {test.Name} acquired after "
+                                + $"{gateSw.Elapsed.TotalSeconds:F0}s");
+            }
+            try { await ExecuteAndCaptureCoreAsync(test, page).ConfigureAwait(false); }
+            finally { _heavyGate.Release(); }
+        }
+
+        private async Task ExecuteAndCaptureCoreAsync(ProjectTest test, IPage? page)
         {
             var sw = Stopwatch.StartNew();
             try
