@@ -181,6 +181,26 @@ namespace PlaywrightMultiTest
             // scheduler runs the enumerated set up-front in StartUp, so an unscoped enumeration
             // would run everything. PMT_FILTER (substring match, this testhost CAN read it) lets
             // dev runs scope the scheduled set: e.g. `PMT_FILTER=VectorAddTest dotnet test ...`.
+            // ⚠️ NAME THE EXCLUDED CATEGORIES, EVERY RUN. Without this the only signal is Phase C's
+            // "no heavy tests in this run (excluded by category, or none matched)", which cannot tell
+            // "your filter matched nothing" from "your filter matched only tests I then skipped" - and the
+            // run still ends in a green "Passed!".
+            //
+            // 🔴 THE CMD.EXE TRAP THIS EXISTS FOR. The documented way to include heavy tests is
+            // `PMT_EXCLUDE_CATEGORIES=` (empty = exclude nothing). That works in bash. In cmd.exe and in a
+            // .cmd/.bat file - which is how WMI-launched sweeps start - `set VAR=` DELETES the variable, so
+            // ExcludedCategories() sees null and silently restores the DEFAULTS. MEASURED 2026-09-08: a run
+            // scoped to DA3Small with `set PMT_EXCLUDE_CATEGORIES=` reported "Passed! Failed: 0, Passed: 8"
+            // having run not one DA3 test. From cmd, pass a real non-empty value instead: any name that is
+            // not a category, e.g. PMT_EXCLUDE_CATEGORIES=None.
+            var activeExclusions = ExcludedCategories();
+            LogStatus(activeExclusions.Length == 0
+                ? "Excluded categories: NONE - every category will run."
+                : $"Excluded categories: {string.Join(", ", activeExclusions)} "
+                  + (Environment.GetEnvironmentVariable("PMT_EXCLUDE_CATEGORIES") == null
+                      ? "(DEFAULT - PMT_EXCLUDE_CATEGORIES is unset; note `set VAR=` in cmd.exe UNSETS it)"
+                      : "(from PMT_EXCLUDE_CATEGORIES)"));
+
             filter ??= Environment.GetEnvironmentVariable("PMT_FILTER");
             if (!string.IsNullOrEmpty(filter))
             {
@@ -1515,7 +1535,25 @@ namespace PlaywrightMultiTest
             var total = groups.Sum(g => g.Tests.Count);
             if (total == 0)
             {
-                LogStatus("Phase C: no heavy tests in this run (excluded by category, or none matched).");
+                // ⚠️ NAME THE EXCLUSIONS HERE, not only at enumeration. This is the line that actually
+                // reaches a redirected log (the enumeration-time notices are written by a process whose
+                // stdout `dotnet test >` does not capture), and on its own it cannot tell "your filter
+                // matched nothing" from "your filter matched only tests I then skipped".
+                //
+                // 🔴 THE CMD.EXE TRAP IT HIDES. The documented way to include heavy tests is
+                // `PMT_EXCLUDE_CATEGORIES=` (empty = exclude nothing). That works in bash. In cmd.exe and
+                // in a .cmd/.bat - which is how WMI-launched sweeps start - `set VAR=` DELETES the
+                // variable, so ExcludedCategories() sees null and silently restores the DEFAULTS.
+                // MEASURED 2026-09-08: a run scoped to DA3Small with `set PMT_EXCLUDE_CATEGORIES=`
+                // reported a green "Passed! Failed: 0, Passed: 8" having run not one DA3 test. From cmd,
+                // pass a real non-empty value that is not a category, e.g. PMT_EXCLUDE_CATEGORIES=None.
+                var excl = ExcludedCategories();
+                LogStatus("Phase C: no heavy tests in this run. Excluded categories: "
+                    + (excl.Length == 0 ? "NONE" : string.Join(", ", excl))
+                    + (Environment.GetEnvironmentVariable("PMT_EXCLUDE_CATEGORIES") == null
+                        ? " (DEFAULT - PMT_EXCLUDE_CATEGORIES is unset; `set VAR=` in cmd.exe UNSETS it)"
+                        : " (from PMT_EXCLUDE_CATEGORIES)")
+                    + ". If you expected heavy tests, this is why.");
                 return;
             }
 

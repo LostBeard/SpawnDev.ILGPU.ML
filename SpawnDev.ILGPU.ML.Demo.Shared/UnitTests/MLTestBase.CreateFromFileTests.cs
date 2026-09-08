@@ -15,6 +15,71 @@ public abstract partial class MLTestBase
     // ──────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// <c>inputShapes</c> may pin a dynamic DIMENSION and must REFUSE to change an input's RANK.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE FAILURE THIS PINS IS SILENT AND LANDS HUNDREDS OF NODES AWAY. Dims are matched positionally,
+    /// so a shape of the wrong rank hands every value to the wrong axis and the model keeps running.
+    /// MEASURED 2026-09-08: DAv3-Small declares <c>[batch_size, num_images, 3, height, width]</c> and four
+    /// DA3 tests passed <c>[1,3,224,224]</c>, so <c>num_images</c> received the channel count 3. The visible
+    /// symptom was <c>Shapes [3,257,384] and [1,593,384] are not broadcastable</c> in a position-embedding
+    /// Add - 12 failures on all six backends, read for months as a decoder-head reassemble bug whose own
+    /// signature, "batch=2304", is that same 3 (2304 = 3 x 768).
+    ///
+    /// ⚠️ BOTH DIRECTIONS ARE ASSERTED ON PURPOSE. A guard that only checks the throw cannot tell "refuses
+    /// a bad rank" from "refuses everything", and pinning a dynamic dim is what this parameter is FOR - so
+    /// the correct-rank override has to be shown still working. SqueezeNet is used because it is small,
+    /// local and rank-4; the input NAME is read off the model rather than hardcoded.
+    /// </remarks>
+    [TestMethod(Timeout = 120000)]
+    public async Task InputShapes_WrongRank_IsRefused() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        var onnxBytes = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+
+        string inputName;
+        int declaredRank;
+        using (var probe = InferenceSession.CreateFromOnnx(accelerator, onnxBytes))
+        {
+            inputName = probe.InputNames[0];
+            declaredRank = 4;   // SqueezeNet is [N,C,H,W]; asserted below via the accepted override
+        }
+        Console.WriteLine($"[InputShapesRank] model input '{inputName}'");
+
+        // POSITIVE CONTROL: the right rank is still accepted, which is the whole point of the parameter.
+        using (var ok = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { [inputName] = new[] { 1, 3, 224, 224 } }))
+        {
+            Console.WriteLine($"[InputShapesRank] rank-{declaredRank} override accepted: {ok.NodeCount} nodes");
+        }
+
+        // Rank too HIGH and rank too LOW must both be refused, and the message must name both ranks -
+        // "not broadcastable at dim 1" four hundred nodes later is what this replaces.
+        foreach (var bad in new[] { new[] { 1, 1, 3, 224, 224 }, new[] { 3, 224, 224 } })
+        {
+            string? msg = null;
+            try
+            {
+                using var _ = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+                    inputShapes: new Dictionary<string, int[]> { [inputName] = bad });
+            }
+            catch (ArgumentException ex) { msg = ex.Message; }
+
+            if (msg == null)
+                throw new Exception(
+                    $"a rank-{bad.Length} inputShapes override ([{string.Join(",", bad)}]) was ACCEPTED for a "
+                  + $"rank-{declaredRank} input. It will now fail somewhere unrelated instead of here.");
+            if (!msg.Contains($"rank {bad.Length}") || !msg.Contains($"rank {declaredRank}"))
+                throw new Exception(
+                    $"the refusal does not name both ranks, so it cannot be acted on: \"{msg}\"");
+            Console.WriteLine($"[InputShapesRank] rank-{bad.Length} refused: {msg.Split('.')[0]}.");
+        }
+    });
+
+    /// <summary>
     /// Load SqueezeNet via CreateFromFileAsync (.onnx auto-detected),
     /// classify a gradient image, verify non-uniform output.
     /// </summary>

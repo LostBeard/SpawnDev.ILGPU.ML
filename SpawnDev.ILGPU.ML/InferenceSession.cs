@@ -780,10 +780,59 @@ public class InferenceSession : IDisposable
     }
 
     /// <summary>
+    /// Apply caller-supplied input shape overrides, REFUSING any whose rank disagrees with the model.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 🔴 A RANK MISMATCH HERE IS SILENT, AND FATAL HUNDREDS OF NODES LATER. <c>inputShapes</c> exists to
+    /// pin dynamic DIMENSIONS; it was never meant to change an input's RANK, and nothing checked. Dims are
+    /// matched positionally, so a shape of the wrong rank feeds every value to the wrong axis and the model
+    /// keeps running - until some unrelated operator finds two shapes that will not broadcast.
+    /// </para>
+    /// <para>
+    /// ⚠️ MEASURED 2026-09-08. DAv3-Small declares
+    /// <c>pixel_values: [batch_size, num_images, 3, height, width]</c> and four DA3 tests passed
+    /// <c>[1, 3, 224, 224]</c>. <c>num_images</c> therefore received the CHANNEL COUNT, 3, and every
+    /// downstream shape carried it: the visible failure was
+    /// <c>Shapes [3,257,384] and [1,593,384] are not broadcastable</c> inside a position-embedding Add -
+    /// 12 failures across all six backends, read for months as a decoder-head reassemble bug whose
+    /// signature "batch=2304" is the same 3 (2304 = 3 x 768).
+    /// </para>
+    /// <para>
+    /// Only the RANK is compared, never the values: pinning a symbolic dim to a concrete size is the entire
+    /// point of this parameter, and the loader already stores unknown dims as 1 while keeping the rank. An
+    /// input the model does not declare a shape for is left alone.
+    /// </para>
+    /// </remarks>
+    private static void ApplyInputShapeOverrides(
+        Onnx.OnnxModelInfo modelInfo, Dictionary<string, int[]>? inputShapes)
+    {
+        if (inputShapes == null) return;
+        foreach (var (name, shape) in inputShapes)
+        {
+            if (shape is { Length: > 0 }
+                && modelInfo.ValueShapes.TryGetValue(name, out var declared)
+                && declared is { Length: > 0 }
+                && declared.Length != shape.Length)
+            {
+                throw new ArgumentException(
+                    $"inputShapes['{name}'] is rank {shape.Length} ([{string.Join(",", shape)}]) but the model "
+                  + $"declares rank {declared.Length} ([{string.Join(",", declared)}]). inputShapes pins dynamic "
+                  + "DIMENSIONS - it cannot change an input's RANK. Dims are matched positionally, so a shape "
+                  + "of the wrong rank silently feeds each value to the wrong axis and fails much later in an "
+                  + "unrelated operator. Pass a shape with the model's own rank.",
+                    nameof(inputShapes));
+            }
+            modelInfo.ValueShapes[name] = shape;
+        }
+    }
+
+    /// <summary>
     /// Create an InferenceSession directly from raw .onnx bytes.
     /// No Python extraction step needed — uses the native ONNX protobuf parser.
     /// </summary>
-    /// <param name="inputShapes">Optional: override input shapes for models with dynamic dimensions.</param>
+    /// <param name="inputShapes">Optional: override input shapes for models with dynamic dimensions.
+    /// Pins dynamic DIMENSIONS only - a shape whose RANK differs from the model's is refused, loudly.</param>
     /// <param name="externalData">Optional: raw bytes of the external data file (model.onnx_data)
     /// for models that store weights in a separate file.</param>
     public static InferenceSession CreateFromOnnx(
@@ -832,11 +881,7 @@ public class InferenceSession : IDisposable
         onProgress?.Invoke("parse", 100);
 
         // Apply input shape overrides (for models with dynamic dimensions)
-        if (inputShapes != null)
-        {
-            foreach (var (name, shape) in inputShapes)
-                modelInfo.ValueShapes[name] = shape;
-        }
+        ApplyInputShapeOverrides(modelInfo, inputShapes);
 
         // Convert OnnxModelInfo → ModelGraph
         ModelGraph graph;
@@ -987,11 +1032,7 @@ public class InferenceSession : IDisposable
         }
         onProgress?.Invoke("parse", 100);
 
-        if (inputShapes != null)
-        {
-            foreach (var (name, shape) in inputShapes)
-                modelInfo.ValueShapes[name] = shape;
-        }
+        ApplyInputShapeOverrides(modelInfo, inputShapes);
 
         ModelGraph graph;
         try { graph = ConvertToModelGraph(modelInfo); }
@@ -1138,9 +1179,7 @@ public class InferenceSession : IDisposable
         }
         onProgress?.Invoke("parse", 100);
 
-        if (inputShapes != null)
-            foreach (var (name, shape) in inputShapes)
-                modelInfo.ValueShapes[name] = shape;
+        ApplyInputShapeOverrides(modelInfo, inputShapes);
 
         ModelGraph graph;
         try { graph = ConvertToModelGraph(modelInfo); }

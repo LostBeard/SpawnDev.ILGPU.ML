@@ -133,10 +133,27 @@ public abstract partial class MLTestBase
 
         Console.WriteLine($"[DA3] model.onnx: {onnxBytes.Length / 1024}KB, model.onnx_data: {extDataBytes.Length / 1024 / 1024}MB");
 
+        // 🔴 DAv3 IS A MULTI-VIEW MODEL AND ITS INPUT IS RANK 5. Read straight out of the graph proto:
+        //
+        //     pixel_values : float [ batch_size, num_images, 3, height, width ]
+        //
+        // with the symbolic dims elsewhere in the graph reading `batch_size*num_images` and
+        // `(height//14)*(width//14)` (patch size 14).
+        //
+        // ⚠️ These tests fed a rank-4 [1,3,224,224] until 2026-09-08 and it did NOT fail loudly - the ranks
+        // simply line up positionally, so `num_images` was handed OUR CHANNEL COUNT, 3. Every downstream
+        // shape then carried that 3: the crash was `Shapes [3,257,384] and [1,593,384] are not broadcastable`
+        // in the pos-embed Add, 12 failures across all six backends, and the 2026-08-16 note below about a
+        // "DA3-v3 head reassemble/symbolic-shape bug producing batch=2304" is the same 3 (2304 = 3 x 768),
+        // as is the [3,1,768] LayerNorm in that tracked follow-up.
+        //
+        // DA3Small_Pipeline_5D_WebGPU_ProducesDepth has always driven this model at its native rank and has
+        // always been the DA3 test that works - its own summary calls [1,1,3,518,518] "its native 5-D input".
+        // ⚠️ Keep num_images = 1 unless you mean to test multi-view; height and width must stay /14-clean.
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                ["pixel_values"] = new[] { 1, 1, 3, 224, 224 }
             },
             externalData: extDataBytes);
 
@@ -177,13 +194,13 @@ public abstract partial class MLTestBase
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                ["pixel_values"] = new[] { 1, 1, 3, 224, 224 }
             },
             externalData: extDataBytes);
         tCreate = sw.ElapsedMilliseconds - tDownload;
         Console.WriteLine($"[DA3] session created in {tCreate}ms (parse + compile + weight upload), nodes={session.NodeCount}");
 
-        // Generate test input: random normalized image [1, 3, 224, 224]
+        // Generate test input: random normalized image [1, 1, 3, 224, 224] - see the rank note above
         var rng = new Random(42);
         int pixelCount = 3 * 224 * 224;
         var inputData = new float[pixelCount];
@@ -191,7 +208,7 @@ public abstract partial class MLTestBase
             inputData[i] = (float)(rng.NextDouble() * 2 - 1);
 
         using var inputBuf = accelerator.Allocate1D(inputData);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, 3, 224, 224 });
 
         long tRunStart = sw.ElapsedMilliseconds;
         Console.WriteLine($"[DA3] starting inference at t={tRunStart}ms");
@@ -266,7 +283,7 @@ public abstract partial class MLTestBase
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                ["pixel_values"] = new[] { 1, 1, 3, 224, 224 }
             },
             externalData: extDataBytes);
 
@@ -279,7 +296,7 @@ public abstract partial class MLTestBase
                     inputData[c * 224 * 224 + y * 224 + x] = (x / 223f) * 2f - 1f;
 
         using var inputBuf = accelerator.Allocate1D(inputData);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, 3, 224, 224 });
 
         var outputs = await session.RunAsync(new Dictionary<string, Tensor>
         {
@@ -944,7 +961,7 @@ public abstract partial class MLTestBase
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
             {
-                ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                ["pixel_values"] = new[] { 1, 1, 3, 224, 224 }
             },
             externalData: extDataBytes);
         long tCreate = sw.ElapsedMilliseconds - tDownload;
@@ -953,7 +970,7 @@ public abstract partial class MLTestBase
         var inputData = new float[3 * 224 * 224];
         // Deterministic input - constant gray (zeros pre-normalization).
         using var inputBuf = accelerator.Allocate1D(inputData);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 3, 224, 224 });
+        var inputTensor = new Tensor(inputBuf.View, new[] { 1, 1, 3, 224, 224 });
 
         // Bound work to first 200 nodes. Default for this committed diagnostic.
         // Adjust BREAK_AT in working tree (don't commit) when bisecting deeper

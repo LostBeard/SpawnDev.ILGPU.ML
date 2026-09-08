@@ -36,23 +36,33 @@ Console.WriteLine($"operator types present: control flow = "
     + $"[{string.Join(", ", session.OperatorTypes.Where(o => o is "If" or "Loop" or "Scan"))}]");
 
 // The compiled graph is what capture actually inspects, so this is the state that matters.
-var g = session.Graph;
-if (g == null) { Console.WriteLine("no ModelGraph exposed"); return; }
+//
+// ⚠️ `InferenceSession.Graph` and its `ConstantData` are GONE from the public surface, and this probe
+// still referenced both - so it stopped compiling and nobody noticed, because a loose .cs in tools/ is in
+// no solution and nothing builds it (found 2026-09-08 by compiling every tool in the folder). The compiled
+// node view - NodeCount + GetNode - is the same graph capture refuses on, so the question is unchanged.
+//
+// The constant-VALUE print is not reconstructible from the public API, and it was never the answer anyway.
+// What decides where the fold has to live is whether the condition is still COMPUTED AT RUNTIME by a
+// surviving node: if it is, the folder could not evaluate it, and that node names exactly what is missing.
+int nodeCount = session.NodeCount;
+var nodes = Enumerable.Range(0, nodeCount).Select(i => (idx: i, n: session.GetNode(i))).ToList();
+Console.WriteLine($"nodes after optimization: {nodeCount}");
 
-Console.WriteLine($"nodes after optimization: {g.Nodes.Count}");
-var ifs = g.Nodes.Where(n => n.OpType is "If" or "Loop" or "Scan").ToList();
+var ifs = nodes.Where(x => x.n.opType is "If" or "Loop" or "Scan").ToList();
 Console.WriteLine($"control-flow nodes surviving optimization: {ifs.Count}");
 
-foreach (var n in ifs)
+foreach (var (idx, n) in ifs)
 {
-    var cond = n.Inputs.Count > 0 ? n.Inputs[0] : "(none)";
-    bool hasConst = g.ConstantData != null && g.ConstantData.TryGetValue(cond, out var cd) && cd.Length > 0;
-    string val = hasConst ? string.Join(",", g.ConstantData![cond]) : "NOT CONSTANT at this stage";
-    Console.WriteLine($"  {n.OpType} '{n.Name}' condition '{cond}' -> {val}");
+    var cond = n.inputs.Length > 0 ? n.inputs[0] : "(none)";
+    var producers = nodes.Where(x => x.n.outputs.Contains(cond, StringComparer.Ordinal)).ToList();
+    Console.WriteLine($"  node {idx} {n.opType} condition '{cond}' -> "
+        + (producers.Count > 0
+            ? $"STILL COMPUTED at runtime by node {producers[0].idx} '{producers[0].n.opType}' "
+              + "- the constant folder could not evaluate it"
+            : "produced by no surviving node (folded away, or a graph input / initializer)"));
 }
 
-// Which of the condition's producers are still present? Anything still in the node list is a node the
-// folder could not evaluate, and names exactly what is missing.
-var byOp = g.Nodes.GroupBy(n => n.OpType).OrderByDescending(x => x.Count());
 Console.WriteLine("surviving op histogram (top 15):");
-foreach (var grp in byOp.Take(15)) Console.WriteLine($"  {grp.Key,-22} {grp.Count()}");
+foreach (var grp in nodes.GroupBy(x => x.n.opType).OrderByDescending(x => x.Count()).Take(15))
+    Console.WriteLine($"  {grp.Key,-22} {grp.Count()}");
