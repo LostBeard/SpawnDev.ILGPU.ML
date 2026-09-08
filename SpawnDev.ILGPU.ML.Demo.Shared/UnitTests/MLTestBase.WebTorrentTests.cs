@@ -242,8 +242,28 @@ public abstract partial class MLTestBase
                     if (!persisted) await Task.Delay(100);
                 }
                 if (!persisted)
+                {
+                    // Say what IS on disk. "It never persisted" with no evidence sends the next person
+                    // looking in the wrong place; the pieces being present while the .torrent is missing is a
+                    // completely different bug from nothing being written at all.
+                    var st = new List<string>();
+                    if (await fs.DirectoryExists("webtorrent/_state"))
+                        foreach (var sf in await fs.GetFiles("webtorrent/_state"))
+                        {
+                            var b3 = await fs.ReadBytes($"webtorrent/_state/{sf}");
+                            st.Add($"{sf}({b3?.Length ?? -1}B)");
+                        }
+                    var pd = new List<string>();
+                    foreach (var d in await fs.GetDirectories("webtorrent"))
+                        if (d != "_state")
+                            pd.Add($"{d}[{(await fs.GetFiles($"webtorrent/{d}")).Count()} files]");
                     throw new Exception("no non-empty _state/*.torrent appeared within 10s of a complete "
-                                      + "download - the torrent never persisted, so a reload cannot restore it");
+                        + $"download - the torrent never persisted, so a reload cannot restore it. "
+                        + $"_state holds: {(st.Count == 0 ? "(nothing)" : string.Join(", ", st))}. "
+                        + $"piece dirs: {(pd.Count == 0 ? "(none)" : string.Join(", ", pd))}. "
+                        + $"torrent: LazyHash={m.Torrent!.LazyHash} "
+                        + $"pieces={m.Torrent!.CompletedPieces}/{m.Torrent!.PieceCount}");
+                }
             }
 
             // 🔴 WHAT IS ACTUALLY ON DISK, BEFORE ANYONE RESTORES.
