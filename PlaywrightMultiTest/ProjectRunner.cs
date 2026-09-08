@@ -558,7 +558,10 @@ namespace PlaywrightMultiTest
                             // pre-empted every WebRTC test that did real peer discovery, even when
                             // the test's own attribute granted 180s+. Bumping to 10 minutes
                             // restores the contract: "PMT respects test-method timeouts."
-                            var result = await ProcessRunner.Run(publishedBinary, rowTest.Name, timeout: ConsoleTestTimeoutMs()).ConfigureAwait(false);
+                            var consoleCapMs = ConsoleTestTimeoutMs(rowTest);
+                            var rowClock = System.Diagnostics.Stopwatch.StartNew();
+                            var result = await ProcessRunner.Run(publishedBinary, rowTest.Name, timeout: consoleCapMs).ConfigureAwait(false);
+                            rowClock.Stop();
                             var resultLines = result.Text.Split(new[] { '\n', '\r' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
                             // ⚠️ PMT_CONSOLE_LOG applies to the DESKTOP lanes too. It was browser-only, so a
                             // Console.WriteLine benchmark line printed by a CUDA/OpenCL/CPU test was thrown
@@ -595,8 +598,33 @@ namespace PlaywrightMultiTest
                                 // DirectOnnxLoading_MobileNetV2, where the report contained fifteen frames of
                                 // AsyncTaskMethodBuilder and not one word of what threw. A crash report that
                                 // cannot name the crash is not a report.
+                                // 🔴 A KILL IS NOT A CRASH, AND THE TWO NEED OPPOSITE FIXES. When the outer
+                                // cap fires, ProcessRunner kills the subprocess: exit=-1, and because it
+                                // never got to flush, BOTH tails are empty. That is indistinguishable from
+                                // a native abort by exit code alone - but not by the CLOCK, which is why
+                                // the row is timed.
+                                //
+                                // ⚠️ MEASURED 2026-09-08: nine CPU rows reported "subprocess crashed,
+                                // exit=-1" with empty output on the first completed HeavyModel sweep, and
+                                // were carried into a handoff as untriaged correctness failures. They had
+                                // been killed at the cap. Naming the cap is the difference between "this
+                                // test is broken" and "this test needs longer than PMT allowed it".
+                                var elapsed = rowClock.Elapsed.TotalMilliseconds;
+                                if (elapsed >= consoleCapMs * 0.95)
+                                    throw new Exception(
+                                        $"PMT KILLED this test at its outer console cap - it did not crash. "
+                                        + $"Ran {elapsed / 1000:F0}s against a cap of {consoleCapMs / 1000:F0}s "
+                                        + $"({(IsHeavyGated(rowTest) ? "heavy row" : "light row")}, "
+                                        + $"category '{rowTest.Category}'). The subprocess was killed before it "
+                                        + "could report, which is why both tails below are empty. Raise "
+                                        + "PMT_CONSOLE_TIMEOUT_MS for this run, or find out why the test now "
+                                        + $"needs more than {consoleCapMs / 1000:F0}s.\n"
+                                        + $"stdout tail:\n{Tail(result.StdOut, 2200)}\n"
+                                        + $"stderr tail:\n{Tail(result.StdErr, 12000)}");
+
                                 throw new Exception(
-                                    $"Test run failed (no 'TEST:' line - subprocess crashed). exit={result.ExitCode}\n"
+                                    $"Test run failed (no 'TEST:' line - subprocess crashed after "
+                                    + $"{elapsed / 1000:F0}s, cap {consoleCapMs / 1000:F0}s). exit={result.ExitCode}\n"
                                     + $"stdout tail:\n{Tail(result.StdOut, 2200)}\n"
                                     + $"stderr tail:\n{Tail(result.StdErr, 12000)}");
                             }
@@ -1368,14 +1396,27 @@ namespace PlaywrightMultiTest
             return false;
         }
 
-        // Per-console-test hard cap (subprocess kill, ms). Default 10 min. A genuinely heavy test whose
-        // own [TestMethod(Timeout)] exceeds this (e.g. a multi-GB model E2E whose 2.5GB download alone
-        // needs >10 min) would otherwise be killed by this outer cap before its own timeout — raise it
-        // via PMT_CONSOLE_TIMEOUT_MS for that run. Default unchanged so routine runs behave identically.
-        private static int ConsoleTestTimeoutMs()
+        // Per-console-test hard cap (subprocess kill, ms). PMT_CONSOLE_TIMEOUT_MS overrides both defaults.
+        //
+        // 🔴 A HEAVY ROW GETS A HEAVY CAP, or the declared [TestMethod(Timeout)] is a lie. The call site
+        // below says this "restores the contract: PMT respects test-method timeouts" - it did not. Every
+        // console row got a flat 600 s regardless of what it declared, so a test written with
+        // Timeout = 900000 could never reach its own timeout: the outer cap killed the subprocess at 600 s
+        // first, and a kill surfaces with NO output at all.
+        //
+        // ⚠️ MEASURED 2026-09-08 on the first completed HeavyModel sweep: NINE CPU rows - the whole Lfm2 and
+        // Qwen reproducibility family, all declaring Timeout = 900000 with RetryCount 1-2 - reported
+        // "no 'TEST:' line - subprocess crashed. exit=-1" with empty stdout AND empty stderr. They were not
+        // crashing. They were being killed 300 s early, and read as nine correctness failures.
+        //
+        // Heavy is exactly the set that declares long timeouts (HeavyModel / HeavyCpu / WasmHeavy), so the
+        // category PMT already has is the right signal. Light rows keep 600 s: a wedged light test should
+        // still fail fast.
+        private static int ConsoleTestTimeoutMs(ProjectTest? row = null)
         {
             var env = Environment.GetEnvironmentVariable("PMT_CONSOLE_TIMEOUT_MS");
-            return int.TryParse(env, out var ms) && ms > 0 ? ms : 600_000;
+            if (int.TryParse(env, out var ms) && ms > 0) return ms;
+            return row != null && IsHeavyGated(row) ? 1_800_000 : 600_000;
         }
 
         private static string DesktopLaneOf(string? typeName) => (typeName ?? "") switch

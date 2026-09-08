@@ -26,7 +26,7 @@
 | `/super-res` | Super-resolution (ESPCN) | ✅ **VERIFIED** | `CreateFromFile_SuperResolution_ESPCN`, `HF_DownloadAndLoadSession_SuperResolution` |
 | `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | Transformers.js-style `GgufTextGenerationPipeline`: pick a `.gguf` → `BlobStream`→`CreateFromStreamAsync`→streaming chat on WebGPU. Engine verified on CUDA (qwen2.5:0.5b q8_0/q4_K_M ✅ coherent; smollm2:360m ✅ coherent (BPE-merge + RoPE NORM-style fix); gemma3:270m ✅ coherent (V-norm + sliding-window rope fix, matches Ollama)). Page mounts clean (Playwright, 0 console errors). In-browser file-pick→generate E2E = manual confirm (no model delivery in PMT yet) |
 | `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP). NOTE: superseded by `/ai-chat` for real LLM chat — candidate to retire |
-| `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Pipeline_SemanticSearch_SimilarSentencesCloser` (DistilBERT) |
+| `/embeddings` | Sentence embeddings / semantic search | 🟡 **PARTIAL** | `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` runs the real pipeline on **all-MiniLM-L6-v2** and is green on all six backends (self 1.000, related 0.929 > unrelated 0.895, 384/384 dims non-zero). ⚠️ The PAGE has not been re-pointed at that model yet. ⚠️ This row cited `Pipeline_SemanticSearch_SimilarSentencesCloser` until 2026-09-08; that test uses a SENTIMENT CLASSIFIER and its own comment says it reads "first 2 logits (sentiment: [negative, positive])" - it passes, but it is not semantic search |
 | `/inspector` | Model Inspector (structure + compat) | ✅ **VERIFIED** | Streams ONNX structure-only; GPT-2 100% compat after registry fix; inspect-by-URL live-hub test |
 | `/benchmark` | GPU benchmark | ✅ **VERIFIED** | MatMul / perf kernels (92-101 GFLOPS validated) |
 | `/whisper` | Speech-to-text (Whisper) | ✅ **VERIFIED** | **mic → text works end to end.** `Pipeline_Whisper_TranscribesKnownSpeech` runs the real pipeline on a known-transcript clip and gets the same answer on **all six backends**: "All legal box recordings are in the public domain" (whisper-tiny mangles the proper noun "LibriVox"; 7/8 words exact, 88% word overlap). `MLTestBase.ResamplerTests` (5) and `MLTestBase.MicrophoneCaptureTests` (5) gate the audio front end, and `tools/drive-mic-capture.cs --transcribe` drives the actual page from microphone to transcript. ⚠️ Until 2026-08-30 this row cited `Pipeline_WhisperDecoder_Reference_440HzTone`, which never ran the model, and the Start Recording button was a `=> Task.CompletedTask` stub |
@@ -55,7 +55,8 @@
 | BlazeFace | ✅ | ✅ | `Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` |
 | CLIP (vision) | ✅ | ✅ | ORT-matched |
 | ESPCN super-res | ✅ | ✅ | ORT-matched |
-| DistilGPT-2 / DistilBERT | ✅ | ✅ | text-gen + embeddings verified |
+| DistilGPT-2 / DistilBERT | ✅ | ✅ | text-gen verified. ⚠️ DistilBERT here is the **SST-2 classifier** - one output, `logits` [batch,2], no `last_hidden_state`, so it cannot produce embeddings |
+| all-MiniLM-L6-v2 | ✅ | ✅ embeddings | 384-dim `last_hidden_state`; the model the embeddings pipeline is gated on |
 | Whisper | ✅ | 🟡 decoder only | full speech E2E pending |
 | SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; not wired into a verified demo page |
 | SD-Turbo | ✅ | 🚧 | no end-to-end image test |
