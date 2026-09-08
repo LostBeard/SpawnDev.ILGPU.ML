@@ -298,7 +298,21 @@ public class ModelHub : IDisposable
 
         // ── Text / NLP ──
         /// <summary>DistilBERT SST-2 — Sentiment analysis (257 MB)</summary>
+        /// <remarks>
+        /// ⚠️ A CLASSIFIER. Its graph declares exactly one output, <c>logits</c> [batch, 2] - there is no
+        /// <c>last_hidden_state</c>, so it CANNOT produce embeddings. Use <see cref="AllMiniLmL6V2"/> for
+        /// anything semantic. (It was wired into the embeddings tests until 2026-09-08, where its two
+        /// sentiment logits were zero-padded to 768 dimensions and compared by cosine.)
+        /// </remarks>
         public const string DistilBertSST2 = "Xenova/distilbert-base-uncased-finetuned-sst-2-english";
+        /// <summary>all-MiniLM-L6-v2 — Sentence embeddings, 384-dim (86 MB)</summary>
+        /// <remarks>
+        /// The sentence-transformers workhorse. Declares <c>last_hidden_state</c> [batch, seq, 384], and
+        /// takes THREE inputs - <c>input_ids</c>, <c>attention_mask</c> and <c>token_type_ids</c>.
+        /// Mean-pool over the attention mask, then L2 normalise, which is what
+        /// <c>FeatureExtractionPipeline</c> does.
+        /// </remarks>
+        public const string AllMiniLmL6V2 = "Xenova/all-MiniLM-L6-v2";
         /// <summary>GPT-2 — Text generation (548 MB)</summary>
         public const string GPT2 = "onnxmodelzoo/gpt2-10";
         /// <summary>DistilGPT-2 — Smaller text generation (330 MB)</summary>

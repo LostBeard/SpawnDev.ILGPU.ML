@@ -204,14 +204,73 @@ public class FeatureExtractionPipeline : IDisposable
         using var idsBuf = _accelerator.Allocate1D(idsFloat);
         using var maskBuf = _accelerator.Allocate1D(maskFloat);
 
-        var inputs = new Dictionary<string, Tensor>
+        // ⚠️ BIND BY NAME, NOT BY POSITION. This used to feed InputNames[0] and InputNames[1] and stop
+        // there, which fails two ways: a model that declares its inputs in another order is handed the mask
+        // as its ids, and a model with a THIRD input never receives it. all-MiniLM-L6-v2 - the obvious
+        // embedding model to point this at - declares input_ids, attention_mask AND token_type_ids.
+        // Positional binding is kept only as the fallback for a model using non-standard names.
+        var inputs = new Dictionary<string, Tensor>();
+        var idsTensor = new Tensor(idsBuf.View, new[] { 1, _maxLength });
+        var maskTensor = new Tensor(maskBuf.View, new[] { 1, _maxLength });
+        string? Named(string want) => _session.InputNames
+            .FirstOrDefault(n => string.Equals(n, want, StringComparison.OrdinalIgnoreCase));
+        var idsName = Named("input_ids");
+        var maskName = Named("attention_mask");
+        if (idsName != null && maskName != null)
         {
-            [_session.InputNames[0]] = new Tensor(idsBuf.View, new[] { 1, _maxLength }),
-            [_session.InputNames[1]] = new Tensor(maskBuf.View, new[] { 1, _maxLength }),
-        };
+            inputs[idsName] = idsTensor;
+            inputs[maskName] = maskTensor;
+        }
+        else
+        {
+            inputs[_session.InputNames[0]] = idsTensor;
+            if (_session.InputNames.Length > 1) inputs[_session.InputNames[1]] = maskTensor;
+        }
 
-        var outputs = await _session.RunAsync(inputs);
-        var output = outputs[_session.OutputNames[0]];
+        // token_type_ids: a single-sequence embedding is all segment 0, so zeros are correct - but the
+        // model still has to be GIVEN them, or it runs against an unwritten buffer.
+        IDisposable? typeBuf = null;
+        var typeName = Named("token_type_ids");
+        if (typeName != null && !inputs.ContainsKey(typeName))
+        {
+            var zeros = _accelerator.Allocate1D(new float[_maxLength]);
+            typeBuf = zeros;
+            inputs[typeName] = new Tensor(zeros.View, new[] { 1, _maxLength });
+        }
+
+        Dictionary<string, Tensor> outputs;
+        try { outputs = await _session.RunAsync(inputs); }
+        finally { typeBuf?.Dispose(); }
+
+        // ⚠️ PREFER last_hidden_state BY NAME. OutputNames[0] is whatever the graph happens to list first.
+        var hiddenName = _session.OutputNames
+            .FirstOrDefault(n => n.Contains("hidden", StringComparison.OrdinalIgnoreCase))
+            ?? _session.OutputNames[0];
+        var output = outputs[hiddenName];
+
+        // 🔴 REFUSE A MODEL THAT DOES NOT PRODUCE HIDDEN STATES, instead of embedding its logits.
+        //
+        // This class means [1, seq, hidden]. The pooling below reads `t * _hiddenSize + h` and was bounded
+        // by `Math.Min(output.ElementCount, ...)` plus an `offset + h < hiddenStates.Length` guard, so a
+        // SMALLER output did not fail - it produced a vector that was mostly zeros and then L2-normalised
+        // it into a confident unit vector.
+        //
+        // ⚠️ MEASURED 2026-09-08. Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated pointed this at
+        // Xenova/distilbert-base-uncased-finetuned-sst-2-english, whose graph declares exactly ONE output,
+        // `logits`. Every "embedding" was therefore [negative, positive] zero-padded to 768 dimensions, so
+        // cosine similarity measured SENTIMENT AGREEMENT: related scored -0.790 and unrelated +0.842, on all
+        // six backends. Self-similarity was a clean 1.000 the whole time, because the same text really does
+        // give the same two logits - the one assertion that looked like proof could not see it.
+        if (output.Rank < 3 || output.Shape[^1] != _hiddenSize)
+            throw new InvalidOperationException(
+                $"FeatureExtractionPipeline needs a hidden-state output shaped [batch, seq, {_hiddenSize}], "
+              + $"but '{hiddenName}' is [{string.Join(",", output.Shape)}]. "
+              + (output.Rank < 3
+                  ? "This model is a CLASSIFIER - its output is per-label logits, not per-token hidden "
+                  + "states, so it cannot produce embeddings at all. Use a feature-extraction model "
+                  + "(for example Xenova/all-MiniLM-L6-v2, which declares last_hidden_state)."
+                  : $"Construct the pipeline with hiddenSize: {output.Shape[^1]}.")
+              + $" Outputs available: [{string.Join(", ", _session.OutputNames)}].");
 
         // Output shape: [1, seq_len, hidden_size]
         // Mean pool over real (non-padded) token positions
