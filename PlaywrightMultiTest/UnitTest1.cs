@@ -32,6 +32,10 @@ namespace PlaywrightMultiTest
             }
 
             var sw = Stopwatch.StartNew();
+            // Whether this test already has its row in the results JSON. Every exit path below is
+            // guarded by it, because the outcome is recorded BEFORE the NUnit call that reports it -
+            // and those calls report by THROWING.
+            var recorded = false;
             try
             {
                 if (test.Project is TestableBlazorWasm blazorProj)
@@ -41,6 +45,7 @@ namespace PlaywrightMultiTest
                     {
                         sw.Stop();
                         TestResultsWriter.RecordResult(test.Name, "Skip", test.ResultMessage, sw.Elapsed.TotalMilliseconds);
+                        recorded = true;
                         Assert.Ignore(test.ResultMessage!);
                     }
                 }
@@ -51,16 +56,46 @@ namespace PlaywrightMultiTest
                     {
                         sw.Stop();
                         TestResultsWriter.RecordResult(test.Name, "Skip", test.ResultMessage, sw.Elapsed.TotalMilliseconds);
+                        recorded = true;
                         Assert.Ignore(test.ResultMessage!);
                     }
                 }
                 sw.Stop();
                 TestResultsWriter.RecordResult(test.Name, "Pass", null, sw.Elapsed.TotalMilliseconds);
+                recorded = true;
+            }
+            // 🔴 NUnit REPORTS A NON-FAILURE BY THROWING. Assert.Ignore throws IgnoreException,
+            // Assert.Pass throws SuccessException, Assert.Inconclusive throws InconclusiveException -
+            // none of them is a failure, and all of them used to land in the general catch below and
+            // record the SAME test a SECOND time as "Fail", carrying the skip reason as the error.
+            //
+            // ⚠️ MEASURED 2026-09-08 on a PMT_PARALLEL=off run: playwright-latest.json reported
+            // failed 11 / total 129 for a run NUnit scored Failed 1 / Total 119 - one phantom failure
+            // per skip, each a duplicate NAME with result "Fail" and the text "Skipped: ...". NUnit's
+            // own trx was correct throughout, so only the artifact triage reads was wrong, and it
+            // inflates with the skip count (the 2026-09-06 heavy sweep had 234 skips).
+            catch (IgnoreException)
+            {
+                sw.Stop();
+                if (!recorded) TestResultsWriter.RecordResult(test.Name, "Skip", test.ResultMessage, sw.Elapsed.TotalMilliseconds);
+                throw;
+            }
+            catch (InconclusiveException ex)
+            {
+                sw.Stop();
+                if (!recorded) TestResultsWriter.RecordResult(test.Name, "Skip", ex.Message, sw.Elapsed.TotalMilliseconds);
+                throw;
+            }
+            catch (SuccessException)
+            {
+                sw.Stop();
+                if (!recorded) TestResultsWriter.RecordResult(test.Name, "Pass", null, sw.Elapsed.TotalMilliseconds);
+                throw;
             }
             catch (Exception ex)
             {
                 sw.Stop();
-                TestResultsWriter.RecordResult(test.Name, "Fail", ex.Message, sw.Elapsed.TotalMilliseconds);
+                if (!recorded) TestResultsWriter.RecordResult(test.Name, "Fail", ex.Message, sw.Elapsed.TotalMilliseconds);
                 throw;
             }
         }
