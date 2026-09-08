@@ -204,7 +204,27 @@ public abstract partial class MLTestBase
                     throw new Exception("the torrent has no infohash even after a complete download - "
                                       + "lazy-hash finalize did not run, so nothing could be restored by hash");
 
-                // 🔴 AND WAIT FOR THE CACHE TO ACTUALLY BE ON DISK.
+                // 🔴 AND WAIT FOR THE TORRENT TO ACTUALLY HOLD EVERY PIECE.
+                //
+                // Reading the stream to the end does NOT mean the pieces are in OPFS: the hub also serves the
+                // bytes straight off its /hf web seed, so a complete READ is compatible with a torrent that
+                // has persisted nothing. Restoring then finds a bitfield claiming piece 0 and no file behind
+                // it - MEASURED repeatedly as
+                //   "Piece 0 is marked verified ... Store says: no file at webtorrent/<key>/piece_0".
+                // SpawnDev.WebTorrent's own LazyHash_DownloadThenReopen waits for lazy-hash FINALIZE, which
+                // cannot happen until every piece is present and hashed; that is the precondition this test
+                // was missing. Waiting on a *_state/.torrent* file is not the same thing - that appears at
+                // finalize too, but says nothing about the pieces.
+                for (int i = 0; i < 600 && m.Torrent!.LazyHash; i++) await Task.Delay(50);
+                if (m.Torrent!.LazyHash)
+                    throw new Exception("the lazy-hash torrent never finalized, so its pieces are not all in "
+                                      + "OPFS and a reload cannot restore from cache");
+                if (m.Torrent!.CompletedPieces != m.Torrent!.PieceCount)
+                    throw new Exception($"torrent holds {m.Torrent!.CompletedPieces}/{m.Torrent!.PieceCount} "
+                                      + "pieces after a complete read - the rest were served from the web seed "
+                                      + "and never persisted, so a reload would re-download them");
+
+                // AND WAIT FOR THE CACHE TO ACTUALLY BE ON DISK.
                 // Persistence is issued asynchronously when the torrent finalizes. Restoring while that write
                 // is still in flight sees a missing or half-written _state/*.torrent, which restore treats as
                 // "not cached" - so the test raced the very thing it exists to verify. Poll for the observable
@@ -224,6 +244,32 @@ public abstract partial class MLTestBase
                 if (!persisted)
                     throw new Exception("no non-empty _state/*.torrent appeared within 10s of a complete "
                                       + "download - the torrent never persisted, so a reload cannot restore it");
+            }
+
+            // 🔴 WHAT IS ACTUALLY ON DISK, BEFORE ANYONE RESTORES.
+            // The remaining failure says "piece 0 ... no file at webtorrent/<key>/piece_0" even though the
+            // torrent reports every piece complete and finalized. That is only possible if the pieces were
+            // written under a DIFFERENT key than the one restore reconstructs - so print both sides. A
+            // mismatch between these two lists names the bug outright; matching lists kill the theory.
+            {
+                var dirs = new List<string>();
+                foreach (var d in await fs.GetDirectories("webtorrent")) dirs.Add(d);
+                var states = new List<string>();
+                if (await fs.DirectoryExists("webtorrent/_state"))
+                    foreach (var sf in await fs.GetFiles("webtorrent/_state"))
+                    {
+                        var b2 = await fs.ReadBytes($"webtorrent/_state/{sf}");
+                        states.Add($"{sf}({b2?.Length ?? -1}B)");
+                    }
+                var pieceDirs = new List<string>();
+                foreach (var d in dirs)
+                {
+                    if (d == "_state") continue;
+                    var files = await fs.GetFiles($"webtorrent/{d}");
+                    pieceDirs.Add($"{d}[{files.Count()} files]");
+                }
+                Console.WriteLine($"[OPFS LAYOUT] infohash={infoHash} | piece dirs: {string.Join(", ", pieceDirs)} "
+                                + $"| _state: {string.Join(", ", states)}");
             }
 
             // RELOAD: a fresh client over the SAME OPFS restores the torrent from persisted state.
