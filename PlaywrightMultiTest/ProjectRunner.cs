@@ -1409,14 +1409,24 @@ namespace PlaywrightMultiTest
         // "no 'TEST:' line - subprocess crashed. exit=-1" with empty stdout AND empty stderr. They were not
         // crashing. They were being killed 300 s early, and read as nine correctness failures.
         //
-        // Heavy is exactly the set that declares long timeouts (HeavyModel / HeavyCpu / WasmHeavy), so the
-        // category PMT already has is the right signal. Light rows keep 600 s: a wedged light test should
-        // still fail fast.
+        // 🔴 THE CAP DOES NOT MOVE TO LET SLOW CODE THROUGH. Captain, 2026-09-08:
+        //
+        //   "We don't increase timeouts unless we are sure the code is 100% correct and as performant as we
+        //    can make it. Timeouts are there to make sure nothing is going wrong, not to allow bad code to
+        //    pass."
+        //
+        // ⚠️ I RAISED THIS TO 1,800,000 FOR HEAVY ROWS AND IT WAS THE WRONG INSTINCT - measured the same
+        // day, Lfm2Trajectory_TwoIdenticalForwards ran the full 1800 s and was killed anyway. The higher cap
+        // let nothing pass and proved nothing; it only moved the wall and hid that the CPU lane needs a
+        // performance answer. A row that cannot finish inside the cap is a FINDING.
+        //
+        // PMT_CONSOLE_TIMEOUT_MS still exists for a deliberate one-off investigation - use it to MEASURE how
+        // long something really needs, not to make a sweep green.
         private static int ConsoleTestTimeoutMs(ProjectTest? row = null)
         {
             var env = Environment.GetEnvironmentVariable("PMT_CONSOLE_TIMEOUT_MS");
             if (int.TryParse(env, out var ms) && ms > 0) return ms;
-            return row != null && IsHeavyGated(row) ? 1_800_000 : 600_000;
+            return 600_000;
         }
 
         private static string DesktopLaneOf(string? typeName) => (typeName ?? "") switch
