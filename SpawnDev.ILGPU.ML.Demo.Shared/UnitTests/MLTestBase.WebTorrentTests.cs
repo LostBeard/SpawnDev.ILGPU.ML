@@ -162,7 +162,7 @@ public abstract partial class MLTestBase
     // page reload — download to OPFS, then a FRESH client RestoreFromStorageAsync() re-adds the torrent from
     // the persisted state and RE-READS its file from the OPFS pieces (the exact re-access that was reported to
     // throw OPFS NotReadableError). Success means a reload reuses the cache instead of re-downloading.
-    // Throws its result so the browser lane (drops Console.WriteLine) surfaces it: "[OPFS RELOAD OK]" = pass.
+    // Prints "[OPFS RELOAD OK]" and PASSES. Surface it with PMT_CONSOLE_LOG=OPFS.
     [TestMethod(Timeout = 180000, Category = "HeavyModel")]
     public async Task WebTorrent_OpfsReloadPersistence() => await RunTest(async accelerator =>
     {
@@ -185,11 +185,45 @@ public abstract partial class MLTestBase
             {
                 var m = await hub.OpenAsync(repo, file);
                 if (m.Torrent == null) throw new UnsupportedTestException("hub served the model cold (no torrent) — the reload-persistence test needs the torrent path");
-                infoHash = m.Torrent!.WireInfoHashHex; len = m.File!.Length;
-                await using var s = m.Stream;
-                var buf = new byte[len]; int got = 0;
-                while (got < len) { int n = await s.ReadAsync(buf.AsMemory(got, (int)len - got)); if (n == 0) break; got += n; }
-                if (got != len) throw new Exception($"session-1 read {got}/{len}");
+                len = m.File!.Length;
+                await using (var s = m.Stream)
+                {
+                    var buf = new byte[len]; int got = 0;
+                    while (got < len) { int n = await s.ReadAsync(buf.AsMemory(got, (int)len - got)); if (n == 0) break; got += n; }
+                    if (got != len) throw new Exception($"session-1 read {got}/{len}");
+                }
+
+                // 🔴 READ THE INFOHASH *AFTER* THE DOWNLOAD, NOT BEFORE.
+                // The hub serves this as a LAZY-HASH torrent, whose infohash does not exist until every piece
+                // is in and FinalizeLazyHash builds the real .torrent. Reading WireInfoHashHex straight after
+                // OpenAsync returned an EMPTY string, and the restore lookup below then matched nothing -
+                // reported as "[OPFS RELOAD FAIL] torrent  was NOT restored", with a blank where the hash
+                // should be. That was this test's own bug, not the library's.
+                infoHash = m.Torrent!.WireInfoHashHex;
+                if (string.IsNullOrEmpty(infoHash))
+                    throw new Exception("the torrent has no infohash even after a complete download - "
+                                      + "lazy-hash finalize did not run, so nothing could be restored by hash");
+
+                // 🔴 AND WAIT FOR THE CACHE TO ACTUALLY BE ON DISK.
+                // Persistence is issued asynchronously when the torrent finalizes. Restoring while that write
+                // is still in flight sees a missing or half-written _state/*.torrent, which restore treats as
+                // "not cached" - so the test raced the very thing it exists to verify. Poll for the observable
+                // condition instead of assuming.
+                var persisted = false;
+                for (int i = 0; i < 100 && !persisted; i++)
+                {
+                    if (await fs.DirectoryExists("webtorrent/_state"))
+                        foreach (var f in await fs.GetFiles("webtorrent/_state"))
+                        {
+                            if (!f.EndsWith(".torrent")) continue;
+                            var b = await fs.ReadBytes($"webtorrent/_state/{f}");
+                            if (b is { Length: > 0 }) { persisted = true; break; }
+                        }
+                    if (!persisted) await Task.Delay(100);
+                }
+                if (!persisted)
+                    throw new Exception("no non-empty _state/*.torrent appeared within 10s of a complete "
+                                      + "download - the torrent never persisted, so a reload cannot restore it");
             }
 
             // RELOAD: a fresh client over the SAME OPFS restores the torrent from persisted state.
@@ -205,7 +239,13 @@ public abstract partial class MLTestBase
             while (got2 < len) { int n = await rs.ReadAsync(buf2.AsMemory(got2, (int)len - got2)); if (n == 0) break; got2 += n; }
             if (got2 != len) throw new Exception($"[OPFS RELOAD FAIL] re-read {got2}/{len} from restored torrent");
 
-            throw new Exception($"[OPFS RELOAD OK] {repo}/{file} {len}B persisted + restored on a FRESH client + re-read from OPFS (reload reuses cache, no re-download). progress={restored.Progress:P0}");
+            // 🔴 PASS BY PASSING. This used to THROW its success message, so the one test that proves the
+            // model cache survives a reload could never be green - it sat in every failure list looking like
+            // a broken cache. The stated reason ("the browser lane drops Console.WriteLine") is obsolete:
+            // PMT_CONSOLE_LOG surfaces console output on the browser AND desktop lanes. Read it with
+            // PMT_CONSOLE_LOG=OPFS.
+            Console.WriteLine($"[OPFS RELOAD OK] {repo}/{file} {len}B persisted + restored on a FRESH client "
+                + $"+ re-read from OPFS (reload reuses cache, no re-download). progress={restored.Progress:P0}");
         }
         catch (UnsupportedTestException) { throw; }
         catch (Exception ex) when (ex.Message.Contains("No connection") || ex.Message.Contains("network") || ex.Message.Contains("magnet"))
