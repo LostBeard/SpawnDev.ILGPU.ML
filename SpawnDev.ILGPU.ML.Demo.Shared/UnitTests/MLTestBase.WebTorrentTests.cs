@@ -1,4 +1,4 @@
-using SpawnDev.ILGPU.ML.Hub;
+﻿using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.WebTorrent;
 using SpawnDev.UnitTesting;
 using ILGPU.Runtime;
@@ -173,6 +173,22 @@ public abstract partial class MLTestBase
         var fs = GetAsyncFS();
         if (fs == null) throw new UnsupportedTestException("OPFS AsyncFS not available");
 
+        // 🔴 A COLD START IS NOT JUST AN EMPTY DIRECTORY - THE CLIENT IS A SINGLETON AND REMEMBERS.
+        //
+        // Wiping `webtorrent/` while the client still holds torrents it restored at startup does NOT give a
+        // cold start: WebTorrentClient.AddLazyHash dedups on the web-seed URL, so the OpenAsync below gets
+        // the OLD torrent back - complete bitfield, empty store, directory gone - and the first read failed
+        // with "Piece 0 is marked verified in the bitfield but the store cannot serve it". MEASURED
+        // 2026-09-08: ~1 run in 3, and every failure was this. It also explains the other mode: dedup calls
+        // Resume() on that torrent, which rewrites `_state/{key}.state.json` while the `.torrent` stays
+        // deleted (FinalizeLazyHash only runs once), so the test then found a state entry with no .torrent.
+        //
+        // ⚠️ PMT runs this same test on THREE browser lanes in ONE page, so lane 2's wipe lands on lane 1's
+        // live torrent. Remove the torrents first, then wipe.
+        foreach (var stale in client.Torrents.ToArray())
+        {
+            try { await client.RemoveAsync(stale); } catch { /* removing a torrent we are discarding */ }
+        }
         if (await fs.DirectoryExists("webtorrent")) await fs.Remove("webtorrent", true); // clean cold start
 
         var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http);
