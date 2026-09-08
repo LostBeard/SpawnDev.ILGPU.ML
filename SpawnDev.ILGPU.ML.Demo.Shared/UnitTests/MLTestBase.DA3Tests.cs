@@ -228,10 +228,15 @@ public abstract partial class MLTestBase
 
         // Shape gate (2026-08-16): predicted_depth must be a single [.,H,W] map — batch=1 and, for the square
         // 224x224 input, a square H==W. Without this, the weak non-NaN/non-zero checks below would FALSELY pass
-        // on the wrong-shaped output the DA3-v3 head currently produces: [2304,224,16] (batch=2304, W=16). The
-        // storage-buffer (SpawnJS long? marshaller) + Conv-buffer-sizing fixes let this model RUN end-to-end, but
-        // a deeper head reassemble/symbolic-shape bug (LayerNorm→[3,1,768], reassemble Reshape→[2304,1,1,1])
-        // still mis-shapes it. Tracked follow-up: DA3-v3 head shape inference. Do NOT weaken this gate to go green.
+        // on a wrongly-shaped output. Do NOT weaken this gate to go green.
+        //
+        // ✅ THE "DA3-v3 HEAD REASSEMBLE/SYMBOLIC-SHAPE BUG" THIS GATE WAS WRITTEN AGAINST DOES NOT EXIST.
+        // It was the rank-4 input above - see the note on the session construction. Every number in the old
+        // diagnosis is that misread `num_images = 3`: the head produced [2304,224,16] because 2304 = 3 x 768,
+        // and the LayerNorm was [3,1,768] for the same reason. MEASURED 2026-09-08 at the model's native rank,
+        // all six backends: output [1,1,224,224], NaN=0/50176, depth range 0.2399. The tracked follow-up is
+        // CLOSED. The gate stays - it is what would catch a real head defect, and it is the check that made
+        // the wrong shape visible in the first place.
         var depthShape = output.Shape;
         long depthBatch = 1;
         for (int i = 0; i < depthShape.Length - 2; i++) depthBatch *= depthShape[i];
@@ -239,7 +244,9 @@ public abstract partial class MLTestBase
         if (depthBatch != 1 || depthH != depthW)
             throw new Exception(
                 $"DA3 predicted_depth wrong shape [{string.Join(",", depthShape)}]: expected batch=1 and a square H==W map " +
-                "for the square input. Known DA3-v3 head reassemble/symbolic-shape bug (produces batch=2304, W=16); tracked follow-up.");
+                "for the square input. ⚠️ Check the INPUT RANK first: DAv3 declares "
+                + "[batch_size, num_images, 3, height, width] and a rank-4 input silently feeds the channel "
+                + "count to num_images, which is what produced the old batch=2304 (3 x 768).");
 
         // GPU-side finite check + reduction. Only 3 floats read back on
         // atomics-capable backends; no per-element CPU loop. Per project CLAUDE.md:
