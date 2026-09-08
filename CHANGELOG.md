@@ -2,7 +2,83 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## 5.2.11 (unreleased)
+## 5.2.12 (unreleased)
+
+### Fixed - "embeddings" from a classifier were its two sentiment logits, zero-padded to 768 dims
+
+`FeatureExtractionPipeline` bound its inputs POSITIONALLY (`InputNames[0]`, `InputNames[1]`) and read its
+output as `OutputNames[0]`. Three defects followed from that:
+
+- a model declaring its inputs in another order was handed the attention mask as its ids;
+- a model with a THIRD input never received it (all-MiniLM-L6-v2 declares `input_ids`, `attention_mask`
+  AND `token_type_ids`, so the obvious embedding model to point this at ran against an unwritten buffer);
+- a model with no hidden-state output had whatever it DID produce mean-pooled as if it were one.
+
+The pooling read `t * hiddenSize + h` under a `Math.Min` bound and an `offset + h < length` guard, so a
+SMALLER output did not fail. It produced a mostly-zero vector and L2-normalised it into a confident unit
+vector.
+
+⚠️ MEASURED 2026-09-08. `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` was pointed at
+`Xenova/distilbert-base-uncased-finetuned-sst-2-english`, whose graph declares exactly one output,
+`logits` [batch, 2]. Every "embedding" was that pair zero-padded to 768 dimensions, so cosine similarity
+measured SENTIMENT AGREEMENT: related text scored **-0.790**, unrelated **+0.842**, on all six backends.
+Self-similarity stayed a clean **1.000** throughout - the same text really does give the same two logits -
+so the one assertion that looked like proof was structurally unable to see it.
+
+**Fix:** inputs bind BY NAME (`input_ids` / `attention_mask` / `token_type_ids`, zeros for the last, which
+is correct for a single sequence), positional binding kept only as the fallback for non-standard names;
+the output prefers a name containing `hidden`; and a result that is not `[batch, seq, hiddenSize]` now
+THROWS, naming the available outputs and saying that a classifier cannot produce embeddings at all.
+
+### Fixed - inputShapes could silently change an input's RANK
+
+`inputShapes` exists to pin dynamic DIMENSIONS. Nothing checked rank, and dims are matched positionally,
+so a shape of the wrong rank fed every value to the wrong axis. The model kept running until some
+unrelated operator found two shapes that would not broadcast.
+
+⚠️ MEASURED 2026-09-08. DAv3-Small declares `pixel_values: [batch_size, num_images, 3, height, width]`
+and four DA3 tests passed `[1, 3, 224, 224]`. `num_images` therefore received the CHANNEL COUNT, 3, and
+every downstream shape carried it. The visible failure was
+`Shapes [3,257,384] and [1,593,384] are not broadcastable` inside a position-embedding Add - **12
+failures across all six backends**, read for months as a decoder-head reassemble bug whose signature
+`batch=2304` is the same 3 (2304 = 3 x 768).
+
+**Fix:** `ApplyInputShapeOverrides` refuses an entry whose rank disagrees with the model's declared rank,
+with a message that says what `inputShapes` is for. Only RANK is compared, never values - pinning a
+symbolic dim to a concrete size is the entire point of the parameter.
+
+### Changed - every HuggingFace download goes through the hub
+
+`HuggingFaceClient.GetDownloadUrl` now returns a hub `/hf/{repoId}/{filename}` URL by default instead of
+an `huggingface.co` origin URL. The hub caches, supplies CORS headers a browser accepts, and keeps us out
+of HuggingFace's rate limiter.
+
+⚠️ MEASURED 2026-09-08: a sweep row failed with `HttpRequestException: Response status code does not
+indicate success: 429 (Too Many Requests)` purely because it built an huggingface.co URL itself.
+
+- `HuggingFaceClient.HubBaseUrl` selects the hub; `HuggingFaceClient.HuggingFaceOrigin` names the origin
+  for the hub's own fetcher and for deliberate origin tests.
+- A revision other than `main` cannot be served by the hub's `/hf` route and falls back to the origin.
+- `ModelHub.HuggingFaceBaseUrl` is `[Obsolete]` - it no longer builds download URLs.
+- `tools/check-no-direct-huggingface.cs` gates the rule so it cannot regress.
+
+⚠️ `GetDownloadUrl` returns a URL, so a caller can still pull a multi-GB file into a `byte[]`. That is the
+wrong shape for weights in a browser. Use `HubModelStream.OpenAsync` for weights and keep `GetDownloadUrl`
+for KB-scale files.
+
+### Changed - dependency: SpawnDev.WebTorrent 4.2.2 -> 4.2.4
+
+Picks up the OPFS read path that re-fetches and rebuilds a cache entry when it finds a piece it cannot
+serve (the browser evicts OPFS), the bounded extraction cache, and the allowlisted source proxy. 5.2.11
+shipped pinned to 4.2.2, so no consumer of ML could receive any of it.
+
+### Docs
+
+`KnownModels` now records that `distilbert-base-uncased-finetuned-sst-2-english` is a CLASSIFIER with no
+`last_hidden_state`, and documents `AllMiniLmL6V2` (384-dim, three inputs) as the model to use for
+anything semantic.
+
+## 5.2.11 (2026-09-06)
 
 ### Fixed - a cached subgraph plan was reused across DIFFERENT shape executors
 
