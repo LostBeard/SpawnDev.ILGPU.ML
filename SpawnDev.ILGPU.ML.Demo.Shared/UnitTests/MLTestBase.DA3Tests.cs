@@ -5,6 +5,7 @@ using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
+using SpawnDev.ILGPU.ML.Hub;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -127,9 +128,9 @@ public abstract partial class MLTestBase
 
         // Download model + external data
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
 
         Console.WriteLine($"[DA3] model.onnx: {onnxBytes.Length / 1024}KB, model.onnx_data: {extDataBytes.Length / 1024 / 1024}MB");
 
@@ -184,10 +185,10 @@ public abstract partial class MLTestBase
 
         // Download model + external data
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
         Console.WriteLine($"[DA3] onnx={onnxBytes.Length / 1024}KB downloaded at t={sw.ElapsedMilliseconds}ms");
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
         tDownload = sw.ElapsedMilliseconds;
         Console.WriteLine($"[DA3] ext_data={extDataBytes.Length / 1024 / 1024}MB downloaded at t={tDownload}ms (download phase done)");
 
@@ -283,9 +284,9 @@ public abstract partial class MLTestBase
 
         // Download model + external data
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -373,9 +374,9 @@ public abstract partial class MLTestBase
         Graph.GraphExecutor.ShapeInterpElideDispatch = false;
 
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
 
         // Native DAv3 shape: 5-D [1, num_images=1, 3, 518, 518] — the rank the graph is compiled for.
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
@@ -442,9 +443,9 @@ public abstract partial class MLTestBase
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
             var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
                 externalData: extDataBytes);
@@ -519,9 +520,9 @@ public abstract partial class MLTestBase
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
             var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
 
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
@@ -638,9 +639,9 @@ public abstract partial class MLTestBase
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
             var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
 
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
@@ -796,9 +797,9 @@ public abstract partial class MLTestBase
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
             var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
                 externalData: extDataBytes);
@@ -887,9 +888,9 @@ public abstract partial class MLTestBase
         try
         {
             var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
             var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+                HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
             using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
                 externalData: extDataBytes);
@@ -960,9 +961,9 @@ public abstract partial class MLTestBase
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx"));
         var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v3-small/resolve/main/onnx/model.onnx_data");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v3-small", "onnx/model.onnx_data"));
         long tDownload = sw.ElapsedMilliseconds;
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,

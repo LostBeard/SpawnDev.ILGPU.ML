@@ -65,7 +65,10 @@ public class ModelHub : IDisposable
     /// <summary>
     /// HuggingFace Hub base URL. Default: https://huggingface.co
     /// </summary>
-    public string HuggingFaceBaseUrl { get; set; } = "https://huggingface.co";
+    [Obsolete("Downloads go through the hub (HuggingFaceClient.HubBaseUrl / GetDownloadUrl), which caches, "
+            + "supplies CORS headers and keeps us out of HuggingFace's rate limiter. This property no longer "
+            + "builds download URLs. Point HuggingFaceClient.HubBaseUrl at your own hub instead.")]
+    public string HuggingFaceBaseUrl { get; set; } = HuggingFaceClient.HuggingFaceOrigin;
 
     /// <summary>
     /// Fired during download with (bytesReceived, totalBytes).
@@ -91,7 +94,9 @@ public class ModelHub : IDisposable
     {
         // HuggingFace CDN with OPFS cache (SpawnDev.WebTorrent 3.x: P2P hub delivery is via
         // SpawnDev.WebTorrent.Server.HuggingFace on the server; browser clients use HTTP here).
-        var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
+        // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
+        // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
+        var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
         return await _cache.GetOrFetchAsync(url, cacheKey);
     }
@@ -128,7 +133,9 @@ public class ModelHub : IDisposable
     [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public Task<BlobStream?> OpenStreamAsync(string repoId, string filename, string revision = "main")
     {
-        var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
+        // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
+        // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
+        var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
         return _cache.GetOrFetchStreamAsync(url, cacheKey);
     }
@@ -181,7 +188,9 @@ public class ModelHub : IDisposable
     /// <returns>The file's bytes.</returns>
     public Task<byte[]> LoadSmallFileAsync(string repoId, string filename, string revision = "main")
     {
-        var url = $"{HuggingFaceBaseUrl}/{repoId}/resolve/{revision}/{filename}";
+        // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
+        // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
+        var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
 #pragma warning disable CS0618 // the small-file path is the SUPPORTED use of the byte[] cache
         return _cache.GetOrFetchAsync(url, cacheKey);

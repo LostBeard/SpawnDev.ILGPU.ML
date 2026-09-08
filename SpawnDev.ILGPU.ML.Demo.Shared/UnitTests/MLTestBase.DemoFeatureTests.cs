@@ -4,6 +4,7 @@ using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
+using SpawnDev.ILGPU.ML.Hub;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -47,9 +48,9 @@ public abstract partial class MLTestBase
         var expected = refGenIds.Skip(promptIds.Length).Take(NumNew).ToArray();
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json"));
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
         var pipeline = new TextGenerationPipeline(session, accelerator) { UseShapeReadbackCache = true };
@@ -95,9 +96,9 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json"));
 
         using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
         var pipeline = new TextGenerationPipeline(session, accelerator);
@@ -135,9 +136,9 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json"));
 
         // Fresh session per generation (mirrors the proven TextGen_ReadbackCache pattern).
         async Task<TextGenerationResult> Gen(GenerationConfig? cfg)
@@ -172,9 +173,9 @@ public abstract partial class MLTestBase
 
         // Load DistilGPT-2 model + tokenizer from HuggingFace
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json"));
 
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
         var pipeline = new TextGenerationPipeline(session, accelerator);
@@ -213,9 +214,9 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json"));
 
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
         var pipeline = new TextGenerationPipeline(session, accelerator);
@@ -278,7 +279,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model_merged.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model_merged.onnx"));
         using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes, enableOptimization: false);
 
         Console.WriteLine($"[merged] InputNames ({session.InputNames.Length}): {string.Join(", ", session.InputNames)}");
@@ -313,9 +314,9 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var tokenizerJson = await http.GetStringAsync(
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/tokenizer.json");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "tokenizer.json"));
 
         // Seekable stream + tiny threshold forces the streaming weight path (not the inline byte path).
         using var ms = new MemoryStream(modelBytes);
@@ -754,7 +755,7 @@ public abstract partial class MLTestBase
 
         // RMBG 1.4 from HuggingFace (~170MB)
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            $"https://huggingface.co/{Hub.ModelHub.KnownModels.RMBG14}/resolve/main/{Hub.ModelHub.KnownFiles.OnnxModel}");
+            HuggingFaceClient.GetDownloadUrl(Hub.ModelHub.KnownModels.RMBG14, Hub.ModelHub.KnownFiles.OnnxModel));
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
@@ -861,7 +862,7 @@ public abstract partial class MLTestBase
         // the same pipeline path the demo uses. The pipeline's internal resize maps
         // mask back to source dimensions.
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            $"https://huggingface.co/{Hub.ModelHub.KnownModels.RMBG14}/resolve/main/{Hub.ModelHub.KnownFiles.OnnxModel}");
+            HuggingFaceClient.GetDownloadUrl(Hub.ModelHub.KnownModels.RMBG14, Hub.ModelHub.KnownFiles.OnnxModel));
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {
@@ -930,7 +931,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            $"https://huggingface.co/{Hub.ModelHub.KnownModels.RMBG14}/resolve/main/{Hub.ModelHub.KnownFiles.OnnxModel}");
+            HuggingFaceClient.GetDownloadUrl(Hub.ModelHub.KnownModels.RMBG14, Hub.ModelHub.KnownFiles.OnnxModel));
 
         // Use 256x256 — the model accepts dynamic spatial dims; smaller input fits within
         // the diagnostic budget across all backends and exercises the same WGSL codegen.
@@ -1042,7 +1043,7 @@ public abstract partial class MLTestBase
 
         // DistilBERT for embeddings (~255MB)
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilbert-base-uncased-finetuned-sst-2-english", "onnx/model.onnx"));
         using var session = InferenceSession.CreateFromOnnx(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {

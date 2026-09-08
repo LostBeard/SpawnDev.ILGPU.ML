@@ -47,10 +47,17 @@
 <span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromHuggingFaceAsync</span>(
     accelerator, hub, <span class="ty">ModelHub</span>.<span class="ty">KnownModels</span>.<span class="fn">SqueezeNet</span>);
 
-<span class="cm">// Or direct URL (simpler, still CDN)</span>
+<span class="cm">// Or by repo + file - routed through our hub, which caches and adds CORS</span>
 <span class="kw">var</span> session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromFileAsync</span>(
     accelerator, httpClient,
-    <span class="st">"https://huggingface.co/onnxmodelzoo/squeezenet/resolve/main/squeezenet1.1-7.onnx"</span>);</code></pre>
+    <span class="ty">HuggingFaceClient</span>.<span class="fn">GetDownloadUrl</span>(<span class="st">"onnxmodelzoo/squeezenet"</span>, <span class="st">"squeezenet1.1-7.onnx"</span>));
+
+<span class="cm">// For MODEL WEIGHTS prefer the streaming path - a seekable lazy-hash torrent whose</span>
+<span class="cm">// bytes stay JS-side and download on demand, instead of a byte[] on the WASM heap:</span>
+<span class="kw">var</span> hub = <span class="kw">new</span> <span class="ty">HubModelStream</span>(webTorrentClient, httpClient);
+<span class="kw">var</span> model = <span class="kw">await</span> hub.<span class="fn">OpenAsync</span>(<span class="st">"onnxmodelzoo/squeezenet"</span>, <span class="st">"squeezenet1.1-7.onnx"</span>);
+<span class="kw">await using</span> (model.Stream)
+    session = <span class="kw">await</span> <span class="ty">InferenceSession</span>.<span class="fn">CreateFromOnnxStreamAsync</span>(accelerator, model.Stream);</code></pre>
                 </div>
             </div>
         </div>

@@ -1,5 +1,6 @@
 #:project D:/users/tj/Projects/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML.csproj
 using SpawnDev.ILGPU.ML.Onnx;
+using SpawnDev.ILGPU.ML.Hub;
 
 // What control flow does a graph actually contain, and could it be FOLDED AWAY?
 //
@@ -24,10 +25,10 @@ using SpawnDev.ILGPU.ML.Onnx;
 
 var targets = args.Length > 0 ? args : new[]
 {
-    "https://huggingface.co/k2-fsa/ZipVoice/resolve/main/zipvoice_distill/fm_decoder_int8.onnx",
-    "https://huggingface.co/k2-fsa/ZipVoice/resolve/main/zipvoice_distill/text_encoder_int8.onnx",
-    "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_with_past_model.onnx",
-    "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/encoder_model.onnx",
+    HuggingFaceClient.GetDownloadUrl("k2-fsa/ZipVoice", "zipvoice_distill/fm_decoder_int8.onnx"),
+    HuggingFaceClient.GetDownloadUrl("k2-fsa/ZipVoice", "zipvoice_distill/text_encoder_int8.onnx"),
+    HuggingFaceClient.GetDownloadUrl("onnx-community/whisper-tiny", "onnx/decoder_with_past_model.onnx"),
+    HuggingFaceClient.GetDownloadUrl("onnx-community/whisper-tiny", "onnx/encoder_model.onnx"),
 };
 
 var cacheDir = Path.Combine(Path.GetTempPath(), "spawndev-onnx-probe");

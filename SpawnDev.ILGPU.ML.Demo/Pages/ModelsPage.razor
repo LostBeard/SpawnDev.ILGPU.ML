@@ -204,6 +204,7 @@
     }
 
     [Inject] HttpClient Http { get; set; } = default!;
+    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
 
     private InspectionResult? _inspectionResult;
     private CompatibilityResult? _compatResult;
@@ -220,16 +221,25 @@
 
         try
         {
-            var url = $"https://huggingface.co/{_customRepoId}/resolve/main/{_customFilename}";
-            _customResult = $"Downloading from {url}...";
+            // 🔴 STRUCTURE ONLY, THROUGH OUR HUB - never the whole model, never HuggingFace directly.
+            //
+            // This used to build an huggingface.co URL and call Http.GetByteArrayAsync on it, which is two
+            // rule breaks in one line: it hits HF directly (no cache, no CORS headers, and straight into
+            // their rate limiter - a sweep row failed with 429 on 2026-09-08), and it pulls the ENTIRE model
+            // onto the single-threaded WASM managed heap to read its graph. A user typing a multi-GB repo id
+            // into this box was asking the browser to OOM; the CLIPVision reference test did exactly that and
+            // died with OutOfMemoryException inside HttpContent's array-pool write stream.
+            //
+            // HubModelStream adds the file as a lazy-hash torrent and hands back a SEEKABLE stream, so the
+            // inspector seeks past every weight blob and downloads only the few hundred KB of graph
+            // structure. Bytes stay JS-side; .NET sees the structure it actually needs.
+            _customResult = $"Reading structure of {_customRepoId}/{_customFilename} via the hub...";
             StateHasChanged();
 
-            var bytes = await Http.GetByteArrayAsync(url);
-            _customResult = $"Downloaded {(bytes.Length / 1024.0 / 1024.0):F1} MB. Inspecting...";
-            StateHasChanged();
-
-            _inspectionResult = ModelInspectorHelper.Inspect(bytes);
-            _compatResult = ModelInspectorHelper.CheckCompatibility(bytes);
+            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(Torrents, Http);
+            var (inspection, compat) = await hub.InspectWithCompatibilityAsync(_customRepoId, _customFilename);
+            _inspectionResult = inspection;
+            _compatResult = compat;
 
             _customResult = $"{_inspectionResult.GraphName}: {_inspectionResult.NodeCount} nodes, " +
                 $"{_inspectionResult.TotalParameters:N0} params, " +

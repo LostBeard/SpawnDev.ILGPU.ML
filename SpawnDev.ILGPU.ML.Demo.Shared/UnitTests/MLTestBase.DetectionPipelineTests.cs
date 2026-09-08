@@ -26,7 +26,7 @@ public abstract partial class MLTestBase
 
         // Load model (same path as demo page)
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/salim4n/yolov8n-detect-onnx/resolve/main/yolov8n-onnx-web/yolov8n.onnx");
+            HuggingFaceClient.GetDownloadUrl("salim4n/yolov8n-detect-onnx", "yolov8n-onnx-web/yolov8n.onnx"));
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
 
         var pipeline = new ObjectDetectionPipeline(session, accelerator);
@@ -66,7 +66,7 @@ public abstract partial class MLTestBase
 
         // Load model and run with reference input
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/salim4n/yolov8n-detect-onnx/resolve/main/yolov8n-onnx-web/yolov8n.onnx");
+            HuggingFaceClient.GetDownloadUrl("salim4n/yolov8n-detect-onnx", "yolov8n-onnx-web/yolov8n.onnx"));
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes);
 
         // Load reference input (pre-preprocessed NCHW)
@@ -109,7 +109,7 @@ public abstract partial class MLTestBase
 
         // MoveNet is TFLite format
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/movenet-singlepose-lightning/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/movenet-singlepose-lightning", "onnx/model.onnx"));
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
             {

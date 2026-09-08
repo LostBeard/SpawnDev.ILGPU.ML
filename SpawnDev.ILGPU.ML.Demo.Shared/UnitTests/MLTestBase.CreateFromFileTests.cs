@@ -4,6 +4,7 @@ using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.UnitTesting;
+using SpawnDev.ILGPU.ML.Hub;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -279,7 +280,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
         Console.WriteLine("[DepthInference] Loading model...");
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"));
         using var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -364,7 +365,7 @@ public abstract partial class MLTestBase
         if (!js.IsBrowser) throw new UnsupportedTestException("SpawnJSRuntime not available (not a browser lane)");
 
         var httpBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"));
         using var hub = new Hub.ModelHub(js);
         var hubBytes = await hub.LoadAsync(Hub.ModelHub.KnownModels.DepthAnythingV2Small, Hub.ModelHub.KnownFiles.OnnxModel);
 
@@ -395,7 +396,7 @@ public abstract partial class MLTestBase
             throw new UnsupportedTestException("graph capture is CUDA/WebGPU only");
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available for this backend");
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"));
         using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 3, inputSize, inputSize } });
         var pipeline = new DepthEstimationPipeline(session, accelerator);
@@ -573,7 +574,7 @@ public abstract partial class MLTestBase
         var (pixels, width, height) = await LoadCatImage(http);
         Console.WriteLine($"[DepthCat] Cat image: {width}x{height}");
 
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"));
         using var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -608,7 +609,7 @@ public abstract partial class MLTestBase
         if (http == null)
             throw new UnsupportedTestException("HttpClient not available for this backend");
 
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"));
         using var session = InferenceSession.CreateFromOnnx(
             accelerator, onnxBytes,
             inputShapes: new Dictionary<string, int[]>

@@ -1,6 +1,7 @@
 using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
@@ -17,15 +18,19 @@ public abstract partial class MLTestBase
     /// The DistilGPT-2 export that actually HAS a KV cache interface. See
     /// <see cref="TurboQuant_DistilGPT2_KVCacheAutoDetected"/> for why the plain decoder cannot be used.
     /// </summary>
-    private const string DistilGpt2WithPastUrl =
-        "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_with_past_model.onnx";
+    // static readonly, not const: the URL now comes from HuggingFaceClient.GetDownloadUrl so it
+    // routes through our hub, and a method call is not a compile-time constant.
+    private static readonly string DistilGpt2WithPastUrl =
+        HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_with_past_model.onnx");
 
     // DistilGPT-2 KV geometry (config.json: n_layer=6, n_head=12, n_embd=768 -> head_dim=64).
     private const int DistilGpt2Layers = 6, DistilGpt2Heads = 12, DistilGpt2HeadDim = 64;
 
     /// <summary>The base decoder: <c>present.*</c> outputs but NO <c>past_key_values.*</c> inputs.</summary>
-    private const string DistilGpt2BaseUrl =
-        "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+    // static readonly, not const: the URL now comes from HuggingFaceClient.GetDownloadUrl so it
+    // routes through our hub, and a method call is not a compile-time constant.
+    private static readonly string DistilGpt2BaseUrl =
+        HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx");
 
     /// <summary>"The cat sat on the" in DistilGPT-2 tokens.</summary>
     private static readonly float[] Gpt2Prompt = { 464, 3797, 3332, 319, 262 };
@@ -1123,8 +1128,10 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>The Whisper export that carries a KV cache interface (17 inputs / 9 outputs).</summary>
-    private const string WhisperTinyWithPastUrl =
-        "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_with_past_model.onnx";
+    // static readonly, not const: the URL now comes from HuggingFaceClient.GetDownloadUrl so it
+    // routes through our hub, and a method call is not a compile-time constant.
+    private static readonly string WhisperTinyWithPastUrl =
+        HuggingFaceClient.GetDownloadUrl("onnx-community/whisper-tiny", "onnx/decoder_with_past_model.onnx");
 
     // whisper-tiny decoder geometry, MEASURED from the export's own value_info 2026-08-30:
     // 4 layers, 6 heads, head_dim 64. Encoder (cross-attention) KV length is SYMBOLIC

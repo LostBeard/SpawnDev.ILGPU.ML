@@ -4,6 +4,7 @@ using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
+using SpawnDev.ILGPU.ML.Hub;
 
 namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 
@@ -490,7 +491,7 @@ public abstract partial class MLTestBase
             ["attention_mask"] = new[] { 1, 6 },
         };
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilbert-base-uncased-finetuned-sst-2-english", "onnx/model.onnx"));
 
         Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
         try
@@ -580,7 +581,7 @@ public abstract partial class MLTestBase
 
         // Load from HuggingFace CDN — 255MB should not be self-hosted
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilbert-base-uncased-finetuned-sst-2-english/resolve/main/onnx/model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilbert-base-uncased-finetuned-sst-2-english", "onnx/model.onnx"));
 
         // Capture per-node outputs to find where values diverge
         Graph.GraphExecutor.CapturedOutputs = new Dictionary<string, float[]>();
@@ -664,7 +665,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         // ORT ground-truth intermediates: { tensorName: { shape, first[16], absmax, count } }.
         var refJson = await http.GetStringAsync("references/gpt2/distilgpt2_intermediates.json");
         using var refDoc = System.Text.Json.JsonDocument.Parse(refJson);
@@ -774,7 +775,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx");
+            HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx"));
         var refJson = await http.GetStringAsync("references/gpt2/distilgpt2_intermediates.json");
         using var refDoc = System.Text.Json.JsonDocument.Parse(refJson);
         var ortRef = refDoc.RootElement;
@@ -861,7 +862,7 @@ public abstract partial class MLTestBase
         // GPT-2 has dynamic dims and int64 inputs. Optimizer crashes on NLP models.
         // Use HuggingFace onnx-community export (proper weight naming).
         // DistilGPT-2 (330MB) — smaller, faster, uses standard HF naming convention.
-        var gpt2Url = "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+        var gpt2Url = HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx");
         using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
             inputShapes: new Dictionary<string, int[]>
             {
@@ -948,7 +949,7 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        var gpt2Url = "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+        var gpt2Url = HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx");
         // NOTE: NO inputShapes override — the decoder compiles at its dynamic seq (→1).
         using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
             enableOptimization: false);
@@ -1009,7 +1010,7 @@ public abstract partial class MLTestBase
         var promptIds = refDoc.RootElement.GetProperty("input_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
         int numNew = refIds.Length - promptIds.Length;
 
-        var gpt2Url = "https://huggingface.co/Xenova/distilgpt2/resolve/main/onnx/decoder_model.onnx";
+        var gpt2Url = HuggingFaceClient.GetDownloadUrl("Xenova/distilgpt2", "onnx/decoder_model.onnx");
         using var session = await InferenceSession.CreateFromFileAsync(accelerator, http, gpt2Url,
             enableOptimization: false); // NO inputShapes — dynamic, grows each step.
 
@@ -1096,14 +1097,42 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // Download CLIP vision model (~340MB)
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-            $"https://huggingface.co/{Hub.ModelHub.KnownModels.CLIPVitB32}/resolve/main/{Hub.ModelHub.KnownFiles.OnnxVisionModel}");
-        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
-            inputShapes: new Dictionary<string, int[]>
-            {
-                ["pixel_values"] = new[] { 1, 3, 224, 224 }
-            });
+        // 🔴 STREAM THE WEIGHTS - never a byte[]. This is ~340 MB, and pulling it whole through
+        // DownloadBytesChunkedAsync put all of it on the single-threaded WASM managed heap. MEASURED
+        // 2026-09-08: this test was the WebGPU lane's only OOM -
+        // `System.OutOfMemoryException at HttpContent.LimitArrayPoolWriteStream.GrowAndWrite`. Nothing about
+        // CLIP was wrong; the delivery shape was.
+        //
+        // HubModelStream.OpenAsync adds the file as a LAZY-HASH torrent through our hub: random-access
+        // streaming, pieces cached to OPFS under a stable key and restored on reload, seeded to peers, and
+        // the bytes stay JS-side - .NET only ever sees the graph structure and each weight on its way to the
+        // GPU. It also removes the last direct HuggingFace request from this test.
+        var torrents = new SpawnDev.WebTorrent.WebTorrentClient();
+        InferenceSession session;
+        try
+        {
+            var hub = new Hub.HubModelStream(torrents, http);
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromMinutes(8));
+            var model = await hub.OpenAsync(
+                Hub.ModelHub.KnownModels.CLIPVitB32, Hub.ModelHub.KnownFiles.OnnxVisionModel,
+                deselect: false, cts.Token);
+            await using (model.Stream)
+                session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, model.Stream,
+                    inputShapes: new Dictionary<string, int[]>
+                    {
+                        ["pixel_values"] = new[] { 1, 3, 224, 224 }
+                    },
+                    ct: cts.Token);
+        }
+        catch (Exception ex) when (ex is not UnsupportedTestException
+            && (ex.Message.Contains("No connection") || ex.Message.Contains("network")
+             || ex.Message.Contains("magnet") || ex.Message.Contains("preparing") || ex is TimeoutException))
+        {
+            await torrents.DisposeAsync();
+            throw new UnsupportedTestException($"[CLIP] hub/network unavailable: {ex.Message}");
+        }
+        using var _clipSession = session;
+        await using var _clipTorrents = torrents;
 
         // Load preprocessed cat image
         var inputBytes = await http.GetByteArrayAsync("references/clip-vit-b32/cat_preprocessed.bin");
@@ -1147,7 +1176,7 @@ public abstract partial class MLTestBase
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
         // Depth Anything has dynamic dims — override to 224x224 for browser-safe testing
-        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx");
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http, HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"));
 
         try
         {

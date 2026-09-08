@@ -1,5 +1,6 @@
 #:project D:/users/tj/Projects/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML/SpawnDev.ILGPU.ML.csproj
 using SpawnDev.ILGPU.ML.Onnx;
+using SpawnDev.ILGPU.ML.Hub;
 
 // What EXACTLY does a LayerNorm look like in these graphs, and how many nodes is it worth?
 //
@@ -23,7 +24,7 @@ using SpawnDev.ILGPU.ML.Onnx;
 
 var targets = args.Length > 0 ? args : new[]
 {
-    "https://huggingface.co/onnx-community/whisper-tiny/resolve/main/onnx/decoder_with_past_model.onnx",
+    HuggingFaceClient.GetDownloadUrl("onnx-community/whisper-tiny", "onnx/decoder_with_past_model.onnx"),
 };
 
 var cacheDir = Path.Combine(Path.GetTempPath(), "spawndev-onnx-probe");

@@ -62,7 +62,7 @@ public static class HuggingFaceModelDownloader
                 continue;
             }
 
-            var url = $"https://huggingface.co/{repoId}/resolve/main/{fileName}";
+            var url = SpawnDev.ILGPU.ML.Hub.HuggingFaceClient.GetDownloadUrl(repoId, fileName);
             log?.Invoke($"Downloading {repoId}/{fileName} → {localDir}/model.onnx ...");
 
             try

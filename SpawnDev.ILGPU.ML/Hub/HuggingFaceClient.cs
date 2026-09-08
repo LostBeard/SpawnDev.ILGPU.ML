@@ -137,17 +137,44 @@ public class HuggingFaceClient
     //  Download
     // ═══════════════════════════════════════════════════════════
 
+    /// <summary>The HuggingFace origin. Only the hub itself should fetch from here.</summary>
+    public const string HuggingFaceOrigin = "https://huggingface.co";
+
     /// <summary>
-    /// Get the direct CDN download URL for a file in a HuggingFace repository.
+    /// Our hub, which proxies and CACHES HuggingFace files. Every download goes through it by default.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 DO NOT REQUEST ANYTHING FROM HUGGINGFACE DIRECTLY - not from tests, not from clients. The hub
+    /// exists precisely to prevent that: it caches, it fixes CORS, and it removes us from HF's rate limiter.
+    /// MEASURED 2026-09-08: a sweep row failed with
+    /// <c>HttpRequestException: Response status code does not indicate success: 429 (Too Many Requests)</c>
+    /// purely because it built an huggingface.co URL itself.
+    /// </remarks>
+    public static string HubBaseUrl { get; set; } = HubModelStream.DefaultHubBaseUrl;
+
+    /// <summary>
+    /// Get a download URL for a file in a HuggingFace repository, THROUGH THE HUB.
     /// This URL can be passed directly to <see cref="InferenceSession.CreateFromFileAsync"/>.
     /// </summary>
     /// <param name="repoId">Repository ID (e.g., "onnx-community/squeezenet1.1-7")</param>
     /// <param name="filename">File path within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
-    /// <param name="revision">Git revision (default: "main")</param>
-    /// <param name="baseUrl">HuggingFace base URL (default: "https://huggingface.co")</param>
-    public static string GetDownloadUrl(string repoId, string filename, string revision = "main", string baseUrl = "https://huggingface.co")
+    /// <param name="revision">Git revision (default: "main"). Anything other than "main" cannot be served
+    /// by the hub's <c>/hf</c> route and falls back to the origin.</param>
+    /// <param name="baseUrl">Pass a value ONLY to force a specific origin (the hub's own fetcher, or a
+    /// deliberate origin test). Leaving it null is what routes through the hub.</param>
+    /// <remarks>
+    /// ⚠️ This returns a URL, so a caller can still pull a multi-GB file into a <c>byte[]</c> with it. That
+    /// is the wrong shape for weights in a browser - the managed WASM heap is small and the bytes belong in
+    /// JS. Use <see cref="HubModelStream.OpenAsync"/> for weights (seekable, on-demand, torrent-backed) and
+    /// keep this for KB-scale files.
+    /// </remarks>
+    public static string GetDownloadUrl(string repoId, string filename, string revision = "main", string? baseUrl = null)
     {
-        return $"{baseUrl}/{repoId}/resolve/{revision}/{filename}";
+        if (baseUrl != null)
+            return $"{baseUrl}/{repoId}/resolve/{revision}/{filename}";
+        if (!string.Equals(revision, "main", StringComparison.Ordinal))
+            return $"{HuggingFaceOrigin}/{repoId}/resolve/{revision}/{filename}";
+        return $"{HubBaseUrl.TrimEnd('/')}/hf/{repoId.Trim('/')}/{filename.TrimStart('/')}";
     }
 
     /// <summary>
@@ -161,7 +188,9 @@ public class HuggingFaceClient
     public async Task<byte[]> DownloadFileAsync(string repoId, string filename, string revision = "main",
         Action<long, long>? onProgress = null)
     {
-        var url = GetDownloadUrl(repoId, filename, revision, BaseUrl);
+        // ⚠️ No baseUrl argument - that is what routes this through the hub. Passing BaseUrl here (which it
+        // used to do) forced the huggingface.co origin and put every caller straight into HF's rate limiter.
+        var url = GetDownloadUrl(repoId, filename, revision);
         return await DownloadAsync(url, onProgress);
     }
 

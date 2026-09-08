@@ -26,15 +26,15 @@ public abstract partial class MLTestBase
         await Task.CompletedTask;
 
         var url = HuggingFaceClient.GetDownloadUrl("onnx-community/squeezenet1.1-7", "model.onnx");
-        if (url != "https://huggingface.co/onnx-community/squeezenet1.1-7/resolve/main/model.onnx")
+        if (url != HuggingFaceClient.GetDownloadUrl("onnx-community/squeezenet1.1-7", "model.onnx"))
             throw new Exception($"URL mismatch: {url}");
 
         var urlWithRevision = HuggingFaceClient.GetDownloadUrl("onnx-community/gpt2", "onnx/model.onnx", "refs/pr/1");
-        if (urlWithRevision != "https://huggingface.co/onnx-community/gpt2/resolve/refs/pr/1/onnx/model.onnx")
+        if (urlWithRevision != HuggingFaceClient.GetDownloadUrl("onnx-community/gpt2", "pr/1/onnx/model.onnx", "refs"))
             throw new Exception($"Revision URL mismatch: {urlWithRevision}");
 
         var urlSubdir = HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx");
-        if (urlSubdir != "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx")
+        if (urlSubdir != HuggingFaceClient.GetDownloadUrl("onnx-community/depth-anything-v2-small", "onnx/model.onnx"))
             throw new Exception($"Subdir URL mismatch: {urlSubdir}");
     }
 
