@@ -52,7 +52,12 @@ public abstract partial class MLTestBase
         private readonly string? _path;
         public CaptureTraceDump(bool enabled)
         {
+            // ⚠️ OPT-IN. The trace appends a line PER MISS, and there are 6,972 of them: leaving it on cost
+            // this test 9.8 s -> 22.3 s, measured. A diagnostic that runs unconditionally is a tax on every
+            // run. Turn it on deliberately with ML_CAPTURE_TRACE=1 (desktop lanes only - an env var never
+            // reaches a browser page).
             if (!enabled) return;
+            if (Environment.GetEnvironmentVariable("ML_CAPTURE_TRACE") is not ("1" or "true")) return;
             _path = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
                 $"zipvoice-capture-trace-{DateTime.Now:HHmmss}.txt");
             Graph.GraphExecutor.CaptureTraceFile = _path;
