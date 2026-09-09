@@ -1,6 +1,8 @@
 @echo off
 rem ============================================================================
 rem  Scoped PMT gate launcher.   %1 = PMT_FILTER value    %2 = log basename
+rem                              %3 = PMT_CONSOLE_LOG substring (OPTIONAL - browser console lines are
+rem                                   otherwise summarised away and never reach the log)
 rem
 rem  Usage (launch OUTSIDE the agent shell's job object, per the global Rule 5b,
 rem  so the sweep survives the session that started it):
@@ -36,12 +38,23 @@ cd /d "%~dp0.."
 set "PMT_EXCLUDE_CATEGORIES=none"
 set "PMT_FILTER=%~1"
 set "PMT_PARALLEL=off"
+rem  ⚠️ ARG 3 (optional) = PMT_CONSOLE_LOG substring. PMT summarises browser console output to
+rem  "Console: N error(s), M warning(s)", so a Console.WriteLine benchmark or diagnostic line printed by a
+rem  WebGPU/WebGL test DOES NOT REACH THE LOG AT ALL. That is how a diagnostic can run every sweep and have
+rem  its verdict discarded - the ZipVoice ELIDE A/B computes which half of capture/replay is at fault and
+rem  prints it as [Benchmark] ZipVoiceFidelity ..., and nobody had ever read it.
+rem  Pass a substring ("ZipVoiceFidelity"), or 1 / * for everything.
+rem  ⚠️ Left UNSET when arg 3 is absent - deliberately. Unlike PMT_EXCLUDE_CATEGORIES, whose null case
+rem  restores a DEFAULT (see the header), PMT_CONSOLE_LOG's null case is simply "no console capture", so
+rem  not setting it is the correct no-op here.
+if not "%~3"=="" set "PMT_CONSOLE_LOG=%~3"
 if "%GATE_LOG_DIR%"=="" set "GATE_LOG_DIR=%TEMP%"
 set "LOG=%GATE_LOG_DIR%\%~2.log"
 echo === PMT scoped gate start %DATE% %TIME% === > "%LOG%"
 echo PMT_EXCLUDE_CATEGORIES=[%PMT_EXCLUDE_CATEGORIES%] >> "%LOG%"
 echo PMT_FILTER=[%PMT_FILTER%] >> "%LOG%"
 echo PMT_PARALLEL=[%PMT_PARALLEL%] >> "%LOG%"
+echo PMT_CONSOLE_LOG=[%PMT_CONSOLE_LOG%] >> "%LOG%"
 echo LOG=[%LOG%] >> "%LOG%"
 dotnet test PlaywrightMultiTest\PlaywrightMultiTest.csproj -c Release >> "%LOG%" 2>&1
 echo PMT_EXITCODE=%ERRORLEVEL% >> "%LOG%"
