@@ -546,6 +546,27 @@ public abstract partial class MLTestBase
             finally { Graph.GraphExecutor.CaptureImmediateReturn = true; }
         }
 
+        // ⛔ REFUTED BY MEASUREMENT 2026-09-09 - DO NOT RE-TRY "stop the buffer escaping to the shared pool".
+        //
+        // The obvious reading of the DEFERRED-RELEASE result is that a plan-bound buffer escapes to the shared
+        // pool during the recording and gets re-Rented by something else. It was built and measured: a
+        // BufferPool capture scope that parked returns in a capture-local free list, tracked every buffer
+        // handed out during the recording (including ones still LIVE at the end, i.e. the output tensor), and
+        // kept them out of the shared buckets for the plan's lifetime.
+        //
+        //     PLAN-OWNS-BUFFERS A/B: replay 16900 of 16900 differ (worst 3.873695)
+        //
+        // IDENTICAL to the unfixed failure, to the digit. Blocking escape changes nothing, so the mechanism
+        // was reverted rather than left in the library as machinery that fixes nothing.
+        //
+        // ⭐ WHAT THAT LEAVES, and it is much sharper than before. Deferring the return (no reuse at all
+        // during the recording) gives 0 differ; allowing reuse but confining it to the capture gives the full
+        // failure. So the fault is REUSE WITHIN THE CAPTURE ITSELF, not escape: a recorded plan cannot
+        // faithfully replay a forward in which ONE BUFFER SERVES TWO DIFFERENT TENSORS. The executor's own
+        // justification for the immediate return - "on the single capture stream, a later node's kernel that
+        // re-Rents this buffer is recorded AFTER this input's last consumer, so stream ordering makes the
+        // reuse safe" - is the claim that measurement now contradicts, and it is where to look next.
+
         if (!graphs.DecoderCaptured)
             throw new Exception("capture never went live, so there is no replay to check: "
                               + graphs.DecoderCaptureStatus);
