@@ -92,7 +92,7 @@ public abstract partial class MLTestBase
     // "zero-copy did NOT fire" message.
     // HeavyModel + browser-only (zero-copy path needs OPFS + a browser GPU backend / crypto.subtle).
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
-    public async Task WebTorrent_Measure_DistilGpt2_Download() => await RunTest(async accelerator =>
+    public async Task<string> WebTorrent_Measure_DistilGpt2_Download() => await RunTest(async accelerator =>
     {
         var client = GetWebTorrentClient();
         if (client == null) throw new UnsupportedTestException("OPFS WebTorrentClient only wired in the browser demo lane");
@@ -136,14 +136,24 @@ public abstract partial class MLTestBase
 
             double t = sw.Elapsed.TotalSeconds;
             int mb = (int)(total / 1024 / 1024);
-            int pieces = SpawnDev.WebTorrent.Torrent.ZcPieces;
+            // ⚠️ ZeroCopyPiecesVerified, NOT the old static Torrent.ZcPieces. ZcPieces was orphaned by
+            // WebTorrent's span-coalescing rewrite: declared, zeroed by ResetZcProfile, and incremented
+            // NOWHERE, so this line reported a constant 0 - and `fetchedMB` below multiplies it, so a
+            // 313MB download that zero-copied 312MB printed "zeroCopyPieces=0 (~0MB fetched)" on all six
+            // backends. ZeroCopyPiecesVerified is the live instance counter, incremented where a piece is
+            // verified AND stored. (ZcPieces is removed in WebTorrent 4.2.5; this reads correctly on 4.2.4 too.)
+            int pieces = m.Torrent!.ZeroCopyPiecesVerified;
             double fetchedMB = pieces * (pieceLen / 1024.0 / 1024.0);
 
             if (zc == 0)
                 throw new Exception($"[DLMEASURE] ZERO-COPY DID NOT FIRE (zc=0). coldReadDrivenLoad={t:F1}s model={mb}MB pieces={pieces}");
 
-            // Success: report (thrown so PMT surfaces it; the browser lane drops Console.WriteLine).
-            throw new Exception(
+            // Success: RETURN the report. It used to be thrown so PMT would surface it (the browser lane
+            // drops Console.WriteLine), which made this measurement a red row on every run. A returned
+            // string reaches the same place via UnitTest.ResultText and the test scores as a PASS.
+            // ⚠️ Returning also removes a real hazard: the "network unavailable" catch below matches on
+            // MESSAGE TEXT, so a thrown success report was one substring away from being reclassified.
+            return (
                 $"[DLMEASURE] OK distilgpt2 decoder {mb}MB on {accelerator.AcceleratorType} | coldReadDrivenLoad={t:F1}s | " +
                 $"zc={zc / 1024 / 1024}MB | zeroCopyPieces={pieces} (~{fetchedMB:F0}MB fetched, conns=1, leafCap={SpawnDev.WebTorrent.Torrent.MaxConcurrentLeafDigests}) | " +
                 $"PHASE total-ms: fetch={SpawnDev.WebTorrent.Torrent.ZcFetchMs:F0} digestFire={SpawnDev.WebTorrent.Torrent.ZcDigestFireMs:F0} " +

@@ -208,7 +208,7 @@ public abstract partial class MLTestBase
     // the residual ~5.8s/step is dispatch overhead (-> fusion/dispatch-reduction helps) or GPU compute
     // (-> better kernels / incremental KV decode). Logs the breakdown; the only assertion is that it ran.
     [TestMethod(Timeout = 360000, Category = "HeavyModel")]
-    public async Task Profile_DistilGPT2_Decode_OpTypeBreakdown() => await RunTest(async accelerator =>
+    public async Task<string> Profile_DistilGPT2_Decode_OpTypeBreakdown() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -258,10 +258,10 @@ public abstract partial class MLTestBase
         Graph.GraphExecutor.PerOpSync = false;
         Graph.GraphExecutor.CapturedNodeTimingsMs = null;
 
-        // DIAGNOSTIC-THROW: browser-test Console.WriteLine doesn't echo to the PMT .log; PMT DOES capture
-        // the (innermost) exception message. So surface the whole breakdown here. This test always "fails"
-        // by design — it's a measurement probe, not a gate. Remove once the decode lever is chosen.
-        throw new Exception(
+        // DIAGNOSTIC-RETURN: browser-test Console.WriteLine doesn't echo to the PMT .log, so this probe
+        // publishes its breakdown as its RESULT TEXT. It used to throw, which made a measurement probe
+        // report as a failure on every backend; a returned string reaches the same place and PASSES.
+        return (
             $"[DecodeProfile RESULT] CPU-dispatch sum={cpu.totalMs:F0}ms | GPU-inclusive sum={gpu.totalMs:F0}ms " +
             $"over {cpu.nodes} captured nodes | midGraphReadbacks={cpu.readbacks} readbackMs={cpu.readbackMs:F0}. " +
             $"VERDICT: GPU-inclusive>>CPU-dispatch => compute/GPU-bound (better kernels / incremental KV decode); " +
@@ -925,7 +925,7 @@ public abstract partial class MLTestBase
     /// surfaces in test output regardless of pass/fail semantics.
     /// </summary>
     [TestMethod(Timeout = 600000, Category = "HeavyModel")]
-    public async Task Pipeline_BackgroundRemoval_PerOpDiagnostic() => await RunTest(async accelerator =>
+    public async Task<string> Pipeline_BackgroundRemoval_PerOpDiagnostic() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -1019,7 +1019,8 @@ public abstract partial class MLTestBase
             string verdict = firstSaturationIndex < 0
                 ? "no saturated node found"
                 : $"FIRST SATURATED #{firstSaturationIndex}: {firstSaturationLine}";
-            throw new Exception(
+            // RETURN, not throw: a passing diagnostic must not report as a failure.
+            return (
                 $"[RMBG-Diag] backend={accelerator.AcceleratorType} nodes={outputs.Count}\n" +
                 $"FIRST 5 + LAST 15 NODES:\n{firstNodes}\n" +
                 $"VERDICT: {verdict}");

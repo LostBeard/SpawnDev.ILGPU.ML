@@ -289,7 +289,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod(Timeout = 120000, Category = "HeavyModel")]
-    public async Task Reference_StyleMosaic_DiagnosticPerOpSync() => await RunTest(async accelerator =>
+    public async Task<string> Reference_StyleMosaic_DiagnosticPerOpSync() => await RunTest(async accelerator =>
     {
         // 2026-05-04 Data: PerOpSync diagnostic for StyleMosaic Wasm hang. Forces
         // SynchronizeAsync after every node's Execute. CapturedOutputs records each
@@ -318,7 +318,8 @@ public abstract partial class MLTestBase
             var summary = string.Join("|", slow.Select(kv => $"{kv.Key}={kv.Value:F1}ms"));
             var padFallback = Graph.GraphExecutor.PadReadbackFallbackFiredCount;
             var padInfo = Graph.GraphExecutor.LastPadReadbackFallbackInfo ?? "(none)";
-            throw new Exception($"PASSED with PerOpSync. Total nodes={timings.Count}, padFallback={padFallback} (expect 0; lastInfo={padInfo}), slowest 10: {summary}");
+            // RETURN, not throw: a passing diagnostic must not report as a failure. The finally still runs.
+            return ($"PASSED with PerOpSync. Total nodes={timings.Count}, padFallback={padFallback} (expect 0; lastInfo={padInfo}), slowest 10: {summary}");
         }
         finally
         {
@@ -478,7 +479,7 @@ public abstract partial class MLTestBase
     public static bool DistilBERTDumpAllAbsMax { get; set; } = true;
 
     [TestMethod(Timeout = 120000, Category = "HeavyModel")]
-    public async Task Reference_DistilBERT_DiagnosticDump() => await RunTest(async accelerator =>
+    public async Task<string> Reference_DistilBERT_DiagnosticDump() => await RunTest(async accelerator =>
     {
         if (!DistilBERTDumpAllAbsMax) throw new UnsupportedTestException("DistilBERTDumpAllAbsMax not enabled");
 
@@ -552,7 +553,8 @@ public abstract partial class MLTestBase
                   .Append(anyNan ? " HAS_NAN" : "")
                   .Append(" first4=[").Append(first4).Append("]\n");
             }
-            throw new Exception(sb.ToString());
+            // RETURN, not throw: this dump is the test's OUTPUT, not a fault.
+            return sb.ToString();
         }
         finally
         {

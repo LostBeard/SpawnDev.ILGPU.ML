@@ -169,7 +169,7 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod(Timeout = 300000, Category = "HeavyModel")]
-    public async Task DA3Small_Inference_ProducesDepth() => await RunTest(async accelerator =>
+    public async Task<string> DA3Small_Inference_ProducesDepth() => await RunTest(async accelerator =>
     {
         // Baseline measurement (fold OFF): where does DAv3's per-inference wall-clock actually go?
         // readbackMs vs syncDrainMs vs run tells us whether the ~1400 shape readbacks are the real cost.
@@ -269,11 +269,12 @@ public abstract partial class MLTestBase
         if (absMax == 0)
             throw new Exception($"DA3 output is all zeros (timing: dl={tDownload}ms create={tCreate}ms run={tRun}ms verify={tVerify}ms)");
 
-        // Throw-on-pass surfaces the timing breakdown in the test result so we can
-        // see WHERE wall-clock budget went (download / compile / inference / verify).
+        // RETURNING the breakdown surfaces it in the test result while the test still scores as a PASS.
+        // It used to be thrown, which reported this test as a FAILURE on every backend (12 of 12 reds in
+        // the 2026-09-08 DA3 gate were this and its sibling below).
         // folded/readbacks measure the compile-time shape-subgraph fold (2026-07-01): folded = shape nodes
         // removed at compile (target ~1400 for DAv3), readbacks = per-inference GPU->CPU shape drains remaining.
-        throw new Exception($"PASSED. nodes={session.NodeCount} folded={Graph.GraphCompiler.LastCompileFoldedNodeCount} readbacks={Graph.GraphExecutor.LastRunReadbackCount} readbackMs={Graph.GraphExecutor.LastRunReadbackMs:F0} drains={Graph.GraphExecutor.LastRunSyncDrainCount} drainMs={Graph.GraphExecutor.LastRunSyncDrainMs:F0}; timing: create={tCreate}ms run={tRun}ms verify={tVerify}ms total={sw.ElapsedMilliseconds}ms; absMax={absMax:F4} NaN={nanCount}/{elems}");
+        return ($"PASSED. nodes={session.NodeCount} folded={Graph.GraphCompiler.LastCompileFoldedNodeCount} readbacks={Graph.GraphExecutor.LastRunReadbackCount} readbackMs={Graph.GraphExecutor.LastRunReadbackMs:F0} drains={Graph.GraphExecutor.LastRunSyncDrainCount} drainMs={Graph.GraphExecutor.LastRunSyncDrainMs:F0}; timing: create={tCreate}ms run={tRun}ms verify={tVerify}ms total={sw.ElapsedMilliseconds}ms; absMax={absMax:F4} NaN={nanCount}/{elems}");
     });
 
     [TestMethod(Timeout = 300000, Category = "HeavyModel")]
@@ -954,7 +955,7 @@ public abstract partial class MLTestBase
     /// so the test fits in a reasonable budget even on a slow backend.
     /// </summary>
     [TestMethod(Timeout = 120000, Category = "HeavyModel")]
-    public async Task DA3Small_FirstNNodes_DiagnosticPerOpSync() => await RunTest(async accelerator =>
+    public async Task<string> DA3Small_FirstNNodes_DiagnosticPerOpSync() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
@@ -1014,11 +1015,13 @@ public abstract partial class MLTestBase
             var timings = Graph.GraphExecutor.CapturedNodeTimingsMs;
             var ordered = timings.OrderBy(kv => kv.Key).ToList();
             var perNode = string.Join("|", ordered.Select(kv => $"{kv.Key}={kv.Value:F0}ms"));
-            throw new Exception(
+            // RETURN, do not throw: this is a passing diagnostic, and throwing made it a red row on
+            // every backend. The finally below still runs on the way out.
+            return
                 $"PASSED first-{BREAK_AT}-nodes diagnostic. "
                 + $"download={tDownload}ms create={tCreate}ms run={tRun}ms ({timings.Count}/{totalNodes} nodes); "
                 + $"NEXT5: {nextOps}; "
-                + $"per-node: {perNode}");
+                + $"per-node: {perNode}";
         }
         finally
         {

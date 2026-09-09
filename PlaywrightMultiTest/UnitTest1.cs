@@ -16,6 +16,23 @@ namespace PlaywrightMultiTest
             await ProjectRunner.Instance.StartUp();
         }
 
+        /// <summary>
+        /// A passing test's result text, or null when it carries no report of its own.
+        /// </summary>
+        /// <remarks>
+        /// Both layers substitute a placeholder when a test returned nothing:
+        /// <c>UnitTestRunner</c> does <c>ResultText = test.Result.ToString()</c> ("Success") and
+        /// <c>ProjectRunner</c> substitutes the literal "Success". Recording those would put a
+        /// meaningless string on every one of thousands of passing rows, so they are filtered out here and
+        /// only a test's OWN report survives.
+        /// </remarks>
+        private static string? NonTrivial(string? message)
+        {
+            if (string.IsNullOrWhiteSpace(message)) return null;
+            var t = message.Trim();
+            return t is "Success" or "Pass" or "Passed" or "None" or "-" ? null : t;
+        }
+
         [Test, TestCaseSource(nameof(TestCases))]
         public async Task RunTest(ProjectTest test)
         {
@@ -25,9 +42,11 @@ namespace PlaywrightMultiTest
             // tests, or PMT_PARALLEL=off) fall through to the live path below.
             if (ProjectRunner.Instance.TryGetOutcome(test.Name, out var outcome))
             {
-                TestResultsWriter.RecordResult(test.Name, outcome.Status, outcome.Message, outcome.DurationMs);
+                var scheduledMessage = outcome.Status == "Pass" ? NonTrivial(outcome.Message) : outcome.Message;
+                TestResultsWriter.RecordResult(test.Name, outcome.Status, scheduledMessage, outcome.DurationMs);
                 if (outcome.Status == "Skip") Assert.Ignore(outcome.Message ?? "Skipped");
                 if (outcome.Status == "Fail") Assert.Fail(outcome.Message ?? "Failed");
+                if (scheduledMessage != null) Console.Error.WriteLine($"  REPORT {test.Name}: {scheduledMessage}");
                 return; // Pass
             }
 
@@ -61,8 +80,21 @@ namespace PlaywrightMultiTest
                     }
                 }
                 sw.Stop();
-                TestResultsWriter.RecordResult(test.Name, "Pass", null, sw.Elapsed.TotalMilliseconds);
+                // ⭐ Carry the PASSING test's own report through, instead of null. A test that returns a
+                // string has it captured into UnitTest.ResultText by SpawnDev.UnitTesting and mapped to
+                // ResultMessage here, which is how a diagnostic publishes its numbers WITHOUT throwing.
+                // Recording null discarded exactly that, which is why diagnostics threw in the first place.
+                var report = NonTrivial(test.ResultMessage);
+                TestResultsWriter.RecordResult(test.Name, "Pass", report, sw.Elapsed.TotalMilliseconds);
                 recorded = true;
+                // Print it too. A number that only reaches the results JSON is a number nobody reads while
+                // watching a sweep, and these are measurements (timings, node counts, NaN sweeps).
+                // ⚠️ Console.Error, NOT TestContext.Progress: Progress does not reach dotnet test's
+                // redirected stdout (MEASURED - zero REPORT lines in the log while every message was
+                // correctly in the results JSON). stderr is the channel PMT already uses for its own
+                // console diagnostics. Safe here: this is the NUnit testhost, not Blazor WASM, where
+                // Console.Error would raise the framework error UI.
+                if (report != null) Console.Error.WriteLine($"  REPORT {test.Name}: {report}");
             }
             // 🔴 NUnit REPORTS A NON-FAILURE BY THROWING. Assert.Ignore throws IgnoreException,
             // Assert.Pass throws SuccessException, Assert.Inconclusive throws InconclusiveException -

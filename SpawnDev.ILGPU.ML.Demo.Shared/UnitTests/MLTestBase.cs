@@ -96,6 +96,38 @@ public abstract partial class MLTestBase : IDisposable
         await testBody();
     }
 
+    /// <summary>
+    /// <see cref="RunTest(Func{Accelerator, Task}, string)"/> for a test that PASSES AND REPORTS: the
+    /// string the body returns becomes the test's result text.
+    /// </summary>
+    /// <remarks>
+    /// ⭐ WHY THIS EXISTS. Diagnostic tests used to publish their numbers by THROWING
+    /// (<c>throw new Exception($"PASSED. nodes=...")</c>), because PMT summarises browser console output
+    /// to a count and a <c>Console.WriteLine</c> from a browser test is never seen. The cost is that every
+    /// one of them is reported as a FAILURE: on 2026-09-06 that was 32 of 69 sweep "failures", and on
+    /// 2026-09-08 it was 12 of 12 in the DA3 gate and 1 of 1 in the WebTorrent gate. It trains everyone to
+    /// skim the failure list, which is exactly how a real red hides.
+    /// <para>
+    /// <c>SpawnDev.UnitTesting</c> already carries this properly and always did:
+    /// <c>UnitTestRunner</c> captures a test's returned string into <c>UnitTest.ResultText</c> with
+    /// <c>Result = Success</c>, the browser view renders it in <c>.test-state</c> for a passing row, and
+    /// PMT scrapes that into <c>ProjectTest.ResultMessage</c>. Nothing new was needed - the diagnostics
+    /// just were not using it. So RETURN the report, never throw it.
+    /// </para>
+    /// <para>
+    /// This delegates to the <c>Task</c> overload rather than repeating it: that method owns the zombie
+    /// accelerator eviction, the static capture-state reset and the heap-trend line, and a second copy of
+    /// that machinery would be a second thing to keep correct.
+    /// </para>
+    /// </remarks>
+    protected async Task<string> RunTest(Func<Accelerator, Task<string>> testBody,
+        [System.Runtime.CompilerServices.CallerMemberName] string? testName = null)
+    {
+        var report = "";
+        await RunTest(async accelerator => { report = await testBody(accelerator); }, testName);
+        return report;
+    }
+
     protected async Task RunTest(Func<Accelerator, Task> testBody,
         [System.Runtime.CompilerServices.CallerMemberName] string? testName = null)
     {

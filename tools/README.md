@@ -173,3 +173,21 @@ dotnet run --project tools/whisper-harness -c Release                           
 Then the group you touched: `ControlFlow_`, `Recurrent_`, `Scatter_`, `Slice_`, `Vad_`, `Resample`,
 `Microphone_`. `PMT_FILTER=MatchesOnnxRuntime` runs the ORT-referenced operator gates in one pass.
 A full six-backend sweep is the release gate, not routine.
+
+### `run-scoped-gate.cmd` - scoped HeavyModel gates that outlive the shell
+
+```
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine='cmd.exe /c ""<repo>\tools\run-scoped-gate.cmd" "DA3Small" "pmt-da3""'}
+```
+
+`%1` = `PMT_FILTER` value (comma-separated = OR), `%2` = log basename. Writes to `%GATE_LOG_DIR%`
+(default `%TEMP%`) and appends `PMT_EXITCODE=`. Sets `PMT_PARALLEL=off` so heavy rows never overlap on the
+one GPU.
+
+🔴 **It exists to encode a trap.** The HeavyModel escape hatch is documented as
+`PMT_EXCLUDE_CATEGORIES= dotnet test ...`, which is a **bash** prefix assignment (empty string). In cmd
+`set VAR=` **deletes** the variable, and `ProjectRunner.ExcludedCategories()` treats null as "use the
+default set", which is `{ "HeavyModel" }` - so the heavy run silently schedules ZERO heavy tests and
+reports a fast trivial pass. The script sets a non-null sentinel (`=none`) instead and echoes every env
+value into the log. **Confirm scoping by test COUNT, never by a green tally.**
