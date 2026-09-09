@@ -1849,8 +1849,31 @@ public class InferenceSession : IDisposable
         // byte[] reference for any in-memory ones — one Dictionary<object,...> handles both.
         var uploadedQuant = new Dictionary<object, ArrayView1D<byte, Stride1D.Dense>>();
         int loaded = 0;
+
+        // ── Weight-upload accounting (TraceWeightLoad) ──────────────────────────────────────────────
+        // 🔴 THE QUESTION THIS ANSWERS: does any bulk weight cross into the .NET heap on its way to the
+        // GPU? Rule 4 - browser bulk data stays in JS end to end; the WASM managed heap is small and the
+        // crossing IS the cost. The ONNX loader has had this accounting for a while ([WL SUMMARY]); the
+        // GGUF path had none, so a 6.87 GB model spending 343 s in "upload" was completely opaque.
+        // 🔴 SPLIT READ FROM WRITE. Knowing the bulk path is zero-copy is not the same as knowing where
+        // its time goes: BrowserStreamUpload reads a chunk from the torrent/OPFS stream and then hands it
+        // to queue.writeBuffer, and only one of those is the bottleneck. The counters already exist -
+        // BrowserBufferPolicy.TraceStreamUploadTiming - and were simply never switched on for a load.
+        bool _wlTraceStream = TraceWeightLoad;
+        if (_wlTraceStream)
+        {
+            SpawnDev.ILGPU.BrowserBufferPolicy.ResetStreamUploadTiming();
+            SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = true;
+        }
+        long _wlQuantBytes = 0, _wlLowPBytes = 0, _wlHostBytes = 0, _wlTransposeBytes = 0;
+        int _wlQuantN = 0, _wlLowPN = 0, _wlHostN = 0, _wlTransposeN = 0, _wlDedup = 0;
+        double _wlQuantMs = 0, _wlLowPMs = 0, _wlHostMs = 0, _wlTransposeMs = 0;
+        var _wlHostWorst = new List<(string Name, long Bytes, double Ms)>();
+        int _wlTotal = cpuWeightsAll.Count, _wlLastPct = -1;
+
         foreach (var (name, data) in cpuWeightsAll)
         {
+            long _wlT0 = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!graph.Initializers.TryGetValue(name, out var shape)) continue;
 
             if (quantizedWeightsTyped.TryGetValue(name, out var qw))
@@ -1872,6 +1895,10 @@ public class InferenceSession : IDisposable
                     quantizedBuffers.Add(qBuf);
                     uploadedQuant[dedupKey] = qView;
                 }
+                else _wlDedup++;
+                _wlQuantN++;
+                _wlQuantBytes += qw.StreamOffset >= 0 ? qw.StreamByteSize : qw.Bytes.Length;
+                _wlQuantMs += System.Diagnostics.Stopwatch.GetElapsedTime(_wlT0).TotalMilliseconds;
                 gpuQuantizedWeights[name] = qView;
                 quantizedTypes[name] = qw.Type;
                 gpuWeights[name] = Tensor.ShapeOnly(shape, name); // floats never exist (a Q6_K embed would be ~4 GB F32)
@@ -1887,6 +1914,9 @@ public class InferenceSession : IDisposable
                 gpuWeights[name] = WrapLowPWeight(accelerator, registry.Transpose, srcBuf, lp, shape, name, lowPBuffers);
                 await accelerator.SynchronizeAsync().ConfigureAwait(false);
                 srcBuf.Dispose();
+                _wlLowPN++;
+                _wlLowPBytes += lp.StreamByteSize;
+                _wlLowPMs += System.Diagnostics.Stopwatch.GetElapsedTime(_wlT0).TotalMilliseconds;
             }
             else if (data.Length > 0)
             {
@@ -1903,13 +1933,62 @@ public class InferenceSession : IDisposable
                     await accelerator.SynchronizeAsync().ConfigureAwait(false);
                     temp.Dispose();
                     gpuWeights[name] = final;
+                    _wlTransposeN++;
+                    _wlTransposeBytes += (long)data.Length * 4;
+                    _wlTransposeMs += System.Diagnostics.Stopwatch.GetElapsedTime(_wlT0).TotalMilliseconds;
                 }
                 else
                 {
                     gpuWeights[name] = pool.AllocatePermanent(data, shape, name);
+                    _wlHostN++;
+                    _wlHostBytes += (long)data.Length * 4;
+                    var _hostMs = System.Diagnostics.Stopwatch.GetElapsedTime(_wlT0).TotalMilliseconds;
+                    _wlHostMs += _hostMs;
+                    if (TraceWeightLoad) _wlHostWorst.Add((name, (long)data.Length * 4, _hostMs));
                 }
             }
             loaded++;
+
+            // Per-weight progress. Without it "upload 0%" is followed by silence until "upload 100%",
+            // which for a 12B model is nearly six minutes of nothing - indistinguishable from a hang.
+            int _pct = _wlTotal > 0 ? (int)Math.Min(99, loaded * 100L / _wlTotal) : 0;
+            if (_pct != _wlLastPct) { _wlLastPct = _pct; onProgress?.Invoke("upload", _pct); }
+        }
+        if (TraceWeightLoad)
+        {
+            double MB(long b) => b / 1048576.0;
+            Console.WriteLine($"[GGUF-WL] quantized-stream: {_wlQuantN,4} tensors {MB(_wlQuantBytes),9:F1} MB "
+                + $"{_wlQuantMs,8:F0} ms  (zero-copy, {_wlDedup} tied aliases reused)");
+            Console.WriteLine($"[GGUF-WL] lowp-stream     : {_wlLowPN,4} tensors {MB(_wlLowPBytes),9:F1} MB "
+                + $"{_wlLowPMs,8:F0} ms  (zero-copy)");
+            Console.WriteLine($"[GGUF-WL] host float[]    : {_wlHostN,4} tensors {MB(_wlHostBytes),9:F1} MB "
+                + $"{_wlHostMs,8:F0} ms  <- MATERIALISED IN THE .NET HEAP");
+            Console.WriteLine($"[GGUF-WL] host+transpose  : {_wlTransposeN,4} tensors {MB(_wlTransposeBytes),9:F1} MB "
+                + $"{_wlTransposeMs,8:F0} ms  <- MATERIALISED IN THE .NET HEAP");
+            foreach (var (n, b, ms) in _wlHostWorst.OrderByDescending(x => x.Bytes).Take(8))
+                Console.WriteLine($"[GGUF-WL]   worst host copy: {MB(b),8:F1} MB {ms,7:F0} ms  {n}");
+            Console.WriteLine($"[GGUF-WL] TOTAL host-materialised: {MB(_wlHostBytes + _wlTransposeBytes):F1} MB "
+                + $"of {MB(_wlQuantBytes + _wlLowPBytes + _wlHostBytes + _wlTransposeBytes):F1} MB uploaded");
+
+            // Where the zero-copy path actually spends itself: stream READ vs GPU WRITE.
+            var _rd = SpawnDev.ILGPU.BrowserBufferPolicy.StreamReadMs;
+            var _wr = SpawnDev.ILGPU.BrowserBufferPolicy.StreamWriteMs;
+            var _by = SpawnDev.ILGPU.BrowserBufferPolicy.StreamBytes;
+            var _ch = SpawnDev.ILGPU.BrowserBufferPolicy.StreamChunks;
+            if (_ch == 0)
+                Console.WriteLine("[GGUF-WL] zero-copy JS->GPU path NOT TAKEN (0 chunks) - the stream is "
+                    + "not an IJSReadStream, so every byte went through the managed heap after all");
+            else
+            {
+                Console.WriteLine($"[GGUF-WL] JS->GPU chunks: {_ch}, {MB(_by):F1} MB");
+                Console.WriteLine($"[GGUF-WL]   stream READ (torrent/OPFS): {_rd,9:F0} ms "
+                    + $"({MB(_by) / Math.Max(0.001, _rd / 1000.0),7:F1} MB/s)");
+                Console.WriteLine($"[GGUF-WL]   GPU WRITE (writeBuffer)   : {_wr,9:F0} ms "
+                    + $"({MB(_by) / Math.Max(0.001, _wr / 1000.0),7:F1} MB/s)");
+                Console.WriteLine($"[GGUF-WL]   -> the bottleneck is the "
+                    + (_rd > _wr ? "STREAM READ" : "GPU WRITE"));
+            }
+            SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = false;
         }
         onProgress?.Invoke("upload", 100);
 
