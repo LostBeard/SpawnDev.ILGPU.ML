@@ -1864,6 +1864,12 @@ public class InferenceSession : IDisposable
         {
             SpawnDev.ILGPU.BrowserBufferPolicy.ResetStreamUploadTiming();
             SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = true;
+            // One layer further down: the stream READ resolves to a ranged OPFS read per chunk, and this
+            // says which call inside it costs the time.
+            SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ResetReadTiming();
+            SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.TraceReadTiming = true;
+            SpawnDev.WebTorrent.Torrent.ResetEnsurePieceTiming();
+            SpawnDev.WebTorrent.Torrent.TraceEnsurePiece = true;
         }
         long _wlQuantBytes = 0, _wlLowPBytes = 0, _wlHostBytes = 0, _wlTransposeBytes = 0;
         int _wlQuantN = 0, _wlLowPN = 0, _wlHostN = 0, _wlTransposeN = 0, _wlDedup = 0;
@@ -1988,6 +1994,37 @@ public class InferenceSession : IDisposable
                 Console.WriteLine($"[GGUF-WL]   -> the bottleneck is the "
                     + (_rd > _wr ? "STREAM READ" : "GPU WRITE"));
             }
+            var _rc = SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadCalls;
+            if (_rc > 0)
+            {
+                double _rb = SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadBytes / 1048576.0;
+                Console.WriteLine($"[GGUF-WL] OPFS ranged reads: {_rc}, {_rb:F1} MB, "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadHandleMisses} handle miss(es)");
+                Console.WriteLine($"[GGUF-WL]   sync-handle OPENS: {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncOpens}"
+                    + $" costing {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncOpenMs:F0} ms "
+                    + $"= resolve {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncResolveMs:F0}"
+                    + $" + create {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncCreateMs:F0} ms");
+                Console.WriteLine($"[GGUF-WL]   sync-handle read: "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadSyncMs,9:F0} ms over "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadSyncCalls} read(s)  <- fast path");
+                Console.WriteLine($"[GGUF-WL]   getFile/handle : "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadHandleMs,9:F0} ms");
+                Console.WriteLine($"[GGUF-WL]   Blob.slice     : "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadSliceMs,9:F0} ms");
+                Console.WriteLine($"[GGUF-WL]   Blob.arrayBuffer: "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadArrayBufferMs,9:F0} ms  <- the actual disk read");
+                Console.WriteLine($"[GGUF-WL]   wrap Uint8Array: "
+                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadWrapMs,9:F0} ms");
+            }
+            Console.WriteLine($"[GGUF-WL] ranged reads: {SpawnDev.WebTorrent.Torrent.ReadRangeCalls} calls, "
+                + $"total {SpawnDev.WebTorrent.Torrent.ReadTotalMs:F0} ms = alloc {SpawnDev.WebTorrent.Torrent.ReadAllocMs:F0}"
+                + $" + setup {SpawnDev.WebTorrent.Torrent.ReadSetupMs:F0}"
+                + $" + store {SpawnDev.WebTorrent.Torrent.ReadStoreMs:F0}"
+                + $" + set {SpawnDev.WebTorrent.Torrent.ReadSetMs:F0} ms");
+            Console.WriteLine($"[GGUF-WL] piece waits: {SpawnDev.WebTorrent.Torrent.EnsureWaited} waited, "
+                + $"{SpawnDev.WebTorrent.Torrent.EnsureImmediate} already present, "
+                + $"{SpawnDev.WebTorrent.Torrent.EnsureWaitMs:F0} ms waiting  <- 100ms poll granularity");
+            SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.TraceReadTiming = false;
             SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = false;
         }
         onProgress?.Invoke("upload", 100);
