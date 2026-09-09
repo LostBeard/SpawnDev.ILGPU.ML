@@ -324,17 +324,24 @@ public abstract partial class MLTestBase
         graphs.AllowControlFlowCapture = true;
         // ⚠️ EVERY PASS IS KEPT, not just the replay. SessionGraphCapture runs three different regimes for
         // these three calls - an OBSERVE forward, then the CAPTURE pass (drains suppressed, readbacks
-        // skipped, shape values seeded from the warm snapshot, dispatch-elide forced on), then replays -
-        // and only the third is "a replay". If the CAPTURE PASS itself already disagrees with the direct
-        // forward, the plan is a recording of the wrong computation and the replay is faithfully repeating
-        // it, which is a completely different bug from a replay that loses work.
-        // ⚠️ PROBE THE **REAL** CAPTURE PASS, NOT AN EMULATION OF IT. Everything the emulation above can
-        // express is now CLEAN by measurement - each regime flag alone, all of them together, the warm
-        // priming, the runtime-constant seed (the warm passes DO snapshot it: the condition is
-        // UseCaptureParamSlots && !SuppressDrains), an active recording, and unreplayable host writes
-        // (0 of 8,141). Yet TryCaptureAsync's capture pass still disagrees with a plain forward in all
-        // 16,900 values. So the difference is inside the real path, and the per-node probe - which named
-        // Range_1_output_0 on 2026-09-03 - had only ever been pointed at the emulation.
+        // skipped, shape values seeded from the warm snapshot, dispatch-elide forced on), then replays.
+        //
+        // ⛔ CORRECTED 2026-09-04 - this comment used to end "and only the third is 'a replay'", and to
+        // claim TryCaptureAsync's capture pass disagreed with a plain forward in all 16,900 values. BOTH
+        // ARE FALSE and they are the misdirection that cost two days:
+        //   - the SECOND call returns a replay too. SessionGraphCapture.RunAsync ends with
+        //     `return await _webGpu.ReplayAsync(inputs)`, so the value everyone called "the capture pass"
+        //     was a replay result. Read the call a variable came from, not the name it was given.
+        //   - the TRUE capture-pass output, read inside TryCaptureAsync before the finally lifts
+        //     SuppressDrains, matched a plain forward in ALL 16,900 values, as did all 4,873 probed node
+        //     outputs. There is no capture-regime arithmetic bug to find.
+        // So the fault is IN REPLAY. Everything the emulation above can express is clean by measurement -
+        // each regime flag alone, all of them together, the warm priming, the runtime-constant seed (the
+        // warm passes DO snapshot it: the condition is UseCaptureParamSlots && !SuppressDrains), an active
+        // recording (passive over 8,187 dispatches), and unreplayable host writes (HostWriteCount minus
+        // ScalarParamWriteCount is 0). What remains is work the plan does not carry because the value was
+        // already sitting in a buffer when recording began - the RangeOperator pattern fixed 2026-09-03,
+        // and the reason CaptureParamArena.CaptureConstWrite exists.
         //
         // The reference is re-recorded here rather than reused from 0b so this block stands alone.
         Graph.GraphExecutor.NodeProbeFromIndex = 0;
@@ -511,11 +518,22 @@ public abstract partial class MLTestBase
 
         if (capDiff != 0)
             throw new Exception(
-                $"the CAPTURE PASS itself disagrees with a plain forward: {capDiff} of {count} values differ "
-              + $"(worst {capWorst:F6}). Replay is not involved - the capture pass runs with drains "
-              + "suppressed, per-node readbacks skipped and shape values seeded from the warm snapshot, so "
-              + "the plan being recorded is a recording of the WRONG computation. Fix that before looking "
-              + "at replay at all.");
+                $"the call that PERFORMS the capture returned a value disagreeing with a plain forward: "
+              + $"{capDiff} of {count} values differ (worst {capWorst:F6}). "
+              + "⚠️ READ THIS BEFORE INVESTIGATING: that returned value is A REPLAY, not the capture pass - "
+              + "SessionGraphCapture.RunAsync ends with `return await _webGpu.ReplayAsync(inputs)`. So this "
+              + "is a REPLAY fault, and the message that used to be printed here ('the CAPTURE PASS itself "
+              + "disagrees ... Replay is not involved') was exactly backwards and cost two days. "
+              + "MEASURED 2026-09-04: the TRUE capture-pass output, read inside TryCaptureAsync, matched a "
+              + "plain forward in ALL values, and so did all 4,873 probed node outputs - do NOT go hunting "
+              + "arithmetic that goes wrong under the capture regime, there is none. Look instead for work "
+              + "the plan does not carry because the value was already sitting in a buffer when recording "
+              + "began (the RangeOperator pattern, and why CaptureParamArena.CaptureConstWrite exists). "
+              + "Ruled out already: IfOperator.TryWriteConstantBranch (it rents a NAMED buffer the pool "
+              + "never rebinds), missing host writes (HostWriteCount - ScalarParamWriteCount is 0), and "
+              + "recording itself (BeginDispatchCapture is passive over 8,187 dispatches). The ELIDE A/B "
+              + "printed above narrows it further: 0 differ there means elided dispatches are the missing "
+              + "work.");
         if (sameDiff != 0)
             throw new Exception(
                 $"a replay does not reproduce the forward it recorded: {sameDiff} of {count} values differ "
