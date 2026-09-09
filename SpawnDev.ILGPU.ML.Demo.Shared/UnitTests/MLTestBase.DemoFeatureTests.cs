@@ -747,7 +747,34 @@ public abstract partial class MLTestBase
     //  Background Removal (RMBG)
     // ═══════════════════════════════════════════════════════════
 
-    [TestMethod(Timeout = 300000, Category = "HeavyModel")]
+    /// <remarks>
+    /// ⚠️ 900 s, and HeavyCpu, both for MEASURED reasons - this is not a timeout papering over a bug.
+    ///
+    /// This is the only RMBG test that runs the model at its NATIVE 1024x1024 (the siblings use 256x256),
+    /// which is 16x the pixels. It had timed out at the old 300 s cap in EVERY archived run
+    /// (2026-09-06 300560 ms, 09-07 300656 ms, 09-08 300700 ms, 09-08 300816 ms) - pinned just over the
+    /// cap every time, i.e. hitting a wall, not flaking. **So it had never once been verified to work at
+    /// 1024x1024 on the CPU accelerator**, and "it is merely slow" was an assumption.
+    ///
+    /// Three candidate causes were checked and eliminated before touching the budget:
+    ///   - NOT the verification: that is two 64-element Scale kernels, two 64-float readbacks and LINQ
+    ///     over 64 values.
+    ///   - NOT CPU-lane contention: the 300816 ms run was PMT_PARALLEL=off, so it was sequential with no
+    ///     sibling competition.
+    ///   - NOT the accelerator config: CPUDevice.Default is already tuned (64-thread groups,
+    ///     numMultiprocessors = Environment.ProcessorCount); the Nvidia/AMD/Intel presets are all
+    ///     numMultiprocessors:1 simulation shapes and would be slower.
+    ///
+    /// It is irreducible compute. Scaling 256x256 -> 1024x1024 on the same model: CUDA goes 5.2-7.2 s ->
+    /// 10.1 s (~1.5x, so CUDA is dominated by the 170 MB load + graph compile, not compute), while CPU
+    /// goes 26.1-27.2 s -> >300 s (>11x, i.e. roughly linear in pixels - compute-bound). The ILGPU CPU
+    /// accelerator is a correctness simulator, so a 1024x1024 U2Net through it genuinely costs minutes.
+    ///
+    /// HeavyCpu is correct semantics independent of the budget: compute-bound and all-core, slow ONLY on
+    /// the CPU backend, so the scheduler serializes it on the CPU lane and it still runs normally on every
+    /// other lane (where it takes 10-24 s). HeavyModel stays too, so it is out of routine sweeps.
+    /// </remarks>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel,HeavyCpu")]
     public async Task Pipeline_BackgroundRemoval_ProducesMask() => await RunTest(async accelerator =>
     {
         var http = GetHttpClient();
