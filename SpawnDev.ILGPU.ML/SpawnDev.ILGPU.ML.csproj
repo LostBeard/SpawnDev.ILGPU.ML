@@ -5,7 +5,7 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<Version>5.2.12</Version>
-		<PackageReleaseNotes>v5.2.12 - FeatureExtractionPipeline bound model inputs by POSITION and read OutputNames[0], so a classifier's two sentiment logits were zero-padded to 768 dims and compared by cosine (related scored -0.790, unrelated +0.842); inputs now bind by name, token_type_ids is supplied, and a non-hidden-state output is refused. inputShapes now rejects a shape whose RANK disagrees with the model, which was silently feeding values to the wrong axis and failing hundreds of nodes later. Every HuggingFace download goes through the hub, which caches and avoids HF rate limiting. Consumes SpawnDev.WebTorrent 4.2.4 (5.2.11 packed against 4.2.2, so its OPFS and hub fixes could not reach consumers). Full history: CHANGELOG.md</PackageReleaseNotes>
+		<PackageReleaseNotes>v5.2.12 - FeatureExtractionPipeline bound model inputs by POSITION and read OutputNames[0], so a classifier's two sentiment logits were zero-padded to 768 dims and compared by cosine (related scored -0.790, unrelated +0.842); inputs now bind by name, token_type_ids is supplied, and a non-hidden-state output is refused. inputShapes now rejects a shape whose RANK disagrees with the model, which was silently feeding values to the wrong axis and failing hundreds of nodes later. Every HuggingFace download goes through the hub, which caches and avoids HF rate limiting. Consumes SpawnDev.WebTorrent 4.2.5 (5.2.11 packed against 4.2.2, so its OPFS and hub fixes could not reach consumers). Full history: CHANGELOG.md</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -36,7 +36,7 @@
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.10" />
 		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.10" />
-		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.4" />
+		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.5" />
 	</ItemGroup>
 
 	<ItemGroup>

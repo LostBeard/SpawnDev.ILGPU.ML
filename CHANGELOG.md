@@ -66,11 +66,18 @@ indicate success: 429 (Too Many Requests)` purely because it built an huggingfac
 wrong shape for weights in a browser. Use `HubModelStream.OpenAsync` for weights and keep `GetDownloadUrl`
 for KB-scale files.
 
-### Changed - dependency: SpawnDev.WebTorrent 4.2.2 -> 4.2.4
+### Changed - dependency: SpawnDev.WebTorrent 4.2.2 -> 4.2.5
 
 Picks up the OPFS read path that re-fetches and rebuilds a cache entry when it finds a piece it cannot
 serve (the browser evicts OPFS), the bounded extraction cache, and the allowlisted source proxy. 5.2.11
 shipped pinned to 4.2.2, so no consumer of ML could receive any of it.
+
+4.2.5 additionally removes `Torrent.ZcPieces`, a public counter that was declared, zeroed and never
+incremented after WebTorrent's span-coalescing rewrite. `WebTorrent_Measure_DistilGpt2_Download` printed it
+as `zeroCopyPieces` AND derived `~{N}MB fetched` by multiplying it, so a 313 MB download that had in fact
+zero-copied 312 MB reported `zeroCopyPieces=0 (~0MB fetched)`. That test now reads the live instance
+counter `Torrent.ZeroCopyPiecesVerified` and reports `zeroCopyPieces=79 (~316MB fetched)`, which
+cross-checks against the file size.
 
 ### Docs
 
