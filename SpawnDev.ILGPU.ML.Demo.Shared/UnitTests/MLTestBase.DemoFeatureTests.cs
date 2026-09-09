@@ -933,8 +933,15 @@ public abstract partial class MLTestBase
         var modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
             HuggingFaceClient.GetDownloadUrl(Hub.ModelHub.KnownModels.RMBG14, Hub.ModelHub.KnownFiles.OnnxModel));
 
-        // Use 256x256 — the model accepts dynamic spatial dims; smaller input fits within
-        // the diagnostic budget across all backends and exercises the same WGSL codegen.
+        // 🔴 THE MODEL DOES NOT ACCEPT DYNAMIC SPATIAL DIMS. RMBG-1.4 declares
+        // input: [batch_size, 3, 1024, 1024] - batch is symbolic, H and W are STATIC 1024.
+        // MEASURED 2026-09-08: onnxruntime REFUSES this 256x256 feed outright -
+        //   InvalidArgument: Got invalid dimensions for input: index 2 Got: 256 Expected: 1024
+        // Our engine accepts the inputShapes override and runs it anyway (it is fully
+        // convolutional, so it computes something plausible), which is why nobody noticed.
+        // ⚠️ CONSEQUENCE: this shape has NO onnxruntime oracle - it cannot be cross-checked. Use
+        // side=1024 when comparing against gen_rmbg_node_reference.py. 256 is kept only because it
+        // fits the per-op-capture budget on every backend.
         const int side = 256;
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes,
             inputShapes: new Dictionary<string, int[]>
@@ -998,6 +1005,25 @@ public abstract partial class MLTestBase
                 bool isDataTensor = sample.Length >= 10;
                 bool nearOne = isDataTensor && mean > 0.95 && variance < 0.001;
                 bool nearZero = isDataTensor && Math.Abs(mean) < 0.05 && variance < 0.001;
+                // 🔴 A CONTIGUOUS PREFIX CANNOT ESTABLISH SATURATION, so this is a CANDIDATE, never a
+                // verdict. `sample` is GraphExecutor.CaptureMaxElements (1024) elements taken as
+                // SubView(0, n) - for a [1,32,256,256] NCHW tensor that is rows 0..15 of CHANNEL 0, i.e.
+                // the image's top-left corner, out of 2,097,152 values.
+                //
+                // ⚠️ MEASURED 2026-09-08 against onnxruntime on the identical input at the model's native
+                // 1024x1024 (tools/gen_rmbg_node_reference.py):
+                //     /stage1/rebnconv2/relu_s1/Relu_output_0
+                //        FULL tensor  min 0.00000 max 4.83730 mean 0.81317 var 1.2244113
+                //        first 1024   min 0.00000 max 0.00000 mean 0.00000 var 0.0000000
+                // ORT produces the SAME dead prefix. This node is alive and our engine agrees with ORT;
+                // the old "FIRST SATURATED #13" verdict - which reproduced identically on all six
+                // backends and therefore looked like a real cross-backend defect - was this sampling
+                // artifact. `stage1/rebnconv2d` and `stage2/rebnconv2d` do it too: the top-left corner of
+                // this synthetic half-white image is uniform, so a downsampled channel there IS zero.
+                //
+                // Reported as "PREFIX-DEAD CANDIDATE" for that reason. To actually settle one, capture it
+                // in FULL via GraphExecutor.CaptureOutputNames (that path ignores CaptureMaxElements) and
+                // compare against gen_rmbg_node_reference.py.
                 bool extreme = nearOne || nearZero;
 
                 string line = $"#{index} {kv.Key} | min={min:F4} max={max:F4} mean={mean:F4} var={variance:F6} | {opInfo}";
@@ -1016,9 +1042,12 @@ public abstract partial class MLTestBase
                 index++;
             }
 
+            // "candidate", not "SATURATED": see the long note above - this is a 1024-element
+            // contiguous prefix, and onnxruntime shows the same dead prefix on a healthy tensor.
             string verdict = firstSaturationIndex < 0
-                ? "no saturated node found"
-                : $"FIRST SATURATED #{firstSaturationIndex}: {firstSaturationLine}";
+                ? "no prefix-dead candidate found"
+                : $"PREFIX-DEAD CANDIDATE #{firstSaturationIndex} (NOT a saturation verdict - 1024-element "
+                + $"contiguous prefix; verify in FULL before believing it): {firstSaturationLine}";
             // RETURN, not throw: a passing diagnostic must not report as a failure.
             return (
                 $"[RMBG-Diag] backend={accelerator.AcceleratorType} nodes={outputs.Count}\n" +
