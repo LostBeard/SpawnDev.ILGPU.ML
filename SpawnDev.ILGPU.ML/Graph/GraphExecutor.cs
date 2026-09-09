@@ -2452,15 +2452,31 @@ public class GraphExecutor : IDisposable
                         // stream, a later node's kernel that re-Rents this buffer is recorded after this input's
                         // last consumer, so stream ordering makes the reuse safe with no host drain. Keeps the
                         // captured forward's pool footprint bounded with ZERO allocation.
+                        //
+                        // 🔴 CUDA ONLY, and the restriction it serves is CUDA's. `cuMemAlloc` mid-capture is what
+                        // makes a pool miss fatal there; a WebGPU capture merely RECORDS dispatches, so allocating
+                        // during it is fine. Applying this to WebGPU bought nothing and cost correctness:
+                        // MEASURED 2026-09-09 on ZipVoice's fm_decoder, a replay differed from a plain forward in
+                        // 16900 of 16900 values (worst 3.873695), deterministically, since 2026-09-04. With the
+                        // immediate return off it is 0 of 16900 (worst 0.000000).
+                        //
+                        // ⚠️ The stream-ordering argument above is what fails here. It holds for a single CUDA
+                        // stream; a WebGPU replay submits the recorded plan with its own encoder/barrier
+                        // structure, so once one buffer serves TWO tensors the replay is not equivalent to the
+                        // forward it recorded. REUSE INSIDE THE CAPTURE is the fault - not the buffer escaping to
+                        // the shared pool afterwards, which was built, measured and REFUTED (identical 16900,
+                        // worst 3.873695) before landing this.
+                        bool captureImmediate = SuppressDrains && CaptureImmediateReturn
+                                             && _accelerator.AcceleratorType == AcceleratorType.Cuda;
                         if (halfTensors.TryGetValue(inputName, out var hrel))
                         {
                             halfTensors.Remove(inputName);
-                            if (SuppressDrains && CaptureImmediateReturn) _pool.ReturnHalf(hrel);
+                            if (captureImmediate) _pool.ReturnHalf(hrel);
                             else { pendingHalfReleases.Add(hrel); pendingReleaseBytes += (long)hrel.ElementCount * 2; }
                         }
                         else if (tensors.TryGetValue(inputName, out var releaseTensor))
                         {
-                            if (SuppressDrains && CaptureImmediateReturn) _pool.Return(releaseTensor);
+                            if (captureImmediate) _pool.Return(releaseTensor);
                             else { pendingReleases.Add(releaseTensor); pendingReleaseBytes += (long)releaseTensor.ElementCount * sizeof(float); }
                         }
                     }

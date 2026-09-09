@@ -41,12 +41,63 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </remarks>
 public abstract partial class MLTestBase
 {
+    /// <summary>
+    /// Turns on <see cref="Graph.GraphExecutor.CaptureTraceFile"/> for the CUDA lane and reports the
+    /// POOL-ALLOC lines - each one a Rent that MISSED during the capture, which is what makes a CUDA
+    /// capture fault ("cuMemAlloc mid-capture is illegal; the context is corrupted and the next free AVs").
+    /// Reports on every exit path, including the throwing one, which is how the CUDA lane exits today.
+    /// </summary>
+    private sealed class CaptureTraceDump : IDisposable
+    {
+        private readonly string? _path;
+        public CaptureTraceDump(bool enabled)
+        {
+            if (!enabled) return;
+            _path = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                $"zipvoice-capture-trace-{DateTime.Now:HHmmss}.txt");
+            Graph.GraphExecutor.CaptureTraceFile = _path;
+        }
+
+        public void Dispose()
+        {
+            if (_path == null) return;
+            Graph.GraphExecutor.CaptureTraceFile = null;
+            try
+            {
+                if (!System.IO.File.Exists(_path)) { Console.WriteLine("[Benchmark] ZipVoiceFidelity [Cuda] capture trace: no file written"); return; }
+                var misses = System.IO.File.ReadAllLines(_path).Where(l => l.Contains("POOL-ALLOC")).ToList();
+                Console.WriteLine($"[Benchmark] ZipVoiceFidelity [Cuda] capture priming gaps: {misses.Count} "
+                    + "POOL-ALLOC (each is a Rent that MISSED during capture => cuMemAlloc mid-capture)");
+                foreach (var m in misses.Take(15)) Console.WriteLine($"[Benchmark] ZipVoiceFidelity [Cuda]   {m.Trim()}");
+                if (misses.Count == 0)
+                    Console.WriteLine("[Benchmark] ZipVoiceFidelity [Cuda]   NONE - the capture pass is "
+                        + "miss-free, so the illegal access is NOT a priming gap; look elsewhere");
+            }
+            catch (Exception ex) { Console.WriteLine($"[Benchmark] ZipVoiceFidelity [Cuda] trace read failed: {ex.Message}"); }
+        }
+    }
+
     [TestMethod(Timeout = 900000, Category = "HeavyModel")]
     public async Task Pipeline_ZipVoice_CaptureReplayFidelity() => await RunTest(async accelerator =>
     {
         if (accelerator.AcceleratorType is not (AcceleratorType.WebGPU or AcceleratorType.Cuda))
             throw new UnsupportedTestException(
                 $"graph capture is CUDA and WebGPU only; {accelerator.AcceleratorType} has nothing to replay");
+
+        // ── CUDA: name the POOL MISS that corrupts the capture ───────────────────────────────────────────
+        // The CUDA lane fails this test with "an illegal memory access was encountered" at an If whose
+        // output is the [1999,48] relative-position table. That is the documented root-cause chain, not a
+        // kernel bug: any Rent that MISSES during the capture enters AllocateWithReclaim, which flushes
+        // pending GPU work and can cuMemAlloc mid-capture - illegal, the context is corrupted, and the next
+        // free anywhere AVs. Plans/sd-capture-pool-priming.md calls "make the capture pass provably
+        // miss-free" the remaining work, and GraphExecutor already logs each under-primed Rent as
+        // POOL-ALLOC. It just needed switching on: CaptureTraceFile has no env default, and the browser
+        // could not use one anyway.
+        // Appended+flushed BEFORE each node's work, so it survives a native fault.
+        // ⚠️ A `using` dumper, NOT a try/finally around the body - the same reason as in GraphExecutor.RunAsync:
+        // wrapping a long method by hand is brace surgery that risks a second defect. It reports on every exit
+        // path, which matters here because the CUDA lane exits by THROWING.
+        using var _captureTrace = new CaptureTraceDump(accelerator.AcceleratorType == AcceleratorType.Cuda);
 
         using var http = CreateHuggingFaceHttpClient();
         var encoderBytes = await InferenceSession.DownloadBytesChunkedAsync(
