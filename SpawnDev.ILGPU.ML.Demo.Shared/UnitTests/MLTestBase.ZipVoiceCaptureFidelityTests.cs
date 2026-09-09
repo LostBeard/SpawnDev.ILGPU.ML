@@ -498,6 +498,54 @@ public abstract partial class MLTestBase
             finally { WebGPUGraphCapture.ElideDispatchDuringCapture = true; }
         }
 
+        // ── DEFERRED-RELEASE A/B: is the RETURNED tensor's buffer recycled out from under the caller? ──
+        //
+        // Why this A/B exists now: the OUTPUT EXTRACTION probe above fired its designed verdict - the last
+        // node's own buffer holds the RIGHT values while the call RETURNS different data - so the divergence
+        // is introduced when the result is extracted, not while it is computed. The prime suspect recorded
+        // there is that under SuppressDrains the pool returns a buffer IMMEDIATELY
+        // (GraphExecutor: `if (SuppressDrains && CaptureImmediateReturn) _pool.Return(releaseTensor)`), so
+        // the buffer backing the returned tensor can be re-rented and rewritten before the caller copies it.
+        //
+        // CaptureImmediateReturn exists precisely to separate the two things SuppressDrains does - skipping
+        // per-node readbacks, and recycling immediately rather than at a drain - because (its own words)
+        // "telling them apart by reading the code has been tried and did not settle it". So settle it by
+        // measurement: capture the REAL path with immediate return OFF and compare the replay.
+        //
+        // ⚠️ Do NOT read a 0 here as "immediate return is the whole story". The emulated regimes say
+        // SuppressDrains ALONE is 0 differ and UseCaptureParamSlots ALONE is 0 differ, and only the two
+        // TOGETHER diverge - so the fault needs both, and this A/B tests one leg of that pair.
+        // ⚠️ DIAGNOSTIC A/B, not a proposed setting. It costs another decoder session.
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
+        {
+            Graph.GraphExecutor.CaptureImmediateReturn = false;
+            try
+            {
+                using var deferred = IlgpuZipVoiceGraphs.Create(accelerator, encoderBytes, decoderBytes, vocoderBytes);
+                deferred.EnableGraphCapture = true;
+                deferred.AllowControlFlowCapture = true;
+                await deferred.RunDecoderAsync(tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+                var drReplay = await deferred.RunDecoderAsync(
+                    tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+                var (drDiff, drWorst) = Compare(directCapture, drReplay);
+                Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] DEFERRED-RELEASE A/B: "
+                    + $"captured with CaptureImmediateReturn OFF -> replay {drDiff} of {count} differ (worst {drWorst:F6}) "
+                    + $"| capture {(deferred.DecoderCaptured ? "LIVE" : "NOT live: " + deferred.DecoderCaptureStatus)} => "
+                    + (drDiff == 0
+                        ? "IMMEDIATE POOL RETURN IS A NECESSARY LEG - the buffer backing the returned tensor is "
+                          + "recycled and rewritten before the caller copies it out. Fix by holding the OUTPUT "
+                          + "tensor's buffer until the caller has copied it, not by disabling the optimisation"
+                        : "immediate return is NOT the cause - the returned tensor is wrong for another reason; "
+                          + "next suspect is the capture-seed leg (UseCaptureParamSlots) of the same pair"));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] "
+                                + $"DEFERRED-RELEASE A/B failed: {ex.Message}");
+            }
+            finally { Graph.GraphExecutor.CaptureImmediateReturn = true; }
+        }
+
         if (!graphs.DecoderCaptured)
             throw new Exception("capture never went live, so there is no replay to check: "
                               + graphs.DecoderCaptureStatus);
