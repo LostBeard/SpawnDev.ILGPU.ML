@@ -169,7 +169,32 @@ public abstract partial class MLTestBase
         //
         // Capture is NOT enabled here - these are plain forwards with one flag flipped, so a difference is
         // attributable to that flag alone.
+        //
+        // 🔴 WEBGPU ONLY, and NOT for tidiness - running these on CUDA CORRUPTS THE REAL CAPTURE THAT
+        // FOLLOWS. MEASURED 2026-09-09 from the capture-regime pass trace:
+        //
+        //   pass 1 start: free=337  live=24
+        //   pass 2 start: free=529  live=24
+        //   pass 3 start: free=8    live=6199     <- the pool is gone
+        //
+        // The "deferred release kept" regime sets CaptureImmediateReturn = false WITH SuppressDrains on, so
+        // every release goes to pendingReleases and the suppressed drain never returns them: 6,175 buffers
+        // (one per node of a 6,149-node graph) stay live and the free pool falls to EIGHT. The real capture
+        // attempt then runs against that wreckage, misses the pool thousands of times, and each miss is a
+        // cuMemAlloc mid-capture - illegal, the context is corrupted, and the next free anywhere AVs. That
+        // is the "an illegal memory access was encountered" this test reported on CUDA.
+        //
+        // These regimes exist to characterise the WEBGPU capture regime (that is what every one of their
+        // comments is about), and the ELIDE / DEFERRED-RELEASE A/Bs below are already WebGPU-gated. The
+        // undo lambdas restore the FLAGS but cannot give the leaked buffers back, so the only safe scope
+        // is the backend they were written for.
+        // ⚠️ OUTSIDE the gate below, on purpose: this keeps the direct reference forwards pure on BOTH
+        // backends. Gating it with the regimes left capture ENABLED during CUDA's reference forwards, which
+        // both risks comparing against a replay and desynchronises the observe-then-capture state machine.
         graphs.EnableGraphCapture = false;
+
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
+        {
         foreach (var (label, apply, undo) in new (string, Action, Action)[]
         {
             ("SuppressDrains",
@@ -218,6 +243,7 @@ public abstract partial class MLTestBase
             Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] regime "
                             + $"'{label}': {d} of {count} differ (worst {w:F6})");
         }
+        }   // end WebGPU-only regime bisect (see the note above: on CUDA it wrecks the pool for the real capture)
 
         // ── 0a2. IS THE RECORDING ITSELF THE VARIABLE? ───────────────────────────────────────────────
         //
@@ -622,6 +648,27 @@ public abstract partial class MLTestBase
         // justification for the immediate return - "on the single capture stream, a later node's kernel that
         // re-Rents this buffer is recorded AFTER this input's last consumer, so stream ordering makes the
         // reuse safe" - is the claim that measurement now contradicts, and it is where to look next.
+
+        // SessionGraphCapture is a TWO-PHASE state machine: one forward is spent OBSERVING (proving no
+        // control-flow body runs, so recording is safe), and the capture is attempted on the NEXT call.
+        //
+        // ⚠️ MEASURED 2026-09-09 - THIS RETRY IS NOT SUFFICIENT ON CUDA, and the comment says so rather
+        // than implying a fix. The retry fires (its line is in the log) and the status afterwards is STILL
+        // "observing ... capture is attempted on the next call", so the observe phase is re-entered rather
+        // than advanced: on the CUDA lane this test never gets a live capture, with FIVE capture-enabled
+        // decoder calls before the check. That is the open question for CUDA - not a crash and not wrong
+        // numbers (the pool now runs miss-free, 0 POOL-ALLOC), just a capture that never engages here.
+        // Next place to look: whether CudaGraphCapture refuses per call and resets the observation, since
+        // the status reported is the OBSERVE result and not a refusal message.
+        // ⚠️ Deliberately ONE retry, and only while the status says capture is still pending: a genuine
+        // refusal (control flow present, warm reclaimed, driver lacks the API) must still fail loudly here.
+        if (!graphs.DecoderCaptured && graphs.DecoderCaptureStatus?.Contains("next call") == true)
+        {
+            Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] capture pending "
+                            + "after the observe pass; spending one more decoder call to let it record");
+            replaySame = await graphs.RunDecoderAsync(
+                tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+        }
 
         if (!graphs.DecoderCaptured)
             throw new Exception("capture never went live, so there is no replay to check: "

@@ -2354,6 +2354,19 @@ public class GraphExecutor : IDisposable
 
     public async Task<Dictionary<string, Tensor>> RunAsync(Dictionary<string, Tensor> inputs)
     {
+        // Pool state at the START of a capture pass. A miss COUNT says the capture allocated; this says
+        // WHY - an empty pool (warm primed nothing that survived) reads very differently from a pool full
+        // of the wrong bucket sizes, and the priming fix is different for each. Rides the existing
+        // CaptureTraceFile opt-in so it costs nothing on a normal run.
+        if (SuppressDrains && CaptureTraceFile != null)
+        {
+            try { System.IO.File.AppendAllText(CaptureTraceFile,
+                $"== capture-regime pass start: free={_pool.AvailableBufferCount} "
+                + $"live={_pool.LiveNamedCount} "
+                + $"missesSoFar={Tensors.BufferPool.CaptureMissCount} "
+                + $"returnsSoFar={Tensors.BufferPool.CaptureReturnCount} "
+                + $"buckets[{_pool.BucketProfileSummary()}]\n"); } catch { }
+        }
         ForwardGeneration++;   // signals per-forward "stable capture slot" counters to reset (CUDA-graph capture)
         LastRunOpLog.Clear();
         LastRunIntegerDivCount = 0;

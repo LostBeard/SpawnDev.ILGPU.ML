@@ -61,6 +61,27 @@ public class BufferPool : IDisposable
     /// <summary>Number of buffers available for reuse.</summary>
     public int AvailableBufferCount => _buckets.Values.Sum(s => s.Count);
 
+    /// <summary>
+    /// Buffers currently RENTED (recorded in <c>_namedBuffers</c>, not yet Returned). Rising across a pass
+    /// while the free count falls is the signature of rentals that never come back - which drains the pool
+    /// and, during a capture, turns every later Rent into an allocation.
+    /// </summary>
+    public int LiveNamedCount => _namedBuffers.Count;
+
+    /// <summary>
+    /// Compact "bucketSize:freeCount" profile of the FREE buckets, largest counts first. Answers the
+    /// question a miss count alone cannot: whether the capture pass started against an EMPTY pool or a
+    /// pool primed with the WRONG bucket sizes. Diagnostic only.
+    /// </summary>
+    public string BucketProfileSummary(int top = 10)
+    {
+        var parts = _buckets.Where(kv => kv.Value.Count > 0)
+            .OrderByDescending(kv => kv.Value.Count)
+            .Take(top)
+            .Select(kv => $"{kv.Key}:{kv.Value.Count}");
+        return string.Join(" ", parts);
+    }
+
     /// <summary>Test/diagnostic switch: when true, the browser JS zero-copy weight-upload path is skipped and
     /// the .NET byte[] chunked path is used instead. Lets a measurement A/B the two upload paths from the same
     /// cached source to isolate the JS&lt;-&gt;.NET copy cost. Default false (zero-copy on where applicable).</summary>
@@ -226,6 +247,15 @@ public class BufferPool : IDisposable
 
     /// <summary>Reset <see cref="CaptureMissCount"/> before a pass you intend to prove miss-free.</summary>
     public static void ResetCaptureMissCount() => CaptureMissCount = 0;
+
+    /// <summary>
+    /// Buffers actually RETURNED to a bucket while <see cref="Graph.GraphExecutor.SuppressDrains"/> was set.
+    /// Paired with <see cref="CaptureMissCount"/> it separates the two reasons a capture pass allocates:
+    /// the pool was too small (returns happen, demand exceeds supply) versus nothing is being recycled at
+    /// all (returns ~0, so every Rent is a first Rent). Those need opposite fixes, and a miss count alone
+    /// cannot tell them apart.
+    /// </summary>
+    public static int CaptureReturnCount;
 
     private static void PoolViolation(string message)
     {
@@ -538,6 +568,7 @@ public class BufferPool : IDisposable
                 _buckets[bucketSize] = stack;
             }
             stack.Push(buffer);
+            if (Graph.GraphExecutor.SuppressDrains) CaptureReturnCount++;
         }
     }
 
