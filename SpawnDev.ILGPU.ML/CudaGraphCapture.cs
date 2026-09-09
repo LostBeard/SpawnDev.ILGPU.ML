@@ -247,6 +247,13 @@ public sealed class CudaGraphCapture : IDisposable
                 // kill, not a wrong number.
                 // Name the fresh allocations for the last warm pass - the count alone cannot say WHICH.
                 BufferPool.TraceFreshAllocNames = true;
+                // REBIND-LIVE fires when a name's pool record is overwritten while the previous buffer is
+                // still live - the buffer is then orphaned: not free, not live-named, never returnable, and
+                // a permanent accelerator child. That is precisely the bookkeeping signature measured here
+                // (allocations +5 per forward while BOTH the free count and the live count stay flat), so
+                // turn the detector on and let it name the tensor instead of guessing at it.
+                BufferPool.TracePoolOwnership = true;
+                BufferPool.PoolOwnershipViolations.Clear();
                 int prevChildren = -1;
                 int nonIncreasing = 0;
                 var childTrajectory = new List<int>();
@@ -284,7 +291,9 @@ public sealed class CudaGraphCapture : IDisposable
                         + "grows in step with the child count the leak is IN BufferPool, if it is flat the leak "
                         + "is kernels/streams/out-of-pool allocations. FRESH alloc names (last pass): "
                         + string.Join(" | ", BufferPool.RecentFreshAllocNames
-                            .Skip(Math.Max(0, BufferPool.RecentFreshAllocNames.Count - 10)));
+                            .Skip(Math.Max(0, BufferPool.RecentFreshAllocNames.Count - 6)))
+                        + $" || POOL-OWNERSHIP violations: {BufferPool.PoolOwnershipViolations.Count} :: "
+                        + string.Join(" ;; ", BufferPool.PoolOwnershipViolations.Take(4));
                     Console.WriteLine($"[CudaGraphCapture] accelerator objects still growing after warm "
                         + $"passes ({prevChildren} -> {acc.NumberChildObjects}); a registration inside the "
                         + "capture window would unload a module on ILGPU's GC thread and take the process "

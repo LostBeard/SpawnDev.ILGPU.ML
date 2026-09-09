@@ -547,6 +547,31 @@ public class BufferPool : IDisposable
     }
 
     /// <summary>Return a tensor's buffer to the pool for reuse by name.</summary>
+    /// <remarks>
+    /// 🔴 IDENTITY WINS OVER THE NAME RECORD when the two disagree. This method pools the buffer recorded
+    /// under the tensor's NAME, and when a name is re-Rented before its previous tensor is Returned, that
+    /// record no longer points at the buffer this tensor views - so the tensor's own buffer was pooled by
+    /// nobody: not free, not live-named, never returnable again, and a permanent ILGPU accelerator child.
+    ///
+    /// MEASURED 2026-09-09, ZipVoice fm_decoder on CUDA. Every forward allocated 5 fresh buffers while BOTH
+    /// the free count (~357-382) and the live count (24) stayed flat - buffers vanishing from the pool's own
+    /// bookkeeping - and the ownership trace named them: 201 ALIEN-RETURN violations with
+    /// <c>ownAlreadyFree=False</c>, e.g. "'v': pooling #44627d but this tensor views #16da15" (node 6146,
+    /// the graph OUTPUT) and "'_mmi_azp': pooling #5fbe22 but this tensor views #536487".
+    ///
+    /// That leak is why <see cref="CudaGraphCapture"/> refuses to record this graph: it warms until the
+    /// accelerator's child-object count stops growing, and a per-forward leak means it never does (+12 per
+    /// pass, of which 5 are these).
+    ///
+    /// ⚠️ The old comment called ALIEN-RETURN "often benign". It is benign only when the tensor's own buffer
+    /// is ALREADY FREE (a view or handoff carrying a name it never Rented) - which is why that case is still
+    /// left alone here. When the own buffer is live and pool-owned, it is a leak.
+    /// ⚠️ NOT YET FIXED. An identity-based reclaim was written here and MEASURABLY NEVER EXECUTED: it
+    /// required the orphaned buffer to be in <c>_allBuffers</c>, and the new path's own trace line never
+    /// appeared once across a 12-forward run while plain ALIEN-RETURN fired 201 times. So the orphaned
+    /// buffers are NOT plain entries of that list - sub-views resolving to a parent buffer, or permanent
+    /// allocations tracked elsewhere, are the candidates. Removed rather than left as dead code.
+    /// </remarks>
     public void Return(Tensor tensor)
     {
         var name = tensor.Name;
