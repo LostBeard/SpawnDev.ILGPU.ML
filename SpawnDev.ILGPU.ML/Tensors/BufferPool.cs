@@ -208,6 +208,25 @@ public class BufferPool : IDisposable
     public static bool TraceRents
         = Environment.GetEnvironmentVariable("ML_TRACE_RENTS") is "1" or "true";
 
+    /// <summary>
+    /// Rents that MISSED the pool while <see cref="Graph.GraphExecutor.SuppressDrains"/> was set, i.e.
+    /// during a capture pass. On CUDA every one of these is a <c>cuMemAlloc</c> mid-capture: illegal, the
+    /// context is corrupted, and the next free anywhere access-violates. So a capture is only safe when
+    /// this reads ZERO across the pass.
+    /// </summary>
+    /// <remarks>
+    /// MEASURED 2026-09-09, ZipVoice fm_decoder on CUDA: <b>6,972 misses</b> across a 6,149-node graph -
+    /// roughly one per node, spread over every bucket size (3,207 at bucket=1, 930 at 131072, 339 at
+    /// 262144). That is the reported "an illegal memory access was encountered" in
+    /// <c>Pipeline_ZipVoice_CaptureReplayFidelity</c>, and it is a PRIMING gap, not a kernel bug.
+    /// The cause is a liveness mismatch: warm passes release on the DEFERRED schedule while the capture
+    /// pass returns immediately, so the buckets warm leaves are not the buckets capture rents.
+    /// </remarks>
+    public static int CaptureMissCount;
+
+    /// <summary>Reset <see cref="CaptureMissCount"/> before a pass you intend to prove miss-free.</summary>
+    public static void ResetCaptureMissCount() => CaptureMissCount = 0;
+
     private static void PoolViolation(string message)
     {
         lock (PoolOwnershipViolations)
@@ -355,10 +374,16 @@ public class BufferPool : IDisposable
         // CUDA-graph capture diagnostic: a pool allocation while SuppressDrains means the warm passes did NOT
         // prime this size-bucket, so the capture pass is about to cuMemAlloc (illegal mid-capture → native crash).
         // Naming it here (survives the crash) reveals which Rent site is under-primed. Inert in production.
-        if (Graph.GraphExecutor.SuppressDrains && Graph.GraphExecutor.CaptureTraceFile != null)
+        if (Graph.GraphExecutor.SuppressDrains)
         {
-            try { System.IO.File.AppendAllText(Graph.GraphExecutor.CaptureTraceFile,
-                $"   -> POOL-ALLOC '{name}' count={count} bucket={bucketSize}  (capture priming gap)\n"); } catch { }
+            // Counted ALWAYS, not only when the trace file is on: a capture is safe only when this is zero,
+            // and the guard that decides whether to capture must not depend on a diagnostic being enabled.
+            CaptureMissCount++;
+            if (Graph.GraphExecutor.CaptureTraceFile != null)
+            {
+                try { System.IO.File.AppendAllText(Graph.GraphExecutor.CaptureTraceFile,
+                    $"   -> POOL-ALLOC '{name}' count={count} bucket={bucketSize}  (capture priming gap)\n"); } catch { }
+            }
         }
         // Memory-bounded execution: the pool retains every Returned buffer in size-buckets for reuse, so a
         // 1-pass large model (e.g. a 512x512 VAE decode = ~227 distinct-size feature maps, each used once)
