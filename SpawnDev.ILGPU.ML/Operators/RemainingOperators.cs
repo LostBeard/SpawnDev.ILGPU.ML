@@ -1082,6 +1082,17 @@ internal static class SubgraphRunner
     /// </remarks>
     public static int ExecutionCount;
 
+    /// <summary>
+    /// How many times <c>BuildExecutor</c> has actually run, i.e. subgraph plan cache MISSES. Each build
+    /// converts the subgraph to IR, runs the full GraphCompiler, and calls Pool.AllocatePermanent for every
+    /// initializer and Constant table - permanent allocations that are ILGPU accelerator CHILD OBJECTS and
+    /// are never freed. So a nonzero rate here is a per-forward registration leak, and it is what makes
+    /// CudaGraphCapture refuse to record: it warms until the child count stops moving, and with a leak it
+    /// never does. MEASURED 2026-09-09 on ZipVoice fm_decoder: +11 child objects per warm pass, flat across
+    /// 12 passes (deltas 11,11,11,11,-6,11,10,11,12,11,11,11), which is ~2 per If for five Ifs.
+    /// </summary>
+    public static int BuildExecutorCount;
+
     /// <summary>Zero the body-execution counter, so a capture decision covers a known window.</summary>
     public static void ResetExecutionCount() => ExecutionCount = 0;
 
@@ -1214,6 +1225,7 @@ internal static class SubgraphRunner
                 return candidate;
             }
 
+        BuildExecutorCount++;
         var executor = BuildExecutor(ctx, subgraph, subgraphInputs, out var constants);
         if (executor == null) return null;
 

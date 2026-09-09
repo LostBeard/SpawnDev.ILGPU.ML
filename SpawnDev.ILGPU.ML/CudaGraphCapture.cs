@@ -62,6 +62,14 @@ public sealed class CudaGraphCapture : IDisposable
     /// post-capture drain is what frees the buffers a replay then reads.</summary>
     internal static bool ExperimentKeepDrainsSuppressed;
 
+    /// <summary>
+    /// Why the last <see cref="TryCaptureAsync"/> returned null. A STATIC deliberately: every refusal in
+    /// here is a Console line, and on the CUDA test lane library Console output does not reach the log - so
+    /// a refusal was invisible and the caller could only say "returned null, no message". Surfaced through
+    /// SessionGraphCapture's status so a test can report the real reason.
+    /// </summary>
+    public static string? LastRefusalReason;
+
     /// <param name="allowControlFlow">
     /// The CALLER's decision, when it has one. <see cref="Graph.SessionGraphCapture"/> can establish by
     /// OBSERVATION that a full forward runs no control-flow body (see its remarks), and that observation is
@@ -78,9 +86,26 @@ public sealed class CudaGraphCapture : IDisposable
     public static async Task<CudaGraphCapture?> TryCaptureAsync(InferenceSession session,
         Dictionary<string, Tensor> inputs, bool? allowControlFlow = null)
     {
+        LastRefusalReason = null;
         var acc = session.Accelerator;
-        if (acc is not CudaAccelerator) return null;
-        if (!CudaStream.SupportsGraphCapture) return null;
+        // ⚠️ These two used to return null in SILENCE, and they are the only outcomes of this method that
+        // print nothing and throw nothing. Combined with SessionGraphCapture reporting a STALE status, a
+        // refusal here was invisible: the ZipVoice fidelity test read "observing ... capture is attempted on
+        // the next call" for five calls while the real answer was one of these lines. Say which.
+        if (acc is not CudaAccelerator)
+        {
+            LastRefusalReason = $"not a CUDA accelerator ({acc.AcceleratorType})";
+            Console.WriteLine($"[CudaGraphCapture] not a CUDA accelerator ({acc.AcceleratorType}); "
+                            + "graph capture is a CUDA driver feature. Running direct forward.");
+            return null;
+        }
+        if (!CudaStream.SupportsGraphCapture)
+        {
+            LastRefusalReason = "CudaStream.SupportsGraphCapture is FALSE (no graph-capture API in this driver/build)";
+            Console.WriteLine("[CudaGraphCapture] CudaStream.SupportsGraphCapture is FALSE - this driver or "
+                            + "ILGPU build has no graph-capture API. Running direct forward.");
+            return null;
+        }
 
         // ⚠️ REFUSE control flow. If/Loop/Scan run their bodies through SubgraphRunner, which calls
         // BuildExecutor on EVERY execution and allocates permanent buffers there - a device allocation
@@ -100,6 +125,7 @@ public sealed class CudaGraphCapture : IDisposable
             : Array.Empty<string>();
         if (present.Length > 0)
         {
+            LastRefusalReason = $"graph contains control flow ({string.Join(", ", present)}) and the refusal was not lifted";
             Console.WriteLine($"[CudaGraphCapture] graph contains control flow ({string.Join(", ", present)}), "
                 + "whose subgraph executors allocate per call - a mid-capture allocation is an uncatchable "
                 + "access violation; running direct forward.");
@@ -169,6 +195,7 @@ public sealed class CudaGraphCapture : IDisposable
                 // (0xC0000005, uncatchable). Do NOT enter the capture window; degrade to the direct forward.
                 if (BufferPool.ReclaimFireCount > 0)
                 {
+                    LastRefusalReason = $"warm reclaimed {BufferPool.ReclaimFireCount}x - working set not resident";
                     Console.WriteLine($"[CudaGraphCapture] warm reclaimed {BufferPool.ReclaimFireCount}x " +
                         $"({BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB) - working set not resident, " +
                         "capture not provably safe; running direct forward.");
@@ -195,16 +222,70 @@ public sealed class CudaGraphCapture : IDisposable
                 //
                 // The GC.Collect + WaitForPendingFinalizers then leaves nothing dead for the collector to
                 // find even if it does wake: a pulse it cannot act on is harmless.
+                // ⚠️ TRAJECTORY, not just the last delta. MEASURED 2026-09-09 on ZipVoice's fm_decoder:
+                // the count moved 36771 -> 36782, i.e. +11 per pass, and the old message could only say
+                // "still growing" - it could not say whether the series was CONVERGING (warm to a fixed
+                // point, just needs more passes) or LEAKING (a per-forward registration that never stops).
+                // Those need opposite fixes, so record the whole series and report it.
+                // The cap is 12 rather than 6 for the same reason: 6 was not enough to tell them apart.
+                // 🔴 THE CRITERION, and the old one could never pass. This used to loop while
+                // `acc.NumberChildObjects != prevChildren`, i.e. it demanded that a global counter be
+                // EXACTLY equal on two consecutive reads. ILGPU releases child objects on its own GC
+                // thread, so that number DITHERS: measured per-pass deltas on ZipVoice's fm_decoder were
+                // [11,11,11,11,-6,12,-69,11,11,11,11,11] - the negatives are asynchronous releases landing
+                // mid-series. Exact equality of a noisy, asynchronously-updated counter is unreachable, so
+                // the guard refused every capture on this graph forever and reported it as "still growing".
+                //
+                // What the guard actually needs to prove is narrower: that a forward registers NO NEW child
+                // objects, because a registration inside the capture window unloads a module on ILGPU's GC
+                // thread and takes the process down. Releases are harmless. So:
+                //   - SETTLE before and after each pass (collect + finalizers + accelerator sync), so a
+                //     sample is not competing with releases still in flight, and
+                //   - require NO INCREASE across a pass (delta <= 0), twice in a row rather than once, so a
+                //     single lucky sample cannot green-light a recording.
+                // ⚠️ Do NOT relax this to "the count is close enough". The failure it prevents is a process
+                // kill, not a wrong number.
+                // Name the fresh allocations for the last warm pass - the count alone cannot say WHICH.
+                BufferPool.TraceFreshAllocNames = true;
                 int prevChildren = -1;
-                for (int warm = 0; warm < 6 && acc.NumberChildObjects != prevChildren; warm++)
+                int nonIncreasing = 0;
+                var childTrajectory = new List<int>();
+                // Splits the leak in two: ILGPU child objects that are POOL buffers versus everything else
+                // (kernels, streams, out-of-pool Allocate1D). The fixes are in different places, so measure
+                // which before touching either.
+                var poolTrajectory = new List<int>();
+                for (int warm = 0; warm < 12 && nonIncreasing < 2; warm++)
                 {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    await acc.SynchronizeAsync();
                     prevChildren = acc.NumberChildObjects;
+                    childTrajectory.Add(prevChildren);
+                    poolTrajectory.Add(BufferPool.TotalDeviceAllocations);
+
                     await session.RunAsync(inputs);
                     await acc.SynchronizeAsync();
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+
+                    nonIncreasing = acc.NumberChildObjects <= prevChildren ? nonIncreasing + 1 : 0;
                 }
-                if (acc.NumberChildObjects != prevChildren)
+                childTrajectory.Add(acc.NumberChildObjects);
+                if (nonIncreasing < 2)
                 {
-                    Console.WriteLine($"[CudaGraphCapture] accelerator objects still growing after 6 warm "
+                    var deltas = string.Join(",", childTrajectory.Zip(childTrajectory.Skip(1), (a, b) => b - a));
+                    LastRefusalReason = $"accelerator child objects still growing after {childTrajectory.Count - 1} "
+                        + $"warm passes ({prevChildren} -> {acc.NumberChildObjects}); per-pass deltas [{deltas}] "
+                        + "- a shrinking series means warm needs more passes, a flat series means a per-forward "
+                        + $"registration leak. Subgraph plan cache MISSES: {Operators.SubgraphRunner.BuildExecutorCount}. "
+                        + $"Pool-allocated buffers per pass [{string.Join(",", poolTrajectory)}] - if that series "
+                        + "grows in step with the child count the leak is IN BufferPool, if it is flat the leak "
+                        + "is kernels/streams/out-of-pool allocations. FRESH alloc names (last pass): "
+                        + string.Join(" | ", BufferPool.RecentFreshAllocNames
+                            .Skip(Math.Max(0, BufferPool.RecentFreshAllocNames.Count - 10)));
+                    Console.WriteLine($"[CudaGraphCapture] accelerator objects still growing after warm "
                         + $"passes ({prevChildren} -> {acc.NumberChildObjects}); a registration inside the "
                         + "capture window would unload a module on ILGPU's GC thread and take the process "
                         + "down. Running direct forward.");

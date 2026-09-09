@@ -223,6 +223,9 @@ public sealed class SessionGraphCapture : IDisposable
                 stable[name] = new Tensor(buf.View.SubView(0, Math.Max(1, t.ElementCount)), (int[])t.Shape.Clone());
             }
             await _accelerator.SynchronizeAsync();
+            // Set only by the catch below, so the outcome line further down can tell "a throw already
+            // described this attempt" from "the previous call's status is still sitting there".
+            bool statusWrittenByThrow = false;
             try
             {
                 if (_accelerator.AcceleratorType == AcceleratorType.Cuda)
@@ -239,16 +242,30 @@ public sealed class SessionGraphCapture : IDisposable
                 // Capture is BEST-EFFORT: an over-VRAM model (pool reclaim is forbidden mid-capture)
                 // or a capture-unsafe op must degrade to the direct forward, not fail generation.
                 CaptureStatus = $"capture threw {ex.GetType().Name}: {ex.Message}";
+                statusWrittenByThrow = true;
                 Console.WriteLine($"[SessionGraphCapture] capture failed - running direct: {ex.Message}");
             }
 
             // ⚠️ TryCapture returning NULL is the one outcome that prints nothing and throws nothing, so
-            // without this line the loudest signal for the commonest silent failure is no signal at all.
-            if (CaptureStatus == "not attempted")
+            // without this the loudest signal for the commonest silent failure is no signal at all.
+            //
+            // 🔴 AND IT MUST NOT BE GATED ON THE SENTINEL. This used to read
+            // `if (CaptureStatus == "not attempted")`, but the OBSERVE pass on the PREVIOUS call has
+            // already replaced that sentinel with "capture is attempted on the next call" - so on the very
+            // call that attempts the capture, the gate was false and the real outcome was never written.
+            // The stale observe text then survived forever.
+            //
+            // MEASURED 2026-09-09, CUDA lane: `Pipeline_ZipVoice_CaptureReplayFidelity` reported
+            // "observing ... capture is attempted on the next call" across FIVE capture-enabled decoder
+            // calls, so the failure looked like a state machine stuck in observe. It was not: capture was
+            // attempted every time and `TryCaptureAsync` returned null, silently. A status field that only
+            // reports its FIRST outcome describes the wrong event for every call after it.
+            if (!statusWrittenByThrow)
                 CaptureStatus = IsCaptured
                     ? $"live on {_accelerator.AcceleratorType} ({DispatchCount} dispatches)"
-                    : $"TryCapture returned null on {_accelerator.AcceleratorType} "
-                    + "(no exception, no message - the graph was ineligible to record)";
+                    : $"TryCapture returned null on {_accelerator.AcceleratorType}: "
+                    + (CudaGraphCapture.LastRefusalReason ?? "no reason recorded - the graph was ineligible "
+                      + "to record and the backend left no explanation");
         }
 
         // Recorded only once a capture is live, so it describes a graph that actually exists.

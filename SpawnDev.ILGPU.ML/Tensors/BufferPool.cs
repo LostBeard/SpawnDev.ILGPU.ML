@@ -257,6 +257,26 @@ public class BufferPool : IDisposable
     /// </summary>
     public static int CaptureReturnCount;
 
+    /// <summary>
+    /// Device buffers this process has allocated through ANY BufferPool. Static on purpose: a per-instance
+    /// count can be read off the wrong pool - InferenceSession.ResolveExecutor hands each shape its own
+    /// shape-specialised GraphExecutor, each with its own pool, so `session.Executor`'s pool is not
+    /// necessarily the one a forward just used (measured: it read 0 while the graph was clearly allocating).
+    /// Used to split "the accelerator's child objects are growing" into pool buffers versus everything else
+    /// (kernels, streams, out-of-pool allocations), which have fixes in different places.
+    /// </summary>
+    public static int TotalDeviceAllocations;
+
+    /// <summary>
+    /// Names of the most recent FRESH device allocations (pool misses). A count says a forward leaks
+    /// buffers; this says WHICH rents, which is what points at the operator responsible.
+    /// Capped, and only appended when <see cref="TraceFreshAllocNames"/> is on.
+    /// </summary>
+    public static readonly List<string> RecentFreshAllocNames = new();
+
+    /// <summary>Enables <see cref="RecentFreshAllocNames"/>. Diagnostic; off by default.</summary>
+    public static bool TraceFreshAllocNames;
+
     private static void PoolViolation(string message)
     {
         lock (PoolOwnershipViolations)
@@ -380,6 +400,7 @@ public class BufferPool : IDisposable
                 cbuf = _captureUnnamedSlots[ci];
             else
             {
+                TotalDeviceAllocations++;
                 cbuf = _accelerator.Allocate1D<float>(bucketSize);
                 if (ci < _captureUnnamedSlots.Count) { _captureUnnamedSlots[ci].Dispose(); _captureUnnamedSlots[ci] = cbuf; }
                 else _captureUnnamedSlots.Add(cbuf);
@@ -421,6 +442,9 @@ public class BufferPool : IDisposable
         // pressure, ILGPU's AllocateWithReclaim flushes pending GPU work, runs our reclaim (dispose the
         // AVAILABLE Returned-not-live bucketed buffers), retries once, and throws our working-set message if
         // still OOM. Models that fit never hit this; models that don't are bounded to their live set.
+        TotalDeviceAllocations++;
+        if (TraceFreshAllocNames && RecentFreshAllocNames.Count < 4000)
+            RecentFreshAllocNames.Add($"{name ?? "(unnamed)"}#{bucketSize}");
         MemoryBuffer1D<float, Stride1D.Dense> newBuffer = _accelerator.AllocateWithReclaim(
             () => _accelerator.Allocate1D<float>(bucketSize),   // allocate
             DisposeBucketedBuffers,                             // reclaim (dispose Returned-not-live), returns bytes freed
