@@ -1,6 +1,22 @@
-﻿# SpawnDev.ILGPU.ML Changelog
+# SpawnDev.ILGPU.ML Changelog
 
 Notable changes per release. Pre-stable; API will change between preview drops.
+
+## 5.2.13 (unreleased)
+
+### Fixed - the library did not compile at HEAD
+
+`InferenceSession`'s weight-load diagnostics call `AsyncFSChunkStore.ResetReadTiming` /
+`TraceReadTiming` / `ReadCalls` / `ReadBytes` / `ReadHandleMisses` / `SyncOpens` and
+`Torrent.ResetEnsurePieceTiming` / `TraceEnsurePiece`. Every one of those arrived in
+SpawnDev.WebTorrent **4.2.6**, while this project still pinned **4.2.5** - so `dotnet build` failed
+with eight `CS0117`s and the package could not be rebuilt from its own source.
+
+⚠️ Found by `SpawnDev.AI/tools/check-tools-compile.cs`, which builds the ML source as a side effect of
+compiling a diagnostic probe. Nothing else caught it: the SHIPPED 5.2.12 binary runs fine, so every
+consumer test stayed green while the tree it was built from had stopped compiling.
+
+Pin bumped to SpawnDev.WebTorrent 4.2.6.
 
 ## 5.2.12 (unreleased)
 
