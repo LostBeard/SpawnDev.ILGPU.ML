@@ -44,3 +44,25 @@ public interface IModelSource
     /// </remarks>
     Task<byte[]> FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// An <see cref="IModelSource"/> that caches into an <see cref="IModelStore"/> and can report what it
+/// holds and what is downloading - enough to drive a model-management UI.
+/// </summary>
+/// <remarks>
+/// Separate from <see cref="IModelSource"/> because not every source caches: a plain ranged-HTTP reader or
+/// a local-file source delivers models without a store behind it, and forcing those to invent one would
+/// make the interface a lie. A caller that wants cache state tests for this interface and degrades when it
+/// is absent.
+/// </remarks>
+public interface ICachingModelSource : IModelSource
+{
+    /// <summary>The store being filled, for listing, sizing and eviction.</summary>
+    IModelStore Store { get; }
+
+    /// <summary>The store key this source uses for a repo file - so a caller can ask the store about it.</summary>
+    string CacheKey(string repoId, string filePath);
+
+    /// <summary>Downloads in flight through this source. Empty when the source does not track them.</summary>
+    IReadOnlyList<ActiveModelDownload> ActiveDownloads { get; }
+}

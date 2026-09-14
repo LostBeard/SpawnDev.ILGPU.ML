@@ -16,7 +16,7 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// limiter.
 /// </para>
 /// </remarks>
-public class HttpClientModelSource : IModelSource
+public class HttpClientModelSource : ICachingModelSource
 {
     /// <summary>Checkpoint the resume point every this many bytes.</summary>
     private const long CheckpointInterval = 8L * 1024 * 1024;
@@ -36,6 +36,11 @@ public class HttpClientModelSource : IModelSource
 
     /// <summary>The store being filled, for listing, sizing and eviction.</summary>
     public IModelStore Store => _store;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ActiveModelDownload> _active = new();
+
+    /// <inheritdoc/>
+    public IReadOnlyList<ActiveModelDownload> ActiveDownloads => _active.Values.ToList();
 
     /// <summary>Create a source over <paramref name="http"/> filling <paramref name="store"/>.</summary>
     public HttpClientModelSource(HttpClient http, IResumableModelStore store)
@@ -75,6 +80,9 @@ public class HttpClientModelSource : IModelSource
         }
         finally
         {
+            // Here, not in DownloadAsync, so the entry cannot survive any exit path - success, throw or
+            // cancellation. A stuck entry shows in a UI as a download that never finishes.
+            _active.TryRemove(key, out _);
             gate.Release();
         }
     }
@@ -129,9 +137,12 @@ public class HttpClientModelSource : IModelSource
         await _store.SetStateAsync(key, url, total, resumeFrom, false, etag, ct).ConfigureAwait(false);
 
         long written = resumeFrom;
-        var lastReport = Environment.TickCount64 - ProgressIntervalMs;
+        var startedAt = Environment.TickCount64;
+        var startReceived = resumeFrom;
+        var lastReport = startedAt - ProgressIntervalMs;
         var lastCheckpoint = written;
         progress?.Report(new ModelDownloadProgress(written, total, resumed));
+        _active[key] = new ActiveModelDownload(key, url, written, total, resumed, 0);
 
         var body = await res.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
         await using (body.ConfigureAwait(false))
@@ -160,6 +171,9 @@ public class HttpClientModelSource : IModelSource
                         if (now - lastReport >= ProgressIntervalMs)
                         {
                             progress?.Report(new ModelDownloadProgress(written, total, resumed));
+                            var secs = Math.Max(0.001, (now - startedAt) / 1000.0);
+                            _active[key] = new ActiveModelDownload(key, url, written, total, resumed,
+                                secs < 0.25 ? 0 : (written - startReceived) / secs);
                             lastReport = now;
                         }
                     }

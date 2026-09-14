@@ -21,7 +21,7 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// var pipe = await DepthEstimationPipeline.CreateFromHubAsync(accelerator, source, repoId);
 /// </code>
 /// </remarks>
-public class HubModelSource : IModelSource, IDisposable
+public class HubModelSource : ICachingModelSource, IDisposable
 {
     private readonly OpfsModelCache _cache;
     private readonly bool _ownsCache;
