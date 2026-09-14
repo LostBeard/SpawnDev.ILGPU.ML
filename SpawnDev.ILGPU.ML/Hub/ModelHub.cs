@@ -63,6 +63,17 @@ public class ModelHub : IDisposable
     private readonly ModelCache _cache;
 
     /// <summary>
+    /// The streaming cache behind <see cref="OpenStreamAsync"/> / <see cref="OpenStreamFromUrlAsync"/>:
+    /// downloads straight from <c>fetch</c> into OPFS with the payload never entering the managed heap.
+    /// <see cref="_cache"/> survives only for the obsolete <c>byte[]</c> methods below; both use the same
+    /// OPFS directory, so there is one store, not two.
+    /// </summary>
+    private readonly OpfsModelCache _streamCache;
+
+    /// <summary>Bridges the cache's typed progress onto this class's existing (received, total) event.</summary>
+    private readonly Progress<ModelDownloadProgress> _streamProgress;
+
+    /// <summary>
     /// HuggingFace Hub base URL. Default: https://huggingface.co
     /// </summary>
     [Obsolete("Downloads go through the hub (HuggingFaceClient.HubBaseUrl / GetDownloadUrl), which caches, "
@@ -80,6 +91,9 @@ public class ModelHub : IDisposable
     {
         _cache = new ModelCache(js);
         _cache.OnDownloadProgress += (received, total) => OnProgress?.Invoke(received, total);
+        // Same CacheDirectoryName as ModelCache by default, so the two share one OPFS store.
+        _streamCache = new OpfsModelCache(js);
+        _streamProgress = new Progress<ModelDownloadProgress>(p => OnProgress?.Invoke(p.BytesReceived, p.TotalBytes));
     }
 
     /// <summary>
@@ -117,37 +131,42 @@ public class ModelHub : IDisposable
     /// <remarks>
     /// <c>LoadAsync</c> returns the whole file on the .NET/WASM managed heap. For a 300 MB+ model that
     /// breaks the standing "bulk bytes stay in JS" rule on its own, and it is what makes a load OOM under
-    /// memory pressure. The stream returned here is a <c>BlobStream</c> over the OPFS entry, which is an
-    /// <c>IJSReadStream</c>: pass it to <c>InferenceSession.CreateFromOnnxStreamAsync</c> and the graph
-    /// structure is parsed from the stream while each weight goes JS-&gt;GPU without entering the heap.
+    /// memory pressure. The stream returned here is an <c>OPFSStream</c>, which is an <c>IJSReadStream</c>:
+    /// pass it to <c>InferenceSession.CreateFromOnnxStreamAsync</c> and the graph structure is parsed from
+    /// the stream while each weight goes JS-&gt;GPU without entering the heap.
     /// <para>
-    /// ⚠️ On a cache MISS the first download still goes through the byte[] path before being written to
-    /// OPFS and re-opened as a stream - see <see cref="ModelCache.GetOrFetchStreamAsync"/>. Every load
-    /// after the first is fully streamed.
+    /// ⭐ The cache MISS is now streamed too. This used to route the first download through
+    /// <c>ModelCache</c>, which read every <c>fetch</c> chunk with <c>ReadBytes()</c>, accumulated a
+    /// <c>List&lt;byte[]&gt;</c> and concatenated it - putting the whole model on the managed heap twice
+    /// before caching it. <see cref="OpfsModelCache"/> hands each chunk from <c>fetch</c> straight to OPFS
+    /// as a <c>Uint8Array</c>, so the payload never enters .NET on any load, first or subsequent. It also
+    /// resumes an interrupted download and refuses to serve a truncated one.
     /// </para>
     /// </remarks>
     /// <param name="repoId">Repository ID (e.g., "onnx-community/mobilenetv2-12")</param>
     /// <param name="filename">File within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
     /// <param name="revision">Git revision (default: "main")</param>
     /// <returns>A seekable JS-side stream, or null when OPFS is unavailable. Caller disposes it.</returns>
-    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
-    public Task<BlobStream?> OpenStreamAsync(string repoId, string filename, string revision = "main")
+    public async Task<Stream?> OpenStreamAsync(string repoId, string filename, string revision = "main")
     {
         // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
         // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
-        return _cache.GetOrFetchStreamAsync(url, cacheKey);
+        return await OpenStreamFromUrlAsync(url, cacheKey).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Open any URL as a seekable, JS-side stream with OPFS caching. Streaming counterpart to
     /// <see cref="LoadFromUrlAsync"/>; see <see cref="OpenStreamAsync"/> for why this is preferred.
     /// </summary>
-    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
-    public Task<BlobStream?> OpenStreamFromUrlAsync(string url, string? cacheKey = null)
+    /// <returns>A seekable JS-side stream, or null when OPFS is unavailable. Caller disposes it.</returns>
+    public async Task<Stream?> OpenStreamFromUrlAsync(string url, string? cacheKey = null)
     {
-        return _cache.GetOrFetchStreamAsync(url, cacheKey);
+        // Preserve the documented contract: null means "no OPFS here", so a caller can fall back. A real
+        // download failure still THROWS - it must never be mistaken for an unavailable cache.
+        if (!await _streamCache.IsAvailableAsync().ConfigureAwait(false)) return null;
+        return await _streamCache.OpenOrDownloadAsync(url, cacheKey, _streamProgress).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -197,18 +216,41 @@ public class ModelHub : IDisposable
 #pragma warning restore CS0618
     }
 
+    /// <summary>
+    /// True when the file is cached AND complete - i.e. actually usable without touching the network.
+    /// </summary>
+    /// <remarks>
+    /// This asks <see cref="OpfsModelCache.IsCompleteAsync"/>, not "does a file with this name exist".
+    /// A half-downloaded model has a file too, and reporting that as cached is how a truncated entry gets
+    /// handed to a parser and fails as a confusing format error instead of as the short file it is.
+    /// </remarks>
     public Task<bool> IsCachedAsync(string repoId, string filename, string revision = "main")
     {
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
-        return _cache.IsCachedAsync("", cacheKey);
+        return _streamCache.IsCompleteAsync(cacheKey);
     }
 
     /// <summary>
     /// List all cached models with sizes.
     /// </summary>
-    public Task<List<(string Key, long SizeBytes)>> ListCachedAsync()
+    /// <remarks>
+    /// Served by <see cref="OpfsModelCache"/>, not <see cref="ModelCache"/>: the streaming cache keeps a
+    /// small <c>.meta</c> sidecar beside each entry, and only its listing filters those out. Routing this
+    /// through the byte[] cache would report every sidecar as if it were a cached model.
+    /// </remarks>
+    public async Task<List<(string Key, long SizeBytes)>> ListCachedAsync()
     {
-        return _cache.ListCachedAsync();
+        var entries = await _streamCache.ListCachedAsync().ConfigureAwait(false);
+        return entries.ConvertAll(e => (e.Key, e.SizeBytes));
+    }
+
+    /// <summary>
+    /// List all cached models with sizes AND whether each one is complete. A partial entry is resumable,
+    /// not usable - a cache-management UI should show the difference rather than implying a usable model.
+    /// </summary>
+    public Task<List<(string Key, long SizeBytes, bool Complete)>> ListCachedDetailedAsync()
+    {
+        return _streamCache.ListCachedAsync();
     }
 
     /// <summary>
@@ -216,7 +258,7 @@ public class ModelHub : IDisposable
     /// </summary>
     public Task<long> GetCacheSizeAsync()
     {
-        return _cache.GetCacheSizeAsync();
+        return _streamCache.GetCacheSizeAsync();
     }
 
     /// <summary>
@@ -228,15 +270,19 @@ public class ModelHub : IDisposable
     public Task RemoveCachedAsync(string repoId, string filename, string revision = "main")
     {
         var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
-        return _cache.RemoveAsync(cacheKey);
+        return RemoveCachedAsync(cacheKey);
     }
 
     /// <summary>
     /// Remove a cached item by its raw cache key (as returned by <see cref="ListCachedAsync"/>).
     /// </summary>
+    /// <remarks>
+    /// Goes through <see cref="OpfsModelCache"/> so the entry's <c>.meta</c> sidecar is deleted with it.
+    /// Removing only the data file would leave an orphan sidecar behind on every eviction.
+    /// </remarks>
     public Task RemoveCachedAsync(string cacheKey)
     {
-        return _cache.RemoveAsync(cacheKey);
+        return _streamCache.RemoveAsync(cacheKey);
     }
 
     /// <summary>
@@ -403,5 +449,6 @@ public class ModelHub : IDisposable
     public void Dispose()
     {
         _cache.Dispose();
+        _streamCache.Dispose();
     }
 }
