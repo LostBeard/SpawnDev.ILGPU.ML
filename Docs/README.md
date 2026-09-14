@@ -26,6 +26,6 @@ This folder exists because marketing copy had drifted ahead of reality (e.g. Hom
 - `architecture.md` — multi-format engine, graph compiler, executor, fixed-shape decode
 - `operators.md` — registered vs. reference-tested vs. pass-through ops; the `BuiltinOpTypes` policy
 - `backends.md` — per-backend support matrix, sync-vs-async rules (see SpawnDev.ILGPU `Docs/async.md`)
-- `weight-loading.md` — streaming load, OPFS caching, hub/torrent model delivery
+- `weight-loading.md` — streaming load, OPFS/disk caching, hub model delivery (HTTP; torrent optional)
 
 If you add one of these, link it here and delete it from this "planned" list — same rule as the demo status.

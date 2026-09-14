@@ -32,7 +32,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **122+ numpy-verified operator tests** — every operator validated against known-correct reference data, CPU reference comparison minimum bar
 - **Single image to 3D** — TripoSR for exportable meshes (glTF/OBJ), LGM for Gaussian splats (SPZ/PLY)
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
-- **P2P Model Delivery + Shared Compute** — [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) integration for decentralized model delivery via BitTorrent. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
+- **P2P Model Delivery + Shared Compute** — OPTIONAL, via the separate `SpawnDev.ILGPU.ML.WebTorrent` package: [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) decentralized model delivery over BitTorrent. The core library delivers models over plain HTTP through the hub and does NOT depend on WebTorrent; `HubModelStream` implements the same `IModelSource`, so P2P is a one-line swap. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
 
 ## What's verified in `4.0.0-preview.5`
 
@@ -51,7 +51,7 @@ Every result above is rendered directly from a GPU buffer to an HTML `<canvas>` 
 
 The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes.
 
-**Text generation** is verified end-to-end on WebGPU as the 7th demo pipeline: the `/text-gen` demo streams DistilGPT-2 from the SpawnDev hub (`hub.spawndev.com`) over a **seekable torrent stream straight to the GPU** — the model is never held whole in memory — then runs autoregressive generation entirely on-device. The **Model Inspector** (`/inspector`) is fully working: drop a local file or paste a hub/HuggingFace URL and any ONNX/TFLite/GGUF/SafeTensors model is parsed structure-only (weights skipped) into an architecture summary + operator-compatibility report — GPT-2 reports **100% supported**. No other browser ML library has either.
+**Text generation** is verified end-to-end on WebGPU as the 7th demo pipeline: the `/text-gen` demo streams DistilGPT-2 from the SpawnDev hub (`hub.spawndev.com`) over a **seekable stream straight to the GPU** — plain HTTP, cached in OPFS, so the model is never held whole in memory — then runs autoregressive generation entirely on-device. The **Model Inspector** (`/inspector`) is fully working: drop a local file or paste a hub/HuggingFace URL and any ONNX/TFLite/GGUF/SafeTensors model is parsed structure-only (weights skipped) into an architecture summary + operator-compatibility report — GPT-2 reports **100% supported**. No other browser ML library has either.
 
 9 more pipelines exist in the codebase (object detection, face detection, other NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
 

@@ -4,6 +4,83 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## 5.2.13 (unreleased)
 
+### Changed - BREAKING: model delivery no longer uses WebTorrent
+
+`SpawnDev.ILGPU.ML` no longer references `SpawnDev.WebTorrent` at all. Models are delivered over plain
+HTTP through the SpawnDev hub and cached locally. Torrent delivery moves to the optional
+**SpawnDev.ILGPU.ML.WebTorrent** package, whose `HubModelStream` implements the same `IModelSource` - so
+it is a one-line swap, not a rewrite.
+
+Why: HTTP delivery had been left in a state that made torrents look mandatory.
+`ModelCache.DownloadWithProgressAsync` read every `fetch` chunk with `Uint8Array.ReadBytes()`,
+accumulated a `List<byte[]>`, concatenated it, and copied the result back to JS to write OPFS - so a
+1.7 GB checkpoint landed on the single-threaded WASM managed heap **twice** before being cached. That is
+a bug, not a property of HTTP.
+
+New delivery types:
+
+- `IModelSource` - transport. `HubModelSource` (browser: `fetch` -> OPFS),
+  `HttpClientModelSource` (desktop: `HttpClient` -> disk), `HubModelStream` (torrent, separate package).
+- `IModelStore` / `IResumableModelStore` - storage. `OpfsModelCache` (browser), `FileModelStore` (desktop).
+- `ICachingModelSource` - the capability of reporting cache state and downloads in flight.
+
+MEASURED, WebGPU, Qwen3-1.7B-Q8_0 (1,834,426,016 B):
+
+| phase | time |
+| --- | --- |
+| download to cache | 44.4 s (39.4 MB/s - network bound) |
+| warm load -> GPU | **4.5 s** (parse 2.2 / upload 1.8 / compile 0.1) |
+
+Managed allocation during download is **9.6-20.1%** of the file; reinstating a per-chunk `ReadBytes()`
+takes it to 119.8-136.6%, which is how that guard is verified.
+
+Delivery is resumable (byte-verified after both truncation and cancellation), cancellable (an
+`AbortController` reaches the network, not just the loop), reports progress DURING the transfer, and
+refuses to serve a truncated entry. Cache management - list with sizes, partials marked, individual
+removal, clear - is on `IModelStore`.
+
+### Changed - chunk sizes, measured rather than assumed
+
+4 MiB was the largest size anyone had tested, not an optimum. Sweeping 64 KiB -> 64 MiB over a 192 MiB
+OPFS file on three browser lanes (MB/s):
+
+| chunk | L1 | L2 | L3 |
+| --- | --- | --- | --- |
+| 64 KiB | 75 | 87 | 86 |
+| 1 MiB | 577 | 591 | 612 |
+| 4 MiB | 1290 | 1320 | 1291 |
+| **16 MiB** | **1559** | **1986** | **1981** |
+| 32/64 MiB | noise - fastest on one lane, near-slowest on another |
+
+16 MiB is the largest size with a gain that repeats on every lane, and it is exactly ILGPU's
+`MemoryBuffer.DefaultStreamChunkSizeInBytes`. `BufferPool`'s quantized-tensor path was the one call
+overriding that default DOWNWARD (to 4 MiB) and is raised. `StreamProtoReader` stays at 64 KiB
+deliberately - it seeks past weight blobs, so a large read-ahead would fetch bytes it discards.
+
+### Changed - BREAKING: pipeline and session signatures
+
+- `DepthEstimationPipeline.CreateFromHubAsync` and `ImageGenerationPipeline.CreateAsync` take
+  `IModelSource` instead of `HubModelStream`, so neither requires a `WebTorrentClient`.
+- `InferenceSession.CreateFromHuggingFaceAsync` loses its `webTorrent` parameter and the lazy-hash branch.
+- `ModelHub.OpenStreamAsync` / `OpenStreamFromUrlAsync` return `Stream` rather than `BlobStream`, and are
+  no longer `[Obsolete]` - they are the supported streaming path.
+- `HuggingFaceClient.DefaultHubBaseUrl` replaces `HubModelStream.DefaultHubBaseUrl` (aliased, not removed):
+  the hub address must not live in the WebTorrent adapter.
+
+### Removed - `ModelCache`
+
+A second OPFS cache with its own bookkeeping and download loop. The `byte[]` entry points on `ModelHub`
+remain (external-data resolution and tokenizers need arrays) but now read back from the one store.
+
+### Fixed - `IsComplete`'s truncation check was dead for every hub-served model
+
+`ContentLengthAsync` probed with `HEAD`; the hub answered **405**, so it returned -1 for every model URL
+and `IsComplete` fell back to "existence is all we have". A half-downloaded checkpoint was cached and
+reused, surfacing as a confusing parse error rather than the short file it was. Now probes with a 0-0
+range GET. (The hub answers HEAD as of 2026-09-14, but the range probe stays first: same single bodyless
+request, and it also works against origins that refuse HEAD.)
+
+
 ### Fixed - the library did not compile at HEAD
 
 `InferenceSession`'s weight-load diagnostics call `AsyncFSChunkStore.ResetReadTiming` /

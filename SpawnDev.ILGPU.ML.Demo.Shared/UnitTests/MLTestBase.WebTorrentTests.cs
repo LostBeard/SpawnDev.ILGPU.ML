@@ -1,4 +1,4 @@
-﻿using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.WebTorrent;
 using SpawnDev.UnitTesting;
 using ILGPU.Runtime;
@@ -392,5 +392,60 @@ public abstract partial class MLTestBase
             if ((float)gotJs[i] != (float)gotCpu[i])
                 throw new Exception($"fp16 zero-copy != byte[] path at [{i}]: js {(float)gotJs[i]} vs cpu {(float)gotCpu[i]}");
         }
+    });
+
+    /// <summary>
+    /// 🔴 The contract SpawnDev.ILGPU.ML.WebTorrent actually ships: HubModelStream AS an IModelSource.
+    /// </summary>
+    /// <remarks>
+    /// The other tests here drive HubModelStream through its OWN API (OpenAsync -> HubModel). The adapter
+    /// package's whole promise is different: that it is a drop-in <see cref="IModelSource"/>, so a caller
+    /// written against HubModelSource gets torrent delivery by swapping one object. That implementation -
+    /// the explicit interface methods returning model.Stream - had no coverage at all, which is not a thing
+    /// to publish a package on.
+    /// <para>
+    /// Deliberately calls THROUGH the interface (the local is typed IModelSource), so a regression that
+    /// breaks only the explicit implementation fails here.
+    /// </para>
+    /// </remarks>
+    [TestMethod(Timeout = 180000, Category = "HeavyCpu")]
+    public async Task WebTorrent_HubModelStream_IsADropInModelSource() => await RunTest(async accelerator =>
+    {
+        var client = GetWebTorrentClient();
+        if (client == null) throw new UnsupportedTestException("no DI WebTorrentClient on this lane");
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // Typed as the INTERFACE on purpose - that is the thing under test.
+        SpawnDev.ILGPU.ML.Hub.IModelSource source = new SpawnDev.ILGPU.ML.Hub.HubModelStream(client, http);
+
+        const string repo = "Xenova/distilgpt2";
+        const string file = "tokenizer.json";
+
+        var stream = await source.OpenAsync(repo, file);
+        await using (stream.ConfigureAwait(false))
+        {
+            if (stream.Length < 100_000)
+                throw new Exception($"tokenizer.json came back as {stream.Length} bytes - too small to be the real file.");
+            if (!stream.CanSeek)
+                throw new Exception("torrent source stream is not seekable; the ONNX reader could not skip weight blobs.");
+
+            // It must be a JS-side stream, which is the point of the torrent path in a browser.
+            if (stream is not SpawnDev.SpawnJS.Toolbox.IJSReadStream)
+                throw new Exception($"torrent source returned {stream.GetType().Name}, not an IJSReadStream.");
+
+            var head = new byte[64];
+            stream.Position = 0;
+            await stream.ReadExactlyAsync(head);
+            if (head[0] != (byte)'{')
+                throw new Exception($"tokenizer.json did not start with '{{' (got 0x{head[0]:X2}) - wrong bytes.");
+        }
+
+        // FetchBytesAsync is the other half of the interface and must agree with the stream.
+        var bytes = await source.FetchBytesAsync(repo, file);
+        if (bytes.Length < 100_000)
+            throw new Exception($"FetchBytesAsync returned {bytes.Length} bytes.");
+
+        Console.WriteLine($"[WTSource] HubModelStream as IModelSource: {bytes.Length:N0} bytes, seekable, IJSReadStream: PASS");
     });
 }

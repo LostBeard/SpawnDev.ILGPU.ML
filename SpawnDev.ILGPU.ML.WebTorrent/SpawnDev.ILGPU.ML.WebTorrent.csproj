@@ -1,11 +1,11 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
+<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.13</Version>
-		<PackageReleaseNotes>v5.2.13 - Initial release. WebTorrent model delivery for SpawnDev.ILGPU.ML, split out of the main package so ML no longer depends on SpawnDev.WebTorrent. Provides HubModelStream, an IModelSource that delivers models as lazy-hash torrents - swap it in wherever HubModelSource is used to get P2P delivery with no other changes.</PackageReleaseNotes>
+		<Version>1.0.0</Version>
+		<PackageReleaseNotes>v1.0.0 - Initial release. WebTorrent model delivery for SpawnDev.ILGPU.ML, split out so the main package no longer depends on SpawnDev.WebTorrent. Supplies HubModelStream, an IModelSource that streams models from the SpawnDev hub as lazy-hash torrents: seekable with random access, OPFS-cached by piece, resumed across reloads and seeded to peers. Optional - SpawnDev.ILGPU.ML delivers models over plain HTTP by default; swap a HubModelStream in wherever a HubModelSource is used to get P2P delivery with no other changes.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
