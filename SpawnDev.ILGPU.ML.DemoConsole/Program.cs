@@ -1,3 +1,6 @@
+using ILGPU.Runtime.CPU;
+using ILGPU.Runtime.Cuda;
+using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.DemoConsole;
 using SpawnDev.UnitTesting;
 using System.Reflection;
@@ -89,6 +92,99 @@ if (args.Length > 0 && args[0] == "KOKOROFIT")
         ? "KOKOROFIT: every phoneme our frontend emits has a Kokoro token."
         : "KOKOROFIT: UNMAPPED -> " + string.Join(", ", missing.Select(kv => $"'{kv.Key}' x{kv.Value}")));
     return 0;
+}
+
+// Investigation diagnostic (NOT a PMT test): actually SPEAK with Kokoro, and time it.
+//
+// 🔴 EVERYTHING ELSE ABOUT THIS PORT IS STATIC ANALYSIS. Operator coverage, node count, phoneme fit and
+// the style-table layout are all facts read off files. None of them proves the thing produces speech, and
+// none of them produces a realtime factor - the number that actually decides whether a voice can stream.
+// This runs the graph end to end and writes a WAV, so the claim is audible rather than argued.
+//
+// ⚠️ DESKTOP, on CUDA or CPU. The browser pays ~1 ms per node of HOST orchestration that a desktop run
+// does not, so the RTF here is a floor, not the number a user gets. It is still the right first
+// measurement: if it were slow HERE the port would be dead.
+//
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -- KOKOROSPEAK ["text"] [voice] [CUDA|CPU]
+if (args.Length > 0 && args[0] == "KOKOROSPEAK")
+{
+    var text = args.Length > 1 ? args[1] : "The capital of France is Paris.";
+    var voiceName = args.Length > 2 ? args[2] : "af_heart";
+    var backend = args.Length > 3 ? args[3].ToUpperInvariant() : "CUDA";
+    const string HubBase = "https://hub.spawndev.com:44365/hf/onnx-community/Kokoro-82M-v1.0-ONNX";
+
+    using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+    Console.WriteLine($"KOKOROSPEAK: fetching the model through the hub ({backend})");
+    var modelBytes = await http.GetByteArrayAsync($"{HubBase}/onnx/model.onnx");
+    var voiceBytes = await http.GetByteArrayAsync($"{HubBase}/voices/{voiceName}.bin");
+    Console.WriteLine($"  model {modelBytes.Length / 1048576.0:F1} MB, voice {voiceBytes.Length} bytes");
+
+    var pack = SpawnDev.ILGPU.ML.Pipelines.KokoroVoicePack.FromBytes(voiceName, voiceBytes);
+    var phonemes = SpawnDev.Phonemizer.EmbeddedData.CreatePhonemizer().ToSymbols(text);
+    Console.WriteLine($"  \"{text}\" -> {phonemes.Count} phonemes");
+
+    ILGPU.Context? kctx = null;
+    ILGPU.Runtime.Accelerator? kacc = null;
+    try
+    {
+        if (backend == "CUDA")
+        {
+            kctx = MLContext.Create().ToContext();
+            var devs = kctx.GetCudaDevices();
+            if (devs.Count == 0) { Console.WriteLine("  no CUDA device; falling back to CPU"); kctx.Dispose(); kctx = null; }
+            else kacc = devs[0].CreateCudaAccelerator(kctx);
+        }
+        if (kacc == null)
+        {
+            kctx ??= MLContext.CreateContext();
+            kacc = kctx.CreateCPUAccelerator(0);
+        }
+        Console.WriteLine($"  accelerator: {kacc.AcceleratorType} {kacc.Name}");
+
+        using var pipeline = SpawnDev.ILGPU.ML.Pipelines.KokoroPipeline.Create(kacc, modelBytes);
+        // ⚠️ TWICE. The first call compiles kernels, which is a one-off this engine pays per process and
+        // which would otherwise be reported as the model's speed. The second is the steady state.
+        for (var pass = 1; pass <= 2; pass++)
+        {
+            var audio = await pipeline.SpeakAsync(phonemes, pack);
+            Console.WriteLine($"  pass {pass}: {audio.Samples.Length} samples = {audio.Seconds:F2}s of audio "
+                            + $"in {audio.InferenceMs:F0} ms  ->  RTF {audio.RealtimeFactor:F2}x "
+                            + $"({audio.Tokens} tokens, {audio.DroppedPhonemes} dropped)");
+            if (pass == 2)
+            {
+                var peak = 0f;
+                foreach (var s in audio.Samples) { var a = Math.Abs(s); if (a > peak) peak = a; }
+                Console.WriteLine($"  peak amplitude {peak:F3}"
+                                + (peak < 0.01f ? "  <- SILENCE: the graph ran and produced nothing audible" : ""));
+                var wav = Path.GetFullPath($"kokoro-{voiceName}.wav");
+                await File.WriteAllBytesAsync(wav, WavBytes(audio.Samples, audio.SampleRate));
+                Console.WriteLine($"  wrote {wav}");
+            }
+        }
+    }
+    finally { kacc?.Dispose(); kctx?.Dispose(); }
+    return 0;
+
+    // Minimal 16-bit PCM WAV, so the result can be LISTENED TO. An amplitude check proves the graph
+    // produced signal; only a human ear proves it produced the right words.
+    static byte[] WavBytes(float[] samples, int rate)
+    {
+        var data = new byte[samples.Length * 2];
+        for (var i = 0; i < samples.Length; i++)
+        {
+            var v = (short)Math.Clamp(samples[i] * short.MaxValue, short.MinValue, short.MaxValue);
+            data[i * 2] = (byte)(v & 0xFF);
+            data[i * 2 + 1] = (byte)((v >> 8) & 0xFF);
+        }
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write("RIFF"u8.ToArray()); w.Write(36 + data.Length); w.Write("WAVE"u8.ToArray());
+        w.Write("fmt "u8.ToArray()); w.Write(16); w.Write((short)1); w.Write((short)1);
+        w.Write(rate); w.Write(rate * 2); w.Write((short)2); w.Write((short)16);
+        w.Write("data"u8.ToArray()); w.Write(data.Length); w.Write(data);
+        w.Flush();
+        return ms.ToArray();
+    }
 }
 
 // Investigation diagnostic (NOT a PMT-substitute test runner): CPU-vs-CUDA per-node

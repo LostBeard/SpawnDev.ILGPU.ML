@@ -84,6 +84,9 @@ public class OperatorRegistry : IDisposable
     public ScatterKernel Scatter { get; }
     public PadKernel Pad { get; }
     public ConvTranspose2DKernel ConvTranspose { get; }
+
+    /// <summary>1-D transposed convolution - every neural vocoder upsamples with these.</summary>
+    public Kernels.ConvTranspose1DKernel ConvTranspose1D { get; }
     public Kernels.FusedDequantMatMul FusedDequant { get; }
     public Kernels.FusedDequantGather FusedDequantGather { get; }
     public Kernels.MoEKernels MoE { get; }
@@ -134,6 +137,7 @@ public class OperatorRegistry : IDisposable
         Scatter = new ScatterKernel(accelerator);
         Pad = new PadKernel(accelerator);
         ConvTranspose = new ConvTranspose2DKernel(accelerator);
+        ConvTranspose1D = new Kernels.ConvTranspose1DKernel(accelerator);
         FusedDequant = new Kernels.FusedDequantMatMul(accelerator);
         FusedDequantGather = new Kernels.FusedDequantGather(accelerator);
         MoE = new Kernels.MoEKernels(accelerator);
@@ -478,6 +482,7 @@ public class OperatorRegistry : IDisposable
         try { (ElementWise as IDisposable)?.Dispose(); } catch { }
         try { (Conv2D as IDisposable)?.Dispose(); } catch { }
         try { (Conv1D as IDisposable)?.Dispose(); } catch { }
+        try { (ConvTranspose1D as IDisposable)?.Dispose(); } catch { }
         try { (ShortConv as IDisposable)?.Dispose(); } catch { }
         try { (GatedDeltaNetScan as IDisposable)?.Dispose(); } catch { }
         try { (GatedDeltaNetOps as IDisposable)?.Dispose(); } catch { }

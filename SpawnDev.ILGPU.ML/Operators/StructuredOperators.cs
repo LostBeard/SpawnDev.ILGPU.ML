@@ -752,9 +752,28 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
     {
         var x = inputs[0]; var w = inputs[1];
+        var groups = attrs.ContainsKey("group") ? (int)(long)attrs["group"] : 1;
+        // ⚠️ ONNX ConvTranspose weight is [inC, outC/groups, kSpatial...] - the INPUT channel leads, which
+        // is the opposite of Conv. outC is therefore w[1]*groups, not w[1]; with groups=1 they coincide,
+        // which is why this reads correct until the first grouped transpose.
+        var outC = w[1] * groups;
+
+        // ── 1-D: [N, C, L], weight [inC, outC/g, kL] ────────────────────────────────────────────────
+        if (x.Length == 3)
+        {
+            var s1 = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1 };
+            var p1 = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[2];
+            var d1 = attrs.ContainsKey("dilations") ? ((long[])attrs["dilations"]).Select(d => (int)d).ToArray() : new[] { 1 };
+            var op1 = attrs.ContainsKey("output_padding") ? ((long[])attrs["output_padding"]).Select(o => (int)o).ToArray() : new[] { 0 };
+            var outL = Kernels.ConvTranspose1DKernel.OutputLength(
+                x[2], w[2], s1[0], p1.Length > 0 ? p1[0] : 0, p1.Length > 1 ? p1[1] : 0,
+                d1.Length > 0 ? d1[0] : 1, op1.Length > 0 ? op1[0] : 0);
+            return new[] { new[] { x[0], outC, outL } };
+        }
+
         var strides = attrs.ContainsKey("strides") ? ((long[])attrs["strides"]).Select(s => (int)s).ToArray() : new[] { 1, 1 };
         var pads = attrs.ContainsKey("pads") ? ((long[])attrs["pads"]).Select(p => (int)p).ToArray() : new int[4];
-        int outC = w[1]; int kH = w[2]; int kW = w[3];
+        int kH = w[2]; int kW = w[3];
         int outH = (x[2] - 1) * strides[0] - pads[0] - pads[2] + kH;
         int outW = (x[3] - 1) * strides[1] - pads[1] - pads[3] + kW;
         return new[] { new[] { x[0], outC, outH, outW } };
@@ -762,9 +781,40 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0]; var w = ctx.Inputs[1];
+
+        // ── 1-D ───────────────────────────────────────────────────────────────────────────────────
+        // 🔴 THIS USED TO THROW. "ConvTranspose expects 4D input [N,C,H,W]" refused every 1-D transposed
+        // convolution, while Conv had had a 1-D path for ages - so the engine could run the analysis half
+        // of an audio model and none of the synthesis half. Every neural vocoder (HiFiGAN and everything
+        // descended from it, which is most of them) upsamples with stacked ConvTranspose1d; Kokoro stops
+        // at node 1331 of 2323 without this.
+        if (x.Shape.Length == 3)
+        {
+            var s = ctx.GetInts("strides");
+            var p = ctx.GetInts("pads");
+            var d = ctx.GetInts("dilations");
+            var op = ctx.GetInts("output_padding");
+            var g = ctx.Attributes.TryGetValue("group", out var gv) ? (int)Convert.ToInt64(gv) : 1;
+            int inC1 = x.Shape[1], inL = x.Shape[2];
+            int outC1 = ctx.Outputs[0].Shape[1], kL = w.Shape[2];
+
+            Tensor? zeroBias1 = null;
+            var bias1 = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
+                ? ctx.Inputs[2].Data
+                : (zeroBias1 = ctx.Pool.Rent(new[] { outC1 }, "_convt1d_zero_bias")).Data;
+            reg.ConvTranspose1D.Forward(x.Data, w.Data, bias1, ctx.Outputs[0].Data,
+                x.Shape[0], inC1, inL, outC1, kL,
+                s.Length > 0 ? s[0] : 1,
+                p.Length > 0 ? p[0] : 0, p.Length > 1 ? p[1] : 0,
+                d.Length > 0 ? d[0] : 1, g,
+                op.Length > 0 ? op[0] : 0);
+            if (zeroBias1 != null) ctx.Pool.Return(zeroBias1);
+            return;
+        }
+
         if (x.Shape.Length < 4)
             throw new InvalidOperationException(
-                $"ConvTranspose expects 4D input [N,C,H,W], got shape [{string.Join(",", x.Shape)}] (rank={x.Shape.Length}). " +
+                $"ConvTranspose expects 4D input [N,C,H,W] or 3D [N,C,L], got shape [{string.Join(",", x.Shape)}] (rank={x.Shape.Length}). " +
                 $"This may be caused by an upstream Resize/Expand with unresolved dynamic shapes.");
         var strides = ctx.GetInts("strides"); int stride = strides.Length > 0 ? strides[0] : 1;
         var pads = ctx.GetInts("pads"); int pad = pads.Length > 0 ? pads[0] : 0;
@@ -1636,9 +1686,24 @@ public class ResizeOperator(OperatorRegistry reg) : IOnnxOperator
     {
         var inShape = ctx.Inputs[0].Shape;
         var outShape = ctx.Outputs[0].Shape;
-        int C = inShape[0] * inShape[1]; // N*C for batch
-        int inH = inShape[2]; int inW = inShape[3];
-        int outH = outShape[2]; int outW = outShape[3];
+
+        // 🔴 RANK-TOLERANT, and it was not. This unpacked inShape[2] and inShape[3] unconditionally, so a
+        // Resize on anything that is not rank 4 threw IndexOutOfRangeException before the mode was even
+        // read. Kokoro upsamples its F0 curve at RANK 3 - [1,512,1] -> [1,512,2], a 1-D stretch along the
+        // last axis - and died at node 1310 of 2323 with "Index was outside the bounds of the array",
+        // which names neither the rank nor the operator's assumption.
+        //
+        // ⚠️ The convention matches ElementWise.NearestUpsample, which was ALREADY rank-general: the last
+        // two dims are spatial and everything before them folds into the channel count. Rank 3 therefore
+        // reads as H = dim[1], W = dim[2], C = dim[0] - not as (H=1, W=last), which would transpose the
+        // stretch onto the wrong axis and produce 512 copies of one value.
+        int rank = inShape.Length;
+        int inH = rank >= 2 ? inShape[rank - 2] : 1;
+        int inW = rank >= 1 ? inShape[rank - 1] : 1;
+        int outH = rank >= 2 ? outShape[rank - 2] : 1;
+        int outW = rank >= 1 ? outShape[rank - 1] : 1;
+        int C = 1;
+        for (int i = 0; i < rank - 2; i++) C *= inShape[i];
 
         // ONNX Resize `mode`: "nearest" (the op's DEFAULT) | "linear" | "cubic". We previously IGNORED it and
         // always bilinear-resized — which low-passes a nearest Resize, blurring the whole image. The SD-Turbo
