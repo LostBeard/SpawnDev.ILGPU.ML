@@ -5,11 +5,9 @@
 @using SpawnDev.ILGPU.ML.Preprocessing
 @using SpawnDev.SpawnJS
 @using SpawnDev.SpawnJS.JSObjects
-@using SpawnDev.WebTorrent
 @using global::ILGPU.Runtime
 @implements IAsyncDisposable
 @inject SpawnJSRuntime JS
-@inject WebTorrentClient WebTorrent
 @inject HttpClient Http
 
 <PageTitle>AI Chat — on-device LLM</PageTitle>
@@ -18,7 +16,7 @@
     <header class="hdr">
         <h1>AI Chat <span class="badge">100% on-device</span></h1>
         <p class="sub">Chat with a quantized GGUF language model running entirely in your browser on WebGPU — your
-            text never leaves your device. The weights stream peer-to-peer from the SpawnDev hub and are cached
+            text never leaves your device. The weights stream from the SpawnDev hub and are cached
             in your browser; pick a model to begin.</p>
     </header>
 
@@ -27,7 +25,7 @@
         <div class="optin">
             <h2>Choose a model</h2>
             <p>
-                The model downloads from the SpawnDev hub (pulled from Hugging Face, seeded over WebTorrent) and is
+                The model downloads from the SpawnDev hub (pulled from Hugging Face) and is
                 cached in your browser — manage or evict it on the <a href="/cache">Model Cache</a> page. Loading
                 starts streaming straight to the GPU as soon as the download begins; you don't wait for the full file.
             </p>
@@ -113,11 +111,11 @@
 
     // "Show how" — the actual GGUF chat path this page runs (no Transformers.js equivalent exists).
     private const string _howToCs = """
-// Stream a GGUF LLM from the hub (WebTorrent / HuggingFace) onto YOUR GPU — weights stream AS they
-// download, KV-cache decode, no server, no ONNX Runtime
-var hub = new HubModelStream(WebTorrent, Http);
-var model = await hub.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
-var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, model.Stream, maxSeqLen: 4096);
+// Stream a GGUF LLM from the hub onto YOUR GPU — weights stream AS they download, KV-cache
+// decode, no server, no ONNX Runtime. Plain HTTP cached in OPFS; no WebTorrent needed.
+var source = new HubModelSource(JS);
+var model = await source.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
+var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, model, maxSeqLen: 4096);
 
 // Chat — architecture + chat template auto-detected; tokens stream as they decode
 var convo = new[] { ("user", "What is the capital of France?") };
@@ -127,7 +125,7 @@ string answer = await pipe.GenerateAsync(convo,
 """;
     string _status = "";
 
-    // The models served via the hub (Hugging Face GGUF repos, streamed over WebTorrent). HONEST status — see
+    // The models served via the hub (Hugging Face GGUF repos, streamed over HTTP). HONEST status — see
     // DEMO_AND_MODEL_STATUS.md. Repo/File are the Hugging Face coordinates HubModelStream.OpenAsync streams.
     sealed record ModelOption(string Label, string Repo, string File, string Size, string Arch, string Status, string Note);
     readonly List<ModelOption> _models = new()
@@ -145,7 +143,7 @@ string answer = await pipe.GenerateAsync(convo,
     global::ILGPU.Context? _context;
     Accelerator? _accelerator;
     GgufTextGenerationPipeline? _pipeline;
-    HubModelStream.HubModel? _openModel; // keep the hub stream alive for the session
+    Stream? _openModel; // keep the model stream alive for the session
     System.Threading.CancellationTokenSource? _loadCts;
     string _acceleratorName = "";
     string _modelLabel = "";
@@ -180,19 +178,26 @@ string answer = await pipe.GenerateAsync(convo,
                 JS.Log($"[AiChat] accelerator: {_acceleratorName}");
             }
 
-            // Stream the GGUF from the hub. The returned stream is SEEKABLE and downloads on demand — the weights
-            // stream to the GPU AS the file downloads (no waiting for the whole file or for the hub to finish
-            // caching). The torrent stays in the WebTorrent client's OPFS store for fast later loads (managed on
-            // the /cache page).
-            var hub = new HubModelStream(WebTorrent, Http) { PrepareTimeout = TimeSpan.FromMinutes(15) };
+            // Stream the GGUF from the hub over plain HTTP, cached in OPFS. The returned stream is SEEKABLE,
+            // the download resumes if interrupted and is cancellable, and the file persists across reloads
+            // for fast later loads (managed on the /cache page).
+            // HubModelSource, not HubModelStream: delivery no longer needs WebTorrent. Swap in a
+            // HubModelStream here (same IModelSource) to get torrent delivery instead.
+            // ⚠️ The old torrent path needed deselect:true here - without it WebTorrent background-downloaded
+            // the ENTIRE repo (every quant, 10-15GB) behind the working stream (caught 2026-07-04). HTTP has
+            // no such trap: a range request fetches only what is read, so there is nothing to opt out of.
+            var source = new HubModelSource(JS);
+            source.OnProgress += (received, total) =>
+            {
+                if (total > 0) _status = $"Downloading {model.Label} ({model.Size}) — {received * 100 / total}%";
+                InvokeAsync(StateHasChanged);
+            };
             _status = $"Streaming {model.Label} ({model.Size}) from the hub to the GPU…";
             await InvokeAsync(StateHasChanged);
-            _openModel?.Stream.Dispose();
-            // deselect:true - only the pieces the weight-stream reads; false background-downloaded the
-            // ENTIRE repo (every quant, 10-15GB) behind the working stream (caught 2026-07-04).
-            _openModel = await hub.OpenAsync(model.Repo, model.File, deselect: true, _loadCts.Token);
+            _openModel?.Dispose();
+            _openModel = await source.OpenAsync(model.Repo, model.File, _loadCts.Token);
 
-            _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, _openModel.Stream,
+            _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, _openModel,
                 maxSeqLen: 4096,
                 onProgress: (stage, pct) => { _status = $"{Humanize(stage)} {pct}%"; InvokeAsync(StateHasChanged); },
                 ct: _loadCts.Token);
@@ -235,7 +240,7 @@ string answer = await pipe.GenerateAsync(convo,
     {
         _pipeline?.Dispose();
         _pipeline = null;
-        _openModel?.Stream.Dispose();
+        _openModel?.Dispose();
         _openModel = null;
         _messages.Clear();
         _state = LoadState.Idle;
@@ -359,8 +364,8 @@ string answer = await pipe.GenerateAsync(convo,
         {
             _loadCts?.Cancel();
             _pipeline?.Dispose();
-            // Keep the torrent in the WebTorrent client's OPFS store (fast later loads); just dispose our reader.
-            _openModel?.Stream.Dispose();
+            // The file stays in the OPFS model cache (fast later loads); just dispose our reader.
+            _openModel?.Dispose();
             _accelerator?.Dispose();
             _context?.Dispose();
         }

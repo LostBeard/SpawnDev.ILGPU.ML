@@ -4,10 +4,8 @@
 @using SpawnDev.SpawnJS.Toolbox
 @using SpawnDev.ILGPU.ML.Onnx
 @using SpawnDev.ILGPU.ML.Hub
-@using SpawnDev.WebTorrent
 @using Microsoft.AspNetCore.Components.Forms
 @implements IDisposable
-@inject WebTorrentClient WtClient
 @inject HttpClient Http
 @inject SpawnJSRuntime JS
 
@@ -317,11 +315,16 @@
 
         try
         {
-            // HubModelStream asks the hub for a magnet, resolves metadata peer-free via the magnet's HTTP
-            // exact-source, opens the torrent DESELECTED, and the inspector seeks past every weight blob —
-            // so only structure pieces are fetched. A multi-GB checkpoint inspects from a few hundred KB.
-            var hub = new HubModelStream(WtClient, Http);
-            (_result, _compatibility) = await hub.InspectWithCompatibilityAsync(_hubRepoId.Trim(), _hubFilePath.Trim());
+            // Ranged HTTP against the hub - no WebTorrent, no magnet, no swarm. The inspector seeks past
+            // every weight blob, so only the bytes it actually reads are fetched and a multi-GB checkpoint
+            // inspects from a few hundred KB.
+            // ⚠️ OpenForInspectionAsync, NOT OpenAsync: OpenAsync would download and CACHE the whole model
+            // just to read its graph. Inspecting is not loading.
+            using var source = new SpawnDev.ILGPU.ML.Hub.HubModelSource(JS, Http);
+            var structure = await source.OpenForInspectionAsync(_hubRepoId.Trim(), _hubFilePath.Trim());
+            await using (structure.ConfigureAwait(false))
+                (_result, _compatibility) = await SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper
+                    .InspectWithCompatibilityAsync(structure);
         }
         catch (Exception ex)
         {

@@ -3,12 +3,10 @@
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Pipelines
 @using SpawnDev.ILGPU.ML.Hub
-@using SpawnDev.WebTorrent
 @using SpawnDev.SpawnJS
 @using SpawnDev.SpawnJS.JSObjects
 @implements IAsyncDisposable
 @inject SpawnJSRuntime JS
-@inject WebTorrentClient WebTorrent
 @inject HttpClient Http
 
 <PageTitle>Gemma 4 Multimodal Chat</PageTitle>
@@ -24,7 +22,7 @@
             <p>
                 This demo runs <b>@_ollamaModel:@_ollamaTag</b> locally on your GPU. The weights are large and are
                 <b>not</b> downloaded until you opt in below. They stream from the SpawnDev hub (pulled from the
-                ollama registry, seeded over WebTorrent) and are cached in your browser (OPFS) — manage or evict
+                ollama registry) and are cached in your browser (OPFS) — manage or evict
                 them on the <a href="/cache">Model Cache</a> page.
             </p>
             <ul class="sizes">
@@ -122,12 +120,14 @@
 
     // "Show how" — the actual Gemma 4 multimodal path this page runs (no Transformers.js equivalent exists).
     private const string _howToCs = """
-// Stream the text + vision/audio (mmproj) GGUF layers from the hub (ollama registry / WebTorrent) to YOUR GPU
-var hub = new HubModelStream(WebTorrent, Http);
-var proj = await hub.OpenOllamaAsync("gemma4", "12b", "projector");
-var text = await hub.OpenOllamaAsync("gemma4", "12b", "model");
+// Stream the text + vision/audio (mmproj) GGUF layers from the hub (ollama registry) to YOUR GPU.
+// Plain HTTP cached in OPFS - no WebTorrent needed.
+var source = new HubModelSource(JS);
+var proj = await source.OpenOllamaAsync("gemma4", "12b", "projector");
+var text = await source.OpenOllamaAsync("gemma4", "12b", "model");
+// The pipeline wants two independent readers of the text GGUF; re-opening is a cache hit.
 var pipe = await Gemma4MultimodalPipeline.CreateFromStreamsAsync(
-    accelerator, () => Task.FromResult(text.File.CreateReadStream()), proj.Stream);
+    accelerator, () => source.OpenOllamaAsync("gemma4", "12b", "model"), proj);
 
 // Chat over text + image + audio — tokens stream as they decode, all on-device
 var chat = pipe.StartChat(thinking: true);
@@ -138,7 +138,7 @@ string answer = await chat.SendAsync("What's in this picture?",
 """;
 
     // Ollama model coordinates (editable in the opt-in panel). The hub's OllamaProxy pulls these layers
-    // from registry.ollama.ai, seeds them as torrents, and the WebTorrent client streams them here.
+    // from registry.ollama.ai and serves them over HTTP; they are cached in OPFS here.
     string _ollamaModel = "gemma4";
     string _ollamaTag = "12b";
     const string _modelSize = "~6.9 GB";   // application/vnd.ollama.image.model  (GGUF weights)
@@ -149,7 +149,7 @@ string answer = await chat.SendAsync("What's in this picture?",
     Accelerator? _accelerator;
     Gemma4MultimodalPipeline? _pipeline;
     Gemma4Chat? _chat;
-    readonly List<HubModelStream.HubModel> _openModels = new();
+    readonly List<Stream> _openModels = new();
 
     sealed class ChatMessage { public string Role = "user"; public string Text = ""; public string? ImageUrl; public string? AudioName; }
     readonly List<ChatMessage> _messages = new();
@@ -179,28 +179,40 @@ string answer = await chat.SendAsync("What's in this picture?",
             if (_accelerator == null) { Fail("No WebGPU accelerator available in this browser."); return; }
             JS.Log($"[GemmaChat] accelerator: {_accelerator.Name} ({_accelerator.AcceleratorType})");
 
-            var hub = new HubModelStream(WebTorrent, Http) { PrepareTimeout = TimeSpan.FromMinutes(30) }; // cold 6.9 GB pull
+            // HubModelSource, not HubModelStream: delivery no longer needs WebTorrent. The hub's /ollama web
+            // seed resolves the registry manifest and serves the layer blob, so this is the same
+            // download-into-OPFS path as everything else - resumable, cancellable, cached across reloads.
+            var source = new HubModelSource(JS);
+            source.OnProgress += (received, total) =>
+            {
+                if (total > 0) _status = $"Downloading… {received * 100 / total}% of {total / 1048576} MiB";
+                InvokeAsync(StateHasChanged);
+            };
+
             _status = $"Fetching the projector layer ({_projSize}) from the hub…";
             StateHasChanged();
-            var mm = await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "projector");
+            var mm = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "projector");
             _openModels.Add(mm);
 
-            // The pipeline needs two independent seekable readers of the text GGUF (weight upload + token
-            // gather). Open the ollama "model" layer once; CreateReadStream gives a fresh seekable reader
-            // each call over the same cached torrent.
             _status = $"Streaming the model layer ({_modelSize}) to the GPU… first load downloads; later loads use cache.";
             StateHasChanged();
-            var textHub = await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model");
-            _openModels.Add(textHub);
-            // Two independent seekable readers (weight upload + token gather). Warm (torrent): a fresh
-            // CreateReadStream over the cached torrent. Cold (raw-HTTP web seed, no torrent): re-open for a fresh
-            // HttpRangeStream each call (each seeks/reads independently).
-            Func<Task<Stream>> openText = textHub.File != null
-                ? () => Task.FromResult<Stream>(textHub.File.CreateReadStream())
-                : async () => (await hub.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model")).Stream;
+            var textStream = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model");
+            _openModels.Add(textStream);
+
+            // The pipeline needs two INDEPENDENT seekable readers of the text GGUF (weight upload + token
+            // gather). Over HTTP+OPFS that is simply re-opening: the first call downloaded it, so every call
+            // after is a cache hit that hands back a fresh, independently-seekable OPFSStream with no
+            // network at all. The torrent path needed two branches here (CreateReadStream when warm, a new
+            // HttpRangeStream when cold); there is only one case now.
+            Func<Task<Stream>> openText = async () =>
+            {
+                var s = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model");
+                _openModels.Add(s);
+                return s;
+            };
 
             _pipeline = await Gemma4MultimodalPipeline.CreateFromStreamsAsync(
-                _accelerator, openText, mm.Stream,
+                _accelerator, openText, mm,
                 onProgress: (stage, pct) => { _status = $"{stage} {pct}%"; InvokeAsync(StateHasChanged); });
 
             _chat = _pipeline.StartChat(_thinking);
@@ -349,7 +361,7 @@ string answer = await chat.SendAsync("What's in this picture?",
         try
         {
             _pipeline?.Dispose();
-            // Do NOT remove the torrents — they persist in the WebTorrent client's OPFS store so a later visit
+            // Do NOT evict the layers — they persist in the OPFS model cache so a later visit
             // reuses the cached pieces instead of re-downloading. The Model Cache page (/cache) is where the
             // user cancels/removes/seeds them. (GPU buffers are freed by disposing the accelerator; a reload
             // re-streams from the cached OPFS torrent, which is fast.)
