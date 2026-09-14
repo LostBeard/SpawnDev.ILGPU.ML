@@ -1,9 +1,7 @@
 @page "/cache"
 @using SpawnDev.ILGPU.ML.Hub
-@using SpawnDev.WebTorrent
 @implements IDisposable
-@inject ModelCache Cache
-@inject WebTorrentClient WebTorrent
+@inject HubModelSource ModelSource
 
 <PageTitle>Model Cache — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -19,7 +17,7 @@
         <div class="cache-summary-stat"><span class="cache-num">@_models.Count</span> models</div>
         <div class="cache-summary-stat"><span class="cache-num">@FormatBytes(_totalBytes)</span> on device</div>
         <button class="cache-btn" @onclick="Refresh" disabled="@_busy">Refresh</button>
-        <button class="cache-btn danger" @onclick="ClearAll" disabled="@(_busy || (_models.Count == 0 && _torrents.Count == 0))">Clear All</button>
+        <button class="cache-btn danger" @onclick="ClearAll" disabled="@(_busy || _models.Count == 0)">Clear All</button>
     </div>
 
     @if (_loading)
@@ -42,44 +40,62 @@
                 @foreach (var m in _models)
                 {
                     <tr>
-                        <td class="cache-key">@m.Key</td>
+                        <td class="cache-key">
+                            @m.Key
+                            @if (!m.Complete)
+                            {
+                                <span class="cache-badge dl">partial</span>
+                            }
+                        </td>
                         <td class="cache-right cache-size">@FormatBytes(m.SizeBytes)</td>
                         <td class="cache-right"><button class="cache-btn danger small" @onclick="() => Remove(m.Key)" disabled="@_busy">Remove</button></td>
                     </tr>
                 }
             </tbody>
         </table>
+        @if (_models.Any(m => !m.Complete))
+        {
+            <p class="cache-muted">
+                A <b>partial</b> entry is an interrupted download. It is never served as a model — the next
+                demo that needs it RESUMES from where it stopped rather than starting over. Remove it to
+                reclaim the space and force a clean download.
+            </p>
+        }
     }
 
-    <h2 class="cache-h2">Peer-to-peer model transfers <span class="cache-sub">(WebTorrent)</span></h2>
+    <h2 class="cache-h2">Downloads in progress</h2>
     <p class="cache-desc">
-        Models stream from the SpawnDev hub over WebTorrent and seed back to other users while a demo is open
-        (sharing) — so popular models get faster for everyone. Cancel a download or stop seeding by removing
-        its torrent here.
+        Models stream from the SpawnDev hub over HTTP straight into browser storage. A download that is
+        interrupted — closed tab, lost connection, cancelled load — RESUMES from where it stopped rather
+        than starting over.
     </p>
-    @if (_torrents.Count == 0)
+    @if (_downloads.Count == 0)
     {
-        <p class="cache-muted">No active model torrents. Open a demo that loads a hub model to start one.</p>
+        <p class="cache-muted">Nothing downloading. Open a demo that loads a hub model to start one.</p>
     }
     else
     {
         <div class="cache-summary">
-            <div class="cache-summary-stat">↓ <span class="cache-num">@FormatSpeed(WebTorrent.DownloadSpeed)</span></div>
-            <div class="cache-summary-stat">↑ <span class="cache-num">@FormatSpeed(WebTorrent.UploadSpeed)</span> shared</div>
+            <div class="cache-summary-stat">↓ <span class="cache-num">@FormatSpeed(_downloads.Sum(d => d.BytesPerSecond))</span></div>
+            <div class="cache-summary-stat"><span class="cache-num">@_downloads.Count</span> active</div>
         </div>
         <table class="cache-table">
-            <thead><tr><th>Torrent</th><th class="cache-right">Size</th><th class="cache-right">Progress</th><th class="cache-right">↓</th><th class="cache-right">↑ share</th><th class="cache-right">Peers</th><th></th></tr></thead>
+            <thead><tr><th>Model</th><th class="cache-right">Downloaded</th><th class="cache-right">Size</th><th class="cache-right">Progress</th><th class="cache-right">↓</th></tr></thead>
             <tbody>
-                @foreach (var t in _torrents)
+                @foreach (var d in _downloads)
                 {
                     <tr>
-                        <td class="cache-key">@t.DisplayNameShort <span class="cache-badge @(t.Done ? "seed" : "dl")">@(t.Done ? "seeding" : "downloading")</span></td>
-                        <td class="cache-right cache-size">@FormatBytes(t.Length)</td>
-                        <td class="cache-right">@($"{t.Progress * 100:0.#}%")</td>
-                        <td class="cache-right">@FormatSpeed(t.DownloadSpeed)</td>
-                        <td class="cache-right">@FormatSpeed(t.UploadSpeed)</td>
-                        <td class="cache-right">@t.NumPeers</td>
-                        <td class="cache-right"><button class="cache-btn danger small" @onclick="() => RemoveTorrent(t)" disabled="@_busy">@(t.Done ? "Stop" : "Cancel")</button></td>
+                        <td class="cache-key">
+                            @d.Key
+                            @if (d.Resumed)
+                            {
+                                <span class="cache-badge seed">resumed</span>
+                            }
+                        </td>
+                        <td class="cache-right cache-size">@FormatBytes(d.BytesReceived)</td>
+                        <td class="cache-right cache-size">@(d.TotalBytes > 0 ? FormatBytes(d.TotalBytes) : "—")</td>
+                        <td class="cache-right">@(d.Fraction is { } f ? $"{f * 100:0.#}%" : "—")</td>
+                        <td class="cache-right">@FormatSpeed(d.BytesPerSecond)</td>
                     </tr>
                 }
             </tbody>
@@ -119,64 +135,80 @@
 </style>
 
 @code {
-    private List<(string Key, long SizeBytes)> _models = new();
+    private IReadOnlyList<ModelStoreEntry> _models = Array.Empty<ModelStoreEntry>();
     private long _totalBytes;
     private bool _loading = true;
     private bool _busy;
     private bool _opfsAvailable = true;
     private string? _status;
-    private List<Torrent> _torrents = new();
+    private IReadOnlyList<ActiveModelDownload> _downloads = Array.Empty<ActiveModelDownload>();
     private System.Threading.PeriodicTimer? _timer;
+
+    // The store, via the SHARED source. Injecting it (rather than newing a HubModelSource here) is what
+    // makes this page able to see downloads other pages started - a per-page source only knows its own.
+    private IModelStore Store => ModelSource.Store;
 
     protected override async Task OnInitializedAsync()
     {
+        ModelSource.ActiveDownloadsChanged += OnDownloadsChanged;
         await Refresh();
-        _torrents = WebTorrent.Torrents.ToList();
-        _ = PollTorrentsAsync();   // live-update progress / speeds / peers
+        _ = PollAsync();
     }
 
-    private async Task PollTorrentsAsync()
+    /// <summary>
+    /// Event-driven refresh of the download table, plus a slow timer as a backstop.
+    /// </summary>
+    /// <remarks>
+    /// The event carries the live updates; the timer exists because the event fires on the DOWNLOAD's
+    /// context and a download that ends between ticks would otherwise leave a stale row on screen. It also
+    /// keeps the throughput column moving when a download stalls (no chunks = no events).
+    /// </remarks>
+    private void OnDownloadsChanged()
+    {
+        _downloads = ModelSource.ActiveDownloads;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private async Task PollAsync()
     {
         _timer = new System.Threading.PeriodicTimer(TimeSpan.FromSeconds(1));
         try
         {
+            var hadDownloads = false;
             while (await _timer.WaitForNextTickAsync())
             {
-                _torrents = WebTorrent.Torrents.ToList();
+                _downloads = ModelSource.ActiveDownloads;
+                // When the last download finishes, the cached-models table is now stale - a model just
+                // landed in it. Refresh once on that edge rather than re-listing OPFS every second.
+                if (hadDownloads && _downloads.Count == 0) await Refresh();
+                hadDownloads = _downloads.Count > 0;
                 StateHasChanged();
             }
         }
         catch (OperationCanceledException) { }
     }
 
-    private async Task RemoveTorrent(Torrent t)
+    public void Dispose()
     {
-        _busy = true; StateHasChanged();
-        try
-        {
-            bool wasDone = t.Done;
-            await WebTorrent.RemoveAsync(t);
-            _status = wasDone ? $"Stopped seeding \"{t.DisplayNameShort}\"." : $"Cancelled download of \"{t.DisplayNameShort}\".";
-        }
-        catch (Exception ex) { _status = $"Remove failed: {ex.Message}"; }
-        finally { _busy = false; }
-        _torrents = WebTorrent.Torrents.ToList();
-        StateHasChanged();
+        // Must unsubscribe: the source is a singleton and outlives this page, so a retained handler would
+        // keep the whole page alive and call StateHasChanged on a disposed component.
+        ModelSource.ActiveDownloadsChanged -= OnDownloadsChanged;
+        _timer?.Dispose();
     }
-
-    public void Dispose() => _timer?.Dispose();
 
     private async Task Refresh()
     {
         _busy = true; _loading = true; StateHasChanged();
         try
         {
-            // ListCachedAsync returns empty both when OPFS is unavailable and when nothing is cached;
+            // ListAsync returns empty both when OPFS is unavailable and when nothing is cached;
             // IsAvailableAsync distinguishes them so the user gets the right message.
-            _opfsAvailable = await Cache.IsAvailableAsync();
-            _models = await Cache.ListCachedAsync();
-            _models.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
-            _totalBytes = _models.Sum(m => m.SizeBytes);
+            _opfsAvailable = await ModelSource.IsAvailableAsync();
+            var entries = (await Store.ListAsync()).ToList();
+            entries.Sort((a, b) => b.SizeBytes.CompareTo(a.SizeBytes));
+            _models = entries;
+            _totalBytes = await Store.GetTotalSizeAsync();
+            _downloads = ModelSource.ActiveDownloads;
         }
         catch { _opfsAvailable = false; }
         finally { _loading = false; _busy = false; StateHasChanged(); }
@@ -187,9 +219,10 @@
         _busy = true; StateHasChanged();
         try
         {
-            await Cache.RemoveAsync(key);
+            await Store.RemoveAsync(key);
             _status = $"Removed \"{key}\" — it will re-download next time a demo needs it.";
         }
+        catch (Exception ex) { _status = $"Remove failed: {ex.Message}"; }
         finally { _busy = false; }
         await Refresh();
     }
@@ -199,18 +232,16 @@
         _busy = true; StateHasChanged();
         try
         {
-            // Stop + remove ALL active model torrents (cancels downloads, stops seeding, and deletes their cached
-            // pieces + restore state) AND clear the model cache. Previously this cleared only the model cache, so
-            // the WebTorrent torrents kept running and re-appeared on the next reload.
-            foreach (var t in WebTorrent.Torrents.ToList())
-            {
-                try { await WebTorrent.RemoveAsync(t); } catch { }
-            }
-            await Cache.ClearAllAsync();
-            _status = "Cleared all cached models and stopped all transfers.";
+            // Clears completed models, interrupted partials and their sidecars together. A download running
+            // right now keeps going and re-creates its entry - cancelling it belongs to the page that
+            // started it, which owns the CancellationToken.
+            await Store.ClearAsync();
+            _status = _downloads.Count > 0
+                ? "Cleared cached models. Downloads still in progress will finish and re-appear."
+                : "Cleared all cached models.";
         }
+        catch (Exception ex) { _status = $"Clear failed: {ex.Message}"; }
         finally { _busy = false; }
-        _torrents = WebTorrent.Torrents.ToList();
         await Refresh();
     }
 

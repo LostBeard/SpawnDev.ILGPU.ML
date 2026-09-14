@@ -8,6 +8,7 @@
 @implements IDisposable
 @inject HttpClient Http
 @inject SpawnJSRuntime JS
+@inject SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource
 
 <PageTitle>Model Inspector — SpawnDev.ILGPU.ML</PageTitle>
 
@@ -320,7 +321,7 @@
             // inspects from a few hundred KB.
             // ⚠️ OpenForInspectionAsync, NOT OpenAsync: OpenAsync would download and CACHE the whole model
             // just to read its graph. Inspecting is not loading.
-            using var source = new SpawnDev.ILGPU.ML.Hub.HubModelSource(JS, Http);
+            var source = ModelSource;
             var structure = await source.OpenForInspectionAsync(_hubRepoId.Trim(), _hubFilePath.Trim());
             await using (structure.ConfigureAwait(false))
                 (_result, _compatibility) = await SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper

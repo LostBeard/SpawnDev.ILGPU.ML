@@ -8,6 +8,7 @@
 @using global::ILGPU.Runtime
 @implements IAsyncDisposable
 @inject SpawnJSRuntime JS
+@inject SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource
 @inject HttpClient Http
 
 <PageTitle>AI Chat — on-device LLM</PageTitle>
@@ -113,7 +114,7 @@
     private const string _howToCs = """
 // Stream a GGUF LLM from the hub onto YOUR GPU — weights stream AS they download, KV-cache
 // decode, no server, no ONNX Runtime. Plain HTTP cached in OPFS; no WebTorrent needed.
-var source = new HubModelSource(JS);
+var source = new HubModelSource(JS);   // or inject it as a singleton
 var model = await source.OpenAsync("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q8_0.gguf");
 var pipe = await GgufTextGenerationPipeline.CreateFromStreamAsync(accelerator, model, maxSeqLen: 4096);
 
@@ -186,16 +187,19 @@ string answer = await pipe.GenerateAsync(convo,
             // ⚠️ The old torrent path needed deselect:true here - without it WebTorrent background-downloaded
             // the ENTIRE repo (every quant, 10-15GB) behind the working stream (caught 2026-07-04). HTTP has
             // no such trap: a range request fetches only what is read, so there is nothing to opt out of.
-            var source = new HubModelSource(JS);
-            source.OnProgress += (received, total) =>
+            // Per-call progress, NOT source.OnProgress: the source is a shared singleton, so the event also
+            // fires for downloads other pages started, and a handler on it would outlive this page.
+            var download = new Progress<SpawnDev.ILGPU.ML.Hub.ModelDownloadProgress>(p =>
             {
-                if (total > 0) _status = $"Downloading {model.Label} ({model.Size}) — {received * 100 / total}%";
+                _status = p.Fraction is { } f
+                    ? $"Downloading {model.Label} ({model.Size}) — {f:P0}"
+                    : $"Downloading {model.Label} ({model.Size}) — {p.BytesReceived / 1048576} MiB";
                 InvokeAsync(StateHasChanged);
-            };
+            });
             _status = $"Streaming {model.Label} ({model.Size}) from the hub to the GPU…";
             await InvokeAsync(StateHasChanged);
             _openModel?.Dispose();
-            _openModel = await source.OpenAsync(model.Repo, model.File, _loadCts.Token);
+            _openModel = await ModelSource.OpenAsync(model.Repo, model.File, download, _loadCts.Token);
 
             _pipeline = await GgufTextGenerationPipeline.CreateFromStreamAsync(_accelerator, _openModel,
                 maxSeqLen: 4096,

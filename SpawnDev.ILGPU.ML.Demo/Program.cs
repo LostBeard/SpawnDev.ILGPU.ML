@@ -42,6 +42,17 @@ builder.Services.AddSingleton<WebTorrentClient>(sp =>
 // instances would share storage — but a singleton gives the management UI a single source to query/purge.
 builder.Services.AddSingleton<SpawnDev.ILGPU.ML.Hub.ModelCache>();
 
+// Model delivery: plain HTTP through the hub, cached in OPFS. No WebTorrent.
+// ⚠️ MUST be a singleton, and demos must INJECT it rather than newing their own. Two reasons:
+//   1. The cache page reports downloads in flight (HubModelSource.ActiveDownloads). A per-page source only
+//      knows about its own, which is precisely the wrong answer for a cache UI.
+//   2. The per-key gate that stops two callers racing the same download lives on the shared downloader.
+//      Separate instances would both download the same model into the same OPFS entry.
+// The HttpClient is only used by OpenForInspectionAsync (ranged, non-caching); everything else uses fetch
+// so the payload stays JS-side.
+builder.Services.AddSingleton(sp => new SpawnDev.ILGPU.ML.Hub.HubModelSource(
+    sp.GetRequiredService<SpawnJSRuntime>(), sp.GetRequiredService<HttpClient>()));
+
 // Register test types as singletons for UnitTestsView discovery
 // DumpFolder test runs FIRST — verifies results can be written
 builder.Services.AddSingleton<DumpFolderTests>();

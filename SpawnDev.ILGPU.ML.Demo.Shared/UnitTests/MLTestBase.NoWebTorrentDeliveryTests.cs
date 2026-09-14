@@ -66,6 +66,100 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// <see cref="FileModelStore"/> honours the whole <see cref="IResumableModelStore"/> contract.
+    /// </summary>
+    /// <remarks>
+    /// The desktop half of delivery, and unlike the OPFS tests this runs on EVERY lane - the browser ones
+    /// too, since System.IO works there over a virtual filesystem. Covers the three properties a downloader
+    /// depends on and that are easy to get subtly wrong: a partial is never reported complete,
+    /// OpenWriteAsync TRUNCATES at the offset rather than merely seeking, and the confirmed byte count is
+    /// the lesser of sidecar and disk.
+    /// </remarks>
+    [TestMethod(Timeout = 60000)]
+    public async Task FileModelStore_HonoursTheResumableContract() => await RunTest(async accelerator =>
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ilgpu-ml-filestore-test-" + Guid.NewGuid().ToString("N"));
+        var store = new FileModelStore(dir);
+        try
+        {
+            IResumableModelStore resumable = store;
+            const string key = "demo/model.bin";   // deliberately contains a separator - keys come from URLs
+            var payload = new byte[64 * 1024];
+            new Random(1234).NextBytes(payload);
+
+            // Put from an arbitrary Stream, then read it back.
+            using (var src = new MemoryStream(payload))
+                await store.PutAsync(key, src);
+
+            if (!await store.ExistsAsync(key)) throw new Exception("Entry not present after PutAsync.");
+            var read = await store.OpenReadAsync(key) ?? throw new Exception("OpenReadAsync returned null.");
+            await using (read.ConfigureAwait(false))
+            {
+                if (read.Length != payload.Length)
+                    throw new Exception($"Stored length {read.Length} != {payload.Length}.");
+                var got = new byte[payload.Length];
+                await read.ReadExactlyAsync(got);
+                for (int i = 0; i < got.Length; i++)
+                    if (got[i] != payload[i]) throw new Exception($"Stored bytes differ at {i}.");
+            }
+
+            // Listing reports the real size and completeness.
+            var listed = await store.ListAsync();
+            if (listed.Count != 1) throw new Exception($"Expected 1 entry, listed {listed.Count}.");
+            if (listed[0].SizeBytes != payload.Length || !listed[0].Complete)
+                throw new Exception($"Listed {listed[0].SizeBytes} bytes complete={listed[0].Complete}.");
+
+            // A partial must NOT read as complete, and must report the confirmed count.
+            long cut = payload.Length / 3;
+            await resumable.SetStateAsync(key, "http://example/x", payload.Length, cut, false, null);
+            var partial = await resumable.GetStateAsync(key);
+            if (partial.Complete) throw new Exception("A sidecar marked incomplete still reported Complete.");
+            if (partial.BytesWritten != cut)
+                throw new Exception($"Confirmed bytes {partial.BytesWritten}, expected {cut} (min of sidecar and disk).");
+            if (await store.ExistsAsync(key)) throw new Exception("ExistsAsync is true for a partial entry.");
+            if (await store.OpenReadAsync(key) != null) throw new Exception("OpenReadAsync served a partial entry.");
+
+            // OpenWriteAsync must TRUNCATE at the offset, not just seek - otherwise unverified bytes past
+            // the resume point survive inside a file that later reports itself complete.
+            var w = await resumable.OpenWriteAsync(key, cut);
+            await using (w.ConfigureAwait(false))
+            {
+                if (w.Length != cut) throw new Exception($"OpenWriteAsync left length {w.Length}, expected {cut}.");
+                await w.WriteAsync(payload.AsMemory((int)cut));
+                await w.FlushAsync();
+            }
+            await resumable.SetStateAsync(key, "http://example/x", payload.Length, payload.Length, true, null);
+
+            var finished = await resumable.GetStateAsync(key);
+            if (!finished.Complete) throw new Exception("Entry not complete after the resume was finished.");
+            var again = await store.OpenReadAsync(key) ?? throw new Exception("Resumed entry unreadable.");
+            await using (again.ConfigureAwait(false))
+            {
+                var got = new byte[payload.Length];
+                again.Position = 0;
+                await again.ReadExactlyAsync(got);
+                for (int i = 0; i < got.Length; i++)
+                    if (got[i] != payload[i]) throw new Exception($"Resumed file differs at {i}.");
+            }
+
+            // Removal takes the sidecar; clearing empties the store.
+            await store.RemoveAsync(key);
+            if ((await store.ListAsync()).Count != 0) throw new Exception("Entry survived RemoveAsync.");
+            if (await store.GetTotalSizeAsync() != 0) throw new Exception("Sidecar survived RemoveAsync.");
+
+            using (var src = new MemoryStream(payload)) await store.PutAsync(key, src);
+            await store.ClearAsync();
+            if ((await store.ListAsync()).Count != 0) throw new Exception("Entry survived ClearAsync.");
+
+            Console.WriteLine($"[NoWT] FileModelStore contract ({payload.Length:N0} B, resume from {cut:N0}): PASS");
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    });
+
+    /// <summary>
     /// A real pipeline builds end to end from <see cref="HubModelSource"/> - no WebTorrentClient exists in
     /// this test at all.
     /// </summary>

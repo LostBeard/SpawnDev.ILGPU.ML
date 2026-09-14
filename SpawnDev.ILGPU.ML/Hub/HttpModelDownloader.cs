@@ -1,7 +1,22 @@
+using System.Collections.Concurrent;
 using SpawnDev.SpawnJS;
 using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Hub;
+
+/// <summary>A download that is running right now.</summary>
+/// <param name="Key">Store key being filled.</param>
+/// <param name="Url">Where the bytes are coming from.</param>
+/// <param name="BytesReceived">Bytes pulled so far, including any carried by a resume.</param>
+/// <param name="TotalBytes">Expected total, or -1 when the origin did not say.</param>
+/// <param name="Resumed">True when this continued an interrupted download.</param>
+/// <param name="BytesPerSecond">Throughput over this attempt, 0 until enough time has passed to mean anything.</param>
+public readonly record struct ActiveModelDownload(
+    string Key, string Url, long BytesReceived, long TotalBytes, bool Resumed, double BytesPerSecond)
+{
+    /// <summary>Completion fraction in [0,1], or null when the total is unknown.</summary>
+    public double? Fraction => TotalBytes > 0 ? Math.Clamp((double)BytesReceived / TotalBytes, 0d, 1d) : null;
+}
 
 /// <summary>
 /// Downloads a file over HTTP into an <see cref="IResumableModelStore"/>, resuming an interrupted transfer
@@ -48,6 +63,38 @@ public class HttpModelDownloader
     /// <summary>Bytes transferred during the most recent download, excluding anything carried by a resume.</summary>
     public long LastDownloadBytes { get; private set; }
 
+    private sealed class Tracker
+    {
+        public string Url = "";
+        public long Received, Total = -1, StartedAt, StartReceived;
+        public bool Resumed;
+    }
+
+    private readonly ConcurrentDictionary<string, Tracker> _active = new();
+
+    /// <summary>
+    /// Every download currently in flight through this downloader, for a cache/status UI.
+    /// </summary>
+    /// <remarks>
+    /// The page showing progress is almost never the page doing the download, so per-call
+    /// <see cref="IProgress{T}"/> cannot answer "what is downloading right now". This can, which is why the
+    /// downloader should be a shared instance rather than one per caller.
+    /// </remarks>
+    public IReadOnlyList<ActiveModelDownload> ActiveDownloads =>
+        _active.Select(kv =>
+        {
+            var t = kv.Value;
+            var seconds = Math.Max(0.001, (Environment.TickCount64 - t.StartedAt) / 1000.0);
+            // Rate over THIS attempt only - bytes carried in by a resume were not transferred now, and
+            // counting them would show a wildly inflated speed for the first second of every resume.
+            var rate = seconds < 0.25 ? 0 : (t.Received - t.StartReceived) / seconds;
+            return new ActiveModelDownload(kv.Key, t.Url, t.Received, t.Total, t.Resumed, rate);
+        }).ToList();
+
+    /// <summary>Raised when a download starts, makes progress, or finishes - for a UI that wants to refresh
+    /// without polling. Fired on the download's own execution context; marshal to the UI yourself.</summary>
+    public event Action? ActiveDownloadsChanged;
+
     /// <summary>Create a downloader that fills <paramref name="store"/>.</summary>
     public HttpModelDownloader(SpawnJSRuntime js, IResumableModelStore store)
     {
@@ -86,6 +133,9 @@ public class HttpModelDownloader
         }
         finally
         {
+            // Here rather than inside DownloadAsync, so the entry cannot survive ANY exit path - success,
+            // throw, or cancellation. A stuck entry would show as a download that never finishes in the UI.
+            if (_active.TryRemove(key, out _)) ActiveDownloadsChanged?.Invoke();
             gate.Release();
         }
     }
@@ -154,6 +204,14 @@ public class HttpModelDownloader
         }
 
         await _store.SetStateAsync(key, url, total, resumeFrom, false, etag, ct).ConfigureAwait(false);
+
+        var tracker = new Tracker
+        {
+            Url = url, Received = resumeFrom, Total = total, Resumed = resumed,
+            StartedAt = Environment.TickCount64, StartReceived = resumeFrom,
+        };
+        _active[key] = tracker;
+        ActiveDownloadsChanged?.Invoke();
 
         long received = resumeFrom;   // pulled off the network
         long written = resumeFrom;    // durable in the store (lags `received` while buffering)
@@ -227,10 +285,15 @@ public class HttpModelDownloader
                         lastCheckpoint = written;
                     }
 
+                    tracker.Received = received;
+
                     var now = Environment.TickCount64;
-                    if (progress != null && now - lastReport >= ProgressIntervalMs)
+                    if (now - lastReport >= ProgressIntervalMs)
                     {
-                        progress.Report(new ModelDownloadProgress(received, total, resumed));
+                        progress?.Report(new ModelDownloadProgress(received, total, resumed));
+                        // Same cadence for the shared view, so a cache UI refreshes without polling and
+                        // without a JS crossing per chunk.
+                        ActiveDownloadsChanged?.Invoke();
                         lastReport = now;
                     }
                 }

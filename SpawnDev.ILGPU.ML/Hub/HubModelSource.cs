@@ -54,18 +54,70 @@ public class HubModelSource : IModelSource, IDisposable
     /// <summary>The OPFS cache backing this source, for listing, sizing and eviction.</summary>
     public IModelStore Store => _cache;
 
+    /// <summary>
+    /// Downloads running right now through this source - for a cache/status page.
+    /// </summary>
+    /// <remarks>Only meaningful if this source is SHARED (registered in DI). A page that constructs its own
+    /// source sees only its own downloads, which is exactly the wrong answer for a cache UI.</remarks>
+    public IReadOnlyList<ActiveModelDownload> ActiveDownloads => _cache.Downloader.ActiveDownloads;
+
+    /// <summary>Raised when a download starts, progresses or ends. Marshal to the UI thread yourself.</summary>
+    public event Action? ActiveDownloadsChanged
+    {
+        add => _cache.Downloader.ActiveDownloadsChanged += value;
+        remove => _cache.Downloader.ActiveDownloadsChanged -= value;
+    }
+
     /// <summary>Git revision requested from the hub. The hub's web seed serves the default revision.</summary>
     public string Revision { get; set; } = "main";
 
+    /// <summary>
+    /// True when the browser storage backing this source is usable (a secure context on a supporting
+    /// browser). False means nothing can be cached and every load re-downloads.
+    /// </summary>
+    /// <remarks>A cache UI needs this to tell "storage unavailable" apart from "nothing cached yet" - the
+    /// listing is empty either way, and only one of them is worth warning the user about.</remarks>
+    public Task<bool> IsAvailableAsync() => _cache.IsAvailableAsync();
+
     /// <inheritdoc/>
-    public async Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+    public Task<Stream> OpenAsync(string repoId, string filePath, CancellationToken cancellationToken = default)
+        => OpenAsync(repoId, filePath, null, cancellationToken);
+
+    /// <summary>
+    /// Open a model file, reporting progress for THIS call only.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ Prefer this over the <see cref="OnProgress"/> event when the source is shared (the normal case -
+    /// it should be a DI singleton). The event fires for every download through the source, including ones
+    /// started by other pages, and a subscriber that outlives the page leaks. A per-call
+    /// <see cref="IProgress{T}"/> is scoped to the caller and needs no unsubscribe.
+    /// </remarks>
+    public async Task<Stream> OpenAsync(string repoId, string filePath,
+        IProgress<ModelDownloadProgress>? progress, CancellationToken cancellationToken = default)
     {
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filePath, Revision);
-        var progress = OnProgress == null
-            ? null
-            : new Progress<ModelDownloadProgress>(p => OnProgress?.Invoke(p.BytesReceived, p.TotalBytes));
-        return await _cache.OpenOrDownloadAsync(url, CacheKey(repoId, filePath), progress, cancellationToken)
+        return await _cache.OpenOrDownloadAsync(url, CacheKey(repoId, filePath), Combine(progress), cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>Feed both the per-call sink and the source-wide <see cref="OnProgress"/> event.</summary>
+    private IProgress<ModelDownloadProgress>? Combine(IProgress<ModelDownloadProgress>? progress)
+    {
+        if (OnProgress == null) return progress;
+        return new RelayProgress(p =>
+        {
+            progress?.Report(p);
+            OnProgress?.Invoke(p.BytesReceived, p.TotalBytes);
+        });
+    }
+
+    /// <summary>Synchronous <see cref="IProgress{T}"/> - unlike <see cref="Progress{T}"/> it does not post
+    /// to a SynchronizationContext, so reports arrive in order and before the download returns.</summary>
+    private sealed class RelayProgress : IProgress<ModelDownloadProgress>
+    {
+        private readonly Action<ModelDownloadProgress> _onReport;
+        public RelayProgress(Action<ModelDownloadProgress> onReport) => _onReport = onReport;
+        public void Report(ModelDownloadProgress value) => _onReport(value);
     }
 
     /// <inheritdoc/>
@@ -99,14 +151,16 @@ public class HubModelSource : IModelSource, IDisposable
     /// <param name="tag">Tag, e.g. <c>12b</c>.</param>
     /// <param name="layer"><c>model</c> (GGUF weights) | <c>projector</c> (mmproj) | <c>params</c> | <c>template</c> | <c>license</c>.</param>
     /// <param name="cancellationToken">Cancels the download; a cancelled one stays resumable.</param>
-    public async Task<Stream> OpenOllamaAsync(string model, string tag, string layer,
+    public Task<Stream> OpenOllamaAsync(string model, string tag, string layer,
         CancellationToken cancellationToken = default)
+        => OpenOllamaAsync(model, tag, layer, null, cancellationToken);
+
+    /// <summary>Open an Ollama layer, reporting progress for THIS call only. See <see cref="OpenAsync"/>.</summary>
+    public async Task<Stream> OpenOllamaAsync(string model, string tag, string layer,
+        IProgress<ModelDownloadProgress>? progress, CancellationToken cancellationToken = default)
     {
         var url = $"{HuggingFaceClient.HubBaseUrl.TrimEnd('/')}/ollama/{model.Trim('/')}/{tag.Trim('/')}/{layer.Trim('/')}";
-        var progress = OnProgress == null
-            ? null
-            : new Progress<ModelDownloadProgress>(p => OnProgress?.Invoke(p.BytesReceived, p.TotalBytes));
-        return await _cache.OpenOrDownloadAsync(url, OllamaCacheKey(model, tag, layer), progress, cancellationToken)
+        return await _cache.OpenOrDownloadAsync(url, OllamaCacheKey(model, tag, layer), Combine(progress), cancellationToken)
             .ConfigureAwait(false);
     }
 
@@ -131,7 +185,13 @@ public class HubModelSource : IModelSource, IDisposable
     /// 2026-09-14; before that HEAD returned 405 and only the range probe worked.
     /// </para>
     /// </remarks>
-    public async Task<Stream> OpenForInspectionAsync(string repoId, string filePath,
+    /// <returns>
+    /// The concrete <see cref="HttpRangeStream"/>, not just a <see cref="Stream"/>, so a caller can assert
+    /// on <see cref="HttpRangeStream.BytesFetched"/>. "Structure only" is a claim about how much crossed the
+    /// wire, and a regression that quietly starts reading weight blobs still returns perfectly correct
+    /// structure - without that counter the property is untestable.
+    /// </returns>
+    public async Task<HttpRangeStream> OpenForInspectionAsync(string repoId, string filePath,
         CancellationToken cancellationToken = default)
     {
         if (_http == null)
@@ -146,25 +206,36 @@ public class HubModelSource : IModelSource, IDisposable
         return new HttpRangeStream(_http, url, size);
     }
 
-    /// <summary>Total size of a URL: HEAD first, then a 0-0 range GET reading <c>Content-Range</c>.</summary>
+    /// <summary>Total size of a URL: a 0-0 range GET reading <c>Content-Range</c>, with HEAD as a fallback.</summary>
+    /// <remarks>
+    /// ⚠️ Range probe FIRST, deliberately. It works against every version of the hub, whereas HEAD only
+    /// started working with the 2026-09-14 proxy fix - and an undeployed hub answers HEAD with 405, which
+    /// costs a wasted round trip and logs a console error on every inspection. Both are one request, so
+    /// there is nothing to gain by trying the narrower one first. HEAD stays as a fallback for an origin
+    /// that refuses ranges.
+    /// </remarks>
     private static async Task<long> ProbeSizeAsync(HttpClient http, string url, CancellationToken ct)
     {
         try
         {
-            using var head = new HttpRequestMessage(HttpMethod.Head, url);
-            using var headRes = await http.SendAsync(head, ct).ConfigureAwait(false);
-            if (headRes.IsSuccessStatusCode && headRes.Content.Headers.ContentLength is > 0 and var len)
-                return len;
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+            req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+            using var res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            if (res.IsSuccessStatusCode)
+            {
+                // A 206's Content-Length is the PART (1 byte) - only Content-Range carries the file size.
+                var total = res.Content.Headers.ContentRange?.Length;
+                if (total is > 0) return total.Value;
+                if (res.StatusCode == System.Net.HttpStatusCode.OK && res.Content.Headers.ContentLength is > 0 and var full)
+                    return full;
+            }
         }
-        catch (HttpRequestException) { /* fall through to the range probe */ }
+        catch (HttpRequestException) { /* fall through to HEAD */ }
 
-        using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        req.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
-        using var res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        res.EnsureSuccessStatusCode();
-        // A 206's Content-Length is the PART (1 byte) - only Content-Range carries the file size.
-        return res.Content.Headers.ContentRange?.Length
-               ?? (res.StatusCode == System.Net.HttpStatusCode.OK ? res.Content.Headers.ContentLength ?? -1 : -1);
+        using var head = new HttpRequestMessage(HttpMethod.Head, url);
+        using var headRes = await http.SendAsync(head, ct).ConfigureAwait(false);
+        headRes.EnsureSuccessStatusCode();
+        return headRes.Content.Headers.ContentLength ?? -1;
     }
 
     /// <summary>The OPFS cache key for a repo file. Stable across runs, and distinct per revision.</summary>

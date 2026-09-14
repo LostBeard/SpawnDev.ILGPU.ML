@@ -7,6 +7,7 @@
 @using SpawnDev.SpawnJS.JSObjects
 @implements IAsyncDisposable
 @inject SpawnJSRuntime JS
+@inject SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource
 @inject HttpClient Http
 
 <PageTitle>Gemma 4 Multimodal Chat</PageTitle>
@@ -122,7 +123,7 @@
     private const string _howToCs = """
 // Stream the text + vision/audio (mmproj) GGUF layers from the hub (ollama registry) to YOUR GPU.
 // Plain HTTP cached in OPFS - no WebTorrent needed.
-var source = new HubModelSource(JS);
+var source = new HubModelSource(JS);   // or inject it as a singleton
 var proj = await source.OpenOllamaAsync("gemma4", "12b", "projector");
 var text = await source.OpenOllamaAsync("gemma4", "12b", "model");
 // The pipeline wants two independent readers of the text GGUF; re-opening is a cache hit.
@@ -182,21 +183,25 @@ string answer = await chat.SendAsync("What's in this picture?",
             // HubModelSource, not HubModelStream: delivery no longer needs WebTorrent. The hub's /ollama web
             // seed resolves the registry manifest and serves the layer blob, so this is the same
             // download-into-OPFS path as everything else - resumable, cancellable, cached across reloads.
-            var source = new HubModelSource(JS);
-            source.OnProgress += (received, total) =>
+            var source = ModelSource;
+            // Per-call progress, NOT source.OnProgress: the source is a shared singleton, so the event also
+            // fires for downloads other pages started, and a handler on it would outlive this page.
+            var download = new Progress<SpawnDev.ILGPU.ML.Hub.ModelDownloadProgress>(p =>
             {
-                if (total > 0) _status = $"Downloading… {received * 100 / total}% of {total / 1048576} MiB";
+                _status = p.Fraction is { } f
+                    ? $"Downloading… {f:P0} of {p.TotalBytes / 1048576} MiB"
+                    : $"Downloading… {p.BytesReceived / 1048576} MiB";
                 InvokeAsync(StateHasChanged);
-            };
+            });
 
             _status = $"Fetching the projector layer ({_projSize}) from the hub…";
             StateHasChanged();
-            var mm = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "projector");
+            var mm = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "projector", download);
             _openModels.Add(mm);
 
             _status = $"Streaming the model layer ({_modelSize}) to the GPU… first load downloads; later loads use cache.";
             StateHasChanged();
-            var textStream = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model");
+            var textStream = await source.OpenOllamaAsync(_ollamaModel, _ollamaTag, "model", download);
             _openModels.Add(textStream);
 
             // The pipeline needs two INDEPENDENT seekable readers of the text GGUF (weight upload + token

@@ -614,12 +614,12 @@ public class ModelInspectorTests
     // ── Inspect-by-URL via the live SpawnDev hub (the original #1 goal) ──
 
     /// <summary>
-    /// Inspect a HuggingFace model BY URL via the live SpawnDev hub (hub.spawndev.com): HubModelStream
-    /// asks the hub for a magnet, resolves metadata PEER-FREE via the magnet's HTTP exact-source (xs=),
-    /// opens the torrent DESELECTED, and the inspector seeks past every weight blob. So inspecting the
-    /// model fetches only the structure pieces it touches — NOT the weights. Asserts (a) a meaningful
-    /// architecture parsed, and (b) the torrent did NOT download the whole file. This is the production
-    /// inspect-by-URL path the demo exposes; requires internet (cold hub cache → generous timeout).
+    /// Inspect a HuggingFace model BY URL via the live SpawnDev hub (hub.spawndev.com):
+    /// HubModelSource.OpenForInspectionAsync opens a ranged HTTP stream — no WebTorrent, no magnet, no
+    /// swarm — and the inspector seeks past every weight blob, so only the bytes it actually touches cross
+    /// the wire. Asserts (a) a meaningful architecture parsed, and (b) it fetched a small fraction of the
+    /// file rather than the weights. This is the production inspect-by-URL path the demo exposes; requires
+    /// internet (cold hub cache → generous timeout).
     /// </summary>
     /// <summary>
     /// Structure-only inspection over OUR hub's <c>/hf</c> web seed - plain HTTP range requests, no
@@ -647,10 +647,12 @@ public class ModelInspectorTests
         const string repoId = "onnx-community/mobilenetv3_small_100.lamb_in1k";
         const string filePath = "onnx/model.onnx";
 
-        var hub = new HubModelStream(new WebTorrentClient(), _http);
+        // HubModelSource + OpenForInspectionAsync: ranged HTTP against the hub, no WebTorrent, and
+        // deliberately NOT the caching OpenAsync - inspecting a model must not download and store it.
+        using var source = new HubModelSource(SpawnDev.SpawnJS.SpawnJSRuntime.Instance!, _http);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
 
-        await using var stream = await hub.OpenWebSeedAsync(repoId, filePath, cts.Token);
+        await using var stream = await source.OpenForInspectionAsync(repoId, filePath, cts.Token);
         if (stream.Length <= 0) throw new Exception($"hub web seed reported length={stream.Length}");
 
         var r = await ModelInspectorHelper.InspectAsync(stream, cts.Token);
@@ -676,77 +678,60 @@ public class ModelInspectorTests
                         + $"({100.0 * stream.BytesFetched / stream.Length:F1}%) from hub.spawndev.com");
     }
 
+    /// <summary>
+    /// Inspecting a model must NOT cache it.
+    /// </summary>
+    /// <remarks>
+    /// This replaces a test that asserted the same "structure only" property over a DESELECTED torrent.
+    /// That property is now covered by ModelInspector_SpawnDevHub_WebSeed_StructureOnly over ranged HTTP,
+    /// so repeating it here would be duplication. The property worth guarding instead is the one the HTTP
+    /// path can newly get WRONG: HubModelSource.OpenAsync downloads and stores the whole model, and routing
+    /// inspection through it would pull gigabytes to read a graph and fill the model cache with models
+    /// nobody asked to load. OpenForInspectionAsync must not touch the store at all.
+    /// </remarks>
     [TestMethod(Timeout = 240000, RetryCount = 2, Category = "HeavyCpu")]
-    public async Task ModelInspector_Hub_InspectByUrl_StructureOnly()
+    public async Task ModelInspector_Hub_InspectDoesNotCacheTheModel()
     {
         const string repoId = "onnx-community/mobilenetv3_small_100.lamb_in1k";
         const string filePath = "onnx/model.onnx";
 
-        var client = new WebTorrentClient();
-        try
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (js == null || !js.IsBrowser)
+            throw new UnsupportedTestException("Needs the browser model store to observe caching");
+
+        using var source = new HubModelSource(js, _http);
+        if (!await source.IsAvailableAsync())
+            throw new UnsupportedTestException("OPFS unavailable in this context");
+
+        var key = source.CacheKey(repoId, filePath);
+        await source.Store.RemoveAsync(key);
+        var before = await source.Store.GetTotalSizeAsync();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(180));
+        InspectionResult r;
+        await using (var stream = await source.OpenForInspectionAsync(repoId, filePath, cts.Token))
         {
-            var hub = new HubModelStream(client, _http);
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(180));
-
-            // Open DESELECTED so only touched (structure) pieces download.
-            var model = await hub.OpenAsync(repoId, filePath, deselect: true, cts.Token);
-            if (model.Length <= 0) throw new Exception($"hub model file length={model.Length}");
-
-            InspectionResult r;
-            await using (model.Stream)
-                r = await ModelInspectorHelper.InspectAsync(model.Stream, cts.Token);
-
-            // (a) Structure must be meaningful — proves on-demand deselected reads fetch the right pieces.
-            if (r.NodeCount <= 0) throw new Exception($"NodeCount={r.NodeCount}, expected > 0");
-            if (r.TotalParameters <= 0) throw new Exception($"TotalParameters={r.TotalParameters}, expected > 0");
-            if (!r.Operators.Any(o => o.OpType == "Conv")) throw new Exception("mobilenet must use Conv");
-
-            // (b) Inspecting structure must NOT pull the whole model. Without deselect + seek-past-weights
-            // the default select-all would download every byte. Degree of saving is layout/piece-size
-            // dependent, so the robust, non-flaky claim is simply: strictly less than the full file.
-            // The cold raw-HTTP web-seed path has no torrent and inherently fetches only the touched ranges, so
-            // the "didn't pull the whole file" guarantee holds without a download counter. Assert it only for
-            // the P2P/torrent path, which CAN over-fetch if deselect/seek-past-weights isn't effective.
-            if (model.Torrent != null)
-            {
-                // Whether "did not pull the whole file" is even EXPRESSIBLE depends on the piece geometry, and
-                // this assertion used to ignore that. A Lazy-Hash torrent's piece length comes from
-                // Torrent.LazyPieceLength, which floors at a 4 MiB web-seed minimum - so THIS 10.2 MB model is
-                // THREE pieces. Structure inspection reads the protobuf header and seeks through the graph
-                // metadata, which touches every one of those three, and three pieces IS the whole file. The old
-                // check therefore reported a deselect failure for what is ordinary piece granularity, and it
-                // went red on a healthy library. (Over-fetch at piece boundaries is inherent to torrents; the
-                // library documents it, and at >= 2 GB - the multi-GB checkpoints this feature exists for - the
-                // floor is a no-op and the saving is real.)
-                //
-                // So: derive the claim from the geometry, and REFUSE to assert rather than fail or pass
-                // vacuously when the geometry cannot carry it.
-                long pieceLen = model.Torrent.PieceLength;
-                if (pieceLen <= 0) throw new Exception($"torrent reported PieceLength={pieceLen}");
-                long pieceCount = (model.Length + pieceLen - 1) / pieceLen;
-
-                // Below this, a structure read touching a few scattered pieces is indistinguishable from
-                // reading everything, so there is no saving to measure.
-                const long MinPiecesForAMeaningfulSaving = 8;
-                if (pieceCount < MinPiecesForAMeaningfulSaving)
-                    throw new UnsupportedTestException(
-                        $"piece geometry cannot express the claim: pieceLength={pieceLen} over {model.Length} bytes " +
-                        $"is only {pieceCount} piece(s), so structure inspection touching a few scattered pieces is " +
-                        "already the whole file. This is piece granularity, NOT a deselect failure. To cover the " +
-                        "claim here, point this test at a model large enough to be many pieces.");
-
-                long downloaded = model.Torrent.Downloaded;
-                if (downloaded >= model.Length)
-                    throw new Exception(
-                        $"inspect-by-URL downloaded {downloaded} of {model.Length} bytes (the whole file) across " +
-                        $"{pieceCount} pieces of {pieceLen} — deselect / seek-past-weights was not effective; " +
-                        "weights were pulled");
-            }
+            if (stream.Length <= 0) throw new Exception($"hub reported length={stream.Length}");
+            r = await ModelInspectorHelper.InspectAsync(stream, cts.Token);
         }
-        finally
-        {
-            await client.DisposeAsync();
-        }
+
+        // (a) Real structure came back - proves the ranged reads landed on the right bytes.
+        if (r.NodeCount <= 0) throw new Exception($"NodeCount={r.NodeCount}, expected > 0");
+        if (r.TotalParameters <= 0) throw new Exception($"TotalParameters={r.TotalParameters}, expected > 0");
+        if (!r.Operators.Any(o => o.OpType == "Conv")) throw new Exception("mobilenet must use Conv");
+
+        // (b) And the store is untouched. Both checks matter: the keyed entry must not exist, AND the store
+        // must not have grown - a future change that cached under a different key would slip past the first
+        // check alone.
+        if (await source.Store.ExistsAsync(key))
+            throw new Exception($"Inspection cached the model under '{key}' - inspecting is not loading.");
+        var after = await source.Store.GetTotalSizeAsync();
+        if (after > before)
+            throw new Exception(
+                $"Inspection grew the model store from {before:N0} to {after:N0} bytes - it cached the model " +
+                "under some key. Inspecting must not store anything.");
+
+        Console.WriteLine($"[hub inspect] {r.NodeCount} nodes, {r.TotalParameters:N0} params, store unchanged at {after:N0} bytes");
     }
 }
 

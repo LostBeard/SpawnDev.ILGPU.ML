@@ -97,15 +97,19 @@ async Task<int> Run(string firstPrompt, int? seed, string? outPath, bool ci, boo
     if (Environment.GetEnvironmentVariable("WL_TRACE") == "1") InferenceSession.TraceWeightLoad = true; // per-tensor upload attribution
     Console.WriteLine($"Accelerator: {accelerator.Name} ({accelerator.AcceleratorType})");
 
-    // Model acquisition: the SpawnDev hub streams SD-Turbo's ONNX weights (cached after first run).
-    using var http = new HttpClient();
-    await using var webTorrent = new SpawnDev.WebTorrent.WebTorrentClient();
-    var hub = new HubModelStream(webTorrent, http);
+    // Model acquisition: the SpawnDev hub streams SD-Turbo's ONNX weights over plain HTTP, cached on disk
+    // after the first run. No WebTorrent - HttpClientModelSource + FileModelStore are the desktop pair
+    // (HubModelSource + OPFS is the browser one), and both satisfy IModelSource so the pipeline is the same.
+    // An interrupted download RESUMES on the next run instead of starting the ~2.5 GB over.
+    using var http = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+    var store = FileModelStore.Default();
+    var source = new HttpClientModelSource(http, store);
+    Console.WriteLine($"Model cache: {store.RootDirectory}");
 
     Console.WriteLine("Loading SD-Turbo (first run downloads ~2.5 GB)...");
     // Loaded ONCE and reused for every generation below — the load is the expensive part; an interactive
     // session must never pay it per image.
-    var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, hub, ModelHub.KnownModels.SDTurbo,
+    var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, source, ModelHub.KnownModels.SDTurbo,
         onProgress: (stage, pct) => Console.WriteLine($"  [load] {stage} {pct}%"));
     using (pipe)
     {

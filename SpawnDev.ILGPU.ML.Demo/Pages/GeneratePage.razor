@@ -198,7 +198,7 @@
 // Stream the SD-Turbo sub-models (text encoder, U-Net, VAE) from the hub to YOUR GPU.
 // Plain HTTP, cached in OPFS - no WebTorrent needed. (Swap in a HubModelStream, which
 // implements the same IModelSource, to deliver over torrents instead.)
-var source = new HubModelSource(JS);
+var source = new HubModelSource(JS);   // or inject it as a singleton
 var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, source,
     onProgress: (stage, pct) => Show($"{stage} {pct}%"));
 
@@ -230,6 +230,7 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
+    [Inject] SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -260,7 +261,7 @@ ShowImage(result.ImageRGBA, result.Width, result.Height);
             // materialized the 1.7GB U-Net as a byte[] and OOM'd before /generate could run.
             // HubModelSource, not HubModelStream: delivery no longer needs WebTorrent. Swap in a
             // HubModelStream here (it implements the same IModelSource) to get torrent delivery instead.
-            var modelSource = new SpawnDev.ILGPU.ML.Hub.HubModelSource(JS);
+            var modelSource = ModelSource;
             _pipeline = await SpawnDev.ILGPU.ML.Pipelines.ImageGenerationPipeline.CreateAsync(
                 _accelerator, modelSource, onProgress: (stage, pct) =>
                 {
