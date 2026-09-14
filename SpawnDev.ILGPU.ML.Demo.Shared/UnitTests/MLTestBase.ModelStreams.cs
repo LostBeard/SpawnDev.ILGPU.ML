@@ -168,16 +168,17 @@ public abstract partial class MLTestBase
 
     /// <summary>Content-Length of <paramref name="url"/>, or -1 when the server does not report one.</summary>
     /// <remarks>
-    /// ⚠️ A <c>HEAD</c> is NOT enough: the SpawnDev hub answers HEAD with <b>405 Method Not Allowed</b>
-    /// (MEASURED 2026-09-14 against <c>/hf/Xenova/distilgpt2/tokenizer.json</c>), and every model URL here
-    /// now routes through the hub via <see cref="HuggingFaceClient.GetDownloadUrl"/>. HEAD-only therefore
-    /// returned -1 for every model, which made <see cref="IsComplete"/> fall back to its
-    /// "existence is all we have" branch - silently retiring the truncation check that is the entire reason
-    /// the expected length is passed around. A half-downloaded 329 MB checkpoint was then cached and reused
-    /// forever, surfacing as a confusing ONNX parse error rather than as the short file it is.
+    /// ⚠️ Do NOT reduce this back to a bare <c>HEAD</c>. The hub answered HEAD with <b>405 Method Not
+    /// Allowed</b> until the proxy fix deployed 2026-09-14, and every model URL here routes through the hub
+    /// via <see cref="HuggingFaceClient.GetDownloadUrl"/>. HEAD-only therefore returned -1 for every model,
+    /// which made <see cref="IsComplete"/> fall back to its "existence is all we have" branch - silently
+    /// retiring the truncation check that is the entire reason the expected length is passed around. A
+    /// half-downloaded 329 MB checkpoint was then cached and reused forever, surfacing as a confusing ONNX
+    /// parse error rather than as the short file it is.
     /// <para>
-    /// A one-byte range GET gets the real size from <c>Content-Range: bytes 0-0/TOTAL</c> and works on the
-    /// hub. HEAD is kept as a fallback for any origin that prefers it.
+    /// HEAD works against the hub today, but the range probe stays first: a one-byte range GET is the same
+    /// single request, reads the real size from <c>Content-Range: bytes 0-0/TOTAL</c>, and also works
+    /// against origins that refuse HEAD. HEAD is the fallback for any origin that refuses ranges.
     /// </para>
     /// </remarks>
     private static async Task<long> ContentLengthAsync(HttpClient http, string url, CancellationToken ct)

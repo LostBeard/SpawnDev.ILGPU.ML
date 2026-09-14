@@ -208,11 +208,12 @@ public class HubModelSource : IModelSource, IDisposable
 
     /// <summary>Total size of a URL: a 0-0 range GET reading <c>Content-Range</c>, with HEAD as a fallback.</summary>
     /// <remarks>
-    /// ⚠️ Range probe FIRST, deliberately. It works against every version of the hub, whereas HEAD only
-    /// started working with the 2026-09-14 proxy fix - and an undeployed hub answers HEAD with 405, which
-    /// costs a wasted round trip and logs a console error on every inspection. Both are one request, so
-    /// there is nothing to gain by trying the narrower one first. HEAD stays as a fallback for an origin
-    /// that refuses ranges.
+    /// ⚠️ Range probe FIRST, deliberately, and it should STAY that way. The hub does answer HEAD now (proxy
+    /// fix deployed 2026-09-14; before that it was 405), but that is not the reason for the order: a 0-0
+    /// range GET with <see cref="HttpCompletionOption.ResponseHeadersRead"/> is exactly one request and no
+    /// body, same as HEAD, and it works against origins that refuse HEAD as well as those that do not.
+    /// There is nothing to gain by trying the narrower probe first, and a 405 costs a wasted round trip plus
+    /// a console error on every inspection. HEAD remains the fallback for an origin that refuses ranges.
     /// </remarks>
     private static async Task<long> ProbeSizeAsync(HttpClient http, string url, CancellationToken ct)
     {
