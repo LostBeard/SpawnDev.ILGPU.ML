@@ -6,6 +6,41 @@ using System.Text.Json;
 // Auto-flush stdout so PlaywrightMultiTest sees output immediately
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
 
+// Investigation diagnostic (NOT a PMT test): can this engine run a given ONNX model at all?
+//
+// 🔴 WHY IT EXISTS. "Should we replace ZipVoice with something faster" is not answerable by opinion. The
+// engine either has the operators a candidate model needs or it does not, and that is a fact readable
+// from the file in a second - as opposed to discovering it partway through a port. Reports the ops used,
+// which are unsupported, and the node count, which is what actually costs time in a browser (MEASURED
+// ~1 ms per node of host orchestration, so node count IS the speed estimate).
+//
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -- OPCHECK <path-to.onnx>
+if (args.Length > 1 && args[0] == "OPCHECK")
+{
+    var path = args[1];
+    if (!File.Exists(path)) { Console.WriteLine($"OPCHECK: no such file: {path}"); return 1; }
+    var bytes = await File.ReadAllBytesAsync(path);
+    Console.WriteLine($"OPCHECK {path} ({bytes.Length / 1048576.0:F1} MB)");
+    var inspection = SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper.Inspect(bytes);
+    var compat = SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper.CheckCompatibility(bytes);
+    Console.WriteLine($"  graph      : {inspection.GraphName}");
+    Console.WriteLine($"  producer   : {inspection.ProducerName} {inspection.ProducerVersion}");
+    Console.WriteLine($"  opset      : {inspection.OpsetVersion}");
+    Console.WriteLine($"  NODES      : {inspection.NodeCount}   <- ~1 ms each of host time in a browser");
+    Console.WriteLine($"  ops used   : {compat.TotalOpsUsed}");
+    Console.WriteLine($"  supported  : {compat.SupportedOps.Length} ({compat.CompatibilityPercent:F1}%)");
+    Console.WriteLine(compat.UnsupportedOps.Length == 0
+        ? "  UNSUPPORTED: none - this engine can run every operator in the graph"
+        : $"  UNSUPPORTED: {string.Join(", ", compat.UnsupportedOps)}");
+    // The signature is what a port actually hinges on: operator coverage says the graph can RUN, the
+    // inputs say what has to be built to feed it (a phonemizer, a style vector, a tokenizer).
+    foreach (var t in inspection.Inputs)
+        Console.WriteLine($"  IN   {t.Name} : {t.DataType} [{string.Join(",", t.Shape)}]");
+    foreach (var t in inspection.Outputs)
+        Console.WriteLine($"  OUT  {t.Name} : {t.DataType} [{string.Join(",", t.Shape)}]");
+    return 0;
+}
+
 // Investigation diagnostic (NOT a PMT-substitute test runner): CPU-vs-CUDA per-node
 // bisection for the CPU-backend style-transfer correctness bug.
 if (args.Length > 0 && args[0] == "STYLEBISECT")
