@@ -286,11 +286,14 @@ public class ModelHub : IDisposable
     }
 
     /// <summary>
-    /// Clear all cached models.
+    /// Clear all cached models, partials and their sidecars.
     /// </summary>
+    /// <remarks>Routed through <see cref="OpfsModelCache"/> like the rest of cache management, so an entry
+    /// and its <c>.meta</c> sidecar go together. Clearing via the byte[] cache would leave orphan sidecars
+    /// that later read as phantom entries.</remarks>
     public Task ClearCacheAsync()
     {
-        return _cache.ClearAllAsync();
+        return _streamCache.ClearAllAsync();
     }
 
     // ═══════════════════════════════════════════════════════════

@@ -210,6 +210,9 @@ public class OpfsModelCache : IResumableModelStore, IDisposable
     Task IModelStore.RemoveAsync(string key, CancellationToken cancellationToken) => RemoveAsync(key);
 
     /// <inheritdoc/>
+    Task IModelStore.ClearAsync(CancellationToken cancellationToken) => ClearAllAsync();
+
+    /// <inheritdoc/>
     public async Task<ModelStoreState> GetStateAsync(string key, CancellationToken cancellationToken = default)
     {
         await EnsureInitializedAsync().ConfigureAwait(false);

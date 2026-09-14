@@ -106,11 +106,33 @@ public class HttpModelDownloader
             if (!string.IsNullOrEmpty(knownETag)) headers["If-Range"] = knownETag!;
         }
 
+        // 🔴 Cancellation must reach the NETWORK, not just this loop. Checking the token between chunks
+        // leaves the HTTP request itself running: the browser keeps pulling the body, the connection and
+        // bandwidth stay committed, and a cancel during a multi-GB model frees nothing. An AbortController
+        // wired to the token aborts the fetch itself, and also unblocks a `reader.Read()` that is parked on
+        // a stalled origin - which a token check between chunks can never do, because it never gets to run.
+        using var abort = new AbortController();
+        using var abortSignal = abort.Signal;
+        using var abortReg = ct.Register(() => { try { abort.Abort(); } catch { /* already gone */ } });
+
         // Fetch from the RUNTIME, not from `window`: there is no `window` in a worker, and a model SHOULD be
         // loadable from a worker. SpawnJSRuntime.Fetch calls fetch() on whatever the global scope is.
-        using var response = headers.Count > 0
-            ? await _js.Fetch(url, new FetchOptions { Headers = headers }).ConfigureAwait(false)
-            : await _js.Fetch(url).ConfigureAwait(false);
+        Response response;
+        try
+        {
+            response = await _js.Fetch(url, new FetchOptions
+            {
+                Headers = headers.Count > 0 ? headers : null,
+                Signal = abortSignal,
+            }).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ct.IsCancellationRequested)
+        {
+            // An aborted fetch surfaces as a JS AbortError. Callers cancel with a token and expect the
+            // token's exception, so translate rather than leaking the transport's error type.
+            throw new OperationCanceledException($"Model download cancelled: {url}", ex, ct);
+        }
+        using var _response = response;
 
         // fetch() does NOT throw on 404/500 - it resolves with Ok=false and an ERROR BODY. Nothing is opened
         // or written before this check, so a failed response can never reach the store.
@@ -135,7 +157,21 @@ public class HttpModelDownloader
 
         long received = resumeFrom;   // pulled off the network
         long written = resumeFrom;    // durable in the store (lags `received` while buffering)
-        var lastReport = Environment.TickCount64;
+
+        // Report ONCE up front, as soon as the total is known and before a single byte is read. Without
+        // this a caller cannot render a progress bar at all until the first interval elapses - and for a
+        // file that finishes faster than ProgressIntervalMs the ONLY report was the final 100%, which is
+        // indistinguishable from no progress reporting at all. It also hands the UI the total immediately.
+        // Report ONCE up front, as soon as the total is known and before a single byte is read. Without
+        // this a caller cannot render a progress bar at all until the first interval elapses - and for a
+        // file that finishes faster than ProgressIntervalMs the ONLY report was the final 100%, which is
+        // indistinguishable from no progress reporting at all. It also hands the UI the total immediately.
+        progress?.Report(new ModelDownloadProgress(received, total, resumed));
+
+        // Deliberately NOT `TickCount64`: seeding with "now" suppressed the first in-loop report for a
+        // whole interval. Seeding a full interval in the past means the next chunk reports immediately, so
+        // a short download still produces real intermediate progress.
+        var lastReport = Environment.TickCount64 - ProgressIntervalMs;
         var lastCheckpoint = written;
         long chunkCount = 0, writeCount = 0;
         Uint8Array? writeBuffer = null;
@@ -201,10 +237,12 @@ public class HttpModelDownloader
 
                 await FlushAsync().ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
                 // Record only what actually landed. The staging buffer is deliberately NOT flushed: a
                 // failure mid-fill leaves its tail indeterminate, and writing it would corrupt the resume.
+                // CancellationToken.None on purpose - this bookkeeping is exactly what a CANCELLED download
+                // needs, so passing the cancelled token would skip it and throw away the resume point.
                 try
                 {
                     await dest.FlushAsync(CancellationToken.None).ConfigureAwait(false);
@@ -212,6 +250,11 @@ public class HttpModelDownloader
                         .ConfigureAwait(false);
                 }
                 catch { /* the original failure is the one worth reporting */ }
+
+                // An aborted read surfaces as a JS AbortError; callers cancelled with a token and expect
+                // the token's exception.
+                if (ct.IsCancellationRequested && ex is not OperationCanceledException)
+                    throw new OperationCanceledException($"Model download cancelled: {url}", ex, ct);
                 throw;
             }
             finally

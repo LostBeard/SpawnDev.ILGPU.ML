@@ -58,14 +58,24 @@ public interface IModelStore
     Task PutAsync(string key, Stream source, IProgress<ModelDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default);
 
-    /// <summary>Delete an entry and any bookkeeping that belongs to it.</summary>
+    /// <summary>Delete a single entry and any bookkeeping that belongs to it.</summary>
+    /// <remarks>Must remove the entry's sidecar/metadata too. Deleting only the payload leaves an orphan
+    /// that later reads as a phantom entry, and a store that accumulates those cannot be managed.</remarks>
     Task RemoveAsync(string key, CancellationToken cancellationToken = default);
 
-    /// <summary>Every entry, with its real size and whether it is complete.</summary>
+    /// <summary>
+    /// Every entry, with its real on-disk size and whether it is complete - enough to drive a
+    /// cache-management UI without a second call per row.
+    /// </summary>
+    /// <remarks>Sizes are what the store actually holds, so a partial entry reports its partial size. A UI
+    /// showing a half-downloaded model at its FULL size would be lying about reclaimable space.</remarks>
     Task<IReadOnlyList<ModelStoreEntry>> ListAsync(CancellationToken cancellationToken = default);
 
-    /// <summary>Total bytes held by the store.</summary>
+    /// <summary>Total bytes held by the store, bookkeeping included.</summary>
     Task<long> GetTotalSizeAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Delete every entry, including partials and their bookkeeping.</summary>
+    Task ClearAsync(CancellationToken cancellationToken = default);
 }
 
 /// <summary>What a store knows about an entry, including a partial one.</summary>
