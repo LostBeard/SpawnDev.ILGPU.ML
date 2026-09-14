@@ -50,7 +50,7 @@ public readonly record struct ModelDownloadProgress(long BytesReceived, long Tot
 /// together from two different files.</item>
 /// </list>
 /// </remarks>
-public class OpfsModelCache : IDisposable
+public class OpfsModelCache : IModelStore, IDisposable
 {
     /// <summary>Sidecar suffix holding an entry's download state. Kept beside the data file, not inside it.</summary>
     private const string MetaSuffix = ".meta";
@@ -161,8 +161,12 @@ public class OpfsModelCache : IDisposable
             var meta = await ReadMetaAsync(cacheKey).ConfigureAwait(false);
             var onDisk = await GetEntrySizeAsync(cacheKey).ConfigureAwait(false);
 
-            // Cache hit: complete, same URL, and the file really is the size we recorded.
-            if (meta is { Complete: true } && meta.Url == url && onDisk >= 0 && (meta.Total < 0 || meta.Total == onDisk))
+            // Cache hit: complete, the file really is the size we recorded, and it came from this URL - or
+            // from nowhere. An empty Url means the entry was handed to PutAsync (a torrent stream, a picked
+            // file, another store) rather than fetched here; re-downloading it over HTTP because we cannot
+            // prove its origin would defeat the point of storing it.
+            if (meta is { Complete: true } && (meta.Url == url || meta.Url.Length == 0)
+                && onDisk >= 0 && (meta.Total < 0 || meta.Total == onDisk))
             {
                 progress?.Report(new ModelDownloadProgress(onDisk, onDisk, false));
                 return await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
@@ -176,6 +180,95 @@ public class OpfsModelCache : IDisposable
 
             await DownloadAsync(url, cacheKey, resumeFrom, meta?.ETag, progress, ct).ConfigureAwait(false);
             return await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────────
+    //  IModelStore - store bytes by key, from ANY source
+    // ──────────────────────────────────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    Task<bool> IModelStore.ExistsAsync(string key, CancellationToken cancellationToken) => IsCompleteAsync(key);
+
+    /// <inheritdoc/>
+    async Task<Stream?> IModelStore.OpenReadAsync(string key, CancellationToken cancellationToken)
+        => await OpenCachedAsync(key, cancellationToken).ConfigureAwait(false);
+
+    /// <inheritdoc/>
+    async Task<IReadOnlyList<ModelStoreEntry>> IModelStore.ListAsync(CancellationToken cancellationToken)
+    {
+        var entries = await ListCachedAsync().ConfigureAwait(false);
+        return entries.ConvertAll(e => new ModelStoreEntry(e.Key, e.SizeBytes, e.Complete));
+    }
+
+    /// <inheritdoc/>
+    Task<long> IModelStore.GetTotalSizeAsync(CancellationToken cancellationToken) => GetCacheSizeAsync();
+
+    /// <inheritdoc/>
+    Task IModelStore.RemoveAsync(string key, CancellationToken cancellationToken) => RemoveAsync(key);
+
+    /// <summary>
+    /// Store <paramref name="source"/> under <paramref name="key"/> and mark it complete - the
+    /// transport-agnostic way in. See <see cref="IModelStore.PutAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 The copy is <see cref="Stream.CopyToAsync(Stream, int, CancellationToken)"/> on purpose, not a
+    /// hand-rolled read/write loop. <c>JSReadStreamBase</c> overrides it to pump <c>Uint8Array</c> chunks
+    /// JS-side whenever the destination is an <c>IJSWriteStream</c> - which an <c>OPFSStream</c> opened for
+    /// writing is - so a JS-side source (a torrent piece stream, a <c>BlobStream</c>, another OPFS entry)
+    /// never lands a byte on the managed heap. Any other <c>Stream</c> falls back to the standard managed
+    /// path and still works. Writing the loop by hand here would silently opt every JS source out of that.
+    /// </remarks>
+    public async Task PutAsync(string key, Stream source, IProgress<ModelDownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        await EnsureInitializedAsync().ConfigureAwait(false);
+        if (_cacheDir == null)
+            throw new InvalidOperationException(
+                "OPFS is not available, so nothing can be stored. OPFS needs a secure context (https or " +
+                "localhost) on a browser that supports it.");
+
+        long expected = -1;
+        try { if (source.CanSeek) expected = source.Length - source.Position; } catch { /* unknowable */ }
+
+        var gate = GetGate(key);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Clear any prior state first: a stale sidecar saying "complete" must never survive a put that
+            // then fails partway, or the truncated result would be served as a finished model.
+            await RemoveAsync(key).ConfigureAwait(false);
+
+            long written;
+            var dest = await OPFSStream.OpenPath(_cacheDir, key, FileMode.Create, FileAccess.Write,
+                cancellationToken: cancellationToken).ConfigureAwait(false);
+            await using (dest.ConfigureAwait(false))
+            {
+                await source.CopyToAsync(dest, WriteBufferSize > 0 ? WriteBufferSize : 81920, cancellationToken)
+                    .ConfigureAwait(false);
+                await dest.FlushAsync(cancellationToken).ConfigureAwait(false);
+                written = dest.Length;
+            }
+
+            if (expected >= 0 && written != expected)
+                throw new IOException(
+                    $"Storing '{key}' copied {written} bytes but the source reported {expected}.");
+
+            await WriteMetaAsync(key, new CacheEntryMeta
+            {
+                Url = "",               // no origin: these bytes were handed to us, not fetched by us
+                Total = written,
+                Received = written,
+                Complete = true,
+                ETag = null,
+            }).ConfigureAwait(false);
+
+            progress?.Report(new ModelDownloadProgress(written, written, false));
         }
         finally
         {

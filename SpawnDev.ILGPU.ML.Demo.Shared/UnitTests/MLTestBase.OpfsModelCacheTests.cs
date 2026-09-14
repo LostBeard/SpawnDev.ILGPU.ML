@@ -275,6 +275,98 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// 🔴 IModelStore.PutAsync stores bytes from ANY Stream - and a JS-side source stays JS-side.
+    /// </summary>
+    /// <remarks>
+    /// This is the transport-agnostic entry point: a torrent piece stream, a picked file, an HTTP response
+    /// and a MemoryStream all arrive the same way. The zero-copy half is not wishful thinking - the copy
+    /// uses Stream.CopyToAsync, and JSReadStreamBase overrides it to pump Uint8Array chunks JS-side when the
+    /// destination is an IJSWriteStream. So this test puts an entry from ANOTHER OPFS entry (both JS-side)
+    /// and asserts the managed allocation stays far below the payload, the same way the download guard does.
+    /// </remarks>
+    [TestMethod(Timeout = 120000)]
+    public async Task OpfsModelCache_PutFromStreamStoresAndStaysJSSide() => await RunTest(async accelerator =>
+    {
+        var js = RequireBrowserRuntime();
+
+        using var cache = new OpfsModelCache(js) { CacheDirectoryName = "ilgpu-ml-test-opfscache" };
+        if (!await cache.IsAvailableAsync())
+            throw new UnsupportedTestException("OPFS unavailable in this context");
+
+        IModelStore store = cache;
+        var sourceKey = OpfsModelCache.UrlToCacheKey(OpfsCacheTestUrl) + ".putsrc";
+        var destKey = OpfsModelCache.UrlToCacheKey(OpfsCacheTestUrl) + ".putdst";
+        await cache.RemoveAsync(sourceKey);
+        await cache.RemoveAsync(destKey);
+
+        // Get a real JS-side source stream (an OPFS entry), which is an IJSReadStream.
+        long total;
+        byte[] head = new byte[64];
+        var src = await cache.OpenOrDownloadAsync(OpfsCacheTestUrl, sourceKey);
+        await using (src.ConfigureAwait(false))
+        {
+            total = src.Length;
+            src.Position = 0;
+            await src.ReadExactlyAsync(head);
+        }
+
+        if (await store.ExistsAsync(destKey))
+            throw new Exception("Destination reported present before anything was stored.");
+
+        var reopened = await cache.OpenCachedAsync(sourceKey)
+            ?? throw new Exception("Source entry vanished.");
+        long allocated;
+        await using (reopened.ConfigureAwait(false))
+        {
+            if (reopened is not SpawnDev.SpawnJS.Toolbox.IJSReadStream)
+                throw new Exception($"Source is {reopened.GetType().Name}, not an IJSReadStream - the " +
+                                    "zero-copy assertion below would be measuring the wrong thing.");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            var before = GC.GetTotalAllocatedBytes(precise: true);
+            await store.PutAsync(destKey, reopened);
+            allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
+        }
+
+        if (!await store.ExistsAsync(destKey))
+            throw new Exception("Stored entry does not report as present and complete.");
+
+        var dst = await store.OpenReadAsync(destKey)
+            ?? throw new Exception("OpenReadAsync returned null for an entry that reports present.");
+        await using (dst.ConfigureAwait(false))
+        {
+            if (dst.Length != total)
+                throw new Exception($"Stored length {dst.Length} != source length {total}.");
+            var got = new byte[64];
+            dst.Position = 0;
+            await dst.ReadExactlyAsync(got);
+            for (int i = 0; i < got.Length; i++)
+                if (got[i] != head[i])
+                    throw new Exception($"Stored bytes differ from the source at offset {i}.");
+        }
+
+        var ratio = (double)allocated / total;
+        Console.WriteLine($"[OpfsCache] PutAsync copied {total:N0} B JS->JS, managed alloc {allocated:N0} B ({ratio:P1})");
+        if (allocated > total / 2)
+            throw new Exception(
+                $"PutAsync allocated {allocated:N0} bytes of managed heap for a {total:N0} byte JS-side " +
+                $"source ({ratio:P1}). The CopyToAsync JS fast path is not being taken.");
+
+        // And the stored entry must satisfy a plain OpenOrDownloadAsync without re-fetching it, even though
+        // it has no origin URL recorded.
+        var viaOpen = await cache.OpenOrDownloadAsync(OpfsCacheTestUrl, destKey);
+        await using (viaOpen.ConfigureAwait(false))
+        {
+            if (viaOpen.Length != total)
+                throw new Exception($"OpenOrDownloadAsync re-fetched a PutAsync entry: {viaOpen.Length} != {total}.");
+        }
+
+        Console.WriteLine("[OpfsCache] PutAsync from Stream: PASS");
+        await cache.RemoveAsync(sourceKey);
+        await cache.RemoveAsync(destKey);
+    });
+
+    /// <summary>
     /// Cut a cache entry down to <paramref name="keepBytes"/> and rewrite its sidecar to say "incomplete",
     /// which is exactly the state an interrupted download leaves behind.
     /// </summary>
