@@ -67,3 +67,51 @@ public interface IModelStore
     /// <summary>Total bytes held by the store.</summary>
     Task<long> GetTotalSizeAsync(CancellationToken cancellationToken = default);
 }
+
+/// <summary>What a store knows about an entry, including a partial one.</summary>
+/// <param name="Exists">An entry (complete or partial) is present.</param>
+/// <param name="Complete">The entry is whole and safe to serve.</param>
+/// <param name="BytesWritten">Bytes the store has CONFIRMED on disk - the resume point, never a buffered count.</param>
+/// <param name="TotalBytes">Expected final size, or -1 when unknown.</param>
+/// <param name="SourceRef">Where the bytes came from (a URL), or null/empty when they were handed in directly.</param>
+/// <param name="ETag">Origin validator recorded at download time, for <c>If-Range</c> on resume.</param>
+public readonly record struct ModelStoreState(
+    bool Exists, bool Complete, long BytesWritten, long TotalBytes, string? SourceRef, string? ETag);
+
+/// <summary>
+/// A store that can be written INCREMENTALLY, so an interrupted transfer resumes instead of restarting.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This is what lets the transport and the storage be separate things. A downloader needs three
+/// store-shaped capabilities and nothing more: ask what is already here, open a writer positioned at the
+/// resume point, and record what landed. It does not need to know the store is OPFS, and the store does not
+/// need to know the bytes arrived over HTTP.
+/// </para>
+/// <para>
+/// 🔴 <see cref="ModelStoreState.BytesWritten"/> must be what is DURABLE, never what has merely been
+/// received. A resume trusts it, so counting buffered-but-unwritten bytes there corrupts the file at the
+/// seam.
+/// </para>
+/// </remarks>
+public interface IResumableModelStore : IModelStore
+{
+    /// <summary>What the store holds for <paramref name="key"/>, including a partial entry.</summary>
+    Task<ModelStoreState> GetStateAsync(string key, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Open <paramref name="key"/> for writing positioned at <paramref name="startOffset"/>, discarding
+    /// anything already stored beyond it. Pass 0 to start over. The caller disposes the stream.
+    /// </summary>
+    /// <remarks>Truncating is deliberate rather than merely seeking: bytes past the confirmed resume point
+    /// were never acknowledged, and keeping them would leave unverified data inside a file that later
+    /// reports itself complete.</remarks>
+    Task<Stream> OpenWriteAsync(string key, long startOffset, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Record an entry's state. Call with <paramref name="complete"/> false to checkpoint a resume point
+    /// mid-transfer, and true exactly once the whole file is durable.
+    /// </summary>
+    Task SetStateAsync(string key, string sourceRef, long totalBytes, long bytesWritten, bool complete,
+        string? etag, CancellationToken cancellationToken = default);
+}

@@ -50,7 +50,7 @@ public readonly record struct ModelDownloadProgress(long BytesReceived, long Tot
 /// together from two different files.</item>
 /// </list>
 /// </remarks>
-public class OpfsModelCache : IModelStore, IDisposable
+public class OpfsModelCache : IResumableModelStore, IDisposable
 {
     /// <summary>Sidecar suffix holding an entry's download state. Kept beside the data file, not inside it.</summary>
     private const string MetaSuffix = ".meta";
@@ -97,14 +97,6 @@ public class OpfsModelCache : IModelStore, IDisposable
     /// </remarks>
     public int WriteBufferSize { get; set; } = 16 * 1024 * 1024;
 
-    /// <summary>Chunks delivered by <c>fetch</c> during the most recent download (diagnostic).</summary>
-    public long LastDownloadChunks { get; private set; }
-
-    /// <summary>OPFS writes issued during the most recent download (diagnostic).</summary>
-    public long LastDownloadWrites { get; private set; }
-
-    /// <summary>Bytes transferred during the most recent download, excluding anything carried over by a resume.</summary>
-    public long LastDownloadBytes { get; private set; }
 
     /// <summary>Create a cache over the OPFS directory named by <see cref="CacheDirectoryName"/>.</summary>
     /// <param name="js">The SpawnJS runtime, used for <c>fetch</c> and <c>navigator.storage</c> in any scope.</param>
@@ -163,38 +155,35 @@ public class OpfsModelCache : IModelStore, IDisposable
                 "OPFS is not available, so no model can be cached or streamed. OPFS needs a secure context " +
                 "(https or localhost) on a browser that supports it.");
 
-        var gate = GetGate(cacheKey);
-        await gate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            var meta = await ReadMetaAsync(cacheKey).ConfigureAwait(false);
-            var onDisk = await GetEntrySizeAsync(cacheKey).ConfigureAwait(false);
-
-            // Cache hit: complete, the file really is the size we recorded, and it came from this URL - or
-            // from nowhere. An empty Url means the entry was handed to PutAsync (a torrent stream, a picked
-            // file, another store) rather than fetched here; re-downloading it over HTTP because we cannot
-            // prove its origin would defeat the point of storing it.
-            if (meta is { Complete: true } && (meta.Url == url || meta.Url.Length == 0)
-                && onDisk >= 0 && (meta.Total < 0 || meta.Total == onDisk))
-            {
-                progress?.Report(new ModelDownloadProgress(onDisk, onDisk, false));
-                return await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
-            }
-
-            // Resume only when the partial we hold was for THIS url. meta.Received is the last count we
-            // actually flushed; anything past it in the file was never confirmed, so it is discarded.
-            long resumeFrom = 0;
-            if (meta is { Complete: false } && meta.Url == url && onDisk > 0)
-                resumeFrom = Math.Max(0, Math.Min(onDisk, meta.Received));
-
-            await DownloadAsync(url, cacheKey, resumeFrom, meta?.ETag, progress, ct).ConfigureAwait(false);
-            return await OpenEntryAsync(cacheKey, ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            gate.Release();
-        }
+        // The HTTP transport lives in HttpModelDownloader, which drives this class only through
+        // IResumableModelStore. This method is the convenience wrapper over "store + HTTP"; it is NOT a
+        // second implementation of the download, because a parallel implementation is exactly how one path
+        // ends up with a fix or a guard the other lacks.
+        var stream = await Downloader.GetOrDownloadAsync(url, cacheKey, progress, ct).ConfigureAwait(false);
+        return (OPFSStream)stream;
     }
+
+    private HttpModelDownloader? _downloader;
+
+    /// <summary>
+    /// The HTTP transport filling this store. Exposed so callers can read its diagnostics
+    /// (<see cref="HttpModelDownloader.LastDownloadChunks"/> and friends) or tune
+    /// <see cref="HttpModelDownloader.WriteBufferSize"/>.
+    /// </summary>
+    public HttpModelDownloader Downloader => _downloader ??= new HttpModelDownloader(_js, this)
+    {
+        WriteBufferSize = WriteBufferSize,
+        ProgressIntervalMs = ProgressIntervalMs,
+    };
+
+    /// <summary>Chunks delivered by <c>fetch</c> during the most recent download (diagnostic).</summary>
+    public long LastDownloadChunks => Downloader.LastDownloadChunks;
+
+    /// <summary>OPFS writes issued during the most recent download (diagnostic).</summary>
+    public long LastDownloadWrites => Downloader.LastDownloadWrites;
+
+    /// <summary>Bytes transferred during the most recent download, excluding anything carried by a resume.</summary>
+    public long LastDownloadBytes => Downloader.LastDownloadBytes;
 
     // ──────────────────────────────────────────────────────────────────────────────────────────────
     //  IModelStore - store bytes by key, from ANY source
@@ -219,6 +208,55 @@ public class OpfsModelCache : IModelStore, IDisposable
 
     /// <inheritdoc/>
     Task IModelStore.RemoveAsync(string key, CancellationToken cancellationToken) => RemoveAsync(key);
+
+    /// <inheritdoc/>
+    public async Task<ModelStoreState> GetStateAsync(string key, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync().ConfigureAwait(false);
+        if (_cacheDir == null) return default;
+
+        var meta = await ReadMetaAsync(key).ConfigureAwait(false);
+        var onDisk = await GetEntrySizeAsync(key).ConfigureAwait(false);
+        if (onDisk < 0 && meta == null) return default;
+
+        // Confirmed bytes are the LESSER of what the sidecar acknowledged and what is actually on disk.
+        // Either can lead the other after a crash, and a resume must trust only what both agree on.
+        var written = meta == null ? Math.Max(0, onDisk) : Math.Max(0, Math.Min(onDisk < 0 ? 0 : onDisk, meta.Received));
+        var complete = meta is { Complete: true } && onDisk >= 0 && (meta.Total < 0 || meta.Total == onDisk);
+        return new ModelStoreState(onDisk >= 0, complete, complete ? onDisk : written,
+            meta?.Total ?? -1, meta?.Url, meta?.ETag);
+    }
+
+    /// <inheritdoc/>
+    public async Task<Stream> OpenWriteAsync(string key, long startOffset, CancellationToken cancellationToken = default)
+    {
+        if (startOffset < 0) throw new ArgumentOutOfRangeException(nameof(startOffset));
+        await EnsureInitializedAsync().ConfigureAwait(false);
+        if (_cacheDir == null)
+            throw new InvalidOperationException(
+                "OPFS is not available, so nothing can be written. It needs a secure context (https or " +
+                "localhost) on a browser that supports it.");
+
+        var stream = await OPFSStream.OpenPath(_cacheDir, key, FileMode.OpenOrCreate, FileAccess.Write,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        // Truncate rather than merely seek: anything past the confirmed resume point was never
+        // acknowledged, and keeping it would bury unverified bytes inside a file that later says complete.
+        stream.SetLength(startOffset);
+        stream.Seek(startOffset, SeekOrigin.Begin);
+        return stream;
+    }
+
+    /// <inheritdoc/>
+    public Task SetStateAsync(string key, string sourceRef, long totalBytes, long bytesWritten, bool complete,
+        string? etag, CancellationToken cancellationToken = default)
+        => WriteMetaAsync(key, new CacheEntryMeta
+        {
+            Url = sourceRef ?? "",
+            Total = totalBytes,
+            Received = bytesWritten,
+            Complete = complete,
+            ETag = etag,
+        });
 
     /// <summary>
     /// Store <paramref name="source"/> under <paramref name="key"/> and mark it complete - the
@@ -354,215 +392,6 @@ public class OpfsModelCache : IModelStore, IDisposable
         return key;
     }
 
-    // ──────────────────────────────────────────────────────────────────────────────────────────────
-    //  Download
-    // ──────────────────────────────────────────────────────────────────────────────────────────────
-
-    private async Task DownloadAsync(string url, string cacheKey, long resumeFrom, string? knownETag,
-        IProgress<ModelDownloadProgress>? progress, CancellationToken ct)
-    {
-        var headers = new Dictionary<string, string>();
-        if (resumeFrom > 0)
-        {
-            headers["Range"] = $"bytes={resumeFrom}-";
-            // If the server's copy changed since our partial was written, it answers 200 with the whole body
-            // instead of 206 and we start over - rather than splicing two different files together.
-            if (!string.IsNullOrEmpty(knownETag)) headers["If-Range"] = knownETag!;
-        }
-
-        // Fetch from the RUNTIME, not from `window`: there is no `window` in a worker, and a model SHOULD be
-        // loaded from a worker. SpawnJSRuntime.Fetch calls fetch() on whatever the global scope is.
-        using var response = headers.Count > 0
-            ? await _js.Fetch(url, new FetchOptions { Headers = headers }).ConfigureAwait(false)
-            : await _js.Fetch(url).ConfigureAwait(false);
-
-        // fetch() does NOT throw on 404/500 - it resolves with Ok=false and an ERROR BODY. Nothing is opened
-        // or written before this check, so a failed response can never reach the cache.
-        if (!response.Ok)
-            throw new HttpRequestException(
-                $"Model download failed: {(int)response.Status} {response.StatusText} for {url}");
-
-        var status = (int)response.Status;
-        var resumed = resumeFrom > 0 && status == 206;
-        if (resumeFrom > 0 && status != 206)
-        {
-            // Server ignored the Range, or If-Range failed because the file changed: take the full body.
-            resumeFrom = 0;
-        }
-
-        long total;
-        string? etag;
-        using (var respHeaders = response.Headers)
-        {
-            total = ParseTotalBytes(respHeaders, resumeFrom);
-            etag = NullIfEmpty(respHeaders.Get("etag"));
-        }
-
-        var meta = new CacheEntryMeta { Url = url, Total = total, Received = resumeFrom, Complete = false, ETag = etag };
-        await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
-
-        long received = resumeFrom;   // bytes pulled off the network
-        long written = resumeFrom;    // bytes actually handed to OPFS (lags `received` while buffering)
-        var lastReport = Environment.TickCount64;
-        var lastMetaFlush = written;
-        long chunkCount = 0, writeCount = 0;
-        Uint8Array? writeBuffer = null;
-        long bufferFill = 0;
-
-        // OpenOrCreate + SetLength(resumeFrom) rather than FileMode.Append: it makes the truncation explicit,
-        // so any unconfirmed bytes past the last flushed count are dropped instead of being kept and counted.
-        var stream = await OPFSStream.OpenPath(_cacheDir!, cacheKey, FileMode.OpenOrCreate, FileAccess.Write,
-            cancellationToken: ct).ConfigureAwait(false);
-        await using (stream.ConfigureAwait(false))
-        {
-            stream.SetLength(resumeFrom);
-            stream.Seek(resumeFrom, SeekOrigin.Begin);
-
-            using var body = response.Body ?? throw new InvalidOperationException($"Response for {url} had no body.");
-            using var reader = body.GetReader();
-            try
-            {
-                while (true)
-                {
-                    if (ct.IsCancellationRequested)
-                    {
-                        await reader.Cancel().ConfigureAwait(false);
-                        ct.ThrowIfCancellationRequested();
-                    }
-
-                    using var result = await reader.Read().ConfigureAwait(false);
-                    if (result.Done) break;
-
-                    // 🔴 The chunk stays a JS Uint8Array from here to OPFS. Never ReadBytes() it - that is
-                    // the copy that put whole checkpoints on the managed heap in ModelCache.
-                    using var chunk = result.Value;
-                    if (chunk == null) continue;
-                    var chunkLength = chunk.Length;
-                    if (chunkLength == 0) continue;
-                    chunkCount++;
-
-                    if (WriteBufferSize <= 0 || chunkLength >= WriteBufferSize)
-                    {
-                        // Already big enough to write on its own. Drain anything pending first so the
-                        // bytes reach the file in order.
-                        await FlushWriteBufferAsync().ConfigureAwait(false);
-                        await stream.WriteUint8ArrayAsync(chunk, ct).ConfigureAwait(false);
-                        writeCount++;
-                        written += chunkLength;
-                    }
-                    else
-                    {
-                        if (bufferFill + chunkLength > WriteBufferSize)
-                            await FlushWriteBufferAsync().ConfigureAwait(false);
-                        // TypedArray.set: a JS-side copy into the staging buffer. No managed array involved.
-                        writeBuffer ??= new Uint8Array(WriteBufferSize);
-                        writeBuffer.Set(chunk, bufferFill);
-                        bufferFill += chunkLength;
-                    }
-                    received += chunkLength;
-
-                    // Only record progress that is actually ON DISK - `written`, never `received`. Buffered
-                    // bytes are not durable, and the sidecar is what a resume trusts.
-                    if (written - lastMetaFlush >= MetaFlushInterval)
-                    {
-                        await stream.FlushAsync(ct).ConfigureAwait(false);
-                        meta.Received = written;
-                        await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
-                        lastMetaFlush = written;
-                    }
-
-                    var now = Environment.TickCount64;
-                    if (progress != null && now - lastReport >= ProgressIntervalMs)
-                    {
-                        progress.Report(new ModelDownloadProgress(received, total, resumed));
-                        lastReport = now;
-                    }
-                }
-
-                // Everything received has now been handed to OPFS.
-                await FlushWriteBufferAsync().ConfigureAwait(false);
-            }
-            catch
-            {
-                // Record only what actually landed, so the next attempt resumes instead of restarting.
-                // The staging buffer is deliberately NOT flushed here: a failure mid-fill means its tail is
-                // indeterminate, and writing it would corrupt the resume point.
-                try
-                {
-                    await stream.FlushAsync(CancellationToken.None).ConfigureAwait(false);
-                    meta.Received = written;
-                    await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
-                }
-                catch { /* the original failure is the one worth reporting */ }
-                throw;
-            }
-            finally
-            {
-                writeBuffer?.Dispose();
-            }
-
-            await stream.FlushAsync(ct).ConfigureAwait(false);
-
-            // Drain the staging buffer into the file, in order. Writes the exact filled prefix, never the
-            // whole buffer - SubArray is a VIEW onto the same storage, so this copies nothing.
-            async Task FlushWriteBufferAsync()
-            {
-                if (bufferFill == 0 || writeBuffer == null) return;
-                if (bufferFill == WriteBufferSize)
-                {
-                    await stream.WriteUint8ArrayAsync(writeBuffer, ct).ConfigureAwait(false);
-                }
-                else
-                {
-                    using var view = writeBuffer.SubArray(0, bufferFill);
-                    await stream.WriteUint8ArrayAsync(view, ct).ConfigureAwait(false);
-                }
-                writeCount++;
-                written += bufferFill;
-                bufferFill = 0;
-            }
-        }
-
-        LastDownloadChunks = chunkCount;
-        LastDownloadWrites = writeCount;
-        LastDownloadBytes = received - resumeFrom;
-
-        // A short read is a truncated download, not a model. Leave the entry incomplete so the next call
-        // resumes it, and say so - rather than caching it and failing much later inside a proto reader.
-        if (total > 0 && written != total)
-        {
-            meta.Received = written;
-            await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
-            throw new IOException(
-                $"Model download truncated for {url}: got {written} of {total} bytes. " +
-                "The partial entry was kept and the next attempt will resume it.");
-        }
-
-        meta.Received = written;
-        meta.Total = total > 0 ? total : written;
-        meta.Complete = true;
-        await WriteMetaAsync(cacheKey, meta).ConfigureAwait(false);
-        progress?.Report(new ModelDownloadProgress(received, meta.Total, resumed));
-    }
-
-    /// <summary>
-    /// Total file size from the response headers. For a 206 that is the total after the '/' in
-    /// <c>Content-Range: bytes A-B/TOTAL</c>; a 206's Content-Length is the PART length, never the file size.
-    /// </summary>
-    private static long ParseTotalBytes(Headers headers, long resumeFrom)
-    {
-        var contentRange = headers.Get("content-range");
-        if (!string.IsNullOrEmpty(contentRange))
-        {
-            var slash = contentRange.LastIndexOf('/');
-            if (slash >= 0 && long.TryParse(contentRange[(slash + 1)..].Trim(), out var fromRange))
-                return fromRange;
-        }
-        var contentLength = headers.Get("content-length");
-        if (!string.IsNullOrEmpty(contentLength) && long.TryParse(contentLength, out var len))
-            return resumeFrom + len;
-        return -1;
-    }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────────
     //  Entry + sidecar plumbing
