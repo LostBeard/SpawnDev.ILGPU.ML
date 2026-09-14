@@ -26,10 +26,11 @@
 	<ItemGroup>
 		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.4" />
 		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="10.0.4" PrivateAssets="all" />
-		<!-- Direct ref to 1.5.0 (adds AsyncFSMemory; resolves the whole graph, incl. WebTorrent's transitive
-		     1.4.0, up to 1.5.0 - binary-compatible, only added a class) so the WebTorrent download store gets
-		     a reliable Uint8Array-capable in-memory FS and the zero-copy path fires. -->
-		<PackageReference Include="SpawnDev.AsyncFileSystem" Version="2.1.1" />
+		<!-- Direct ref so the whole graph (incl. WebTorrent's lower transitive pin) resolves UP to the
+		     current AsyncFileSystem: the WebTorrent download store needs a Uint8Array-capable FS for its
+		     zero-copy path. 2.2.0 also pins SpawnJS 2.1.17, matching the rest of the chain - an older
+		     AsyncFileSystem would reach a stale SpawnJS transitively. -->
+		<PackageReference Include="SpawnDev.AsyncFileSystem" Version="2.2.0" />
 		<!-- Force the whole graph (incl. SpawnDev.ILGPU's transitive version) up to the current SpawnJS. The
 		     original reason for pinning this directly was JSRef.Get<long?> (INumberNullableMarshaller) - WebGPU
 		     adapter/device limits are long?, so without it maxStorageBufferBindingSize read null and the device
