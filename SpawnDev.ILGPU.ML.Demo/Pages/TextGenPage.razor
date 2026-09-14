@@ -141,7 +141,7 @@
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient WebTorrent { get; set; } = default!;
+    [Inject] SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -170,19 +170,17 @@
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(WebTorrent, Http);
-
-            // Open the model file as a SEEKABLE torrent stream from our hub (deselect:false — we need the
-            // weights), then stream it straight to the GPU. CreateFromOnnxStreamAsync seeks past + chunk-
-            // uploads each weight, so the ~330MB model is never materialized whole in CPU memory.
+            // Open the model file as a SEEKABLE stream from our hub, then stream it straight to the GPU.
+            // CreateFromOnnxStreamAsync seeks past + chunk-uploads each weight, so the ~330MB model is never
+            // materialized whole in CPU memory. Plain HTTP cached in OPFS - no WebTorrent.
             _modelProgress = 15;
             StateHasChanged();
-            var model = await hub.OpenAsync(HubRepoId, ModelFile, deselect: false);
+            var model = await ModelSource.OpenAsync(HubRepoId, ModelFile);
 
             SpawnDev.ILGPU.ML.InferenceSession session;
-            await using (model.Stream)
+            await using (model)
                 session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromOnnxStreamAsync(
-                    _accelerator, model.Stream,
+                    _accelerator, model,
                     onProgress: (stage, pct) =>
                     {
                         // Map each load stage to its OWN monotonic slice so the bar never jumps backwards.
@@ -206,10 +204,10 @@
             // Tokenizer from the same hub repo (small JSON — read the stream fully).
             _modelProgress = 90;
             StateHasChanged();
-            var tok = await hub.OpenAsync(HubRepoId, TokenizerFile, deselect: false);
+            var tok = await ModelSource.OpenAsync(HubRepoId, TokenizerFile);
             string tokenizerJson;
-            await using (tok.Stream)
-            using (var reader = new StreamReader(tok.Stream))
+            await using (tok)
+            using (var reader = new StreamReader(tok))
                 tokenizerJson = await reader.ReadToEndAsync();
 
             _pipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);

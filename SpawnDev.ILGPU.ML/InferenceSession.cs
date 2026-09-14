@@ -650,54 +650,21 @@ public class InferenceSession : IDisposable
         string repoId, string filename, string revision = "main",
         Action<string, int>? onProgress = null,
         Dictionary<string, int[]>? inputShapes = null,
-        SpawnDev.WebTorrent.WebTorrentClient? webTorrent = null,
         HttpClient? http = null)
     {
-        // ── PREFERRED: lazy-hash torrent through the hub ────────────────────────────────────────────────
-        // Supply webTorrent + http and the model is delivered by HubModelStream.OpenAsync: a PERSISTENT
-        // torrent from the first byte, streamable with RANDOM ACCESS, cached to OPFS by piece under a stable
-        // URL-derived key, resumed and RESTORED on reload with zero re-download, and seeded to peers. That
-        // is what lazy-hash was built for, and it is strictly better than either branch below.
-        //
-        // ⚠️ Without those two arguments this falls back to ModelHub, which PREDATES lazy-hash: its stream
-        // path is an OPFS blob (no torrent, no resume, no P2P, re-fetched when the cache entry is absent)
-        // and its byte[] path puts the whole model on the single-threaded WASM heap. Both are obsolete for
-        // weights. The fallback is kept so existing callers keep working, not because it is equivalent -
-        // pass the client.
-        if (webTorrent != null && http != null && revision == "main")
-        {
-            var lazy = new Hub.HubModelStream(webTorrent, http);
-            // deselect:false - we need the weights, not just the structure.
-            var model = await lazy.OpenAsync(repoId, filename, deselect: false).ConfigureAwait(false);
-            await using (model.Stream)
-            {
-                var lazyProbe = await Onnx.OnnxParser.ParseFromStreamAsync(model.Stream, 1024 * 1024)
-                    .ConfigureAwait(false);
-                if (!Onnx.OnnxLoader.HasExternalData(lazyProbe))
-                {
-                    model.Stream.Position = 0;
-                    onProgress?.Invoke("download", 100);
-                    return await CreateFromOnnxStreamAsync(accelerator, model.Stream, onProgress, inputShapes)
-                        .ConfigureAwait(false);
-                }
-            }
-            // External data (weights in a sibling .onnx_data) still needs the two-file byte[] resolve below.
-        }
-        else if (webTorrent != null && http != null)
-        {
-            // HubModelStream addresses the hub's /hf web seed, which serves the default revision only, so a
-            // pinned revision cannot use the lazy-hash path today. Say so rather than silently downgrading.
-            Console.WriteLine($"[InferenceSession] revision '{revision}' requested for {repoId}/{filename}; "
-                            + "the hub web seed serves the default revision, so this load uses the older "
-                            + "ModelHub path (no torrent, no resume, no P2P).");
-        }
+        _ = http;   // kept for signature compatibility; delivery no longer needs a separate HTTP client
 
-        // PREFER the streaming path: hub.OpenStreamAsync hands back a BlobStream over the OPFS cache
-        // entry, which is an IJSReadStream - so the graph structure is parsed from the stream and each
-        // weight is seeked to and uploaded JS->GPU without the model ever landing on the .NET/WASM managed
-        // heap. hub.LoadAsync below returns the whole file as a byte[]; for a 300 MB+ model that is the
-        // "bulk bytes stay in JS" rule broken on every browser load, and it is what made loads OOM under
-        // memory pressure.
+        // ⚠️ BREAKING (2026-09-14): this used to take a WebTorrentClient and prefer a lazy-hash torrent.
+        // Model delivery no longer depends on WebTorrent at all - ML does not reference it - so the torrent
+        // branch is gone. For P2P delivery, reference SpawnDev.ILGPU.ML.WebTorrent and pass its
+        // HubModelStream (an IModelSource) to a pipeline, or open the stream yourself and call
+        // CreateFromOnnxStreamAsync.
+        //
+        // PREFER the streaming path: hub.OpenStreamAsync hands back an OPFS stream, which is an
+        // IJSReadStream - so the graph structure is parsed from the stream and each weight is seeked to and
+        // uploaded JS->GPU without the model ever landing on the .NET/WASM managed heap. hub.LoadAsync below
+        // returns the whole file as a byte[]; for a 300 MB+ model that is the "bulk bytes stay in JS" rule
+        // broken on every browser load, and it is what made loads OOM under memory pressure.
         //
         // External-data models (weights in a sibling .onnx_data file) still take the byte[] path: resolving
         // those needs the parsed model plus a second file, which the block below already handles.
@@ -1864,12 +1831,12 @@ public class InferenceSession : IDisposable
         {
             SpawnDev.ILGPU.BrowserBufferPolicy.ResetStreamUploadTiming();
             SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = true;
-            // One layer further down: the stream READ resolves to a ranged OPFS read per chunk, and this
-            // says which call inside it costs the time.
-            SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ResetReadTiming();
-            SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.TraceReadTiming = true;
-            SpawnDev.WebTorrent.Torrent.ResetEnsurePieceTiming();
-            SpawnDev.WebTorrent.Torrent.TraceEnsurePiece = true;
+            // ⚠️ This used to also switch on WebTorrent's AsyncFSChunkStore / Torrent.EnsurePiece counters,
+            // to attribute the stream READ to a ranged torrent-store read. Those counters left with the
+            // WebTorrent dependency, and they measured a store the default path no longer uses - a model now
+            // streams from a plain OPFS file, so there are no pieces to wait on and no chunk store in the
+            // way. What remains (BrowserBufferPolicy's read-vs-write split below) is the part that was ever
+            // transport-independent, and it still answers the question that matters: stream READ or GPU WRITE.
         }
         long _wlQuantBytes = 0, _wlLowPBytes = 0, _wlHostBytes = 0, _wlTransposeBytes = 0;
         int _wlQuantN = 0, _wlLowPN = 0, _wlHostN = 0, _wlTransposeN = 0, _wlDedup = 0;
@@ -1994,37 +1961,12 @@ public class InferenceSession : IDisposable
                 Console.WriteLine($"[GGUF-WL]   -> the bottleneck is the "
                     + (_rd > _wr ? "STREAM READ" : "GPU WRITE"));
             }
-            var _rc = SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadCalls;
-            if (_rc > 0)
-            {
-                double _rb = SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadBytes / 1048576.0;
-                Console.WriteLine($"[GGUF-WL] OPFS ranged reads: {_rc}, {_rb:F1} MB, "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadHandleMisses} handle miss(es)");
-                Console.WriteLine($"[GGUF-WL]   sync-handle OPENS: {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncOpens}"
-                    + $" costing {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncOpenMs:F0} ms "
-                    + $"= resolve {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncResolveMs:F0}"
-                    + $" + create {SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.SyncCreateMs:F0} ms");
-                Console.WriteLine($"[GGUF-WL]   sync-handle read: "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadSyncMs,9:F0} ms over "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadSyncCalls} read(s)  <- fast path");
-                Console.WriteLine($"[GGUF-WL]   getFile/handle : "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadHandleMs,9:F0} ms");
-                Console.WriteLine($"[GGUF-WL]   Blob.slice     : "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadSliceMs,9:F0} ms");
-                Console.WriteLine($"[GGUF-WL]   Blob.arrayBuffer: "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadArrayBufferMs,9:F0} ms  <- the actual disk read");
-                Console.WriteLine($"[GGUF-WL]   wrap Uint8Array: "
-                    + $"{SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.ReadWrapMs,9:F0} ms");
-            }
-            Console.WriteLine($"[GGUF-WL] ranged reads: {SpawnDev.WebTorrent.Torrent.ReadRangeCalls} calls, "
-                + $"total {SpawnDev.WebTorrent.Torrent.ReadTotalMs:F0} ms = alloc {SpawnDev.WebTorrent.Torrent.ReadAllocMs:F0}"
-                + $" + setup {SpawnDev.WebTorrent.Torrent.ReadSetupMs:F0}"
-                + $" + store {SpawnDev.WebTorrent.Torrent.ReadStoreMs:F0}"
-                + $" + set {SpawnDev.WebTorrent.Torrent.ReadSetMs:F0} ms");
-            Console.WriteLine($"[GGUF-WL] piece waits: {SpawnDev.WebTorrent.Torrent.EnsureWaited} waited, "
-                + $"{SpawnDev.WebTorrent.Torrent.EnsureImmediate} already present, "
-                + $"{SpawnDev.WebTorrent.Torrent.EnsureWaitMs:F0} ms waiting  <- 100ms poll granularity");
-            SpawnDev.WebTorrent.Storage.AsyncFSChunkStore.TraceReadTiming = false;
+            // ⚠️ The per-read OPFS/torrent breakdown that used to print here (AsyncFSChunkStore read-call
+            // counts, sync-handle open costs, ranged-read and piece-wait timings) came from WebTorrent's
+            // chunk store. It left with the WebTorrent dependency, and it was measuring a store the default
+            // delivery path no longer uses: a model now streams from a plain OPFS file, so there is no chunk
+            // store and no piece to wait on. The read-vs-write split above is the transport-independent part
+            // and is what actually names the bottleneck.
             SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = false;
         }
         onProgress?.Invoke("upload", 100);

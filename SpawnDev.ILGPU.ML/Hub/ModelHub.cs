@@ -8,16 +8,15 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// The model CATALOGUE, HuggingFace metadata, and OPFS cache administration.
 /// </summary>
 /// <remarks>
-/// 🔴 <b>This is NOT how model WEIGHTS should be delivered.</b> Use
-/// <see cref="HubModelStream.OpenAsync"/>, which adds the file as a LAZY-HASH torrent: streamable with
-/// RANDOM ACCESS, cached to OPFS by piece under a stable URL-derived key, resumed and RESTORED on reload
-/// with zero re-download, and seeded to peers. Lazy-hash exists precisely so anything reachable by URL gets
-/// that for free.
+/// 🔴 <b><see cref="LoadAsync"/> is NOT how model WEIGHTS should be delivered.</b> Use
+/// <see cref="OpenStreamAsync"/> (or <see cref="HubModelSource"/> directly), which hands back a seekable
+/// OPFS stream so each weight goes JS-&gt;GPU without ever entering the .NET/WASM managed heap.
 /// <para>
-/// This class PREDATES lazy-hash (this file 2026-03-19, <c>HubModelStream</c> 2026-06-02) and its original
-/// <c>LoadAsync</c> shape returns the whole model as a <c>byte[]</c> - in the browser, onto the
-/// single-threaded WASM heap - and re-downloads whenever the OPFS entry is absent. Those members are now
-/// obsolete FOR WEIGHTS, so reaching for them is a compiler warning rather than a habit.
+/// This class's original <c>LoadAsync</c> shape returns the whole model as a <c>byte[]</c> - in the
+/// browser, onto the single-threaded WASM heap - which is what makes a large load OOM. Those members are
+/// obsolete FOR WEIGHTS, so reaching for them is a compiler warning rather than a habit. They are no longer
+/// a separate cache, though: since the <c>ModelCache</c> removal they download through
+/// <see cref="OpfsModelCache"/> like everything else and simply read the result back as an array.
 /// </para>
 /// <para>
 /// Still the right tool for: <see cref="KnownModels"/> / <see cref="KnownFiles"/> (the repo+file catalogue,
@@ -60,13 +59,9 @@ namespace SpawnDev.ILGPU.ML.Hub;
 /// </summary>
 public class ModelHub : IDisposable
 {
-    private readonly ModelCache _cache;
-
     /// <summary>
-    /// The streaming cache behind <see cref="OpenStreamAsync"/> / <see cref="OpenStreamFromUrlAsync"/>:
-    /// downloads straight from <c>fetch</c> into OPFS with the payload never entering the managed heap.
-    /// <see cref="_cache"/> survives only for the obsolete <c>byte[]</c> methods below; both use the same
-    /// OPFS directory, so there is one store, not two.
+    /// The one cache. Downloads straight from <c>fetch</c> into OPFS with the payload never entering the
+    /// managed heap; the <c>byte[]</c> methods below read back from it rather than keeping a second store.
     /// </summary>
     private readonly OpfsModelCache _streamCache;
 
@@ -89,9 +84,6 @@ public class ModelHub : IDisposable
 
     public ModelHub(SpawnJSRuntime js)
     {
-        _cache = new ModelCache(js);
-        _cache.OnDownloadProgress += (received, total) => OnProgress?.Invoke(received, total);
-        // Same CacheDirectoryName as ModelCache by default, so the two share one OPFS store.
         _streamCache = new OpfsModelCache(js);
         _streamProgress = new Progress<ModelDownloadProgress>(p => OnProgress?.Invoke(p.BytesReceived, p.TotalBytes));
     }
@@ -103,26 +95,52 @@ public class ModelHub : IDisposable
     /// <param name="repoId">Repository ID (e.g., "onnx-community/mobilenetv2-12")</param>
     /// <param name="filename">File within the repo (e.g., "model.onnx" or "onnx/model.onnx")</param>
     /// <param name="revision">Git revision (default: "main")</param>
-    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
+    [Obsolete("Model WEIGHTS must be delivered by OpenStreamAsync (or HubModelSource), which streams from the OPFS cache so each weight goes JS->GPU without entering the managed heap. This materialises the WHOLE model as a byte[] on the single-threaded WASM heap, which is what makes large loads OOM. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public async Task<byte[]> LoadAsync(string repoId, string filename, string revision = "main")
     {
-        // HuggingFace CDN with OPFS cache (SpawnDev.WebTorrent 3.x: P2P hub delivery is via
-        // SpawnDev.WebTorrent.Server.HuggingFace on the server; browser clients use HTTP here).
         // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
         // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
-        var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
-        return await _cache.GetOrFetchAsync(url, cacheKey);
+        return await LoadFromUrlAsync(url, CacheKey(repoId, filename, revision)).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Load a file from any URL with caching.
     /// </summary>
-    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
-    public Task<byte[]> LoadFromUrlAsync(string url, string? cacheKey = null)
+    [Obsolete("Model WEIGHTS must be delivered by OpenStreamAsync (or HubModelSource), which streams from the OPFS cache so each weight goes JS->GPU without entering the managed heap. This materialises the WHOLE model as a byte[] on the single-threaded WASM heap, which is what makes large loads OOM. For a tokenizer or config use LoadSmallFileAsync instead.")]
+    public async Task<byte[]> LoadFromUrlAsync(string url, string? cacheKey = null)
+        => await ReadAllBytesAsync(url, cacheKey).ConfigureAwait(false);
+
+    /// <summary>
+    /// Download-or-read from the OPFS cache and materialise the whole file as a <c>byte[]</c>.
+    /// </summary>
+    /// <remarks>
+    /// The single byte[] path. It used to be a SECOND cache (<c>ModelCache</c>) with its own OPFS
+    /// bookkeeping, its own download loop, and a copy of every chunk onto the managed heap on the way in;
+    /// now the bytes are downloaded once by <see cref="OpfsModelCache"/> - never touching the heap - and
+    /// read back here only for callers that genuinely need an array.
+    /// <para>
+    /// 🔴 Still a whole-file managed allocation, so it is right for a tokenizer or a graph and wrong for
+    /// weights. Weights go through <see cref="OpenStreamAsync"/>.
+    /// </para>
+    /// </remarks>
+    private async Task<byte[]> ReadAllBytesAsync(string url, string? cacheKey)
     {
-        return _cache.GetOrFetchAsync(url, cacheKey);
+        var stream = await _streamCache.OpenOrDownloadAsync(url, cacheKey, _streamProgress).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            var length = stream.Length;
+            if (length > int.MaxValue)
+                throw new IOException($"{url} is {length} bytes - too large to return as a byte[]. Use OpenStreamAsync.");
+            using var ms = new MemoryStream((int)Math.Max(0, length));
+            await stream.CopyToAsync(ms).ConfigureAwait(false);
+            return ms.ToArray();
+        }
     }
+
+    /// <summary>The OPFS cache key for a repo file - shared by every entry point so they hit one entry.</summary>
+    private static string CacheKey(string repoId, string filename, string revision)
+        => $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
 
     /// <summary>
     /// Same as <see cref="LoadAsync"/>, but hands back a SEEKABLE stream whose bytes stay JS-side instead
@@ -173,7 +191,7 @@ public class ModelHub : IDisposable
     /// Load multiple files from a HuggingFace repo (e.g., weights + manifest + graph).
     /// Downloads happen concurrently.
     /// </summary>
-    [Obsolete("Model WEIGHTS must be delivered by HubModelStream.OpenAsync (a LAZY-HASH torrent: streamable with random access, OPFS-cached by piece, resumed and restored on reload with no re-download, seeded to peers). This returns the whole model as a byte[] on the managed heap and re-downloads when the cache entry is absent. For a tokenizer or config use LoadSmallFileAsync instead.")]
+    [Obsolete("Model WEIGHTS must be delivered by OpenStreamAsync (or HubModelSource), which streams from the OPFS cache so each weight goes JS->GPU without entering the managed heap. This materialises the WHOLE model as a byte[] on the single-threaded WASM heap, which is what makes large loads OOM. For a tokenizer or config use LoadSmallFileAsync instead.")]
     public async Task<Dictionary<string, byte[]>> LoadMultipleAsync(
         string repoId, string[] filenames, string revision = "main")
     {
@@ -210,10 +228,7 @@ public class ModelHub : IDisposable
         // Through OUR hub - it caches, it answers with CORS headers a browser accepts, and it keeps us out
         // of HuggingFace's rate limiter. See HuggingFaceClient.GetDownloadUrl.
         var url = HuggingFaceClient.GetDownloadUrl(repoId, filename, revision);
-        var cacheKey = $"hf_{repoId.Replace('/', '_')}_{revision}_{filename.Replace('/', '_')}";
-#pragma warning disable CS0618 // the small-file path is the SUPPORTED use of the byte[] cache
-        return _cache.GetOrFetchAsync(url, cacheKey);
-#pragma warning restore CS0618
+        return ReadAllBytesAsync(url, CacheKey(repoId, filename, revision));
     }
 
     /// <summary>
@@ -451,7 +466,7 @@ public class ModelHub : IDisposable
 
     public void Dispose()
     {
-        _cache.Dispose();
+
         _streamCache.Dispose();
     }
 }

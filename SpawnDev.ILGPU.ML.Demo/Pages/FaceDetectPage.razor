@@ -103,7 +103,7 @@ using var hub = new ModelHub(JS);
 // by piece, restored on reload with no re-download, and seeded to peers.
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
     accelerator, hub, ModelHub.KnownModels.BlazeFace, "model.tflite",
-    webTorrent: Torrents, http: Http);
+    http: Http);
 var pipe = new FaceDetectionPipeline(session, accelerator);
 
 // Detect — boxes + landmarks + confidence per frame, on-device
@@ -127,7 +127,6 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -160,7 +159,7 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
             // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, Hub.ModelHub.KnownModels.BlazeFace, "model.tflite",
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _pipeline = new Pipelines.FaceDetectionPipeline(session, _accelerator);
 
             _isModelLoaded = true;

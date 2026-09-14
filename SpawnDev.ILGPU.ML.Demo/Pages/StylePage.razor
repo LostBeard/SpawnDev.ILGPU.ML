@@ -203,7 +203,7 @@ using var hub = new ModelHub(JS);
 // by piece, restored on reload with no re-download, and seeded to peers.
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
     accelerator, hub, ModelHub.KnownModels.StyleMosaic, "mosaic-9.onnx",
-    webTorrent: Torrents, http: Http);
+    http: Http);
 var pipeline = new StyleTransferPipeline(session, accelerator);
 
 // Stylize an RGBA image — runs entirely on the GPU (TransferGpuAsync keeps the result GPU-side)

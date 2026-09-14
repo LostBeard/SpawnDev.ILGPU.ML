@@ -148,7 +148,7 @@ using var hub = new ModelHub(JS);
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
     accelerator, hub, ModelHub.KnownModels.DepthAnythingV2Small, ModelHub.KnownFiles.OnnxModel,
     inputShapes: new() { ["pixel_values"] = new[] { 1, 3, 518, 518 } },
-    webTorrent: Torrents, http: Http);
+    http: Http);
 var pipe = new DepthEstimationPipeline(session, accelerator, inputSize: 518);
 
 // Estimate depth — the colormapped result STAYS on the GPU and is presented straight to a canvas (zero readback)
@@ -173,7 +173,6 @@ await renderer.PresentAsync(depthBuffer);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -209,7 +208,7 @@ await renderer.PresentAsync(depthBuffer);
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.DepthAnythingV2Small, ModelHub.KnownFiles.OnnxModel,
                 inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 3, 518, 518 }, },
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _pipeline = new DepthEstimationPipeline(session, _accelerator, inputSize: 518);
 
             _isModelLoaded = true;

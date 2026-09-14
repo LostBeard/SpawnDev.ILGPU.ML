@@ -16,7 +16,6 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class StylePage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private InferenceSession? _session;
@@ -82,7 +81,7 @@ public partial class StylePage : IDisposable
             // by piece, restored on reload with no re-download, and seeded to peers.
             _session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, styleRepo, $"{modelName}-9.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _pipeline = new StyleTransferPipeline(_session, _accelerator);
 
             _isModelLoaded = true;

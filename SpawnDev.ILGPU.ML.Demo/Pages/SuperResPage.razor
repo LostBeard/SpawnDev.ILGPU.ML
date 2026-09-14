@@ -138,7 +138,7 @@ using var hub = new ModelHub(JS);
 // by piece, restored on reload with no re-download, and seeded to peers.
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
     accelerator, hub, ModelHub.KnownModels.SuperResolution, "super-resolution-10.onnx",
-    webTorrent: Torrents, http: Http);
+    http: Http);
 var pipeline = new SuperResolutionPipeline(session, accelerator);
 
 // Upscale an RGBA image — runs entirely on the GPU

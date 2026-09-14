@@ -154,7 +154,7 @@ using var hub = new ModelHub(JS);
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
     accelerator, hub, ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel,
     inputShapes: new() { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 } },
-    webTorrent: Torrents, http: Http);
+    http: Http);
 var pipeline = new FeatureExtractionPipeline(session, accelerator, maxLength: 128, hiddenSize: 768);
 
 // Embed two sentences and compare by meaning — runs entirely on the GPU
@@ -181,7 +181,6 @@ const similarity = cos_sim(a.data, b.data);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -216,7 +215,7 @@ const similarity = cos_sim(a.data, b.data);
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel,
                 inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 }, },
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _pipeline = new FeatureExtractionPipeline(session, _accelerator, maxLength: 128, hiddenSize: 768);
 
             // Real WordPiece tokenizer from the model's own tokenizer.json (NOT the old word-hash) so the

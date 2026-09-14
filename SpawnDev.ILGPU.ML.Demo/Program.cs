@@ -37,12 +37,8 @@ builder.Services.AddSingleton<WebTorrentClient>(sp =>
     return client;
 });
 
-// Shared OPFS model cache (browser). One instance so every demo + the cache-management page see the same
-// cached models. ModelCache reads/writes the persistent OPFS "ilgpu-ml-models" dir, so even multiple
-// instances would share storage — but a singleton gives the management UI a single source to query/purge.
-builder.Services.AddSingleton<SpawnDev.ILGPU.ML.Hub.ModelCache>();
-
 // Model delivery: plain HTTP through the hub, cached in OPFS. No WebTorrent.
+// One instance so every demo AND the cache-management page see the same cached models.
 // ⚠️ MUST be a singleton, and demos must INJECT it rather than newing their own. Two reasons:
 //   1. The cache page reports downloads in flight (HubModelSource.ActiveDownloads). A per-page source only
 //      knows about its own, which is precisely the wrong answer for a cache UI.

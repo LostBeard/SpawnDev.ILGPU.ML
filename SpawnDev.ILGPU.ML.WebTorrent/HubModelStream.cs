@@ -51,7 +51,10 @@ public class HubModelStream : IModelSource
         => FetchBytesAsync(repoId, filePath, cancellationToken);
 
     /// <summary>The public SpawnDev hub running the HuggingFace proxy.</summary>
-    public const string DefaultHubBaseUrl = "https://hub.spawndev.com:44365";
+    /// <remarks>Now defined by <see cref="HuggingFaceClient"/> - the hub is where models come from
+    /// regardless of transport, so the address must not live in the WebTorrent adapter. Kept as an alias so
+    /// existing callers of <c>HubModelStream.DefaultHubBaseUrl</c> keep compiling.</remarks>
+    public const string DefaultHubBaseUrl = HuggingFaceClient.DefaultHubBaseUrl;
 
     private readonly WebTorrentClient _client;
     private readonly HttpClient _http;

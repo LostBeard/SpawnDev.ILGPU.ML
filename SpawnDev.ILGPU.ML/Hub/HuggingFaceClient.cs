@@ -150,7 +150,18 @@ public class HuggingFaceClient
     /// <c>HttpRequestException: Response status code does not indicate success: 429 (Too Many Requests)</c>
     /// purely because it built an huggingface.co URL itself.
     /// </remarks>
-    public static string HubBaseUrl { get; set; } = HubModelStream.DefaultHubBaseUrl;
+    public static string HubBaseUrl { get; set; } = DefaultHubBaseUrl;
+
+    /// <summary>
+    /// The public SpawnDev hub running the HuggingFace + Ollama proxies.
+    /// </summary>
+    /// <remarks>
+    /// Lives here rather than on a delivery class: the hub is where models come from regardless of how they
+    /// are fetched. It used to be <c>HubModelStream.DefaultHubBaseUrl</c>, which meant the base URL for
+    /// plain HTTP delivery was defined by the WebTorrent adapter - so ML could not stop referencing
+    /// WebTorrent without losing the address of its own hub.
+    /// </remarks>
+    public const string DefaultHubBaseUrl = "https://hub.spawndev.com:44365";
 
     /// <summary>
     /// Get a download URL for a file in a HuggingFace repository, THROUGH THE HUB.

@@ -157,9 +157,9 @@
 using var hub = new ModelHub(JS);
 // Weights stream as a LAZY-HASH torrent: random access, OPFS-cached by piece, seeded to peers
 var encoder = await InferenceSession.CreateFromHuggingFaceAsync(accelerator, hub,
-    ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx", webTorrent: Torrents, http: Http);
+    ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx", http: Http);
 var decoder = await InferenceSession.CreateFromHuggingFaceAsync(accelerator, hub,
-    ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx", webTorrent: Torrents, http: Http);
+    ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx", http: Http);
 var pipeline = new SpeechRecognitionPipeline(encoder, decoder, accelerator);
 pipeline.LoadTokenizer(tokenizerJson);
 
@@ -188,7 +188,6 @@ const out = await pipe(audio);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -225,7 +224,7 @@ const out = await pipe(audio);
             // by piece, restored on reload with no re-download, and seeded to peers.
             var encoderSession = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
 
             // Load decoder
             _modelProgress = 60;
@@ -234,7 +233,7 @@ const out = await pipe(audio);
             // by piece, restored on reload with no re-download, and seeded to peers.
             var decoderSession = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
 
             // Optional KV-cache decoder. Without it every decode step re-feeds the whole token prefix, so
             // decoding is quadratic - absence costs SPEED, not correctness, and a repo lacking the file
@@ -246,7 +245,7 @@ const out = await pipe(audio);
             {
                 decoderWithPast = await InferenceSession.CreateFromHuggingFaceAsync(
                     _accelerator, hub, ModelHub.KnownModels.WhisperTiny, "onnx/decoder_with_past_model.onnx",
-                    webTorrent: Torrents, http: Http);
+                    http: Http);
             }
             catch (Exception ex)
             {

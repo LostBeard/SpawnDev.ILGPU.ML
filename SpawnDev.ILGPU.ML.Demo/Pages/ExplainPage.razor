@@ -177,7 +177,6 @@
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -211,7 +210,7 @@
             // by piece, restored on reload with no re-download, and seeded to peers.
             _session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _pipeline = new SpawnDev.ILGPU.ML.Pipelines.ClassificationPipeline(_session, _accelerator);
             _isModelLoaded = true;
             StateHasChanged();

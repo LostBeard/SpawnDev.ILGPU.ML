@@ -14,7 +14,6 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class SentimentPage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private Context? _context;
@@ -68,7 +67,7 @@ public partial class SentimentPage : IDisposable
             // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.DistilBertSST2, "onnx/model.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _pipeline = new TextClassificationPipeline(session, _accelerator);
 
             _isModelLoaded = true;

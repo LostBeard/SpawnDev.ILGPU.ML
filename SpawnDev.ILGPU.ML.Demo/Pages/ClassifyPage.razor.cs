@@ -13,7 +13,6 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 public partial class ClassifyPage : IDisposable
 {
     [Inject] SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private ClassificationService? _classService;
@@ -66,7 +65,7 @@ public partial class ClassifyPage : IDisposable
             // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.SqueezeNet, "squeezenet1.1-7.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
             _classService = new ClassificationService(Http);
             _classService.UseSession(session, _accelerator);
 

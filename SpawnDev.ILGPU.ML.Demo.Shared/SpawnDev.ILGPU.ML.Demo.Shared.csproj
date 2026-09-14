@@ -14,6 +14,10 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+		<!-- Optional WebTorrent delivery. SpawnDev.ILGPU.ML no longer references WebTorrent; the test
+		     project keeps this so the torrent IModelSource stays exercised by the suite. It also supplies
+		     SpawnDev.AsyncFileSystem, which these tests used to get transitively through ML. -->
+		<ProjectReference Include="..\SpawnDev.ILGPU.ML.WebTorrent\SpawnDev.ILGPU.ML.WebTorrent.csproj" />
 	</ItemGroup>
 
   <ItemGroup>

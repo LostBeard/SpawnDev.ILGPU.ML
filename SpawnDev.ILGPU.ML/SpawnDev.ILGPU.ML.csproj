@@ -36,7 +36,6 @@
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.17" />
 		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.11" />
-		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.7" />
 	</ItemGroup>
 
 	<ItemGroup>

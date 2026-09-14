@@ -204,7 +204,7 @@
     }
 
     [Inject] HttpClient Http { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
+    [Inject] SpawnDev.ILGPU.ML.Hub.HubModelSource ModelSource { get; set; } = default!;
 
     private InspectionResult? _inspectionResult;
     private CompatibilityResult? _compatResult;
@@ -230,14 +230,19 @@
             // into this box was asking the browser to OOM; the CLIPVision reference test did exactly that and
             // died with OutOfMemoryException inside HttpContent's array-pool write stream.
             //
-            // HubModelStream adds the file as a lazy-hash torrent and hands back a SEEKABLE stream, so the
-            // inspector seeks past every weight blob and downloads only the few hundred KB of graph
-            // structure. Bytes stay JS-side; .NET sees the structure it actually needs.
+            // Ranged HTTP against the hub: the inspector seeks past every weight blob, so only the few
+            // hundred KB of graph structure is fetched.
+            // ⚠️ OpenForInspectionAsync, NOT OpenAsync - OpenAsync would download and CACHE the whole model
+            // just to read its graph. Inspecting is not loading.
             _customResult = $"Reading structure of {_customRepoId}/{_customFilename} via the hub...";
             StateHasChanged();
 
-            var hub = new SpawnDev.ILGPU.ML.Hub.HubModelStream(Torrents, Http);
-            var (inspection, compat) = await hub.InspectWithCompatibilityAsync(_customRepoId, _customFilename);
+            var structure = await ModelSource.OpenForInspectionAsync(_customRepoId, _customFilename);
+            (InspectionResult inspection, CompatibilityResult compat) result;
+            await using (structure.ConfigureAwait(false))
+                result = await SpawnDev.ILGPU.ML.Onnx.ModelInspectorHelper
+                    .InspectWithCompatibilityAsync(structure);
+            var (inspection, compat) = result;
             _inspectionResult = inspection;
             _compatResult = compat;
 

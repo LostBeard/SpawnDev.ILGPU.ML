@@ -269,7 +269,6 @@
     private List<ChatMessage> _messages = new();
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
     private global::ILGPU.Context? _context;
@@ -299,7 +298,7 @@
             // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "onnx/decoder_model.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
 
             var tokenizerBytes = await hub.LoadSmallFileAsync(
                 SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");

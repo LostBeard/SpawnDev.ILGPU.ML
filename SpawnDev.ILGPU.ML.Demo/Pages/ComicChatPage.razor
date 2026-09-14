@@ -230,7 +230,6 @@
     private int _nextCharId = 3;
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
     private SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline? _textGenPipeline;
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -259,7 +258,7 @@
             // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await SpawnDev.ILGPU.ML.InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "onnx/decoder_model.onnx",
-                webTorrent: Torrents, http: Http);
+                http: Http);
             var tokenizerBytes = await hub.LoadSmallFileAsync(
                 SpawnDev.ILGPU.ML.Hub.ModelHub.KnownModels.DistilGPT2, "tokenizer.json");
             _textGenPipeline = new SpawnDev.ILGPU.ML.Pipelines.TextGenerationPipeline(session, _accelerator);

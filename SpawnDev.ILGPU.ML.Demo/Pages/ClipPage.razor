@@ -134,7 +134,6 @@ const out = await pipe(imageUrl, labels);
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
-    [Inject] SpawnDev.WebTorrent.WebTorrentClient Torrents { get; set; } = default!;
     [Inject] HttpClient Http { get; set; } = default!;
 
     private global::ILGPU.Runtime.Accelerator? _accelerator;
@@ -171,7 +170,7 @@ const out = await pipe(imageUrl, labels);
             // by piece, restored on reload with no re-download, and seeded to peers.
             var visionSession = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxVisionModel,
-                webTorrent: Torrents, http: Http);
+                http: Http);
 
             // Load CLIP text model
             _modelProgress = 60;
@@ -180,7 +179,7 @@ const out = await pipe(imageUrl, labels);
             // by piece, restored on reload with no re-download, and seeded to peers.
             var textSession = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, ModelHub.KnownModels.CLIPVitB32, ModelHub.KnownFiles.OnnxTextModel,
-                webTorrent: Torrents, http: Http);
+                http: Http);
 
             // Load tokenizer
             _modelProgress = 90;

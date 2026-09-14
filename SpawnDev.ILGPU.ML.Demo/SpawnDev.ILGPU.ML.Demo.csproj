@@ -49,6 +49,10 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+		<!-- Optional WebTorrent delivery. SpawnDev.ILGPU.ML no longer references WebTorrent; the demo keeps
+		     this so the torrent path stays available and tested. Delivery DEFAULTS to HubModelSource (plain
+		     HTTP + OPFS) - nothing here requires a WebTorrentClient to load a model. -->
+		<ProjectReference Include="..\SpawnDev.ILGPU.ML.WebTorrent\SpawnDev.ILGPU.ML.WebTorrent.csproj" />
 		<ProjectReference Include="..\SpawnDev.ILGPU.ML.Demo.Shared\SpawnDev.ILGPU.ML.Demo.Shared.csproj" />
 	</ItemGroup>
 

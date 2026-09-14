@@ -1,0 +1,47 @@
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<Version>5.2.13</Version>
+		<PackageReleaseNotes>v5.2.13 - Initial release. WebTorrent model delivery for SpawnDev.ILGPU.ML, split out of the main package so ML no longer depends on SpawnDev.WebTorrent. Provides HubModelStream, an IModelSource that delivers models as lazy-hash torrents - swap it in wherever HubModelSource is used to get P2P delivery with no other changes.</PackageReleaseNotes>
+		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<EmbedAllSources>true</EmbedAllSources>
+		<DebugType>Embedded</DebugType>
+		<Title>SpawnDev.ILGPU.ML.WebTorrent</Title>
+		<Authors>LostBeard</Authors>
+		<Description>WebTorrent model delivery for SpawnDev.ILGPU.ML. Supplies HubModelStream, an IModelSource that streams models from the SpawnDev hub as lazy-hash torrents - seekable, cached to OPFS by piece, resumed across reloads and seeded to peers. Optional: SpawnDev.ILGPU.ML delivers models over plain HTTP by default and does not depend on WebTorrent.</Description>
+		<PackageProjectUrl>https://github.com/LostBeard/SpawnDev.ILGPU.ML</PackageProjectUrl>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageLicenseFile>LICENSE.txt</PackageLicenseFile>
+		<PackageIcon>icon-128.png</PackageIcon>
+		<RepositoryUrl>https://github.com/LostBeard/SpawnDev.ILGPU.ML.git</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageTags>Blazor;BlazorWebAssembly;WebAssembly;WebTorrent;P2P;MachineLearning;ILGPU;ModelDelivery</PackageTags>
+		<NoPackageAnalysis>true</NoPackageAnalysis>
+		<EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+		<IsPackable>true</IsPackable>
+		<LangVersion>latest</LangVersion>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Include="..\SpawnDev.ILGPU.ML\Assets\icon-128.png" Pack="true" PackagePath="\" />
+		<None Include="..\LICENSE.txt" Pack="true" PackagePath="\" />
+		<None Include="..\README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.7" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<SupportedPlatform Include="browser" />
+	</ItemGroup>
+
+</Project>
