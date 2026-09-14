@@ -989,10 +989,21 @@ public class GraphExecutor : IDisposable
                 var runIn = new int[nodeInputs.Length][];
                 for (int k = 0; k < nodeInputs.Length; k++)
                 {
+                    // 🔴 AN ABSENT OPTIONAL INPUT IS NOT AN UNKNOWN ONE. This abandoned runtime
+                    // re-inference entirely the moment ANY input was null - and ONNX is full of
+                    // legitimately omitted optional inputs, so the operators most likely to need
+                    // re-inference were the least likely to get it.
+                    // MEASURED on Kokoro: LSTM declares `sequence_lens` and the model omits it, so a
+                    // bidirectional LSTM fed [35,1,640] kept its compile-time Y shape of [1,2,1,256] - the
+                    // sequence collapsed from 35 to 1, and every shape downstream inherited it. The failure
+                    // surfaced 500 nodes later, in the vocoder, as an unrelated-looking broadcast error.
+                    // ⚠️ Empty is exactly what GraphCompiler passes for an omitted input
+                    // (Array.Empty<int>()), so the compile-time and runtime bases stay directly comparable
+                    // and an absent input can never read as "changed".
                     var t = nodeInputs[k];
-                    if (t == null) { allKnown = false; break; }
-                    runIn[k] = t.Shape;
-                    if (k >= ctIn.Length || ctIn[k] == null || !ctIn[k].AsSpan().SequenceEqual(t.Shape))
+                    var rs = t?.Shape ?? Array.Empty<int>();
+                    runIn[k] = rs;
+                    if (k >= ctIn.Length || ctIn[k] == null || !ctIn[k].AsSpan().SequenceEqual(rs))
                         basisChanged = true;
                 }
                 if (allKnown && basisChanged)
@@ -2828,10 +2839,21 @@ public class GraphExecutor : IDisposable
                 var runIn = new int[nodeInputs.Length][];
                 for (int k = 0; k < nodeInputs.Length; k++)
                 {
+                    // 🔴 AN ABSENT OPTIONAL INPUT IS NOT AN UNKNOWN ONE. This abandoned runtime
+                    // re-inference entirely the moment ANY input was null - and ONNX is full of
+                    // legitimately omitted optional inputs, so the operators most likely to need
+                    // re-inference were the least likely to get it.
+                    // MEASURED on Kokoro: LSTM declares `sequence_lens` and the model omits it, so a
+                    // bidirectional LSTM fed [35,1,640] kept its compile-time Y shape of [1,2,1,256] - the
+                    // sequence collapsed from 35 to 1, and every shape downstream inherited it. The failure
+                    // surfaced 500 nodes later, in the vocoder, as an unrelated-looking broadcast error.
+                    // ⚠️ Empty is exactly what GraphCompiler passes for an omitted input
+                    // (Array.Empty<int>()), so the compile-time and runtime bases stay directly comparable
+                    // and an absent input can never read as "changed".
                     var t = nodeInputs[k];
-                    if (t == null) { allKnown = false; break; }
-                    runIn[k] = t.Shape;
-                    if (k >= ctIn.Length || ctIn[k] == null || !ctIn[k].AsSpan().SequenceEqual(t.Shape))
+                    var rs = t?.Shape ?? Array.Empty<int>();
+                    runIn[k] = rs;
+                    if (k >= ctIn.Length || ctIn[k] == null || !ctIn[k].AsSpan().SequenceEqual(rs))
                         basisChanged = true;
                 }
                 if (allKnown && basisChanged)
@@ -3802,6 +3824,23 @@ public class GraphExecutor : IDisposable
                 // being lumped into the next periodic 64-node sync. Significant perf cost;
                 // only useful for kernel-bisection debugging.
                 if (PerOpSync) await _accelerator.SynchronizeAsync();
+                // 🔴 THE SHAPES THAT ACTUALLY EXIST, printed AFTER the node ran. The line above this loop
+                // prints node.OutputShapes, which is a COMPILE-TIME PREDICTION - and when a graph goes
+                // wrong on a dynamic length the prediction is exactly the thing that is lying. Tracing a
+                // Kokoro failure, every compile-time line read [1,128,121] while the tensors were
+                // [1,128,4201] and [1,128,5]; the trace agreed with itself all the way down and pointed
+                // nowhere. Runtime shapes name the node where the two diverged.
+                if (VerboseLogging)
+                {
+                    // Inputs as well as outputs: a shape that is wrong here was either produced wrong by
+                    // the node above or predicted wrong for this one, and only the pair distinguishes them.
+                    var ins = string.Join(", ", nodeInputs.Select(t =>
+                        t == null ? "null" : $"[{string.Join(",", t.Shape)}]"));
+                    var actual = string.Join(", ", nodeOutputs.Select(t =>
+                        t == null ? "null" : $"[{string.Join(",", t.Shape)}]"));
+                    Console.WriteLine($"[GraphExecutor]   runtime {nodeIdx} {node.OpType} ({ins}) -> {actual}");
+                    Console.Out.Flush();
+                }
                 if (sw != null && CapturedNodeTimingsMs != null && node.OutputNames.Length > 0)
                 {
                     sw.Stop();

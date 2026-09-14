@@ -52,6 +52,14 @@ public class FusedLinearKernel
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int>? _fusedLinearSigmoidKernel;
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int>? _fusedLinearTanhKernel;
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int>? _fusedLinearNoneKernel;
 
     public FusedLinearKernel(Accelerator accelerator) => _accelerator = accelerator;
@@ -122,13 +130,50 @@ public class FusedLinearKernel
                 _fusedLinearSiluKernel(M * N, input, weights, bias, output, M, K, N);
                 break;
 
-            default: // None
+            // 🔴 SIGMOID AND TANH USED TO FALL INTO `default` AND BE DROPPED IN SILENCE. FusedActivation
+            // declares them, FusedLinearOperator maps the strings to them, and GraphOptimizer happily
+            // fuses MatMul -> Add -> Sigmoid into a node carrying activation="Sigmoid" - and then this
+            // switch applied NO activation and returned the raw linear output. Nothing threw; the model
+            // simply computed something else.
+            //
+            // MEASURED on Kokoro, where it lands on the duration predictor: the "sigmoid" output ranged
+            // +38 to -38 instead of (0,1), the ReduceSum over it gave ~-1200 per token, Round produced
+            // -1200 and Clip(min=1) turned EVERY duration into 1. Every token got one frame, so 35 tokens
+            // produced 35 frames instead of 182 - a third of a second of audio instead of two seconds,
+            // with no error anywhere. A fused activation that is declared, mapped, and then ignored is the
+            // worst shape this bug can take.
+            case FusedActivation.Sigmoid:
+                _fusedLinearSigmoidKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int, int, int>(FusedLinearSigmoidImpl);
+                _fusedLinearSigmoidKernel(M * N, input, weights, bias, output, M, K, N);
+                break;
+
+            case FusedActivation.Tanh:
+                _fusedLinearTanhKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                    int, int, int>(FusedLinearTanhImpl);
+                _fusedLinearTanhKernel(M * N, input, weights, bias, output, M, K, N);
+                break;
+
+            case FusedActivation.None:
                 _fusedLinearNoneKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                     ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
                     int, int, int>(FusedLinearNoneImpl);
                 _fusedLinearNoneKernel(M * N, input, weights, bias, output, M, K, N);
                 break;
+
+            // ⚠️ NOT `default: // None`. Treating an unknown activation as "no activation" is what made
+            // the above silent: a new FusedActivation member would be fused in by the optimizer and then
+            // quietly discarded here. An activation this kernel cannot perform must refuse to run.
+            default:
+                throw new NotSupportedException(
+                    $"FusedLinear cannot apply activation '{activation}'. GraphOptimizer only fuses an "
+                    + "activation this kernel implements, so reaching here means the two have drifted - "
+                    + "add the kernel rather than letting the activation be dropped.");
         }
     }
 
@@ -225,6 +270,48 @@ public class FusedLinearKernel
         float x = sum + bias[col];
         // SiLU = x * sigmoid(x)
         output[idx] = x / (1f + MathF.Exp(-x));
+    }
+
+    private static void FusedLinearSigmoidImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weights,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N)
+    {
+        int row = idx / N;
+        int col = idx % N;
+
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += input[row * K + k] * weights[k * N + col];
+
+        float x = sum + bias[col];
+        // ⚠️ CLAMPED. exp(-x) overflows to +inf for x below about -88 in fp32, giving 1/inf = 0 - which is
+        // the right ANSWER here, but the same expression at large +x underflows the other way and some
+        // backends return NaN rather than 0 from inf arithmetic. The saturating branches are exact to
+        // fp32 well inside these bounds, so clamping costs nothing and removes the backend dependence.
+        // (Same reasoning as the GELU clamp this file's header documents.)
+        output[idx] = x >= 30f ? 1f : x <= -30f ? 0f : 1f / (1f + MathF.Exp(-x));
+    }
+
+    private static void FusedLinearTanhImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> weights,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int M, int K, int N)
+    {
+        int row = idx / N;
+        int col = idx % N;
+
+        float sum = 0f;
+        for (int k = 0; k < K; k++)
+            sum += input[row * K + k] * weights[k * N + col];
+
+        float x = sum + bias[col];
+        // tanh saturates to +-1 well before fp32 range problems; clamped for the same reason as above.
+        output[idx] = x >= 20f ? 1f : x <= -20f ? -1f : MathF.Tanh(x);
     }
 
     // ── Native low-precision weight path (bf16 / fp16 / FP8) ──

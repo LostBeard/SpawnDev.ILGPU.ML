@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Operators;
@@ -363,7 +363,12 @@ public class InferenceSession : IDisposable
                                 // <=64 elements: at most 256 bytes cross the boundary per tensor.
                                 var hostBuf = await view.Value.SubView(0, elems).CopyToHostAsync<float, Stride1D.Dense>();
                                 constantFloatValues[name] = hostBuf;
+                                // ⚠️ FloatConstantData TOO. ConstantData is int[] and truncates - a consumer that
+                                // needs the exact value (strength reduction, Resize scale chains, an epsilon)
+                                // must never be left with only the truncated copy. See GraphOptimizer.
                                 modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                                modelGraph.FloatConstantData ??= new Dictionary<string, float[]>();
+                                modelGraph.FloatConstantData[name] = hostBuf.ToArray();
                             }
                             else
                             {
@@ -375,7 +380,12 @@ public class InferenceSession : IDisposable
                                 await accelerator.SynchronizeAsync();
                                 var hostBuf = await readBuf.CopyToHostAsync<float>(0, elems);
                                 constantFloatValues[name] = hostBuf;
+                                // ⚠️ FloatConstantData TOO. ConstantData is int[] and truncates - a consumer that
+                                // needs the exact value (strength reduction, Resize scale chains, an epsilon)
+                                // must never be left with only the truncated copy. See GraphOptimizer.
                                 modelGraph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                                modelGraph.FloatConstantData ??= new Dictionary<string, float[]>();
+                                modelGraph.FloatConstantData[name] = hostBuf.ToArray();
                             }
                         }
                     }
@@ -483,7 +493,10 @@ public class InferenceSession : IDisposable
                     tensor.Data.SubView(0, elems).CopyToCPU(hostBuf);
                     accelerator.Synchronize();
                     constantFloatValues[name] = hostBuf;
+                    // ⚠️ FloatConstantData TOO - see the note above; ConstantData is int[] and truncates.
                     graph.ConstantData[name] = hostBuf.Select(v => v < int.MinValue ? int.MinValue : v > int.MaxValue ? int.MaxValue : (int)v).ToArray();
+                    graph.FloatConstantData ??= new Dictionary<string, float[]>();
+                    graph.FloatConstantData[name] = hostBuf.ToArray();
                 }
             }
         }

@@ -2,6 +2,75 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.14
+
+### Added - Kokoro-82M text to speech, and it is 12x faster than the TTS it replaces
+
+`KokoroPipeline`, `KokoroVoicePack`, `KokoroTokenizer` and the 115-symbol vocabulary. One pass through a
+2,464-node graph; 49 operator types, all already supported.
+
+MEASURED against onnxruntime on an RTX 4070 (CUDA), "The capital of France is Paris.", voice `af_heart`:
+
+| | |
+| --- | --- |
+| waveform correlation vs onnxruntime | **0.9936** (0.9951 on a 7.35 s line) |
+| best-fit gain | 1.00 |
+| sample count | exact |
+| realtime factor | **0.30x** - 3.3x faster than realtime |
+
+For contrast, ZipVoice - the TTS this is for - measured **3.6x SLOWER than realtime** (73.0 s of compute
+for 20.4 s of audio): its `fm_decoder` is 8,621 nodes and runs four times per utterance.
+
+⚠️ The fp32 export is the one to use. The published **fp16** export correlates only **0.918** against
+fp32 - a bigger deviation than this engine's entire remaining error - so the 2x smaller download costs
+real quality. Measured, not assumed.
+
+New API: `KokoroPipeline.CreateFromStreamAsync` (the browser path - the fp32 model is ~326 MB and must not
+cross the WASM managed heap), `SpeakTokensAsync` (synthesise from ids, skipping the front end),
+`KokoroVoicePack.EnglishVoiceNames` (28 voices, each verified present and 522,240 bytes).
+
+### Fixed - seven silent defects the port found, none of which threw
+
+Every one produced a full, correctly-shaped, plausible buffer. Each is a class, not an incident:
+
+- **`Add(x, epsilon)` was deleted from every normalisation.** `GraphOptimizer.StrengthReduce` proved
+  "this is an add by zero" from `ConstantData`, which is `int[]` - so `1e-5` read back as `0`, and `1.9`
+  read back as `1` for the matching `Mul` rule. It now reads `FloatConstantData` and declines to optimize
+  a constant it cannot see exactly. Three `InferenceSession` load paths also populated only the truncated
+  copy; they now populate both. Waveform correlation 0.45 -> 0.95.
+- **The exported longhand `atan2` is not atan2.** ONNX has no Atan2, so exporters emit
+  `Div -> Atan -> Greater/Less -> Add/Sub -> Where -> Where`; at `y == +0, x < 0` its `y > 0` test is
+  false and it returns `-pi` where atan2 returns `+pi`. The DC and Nyquist bins of the STFT of a REAL
+  signal have an exactly zero imaginary part, so an entire phase channel took the wrong sign. New
+  `FusedAtan2` operator and `GraphOptimizer.FuseAtan2` pass: correlation 0.9503 -> 0.9936, and seven
+  nodes become one. It is also far better conditioned - `y/x` overflows as x approaches zero.
+- **`FusedLinear` dropped Sigmoid and Tanh.** Both are declared in `FusedActivation`, both are mapped by
+  `FusedLinearOperator`, and the kernel's switch let them fall into `default: // None` and applied no
+  activation at all. On Kokoro's duration predictor the "sigmoid" ranged +-38 instead of (0,1) and every
+  phoneme duration clamped to 1 - 35 frames of audio instead of 182. `default:` now throws.
+- **`ConvTranspose`'s zero-bias rental was never zeroed.** `BufferPool.Rent` does not zero, and this is
+  the first ConvTranspose in practice with no bias input (an iSTFT's inverse basis). 0.333 from a previous
+  tenant was added to all 54,620 output samples.
+- **STFT's frame step is an INPUT value, which shape inference cannot see**, so it defaulted to a hop of
+  128: 5 frames where the model wanted 121. Folded at compile time as `_resolved_frame_step` /
+  `_resolved_frame_length`, the same mechanism `Pad` already used.
+- **Runtime shape re-inference was abandoned whenever ANY input was null** - and ONNX is full of
+  legitimately omitted optional inputs, so the operators most likely to need re-inference were the least
+  likely to get it. A bidirectional LSTM with `sequence_lens` absent kept a compile-time `[1,2,1,256]`
+  while it was fed `[35,1,640]`. An absent optional input is now `Array.Empty<int>()`, which is exactly
+  what the compiler records for one, so the two bases stay comparable.
+- **`Resize` was rank-4 only and `ConvTranspose` was 2-D only.** Both now handle rank 3; new
+  `ConvTranspose1DKernel` (gather form, no atomics), oracle-checked against onnxruntime.
+
+### Added - a Node/onnxruntime oracle for numerically sensitive graphs
+
+`tools/onnx-nodes.mjs`, `onnx-intermediates.mjs`, `op-oracle.mjs`, `onnx-perturb.mjs`, `onnx-inject.mjs`
+plus `f32diff.mjs` / `f32bins.mjs`. `perturb` answers "is the number I am seeing the FLOOR?" by adding
+noise of your measured error to the REFERENCE engine's own tensor; `inject` answers "is the rest of my
+graph right given what I feed it?" by splicing our tensor into the reference. Both were necessary here:
+this model's vocoder takes atan2 of an STFT whose quiet bins are near zero, so perturbing onnxruntime's
+own spectrogram by one part in 1e6 moves its waveform to 0.974 against itself. See `tools/README.md`.
+
 ## 5.2.13
 
 ### Changed - BREAKING: model delivery no longer uses WebTorrent

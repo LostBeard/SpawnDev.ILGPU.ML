@@ -798,10 +798,23 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
             int inC1 = x.Shape[1], inL = x.Shape[2];
             int outC1 = ctx.Outputs[0].Shape[1], kL = w.Shape[2];
 
+            // 🔴 A RENTED BUFFER IS NOT A ZEROED BUFFER, and this is the first ConvTranspose in practice
+            // that has no bias at all - an iSTFT's inverse_basis node. MEASURED on Kokoro: the pool handed
+            // back a buffer holding 0.3333 from a previous tenant, that value was added to EVERY one of
+            // the 54,620 output samples, and the waveform came out as a constant with the audio buried
+            // under it (correlation with the reference: 0.0017). Nothing threw, and the shape was right.
             Tensor? zeroBias1 = null;
-            var bias1 = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
-                ? ctx.Inputs[2].Data
-                : (zeroBias1 = ctx.Pool.Rent(new[] { outC1 }, "_convt1d_zero_bias")).Data;
+            ArrayView1D<float, Stride1D.Dense> bias1;
+            if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
+            {
+                bias1 = ctx.Inputs[2].Data;
+            }
+            else
+            {
+                zeroBias1 = ctx.Pool.Rent(new[] { outC1 }, "_convt1d_zero_bias");
+                zeroBias1.Data.MemSetToZero();
+                bias1 = zeroBias1.Data;
+            }
             reg.ConvTranspose1D.Forward(x.Data, w.Data, bias1, ctx.Outputs[0].Data,
                 x.Shape[0], inC1, inL, outC1, kL,
                 s.Length > 0 ? s[0] : 1,
@@ -823,10 +836,21 @@ public class ConvTransposeOperator(OperatorRegistry reg) : IOnnxOperator
         // Always provide a valid bias buffer — no conditional branch in kernel.
         // ANGLE's HLSL optimizer changes FP evaluation when a branch precedes
         // the accumulation loop, causing 0.009 error on WebGL.
+        // ⚠️ ZEROED, for the same reason as the 1-D path above: Rent returns whatever the previous tenant
+        // left, and a stale value here is added to every output element. Latent in 2-D only because a
+        // 2-D ConvTranspose almost always carries a bias.
         Tensor? zeroBias = null;
-        var bias = ctx.Inputs.Length > 2 && ctx.Inputs[2] != null
-            ? ctx.Inputs[2].Data
-            : (zeroBias = ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias")).Data;
+        ArrayView1D<float, Stride1D.Dense> bias;
+        if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
+        {
+            bias = ctx.Inputs[2].Data;
+        }
+        else
+        {
+            zeroBias = ctx.Pool.Rent(new[] { outC }, "_conv_zero_bias");
+            zeroBias.Data.MemSetToZero();
+            bias = zeroBias.Data;
+        }
         reg.ConvTranspose.Forward(x.Data, w.Data, bias, ctx.Outputs[0].Data,
             inC, inH, inW, outC, kH, kW, stride, pad, x.Shape[0]);   // x.Shape[0] = batch (DAv3 multi-view N views)
         if (zeroBias != null) ctx.Pool.Return(zeroBias);

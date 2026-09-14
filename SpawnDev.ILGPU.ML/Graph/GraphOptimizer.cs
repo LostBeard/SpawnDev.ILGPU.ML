@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace SpawnDev.ILGPU.ML.Graph;
 
@@ -63,6 +63,13 @@ public static class GraphOptimizer
         // before they run keeps the pattern intact.
         int fusedLayerNorm = FuseLayerNorm(optimized);
 
+        // Pass 3b: Fuse the seven-node atan2 decomposition into ONE FusedAtan2 node.
+        // 🔴 A CORRECTNESS pass that happens to also cut nodes - the chain it replaces is NOT atan2 at an
+        // exactly-zero y. See FuseAtan2. Order: after LayerNorm (which claims its own Add/Sub/Div and
+        // cannot overlap this) and BEFORE FuseLinearLayers and strength reduction, both of which rewrite
+        // the Add/Sub/Mul this pattern is made of.
+        int fusedAtan2 = FuseAtan2(optimized);
+
         int fusedLinear = FuseLinearLayers(optimized);
 
         // Pass 3b: Fuse a full decomposed self-attention subgraph (Q·Kᵀ → scale → [+zero-bias] → Softmax →
@@ -101,11 +108,169 @@ public static class GraphOptimizer
         // Pass 8: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
-        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm;
+        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm + fusedAtan2;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
-            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {fusedLayerNorm} fused-layernorm, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
+            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {fusedLayerNorm} fused-layernorm, {fusedAtan2} fused-atan2, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
 
         return optimized;
+    }
+
+    /// <summary>Where FuseAtan2 declined, by reason - a fusion that silently does nothing must say why.</summary>
+    public static Dictionary<string, int> LastAtan2Rejects = new();
+
+    /// <summary>
+    /// Fuse an exporter's longhand <c>atan2</c> into one <c>FusedAtan2</c> node.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ONNX has no Atan2, so every exporter writes the quadrant logic out by hand:
+    /// <code>
+    ///   d  = Div(y, x)            a  = Atan(d)
+    ///   gt = Greater(y, 0)        lt = Less(x, 0)
+    ///   ap = Add(a, pi)           am = Sub(a, pi)
+    ///   w  = Where(gt, ap, am)    w1 = Where(lt, w, a)
+    /// </code>
+    /// </para>
+    /// <para>
+    /// THIS IS A CORRECTNESS FIX, not an optimization. The chain above is not atan2: at <c>y == +0</c>
+    /// with <c>x &lt; 0</c> the <c>y &gt; 0</c> test is false, so it returns <c>-pi</c> where atan2
+    /// returns <c>+pi</c>. That is not a corner case in a signal graph - the DC and Nyquist bins of the
+    /// STFT of a REAL signal have an exactly zero imaginary part, so the entire DC phase channel takes
+    /// the wrong sign of pi. MEASURED on Kokoro-82M: waveform correlation against onnxruntime 0.9503
+    /// with the chain and 0.9936 with atan2, from that one channel of eleven. onnxruntime is not bitten
+    /// by it only because its FFT leaves a ~1e-7 residue in that bin instead of a true zero.
+    /// </para>
+    /// <para>
+    /// It is also far better conditioned: <c>y/x</c> overflows as x approaches 0 and the angle collapses
+    /// onto +-pi/2 with its sign decided by rounding noise, while atan2 reads both components directly.
+    /// </para>
+    /// <para>
+    /// Every internal tensor is single-consumer checked, and the Atan output is allowed EXACTLY its three
+    /// consumers (Add, Sub, and the outer Where). A chain whose pieces are shared elsewhere is not this
+    /// pattern, and fusing it would drop somebody's input.
+    /// </para>
+    /// </remarks>
+    private static int FuseAtan2(ModelGraph graph)
+    {
+        var rej = new Dictionary<string, int>();
+        void No(string why) { rej[why] = rej.GetValueOrDefault(why) + 1; }
+        LastAtan2Rejects = rej;
+        int fused = 0;
+        var remove = new HashSet<int>();
+
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp))
+                    consumers[inp] = consumers.GetValueOrDefault(inp, 0) + 1;
+
+        int SoleConsumer(string name, string expectedOp)
+        {
+            if (consumers.GetValueOrDefault(name, 0) != 1) return -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j)) continue;
+                if (graph.Nodes[j].Inputs.Contains(name))
+                    return graph.Nodes[j].OpType == expectedOp ? j : -1;
+            }
+            return -1;
+        }
+
+        int ProducerOf(string name)
+        {
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j)) continue;
+                if (graph.Nodes[j].Outputs.Count > 0 && graph.Nodes[j].Outputs[0] == name) return j;
+            }
+            return -1;
+        }
+
+        // A constant that is pi. Read from FloatConstantData ONLY: ConstantData is int[] and reports pi
+        // as 3, which would match a Add(a, 3) chain that is not this pattern at all.
+        bool IsPi(string name)
+            => !string.IsNullOrEmpty(name) && graph.FloatConstantData != null
+               && graph.FloatConstantData.TryGetValue(name, out var v) && v.Length == 1
+               && Math.Abs(v[0] - Math.PI) < 1e-5;
+
+        bool IsZero(string name)
+            => !string.IsNullOrEmpty(name) && graph.FloatConstantData != null
+               && graph.FloatConstantData.TryGetValue(name, out var v) && v.Length == 1 && v[0] == 0f;
+
+        for (int i = 0; i < graph.Nodes.Count; i++)
+        {
+            if (remove.Contains(i)) continue;
+            var divNode = graph.Nodes[i];
+            if (divNode.OpType != "Div" || divNode.Inputs.Count != 2) continue;
+            No("candidates");
+            var y = divNode.Inputs[0];
+            var x = divNode.Inputs[1];
+            var d = divNode.Outputs.Count > 0 ? divNode.Outputs[0] : null;
+            if (string.IsNullOrEmpty(y) || string.IsNullOrEmpty(x) || string.IsNullOrEmpty(d)) continue;
+
+            int atanIdx = SoleConsumer(d, "Atan");
+            if (atanIdx < 0) { No("Div not solely consumed by Atan"); continue; }
+            var a = graph.Nodes[atanIdx].Outputs[0];
+
+            // The Atan output feeds exactly the two pi-adjustments and the outer Where.
+            if (consumers.GetValueOrDefault(a, 0) != 3) { No("Atan consumers != 3"); continue; }
+            int addIdx = -1, subIdx = -1, outerIdx = -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j) || !graph.Nodes[j].Inputs.Contains(a)) continue;
+                if (graph.Nodes[j].OpType == "Add") addIdx = j;
+                else if (graph.Nodes[j].OpType == "Sub") subIdx = j;
+                else if (graph.Nodes[j].OpType == "Where") outerIdx = j;
+            }
+            if (addIdx < 0 || subIdx < 0 || outerIdx < 0) { No("Atan does not feed Add, Sub and Where"); continue; }
+
+            var add = graph.Nodes[addIdx];
+            var sub = graph.Nodes[subIdx];
+            if (add.Inputs.Count != 2 || sub.Inputs.Count != 2) continue;
+            // Add(a, pi) in either order; Sub(a, pi) only in that order - pi - a is a different function.
+            if (!IsPi(add.Inputs[0] == a ? add.Inputs[1] : add.Inputs[0])) { No("Add is not a + pi"); continue; }
+            if (sub.Inputs[0] != a || !IsPi(sub.Inputs[1])) { No("Sub is not a - pi"); continue; }
+
+            int innerIdx = SoleConsumer(add.Outputs[0], "Where");
+            if (innerIdx < 0 || SoleConsumer(sub.Outputs[0], "Where") != innerIdx)
+            { No("Add/Sub do not meet at one Where"); continue; }
+            var inner = graph.Nodes[innerIdx];
+            if (inner.Inputs.Count != 3 || inner.Inputs[1] != add.Outputs[0] || inner.Inputs[2] != sub.Outputs[0])
+            { No("inner Where is not (gt, a+pi, a-pi)"); continue; }
+
+            // The inner condition must be `y > 0`, on the SAME y the Div divides.
+            int gtIdx = ProducerOf(inner.Inputs[0]);
+            if (gtIdx < 0 || graph.Nodes[gtIdx].OpType != "Greater") { No("inner condition is not Greater"); continue; }
+            var gt = graph.Nodes[gtIdx];
+            if (gt.Inputs.Count != 2 || gt.Inputs[0] != y || !IsZero(gt.Inputs[1])) { No("Greater is not (y, 0)"); continue; }
+            if (consumers.GetValueOrDefault(gt.Outputs[0], 0) != 1) { No("Greater output shared"); continue; }
+
+            if (SoleConsumer(inner.Outputs[0], "Where") != outerIdx) { No("inner Where not consumed by outer"); continue; }
+            var outer = graph.Nodes[outerIdx];
+            if (outer.Inputs.Count != 3 || outer.Inputs[1] != inner.Outputs[0] || outer.Inputs[2] != a)
+            { No("outer Where is not (lt, inner, a)"); continue; }
+
+            // The outer condition must be `x < 0`, on the SAME x the Div divides by.
+            int ltIdx = ProducerOf(outer.Inputs[0]);
+            if (ltIdx < 0 || graph.Nodes[ltIdx].OpType != "Less") { No("outer condition is not Less"); continue; }
+            var lt = graph.Nodes[ltIdx];
+            if (lt.Inputs.Count != 2 || lt.Inputs[0] != x || !IsZero(lt.Inputs[1])) { No("Less is not (x, 0)"); continue; }
+            if (consumers.GetValueOrDefault(lt.Outputs[0], 0) != 1) { No("Less output shared"); continue; }
+
+            graph.Nodes[i] = new GraphNode
+            {
+                OpType = "FusedAtan2",
+                Inputs = new List<string> { y, x },
+                Outputs = new List<string> { outer.Outputs[0] },
+                Attributes = new Dictionary<string, JsonElement>(),
+            };
+            foreach (var idx in new[] { atanIdx, addIdx, subIdx, innerIdx, outerIdx, gtIdx, ltIdx })
+                remove.Add(idx);
+            fused++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(v => v)) graph.Nodes.RemoveAt(idx);
+        return fused;
     }
 
     /// <summary>
@@ -1617,17 +1782,30 @@ public static class GraphOptimizer
             // in the optimizer, this can be re-enabled properly.
 
             // Mul by 1.0 or Add by 0.0 → convert to Identity (eliminated by pass 2)
+            //
+            // 🔴 THE VALUE MUST COME FROM FloatConstantData, NEVER FROM ConstantData. ConstantData is
+            // int[] - every small initializer is stored there TRUNCATED, so 1e-5 reads back as 0 and 1.9
+            // reads back as 1. Proving "this Add is + 0" from a truncated int deletes a real operation.
+            // MEASURED on Kokoro-82M: every AdaIN's `Add(variance, 1e-5)` matched `Add(x, 0)` and was
+            // eliminated, so `Sqrt(variance)` ran with no epsilon. On the near-constant channels the
+            // epsilon exists to protect, that alone moved std by 0.5%, the following Div amplified it
+            // ~1000x, and the f0 branch came out 3% wrong - enough to flip the SIGN of near-zero f0,
+            // which the sine generator's frac() turns into a whole cycle of phase error. Final waveform
+            // correlation against onnxruntime: 0.45.
+            //
+            // A constant known ONLY as an int is left alone. The optimization is worth nothing next to
+            // changing what the graph computes, and a truncated value cannot prove the float was exact.
             if ((node.OpType == "Mul" || node.OpType == "Add") && node.Inputs.Count == 2)
             {
                 for (int inp = 0; inp < 2; inp++)
                 {
                     string constInput = node.Inputs[inp];
-                    if (graph.ConstantData != null && graph.ConstantData.TryGetValue(constInput, out var vals))
+                    if (graph.FloatConstantData != null && graph.FloatConstantData.TryGetValue(constInput, out var vals))
                     {
                         bool isIdentityOp = false;
-                        if (node.OpType == "Mul" && vals.Length == 1 && vals[0] == 1)
+                        if (node.OpType == "Mul" && vals.Length == 1 && vals[0] == 1f)
                             isIdentityOp = true;
-                        if (node.OpType == "Add" && vals.Length == 1 && vals[0] == 0)
+                        if (node.OpType == "Add" && vals.Length == 1 && vals[0] == 0f)
                             isIdentityOp = true;
 
                         if (isIdentityOp)

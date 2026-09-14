@@ -1,4 +1,4 @@
-using SpawnDev.ILGPU.ML.Pipelines;
+﻿using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.Phonemizer;
 using SpawnDev.UnitTesting;
 
@@ -178,6 +178,46 @@ public abstract partial class MLTestBase
         // timbre of a very short one, which sounds like the voice changing mid-reply.
         if (pack.StyleFor(10_000)[0] != 509f)
             throw new Exception($"a long utterance must clamp to the last row, read {pack.StyleFor(10_000)[0]}");
+        return Task.CompletedTask;
+    });
+
+    /// <summary>The built-in voice catalogue is well formed and the default is in it.</summary>
+    /// <remarks>
+    /// ⚠️ A catalogue is a list of NAMES, and a name that is a typo fails as "voice not found" at the
+    /// moment somebody picks it from a menu - not at build time, and not on the developer's machine where
+    /// the one voice they tested works. The repo path is built from the name, so the shape of the name is
+    /// the whole contract: this checks what can be checked WITHOUT the network, and
+    /// <c>Pipeline_Kokoro_MatchesOnnxRuntimeWaveform</c> proves the bytes actually load.
+    /// </remarks>
+    [TestMethod]
+    public async Task Kokoro_VoiceCatalogueIsWellFormed() => await RunPureTest(() =>
+    {
+        var names = KokoroVoicePack.EnglishVoiceNames;
+        if (names.Count == 0) throw new Exception("the voice catalogue is empty");
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var n in names)
+        {
+            if (string.IsNullOrWhiteSpace(n)) throw new Exception("the catalogue holds a blank name");
+            if (!seen.Add(n)) throw new Exception($"'{n}' appears twice in the catalogue");
+            // The prefix is the accent and gender, and it is also what a picker groups by - a name that
+            // does not carry one would sort into nothing.
+            if (!(n.StartsWith("af_") || n.StartsWith("am_") || n.StartsWith("bf_") || n.StartsWith("bm_")))
+                throw new Exception($"'{n}' has no accent/gender prefix (af_/am_/bf_/bm_)");
+            // A name goes into a URL. Anything needing escaping would be a path bug waiting to happen.
+            foreach (var c in n)
+                if (!(char.IsAsciiLetterOrDigit(c) || c == '_'))
+                    throw new Exception($"'{n}' contains '{c}', which does not belong in a repo path");
+            if (KokoroVoicePack.VoicePath(n) != $"voices/{n}.bin")
+                throw new Exception($"VoicePath('{n}') = '{KokoroVoicePack.VoicePath(n)}'");
+        }
+
+        if (!seen.Contains(KokoroVoicePack.DefaultVoiceName))
+            throw new Exception($"the default voice '{KokoroVoicePack.DefaultVoiceName}' is not in the "
+                + "catalogue - every caller that falls back to the default would fail");
+        if (string.IsNullOrWhiteSpace(KokoroVoicePack.VoiceRepoId)
+            || KokoroVoicePack.VoiceRepoId.Contains("huggingface.co"))
+            throw new Exception("VoiceRepoId must be a repo id the hub resolves, not a URL");
         return Task.CompletedTask;
     });
 

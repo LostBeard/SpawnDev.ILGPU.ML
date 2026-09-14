@@ -1,5 +1,7 @@
 {
   "dependencies": {
+    "onnx-proto": "^8.0.1",
+    "onnxruntime-node": "^1.30.0",
     "playwright": "^1.58.2"
   }
 }

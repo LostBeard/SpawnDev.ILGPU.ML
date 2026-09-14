@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 using static SpawnDev.ILGPU.ML.Operators.BroadcastHelper;
@@ -1374,6 +1374,24 @@ public class AtanOperator(OperatorRegistry reg) : IOnnxOperator
     public string OpType => "Atan";
     public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx) => reg.ElementWise.Atan(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
+}
+
+/// <summary>
+/// <c>FusedAtan2(y, x)</c> - the two-argument arctangent, emitted by <c>GraphOptimizer.FuseAtan2</c> in
+/// place of the seven-node <c>Div -> Atan -> Greater/Less -> Add/Sub -> Where -> Where</c> chain exporters
+/// produce for it. Not an ONNX operator: ONNX has no Atan2, which is why exporters write it out longhand.
+/// </summary>
+/// <remarks>
+/// The longhand form is not merely slower, it is a DIFFERENT function at <c>y == +0, x &lt; 0</c>, where
+/// its <c>y &gt; 0</c> test is false and it returns -pi instead of +pi. See <c>Atan2Impl</c> for what that
+/// cost on a real model. It is also ill-conditioned near <c>x == 0</c>, where <c>y/x</c> overflows.
+/// </remarks>
+public class FusedAtan2Operator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "FusedAtan2";
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs) => new[] { inputs[0] };
+    public void Execute(OnnxOpContext ctx)
+        => reg.ElementWise.Atan2(ctx.Inputs[0].Data, ctx.Inputs[1].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
 }
 
 public class AtanhOperator(OperatorRegistry reg) : IOnnxOperator

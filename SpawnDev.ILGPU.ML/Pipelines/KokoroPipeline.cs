@@ -1,4 +1,4 @@
-using ILGPU.Runtime;
+﻿using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -91,8 +91,25 @@ public sealed class KokoroPipeline : IDisposable
     }
 
     /// <summary>Load the graph from raw ONNX bytes.</summary>
+    /// <remarks>
+    /// ⚠️ Desktop and tests. In a browser use <see cref="CreateFromStreamAsync"/> instead: this model is
+    /// ~326 MB as fp32, and a <c>byte[]</c> of it lands on the .NET WASM managed heap, which is small and
+    /// which the crossing itself is the cost of filling. The stream overload hands the bytes to the
+    /// session without ever materialising them managed-side.
+    /// </remarks>
     public static KokoroPipeline Create(Accelerator accelerator, byte[] modelOnnx)
         => new(InferenceSession.CreateFromFile(accelerator, modelOnnx), accelerator);
+
+    /// <summary>Load the graph from a model STREAM - the browser path.</summary>
+    /// <remarks>
+    /// ⭐ This is the form to use behind an <c>IModelSource</c>/OPFS cache: the weights go from the cache
+    /// to the GPU without a managed copy of the whole model in between. Mirrors how the ZipVoice and
+    /// speech engines load.
+    /// </remarks>
+    public static async Task<KokoroPipeline> CreateFromStreamAsync(Accelerator accelerator, Stream modelOnnx,
+        CancellationToken ct = default)
+        => new(await InferenceSession.CreateFromOnnxStreamAsync(accelerator, modelOnnx, ct: ct)
+            .ConfigureAwait(false), accelerator);
 
     /// <summary>The loaded session, for diagnostics.</summary>
     public InferenceSession Session => _session;
@@ -127,7 +144,39 @@ public sealed class KokoroPipeline : IDisposable
                 "there is nothing to say - every phoneme was empty or unmappable, so the sequence is just "
                 + "the two padding tokens", nameof(phonemes));
 
-        var style = voice.StyleFor(tokens.Length).ToArray();
+        return await SpeakTokensAsync(tokens, voice, speed, dropped, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Synthesise from token ids directly, skipping this pipeline's phonemizer and tokenizer.
+    /// </summary>
+    /// <param name="tokens">
+    /// Vocabulary ids INCLUDING the padding token at both ends - exactly what the model's
+    /// <c>input_ids</c> expects. <see cref="KokoroTokenizer.Encode"/> produces them from phonemes.
+    /// </param>
+    /// <param name="droppedPhonemes">
+    /// Carried through to <see cref="KokoroAudio.DroppedPhonemes"/> for a caller that did its own
+    /// tokenizing and knows the count; 0 when there is nothing to report.
+    /// </param>
+    /// <remarks>
+    /// ⚠️ THE POINT OF THIS OVERLOAD IS COMPARABILITY. Rendering from TEXT compares two front ends as well
+    /// as two inference engines, so a phonemizer change reads as an engine regression and vice versa.
+    /// Feeding fixed ids pins the front end out of the question, which is what makes a reference waveform
+    /// from another runtime mean something. It is also the entry point for a caller who has their own
+    /// phonemizer, or a language this one does not cover.
+    /// </remarks>
+    public async Task<KokoroAudio> SpeakTokensAsync(IReadOnlyList<long> tokens, KokoroVoicePack voice,
+        float speed = 1.0f, int droppedPhonemes = 0, CancellationToken ct = default)
+    {
+        if (voice == null) throw new ArgumentNullException(nameof(voice));
+        if (tokens == null) throw new ArgumentNullException(nameof(tokens));
+        if (tokens.Count <= 2)
+            throw new ArgumentException(
+                "there is nothing to say - a sequence of two or fewer ids is just the padding tokens",
+                nameof(tokens));
+
+        var dropped = droppedPhonemes;
+        var style = voice.StyleFor(tokens.Count).ToArray();
 
         var clock = System.Diagnostics.Stopwatch.StartNew();
         using var tokenBuffer = _accelerator.Allocate1D(ToFloats(tokens));
@@ -136,7 +185,7 @@ public sealed class KokoroPipeline : IDisposable
 
         var inputs = new Dictionary<string, Tensor>
         {
-            [_tokensInput] = new Tensor(tokenBuffer.View, new[] { 1, tokens.Length }),
+            [_tokensInput] = new Tensor(tokenBuffer.View, new[] { 1, tokens.Count }),
             [_styleInput] = new Tensor(styleBuffer.View, new[] { 1, KokoroVoicePack.Dim }),
             [_speedInput] = new Tensor(speedBuffer.View, new[] { 1 }),
         };
@@ -157,7 +206,7 @@ public sealed class KokoroPipeline : IDisposable
 
         var samples = await ReadAsync(outputs[_session.OutputNames[0]]).ConfigureAwait(false);
         clock.Stop();
-        return new KokoroAudio(samples, OutputSampleRate, tokens.Length, dropped,
+        return new KokoroAudio(samples, OutputSampleRate, tokens.Count, dropped,
             clock.Elapsed.TotalMilliseconds);
     }
 
@@ -169,10 +218,10 @@ public sealed class KokoroPipeline : IDisposable
         return host;
     }
 
-    private static float[] ToFloats(long[] values)
+    private static float[] ToFloats(IReadOnlyList<long> values)
     {
-        var floats = new float[values.Length];
-        for (var i = 0; i < values.Length; i++) floats[i] = values[i];
+        var floats = new float[values.Count];
+        for (var i = 0; i < values.Count; i++) floats[i] = values[i];
         return floats;
     }
 

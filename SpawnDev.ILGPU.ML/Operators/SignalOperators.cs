@@ -72,11 +72,25 @@ public class STFTOperatorImpl(OperatorRegistry reg) : IOnnxOperator
         var signalShape = inputs[0]; // [batch, signal_length, 1]
         int signalLength = signalShape[1];
 
-        // frame_step from input[1], frame_length from input[2] or attribute
-        int frameStep = 128; // default
-        int frameLength = frameStep; // ONNX spec: defaults to frame_step when not provided
+        // 🔴 THE HOP COMES FROM AN INPUT VALUE, WHICH INFERENCE CANNOT SEE. It used to default to 128 and
+        // carry on - and a wrong hop is a wrong FRAME COUNT, which sizes the output buffer and then
+        // propagates into every shape downstream. MEASURED on Kokoro: a 620-sample signal, a 20-sample
+        // window and a real hop of 5 gives 121 frames; the 128 default gave 5, and the contradiction only
+        // surfaced 539 nodes later in an unrelated subgraph as a broadcast failure.
+        //
+        // GraphCompiler folds the value in as _resolved_frame_step (the same mechanism Pad's amounts use).
+        // The 128 remains only for a graph where the hop genuinely is not a constant, which no exported
+        // model in practice produces.
+        int frameStep = attrs.TryGetValue("_resolved_frame_step", out var stepObj)
+            ? Convert.ToInt32(stepObj)
+            : 128;
+        // ONNX: frame_length defaults to frame_step when absent. The WINDOW's length gives it when there is
+        // a window, and input[3] overrides both - folded in the same way.
+        int frameLength = frameStep;
         if (inputs.Length > 2 && inputs[2].Length > 0)
-            frameLength = inputs[2][0]; // approximate from shape (window length = frame_length)
+            frameLength = inputs[2][0]; // window length == frame_length
+        if (attrs.TryGetValue("_resolved_frame_length", out var lenObj))
+            frameLength = Convert.ToInt32(lenObj);
 
         int numFrames = (signalLength - frameLength) / frameStep + 1;
         int fftLength = onesided != 0 ? frameLength / 2 + 1 : frameLength;

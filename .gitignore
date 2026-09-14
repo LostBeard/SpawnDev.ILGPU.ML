@@ -388,5 +388,12 @@ Examples/04.GGUFTextGen.Console/*.txt
 pmt_*.pid
 
 # DA3 divergence-hunt reference capture (offline-generated artifact, ~2-7MB)
-SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/
+# NOT the whole folder: a reference a GATE depends on must be committed, or the gate degrades to a skip
+# on every machine but this one - which is indistinguishable from green. Ignore by default, admit the
+# small ones a test needs by name.
+SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/*
+!SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/kokoro-af_heart-paris.f32
+
+# Audio written by DemoConsole KOKOROSPEAK / ZipVoice runs, into whatever the working directory was
+kokoro-*.wav
 SpawnDev.ILGPU.ML.Demo/wwwroot/models/whisper-base.en/

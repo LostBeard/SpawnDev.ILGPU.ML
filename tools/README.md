@@ -37,6 +37,48 @@ Silero VAD, where a perfectly correct Slice appeared to be 100% wrong.
 localisation as blocked on them and turned a four-step bisection into an open-ended hunt. Reach for a
 reference runtime early - that is why we keep three of them.
 
+## The Node oracle: is it OUR bug, or is the model ill-conditioned?
+
+`npm i` brings `onnxruntime-node` and `onnx-proto`. These five run the REFERENCE engine and are the answer
+to a class of question the python scripts above cannot reach - the ones that arise once a model is
+numerically sensitive, where EVERY node after the sensitive point differs however correct the code is.
+
+| tool | answers |
+|---|---|
+| `onnx-nodes.mjs <model> <substr>` | **What does this subgraph actually say?** Prints matching nodes with inputs, outputs, attributes and the CONTENTS of small initializers. Diffing tells you which node diverged; it never tells you why, and the why is almost always an attribute (a Resize `coordinate_transformation_mode`, a Pad mode, an axis default). |
+| `onnx-intermediates.mjs <model> <voice> <tokens> <out> <names>` | Rewrites `graph.output` to expose named intermediates and runs them. ORT only hands back declared outputs, so this is the only way to get a reference for the INSIDE of a graph. |
+| `op-oracle.mjs <spec.json> <out>` | Builds a ONE-NODE model and runs it. Our own kernel tests compare against a CPU reference WE wrote, and the two can share a misreading of the spec; this settles an operator against the spec itself. |
+| `onnx-perturb.mjs <model> <voice> <tokens> <out> <tensor> <relRMS> [dump,names]` | **Is the number I am seeing the FLOOR?** Adds noise of your measured `relRMS` to one of the reference's own tensors and re-runs it. If ORT degrades to your number, there is no bug left to find. |
+| `onnx-inject.mjs <model> <voice> <tokens> <out> <tensor> <values.f32> [dump,names]` | **Is the rest of my graph right GIVEN what I feed it?** Splices OUR tensor into the reference and lets ORT compute the rest. Whatever still differs is ours; whatever now matches was never broken. Our side dumps tensors with `KOKORO_SAVE=<dir>`. |
+
+And the statistics, because the wrong statistic hid a whole wrong channel behind a 1e-6:
+
+| tool | answers |
+|---|---|
+| `f32diff.mjs <a> <b>` | correlation, **relRMS** (`||a-b|| / ||b||`), max abs diff, best-fit scale. |
+| `f32bins.mjs <a> <b> [bins]` | the same, PER frequency bin / channel of a `[1,BINS,T]` dump. |
+
+⚠️ **relRMS, never `max|diff|`.** A max over tens of thousands of elements is a TAIL statistic - it cannot
+separate float32 noise amplified by an ill-conditioned normalise from an operator that is simply wrong.
+~1e-6 is float32 working correctly; ~1e-3 is a defect; the FIRST node where it leaves 1e-6 is the defect.
+
+⚠️ **Per channel, not whole-tensor.** A whole-tensor relRMS is dominated by the loud channels. Our STFT
+read "matches to 1.4e-6" while one of its eleven bins carried a systematically inverted phase; splitting
+per bin showed bin 0 at correlation **-0.9956**.
+
+⚠️ **Perturb ADDITIVELY.** A `(1+eps)` perturbation can never change a value's SIGN, so on a graph that
+divides by something near zero it reproduces nothing - MEASURED: a 1.8e-3 multiplicative perturbation of
+Kokoro's STFT moved the waveform by correlation 1.000000, the same additive one moved it to 0.956.
+
+⚠️ **Check the ORACLE's stability before calling our output wrong.** Adding graph outputs changes which
+fusions onnxruntime applies, so two reference runs of the same model are NOT bit-equal - on Kokoro they
+differed by correlation 0.9996. Below that you are chasing the oracle's noise.
+
+⚠️ **Git Bash rewrites a leading-slash argument into a Windows path**, so an ONNX tensor name passed as the
+first of these arguments arrives as `C:/Program Files/Git/decoder/...` and reports "not produced by any
+node". Same family as the `ML_DUMP_TENSORS` trap above. Use the PowerShell tool, or put a dummy first in
+a comma-separated list.
+
 ## Reference-fixture generators (onnx + onnxruntime)
 
 `gen_lstm_reference.py` · `gen_controlflow_reference.py` · `gen_scatter_reference.py` ·

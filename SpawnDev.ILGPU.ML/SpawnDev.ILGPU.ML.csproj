@@ -1,10 +1,10 @@
-<Project Sdk="Microsoft.NET.Sdk.Razor">
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.13</Version>
+		<Version>5.2.14</Version>
 		<PackageReleaseNotes>v5.2.13 - BREAKING: model delivery no longer uses WebTorrent. SpawnDev.ILGPU.ML does not reference SpawnDev.WebTorrent at all; models arrive over plain HTTP through the SpawnDev hub and are cached locally (OPFS in the browser, disk on desktop). Torrent delivery moves to the optional SpawnDev.ILGPU.ML.WebTorrent package, whose HubModelStream implements the same IModelSource - a one-line swap. New delivery types: IModelSource / ICachingModelSource (transport), IModelStore / IResumableModelStore (storage), HubModelSource + OpfsModelCache (browser), HttpClientModelSource + FileModelStore (desktop). Downloads are resumable, cancellable, report progress during transfer, and refuse to serve a truncated entry; the payload never enters the managed heap (measured 9.6-20.1% of file size, vs 119.8-136.6% with a copy reinstated). MEASURED on WebGPU, Qwen3-1.7B-Q8_0 (1.83 GB): 44.4s download, 4.5s warm load to GPU. Chunk sizes measured rather than assumed: 16 MiB reads run 1559-1986 MB/s against 1290-1320 at 4 MiB, so BufferPool no longer overrides ILGPU's 16 MiB default downward. BREAKING signatures: DepthEstimationPipeline.CreateFromHubAsync and ImageGenerationPipeline.CreateAsync take IModelSource; InferenceSession.CreateFromHuggingFaceAsync loses its webTorrent parameter; ModelHub.OpenStreamAsync returns Stream and is no longer obsolete; ModelCache is removed. Full history: CHANGELOG.md</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

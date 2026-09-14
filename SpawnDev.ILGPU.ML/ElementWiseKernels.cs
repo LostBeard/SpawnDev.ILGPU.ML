@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 
 namespace SpawnDev.ILGPU.ML;
@@ -1031,6 +1031,45 @@ public class ElementWiseKernels : IDisposable
     private static void TruncateInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
     { data[idx] = MathF.Truncate(data[idx]); }
 
+    // atan2(y, x) with IEEE quadrant and signed-zero semantics, written out rather than calling
+    // MathF.Atan2 - MathF.Atan2 has no ILGPU intrinsic on every backend, and the two-argument form is
+    // what makes this correct where the one-argument form cannot be.
+    //
+    // 🔴 WHY THIS OPERATOR EXISTS. Exporters emit atan2 as Div -> Atan -> Greater/Less -> Where, and that
+    // decomposition is NOT atan2: at y == +0 with x < 0 it yields -pi where atan2 yields +pi, because
+    // `y > 0` is false for a positive zero. MEASURED on Kokoro-82M, whose generator takes the phase of an
+    // STFT: the DC bin of a real signal has an EXACTLY zero imaginary part, so that one case covered an
+    // entire phase channel - 1 of the 11 fed to conv_post - with the wrong sign of pi. Correlation of the
+    // final waveform against onnxruntime: 0.9503 with the decomposition, 0.9936 with atan2.
+    // (onnxruntime is not bitten by it only because its FFT leaves a ~1e-7 residue in that bin instead of
+    // a true zero - i.e. it is right by accident, and only for inputs that never land on the zero.)
+    //
+    // It is also far better conditioned: y/x overflows toward +-inf as x -> 0 and collapses the angle onto
+    // +-pi/2 with a sign decided by rounding noise, while atan2 uses the two components directly.
+    private static void Atan2Impl(Index1D idx, ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        var yy = y[idx];
+        var xx = x[idx];
+        const float PI = 3.14159265358979f;
+        float r;
+        if (xx > 0f) r = MathF.Atan(yy / xx);
+        else if (xx < 0f) r = MathF.Atan(yy / xx) + (IsNegative(yy) ? -PI : PI);
+        else if (yy > 0f) r = PI * 0.5f;
+        else if (yy < 0f) r = -PI * 0.5f;
+        // Both zero. IEEE: the angle is +-pi when x is a NEGATIVE zero and +-0 when it is positive, the
+        // sign taken from y in both cases - i.e. the limit approached along each axis, which is what makes
+        // the function continuous from every direction. Worth spelling out rather than returning 0: a
+        // silent frame gives an all-zero STFT frame, this is the case that produces, and the decomposition
+        // it replaces does not merely differ here - `0/0` is a NaN, and a NaN in a phase channel poisons
+        // every sample a convolution touches it with.
+        else r = IsNegative(xx) ? (IsNegative(yy) ? -PI : PI) : (IsNegative(yy) ? -0f : 0f);
+        output[idx] = r;
+    }
+
+    // `v < 0` is false for -0.0, which is exactly the case this operator exists to get right. Dividing is
+    // the branch-free test that survives ILGPU's transpilation to every backend: 1/-0.0 is -infinity.
+    private static bool IsNegative(float v) => v < 0f || (v == 0f && 1f / v < 0f);
+
     private static void MinImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = a[idx] < b[idx] ? a[idx] : b[idx]; }
 
@@ -1437,6 +1476,23 @@ public class ElementWiseKernels : IDisposable
             int sIdx = frameStart + n;
             float x = sIdx < signalLength ? signal[b * signalLength + sIdx] : 0f;
             if (hasWindow != 0 && n < frameLength) x *= window[n];
+
+            // The twiddle for exp(-2*pi*i*k*n/L).
+            //
+            // ⚠️ DO NOT "improve" this by reducing k*n modulo L, or by special-casing the quarter turns
+            // to exact 0/+-1. Both look strictly better and neither is: MEASURED against onnxruntime on
+            // Kokoro-82M, per frequency bin, the two forms are the same accuracy on every bin whose value
+            // is well determined (relRMS 1e-6..3e-4 either way, some bins better, some worse).
+            //
+            // What they DO change is the Nyquist bin. For a real signal its imaginary part is
+            // mathematically EXACTLY zero, so its phase is +-pi and WHICH sign comes out is decided
+            // entirely by the transform's rounding residue - and every implementation has one. Reducing
+            // the angle makes our residue exactly zero, so atan2 returns a deterministic +pi, while
+            // onnxruntime's FFT residue there is negative about 90% of the time and it returns -pi.
+            // Waveform correlation against onnxruntime: 0.9936 as written, 0.9829 with the reduction,
+            // 0.9862 with the reduction plus exact quarter turns. The angle is genuinely ambiguous
+            // (+pi and -pi are the same angle); carrying a residue of the same kind the reference
+            // carries is the closer answer, and there is no accuracy being traded away for it.
             float angle = -2f * MathF.PI * k * n / frameLength;
             sumReal += x * MathF.Cos(angle);
             sumImag += x * MathF.Sin(angle);
@@ -1717,6 +1773,7 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _ceilKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _logKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _roundKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _atan2Kernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _minKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _maxKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _clipKernel;
@@ -1866,6 +1923,9 @@ public class ElementWiseKernels : IDisposable
     { EnsureLoaded2(); _logKernel!(count, input, output); }
     public void Round(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _roundKernel!(count, input, output); }
+    /// <summary>atan2(y, x) elementwise, with IEEE quadrant and signed-zero semantics.</summary>
+    public void Atan2(ArrayView1D<float, Stride1D.Dense> y, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded2(); _atan2Kernel!(count, y, x, output); }
     public void Min(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _minKernel!(count, a, b, output); }
     public void Max(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
@@ -1977,6 +2037,7 @@ public class ElementWiseKernels : IDisposable
         _ceilKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(CeilImpl);
         _logKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(LogImpl);
         _roundKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(RoundImpl);
+        _atan2Kernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(Atan2Impl);
         _minKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MinImpl);
         _maxKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(MaxImpl);
         _clipKernel ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(ClipImpl);

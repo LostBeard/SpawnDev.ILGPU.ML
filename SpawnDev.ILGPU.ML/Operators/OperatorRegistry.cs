@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 
@@ -37,7 +37,7 @@ public class OperatorRegistry : IDisposable
         "ConstantOfShape", "Conv", "ConvInteger", "ConvTranspose", "Cos", "Cosh", "CumSum", "DFT",
         "DeformConv", "DepthToSpace", "DequantizeLinear", "Det", "Div", "Dropout", "DynamicQuantizeLinear", "Einsum",
         "Elu", "Equal", "Erf", "Exp", "Expand", "EyeLike", "Flatten", "Floor",
-        "FusedAttention", "FusedLinear", "FusedScaledMatMul", "GRU", "Gather", "GatherElements", "GatherND", "Gelu", "Gemm",
+        "FusedAtan2", "FusedAttention", "FusedLinear", "FusedScaledMatMul", "GRU", "Gather", "GatherElements", "GatherND", "Gelu", "Gemm",
         "GlobalAveragePool", "GlobalLpPool", "GlobalMaxPool", "Greater", "GreaterOrEqual", "GridSample", "GroupNormalization", "HammingWindow",
         "HannWindow", "HardSigmoid", "HardSwish", "Hardmax", "Identity", "If", "ImageDecoder", "InstanceNormalization",
         "IsInf", "IsNaN", "LRN", "LSTM", "LayerNormalization", "LeakyRelu", "Less", "LessOrEqual",
@@ -286,6 +286,7 @@ public class OperatorRegistry : IDisposable
         Register(new AsinOperator(this));
         Register(new AsinhOperator(this));
         Register(new AtanOperator(this));
+        Register(new FusedAtan2Operator(this));
         Register(new AtanhOperator(this));
         Register(new CoshOperator(this));
         Register(new SinhOperator(this));

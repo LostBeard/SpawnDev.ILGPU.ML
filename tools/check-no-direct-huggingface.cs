@@ -1,4 +1,4 @@
-// Nothing in this repo may request huggingface.co directly. This proves it.
+﻿// Nothing in this repo may request huggingface.co directly. This proves it.
 //
 //   dotnet run tools/check-no-direct-huggingface.cs
 //   dotnet run tools/check-no-direct-huggingface.cs -- <repo root>
@@ -65,6 +65,12 @@ foreach (var file in Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirec
         if (!lines[i].Contains("huggingface.co", StringComparison.OrdinalIgnoreCase)) continue;
         // A link to the HF docs site is not a model request.
         if (Regex.IsMatch(lines[i], @"huggingface\.co/docs", RegexOptions.IgnoreCase)) continue;
+        // ⚠️ A COMMENT cannot make a request. Four of this gate's hits were the remarks that say "never
+        // huggingface.co directly" - so the rule's own documentation was the only thing it ever found, and
+        // a gate that reports the same four findings every run is a gate nobody reads. Code only: a line
+        // whose first non-space characters are // or * or /* is prose.
+        var trimmed = lines[i].TrimStart();
+        if (trimmed.StartsWith("//") || trimmed.StartsWith("*") || trimmed.StartsWith("/*")) continue;
         var rel = Path.GetRelativePath(root, file);
         violations.Add($"{rel}:{i + 1}: {lines[i].Trim()}");
     }
