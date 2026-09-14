@@ -41,6 +41,56 @@ if (args.Length > 1 && args[0] == "OPCHECK")
     return 0;
 }
 
+// Investigation diagnostic (NOT a PMT test): does SpawnDev.Phonemizer's IPA actually land on Kokoro's
+// vocabulary?
+//
+// 🔴 THE QUESTION THAT DECIDES THE PORT. Operator coverage says the graph can run and the hub says the
+// weights arrive; neither says the FRONT END fits. Kokoro has 115 phoneme tokens and our phonemizer emits
+// IPA of its own devising - if the two alphabets disagree, every disagreement is a sound the model cannot
+// say, and the result is audio that is subtly wrong rather than audio that fails. A drop rate is the
+// cheapest possible answer and it needs no GPU, no model and no network.
+//
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -- KOKOROFIT ["some sentence"]
+if (args.Length > 0 && args[0] == "KOKOROFIT")
+{
+    var phonemizer = SpawnDev.Phonemizer.EmbeddedData.CreatePhonemizer();
+    var vocab = SpawnDev.ILGPU.ML.Pipelines.KokoroTokenizer.Vocabulary;
+    Console.WriteLine($"KOKOROFIT: vocabulary has {vocab.Count} symbols");
+
+    string[] samples = args.Length > 1
+        ? new[] { args[1] }
+        : new[]
+        {
+            "The capital of France is Paris.",
+            "She waited for 2 more minutes, then left without saying anything.",
+            "Hello! How are you today? I hope it's going well.",
+            "Roughly seventy-three percent of the measurements agreed.",
+            "A quick brown fox jumps over the lazy dog.",
+        };
+
+    var missing = new SortedDictionary<string, int>(StringComparer.Ordinal);
+    int totalSymbols = 0, totalDropped = 0;
+    foreach (var text in samples)
+    {
+        var symbols = phonemizer.ToSymbols(text);
+        var (tokens, dropped) = SpawnDev.ILGPU.ML.Pipelines.KokoroTokenizer.Encode(symbols);
+        totalSymbols += symbols.Count;
+        totalDropped += dropped;
+        foreach (var s in symbols)
+            if (!vocab.TryGetId(s, out _))
+                missing[s] = missing.TryGetValue(s, out var n) ? n + 1 : 1;
+        Console.WriteLine($"  \"{text}\"");
+        Console.WriteLine($"    {symbols.Count} symbols -> {tokens.Length} tokens (incl. 2 pad), "
+                        + $"{dropped} dropped");
+    }
+    var fit = totalSymbols == 0 ? 100 : (totalSymbols - totalDropped) * 100.0 / totalSymbols;
+    Console.WriteLine($"KOKOROFIT: {totalSymbols - totalDropped}/{totalSymbols} symbols encodable ({fit:F1}%)");
+    Console.WriteLine(missing.Count == 0
+        ? "KOKOROFIT: every phoneme our frontend emits has a Kokoro token."
+        : "KOKOROFIT: UNMAPPED -> " + string.Join(", ", missing.Select(kv => $"'{kv.Key}' x{kv.Value}")));
+    return 0;
+}
+
 // Investigation diagnostic (NOT a PMT-substitute test runner): CPU-vs-CUDA per-node
 // bisection for the CPU-backend style-transfer correctness bug.
 if (args.Length > 0 && args[0] == "STYLEBISECT")
