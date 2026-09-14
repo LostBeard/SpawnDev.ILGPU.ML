@@ -167,8 +167,38 @@ public abstract partial class MLTestBase
     }
 
     /// <summary>Content-Length of <paramref name="url"/>, or -1 when the server does not report one.</summary>
+    /// <remarks>
+    /// ⚠️ A <c>HEAD</c> is NOT enough: the SpawnDev hub answers HEAD with <b>405 Method Not Allowed</b>
+    /// (MEASURED 2026-09-14 against <c>/hf/Xenova/distilgpt2/tokenizer.json</c>), and every model URL here
+    /// now routes through the hub via <see cref="HuggingFaceClient.GetDownloadUrl"/>. HEAD-only therefore
+    /// returned -1 for every model, which made <see cref="IsComplete"/> fall back to its
+    /// "existence is all we have" branch - silently retiring the truncation check that is the entire reason
+    /// the expected length is passed around. A half-downloaded 329 MB checkpoint was then cached and reused
+    /// forever, surfacing as a confusing ONNX parse error rather than as the short file it is.
+    /// <para>
+    /// A one-byte range GET gets the real size from <c>Content-Range: bytes 0-0/TOTAL</c> and works on the
+    /// hub. HEAD is kept as a fallback for any origin that prefers it.
+    /// </para>
+    /// </remarks>
     private static async Task<long> ContentLengthAsync(HttpClient http, string url, CancellationToken ct)
     {
+        try
+        {
+            using var probe = new HttpRequestMessage(HttpMethod.Get, url);
+            probe.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+            using var probeRes = await http.SendAsync(probe, HttpCompletionOption.ResponseHeadersRead, ct)
+                .ConfigureAwait(false);
+            if (probeRes.IsSuccessStatusCode)
+            {
+                // Trust the Content-Range TOTAL. A 206's Content-Length is the PART (1 byte), never the file.
+                var total = probeRes.Content.Headers.ContentRange?.Length;
+                if (total is > 0) return total.Value;
+                if (probeRes.StatusCode == System.Net.HttpStatusCode.OK)
+                    return probeRes.Content.Headers.ContentLength ?? -1;
+            }
+        }
+        catch (HttpRequestException) { /* fall through to HEAD */ }
+
         using var req = new HttpRequestMessage(HttpMethod.Head, url);
         using var res = await http.SendAsync(req, ct).ConfigureAwait(false);
         return res.IsSuccessStatusCode ? res.Content.Headers.ContentLength ?? -1 : -1;
