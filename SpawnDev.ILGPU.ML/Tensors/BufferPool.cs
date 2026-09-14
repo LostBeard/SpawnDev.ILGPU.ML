@@ -1253,7 +1253,16 @@ public class BufferPool : IDisposable
         if (byteLength == 0) return buffer;
 
         stream.Seek(byteOffset, SeekOrigin.Begin);
-        const int CHUNK = 4 * 1024 * 1024; // 4 MB (4-byte aligned, preserves the zero-copy gate below)
+        // 16 MiB, matching ILGPU's MemoryBuffer.DefaultStreamChunkSizeInBytes that every other
+        // CopyFromStreamAsync call in this file uses. This was the one site overriding that default
+        // DOWNWARD, to 4 MiB, and it cost real throughput.
+        // MEASURED 2026-09-14, OPFS read of a 192 MiB file, three browser lanes (MB/s):
+        //     64 KiB   75 /   87 /   86      1 MiB   577 /  591 /  612
+        //      4 MiB 1290 / 1320 / 1291     16 MiB  1559 / 1986 / 1981   <- 1.21x-1.53x over 4 MiB
+        // Above 16 MiB the sweep is NOISE, not signal (32/64 MiB were fastest on one lane and near-slowest
+        // on another - only 3-6 reads fit in the file at those sizes), so 16 MiB is the largest size with a
+        // trustworthy gain. Still 4-byte aligned, which the zero-copy gate below requires.
+        const int CHUNK = 16 * 1024 * 1024;
         // CopyFromStreamAsync auto-selects the ZERO-COPY browser path: when `stream` is an IJSReadStream
         // (TorrentReadStream / OPFS) and the (offset,length,chunk) are 4-byte aligned, each chunk's Uint8Array
         // goes STRAIGHT to the GPU via queue.writeBuffer (CopyFromJS) — never entering the .NET/WASM managed

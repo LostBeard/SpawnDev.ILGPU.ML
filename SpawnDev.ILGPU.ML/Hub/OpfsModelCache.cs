@@ -85,8 +85,17 @@ public class OpfsModelCache : IModelStore, IDisposable
     /// Use <see cref="LastDownloadChunks"/> / <see cref="LastDownloadWrites"/> to see what a given source
     /// actually delivered and how many OPFS writes it cost.
     /// </para>
+    /// <para>
+    /// 16 MiB, matching ILGPU's <c>MemoryBuffer.DefaultStreamChunkSizeInBytes</c>. MEASURED 2026-09-14 on a
+    /// 192 MiB OPFS file across three browser lanes (MB/s): 64 KiB 75/87/86, 1 MiB 577/591/612, 4 MiB
+    /// 1290/1320/1291, <b>16 MiB 1559/1986/1981</b> - a consistent 1.21x-1.53x over 4 MiB. Above 16 MiB the
+    /// sweep is noise rather than signal, so this is the largest size with a trustworthy gain. It matters
+    /// most for <see cref="PutAsync"/> (OPFS-to-OPFS, disk-bound); a network download is bounded by the
+    /// network long before the write size matters, and progress granularity is unaffected either way
+    /// because progress is reported from bytes RECEIVED, not bytes written.
+    /// </para>
     /// </remarks>
-    public int WriteBufferSize { get; set; } = 4 * 1024 * 1024;
+    public int WriteBufferSize { get; set; } = 16 * 1024 * 1024;
 
     /// <summary>Chunks delivered by <c>fetch</c> during the most recent download (diagnostic).</summary>
     public long LastDownloadChunks { get; private set; }
