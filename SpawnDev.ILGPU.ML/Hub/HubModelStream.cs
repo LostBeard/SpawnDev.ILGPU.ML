@@ -26,8 +26,30 @@ namespace SpawnDev.ILGPU.ML.Hub;
 ///     "onnx-community/mobilenetv3_small_100.lamb_in1k", "onnx/model.onnx");
 /// </code>
 /// </summary>
-public class HubModelStream
+public class HubModelStream : IModelSource
 {
+    /// <summary>
+    /// <see cref="IModelSource"/> over the torrent path: same call a pipeline makes against
+    /// <see cref="HubModelSource"/>, delivered as a lazy-hash torrent instead of plain HTTP. This is what
+    /// makes WebTorrent an opt-in UPGRADE rather than a requirement - swap the source, change nothing else.
+    /// </summary>
+    /// <remarks>
+    /// The torrent is deliberately left in the client rather than removed when the stream is disposed.
+    /// <see cref="RemoveAsync"/> disposes the model's AsyncFSMemory Blobs, and the WebTorrent store's cached
+    /// <c>File</c> REFERENCES those blobs (<c>new File([blob])</c> is a reference, not a copy), so removing
+    /// mid-load raced an in-flight read and produced intermittent NotReadableError. Callers that want the
+    /// torrent gone call <see cref="RemoveAsync"/> themselves once the model is fully on the GPU.
+    /// </remarks>
+    async Task<Stream> IModelSource.OpenAsync(string repoId, string filePath, CancellationToken cancellationToken)
+    {
+        var model = await OpenAsync(repoId, filePath, deselect: false, cancellationToken).ConfigureAwait(false);
+        return model.Stream;
+    }
+
+    /// <inheritdoc/>
+    Task<byte[]> IModelSource.FetchBytesAsync(string repoId, string filePath, CancellationToken cancellationToken)
+        => FetchBytesAsync(repoId, filePath, cancellationToken);
+
     /// <summary>The public SpawnDev hub running the HuggingFace proxy.</summary>
     public const string DefaultHubBaseUrl = "https://hub.spawndev.com:44365";
 

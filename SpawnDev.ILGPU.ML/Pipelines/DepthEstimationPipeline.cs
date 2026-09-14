@@ -101,44 +101,52 @@ public class DepthEstimationPipeline : IDisposable
     ///   var depth = await pipe.EstimateGpuAsync(rgba, w, h);   // zero-copy end to end
     /// </code>
     /// </summary>
+    /// <remarks>
+    /// ⚠️ BREAKING (2026-09-14): this took <c>HubModelStream</c>, which requires a <c>WebTorrentClient</c> -
+    /// so this pipeline could not be used at all without WebTorrent. It now takes
+    /// <see cref="Hub.IModelSource"/>. Pass <see cref="Hub.HubModelSource"/> for plain HTTP + OPFS (the
+    /// default), or a <c>HubModelStream</c> for torrent delivery - it implements the same interface, so the
+    /// torrent path is an opt-in upgrade and this call is otherwise unchanged.
+    /// </remarks>
     public static async Task<DepthEstimationPipeline> CreateFromHubAsync(
-        Accelerator accelerator, Hub.HubModelStream hubStream, string repoId,
+        Accelerator accelerator, Hub.IModelSource source, string repoId,
         string modelFile = "onnx/model.onnx", string externalDataFile = "onnx/model.onnx_data",
         Action<string, int>? onProgress = null, Dictionary<string, int[]>? inputShapes = null,
         int inputSize = 0, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(source);
         onProgress?.Invoke("open", 0);
         System.IO.Stream modelStream;
-        Hub.HubModelStream.HubModel? extData = null;
+        System.IO.Stream? extData = null;
         if (!string.IsNullOrEmpty(externalDataFile))
         {
             // External-data model (DAv3): model.onnx is a SMALL structure file (weights live in model.onnx_data).
-            // Fetch it over plain HTTP (KBs) and torrent-stream ONLY the big weights file — keeps the 100+ MB
-            // weights zero-copy AND avoids a WebTorrent lazy-hash same-directory collision that otherwise gave the
-            // model.onnx_data stream model.onnx's length (both live under onnx/). If model.onnx_data is absent
-            // (a mislabeled single-file export), extData stays null and the structure file carries any weights.
-            var modelBytes = await hubStream.FetchBytesAsync(repoId, modelFile, ct).ConfigureAwait(false);
+            // Fetch the structure whole (KBs) and STREAM only the big weights file — keeps the 100+ MB weights
+            // off the managed heap. On the torrent source it also avoids a lazy-hash same-directory collision
+            // that otherwise gave the model.onnx_data stream model.onnx's length (both live under onnx/). If
+            // model.onnx_data is absent (a mislabeled single-file export), extData stays null and the structure
+            // file carries any weights.
+            var modelBytes = await source.FetchBytesAsync(repoId, modelFile, ct).ConfigureAwait(false);
             modelStream = new System.IO.MemoryStream(modelBytes);
-            try { extData = await hubStream.OpenAsync(repoId, externalDataFile, ct: ct).ConfigureAwait(false); }
+            try { extData = await source.OpenAsync(repoId, externalDataFile, ct).ConfigureAwait(false); }
             catch { extData = null; }
         }
         else
         {
-            // Single-file model: torrent-stream model.onnx directly (weights embedded — keep them off the heap).
-            var modelTorrent = await hubStream.OpenAsync(repoId, modelFile, ct: ct).ConfigureAwait(false);
-            modelStream = modelTorrent.Stream;
+            // Single-file model: stream model.onnx directly (weights embedded — keep them off the heap).
+            modelStream = await source.OpenAsync(repoId, modelFile, ct).ConfigureAwait(false);
         }
         onProgress?.Invoke("open", 100);
         try
         {
-            return await CreateFromStreamsAsync(accelerator, modelStream, extData?.Stream,
+            return await CreateFromStreamsAsync(accelerator, modelStream, extData,
                 onProgress, inputShapes, inputSize, ct).ConfigureAwait(false);
         }
         finally
         {
             // Weights are on the GPU by now — the streams are done.
             await modelStream.DisposeAsync().ConfigureAwait(false);
-            if (extData != null) await extData.Stream.DisposeAsync().ConfigureAwait(false);
+            if (extData != null) await extData.DisposeAsync().ConfigureAwait(false);
         }
     }
 
