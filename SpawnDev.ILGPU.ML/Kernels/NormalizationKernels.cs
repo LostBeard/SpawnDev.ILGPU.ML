@@ -599,7 +599,25 @@ public class NormalizationKernels : IDisposable
         LastStatsPathWasCooperative = false;
         LastStatsGroupSize = 0;
         if (!CoopInstanceNormEnabled) return false;
-        if (numSlices <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
+        if (numSlices <= 0) return false;
+        // 🔴 THE COOPERATIVE PATH IS FOR REAL GPUs ONLY, and this list is MEASURED, not reasoned.
+        //   WebGL - cannot run it at all (no shared memory / no group barrier in the TF path).
+        //   CPU   - ILGPU emulates a workgroup with real threads and real barriers, so 64 threads and two
+        //           barriers per slice cost far more than a serial loop, and a CPU gains nothing from extra
+        //           threads hiding memory latency. MEASURED (InstanceNormPartialStats, RTX 4070 host):
+        //           serial 1.00/1.66/1.93 ms vs cooperative 13.52/11.88/20.26 ms at spatial=50176 for
+        //           C=3/32/64 - 7-13x WORSE. I shipped that regression for half a day because every gate
+        //           I ran checks correctness and none checks per-backend cost.
+        //   Wasm  - MEASURED both ways rather than assumed, because assuming is what got CPU wrong.
+        //           Full InstanceNorm ms/call: [1,3,50176] coop 9.03 vs serial 7.30; [1,32,50176] coop 28.97
+        //           vs serial 29.95. Mixed and inside run-to-run noise (WebGPU's own rows moved 10-15%
+        //           between the same two runs). No measurable gain, so the simpler path wins on the lane the
+        //           project already documents as slowest and most fragile.
+        //
+        // ⚠️ The pattern: the cooperative kernel pays off where threads hide MEMORY LATENCY - a real GPU.
+        // Where "threads" are OS threads or WASM workers, the barriers cost more than the parallelism buys.
+        var accType = _accelerator.AcceleratorType;
+        if (accType is AcceleratorType.WebGL or AcceleratorType.CPU or AcceleratorType.Wasm) return false;
         int T = _iNormCoopGroup != 0 ? _iNormCoopGroup
             : (_iNormCoopGroup = Math.Min(MaxINormGroup, (int)_accelerator.MaxNumThreadsPerGroup));
         if (T < 32) return false;                                 // group too small — keep the serial kernel

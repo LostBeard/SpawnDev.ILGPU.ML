@@ -187,6 +187,19 @@ feature map) gets the same fix.
 
 `ILGPU_ML_INORM_COOP=0` forces the old kernel back, so the two can be priced in one run.
 
+⚠️ The cooperative path is **GPU-only, by measurement**. It is skipped on WebGL (cannot run shared memory or
+a group barrier), on the CPU accelerator, and on Wasm. ILGPU emulates a workgroup with real threads and real
+barriers, so on the CPU backend the cooperative Pass 1 measured **7-13x SLOWER** than the serial kernel
+(`InstanceNormPartialStats` at spatial=50176: serial 1.00/1.66/1.93 ms for C=3/32/64 vs cooperative
+13.52/11.88/20.26 ms). That regression shipped for half a day because every gate checks correctness and none
+checks per-backend cost. Wasm was measured rather than assumed - coop 9.03 vs serial 7.30 ms and coop 28.97 vs
+serial 29.95 ms, no gain inside noise - so it stays serial too. The pattern: filling a group pays off where
+threads hide MEMORY LATENCY, i.e. a real GPU; where the threads are OS threads or WASM workers, the barriers
+cost more than the parallelism buys.
+
+`InstanceNormPass1_LaunchShape_PerBackend` now asserts WHICH path each backend takes, so neither direction can
+regress silently.
+
 `InstanceNormPartialStats` and `InstanceNormPartialSqDev` - the tiled VAE decode's stat pass, and the
 largest slices in the engine - get the same treatment behind the same `CoopStatsApplies` predicate, so the
 three cooperative paths cannot drift into disagreeing about when a group is worth using. MEASURED on the

@@ -112,20 +112,36 @@ public partial class MLTestBase
                             + $"maxGroup={accelerator.MaxNumThreadsPerGroup} "
                             + $"{sw.Elapsed.TotalMilliseconds / reps:F2} ms/call");
 
-            // The invariant, per shape. A backend with real groups must divide a long slice; a backend
-            // without them must not try. Both directions matter - the second is what keeps WebGL from
-            // silently compiling a shared-memory kernel it cannot run.
-            bool hasGroups = accelerator.MaxNumThreadsPerGroup >= 32;
-            if (spatial >= 50176 && hasGroups && !coop)
+            // The invariant, per backend and per shape. Asserted as INTENT, not as a mirror of
+            // CoopStatsApplies - a test that just restates the implementation cannot catch the
+            // implementation changing.
+            //
+            //   Cuda / OpenCL / WebGPU - real GPUs, a long slice MUST divide across a group.
+            //   CPU                    - MUST stay serial. ILGPU emulates groups with real threads and
+            //                            barriers; MEASURED 7-13x WORSE cooperative. maxGroup is 64 there,
+            //                            so a naive "has groups => must be cooperative" rule gets it wrong,
+            //                            which is exactly the regression this pins.
+            //   WebGL                  - MUST stay serial; it cannot run shared memory + barriers at all.
+            //   Wasm                   - MUST stay serial. MEASURED both ways: coop 9.03 vs serial 7.30 and
+            //                            coop 28.97 vs serial 29.95 ms/call - no gain, inside noise.
+            //
+            // The generalisation: the cooperative kernel wins where threads hide MEMORY LATENCY, i.e. a real
+            // GPU. Where "threads" are OS threads or WASM workers, the barriers cost more than they buy.
+            var t = accelerator.AcceleratorType;
+            bool mustBeCooperative = t is AcceleratorType.Cuda or AcceleratorType.OpenCL or AcceleratorType.WebGPU;
+            bool mustBeSerial = t is AcceleratorType.CPU or AcceleratorType.WebGL or AcceleratorType.Wasm;
+
+            if (spatial >= 50176 && mustBeCooperative && !coop)
                 throw new Exception(
                     $"{BackendName}: a {spatial}-element slice took the SERIAL one-thread-per-slice Pass 1 on a "
-                  + $"backend reporting MaxNumThreadsPerGroup={accelerator.MaxNumThreadsPerGroup}. The "
+                  + $"real GPU backend (MaxNumThreadsPerGroup={accelerator.MaxNumThreadsPerGroup}). The "
                   + "cooperative path stopped being selected - correct but unboundedly slow, and no "
                   + "correctness test would catch it.");
-            if (!hasGroups && coop)
+            if (mustBeSerial && coop)
                 throw new Exception(
-                    $"{BackendName}: took the COOPERATIVE Pass 1 with MaxNumThreadsPerGroup="
-                  + $"{accelerator.MaxNumThreadsPerGroup} - that kernel needs shared memory and a group barrier.");
+                    $"{BackendName}: took the COOPERATIVE Pass 1, which is a deliberate exclusion here - "
+                  + "WebGL cannot run it, and on the CPU accelerator it measured 7-13x SLOWER than the serial "
+                  + "kernel because groups and barriers are emulated with real threads.");
         }
         norm.Dispose();
     });
