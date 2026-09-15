@@ -57,22 +57,29 @@ public abstract partial class MLTestBase
     /// The chunk sizes the SpawnDev.AI demo actually renders, in phoneme tokens.
     /// </summary>
     /// <remarks>
-    /// 🔴 THESE ARE PRODUCTION'S NUMBERS, NOT A GUESS AT THEM. Home.razor.cs splits a reply with
-    /// <c>SpeakChunkCharacters = 160</c> for the FIRST chunk and then merges the rest up to
-    /// <c>SpeakChunkCharactersAfterFirst = 320</c>, so a long reply is 160 / 320 / 320 CHARACTERS.
-    /// Kokoro's reference line is 31 characters -> 35 phoneme tokens, i.e. ~1.13 tokens per character,
-    /// which puts those chunks at ~180 / ~360 / ~360 tokens.
+    /// 🔴 THESE ARE PRODUCTION'S NUMBERS, NOT A GUESS AT THEM. They are the chunk lengths the
+    /// SpawnDev.AI demo's own splitter actually emitted for a ~900-character reply, MEASURED 2026-09-15:
+    /// <b>230 / 311 / 242 / 138 characters</b>. Kokoro's reference line is 31 characters -> 35 phoneme
+    /// tokens, i.e. ~1.13 tokens per character, which puts them at ~260 / ~351 / ~273 / ~156 tokens.
     /// <para>
-    /// ⚠️ The first version of this test used per-SENTENCE chunks (9-47 tokens) and failed loudly - but
-    /// the demo has not chunked per sentence since the merge above was added, so that failure was the
-    /// fixture's, not the product's. A gate that models a policy the product does not use is worse than
-    /// no gate: it reports a stall nobody would ever hear, and it hides the one they would.
+    /// ⚠️ THIS FIXTURE HAS BEEN WRONG TWICE, IN THE SAME WAY, AND BOTH COST A RUN. First it modelled
+    /// per-SENTENCE chunks (9-47 tokens), which the demo had not done since a merge step was added.
+    /// Then it modelled 180 / 360 / 360, which was the demo's policy right up until a chunk FLOOR was
+    /// added to fix the stall this test found. A gate that models a policy the product does not use is
+    /// worse than no gate: it reports a stall nobody would hear and hides the one they would. When
+    /// Home.SpeakChunkCharacters / SpeakChunkMinimumCharacters change, these change with them.
     /// </para>
     /// <para>
-    /// ⚠️ Kokoro's context is 510 tokens, so 360 fits; do not raise these past that without checking.
+    /// ⚠️ This file cannot reference SpawnDev.AI (layering), which is why the numbers are copied rather
+    /// than called. The demo-side gate that DOES call the real chunker is
+    /// <c>AiVoiceStreamingTests.ChunkedReplyStreamsWithoutAPause</c>; this one exists to catch an engine
+    /// regression without needing the whole demo.
+    /// </para>
+    /// <para>
+    /// ⚠️ Kokoro's context is 510 tokens, so these fit; do not raise them past that without checking.
     /// </para>
     /// </remarks>
-    private static readonly int[] KokoroReplyChunkTokenCounts = { 180, 360, 360 };
+    private static readonly int[] KokoroReplyChunkTokenCounts = { 260, 351, 273, 156 };
 
     /// <summary>
     /// Builds a chunk of <paramref name="tokenCount"/> ids framed the way the front end frames a

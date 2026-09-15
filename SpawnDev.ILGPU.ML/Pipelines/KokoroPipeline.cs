@@ -281,7 +281,13 @@ public sealed class KokoroPipeline : IDisposable
         _tail = tail;
         TailStatus = tailStatus;
         session.SyncIntervalNodesOverride = DrainCadenceNodes;
-        session.MaxPendingReleaseBytesOverride = DrainByteBudget;
+        // 🔴 BROWSER BACKENDS ONLY, because the problem it solves is theirs. A drain is a full async GPU
+        // round trip in a browser and ~free on a desktop backend - the cadence note above measured the
+        // same 25 drains at 1,961 ms on WebGPU and 53 ms on CUDA. Raising the byte budget everywhere
+        // would hold up to DrainByteBudget of dead buffers in real VRAM on CUDA/OpenCL to buy back
+        // milliseconds that were never being spent.
+        if (accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
+            session.MaxPendingReleaseBytesOverride = DrainByteBudget;
         // 🔴 RESOLVED FROM THE GRAPH, NOT HARDCODED. Two exports of this same model are in circulation and
         // they do not agree on names: onnx-community's serves `input_ids` -> `waveform`, KokoroSharp's
         // ships `tokens` -> `audio`. Same 2,463-node graph, same operators, same weights. Hardcoding
