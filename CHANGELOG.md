@@ -4,6 +4,53 @@ Notable changes per release. Pre-stable; API will change between preview drops.
 
 ## 5.2.14
 
+### Fixed - Kokoro streaming TTS stalled at the utterance lengths a real reply uses
+
+The engine gate measured Kokoro on a repeated 35-token fixture. The SpawnDev.AI demo renders 160-character
+then 320-character chunks (~180 / ~360 phoneme tokens), and at those sizes three separate things went
+wrong, none of which the fixture could show. MEASURED on WebGPU / RTX 4070, gated by the new
+`Kokoro_StreamingReply_PlaysWithoutAnUnderrun`:
+
+```
+                              BEFORE                 AFTER
+chunk 0  180 tok    7,881 ms executor      11.05s audio in 7,342 ms   RTF 0.66x
+chunk 1  360 tok   10,126 ms executor      21.55s audio in 9,717 ms   RTF 0.45x  +1,333 ms
+chunk 2  360 tok   DEVICE LOST             21.45s audio in 9,331 ms   RTF 0.44x  +13,552 ms
+whole reply        -                       54.05s of audio in 26,391 ms, RTF 0.49x, no underrun
+```
+
+**`KokoroPipeline.EnableGraphCapture` now defaults to FALSE.** It was defaulted on off the back of that
+fixture, where it is a genuine 3.8x (1,689 -> 444 ms). At production chunk sizes, RECORDING a plan costs
+4.5x a plain pass, because `SessionGraphCapture` runs the graph three times:
+
+```
+360 tok, first sight (runs direct)   :  9,852 ms   RTF 0.46x
+360 tok, repeat     (records a plan) : 45,153 ms   RTF 2.11x   <- 22.4 s late, an audible stall
+```
+
+A spoken reply is a handful of chunks, so a length that recurs once recurs once - the recording is paid
+and the replay that would amortise it never comes. Set it true for a fixed-shape workload that runs the
+same utterance length many times (a benchmark, canned lines, a batch render); leave it alone for speech.
+
+The device loss on chunk 2 was capture replay submitting its whole plan as one command buffer - fixed in
+SpawnDev.ILGPU 5.2.12.
+
+### Added - `MaxPendingReleaseBytesOverride` on `GraphExecutor` and `InferenceSession`
+
+The executor drains on EITHER a node cadence or a deferred-release byte cap, and only the cadence was
+tunable per session. The node count does not change with the utterance but the intermediate SIZES do, so
+the fixed 512 MiB cap fires proportionally more often the longer the sentence - **3 drains at 35 tokens,
+15 at 180, 27 at 360**, the last costing 5,123 ms of a 10,126 ms pass. Kokoro now sets 2 GiB; drains went
+to 4 and 7.
+
+⚠️ Carried through `RecompileForShapes`, which a variable-length model hits on every new length - a
+setting that lives only on the first executor silently stops applying exactly when it matters.
+
+⚠️ Raising it raises peak GPU memory to ~(live set + budget). It is per-session precisely so it is not
+raised globally: a 512² VAE decode blew to ~10 GB on the 512 MiB default.
+
+Exact either way - this changes only WHEN buffers are recycled, never the math.
+
 ### Added - Kokoro-82M text to speech, and it is 12x faster than the TTS it replaces
 
 `KokoroPipeline`, `KokoroVoicePack`, `KokoroTokenizer` and the 115-symbol vocabulary. One pass through a
