@@ -415,6 +415,14 @@ public abstract partial class MLTestBase
                     + $"({(probe.ElapsedMilliseconds > 0 ? uncapturedMs / probe.ElapsedMilliseconds : 0):F2}x) | status={capStatus} | "
                     + $"RTF on={(probe.ElapsedMilliseconds / 1000.0) / seconds:F2}x (<1 = faster than realtime)");
 
+            // Which of the three scalar-buffer destroy sites actually fired. Guessing between them by
+            // inspection failed twice; this reports it.
+            if (pipeline.Session.Accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator)
+                Console.WriteLine($"[KokoroCost] {BackendName} scalar destroys: "
+                    + $"poolingOff={SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.ScalarDestroyedByPoolingOff}, "
+                    + $"poolOverflow={SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.ScalarDestroyedByPoolOverflow}, "
+                    + $"cacheEntry={SpawnDev.ILGPU.WebGPU.WebGPUAccelerator.ScalarDestroyedByCacheEntry}");
+
             if (cacheFailure != null)
                 Console.WriteLine($"[KokoroCost] {BackendName} BIND-GROUP CACHE A/B: STILL BROKEN — {cacheFailure}");
             else if (cachedMs >= 0)
