@@ -157,7 +157,33 @@ public sealed class KokoroPipeline : IDisposable
     /// fewer re-records when a conversation revisits lengths.</summary>
     public int MaxCapturedShapes { get; set; } = 6;
 
-    private SessionGraphCapture CaptureFor(int tokenCount)
+    /// <summary>Lengths seen exactly once. Recording is not attempted until a length RECURS.</summary>
+    private readonly HashSet<int> _lengthsSeenOnce = new();
+
+    /// <summary>
+    /// The plan for this length, or <c>null</c> when the caller should just run the graph directly.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 RECUR-ONLY, AND THE REASON IS MEASURED. <see cref="SessionGraphCapture"/> runs the graph THREE
+    /// times to record a plan (warm / probe / record). Capturing on FIRST sight therefore makes a
+    /// never-repeated utterance about three times more expensive - and in streaming speech every chunk is a
+    /// new length, so first sight is the common case, not the rare one.
+    ///
+    /// MEASURED in the SpawnDev.AI demo (WebGPU, RTX 4070) when this captured on first sight:
+    /// <code>
+    ///   65 tok, 4.08 s audio -> RTF 4.70x   (new length)
+    ///   35 tok, 2.27 s audio -> RTF 3.84x   (new length)
+    ///   35 tok, 2.27 s audio -> RTF 0.34x   (same length again)
+    /// </code>
+    /// Against 1.81x / 0.75x before capture existed: the repeat got 2.2x better and the NEW-LENGTH case got
+    /// 2.1x WORSE. Optimising the case a conversation almost never hits, at the expense of the case it
+    /// always hits, is a regression wearing a speedup's clothes.
+    ///
+    /// So a length is run directly the first time and only recorded once it proves it recurs. Same
+    /// recur-only policy the WebGPU bind-group cache uses, for the same reason: never pay to memoise
+    /// something used once.
+    /// </remarks>
+    private SessionGraphCapture? CaptureFor(int tokenCount)
     {
         if (_capturesByTokenCount.TryGetValue(tokenCount, out var existing))
         {
@@ -165,6 +191,11 @@ public sealed class KokoroPipeline : IDisposable
             _captureLru.Add(tokenCount);
             return existing;
         }
+
+        // First sight: remember it and run direct. Recording now would cost ~3 passes for an utterance
+        // length that may never come back.
+        if (_lengthsSeenOnce.Add(tokenCount))
+            return null;
 
         while (_captureLru.Count >= Math.Max(1, MaxCapturedShapes))
         {
@@ -362,9 +393,17 @@ public sealed class KokoroPipeline : IDisposable
             if (EnableGraphCapture)
             {
                 // Keyed by token count: that is the only input dimension that varies, and it is what the
-                // recorded plan is bound to.
-                _capture = CaptureFor(tokens.Count);
-                outputs = await _capture.RunAsync(inputs).ConfigureAwait(false);
+                // recorded plan is bound to. Null on a length's FIRST sighting - see CaptureFor.
+                var capture = CaptureFor(tokens.Count);
+                if (capture != null)
+                {
+                    _capture = capture;
+                    outputs = await capture.RunAsync(inputs).ConfigureAwait(false);
+                }
+                else
+                {
+                    outputs = await _session.RunAsync(inputs).ConfigureAwait(false);
+                }
             }
             else
             {

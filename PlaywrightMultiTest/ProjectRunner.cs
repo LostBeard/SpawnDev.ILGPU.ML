@@ -202,6 +202,10 @@ namespace PlaywrightMultiTest
                       : "(from PMT_EXCLUDE_CATEGORIES)"));
 
             filter ??= Environment.GetEnvironmentVariable("PMT_FILTER");
+            // Backend scoping, independent of the name filter - see LaneFilter().
+            var laneFilter = LaneFilter();
+            if (laneFilter != null)
+                Console.WriteLine($"[PlaywrightMultiTest] PMT_LANES active: only [{string.Join(", ", laneFilter)}] lanes are scheduled.");
             if (!string.IsNullOrEmpty(filter))
             {
                 LogStatus($"Test filter active: '{filter}' (substring match; comma-separated = OR)");
@@ -434,6 +438,13 @@ namespace PlaywrightMultiTest
                                 continue;
                             }
 
+                            // Backend scoping (PMT_LANES) - applied like the name filter, before the
+                            // category excludes, so a scoped run schedules nothing for the lanes it skips.
+                            if (!MatchesLane(laneFilter, typeName))
+                            {
+                                continue;
+                            }
+
                             // Default fast loop skips slow integration tests by category (e.g.
                             // "HeavyModel" — big-model end-to-end tests that run ~minutes via
                             // per-node shape readbacks). Applied REGARDLESS of PMT_FILTER, because
@@ -530,6 +541,16 @@ namespace PlaywrightMultiTest
 
                         var rowTest = new ProjectTest(testableProject, typeName!, methodName!) { Category = category };
                         if (filter != null && !MatchesFilter(filter, rowTest))
+                        {
+                            continue;
+                        }
+
+                        // ⚠️ THE DESKTOP LANES ENUMERATE HERE, SEPARATELY FROM THE BROWSER LANES ABOVE.
+                        // PMT_LANES was first applied only at the browser site; the run then correctly
+                        // skipped WebGL and Wasm while still scheduling CPUTests, which is the single most
+                        // expensive lane there is (~260 s per Kokoro pass). Verifying the browser half and
+                        // assuming the whole run is exactly the "prove the switch reaches the code" trap.
+                        if (!MatchesLane(laneFilter, typeName))
                         {
                             continue;
                         }
@@ -1340,6 +1361,39 @@ namespace PlaywrightMultiTest
         // dragging in the other 20 Pipeline_* tests. The alternative was two full PMT invocations,
         // each paying the publish + static-server + Chromium-launch cost again, which is exactly the
         // kind of tax that gets a gate skipped at 2am.
+        // ── PMT_LANES: run only the named backend lanes ────────────────────────────────────────────
+        //
+        // 🔴 WHY THIS EXISTS. The project's standing rule is FAST BACKENDS FIRST - "CUDA and/or OpenCL
+        // (desktop) + WebGPU (browser)" for iteration, with the full six-backend sweep saved for the
+        // release gate. PMT had PMT_FILTER (by test name) and category excludes, but NO way to scope by
+        // BACKEND - so every iteration ran CPU at ~260 s per Kokoro pass and WebGL at ~2.5x realtime
+        // regardless of whether the change could possibly affect them. On 2026-09-15 that turned a
+        // one-question check into repeated 10-40 minute runs. TJ: "FUCK CPU AND EVERYTHING ELSE RIGHT NOW
+        // UNTIL YOU GET THE 2 MAIN BACKENDS WORKING PERFECTLY ... that way we are not wasting time testing
+        // shit code on shit backends that takes forever."
+        //
+        //   PMT_LANES=WebGPU,Cuda     iterate on the two that matter
+        //   (unset)                   every lane, which is what a release gate wants
+        //
+        // Matched against the TEST CLASS name (WebGPUTests, CudaTests, OpenCLTests, CPUTests, WebGLTests,
+        // WasmTests, DefaultTests, IntegrationTests), substring, case-insensitive - so "WebGPU" also
+        // selects WebGPUNoSubgroupsTests, which is what you want when scoping to a backend.
+        private static string[]? LaneFilter()
+        {
+            var env = Environment.GetEnvironmentVariable("PMT_LANES");
+            if (string.IsNullOrWhiteSpace(env)) return null;
+            return env.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        private static bool MatchesLane(string[]? lanes, string? testTypeName)
+        {
+            if (lanes == null) return true;
+            if (testTypeName == null) return false;
+            foreach (var lane in lanes)
+                if (testTypeName.Contains(lane, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
         private static bool MatchesFilter(string filter, ProjectTest t)
         {
             foreach (var term in filter.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))

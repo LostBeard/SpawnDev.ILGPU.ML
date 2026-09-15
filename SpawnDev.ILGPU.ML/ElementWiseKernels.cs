@@ -976,6 +976,16 @@ public class ElementWiseKernels : IDisposable
     private static void PowImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output)
     { output[idx] = MathF.Pow(a[idx], b[idx]); }
 
+    // Scalar exponent. The ONNX Pow in every normalisation is x^2 with a scalar exponent, and the operator
+    // used to BROADCAST that scalar by allocating a managed float[] the size of the whole output tensor,
+    // filling it in a CPU loop, and uploading it - per node, per call. MEASURED 2026-09-15 on Kokoro
+    // (WebGPU): 62 Pow nodes, 1,144.8 ms of the 2,126 ms new-shape penalty (96% of everything attributable
+    // to nodes) and the bulk of 215 MB of managed allocation per utterance, on a non-concurrent WASM GC.
+    // Bulk data built in .NET and shoved at the GPU is exactly what the zero-copy rule forbids.
+    private static void PowScalarImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> a, float exponent,
+        ArrayView1D<float, Stride1D.Dense> output)
+    { output[idx] = MathF.Pow(a[idx], exponent); }
+
     private static void AbsImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
     { float x = input[idx]; output[idx] = x < 0f ? -x : x; }
 
@@ -1844,6 +1854,18 @@ public class ElementWiseKernels : IDisposable
     { EnsureLoaded2(); _divKernel!(count, a, b, output); }
     public void Pow(ArrayView1D<float, Stride1D.Dense> a, ArrayView1D<float, Stride1D.Dense> b, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _powKernel!(count, a, b, output); }
+
+    /// <summary>output[i] = a[i] ^ exponent. No exponent BUFFER at all - so no managed array, no CPU
+    /// expansion loop, no host-to-device upload, and nothing for the pool to allocate per shape.</summary>
+    public void PowScalar(ArrayView1D<float, Stride1D.Dense> a, float exponent,
+        ArrayView1D<float, Stride1D.Dense> output, int count)
+    {
+        _powScalarKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, float, ArrayView1D<float, Stride1D.Dense>>(PowScalarImpl);
+        _powScalarKernel(count, a, exponent, output);
+    }
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float,
+        ArrayView1D<float, Stride1D.Dense>>? _powScalarKernel;
     public void Abs(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
     { EnsureLoaded2(); _absKernel!(count, input, output); }
     public void Neg(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)

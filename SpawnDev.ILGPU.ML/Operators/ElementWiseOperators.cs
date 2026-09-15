@@ -671,6 +671,30 @@ public class PowOperator(OperatorRegistry reg) : IOnnxOperator
             if (bVals != null)
             {
                 int outCount = ctx.Outputs[0].ElementCount;
+
+                // ⭐ THE COMMON CASE BY FAR: ONE exponent value, broadcast over the whole tensor - every
+                // x^2 in every LayerNorm and InstanceNorm. Pass it as a SCALAR KERNEL ARGUMENT.
+                //
+                // 🔴 WHAT THIS REPLACES, AND WHY IT MATTERED. The code below expands the exponent into a
+                // managed float[] the size of the entire output tensor, fills it in a CPU loop, rents a
+                // device buffer and uploads it - per node, per call. MEASURED 2026-09-15 on Kokoro
+                // (WebGPU, RTX 4070): 62 Pow nodes cost 1,144.8 ms of a 2,126 ms new-shape penalty, i.e.
+                // 96% of everything attributable to nodes, and a large share of 215 MB of managed
+                // allocation per utterance on a GC that stops the world. Building bulk data in .NET to
+                // hand to the GPU is the thing the zero-copy rule exists to forbid - and here the data
+                // was a single number repeated.
+                //
+                // ⚠️ "All values equal" is CHECKED, not assumed: an exponent tensor that genuinely varies
+                // per element still takes the general path below.
+                bool uniform = bVals.Length > 0;
+                for (int i = 1; i < bVals.Length && uniform; i++)
+                    if (bVals[i] != bVals[0]) uniform = false;
+                if (uniform)
+                {
+                    reg.ElementWise.PowScalar(a.Data, bVals[0], ctx.Outputs[0].Data, outCount);
+                    return;
+                }
+
                 var expanded = new float[outCount];
                 for (int i = 0; i < outCount; i++)
                     expanded[i] = bVals[i % bVals.Length];
