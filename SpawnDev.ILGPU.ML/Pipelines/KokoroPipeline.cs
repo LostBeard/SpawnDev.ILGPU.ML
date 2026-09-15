@@ -318,8 +318,13 @@ public sealed class KokoroPipeline : IDisposable
 
     private static async Task<float[]> ReadAsync(Tensor tensor)
     {
-        var host = new float[tensor.ElementCount];
         var data = await SpawnDev.ILGPU.SpawnDevContextExtensions.CopyToHostAsync<float>(tensor.Data);
+        // ⚠️ The readback can come back LONGER than the tensor - a pooled buffer is rented by capacity, not
+        // by exact size - so the length still has to be honoured. But when it already matches, copying it
+        // into a second array of the same length is 218 KB of .NET WASM heap churn per utterance for
+        // nothing, on a heap that is small and whose crossing is the cost of filling.
+        if (data.Length == tensor.ElementCount) return data;
+        var host = new float[tensor.ElementCount];
         Array.Copy(data, host, Math.Min(data.Length, host.Length));
         return host;
     }

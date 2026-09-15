@@ -62,6 +62,52 @@ Every one produced a full, correctly-shaped, plausible buffer. Each is a class, 
 - **`Resize` was rank-4 only and `ConvTranspose` was 2-D only.** Both now handle rank 3; new
   `ConvTranspose1DKernel` (gather form, no atomics), oracle-checked against onnxruntime.
 
+### Added - `InferenceSession(prepareGraph:)`, and Kokoro's iSTFT tail moved off the GPU
+
+`CreateFromOnnx` and `CreateFromOnnxStreamAsync` take an optional
+`Action<ModelGraph> prepareGraph`, invoked after the parsed graph is built and its constants are seeded,
+and before it is compiled. Rewiring `ModelGraph.Outputs` there lets dead-node elimination drop everything
+downstream, so a caller that can do part of a graph better than the GPU can say so.
+
+Kokoro is the case it exists for. Its last **35 nodes** are bookkeeping, not signal processing: a
+`Greater`/`NonZero`/`ScatterND` dance whose entire effect, MEASURED against onnxruntime, is to divide
+**18 of 54,620 samples** by the overlap-add window sum, scale by 4, and trim 10 from each end. `NonZero`
+and the `ScatterND` index build have data-dependent output SHAPES, so they force host readbacks in the
+middle of a dispatch stream, and each readback drains the queue.
+
+`KokoroIstftTail` reproduces it on the orchestrator - **bit-exact**, 0 of 54,600 samples differ. It reads
+the window sum, the scale and the trims OUT OF THE GRAPH and declines anything it does not recognise, so a
+re-export loses the optimisation rather than running a tail it was never read from.
+
+⚠️ Folding the divide and the scale into a single multiply changes 1 sample in 54,600, so the gate asserts
+bit-equality rather than a tolerance - and the fixtures on both sides of it are onnxruntime's own.
+
+### Fixed - the CPU shape interpreter's `Gather` read one element where it should read a slice
+
+`GraphExecutor.TryComputeShapeOnCpu`'s `Gather` (axis 0) produced one float per index. That is correct only
+while the data is rank 1 - the shape vectors the interpreter was built for. Kokoro gathers ROW 0 of its
+`[1,35]` per-phoneme durations, and one-float-per-index reported a 35-element row as **1 element**.
+
+Nothing consumed that value, so it was wrong and invisible for as long as it existed. It surfaced the
+moment `CumSum` was taught to resolve on the CPU: 13 audio frames where there should be 182, i.e. 0.33 s of
+audio for a 2.27 s line, at correlation 0.15.
+
+The slice width now comes from the data tensor's real shape; where that is unavailable (an elided producer
+leaves no tensor to ask) it falls back to the previous behaviour, which is the rank-1 case that behaviour
+was right for.
+
+### Added - `Round`, `Clip` and `CumSum` resolve on the CPU shape interpreter
+
+A duration predictor IS a shape chain: Kokoro decides how many frames each phoneme gets, so these three
+were read back as shape values - one GPU round trip each, over 35 numbers the host already had. `Clip`
+reads its bounds the way `ClipOperator` does (opset-6 float attributes or opset-11 optional inputs, where
+an omitted bound is an empty NAME rather than a missing slot) and declines on a bound it cannot read rather
+than dropping it. `CumSum` declines when its input value's length disagrees with the input tensor's shape,
+and when the sum would cross an inner axis the flat value cannot express.
+
+Together with the tail above, MEASURED on CUDA with correlation 0.9940 and the sample count exact at 54,600
+throughout: **readbacks per pass 11 -> 4**, compiled nodes 1,885 -> 1,850.
+
 ### Added - a Node/onnxruntime oracle for numerically sensitive graphs
 
 `tools/onnx-nodes.mjs`, `onnx-intermediates.mjs`, `op-oracle.mjs`, `onnx-perturb.mjs`, `onnx-inject.mjs`

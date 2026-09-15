@@ -422,6 +422,25 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
                     // column - not this backend's millisecond column - is what predicts it.
                     Console.WriteLine($"    -> at the browser's ~1.5 ms/node, the node split alone implies "
                                     + string.Join(", ", byStage.Select(g => $"{g.Stage}={g.Nodes * 1.5:F0}ms")));
+
+                    // ⭐ WHICH OPS SURVIVE TO DISPATCH - the list fusion and dispatch-elide have to shorten.
+                    // The RAW graph's op census (tools/onnx-opcensus.mjs) counts what the exporter wrote;
+                    // this counts what actually costs a crossing, which is a different and much shorter
+                    // list. Dispatching 100 Unsqueezes to reshape a 2-element shape vector is 100 browser
+                    // crossings for arithmetic the shape interpreter already did on the host.
+                    var byOp = timings.GroupBy(kv =>
+                        {
+                            var k = kv.Key[(kv.Key.IndexOf('_') + 1)..];
+                            return k[..k.IndexOf('_')];
+                        })
+                        .Select(g => (Op: g.Key, Nodes: g.Count(), Ms: g.Sum(x => x.Value)))
+                        .OrderByDescending(g => g.Nodes).ToList();
+                    Console.WriteLine($"  DISPATCHED OPS ({byOp.Count} distinct):");
+                    foreach (var g in byOp.Take(20))
+                        Console.WriteLine($"    {g.Op,-22} {g.Nodes,5} nodes  {g.Ms,8:F1} ms  "
+                                        + $"{g.Ms / g.Nodes,6:F3} ms/node");
+                    var tail20 = byOp.Skip(20).Sum(g => g.Nodes);
+                    if (tail20 > 0) Console.WriteLine($"    {"(" + (byOp.Count - 20) + " more)",-22} {tail20,5} nodes");
                 }
 
                 Console.WriteLine($"  capture: requested={pipeline.EnableGraphCapture} "
