@@ -86,7 +86,7 @@ public abstract partial class MLTestBase
         // MemoryBuffer1D<T,TStride> wrapper. Testing the wrapper compiles and is ALWAYS false, so the first
         // run of this test skipped on every lane including WebGPU and reported nothing at all. A guard that
         // silently converts "I wired this wrong" into "unsupported here" is worse than no guard.
-        Preprocessing.MediaInterop.UploadRgbaToDevice(src, bufB);  // JS -> GPU, .NET never sees a pixel
+        Preprocessing.MediaInterop.UploadToDevice(src, bufB);  // JS -> GPU, .NET never sees a pixel
         await accelerator.SynchronizeAsync();
         swB.Stop();
 

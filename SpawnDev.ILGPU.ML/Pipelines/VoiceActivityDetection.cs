@@ -175,8 +175,41 @@ public sealed class SileroVad : IDisposable
 
         // CopyFromCPU is an immediate write rather than a queued dispatch, so it carries no command-encoder
         // dependency on the browser backends.
+        //
+        // ⚠️ IN A BROWSER, PREFER THE Float32Array OVERLOAD BELOW. Reaching this one from a mic frame means
+        // the samples were pulled out of JS into managed memory first, and then written straight back to the
+        // GPU - a round trip with nothing in between that needed .NET. 512 samples is well past the
+        // ~64-element metadata exemption, and "it is only a few KB" is not a reason to take the slower path.
         _xBuf.View.CopyFromCPU(frame);
+        return await RunLoadedFrameAsync().ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// One VAD frame whose samples are ALREADY a JS typed array — the browser path. The samples go
+    /// JS → GPU via <c>CopyFromJS</c> and never enter the .NET managed heap.
+    /// </summary>
+    /// <remarks>
+    /// This is the overload a microphone should reach. <see cref="ProcessFrameAsync(float[])"/> forces the
+    /// caller to have pulled the frame into managed memory first, which for a WebCodecs <c>AudioData</c>
+    /// frame is a copy out of JS followed immediately by a copy back to the GPU.
+    /// Throws on a desktop accelerator, where there is no JS heap — use the <c>float[]</c> overload there.
+    /// </remarks>
+    public async Task<float> ProcessFrameAsync(SpawnDev.SpawnJS.JSObjects.Float32Array frame)
+    {
+        long len = frame.Length;
+        if (len != WindowSize)
+            throw new ArgumentException(
+                $"Silero VAD takes exactly {WindowSize} samples per frame, got {len}.", nameof(frame));
+
+        Preprocessing.MediaInterop.UploadToDevice(frame, _xBuf);
+        return await RunLoadedFrameAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>Runs the graph over whatever is already in <c>_xBuf</c>. Shared by both overloads so the
+    /// readback ordering and state threading below cannot drift apart between them — a guard or a fix
+    /// landing on one of two copies of one job is how this codebase keeps getting bitten.</summary>
+    private async Task<float> RunLoadedFrameAsync()
+    {
         var outputs = await _capture.RunAsync(new Dictionary<string, Tensor>
         {
             ["x"] = new Tensor(_xBuf.View, _xShape),

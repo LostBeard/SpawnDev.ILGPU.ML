@@ -26,7 +26,7 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// backends."* Nothing here was using it.
 ///
 /// ⭐ So: use the <c>...JS</c> methods below for anything feeding an accelerator, and
-/// <see cref="UploadRgbaToDevice"/> to land it on the GPU. Keep the <c>byte[]</c> overloads for the cases
+/// <see cref="UploadToDevice{T}"/> to land it on the GPU. Keep the <c>byte[]</c> overloads for the cases
 /// that really do need managed data (saving a file, a CPU-side codec, a unit-test oracle).
 ///
 /// IMPORTANT: These methods use SpawnDev.SpawnJS typed wrappers.
@@ -53,7 +53,7 @@ public class MediaInterop
     // ──────────────────────────────────────────────
     //
     // Each returns the pixels as a JS typed array that has never entered managed memory. Hand it to
-    // UploadRgbaToDevice (or straight to IBrowserMemoryBuffer.CopyFromJS) and the frame goes JS → GPU with
+    // UploadToDevice (or straight to IBrowserMemoryBuffer.CopyFromJS) and the frame goes JS → GPU with
     // no copy through .NET at all. The GPU then does the resize, the HWC→NCHW transpose and the
     // normalization via ImagePreprocessKernel — all work that ModelConfig.Preprocess was doing on the
     // single-threaded WASM CPU.
@@ -106,17 +106,23 @@ public class MediaInterop
     }
 
     /// <summary>
-    /// Uploads JS-side RGBA bytes straight into a device buffer of packed int32 pixels — the whole point of
-    /// the <c>...JS</c> methods above. <paramref name="destination"/> must hold at least width*height ints
-    /// (4 bytes per pixel, which is exactly the RGBA byte layout, so no repack is needed or performed).
+    /// Uploads a JS typed array straight into a device buffer — the whole point of the <c>...JS</c> methods
+    /// above. Works for any element type because the copy is bytes: RGBA pixels into an <c>int</c> buffer
+    /// (4 bytes per pixel is exactly the RGBA layout, so no repack is needed or performed), PCM samples into
+    /// a <c>float</c> buffer, and so on. <paramref name="destination"/> must be large enough to hold them.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ ONE method for every element type ON PURPOSE. A per-type pair (UploadRgba.../UploadSamples...)
+    /// would be two mechanisms doing one job, which is how a fix lands on one of them and not the other.
+    /// </remarks>
     /// <exception cref="NotSupportedException">
     /// The buffer is not a browser buffer. On CPU/CUDA/OpenCL there is no JS heap to copy from, and a caller
-    /// reaching here has a desktop accelerator with browser pixels — a wiring mistake worth failing loudly
+    /// reaching here has a desktop accelerator with browser data — a wiring mistake worth failing loudly
     /// rather than silently falling back to a managed copy, which is the very thing this path exists to
     /// avoid.
     /// </exception>
-    public static void UploadRgbaToDevice(TypedArray rgba, MemoryBuffer1D<int, Stride1D.Dense> destination)
+    public static void UploadToDevice<T>(TypedArray source, MemoryBuffer1D<T, Stride1D.Dense> destination)
+        where T : unmanaged
     {
         // ⚠️ It is the UNDERLYING MemoryBuffer that implements IBrowserMemoryBuffer, not the
         // MemoryBuffer1D<T,TStride> view wrapper around it. Testing the wrapper compiles, is always false,
@@ -124,9 +130,9 @@ public class MediaInterop
         // zero-copy weight path already had this right (`buffer.Buffer is IBrowserMemoryBuffer`).
         if (destination.Buffer is not IBrowserMemoryBuffer browserBuffer)
             throw new NotSupportedException(
-                $"UploadRgbaToDevice needs a browser memory buffer; got {destination.Buffer.GetType().Name} " +
-                $"on {destination.Accelerator.AcceleratorType}. On a desktop accelerator use the byte[] path.");
-        browserBuffer.CopyFromJS(rgba);
+                $"UploadToDevice needs a browser memory buffer; got {destination.Buffer.GetType().Name} " +
+                $"on {destination.Accelerator.AcceleratorType}. On a desktop accelerator use the managed path.");
+        browserBuffer.CopyFromJS(source);
     }
 
     // ──────────────────────────────────────────────
@@ -139,7 +145,7 @@ public class MediaInterop
     /// <summary>
     /// Copy RGBA pixels from an ImageData object INTO MANAGED MEMORY.
     /// ⚠️ <c>ReadBytes()</c> copies the whole frame onto the .NET WASM heap. For anything bound for a GPU
-    /// use <see cref="FromImageDataJS"/> + <see cref="UploadRgbaToDevice"/> instead.
+    /// use <see cref="FromImageDataJS"/> + <see cref="UploadToDevice{T}"/> instead.
     /// </summary>
     public static byte[] FromImageData(ImageData imageData)
     {
@@ -345,8 +351,52 @@ public class MediaInterop
     }
 
     // ──────────────────────────────────────────────
-    //  Audio Sources → Float samples
+    //  Audio Sources → GPU, WITHOUT touching the .NET heap  ⭐ PREFER THESE
     // ──────────────────────────────────────────────
+    //
+    // 🔴 SIZE IS NOT AN EXCUSE. A 10 ms WebCodecs AudioData frame is ~480 samples - far past the
+    // ~64-element metadata exemption - and the accelerators take JS typed arrays directly, so there is no
+    // reason for a sample to enter managed memory on the way to the GPU. TJ, 2026-09-15: *"it always
+    // matters when taking the less performant path for no reason."* The chain a VAD frame took was
+    //
+    //     AudioData -> Float32Array -> .ToArray() -> float[] -> (downmix/resample in .NET) -> CopyFromCPU -> GPU
+    //
+    // i.e. out of JS and back to the GPU, once per frame, at ~30 frames/second per turn.
+
+    /// <summary>
+    /// One plane of a WebCodecs <see cref="AudioData"/> as a JS <see cref="Float32Array"/> that never enters
+    /// managed memory. Hand it to <see cref="UploadToDevice{T}"/>. The caller disposes the result.
+    /// </summary>
+    /// <remarks>
+    /// f32 formats only, and deliberately so: an s16 source needs a /32768 scale per sample, and doing that
+    /// in .NET would reintroduce exactly the crossing this method exists to remove. That conversion belongs
+    /// on the GPU; until it is written, s16 callers keep <see cref="FromAudioDataAsync"/> and this method
+    /// says why rather than silently handing back wrong values.
+    /// </remarks>
+    public static async Task<Float32Array> FromAudioDataPlaneJSAsync(AudioData audioData, int planeIndex = 0)
+    {
+        string fmt = audioData.Format ?? "f32-planar";
+        if (!fmt.StartsWith("f32", StringComparison.Ordinal))
+            throw new NotSupportedException(
+                $"FromAudioDataPlaneJSAsync handles f32 formats; this frame is '{fmt}'. An s16 frame needs a "
+              + "per-sample scale that belongs on the GPU - use FromAudioDataAsync until that kernel exists.");
+
+        int frames = audioData.NumberOfFrames;
+        int channels = Math.Max(1, audioData.NumberOfChannels);
+        bool planar = fmt.EndsWith("-planar", StringComparison.Ordinal);
+        int count = planar ? frames : frames * channels;
+
+        var dest = new Float32Array(count);
+        await audioData.CopyTo(dest, new AudioDataCopyToOptions { PlaneIndex = planeIndex });
+        return dest;   // stays in JS
+    }
+
+    // ──────────────────────────────────────────────
+    //  Audio Sources → Float samples IN MANAGED MEMORY
+    // ──────────────────────────────────────────────
+    //
+    // ⚠️ These cross the .NET boundary. Correct when the samples must enter .NET (a CPU codec, a WAV write,
+    // a test oracle); WRONG when they are headed for an accelerator - see above.
 
     /// <summary>
     /// Extract audio samples from an AudioBuffer as mono float array.
