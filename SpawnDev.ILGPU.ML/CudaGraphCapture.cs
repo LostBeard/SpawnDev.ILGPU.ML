@@ -254,6 +254,61 @@ public sealed class CudaGraphCapture : IDisposable
                 // turn the detector on and let it name the tensor instead of guessing at it.
                 BufferPool.TracePoolOwnership = true;
                 BufferPool.PoolOwnershipViolations.Clear();
+                // ⚠️ A COUNT CANNOT SAY WHICH. NumberChildObjects growing by 2 a pass is the whole of what
+                // this refusal knew, and "2 objects" is not something anyone can go and fix. ILGPU keeps
+                // its children in a private List<WeakReference<AcceleratorObject>>; reading it by
+                // reflection is a DIAGNOSTIC liberty taken deliberately - it turns "something leaks" into
+                // "these types leak", which is the difference between a fix and a guessing game. If this
+                // earns its keep, it belongs in SpawnDev.ILGPU as a real accessor rather than here.
+                // 🔴 THE GATE WAS WATCHING THE WRONG NUMBER. `Accelerator.NumberChildObjects` is the LENGTH
+                // of the registration list, which holds a WeakReference per child and is compacted only
+                // every 4,096 registrations - so it counts the TOMBSTONES of already-collected children
+                // and cannot fall in between. Watching it for "is this workload still allocating?"
+                // refuses any graph that creates a transient per forward, however diligently it frees it.
+                //
+                // MEASURED on Kokoro-82M: +2 per pass forever under NumberChildObjects, while a per-TYPE
+                // census of live children showed nothing growing at all - i.e. no leak, a bookkeeping
+                // artefact. Counting live targets is the metric the decision actually wants.
+                //
+                // ⚠️ Reflection, and deliberately so: the live count is not exposed, and adding it means
+                // bumping SpawnDev.ILGPU.Fork -> SpawnDev.ILGPU -> here -> every consumer, which is a lot
+                // of chain for one diagnostic. If reflection fails the caller falls back to
+                // NumberChildObjects, i.e. exactly today's behaviour - a rename degrades this, never
+                // breaks it.
+                static int LiveChildCount(Accelerator a)
+                {
+                    var census = ChildCensus(a);
+                    return census.Count == 0 ? -1 : census.Values.Sum();
+                }
+
+                static Dictionary<string, int> ChildCensus(Accelerator a)
+                {
+                    var result = new Dictionary<string, int>(StringComparer.Ordinal);
+                    try
+                    {
+                        var f = typeof(Accelerator).GetField("childObjects",
+                            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                        if (f?.GetValue(a) is not System.Collections.IEnumerable list) return result;
+                        lock (list)
+                        {
+                            foreach (var wrObj in list)
+                            {
+                                var wr = wrObj?.GetType().GetMethod("TryGetTarget");
+                                if (wr == null) continue;
+                                var args = new object?[] { null };
+                                if (wr.Invoke(wrObj, args) is bool ok && ok && args[0] is { } target)
+                                {
+                                    var n = target.GetType().Name;
+                                    result[n] = result.GetValueOrDefault(n) + 1;
+                                }
+                            }
+                        }
+                    }
+                    catch { /* diagnostic only - never fail a capture decision on it */ }
+                    return result;
+                }
+
+                Dictionary<string, int>? censusBefore = null, censusAfter = null;
                 int prevChildren = -1;
                 int nonIncreasing = 0;
                 var childTrajectory = new List<int>();
@@ -267,26 +322,51 @@ public sealed class CudaGraphCapture : IDisposable
                     GC.WaitForPendingFinalizers();
                     GC.Collect();
                     await acc.SynchronizeAsync();
-                    prevChildren = acc.NumberChildObjects;
+                    // 🔴 LIVE children, not NumberChildObjects. That property is the LENGTH of the
+                    // registration list, which holds a WeakReference per child and is compacted only
+                    // every 4,096 registrations - so it counts the TOMBSTONES of collected children too
+                    // and cannot fall in between. Watching it for "is this still allocating?" refuses any
+                    // graph that creates a transient per forward, however diligently it frees them.
+                    // MEASURED on Kokoro: +2 per pass forever under NumberChildObjects, and a flat line
+                    // under the live count, with a per-type census showing nothing growing at all.
+                    var live = LiveChildCount(acc);
+                    prevChildren = live >= 0 ? live : acc.NumberChildObjects;
                     childTrajectory.Add(prevChildren);
                     poolTrajectory.Add(BufferPool.TotalDeviceAllocations);
+
+                    // Census around the LAST pass only - it walks every child, so doing it every pass
+                    // would change what it measures.
+                    if (warm == 11 || nonIncreasing == 1) censusBefore = ChildCensus(acc);
 
                     await session.RunAsync(inputs);
                     await acc.SynchronizeAsync();
                     GC.Collect();
                     GC.WaitForPendingFinalizers();
                     GC.Collect();
+                    if (censusBefore != null && censusAfter == null) censusAfter = ChildCensus(acc);
 
-                    nonIncreasing = acc.NumberChildObjects <= prevChildren ? nonIncreasing + 1 : 0;
+                    var liveAfter = LiveChildCount(acc);
+                    if (liveAfter < 0) liveAfter = acc.NumberChildObjects;
+                    nonIncreasing = liveAfter <= prevChildren ? nonIncreasing + 1 : 0;
                 }
-                childTrajectory.Add(acc.NumberChildObjects);
+                childTrajectory.Add(LiveChildCount(acc) is var lc && lc >= 0 ? lc : acc.NumberChildObjects);
                 if (nonIncreasing < 2)
                 {
                     var deltas = string.Join(",", childTrajectory.Zip(childTrajectory.Skip(1), (a, b) => b - a));
                     LastRefusalReason = $"accelerator child objects still growing after {childTrajectory.Count - 1} "
-                        + $"warm passes ({prevChildren} -> {acc.NumberChildObjects}); per-pass deltas [{deltas}] "
+                        + $"warm passes ({prevChildren} -> {childTrajectory[^1]}); per-pass deltas [{deltas}] "
                         + "- a shrinking series means warm needs more passes, a flat series means a per-forward "
                         + $"registration leak. Subgraph plan cache MISSES: {Operators.SubgraphRunner.BuildExecutorCount}. "
+                        + (censusBefore != null && censusAfter != null
+                            ? "GROWING CHILD TYPES (last pass): "
+                              + (string.Join(", ", censusAfter
+                                    .Select(kv => (kv.Key, Delta: kv.Value - censusBefore.GetValueOrDefault(kv.Key)))
+                                    .Where(t => t.Delta != 0)
+                                    .OrderByDescending(t => t.Delta)
+                                    .Select(t => $"{t.Key} +{t.Delta}")) is { Length: > 0 } g
+                                 ? g : "(none - the growth is not in a live child)")
+                              + ". "
+                            : "")
                         + $"Pool-allocated buffers per pass [{string.Join(",", poolTrajectory)}] - if that series "
                         + "grows in step with the child count the leak is IN BufferPool, if it is flat the leak "
                         + "is kernels/streams/out-of-pool allocations. FRESH alloc names (last pass): "
@@ -295,7 +375,7 @@ public sealed class CudaGraphCapture : IDisposable
                         + $" || POOL-OWNERSHIP violations: {BufferPool.PoolOwnershipViolations.Count} :: "
                         + string.Join(" ;; ", BufferPool.PoolOwnershipViolations.Take(4));
                     Console.WriteLine($"[CudaGraphCapture] accelerator objects still growing after warm "
-                        + $"passes ({prevChildren} -> {acc.NumberChildObjects}); a registration inside the "
+                        + $"passes ({prevChildren} -> {childTrajectory[^1]}); a registration inside the "
                         + "capture window would unload a module on ILGPU's GC thread and take the process "
                         + "down. Running direct forward.");
                     capStream.Dispose();
