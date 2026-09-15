@@ -171,5 +171,85 @@ public abstract partial class MLTestBase
             + $"({audio.Seconds:F2}s), {warmth} (cold {cold.ElapsedMilliseconds} ms = RTF "
             + $"{cold.Elapsed.TotalSeconds / audio.Seconds:F2}x), peak {peak:F3}, correlation "
             + $"{correlation:F4}, gain {scale:F3} on {BackendName}");
+
+        if (sw != null) await ReportKokoroCostSplitAsync(pipeline, pack, audio.Seconds);
     });
+
+    /// <summary>
+    /// A third, INSTRUMENTED pass that makes the browser report where its own time went.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 🔴 WHY IT CANNOT BE EXTRAPOLATED FROM THE DESKTOP. This engine's browser cost is per-DISPATCH host
+    /// orchestration, and its desktop cost is the GPU work - so the two rank the graph in opposite orders.
+    /// MEASURED on CUDA: <c>encoder/bert</c> is 602 of 1,850 nodes and <b>1.6%</b> of the time, while
+    /// <c>decoder/generator</c> is 639 nodes and 68.5%. Reading that as "optimise the generator" is exactly
+    /// the wrong conclusion for a browser, where 602 near-free dispatches are 602 crossings. Any decision
+    /// about splitting work across backends has to be made on the browser's numbers, so the browser has to
+    /// print them.
+    /// </para>
+    /// <para>
+    /// ⚠️ A SEPARATE PASS, and never the one the RTF is taken from: this puts a Stopwatch around every
+    /// node, which is not free on the .NET WASM heap. Reporting a timing figure measured through the
+    /// instrument that exists to explain it is how an overhead becomes a conclusion.
+    /// </para>
+    /// <para>
+    /// ⚠️ Read it with <c>PMT_CONSOLE_LOG=Kokoro</c>. PMT summarises browser console output to
+    /// "Console: N error(s)", so without that switch these lines are computed and discarded.
+    /// </para>
+    /// </remarks>
+    private async Task ReportKokoroCostSplitAsync(KokoroPipeline pipeline, KokoroVoicePack pack, double seconds)
+    {
+        var timings = new Dictionary<string, double>();
+        Graph.GraphExecutor.CapturedNodeTimingsMs = timings;
+        try
+        {
+            var probe = Stopwatch.StartNew();
+            await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+            probe.Stop();
+
+            var ex = Graph.GraphExecutor.LastRunTotalMs;
+            var rbN = Graph.GraphExecutor.LastRunReadbackCount;
+            var rbMs = Graph.GraphExecutor.LastRunReadbackMs;
+            var drN = Graph.GraphExecutor.LastRunSyncDrainCount;
+            var drMs = Graph.GraphExecutor.LastRunSyncDrainMs;
+            Console.WriteLine($"[KokoroCost] {BackendName}: instrumented pass {probe.ElapsedMilliseconds} ms, "
+                + $"executor {ex:F0} ms | readbacks {rbN} ({rbMs:F0} ms) | drains {drN} ({drMs:F0} ms) | "
+                + $"residual {ex - rbMs - drMs:F0} ms | nodes {pipeline.Session.NodeCount} | "
+                + $"audio {seconds:F2}s");
+
+            // Coarse on purpose - the question is "which half", because that is where a placement split
+            // between two backends would cut. Same buckets the DemoConsole prints, so the browser row and
+            // the CUDA row are directly comparable.
+            static string Stage(string key)
+            {
+                var name = key[(key.IndexOf('_') + 1)..];
+                name = name[(name.IndexOf('_') + 1)..];
+                if (name.Contains("/generator/")) return "decoder/generator";
+                if (name.StartsWith("/decoder")) return "decoder-pre-generator";
+                if (name.Contains("/bert")) return "encoder/bert";
+                if (name.Contains("/predictor")) return "encoder/predictor";
+                if (name.StartsWith("/encoder")) return "encoder-other";
+                return "other";
+            }
+            var buckets = new Dictionary<string, (int Nodes, double Ms)>();
+            foreach (var kv in timings)
+            {
+                var st = Stage(kv.Key);
+                var cur = buckets.TryGetValue(st, out var b) ? b : (0, 0d);
+                buckets[st] = (cur.Item1 + 1, cur.Item2 + kv.Value);
+            }
+            var totalMs = buckets.Values.Sum(b => b.Ms);
+            foreach (var kv in buckets.OrderByDescending(k => k.Value.Nodes))
+                Console.WriteLine($"[KokoroCost] {BackendName}   {kv.Key,-22} {kv.Value.Nodes,5} nodes  "
+                    + $"{kv.Value.Ms,9:F1} ms ({kv.Value.Ms * 100.0 / Math.Max(totalMs, 1e-9),4:F1}%)  "
+                    + $"{kv.Value.Ms / Math.Max(kv.Value.Nodes, 1),6:F3} ms/node");
+        }
+        finally
+        {
+            // ⚠️ STATIC. Left set, every later test on this lane pays the per-node Stopwatch and grows a
+            // dictionary nothing reads.
+            Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+        }
+    }
 }
