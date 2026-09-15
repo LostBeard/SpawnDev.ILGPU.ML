@@ -257,6 +257,21 @@ public abstract partial class MLTestBase
                     + $"arg-build {argMs:F0} ms, bind-group {bindMs:F0} ms, encode {encMs:F0} ms "
                     + $"(total {shaderMs + argMs + bindMs + encMs:F0} ms)");
 
+            // ⭐ AND WHETHER THE BIND-GROUP CACHE IS ACTUALLY WORKING, which decides what the bind-group
+            // column above MEANS. The key is (pipeline + the exact buffers bound), so a pool that hands a
+            // node a different buffer each pass misses every time and pays a CreateBindGroup - a real JS
+            // object - per dispatch. A high hit rate makes that column irreducible; a low one makes it a
+            // pool-stability problem with an obvious fix. The counters have always been exposed and, like
+            // the phase timers, have never been read for this model.
+            if (pipeline.Session.Accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator wgpu)
+            {
+                var hits = wgpu.BindGroupCacheHits;
+                var misses = wgpu.BindGroupCacheMisses;
+                Console.WriteLine($"[KokoroCost] {BackendName} bind-group cache: {hits} hits, {misses} misses "
+                    + $"({(hits + misses > 0 ? hits * 100.0 / (hits + misses) : 0):F1}% hit), "
+                    + $"{wgpu.BindGroupCacheEntryCount} entries");
+            }
+
             var ex = Graph.GraphExecutor.LastRunTotalMs;
             var rbN = Graph.GraphExecutor.LastRunReadbackCount;
             var rbMs = Graph.GraphExecutor.LastRunReadbackMs;

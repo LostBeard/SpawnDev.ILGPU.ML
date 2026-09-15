@@ -1,4 +1,4 @@
-using System.Runtime.InteropServices;
+﻿using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using SpawnDev.ILGPU.ML.Graph;
 
@@ -222,6 +222,15 @@ public sealed class KokoroIstftTail
     /// The shape is left EMPTY on purpose: <c>GraphCompiler</c> registers a declared output shape only
     /// when one is given, and a declared shape that disagrees with inference pins the output buffer.
     /// Inference already knows this tensor's shape - it is a node output like any other.
+    /// <para>
+    /// ⭐ IT SURVIVES A DYNAMIC-SHAPE RECOMPILE, which for a variable-length model is every call but the
+    /// first, and is the exact shape of a bug that has already cost a measurement here (see
+    /// <c>InferenceSession.SyncIntervalNodesOverride</c>, whose note records a setting that silently
+    /// stopped applying at the first recompile). Verified by reading rather than assumed:
+    /// <c>EnableDynamicShapeRecompile</c> stores THIS <see cref="ModelGraph"/> instance, and
+    /// <c>RecompileForShapes</c> resets only its constant seeds and input shapes before re-compiling it -
+    /// it never re-derives <see cref="ModelGraph.Outputs"/> from the model, so the cut stays cut.
+    /// </para>
     /// </remarks>
     public void Truncate(ModelGraph graph)
     {
