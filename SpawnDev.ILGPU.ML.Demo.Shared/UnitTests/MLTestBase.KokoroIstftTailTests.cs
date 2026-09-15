@@ -1,4 +1,4 @@
-using SpawnDev.ILGPU.ML.Graph;
+﻿using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Pipelines;
 using SpawnDev.UnitTesting;
 
@@ -214,8 +214,18 @@ public abstract partial class MLTestBase
         {
             ("a node removed from the tail",
                 g => g.Nodes.RemoveAt(g.Nodes.FindIndex(n => n.OpType == "Transpose"))),
-            ("an extra node in the tail",
-                g => g.Nodes.Add(N("Relu", new[] { "waveform" }, new[] { "waveform2" }))),
+            // ⚠️ INSERTED INTO THE PATH, not hung off the output. The first version of this case appended a
+            // node CONSUMING `waveform`, and TryDetect accepted it - correctly: the reverse walk starts at
+            // the graph output and goes backwards, so a node downstream of the output is not in the tail,
+            // contributes nothing to the waveform, and is deleted as dead by the same truncation. The case
+            // only tests anything once the extra node is on the path from the cut to the output.
+            ("an extra node spliced into the tail",
+                g =>
+                {
+                    var last = g.Nodes.First(n => n.Outputs.Contains("waveform"));
+                    last.Outputs[0] = "pre_waveform";
+                    g.Nodes.Add(N("Relu", new[] { "pre_waveform" }, new[] { "waveform" }));
+                }),
             ("a second graph output",
                 g => g.Outputs.Add(new GraphValueInfo { Name = "sq1", Shape = Array.Empty<int>() })),
             ("the scale is no longer a constant",
@@ -233,8 +243,6 @@ public abstract partial class MLTestBase
         {
             var graph = IstftTailGraph();
             breakIt(graph);
-            // ⚠️ The extra-node case also adds a graph output-less node; dead or not, the detector must
-            // notice the shape of the tail changed rather than reason about liveness.
             if (KokoroIstftTail.TryDetect(graph, out _) != null) missed.Add(what);
         }
 

@@ -2022,6 +2022,14 @@ public class GraphExecutor : IDisposable
             or "Mul" or "Add" or "Sub" or "Div" or "Where" or "Equal" or "Greater" or "Less"
             or "Floor" or "Ceil" or "Neg" or "Abs" or "Mod" or "Min" or "Max"
             or "ConstantOfShape" or "Expand" or "Transpose" => true,
+        // 🔴 A DURATION PREDICTOR IS A SHAPE CHAIN. Kokoro decides how many audio frames each phoneme
+        // gets, and every tensor after that point is sized by the answer - so Round/Clip/CumSum are
+        // read back as SHAPE values, one GPU round trip each, on a vector of 35 numbers the host was
+        // already holding. MEASURED on CUDA before this: 7 readbacks a pass, five of them this chain.
+        // Each of the three is pure arithmetic over a value the interpreter already has, so resolving
+        // them costs nothing and removes a full queue drain apiece.
+        "Round" or "Clip" => true,
+        "CumSum" => true,
         _ => false,
     };
 
@@ -2056,6 +2064,28 @@ public class GraphExecutor : IDisposable
     // OVERFLOWS to INT_MIN - which then reads as a huge NEGATIVE start/end and collapses the slice to 0 (DAv3
     // blocks.4 rope [16:32] -> [.,.,.,0]). Saturate instead, exactly like SliceOperator path-2.
     private static int SatFloatToInt(float v) => v <= int.MinValue ? int.MinValue : v >= int.MaxValue ? int.MaxValue : (int)v;
+
+    /// <summary>
+    /// Read an opset-6 style FLOAT attribute, or leave the default alone when the attribute is absent.
+    /// </summary>
+    /// <returns>
+    /// False when the attribute EXISTS but is not a number we can read - which must not be treated as
+    /// "absent", because absent means unbounded and a bound we cannot read is a bound we may not drop.
+    /// </returns>
+    private static bool TryAttrFloat(CompiledNode node, string key, ref float value)
+    {
+        if (node.Attributes == null || !node.Attributes.TryGetValue(key, out var o) || o == null) return true;
+        switch (o)
+        {
+            case float f: value = f; return true;
+            case double d: value = (float)d; return true;
+            case long l: value = l; return true;
+            case int i: value = i; return true;
+            case float[] fa when fa.Length > 0: value = fa[0]; return true;
+            case double[] da when da.Length > 0: value = (float)da[0]; return true;
+            default: return false;
+        }
+    }
 
     private static float[]? ResolvedShapeAttr(CompiledNode node, string key)
     {
@@ -2157,12 +2187,30 @@ public class GraphExecutor : IDisposable
                 var data = Vals(ins.Length > 0 ? ins[0] : null);
                 var idx = Vals(ins.Length > 1 ? ins[1] : null);
                 if (data == null || idx == null || AttrLong("axis", 0) != 0) return false;
-                var outv = new float[idx.Length];
+                // 🔴 A GATHER ON AXIS 0 TAKES A SLICE, NOT AN ELEMENT. This read one float per index,
+                // which is right only while the data is rank 1 - the shape vectors this interpreter was
+                // built for. Kokoro gathers ROW 0 of the [1,35] per-phoneme DURATIONS, and one-float-per
+                // -index returned the first duration (13) as the whole row: a 35-element tensor reported
+                // as 1 element. Nothing consumed that value, so it was wrong and invisible for as long as
+                // it existed; the moment CumSum was taught to resolve on the CPU it became 13 audio frames
+                // where there should be 182, and the utterance came out at 0.33 s instead of 2.27 s.
+                //
+                // ⚠️ The slice width comes from the data tensor's REAL shape, and when that is unavailable
+                // (the producer's dispatch was elided, so there is no tensor to ask) this falls back to the
+                // old one-per-index behaviour deliberately. An elided producer means the value came from
+                // this interpreter, whose values are flat rank-1 shape vectors - exactly the case the old
+                // code was right for. So the fix engages where there is ground truth and changes nothing
+                // where there is not.
+                var dshape = ShapeOf(ins[0]);
+                var outer = dshape is { Length: > 0 } ? dshape[0] : data.Length;
+                if (outer <= 0 || data.Length % outer != 0) return false;
+                var slice = data.Length / outer;
+                var outv = new float[idx.Length * slice];
                 for (int i = 0; i < idx.Length; i++)
                 {
-                    int ii = (int)idx[i]; if (ii < 0) ii += data.Length;
-                    if (ii < 0 || ii >= data.Length) return false;
-                    outv[i] = data[ii];
+                    int ii = (int)idx[i]; if (ii < 0) ii += outer;
+                    if (ii < 0 || ii >= outer) return false;
+                    System.Array.Copy(data, ii * slice, outv, i * slice, slice);
                 }
                 result = outv; return true;
             }
@@ -2306,6 +2354,89 @@ public class GraphExecutor : IDisposable
                 for (int i = 0; i < v.Length; i++)
                     outv[i] = node.OpType switch { "Floor" => (float)System.Math.Floor(v[i]), "Ceil" => (float)System.Math.Ceiling(v[i]), "Neg" => -v[i], "Abs" => System.Math.Abs(v[i]), _ => v[i] };
                 result = outv; return true;
+            }
+            case "Round":
+            {
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                var outv = new float[v.Length];
+                // ⚠️ ROUND-HALF-TO-EVEN, and written the way the KERNEL writes it rather than as
+                // MathF.Round. The two agree, but "agree" is the claim that has to stay true: this must
+                // match RoundImpl in ElementWiseKernels bit for bit, because whichever path runs decides a
+                // phoneme's frame count, and a single half-case disagreeing shifts every later sample.
+                for (int i = 0; i < v.Length; i++)
+                {
+                    float x = v[i];
+                    float rounded = (float)System.Math.Floor(x + 0.5f);
+                    float xp = x + 0.5f;
+                    if (xp == rounded && (float)System.Math.Floor(rounded * 0.5f) * 2f != rounded) rounded -= 1f;
+                    outv[i] = rounded;
+                }
+                result = outv; return true;
+            }
+            case "Clip":
+            {
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                // ⚠️ THE BOUNDS ARE FLOATS AND LIVE IN TWO PLACES. Opset 6 puts them in `min`/`max`
+                // ATTRIBUTES; opset 11+ (what every current exporter emits) puts them in optional INPUTS,
+                // where an omitted one is an EMPTY NAME rather than a missing slot - so "has an input at
+                // index 2" is not the test. Mirrors ClipOperator, which is the code that runs when this
+                // declines; the two disagreeing would mean the same Clip clamps differently depending on
+                // whether its value happened to be needed as a shape.
+                float lo = float.MinValue, hi = float.MaxValue;
+                if (!TryAttrFloat(node, "min", ref lo) || !TryAttrFloat(node, "max", ref hi)) return false;
+                if (ins.Length > 1 && !string.IsNullOrEmpty(ins[1]))
+                {
+                    var lv = Vals(ins[1]);
+                    if (lv == null) return false;               // a bound we cannot see is not a bound we may guess
+                    if (lv.Length > 0) lo = lv[0];
+                }
+                if (ins.Length > 2 && !string.IsNullOrEmpty(ins[2]))
+                {
+                    var hv = Vals(ins[2]);
+                    if (hv == null) return false;
+                    if (hv.Length > 0) hi = hv[0];
+                }
+                var outv = new float[v.Length];
+                for (int i = 0; i < v.Length; i++) outv[i] = System.Math.Clamp(v[i], lo, hi);
+                result = outv; return true;
+            }
+            case "CumSum":
+            {
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                // ⚠️ DECLINE RATHER THAN GUESS THE LAYOUT. The interpreter holds values FLAT, so a
+                // cumulative sum along an inner axis needs the real shape to stride correctly. Resolve
+                // only the case the flat buffer already expresses - one summed axis - and let anything
+                // else take the GPU round trip it was taking before. Same for exclusive/reverse: they are
+                // cheap to implement and impossible to verify against a model that never emits them.
+                var shape = ShapeOf(ins[0]);
+                if (shape != null)
+                {
+                    var nonTrivial = 0;
+                    foreach (var d in shape) if (d > 1) nonTrivial++;
+                    if (nonTrivial > 1) return false;
+                }
+                if (AttrLong("exclusive", 0) != 0 || AttrLong("reverse", 0) != 0) return false;
+                var axisVals = ins.Length > 1 ? Vals(ins[1]) : null;
+                if (ins.Length > 1 && !string.IsNullOrEmpty(ins[1]) && axisVals == null) return false;
+                // 🔴 A VALUE SHORTER THAN ITS TENSOR IS A WRONG VALUE, NOT A SHORTER ONE. This op's
+                // result sizes every tensor after the duration predictor, so summing a truncated view of
+                // its input produces a shorter UTTERANCE and nothing that looks like an error. MEASURED
+                // while the Gather above was returning one element of a 35-element row: 13 frames instead
+                // of 182, i.e. 0.33 s of audio for a 2.27 s line, at correlation 0.15. Declining costs one
+                // GPU round trip; not declining costs the audio.
+                if (shape != null)
+                {
+                    var expected = 1;
+                    foreach (var d in shape) expected *= d > 0 ? d : 1;
+                    if (expected != v.Length) return false;
+                }
+                var outc = new float[v.Length];
+                var running = 0f;
+                for (int i = 0; i < v.Length; i++) { running += v[i]; outc[i] = running; }
+                result = outc; return true;
             }
             case "Mod": case "Min": case "Max":
             {
