@@ -223,6 +223,7 @@ public abstract partial class MLTestBase
         // DispatchWorkgroups/End/Dispose crossings - so "the browser is slow" is only actionable once one
         // of the four is named. Zeros on a desktop backend, which is correct: there are no crossings there.
         var profWasOn = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling;
+        var bgCacheWasOn = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching;
         var p0 = (SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuShaderResolveMs,
                   SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuArgBuildMs,
                   SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuBindGroupMs,
@@ -240,6 +241,22 @@ public abstract partial class MLTestBase
             var probe = Stopwatch.StartNew();
             await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
             probe.Stop();
+
+            // ⭐ THE BIND-GROUP CACHE A/B, measured here because this is the only place that already knows
+            // the four dispatch phases. The pass above shows bind-group creation as the LARGEST of them on
+            // WebGPU, and WebGPUBackend.EnableBindGroupCaching is opt-in and OFF - so those groups are
+            // built and thrown away once per dispatch, 1,850 times per utterance, for a graph that
+            // re-dispatches the same kernels over the same buffers every pass.
+            //
+            // Safe to flip here: the cache is mutually exclusive with DISPATCH CAPTURE, and this pipeline
+            // runs uncaptured (KokoroPipeline.EnableGraphCapture defaults to false and nothing sets it).
+            // Restored in the finally below with the profiling flags.
+            //
+            // ⚠️ Both passes are WARM and identical in shape - this is the 3rd and 4th SpeakTokensAsync of
+            // the test - so the difference is the cache and not kernel compilation.
+            double cachedMs = -1;
+            string? cacheFailure = null;
+            long bgHits = 0, bgMisses = 0; int bgEntries = 0;
 
             Console.WriteLine($"[KokoroCost] {BackendName} gc: "
                 + $"{(GC.GetTotalAllocatedBytes(false) - gc0.Alloc) / 1048576.0:F1} MB allocated, "
@@ -291,6 +308,72 @@ public abstract partial class MLTestBase
                 + $"residual {ex - rbMs - drMs:F0} ms | nodes {pipeline.Session.NodeCount} | "
                 + $"audio {seconds:F2}s");
 
+            // ⭐ THE BIND-GROUP CACHE A/B — runs LAST, and its failure is reported rather than thrown.
+            //
+            // Bind-group creation is the LARGEST of the four dispatch phases on WebGPU for this model, and
+            // WebGPUBackend.EnableBindGroupCaching is opt-in and OFF, so those groups are built and thrown
+            // away once per dispatch, 1,850 times per utterance, for a graph that re-dispatches the same
+            // kernels over the same buffers every pass.
+            //
+            // 🔴 IT DOES NOT CURRENTLY WORK ON THIS MODEL. MEASURED 2026-09-15: turning it on produced
+            // "[WebGPU] 330 GPU error(s) during dispatch" and the graph failed at node 1238 'ReduceSum'
+            // (/encoder/predictor). That is a LIBRARY defect worth fixing - it is ~39% of the dispatch
+            // cost of a pipeline whose whole goal is beating realtime - and this line is here so the state
+            // of it is a measured fact in every sweep rather than folklore.
+            //
+            // ⚠️ THE FIRST VERSION OF THIS RAN BEFORE THE REPORT AND THREW, so the 330-error failure
+            // aborted the whole method and the WebGPU cost numbers - the reason the method exists - never
+            // printed. The caller catches, so the gate stayed green and the loss was silent. A diagnostic
+            // must never take down the report it belongs to.
+            //
+            // Safe to flip: the cache is mutually exclusive with DISPATCH CAPTURE and this pipeline runs
+            // uncaptured (KokoroPipeline.EnableGraphCapture defaults false, nothing sets it). Restored in
+            // the finally.
+            if (pipeline.Session.Accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator wgpuAb)
+            {
+                try
+                {
+                    SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = true;
+                    // A first pass with the cache on only POPULATES it (recur-only: a signature is stored
+                    // on its 2nd sighting), so timing a single run would measure the miss path and report
+                    // no win even if the cache were perfect.
+                    await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+                    await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+                    var abClock = Stopwatch.StartNew();
+                    await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+                    abClock.Stop();
+                    cachedMs = abClock.Elapsed.TotalMilliseconds;
+                    bgHits = wgpuAb.BindGroupCacheHits;
+                    bgMisses = wgpuAb.BindGroupCacheMisses;
+                    bgEntries = wgpuAb.BindGroupCacheEntryCount;
+                }
+                catch (Exception abEx)
+                {
+                    var m = abEx.Message;
+                    // 2000, not 300: the first cap truncated away every individual WebGPU validation message
+                    // and left only the count, which names no defect. The errors themselves are the diagnosis.
+                    // FLATTEN THE NEWLINES: the exception body is the count, then a newline, then one line per
+                    // GPU error - and PMT_CONSOLE_LOG keeps only lines CONTAINING the filter word, so every
+                    // continuation line was silently dropped and the log showed the COUNT with none of the
+                    // errors. A diagnostic that reaches the log as a number with no evidence is no diagnostic.
+                    m = m.Replace("\r", "").Replace("\n", " | ");
+                    cacheFailure = m.Length > 2000 ? m[..2000] : m;
+                }
+                finally
+                {
+                    SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = bgCacheWasOn;
+                }
+            }
+
+            if (cacheFailure != null)
+                Console.WriteLine($"[KokoroCost] {BackendName} BIND-GROUP CACHE A/B: STILL BROKEN — {cacheFailure}");
+            else if (cachedMs >= 0)
+                Console.WriteLine($"[KokoroCost] {BackendName} BIND-GROUP CACHE A/B: "
+                    + $"off {probe.ElapsedMilliseconds} ms -> on {cachedMs:F0} ms "
+                    + $"({(cachedMs > 0 ? probe.ElapsedMilliseconds / cachedMs : 0):F2}x) | "
+                    + $"{bgHits} hits, {bgMisses} misses, {bgEntries} entries | "
+                    + $"RTF on={(cachedMs / 1000.0) / seconds:F2}x (lower is better, <1 = faster than realtime)");
+
             // Coarse on purpose - the question is "which half", because that is where a placement split
             // between two backends would cut. Same buckets the DemoConsole prints, so the browser row and
             // the CUDA row are directly comparable.
@@ -325,6 +408,11 @@ public abstract partial class MLTestBase
             // flag to what it WAS rather than to false - something else may have turned it on.
             Graph.GraphExecutor.CapturedNodeTimingsMs = null;
             SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = profWasOn;
+            // 🔴 RESTORE THE CACHE FLAG TOO. It is a STATIC on the backend, so leaving it on would change
+            // the behaviour of every later test on this lane - and it is mutually exclusive with dispatch
+            // capture, so the tests it would break are the ones that capture, far from here and for no
+            // visible reason. A diagnostic that mutates global state is part of the system under test.
+            SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableBindGroupCaching = bgCacheWasOn;
         }
     }
 }
