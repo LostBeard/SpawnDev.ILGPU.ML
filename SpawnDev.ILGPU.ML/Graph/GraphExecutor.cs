@@ -2078,6 +2078,13 @@ public class GraphExecutor : IDisposable
         // them costs nothing and removes a full queue drain apiece.
         "Round" or "Clip" => true,
         "CumSum" => true,
+        // 🔴 THE HEAD OF THE SAME DURATION CHAIN. /encoder/predictor/ReduceSum is the SUM OF THE PHONEME
+        // DURATIONS - the total number of audio frames - so every tensor after it is sized by this one
+        // number, and the executor was stopping the GPU to fetch it on every utterance. MEASURED on
+        // WebGPU: 4 readbacks a pass, 278 ms of readback plus 502 ms of the drains they force, and it is
+        // a sum over ~35 numbers the interpreter is already holding. Resolving it also unblocks the ops
+        // DOWNSTREAM of it, which decline today only because their input is unresolved.
+        "ReduceSum" => true,
         _ => false,
     };
 
@@ -2485,6 +2492,38 @@ public class GraphExecutor : IDisposable
                 var running = 0f;
                 for (int i = 0; i < v.Length; i++) { running += v[i]; outc[i] = running; }
                 result = outc; return true;
+            }
+            case "ReduceSum":
+            {
+                var v = Vals(ins.Length > 0 ? ins[0] : null);
+                if (v == null) return false;
+                // Same decline-rather-than-guess rule as CumSum: the interpreter holds values FLAT, so a
+                // reduction along an inner axis of a genuinely multi-dimensional tensor cannot be strided
+                // correctly here. Resolve the case the flat buffer expresses - at most one non-trivial
+                // axis - and let anything else take the round trip it takes today.
+                var rshape = ShapeOf(ins[0]);
+                if (rshape != null)
+                {
+                    var nonTrivial = 0;
+                    foreach (var d in rshape) if (d > 1) nonTrivial++;
+                    if (nonTrivial > 1) return false;
+                    // A value shorter than its tensor is a WRONG value, not a shorter one - summing a
+                    // truncated view yields a shorter utterance and nothing that looks like an error.
+                    // This is the defect the Gather fix chased: 13 frames instead of 182.
+                    var expected = 1;
+                    foreach (var d in rshape) expected *= d > 0 ? d : 1;
+                    if (expected != v.Length) return false;
+                }
+                // 'axes' may be an attribute (opset < 13) or input 1 (opset >= 13). With a single
+                // non-trivial axis the result is the same total either way, so the axes VALUE does not
+                // change the answer - but an unresolvable axes input means the node is not what we think,
+                // so decline.
+                if (ins.Length > 1 && !string.IsNullOrEmpty(ins[1]) && Vals(ins[1]) == null) return false;
+                float total = 0f;
+                for (int i = 0; i < v.Length; i++) total += v[i];
+                // keepdims (default 1) only affects RANK, and the interpreter stores values flat, so the
+                // single total is the correct payload either way.
+                result = new[] { total }; return true;
             }
             case "Mod": case "Min": case "Max":
             {
@@ -4349,7 +4388,22 @@ public class GraphExecutor : IDisposable
                             _rbSw.Stop();
                             LastRunReadbackCount++;
                             LastRunReadbackMs += _rbSw.Elapsed.TotalMilliseconds;
-                            LastRunReadbackNames.Add($"{node.OpType}:{outName}");
+                            // 🔴 SAY WHY, NOT JUST WHAT. A readback name alone cannot distinguish "the CPU
+                            // interpreter has no case for this op" from "it has one and DECLINED" - and the
+                            // fix is completely different: write a case, versus find the input it could not
+                            // resolve. Chasing that difference by inspection cost a round of guessing on
+                            // 2026-09-15, so the run now reports it. `resolvable` means the op is declared
+                            // interpreter-resolvable but TryComputeShapeOnCpu still said no, which almost
+                            // always means one of its INPUTS is not in runtimeConstants.
+                            var whyRb = IsInterpreterResolvableOp(node)
+                                ? "declined(inputs?)"
+                                : "no-interp-case";
+                            var inputsRb = node.InputNames.Length == 0
+                                ? "-"
+                                : string.Join("+", node.InputNames.Select(
+                                    i => string.IsNullOrEmpty(i) ? "-" :
+                                         (runtimeConstants.ContainsKey(i) ? "have" : "MISSING")));
+                            LastRunReadbackNames.Add($"{node.OpType}:{outName} [{whyRb} in={inputsRb}]");
                             // Probing: record this run's value for cross-run stability comparison.
                             // ⚠️ A tainted value must never become a stability candidate. The probe's test is
                             // "identical across two runs", which a capture's identical warm passes satisfy for

@@ -362,8 +362,17 @@ public sealed class KokoroPipeline : IDisposable
     /// from another runtime mean something. It is also the entry point for a caller who has their own
     /// phonemizer, or a language this one does not cover.
     /// </remarks>
+    /// <param name="styleTokenCount">
+    /// Which <see cref="KokoroVoicePack.StyleFor"/> row to use, when it must differ from
+    /// <paramref name="tokens"/>.Count. Exists for SHAPE BUCKETING: a captured plan is bound to one
+    /// sequence length, and in streaming speech every chunk is a different length, so padding the token
+    /// sequence up to a bucket is what lets consecutive chunks reuse one plan. The style row must then
+    /// still be chosen by the REAL phoneme count - picking it by the padded count would make a short
+    /// sentence adopt a longer utterance's timbre, which is audible as the voice changing mid-reply.
+    /// </param>
     public async Task<KokoroAudio> SpeakTokensAsync(IReadOnlyList<long> tokens, KokoroVoicePack voice,
-        float speed = 1.0f, int droppedPhonemes = 0, CancellationToken ct = default)
+        float speed = 1.0f, int droppedPhonemes = 0, CancellationToken ct = default,
+        int styleTokenCount = 0)
     {
         if (voice == null) throw new ArgumentNullException(nameof(voice));
         if (tokens == null) throw new ArgumentNullException(nameof(tokens));
@@ -373,7 +382,7 @@ public sealed class KokoroPipeline : IDisposable
                 nameof(tokens));
 
         var dropped = droppedPhonemes;
-        var style = voice.StyleFor(tokens.Count).ToArray();
+        var style = voice.StyleFor(styleTokenCount > 0 ? styleTokenCount : tokens.Count).ToArray();
 
         var clock = System.Diagnostics.Stopwatch.StartNew();
         using var tokenBuffer = _accelerator.Allocate1D(ToFloats(tokens));
