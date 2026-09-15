@@ -47,6 +47,8 @@ numerically sensitive, where EVERY node after the sensitive point differs howeve
 |---|---|
 | `onnx-nodes.mjs <model> <substr>` | **What does this subgraph actually say?** Prints matching nodes with inputs, outputs, attributes and the CONTENTS of small initializers. Diffing tells you which node diverged; it never tells you why, and the why is almost always an attribute (a Resize `coordinate_transformation_mode`, a Pad mode, an axis default). |
 | `onnx-intermediates.mjs <model> <voice> <tokens> <out> <names>` | Rewrites `graph.output` to expose named intermediates and runs them. ORT only hands back declared outputs, so this is the only way to get a reference for the INSIDE of a graph. |
+| `onnx-tail.mjs <model> <stop-op> [output]` | **What is this graph's tail, exactly?** Walks BACKWARDS from a graph output to the nearest node of `<stop-op>` and prints the whole tail in topological order with every initializer it reads. Truncating a graph and reproducing part of it on the host is only safe if you can SEE that part - "it divides by a window then scales by 4" is a memory of a debug session, this is the model. Wrote `KokoroIstftTail`. |
+| `onnx-opcensus.mjs <model> [prefix]` | **Which subtree costs the most in a BROWSER?** Op-type census, overall and per name prefix. In a browser this engine pays per DISPATCH, not per FLOP - MEASURED on Kokoro, `encoder/bert` is 602 of 1,850 nodes and **1.6%** of the CUDA time - so the answer is a node census, not a profiler: the subtree with the most nodes costs the most however trivial its arithmetic. |
 | `op-oracle.mjs <spec.json> <out>` | Builds a ONE-NODE model and runs it. Our own kernel tests compare against a CPU reference WE wrote, and the two can share a misreading of the spec; this settles an operator against the spec itself. |
 | `onnx-perturb.mjs <model> <voice> <tokens> <out> <tensor> <relRMS> [dump,names]` | **Is the number I am seeing the FLOOR?** Adds noise of your measured `relRMS` to one of the reference's own tensors and re-runs it. If ORT degrades to your number, there is no bug left to find. |
 | `onnx-inject.mjs <model> <voice> <tokens> <out> <tensor> <values.f32> [dump,names]` | **Is the rest of my graph right GIVEN what I feed it?** Splices OUR tensor into the reference and lets ORT compute the rest. Whatever still differs is ours; whatever now matches was never broken. Our side dumps tensors with `KOKORO_SAVE=<dir>`. |
@@ -215,6 +217,22 @@ dotnet run --project tools/whisper-harness -c Release                           
 Then the group you touched: `ControlFlow_`, `Recurrent_`, `Scatter_`, `Slice_`, `Vad_`, `Resample`,
 `Microphone_`. `PMT_FILTER=MatchesOnnxRuntime` runs the ORT-referenced operator gates in one pass.
 A full six-backend sweep is the release gate, not routine.
+
+### `run-full-gate.cmd` - the whole suite, for a change that cannot be scoped
+
+```
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine='cmd.exe /c ""<repo>	oolsun-full-gate.cmd" "pmt-full""'}
+```
+
+`%1` = log basename (default `pmt-full`). For the shared machinery every model goes through - the CPU shape
+interpreter, `GraphCompiler`, the executor's node loop, `BufferPool`. A scoped run cannot cover those: the
+model that exposes the bug is rarely the model you were working on.
+
+⚠️ **HeavyModel stays EXCLUDED here, deliberately.** This is the ~500-test regression gate; the heavy
+end-to-end models are a SEPARATE scoped sequential run (`run-scoped-gate.cmd`), because concurrent heavy
+WebGPU + CUDA + OpenCL on the one GPU causes D3D12 DEVICE_REMOVED. Do BOTH before calling an
+interpreter/executor change verified.
 
 ### `run-scoped-gate.cmd` - scoped HeavyModel gates that outlive the shell
 
