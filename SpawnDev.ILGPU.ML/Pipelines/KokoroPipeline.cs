@@ -133,6 +133,53 @@ public sealed class KokoroPipeline : IDisposable
 
     private SessionGraphCapture? _capture;
 
+    // ── ONE CAPTURE PER TOKEN COUNT ────────────────────────────────────────────────────────────────
+    //
+    // 🔴 A SessionGraphCapture holds ONE plan for ONE shape set and enforces it:
+    //     "SessionGraphCapture: input shapes changed after capture - use one instance per fixed shape set."
+    // Kokoro's input is input_ids[1, tokenCount], so a single shared instance means the SECOND utterance of
+    // a different length THROWS. Not slower - throws. A pipeline that can only repeat one sentence is not a
+    // text-to-speech pipeline.
+    //
+    // ⚠️ THE FIXTURE HID IT. Pipeline_Kokoro_MatchesOnnxRuntimeWaveform speaks the same 35 tokens every
+    // time, so every capture measurement and every correctness result came from a run where the one
+    // variable that mattered never varied. Gated now by Pipeline_Kokoro_SpeaksTwoDifferentLengths, which
+    // speaks 35 -> 15 -> 35 ids: the alternation matters, because returning to a length is what a
+    // conversation does and what an evicting cache gets wrong.
+    //
+    // Bounded, because a plan is not free - each one holds the bind groups for ~3,155 recorded dispatches.
+    // Least-recently-used is evicted and disposed. Utterance lengths in real speech cluster rather than
+    // spread uniformly, so a small set covers most turns; a miss costs a re-record, never a wrong answer.
+    private readonly Dictionary<int, SessionGraphCapture> _capturesByTokenCount = new();
+    private readonly List<int> _captureLru = new();   // most-recent last
+
+    /// <summary>How many distinct utterance lengths keep a recorded plan. Raising it trades GPU memory for
+    /// fewer re-records when a conversation revisits lengths.</summary>
+    public int MaxCapturedShapes { get; set; } = 6;
+
+    private SessionGraphCapture CaptureFor(int tokenCount)
+    {
+        if (_capturesByTokenCount.TryGetValue(tokenCount, out var existing))
+        {
+            _captureLru.Remove(tokenCount);
+            _captureLru.Add(tokenCount);
+            return existing;
+        }
+
+        while (_captureLru.Count >= Math.Max(1, MaxCapturedShapes))
+        {
+            var evict = _captureLru[0];
+            _captureLru.RemoveAt(0);
+            if (_capturesByTokenCount.Remove(evict, out var old))
+                try { old.Dispose(); } catch { /* a plan we are discarding anyway */ }
+        }
+
+        var fresh = new SessionGraphCapture(_session, _accelerator) { Enabled = true };
+        _capturesByTokenCount[tokenCount] = fresh;
+        _captureLru.Add(tokenCount);
+        return fresh;
+    }
+
     /// <summary>
     /// The graph's iSTFT tail, moved to the host - or <c>null</c> when this export's tail was not
     /// recognised and the graph still computes it on the GPU.
@@ -314,7 +361,9 @@ public sealed class KokoroPipeline : IDisposable
         {
             if (EnableGraphCapture)
             {
-                _capture ??= new SessionGraphCapture(_session, _accelerator);
+                // Keyed by token count: that is the only input dimension that varies, and it is what the
+                // recorded plan is bound to.
+                _capture = CaptureFor(tokens.Count);
                 outputs = await _capture.RunAsync(inputs).ConfigureAwait(false);
             }
             else
@@ -362,5 +411,15 @@ public sealed class KokoroPipeline : IDisposable
     }
 
     /// <summary>Release the graph.</summary>
-    public void Dispose() => _session.Dispose();
+    public void Dispose()
+    {
+        // The per-shape plans own GPU resources (bind groups for ~3,155 recorded dispatches each), so they
+        // are released BEFORE the session they were recorded against.
+        foreach (var capture in _capturesByTokenCount.Values)
+            try { capture.Dispose(); } catch { /* disposing anyway */ }
+        _capturesByTokenCount.Clear();
+        _captureLru.Clear();
+        _capture = null;
+        _session.Dispose();
+    }
 }
