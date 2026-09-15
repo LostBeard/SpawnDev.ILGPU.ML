@@ -839,12 +839,25 @@ public class InferenceSession : IDisposable
     /// Pins dynamic DIMENSIONS only - a shape whose RANK differs from the model's is refused, loudly.</param>
     /// <param name="externalData">Optional: raw bytes of the external data file (model.onnx_data)
     /// for models that store weights in a separate file.</param>
+    /// <param name="prepareGraph">
+    /// Optional: adjust the parsed graph AFTER it is built and BEFORE it is compiled.
+    /// </param>
+    /// <remarks>
+    /// ⭐ THE POINT IS TRUNCATION. A caller that can do part of a graph better than the GPU can - a
+    /// post-processing tail that is a handful of scalar corrections, say - has no way to say so once the
+    /// graph is compiled. Rewiring <see cref="Graph.ModelGraph.Outputs"/> here lets dead-node elimination
+    /// drop everything downstream, so those nodes are never dispatched and, more importantly, never force
+    /// the host readbacks that operators like NonZero/ScatterND require.
+    /// ⚠️ The callback sees the graph BEFORE optimization, so anything it changes is subject to the same
+    /// passes as the rest. It must leave the graph valid; nothing here re-validates it.
+    /// </remarks>
     public static InferenceSession CreateFromOnnx(
         Accelerator accelerator, byte[] onnxBytes,
         Action<string, int>? onProgress = null,
         Dictionary<string, int[]>? inputShapes = null,
         bool enableOptimization = true,
-        byte[]? externalData = null)
+        byte[]? externalData = null,
+        Action<Graph.ModelGraph>? prepareGraph = null)
     {
         // Single-parse architecture: parse ONNX protobuf ONCE with zero-copy for large tensors.
         // The parsed model is kept in memory — graph info extracted for compilation,
@@ -913,6 +926,11 @@ public class InferenceSession : IDisposable
 
         // Pre-extract Pad node pads tensors so GraphExecutor never falls back to GPU readback at execute time.
         PreExtractPads(parsedModel, cpuSmallWeights, constantFloatValues, graph);
+
+        // ⚠️ AFTER the constant seeding, not before: a caller adjusting the graph almost always needs to
+        // READ a constant to decide (which initializer feeds what, what a scale is), and before this
+        // point FloatConstantData is still empty.
+        prepareGraph?.Invoke(graph);
 
         // Compile graph
         onProgress?.Invoke("compile", 0);
@@ -1063,6 +1081,7 @@ public class InferenceSession : IDisposable
         // Pre-extract Pad node pads tensors so GraphExecutor never falls back to GPU readback at execute time.
         PreExtractPads(parsedModel, cpuSmallWeights, constantFloatValues, graph);
 
+
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);
         // Snapshot the CLEAN constant seeds before Compile folds seq-specific values onto the graph
@@ -1142,6 +1161,18 @@ public class InferenceSession : IDisposable
     /// owns disposing it afterward. Foundation for loading a model directly from a <c>TorrentReadStream</c> /
     /// HTTP-Range / Blob source, and for sharded loading (a peer fetches only its shard's tensors).
     /// </summary>
+    /// <param name="prepareGraph">
+    /// Optional: adjust the parsed graph AFTER it is built and BEFORE it is compiled.
+    /// </param>
+    /// <remarks>
+    /// ⭐ THE POINT IS TRUNCATION. A caller that can do part of a graph better than the GPU can - a
+    /// post-processing tail that is a handful of scalar corrections, say - has no way to say so once the
+    /// graph is compiled. Rewiring <see cref="Graph.ModelGraph.Outputs"/> here lets dead-node elimination
+    /// drop everything downstream, so those nodes are never dispatched and, more importantly, never force
+    /// the host readbacks that operators like NonZero/ScatterND require.
+    /// ⚠️ The callback sees the graph BEFORE optimization, so anything it changes is subject to the same
+    /// passes as the rest. It must leave the graph valid; nothing here re-validates it.
+    /// </remarks>
     public static async Task<InferenceSession> CreateFromOnnxStreamAsync(
         Accelerator accelerator, Stream stream,
         Action<string, int>? onProgress = null,
@@ -1149,7 +1180,8 @@ public class InferenceSession : IDisposable
         bool enableOptimization = true,
         int streamThreshold = 1024 * 1024,
         Stream? externalDataStream = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Action<Graph.ModelGraph>? prepareGraph = null)
     {
         if (stream == null) throw new ArgumentNullException(nameof(stream));
 
@@ -1204,6 +1236,11 @@ public class InferenceSession : IDisposable
         }
 
         PreExtractPads(parsedModel, cpuSmallWeights, constantFloatValues, graph);
+
+        // ⚠️ AFTER the constant seeding, not before: a caller adjusting the graph almost always needs to
+        // READ a constant to decide (which initializer feeds what, what a scale is), and before this
+        // point FloatConstantData is still empty.
+        prepareGraph?.Invoke(graph);
 
         onProgress?.Invoke("compile", 0);
         var registry = new OperatorRegistry(accelerator);

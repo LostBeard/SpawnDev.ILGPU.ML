@@ -393,6 +393,9 @@ pmt_*.pid
 # small ones a test needs by name.
 SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/*
 !SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/kokoro-af_heart-paris.f32
+# onnxruntime's value for the tensor the truncated graph ends at, so KokoroIstftTail's oracle test
+# runs without the 326 MB model. 213 KB.
+!SpawnDev.ILGPU.ML.Demo/wwwroot/test-refs/kokoro-af_heart-paris-istft-in.f32
 
 # Audio written by DemoConsole KOKOROSPEAK / ZipVoice runs, into whatever the working directory was
 kokoro-*.wav

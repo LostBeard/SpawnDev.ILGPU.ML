@@ -108,10 +108,45 @@ public sealed class KokoroPipeline : IDisposable
 
     private SessionGraphCapture? _capture;
 
-    private KokoroPipeline(InferenceSession session, Accelerator accelerator)
+    /// <summary>
+    /// The graph's iSTFT tail, moved to the host - or <c>null</c> when this export's tail was not
+    /// recognised and the graph still computes it on the GPU.
+    /// </summary>
+    private readonly KokoroIstftTail? _tail;
+
+    /// <summary>
+    /// What happened to the iSTFT tail. Read this rather than assuming the truncation engaged.
+    /// </summary>
+    /// <remarks>
+    /// A decline is not a failure: it costs the dispatches and readbacks the tail would have saved, and
+    /// the graph produces the identical waveform on the GPU as it always did.
+    /// </remarks>
+    public string TailStatus { get; private set; } = "not attempted";
+
+    /// <summary>
+    /// Recognise the iSTFT tail, cut it out of the graph, and hand it back to be run on the host.
+    /// </summary>
+    /// <remarks>
+    /// Passed to <see cref="InferenceSession"/> as its <c>prepareGraph</c> hook, so it sees the parsed
+    /// graph after constant seeding and before compilation - which is the only moment at which rewiring
+    /// the outputs still lets dead-node elimination collect the tail.
+    /// </remarks>
+    private static KokoroIstftTail? PrepareGraph(ModelGraph graph, out string status)
+    {
+        var tail = KokoroIstftTail.TryDetect(graph, out var why);
+        if (tail == null) { status = "declined: " + why; return null; }
+        tail.Truncate(graph);
+        status = tail.ToString();
+        return tail;
+    }
+
+    private KokoroPipeline(InferenceSession session, Accelerator accelerator,
+        KokoroIstftTail? tail = null, string tailStatus = "not attempted")
     {
         _session = session;
         _accelerator = accelerator;
+        _tail = tail;
+        TailStatus = tailStatus;
         session.SyncIntervalNodesOverride = DrainCadenceNodes;
         // 🔴 RESOLVED FROM THE GRAPH, NOT HARDCODED. Two exports of this same model are in circulation and
         // they do not agree on names: onnx-community's serves `input_ids` -> `waveform`, KokoroSharp's
@@ -143,7 +178,16 @@ public sealed class KokoroPipeline : IDisposable
     /// session without ever materialising them managed-side.
     /// </remarks>
     public static KokoroPipeline Create(Accelerator accelerator, byte[] modelOnnx)
-        => new(InferenceSession.CreateFromFile(accelerator, modelOnnx), accelerator);
+    {
+        // CreateFromOnnx rather than CreateFromFile: this is Kokoro, so the format is not in question,
+        // and the hook belongs on the ONNX path rather than on a multi-format dispatcher that would have
+        // to drop it silently for every other format.
+        KokoroIstftTail? tail = null;
+        var status = "not attempted";
+        var session = InferenceSession.CreateFromOnnx(accelerator, modelOnnx,
+            prepareGraph: g => tail = PrepareGraph(g, out status));
+        return new KokoroPipeline(session, accelerator, tail, status);
+    }
 
     /// <summary>Load the graph from a model STREAM - the browser path.</summary>
     /// <remarks>
@@ -153,8 +197,13 @@ public sealed class KokoroPipeline : IDisposable
     /// </remarks>
     public static async Task<KokoroPipeline> CreateFromStreamAsync(Accelerator accelerator, Stream modelOnnx,
         CancellationToken ct = default)
-        => new(await InferenceSession.CreateFromOnnxStreamAsync(accelerator, modelOnnx, ct: ct)
-            .ConfigureAwait(false), accelerator);
+    {
+        KokoroIstftTail? tail = null;
+        var status = "not attempted";
+        var session = await InferenceSession.CreateFromOnnxStreamAsync(accelerator, modelOnnx, ct: ct,
+            prepareGraph: g => tail = PrepareGraph(g, out status)).ConfigureAwait(false);
+        return new KokoroPipeline(session, accelerator, tail, status);
+    }
 
     /// <summary>The loaded session, for diagnostics.</summary>
     public InferenceSession Session => _session;
@@ -258,6 +307,10 @@ public sealed class KokoroPipeline : IDisposable
         ct.ThrowIfCancellationRequested();
 
         var samples = await ReadAsync(outputs[_session.OutputNames[0]]).ConfigureAwait(false);
+        // The graph now ends at the last ConvTranspose, so the overlap-add normalisation, the scale and
+        // the trims happen here - over a buffer that was being copied to the host regardless, so the move
+        // costs no crossing it was not already paying. See KokoroIstftTail for why they left the GPU.
+        if (_tail != null) samples = _tail.Apply(samples);
         clock.Stop();
         return new KokoroAudio(samples, OutputSampleRate, tokens.Count, dropped,
             clock.Elapsed.TotalMilliseconds);

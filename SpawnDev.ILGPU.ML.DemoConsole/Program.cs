@@ -359,6 +359,10 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
         // ⚠️ The COMPILED node count, printed every run. This engine costs ~1 ms per real node in a
         // browser, so the count IS the speed estimate - and a fusion pass that silently stops matching
         // (an exporter changes one attribute and the pattern is gone) shows up here and nowhere else.
+        // ⚠️ "declined" is a legitimate outcome and is NOT a failure - it costs the dispatches and host
+        // readbacks the tail would have saved, and the waveform is identical either way. But it has to be
+        // VISIBLE, because a silent decline looks exactly like a working optimisation that stopped paying.
+        Console.WriteLine($"  istft tail: {pipeline.TailStatus}");
         Console.WriteLine($"  compiled nodes: {pipeline.Session.NodeCount} "
                         + $"(fused-instancenorm {SpawnDev.ILGPU.ML.Graph.GraphOptimizer.LastInstanceNormFused}, "
                         + $"fused-atan2 {SpawnDev.ILGPU.ML.Graph.GraphOptimizer.LastAtan2Fused})");
