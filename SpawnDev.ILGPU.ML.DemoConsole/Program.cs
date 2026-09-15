@@ -370,10 +370,20 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
         // which would otherwise be reported as the model's speed. The second is the steady state.
         for (var pass = 1; pass <= 2; pass++)
         {
+            // ⭐ WHAT ONE FORWARD ALLOCATES ON THE MANAGED HEAP. Free to collect, and it is one half of the
+            // open worker-gap question: .NET WASM's GC is non-concurrent, so if a forward churns tens of MB
+            // then a browser worker with other models resident pays collection pauses this desktop run
+            // never sees. A number here makes that testable instead of arguable.
+            var gcAlloc0 = GC.GetTotalAllocatedBytes(false);
+            var gcG0 = GC.CollectionCount(0);
+            var gcPause0 = GC.GetTotalPauseDuration();
             var audio = await pipeline.SpeakAsync(phonemes, pack);
             Console.WriteLine($"  pass {pass}: {audio.Samples.Length} samples = {audio.Seconds:F2}s of audio "
                             + $"in {audio.InferenceMs:F0} ms  ->  RTF {audio.RealtimeFactor:F2}x "
-                            + $"({audio.Tokens} tokens, {audio.DroppedPhonemes} dropped)");
+                            + $"({audio.Tokens} tokens, {audio.DroppedPhonemes} dropped) | gc "
+                            + $"{(GC.GetTotalAllocatedBytes(false) - gcAlloc0) / 1048576.0:F1} MB, "
+                            + $"gen0 {GC.CollectionCount(0) - gcG0}, "
+                            + $"pause {(GC.GetTotalPauseDuration() - gcPause0).TotalMilliseconds:F0} ms");
             if (pass == 2)
             {
                 // ⚠️ The executor's own split, and the NAMES of every mid-graph readback. MEASURED in
