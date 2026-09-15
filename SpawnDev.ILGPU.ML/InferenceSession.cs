@@ -183,6 +183,26 @@ public class InferenceSession : IDisposable
 
     private int? _syncIntervalNodesOverride;
 
+    /// <summary>
+    /// Per-session override of the executor's deferred-release byte budget
+    /// (<see cref="GraphExecutor.MaxPendingReleaseBytes"/>). Null = the global default.
+    /// </summary>
+    /// <remarks>
+    /// This is the drain trigger that fires at LONG shapes, independently of
+    /// <see cref="SyncIntervalNodesOverride"/>: the node count is fixed but the intermediate SIZES grow
+    /// with the input, so a fixed byte budget is hit proportionally more often. MEASURED on Kokoro/WebGPU
+    /// 2026-09-15: 3 drains at 35 tokens, 15 at 180, 27 at 360. Raising it costs peak GPU memory - see
+    /// <see cref="GraphExecutor.MaxPendingReleaseBytesOverride"/>.
+    /// </remarks>
+    public long? MaxPendingReleaseBytesOverride
+    {
+        get => _maxPendingReleaseBytesOverride;
+        // ⚠️ Same reason as the cadence above: held on the SESSION so RecompileForShapes carries it.
+        set { _maxPendingReleaseBytesOverride = value; _executor.MaxPendingReleaseBytesOverride = value; }
+    }
+
+    private long? _maxPendingReleaseBytesOverride;
+
     /// <summary>The accelerator this session runs on (used by the CUDA-graph capture path).</summary>
     public Accelerator Accelerator => _accelerator;
 
@@ -320,6 +340,9 @@ public class InferenceSession : IDisposable
             ActivationDtype = _executor.ActivationDtype, // carry the activation precision to the recompiled executor
             // Carry the session's drain cadence too - see SyncIntervalNodesOverride.
             SyncIntervalNodesOverride = _syncIntervalNodesOverride,
+            // ...and its deferred-release byte budget, for exactly the same reason. A variable-length
+            // model recompiles on every new shape, which is precisely when the byte cap matters most.
+            MaxPendingReleaseBytesOverride = _maxPendingReleaseBytesOverride,
         };
         recompileSw.Stop();
         LastRecompileMs = recompileSw.Elapsed.TotalMilliseconds;

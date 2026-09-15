@@ -78,6 +78,31 @@ public sealed class KokoroPipeline : IDisposable
     private const int DrainCadenceNodes = 4096;
 
     /// <summary>
+    /// Deferred-release byte budget for this model - the OTHER drain trigger, and the one that fires at
+    /// the utterance lengths the SpawnDev.AI demo actually renders.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 RAISING THE NODE CADENCE ABOVE WAS ONLY HALF THE FIX, and the half that stops working exactly
+    /// when it matters. The cadence is a node COUNT and Kokoro's node count does not change with the
+    /// sentence; the intermediate SIZES do, so the independent 512 MiB byte cap gets hit proportionally
+    /// more often the longer the utterance. MEASURED on WebGPU 2026-09-15, same graph, same cadence:
+    /// <code>
+    ///    35 tok ->  3 drains
+    ///   180 tok -> 15 drains   (the demo's FIRST chunk,  160 characters)
+    ///   360 tok -> 27 drains   (the demo's later chunks, 320 characters)  5,123 ms of a 10,126 ms pass
+    /// </code>
+    /// So the 3-drain figure the cadence bought was measured at a 35-token fixture and never held for a
+    /// real reply. A per-length measurement is the only kind that means anything for a variable-length
+    /// model.
+    /// <para>
+    /// ⚠️ THE COST IS PEAK GPU MEMORY, ~(live set + this budget). Safe here because Kokoro-82M's live set
+    /// is small; this is a per-session override precisely so it does NOT raise the budget for models
+    /// where it would be ruinous (a 512² VAE decode blew to ~10 GB on the 512 MiB default).
+    /// </para>
+    /// </remarks>
+    private const long DrainByteBudget = 2L * 1024 * 1024 * 1024;
+
+    /// <summary>
     /// Record the GPU dispatches once and replay them, instead of walking 1,885 nodes every utterance.
     /// </summary>
     /// <remarks>
@@ -95,23 +120,28 @@ public sealed class KokoroPipeline : IDisposable
     /// Conv/MatMul/elementwise plus one NonZero and one ScatterND).
     /// </para>
     /// <para>
-    /// ⭐ NOW ON BY DEFAULT - MEASURED 2026-09-15, and it is the difference between "about realtime" and
-    /// "five times faster than realtime" in a browser. WebGPU, warm, same shape, 2.27 s of audio over
-    /// 1,850 nodes:
+    /// 🔴 OFF BY DEFAULT, AND THE MEASUREMENT THAT TURNED IT ON IS THE REASON WHY. On 2026-09-15 this was
+    /// defaulted ON off the back of a REPEATED 35-token fixture, where it is a genuine 3.8x:
     /// <code>
-    ///   capture off : 1,689 ms   RTF 0.75x
-    ///   capture on  :   444 ms   RTF 0.20x     3.80x, status "live on WebGPU (3155 dispatches)"
+    ///   35 tok, repeated:  capture off 1,689 ms (RTF 0.75x) -> on 444 ms (RTF 0.20x)
     /// </code>
-    /// The whole win is per-dispatch HOST work. Uncaptured, WebGPU spent arg-build 323 ms + bind-group
-    /// 640 ms + encode 112 ms = ~1,091 ms of that 1,689 ms preparing 1,850 dispatches on the CPU; CUDA
-    /// runs the identical graph in 674 ms. A recorded plan re-executes them with none of that.
+    /// That is a benchmark, not a reply. Measured the same day against the chunk sizes the SpawnDev.AI
+    /// demo actually renders (160 / 320 characters = ~180 / ~360 phoneme tokens), recording a plan costs
+    /// FOUR AND A HALF TIMES a plain pass, because <see cref="SessionGraphCapture"/> runs the graph three
+    /// times to record it:
+    /// <code>
+    ///   360 tok, first sight (runs direct)     :  9,852 ms   RTF 0.46x
+    ///   360 tok, repeat     (records a plan)   : 45,153 ms   RTF 2.11x   &lt;-- 22.4 s late, audible stall
+    /// </code>
+    /// A spoken reply is a handful of chunks, so a length that recurs once recurs once - the recording is
+    /// paid and the replay that would amortise it never comes. Capture optimises the case a conversation
+    /// does not have, at the cost of the case it does, which is exactly the trap the recur-only policy in
+    /// <see cref="CaptureFor"/> was written to avoid one level down. Recur-only bounds how OFTEN the
+    /// recording is paid; it cannot make the recording worth paying.
     /// </para>
     /// <para>
-    /// 🔴 IT WAS OFF ONLY BECAUSE NOBODY TURNED IT ON. Every other pipeline in this library already
-    /// defaults it true - AudioPipelines (Whisper), DepthEstimationPipeline ("ON by default: consumers
-    /// forgetting the ..."). This property was declared without an initialiser and so defaulted to false,
-    /// and Kokoro paid full dispatch cost on every utterance for it. The remark below used to read
-    /// "opt-in until measured on this machine"; it has now been measured.
+    /// ⭐ SET IT TRUE for a fixed-shape workload that runs the SAME utterance length many times - a
+    /// benchmark, a soundboard of canned lines, a batch render. Leave it alone for speech.
     /// </para>
     /// <para>
     /// ⚠️ <see cref="SessionGraphCapture"/> falls through to a direct forward whenever it cannot record -
@@ -126,7 +156,7 @@ public sealed class KokoroPipeline : IDisposable
     /// ⚠️ Read <see cref="CaptureStatus"/> rather than assuming it engaged: "requested" is not "live".
     /// </para>
     /// </remarks>
-    public bool EnableGraphCapture { get; set; } = true;
+    public bool EnableGraphCapture { get; set; }
 
     /// <summary>What the capture actually did - never infer this from <see cref="EnableGraphCapture"/>.</summary>
     public string CaptureStatus => _capture?.CaptureStatus ?? "not attempted";
@@ -251,6 +281,7 @@ public sealed class KokoroPipeline : IDisposable
         _tail = tail;
         TailStatus = tailStatus;
         session.SyncIntervalNodesOverride = DrainCadenceNodes;
+        session.MaxPendingReleaseBytesOverride = DrainByteBudget;
         // 🔴 RESOLVED FROM THE GRAPH, NOT HARDCODED. Two exports of this same model are in circulation and
         // they do not agree on names: onnx-community's serves `input_ids` -> `waveform`, KokoroSharp's
         // ships `tokens` -> `audio`. Same 2,463-node graph, same operators, same weights. Hardcoding

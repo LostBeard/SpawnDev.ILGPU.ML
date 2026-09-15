@@ -54,10 +54,25 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 public abstract partial class MLTestBase
 {
     /// <summary>
-    /// Sentence lengths, in phoneme tokens, of a plausible spoken reply - a short acknowledgement
-    /// first (the worst case for a queue with nothing in it), then progressively longer sentences.
+    /// The chunk sizes the SpawnDev.AI demo actually renders, in phoneme tokens.
     /// </summary>
-    private static readonly int[] KokoroReplyChunkTokenCounts = { 9, 18, 35, 26, 47, 14, 31 };
+    /// <remarks>
+    /// 🔴 THESE ARE PRODUCTION'S NUMBERS, NOT A GUESS AT THEM. Home.razor.cs splits a reply with
+    /// <c>SpeakChunkCharacters = 160</c> for the FIRST chunk and then merges the rest up to
+    /// <c>SpeakChunkCharactersAfterFirst = 320</c>, so a long reply is 160 / 320 / 320 CHARACTERS.
+    /// Kokoro's reference line is 31 characters -> 35 phoneme tokens, i.e. ~1.13 tokens per character,
+    /// which puts those chunks at ~180 / ~360 / ~360 tokens.
+    /// <para>
+    /// ⚠️ The first version of this test used per-SENTENCE chunks (9-47 tokens) and failed loudly - but
+    /// the demo has not chunked per sentence since the merge above was added, so that failure was the
+    /// fixture's, not the product's. A gate that models a policy the product does not use is worse than
+    /// no gate: it reports a stall nobody would ever hear, and it hides the one they would.
+    /// </para>
+    /// <para>
+    /// ⚠️ Kokoro's context is 510 tokens, so 360 fits; do not raise these past that without checking.
+    /// </para>
+    /// </remarks>
+    private static readonly int[] KokoroReplyChunkTokenCounts = { 180, 360, 360 };
 
     /// <summary>
     /// Builds a chunk of <paramref name="tokenCount"/> ids framed the way the front end frames a
@@ -133,8 +148,26 @@ public abstract partial class MLTestBase
             var bind0 = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuBindGroupMs;
             var enc0 = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuEncodeMs;
 
+            Console.WriteLine($"[KokoroStream] {BackendName}: chunk {i} starting, {tokens.Length} tok, "
+                            + $"capture status before: {pipeline.CaptureStatus}");
+
             var sw = Stopwatch.StartNew();
-            var audio = await pipeline.SpeakTokensAsync(tokens, pack);
+            KokoroAudio audio;
+            try
+            {
+                audio = await pipeline.SpeakTokensAsync(tokens, pack);
+            }
+            catch (Exception ex)
+            {
+                // Name the chunk and whether capture was replaying. "device has been lost" with no
+                // context reads as a card problem; "chunk 2, 360 tok, the SECOND time this length was
+                // asked for, so capture was replaying" is the diagnosis.
+                throw new Exception(
+                    $"{BackendName}: chunk {i} ({tokens.Length} tok) FAILED after "
+                  + $"{sw.Elapsed.TotalMilliseconds:F0} ms - capture status {pipeline.CaptureStatus}. "
+                  + $"Lengths asked for so far: [{string.Join(", ", KokoroReplyChunkTokenCounts.Take(i + 1))}] "
+                  + $"- a repeated length is the one that engages graph capture replay. {ex.Message}", ex);
+            }
             sw.Stop();
             renderMs[i] = sw.Elapsed.TotalMilliseconds;
             audioSec[i] = audio.Seconds;
@@ -200,7 +233,9 @@ public abstract partial class MLTestBase
         // drains whatever the length), so rendering N sentences as N passes multiplies that fixed cost
         // by N while the audio only adds up linearly. Rendering the SAME content as ONE pass pays it
         // once. This measures that directly rather than assuming it.
-        int totalTokens = KokoroReplyChunkTokenCounts.Sum() - (KokoroReplyChunkTokenCounts.Length - 1) * 3;
+        // Capped at Kokoro's 510-token context - the coalesced control is a reference point, not a
+        // proposal to feed the model more than it takes.
+        int totalTokens = Math.Min(510, KokoroReplyChunkTokenCounts.Sum() - (KokoroReplyChunkTokenCounts.Length - 1) * 3);
         var oneShot = BuildKokoroChunk(totalTokens, 0);
         var swOne = Stopwatch.StartNew();
         var oneAudio = await pipeline.SpeakTokensAsync(oneShot, pack);

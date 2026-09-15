@@ -334,6 +334,34 @@ public class GraphExecutor : IDisposable
     /// are recycled, never the math.</summary>
     public static long MaxPendingReleaseBytes = 512L * 1024 * 1024;
 
+    /// <summary>Per-session override of <see cref="MaxPendingReleaseBytes"/>. Null = the global default.</summary>
+    /// <remarks>
+    /// 🔴 THIS IS THE DRAIN LEVER THAT ACTUALLY FIRES AT PRODUCTION UTTERANCE LENGTHS.
+    /// <see cref="SyncIntervalNodesOverride"/> is the node-cadence knob and Kokoro already raises it, which
+    /// is why a 35-token synthesis shows only 3 drains. But the byte cap is INDEPENDENT of the cadence, and
+    /// it is what fires once the tensors get big: MEASURED 2026-09-15 on WebGPU, the same Kokoro graph
+    /// drained 3 times at 35 tokens, <b>15 times at 180 tokens and 27 times at 360 tokens</b> - the sizes
+    /// the SpawnDev.AI demo actually renders (160 / 320 characters per chunk). At 360 tokens that was
+    /// 5,123 ms of a 10,126 ms pass.
+    /// <para>
+    /// The node count does not change with the utterance; the INTERMEDIATE SIZES do, so a fixed 512 MiB
+    /// budget is hit proportionally more often the longer the sentence. That makes the cap a
+    /// per-model-and-shape decision, exactly like the cadence, and for the same reason it belongs on the
+    /// session rather than in a static every other model shares.
+    /// </para>
+    /// ⚠️ Raising it raises PEAK GPU memory to ~(live set + this cap). That is the whole trade; it is safe
+    /// for a small-weight model like Kokoro-82M and is NOT safe to raise globally - a 512² VAE decode blew
+    /// to ~10 GB on exactly this budget (see <see cref="MaxPendingReleaseBytes"/>).
+    /// <para>
+    /// ⚠️ Exact either way: this changes only WHEN buffers are recycled, never the math.
+    /// </para>
+    /// </remarks>
+    public long? MaxPendingReleaseBytesOverride { get; set; }
+
+    /// <summary>The deferred-release byte budget in force for this executor.</summary>
+    private long EffectiveMaxPendingReleaseBytes =>
+        MaxPendingReleaseBytesOverride is > 0 ? MaxPendingReleaseBytesOverride.Value : MaxPendingReleaseBytes;
+
     /// <summary>
     /// DIAGNOSTIC: when set, RunAsync's main loop breaks after executing
     /// `BreakAtNode` nodes (1-indexed). Used to bisect which operator triggers
@@ -2824,7 +2852,7 @@ public class GraphExecutor : IDisposable
             // CUDA-graph capture records this forward; a synchronize would abort the capture. The
             // captured forward is warm, so skipping the drain leaks no buffers within the single pass.
             if (SuppressDrains) return;
-            if (nodeIdx % EffectiveSyncInterval == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
+            if (nodeIdx % EffectiveSyncInterval == 0 || pendingReleaseBytes >= EffectiveMaxPendingReleaseBytes)
             {
                 _drainSw.Restart();
                 try { await _accelerator.SynchronizeAsync(); }
