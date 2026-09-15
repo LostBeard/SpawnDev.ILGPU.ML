@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Tensors;
 
@@ -1492,8 +1492,9 @@ public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator, IPrecis
         var (N, C, _, _) = shape.Length >= 4 ? LayoutHelper.GetDims(shape, ctx.Format)
             : (shape[0], shape.Length > 1 ? shape[1] : 1, 1, 1);
         int spatial = ctx.Inputs[0].ElementCount / (N * C);
+        // ONNX declares `epsilon` (default 1e-5) and it used to be dropped on the floor here.
         reg.Normalization.InstanceNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
-            ctx.Inputs[1].Data, ctx.Inputs[2].Data, N, C, spatial);
+            ctx.Inputs[1].Data, ctx.Inputs[2].Data, N, C, spatial, ctx.GetFloat("epsilon", 1e-5f));
     }
     /// <summary>Precision-aware (F16) path: InstanceNorm == GroupNorm with one group per channel (G=C). Reads the
     /// low-p activation, accumulates mean/var in fp32, writes low-p; scale/bias stay fp32. eps=1e-5f matches the
@@ -1511,6 +1512,72 @@ public class InstanceNormOperator(OperatorRegistry reg) : IOnnxOperator, IPrecis
         pak.GroupNorm<global::ILGPU.Half>(inputs[0].Half!.Data, output.Data,
             inputs[1].Float!.Data, inputs[2].Float!.Data, N, C, spatial, numGroups: C, epsilon: 1e-5f);
         return true;
+    }
+}
+
+/// <summary>
+/// <c>FusedInstanceNorm(x, scale, bias)</c> - the nine-node "normalise the last axes, then scale and shift
+/// per CHANNEL" chain exporters write out longhand, collapsed into one node.
+/// </summary>
+/// <remarks>
+/// <para>
+/// ⭐ WHY IT IS WORTH MORE THAN THE NODE COUNT SUGGESTS. This engine costs roughly 1 ms per REAL node in a
+/// browser - per-node host orchestration IS the browser wall - and the chain below is nine real dispatches
+/// with nine sets of pool traffic. MEASURED on Kokoro-82M: <b>65 of these chains, 585 nodes, 24% of a
+/// 2,463-node graph</b>. The precedent is Whisper's decode step, where collapsing the LayerNorm form
+/// (20% fewer nodes) took it 491 -> 357 ms, <b>27% faster</b>.
+/// </para>
+/// <para>
+/// ⚠️ THIS IS NOT LayerNormalization, and the difference is the whole reason it needs its own pass.
+/// LayerNorm's scale and bias are shaped like the NORMALISED axes; here they are per-CHANNEL - one value
+/// for each row of the axis BEFORE the normalised one - and broadcast along the normalised axis. That is
+/// InstanceNormalization's shape, which is why this delegates to that kernel. In an adaptive-norm model
+/// (AdaIN) the scale and bias are computed at RUNTIME from a style vector rather than being weights, so
+/// the LayerNorm pass's "both must be initializers" rule also excludes it.
+/// </para>
+/// <para>
+/// ⚠️ It VALIDATES rather than assuming. The fusion runs before shape inference, so it cannot check that
+/// scale has one value per channel - only this can, at execute time, and a mismatch throws with both
+/// shapes named instead of indexing off the end of a buffer into whatever the pool left there.
+/// </para>
+/// </remarks>
+public class FusedInstanceNormOperator(OperatorRegistry reg) : IOnnxOperator
+{
+    public string OpType => "FusedInstanceNorm";
+
+    public int[][] InferOutputShapes(int[][] inputs, Dictionary<string, object> attrs)
+        => new[] { inputs[0] };
+
+    public void Execute(OnnxOpContext ctx)
+    {
+        var shape = ctx.Inputs[0].Shape;
+        var axis = ctx.GetInt("axis", -1);
+        if (axis < 0) axis += shape.Length;
+        if (axis < 1 || axis >= shape.Length)
+            throw new InvalidOperationException(
+                $"FusedInstanceNorm normalises dims [{axis}..] of [{string.Join(",", shape)}] and takes its "
+                + "channels from the dim before that, so the axis must be at least 1 and inside the rank");
+
+        var spatial = 1;
+        for (var i = axis; i < shape.Length; i++) spatial *= shape[i];
+        var channels = shape[axis - 1];
+        var slices = spatial > 0 ? ctx.Inputs[0].ElementCount / spatial : 0;
+        if (spatial <= 0 || channels <= 0 || slices <= 0 || slices % channels != 0)
+            throw new InvalidOperationException(
+                $"FusedInstanceNorm cannot split [{string.Join(",", shape)}] at axis {axis} into "
+                + $"batch x {channels} channels x {spatial} spatial");
+
+        // One scale and one bias PER CHANNEL. The chain this replaces broadcast them, so a tensor of any
+        // shape holding exactly `channels` values is the same computation - [C], [1,C,1] and [C,1] all
+        // arrive here as the same contiguous run. Anything else is a different operator.
+        if (ctx.Inputs[1].ElementCount != channels || ctx.Inputs[2].ElementCount != channels)
+            throw new InvalidOperationException(
+                $"FusedInstanceNorm on [{string.Join(",", shape)}] axis {axis} needs {channels} scale and "
+                + $"{channels} bias values, got {ctx.Inputs[1].ElementCount} and {ctx.Inputs[2].ElementCount}");
+
+        reg.Normalization.InstanceNorm(ctx.Inputs[0].Data, ctx.Outputs[0].Data,
+            ctx.Inputs[1].Data, ctx.Inputs[2].Data,
+            slices / channels, channels, spatial, ctx.GetFloat("epsilon", 1e-5f));
     }
 }
 

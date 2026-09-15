@@ -469,7 +469,7 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> output,
         ArrayView1D<float, Stride1D.Dense> scale,
         ArrayView1D<float, Stride1D.Dense> bias,
-        int N, int C, int spatial)
+        int N, int C, int spatial, float epsilon = 1e-5f)
     {
         EnsureLoaded();
         int numSlices = N * C;
@@ -481,7 +481,10 @@ public class NormalizationKernels : IDisposable
         var (inMeans, inInvStds) = GetStatsScratch(numSlices);
 
         // Pass 1: compute mean + invStd per slice
-        _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, 1e-5f);
+        // ⚠️ The CALLER's epsilon, not a constant. ONNX InstanceNormalization declares `epsilon`
+        // and this ignored it, so a model asking for anything but the 1e-5 default was quietly
+        // computed wrong. The default here keeps every existing caller on the number it already had.
+        _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, epsilon);
 
         // DIAGNOSTIC capture (opt-in): record buffer refs so caller can async-read.
         // The temp buffers are held alive by _allTempBufs until Dispose, so it's
@@ -509,12 +512,12 @@ public class NormalizationKernels : IDisposable
     public void InstanceNormInPlace(ArrayView1D<float, Stride1D.Dense> data,
         ArrayView1D<float, Stride1D.Dense> scale,
         ArrayView1D<float, Stride1D.Dense> bias,
-        int N, int C, int spatial)
+        int N, int C, int spatial, float epsilon = 1e-5f)
     {
         EnsureLoaded();
         int numSlices = N * C;
         var (inMeans, inInvStds) = GetStatsScratch(numSlices);
-        _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, 1e-5f);
+        _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, epsilon);
         _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 

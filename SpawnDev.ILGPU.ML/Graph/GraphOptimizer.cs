@@ -63,6 +63,11 @@ public static class GraphOptimizer
         // before they run keeps the pattern intact.
         int fusedLayerNorm = FuseLayerNorm(optimized);
 
+        // Pass 3a2: Fuse the nine-node ADAPTIVE normalisation chain (per-CHANNEL scale/bias computed at
+        // runtime) into one FusedInstanceNorm. Runs right after FuseLayerNorm, which gets first refusal on
+        // any chain that is really a LayerNorm.
+        int fusedInstNorm = FuseInstanceNorm(optimized);
+
         // Pass 3b: Fuse the seven-node atan2 decomposition into ONE FusedAtan2 node.
         // 🔴 A CORRECTNESS pass that happens to also cut nodes - the chain it replaces is NOT atan2 at an
         // exactly-zero y. See FuseAtan2. Order: after LayerNorm (which claims its own Add/Sub/Div and
@@ -108,11 +113,209 @@ public static class GraphOptimizer
         // Pass 8: Remove dead nodes (outputs never consumed)
         int dead = EliminateDeadNodes(optimized);
 
-        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm + fusedAtan2;
+        int totalOpt = fusedLinear + fusedScaled + fusedAttn + eliminated + dead + folded + reduced + constNodes + fusedLayerNorm + fusedAtan2 + fusedInstNorm;
         if (InferenceSession.VerboseLogging && totalOpt > 0)
-            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {fusedLayerNorm} fused-layernorm, {fusedAtan2} fused-atan2, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
+            Console.WriteLine($"[GraphOptimizer] {totalOpt} optimizations: {folded} folded, {eliminated} identity, {fusedLinear} fused-linear, {fusedScaled} fused-scaled, {fusedAttn} fused-attention, {fusedLayerNorm} fused-layernorm, {fusedInstNorm} fused-instancenorm, {fusedAtan2} fused-atan2, {reduced} strength-reduced, {constNodes} constant-nodes, {dead} dead");
 
         return optimized;
+    }
+
+    /// <summary>Where FuseInstanceNorm declined, by reason.</summary>
+    public static Dictionary<string, int> LastInstanceNormRejects = new();
+
+    /// <summary>How many chains the last FuseInstanceNorm run claimed. A fusion that stops matching is
+    /// silent everywhere else - the graph still computes the right answer, just slowly.</summary>
+    public static int LastInstanceNormFused;
+
+    /// <summary>How many chains the last FuseAtan2 run claimed.</summary>
+    public static int LastAtan2Fused;
+
+    /// <summary>
+    /// Fuse the nine-node ADAPTIVE normalisation chain into one <c>FusedInstanceNorm</c> node.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <code>
+    ///   mean = ReduceMean(x, axes)    d   = Sub(x, mean)     d2  = Mul(d, d)   [or Pow(d, 2)]
+    ///   var  = ReduceMean(d2, axes)   ve  = Add(var, eps)    std = Sqrt(ve)
+    ///   n    = Div(d, std)            y0  = Mul(n, scale)    y   = Add(y0, bias)
+    /// </code>
+    /// </para>
+    /// <para>
+    /// ⭐ WHY. MEASURED on Kokoro-82M: <b>65 of these, 585 nodes, 24% of a 2,463-node graph</b>, none of
+    /// which <see cref="FuseLayerNorm"/> can claim. At the ~1 ms per real node this engine costs in a
+    /// browser that is most of a second of pure host orchestration. Whisper's LayerNorm pass is the
+    /// precedent: 20% fewer nodes bought 27% of the decode step.
+    /// </para>
+    /// <para>
+    /// ⚠️ THREE THINGS MAKE IT INVISIBLE TO THE LAYERNORM PASS, and all three are the adaptive-norm
+    /// signature rather than incidental: the square is <c>Mul(d, d)</c> rather than <c>Pow(d, 2)</c>; the
+    /// axes arrive as an INPUT (opset 18+) rather than an attribute; and the scale and bias are computed
+    /// at RUNTIME from a style vector rather than being weights. The last one is also the discriminator
+    /// this pass relies on.
+    /// </para>
+    /// <para>
+    /// 🔴 THE CONSERVATIVE RULE, AND WHY. The optimizer runs BEFORE shape inference, so nothing here can
+    /// see whether scale is shaped like the normalised axis (LayerNorm) or like the channel axis
+    /// (InstanceNorm) - and the two are the same nine nodes. So this claims a chain ONLY when scale and
+    /// bias are NOT initializers: a classic LayerNorm's are always weights, an adaptive norm's never are.
+    /// A longhand InstanceNorm with constant parameters is therefore left alone, which costs a fusion and
+    /// cannot cost a wrong answer. <c>FusedInstanceNormOperator</c> then validates the channel count at
+    /// execute time and throws rather than reading off the end of a buffer.
+    /// </para>
+    /// </remarks>
+    private static int FuseInstanceNorm(ModelGraph graph)
+    {
+        var rej = new Dictionary<string, int>();
+        void No(string why) { rej[why] = rej.GetValueOrDefault(why) + 1; }
+        LastInstanceNormRejects = rej;
+        int fused = 0;
+        var remove = new HashSet<int>();
+
+        var consumers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var n in graph.Nodes)
+            foreach (var inp in n.Inputs)
+                if (!string.IsNullOrEmpty(inp))
+                    consumers[inp] = consumers.GetValueOrDefault(inp, 0) + 1;
+
+        int SoleConsumer(string name, string expectedOp)
+        {
+            if (consumers.GetValueOrDefault(name, 0) != 1) return -1;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j)) continue;
+                if (graph.Nodes[j].Inputs.Contains(name))
+                    return graph.Nodes[j].OpType == expectedOp ? j : -1;
+            }
+            return -1;
+        }
+
+        // The reduced axes, from the `axes` attribute (opset < 18) or input 1 (opset 18+). Exactly one
+        // axis: this normalises a trailing run and takes its channels from the dim before it.
+        bool TryAxis(GraphNode node, out int axis)
+        {
+            axis = 0;
+            if (node.Attributes != null && node.Attributes.TryGetValue("axes", out var el))
+            {
+                var list = ReadIntList(el);
+                if (list.Count != 1) return false;
+                axis = list[0];
+                return true;
+            }
+            if (node.Inputs.Count < 2 || string.IsNullOrEmpty(node.Inputs[1])) return false;
+            if (graph.ConstantData != null && graph.ConstantData.TryGetValue(node.Inputs[1], out var iv)
+                && iv.Length == 1) { axis = iv[0]; return true; }
+            return false;
+        }
+
+        // keepdims must be on, or Sub(x, mean) would not broadcast back over the reduced axis.
+        bool KeepsDims(GraphNode node)
+            => node.Attributes == null || !node.Attributes.TryGetValue("keepdims", out var el)
+               || ReadIntList(el) is { Count: 1 } l && l[0] == 1;
+
+        bool IsInitializer(string name)
+            => !string.IsNullOrEmpty(name) && graph.Initializers.ContainsKey(name);
+
+        for (int i = 0; i < graph.Nodes.Count; i++)
+        {
+            if (remove.Contains(i)) continue;
+            var meanNode = graph.Nodes[i];
+            if (meanNode.OpType != "ReduceMean" || meanNode.Inputs.Count < 1) continue;
+            No("candidates");
+            var x = meanNode.Inputs[0];
+            var meanOut = meanNode.Outputs.Count > 0 ? meanNode.Outputs[0] : null;
+            if (string.IsNullOrEmpty(x) || string.IsNullOrEmpty(meanOut)) continue;
+            if (!TryAxis(meanNode, out var axis)) { No("mean axes not a known single axis"); continue; }
+            if (!KeepsDims(meanNode)) { No("mean does not keep dims"); continue; }
+
+            int subIdx = SoleConsumer(meanOut, "Sub");
+            if (subIdx < 0) { No("mean not solely consumed by Sub"); continue; }
+            var sub = graph.Nodes[subIdx];
+            if (sub.Inputs.Count != 2 || sub.Inputs[0] != x || sub.Inputs[1] != meanOut)
+            { No("Sub is not (x, mean)"); continue; }
+            var d = sub.Outputs[0];
+
+            // d feeds the square (twice, when it is Mul(d,d)) and the Div.
+            int sqIdx = -1, divIdx = -1;
+            bool squareIsMul = false;
+            for (int j = 0; j < graph.Nodes.Count; j++)
+            {
+                if (remove.Contains(j) || !graph.Nodes[j].Inputs.Contains(d)) continue;
+                var nj = graph.Nodes[j];
+                if (nj.OpType == "Div") divIdx = j;
+                else if (nj.OpType == "Mul" && nj.Inputs.Count == 2 && nj.Inputs[0] == d && nj.Inputs[1] == d)
+                { sqIdx = j; squareIsMul = true; }
+                else if (nj.OpType == "Pow" && nj.Inputs.Count == 2 && nj.Inputs[0] == d) sqIdx = j;
+            }
+            if (sqIdx < 0 || divIdx < 0) { No("d does not feed a square and a Div"); continue; }
+            // Mul(d,d) occupies TWO input slots, so d has three consumers in that form and two in Pow's.
+            var expectedD = squareIsMul ? 3 : 2;
+            if (consumers.GetValueOrDefault(d, 0) != expectedD)
+            { No($"d consumers != {expectedD}"); continue; }
+            if (!squareIsMul)
+            {
+                if (!TryConstScalar(graph, graph.Nodes[sqIdx].Inputs[1], out var exp)
+                    || Math.Abs(exp - 2f) > 1e-6f) { No("Pow exponent not a known 2"); continue; }
+            }
+
+            int varIdx = SoleConsumer(graph.Nodes[sqIdx].Outputs[0], "ReduceMean");
+            if (varIdx < 0) { No("square not solely consumed by ReduceMean"); continue; }
+            var varNode = graph.Nodes[varIdx];
+            if (!TryAxis(varNode, out var varAxis) || varAxis != axis)
+            { No("variance reduces a different axis"); continue; }
+            if (!KeepsDims(varNode)) { No("variance does not keep dims"); continue; }
+
+            int epsIdx = SoleConsumer(varNode.Outputs[0], "Add");
+            if (epsIdx < 0) { No("variance not solely consumed by Add"); continue; }
+            var epsAdd = graph.Nodes[epsIdx];
+            if (epsAdd.Inputs.Count != 2) continue;
+            var epsName = epsAdd.Inputs[0] == varNode.Outputs[0] ? epsAdd.Inputs[1] : epsAdd.Inputs[0];
+            if (!TryConstScalar(graph, epsName, out var epsilon)) { No("epsilon not a known constant"); continue; }
+
+            int sqrtIdx = SoleConsumer(epsAdd.Outputs[0], "Sqrt");
+            if (sqrtIdx < 0) { No("eps-Add not solely consumed by Sqrt"); continue; }
+
+            var div = graph.Nodes[divIdx];
+            if (div.Inputs.Count != 2 || div.Inputs[0] != d
+                || div.Inputs[1] != graph.Nodes[sqrtIdx].Outputs[0]) { No("Div is not (d, std)"); continue; }
+
+            int mulIdx = SoleConsumer(div.Outputs[0], "Mul");
+            if (mulIdx < 0) { No("Div not solely consumed by Mul"); continue; }
+            var mul = graph.Nodes[mulIdx];
+            if (mul.Inputs.Count != 2) continue;
+            var scale = mul.Inputs[0] == div.Outputs[0] ? mul.Inputs[1] : mul.Inputs[0];
+
+            int biasIdx = SoleConsumer(mul.Outputs[0], "Add");
+            if (biasIdx < 0) { No("Mul not solely consumed by Add"); continue; }
+            var biasAdd = graph.Nodes[biasIdx];
+            if (biasAdd.Inputs.Count != 2) continue;
+            var bias = biasAdd.Inputs[0] == mul.Outputs[0] ? biasAdd.Inputs[1] : biasAdd.Inputs[0];
+
+            // See the remarks: initializer parameters mean this may be a LayerNorm, whose scale is shaped
+            // like the NORMALISED axis, and nothing here can see shapes. Leave it to FuseLayerNorm.
+            if (IsInitializer(scale) || IsInitializer(bias))
+            { No("scale/bias are initializers - possibly a LayerNorm"); continue; }
+            if (string.IsNullOrEmpty(scale) || string.IsNullOrEmpty(bias)) continue;
+
+            graph.Nodes[i] = new GraphNode
+            {
+                OpType = "FusedInstanceNorm",
+                Inputs = new List<string> { x, scale, bias },
+                Outputs = new List<string> { biasAdd.Outputs[0] },
+                Attributes = new Dictionary<string, JsonElement>
+                {
+                    ["axis"] = JsonSerializer.SerializeToElement(axis),
+                    ["epsilon"] = JsonSerializer.SerializeToElement(epsilon),
+                },
+            };
+            foreach (var idx in new[] { subIdx, sqIdx, varIdx, epsIdx, sqrtIdx, divIdx, mulIdx, biasIdx })
+                remove.Add(idx);
+            fused++;
+        }
+
+        foreach (var idx in remove.OrderByDescending(v => v)) graph.Nodes.RemoveAt(idx);
+        LastInstanceNormFused = fused;
+        return fused;
     }
 
     /// <summary>Where FuseAtan2 declined, by reason - a fusion that silently does nothing must say why.</summary>
@@ -270,6 +473,7 @@ public static class GraphOptimizer
         }
 
         foreach (var idx in remove.OrderByDescending(v => v)) graph.Nodes.RemoveAt(idx);
+        LastAtan2Fused = fused;
         return fused;
     }
 

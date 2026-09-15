@@ -330,6 +330,12 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
         using var modelStream = new MemoryStream(modelBytes, writable: false);
         using var pipeline = await SpawnDev.ILGPU.ML.Pipelines.KokoroPipeline
             .CreateFromStreamAsync(kacc, modelStream);
+        // ⚠️ The COMPILED node count, printed every run. This engine costs ~1 ms per real node in a
+        // browser, so the count IS the speed estimate - and a fusion pass that silently stops matching
+        // (an exporter changes one attribute and the pattern is gone) shows up here and nowhere else.
+        Console.WriteLine($"  compiled nodes: {pipeline.Session.NodeCount} "
+                        + $"(fused-instancenorm {SpawnDev.ILGPU.ML.Graph.GraphOptimizer.LastInstanceNormFused}, "
+                        + $"fused-atan2 {SpawnDev.ILGPU.ML.Graph.GraphOptimizer.LastAtan2Fused})");
         // ⚠️ TWICE. The first call compiles kernels, which is a one-off this engine pays per process and
         // which would otherwise be reported as the model's speed. The second is the steady state.
         for (var pass = 1; pass <= 2; pass++)

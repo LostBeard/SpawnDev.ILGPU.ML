@@ -101,9 +101,30 @@ public abstract partial class MLTestBase
         var pack = KokoroVoicePack.FromBytes("af_heart", voiceBytes);
         using var pipeline = KokoroPipeline.Create(accelerator, modelBytes);
 
-        var sw = Stopwatch.StartNew();
+        // ⚠️ TWICE WHERE THAT IS AFFORDABLE, because the first run of this graph is not the cost of the
+        // graph. Every kernel compiles on its FIRST execution, and on a browser backend that compile is
+        // most of a cold run - MEASURED on WebGPU (real RTX 4070, isFallbackAdapter=False): 8.1 s cold,
+        // 2.1 s warm. Reporting only the cold figure describes the first reply of a session as though it
+        // were every reply, which is the difference between "slower than realtime" and "faster than
+        // realtime" for this model.
+        //
+        // 🔴 But the SECOND pass is a measurement, and correctness is the gate. The CPU backend takes
+        // ~312 s per pass, so running it twice cost 624 s against PMT's 600 s outer cap and the row was
+        // KILLED - a backend that was verifying correctness perfectly well reported as a failure, for a
+        // timing number nobody would ship anyway. So the warm pass runs only where the cold one showed it
+        // is affordable, and its absence is stated rather than papered over.
+        var cold = Stopwatch.StartNew();
         var audio = await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
-        sw.Stop();
+        cold.Stop();
+
+        const int warmBudgetMs = 60_000;
+        Stopwatch? sw = null;
+        if (cold.ElapsedMilliseconds <= warmBudgetMs)
+        {
+            sw = Stopwatch.StartNew();
+            audio = await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+            sw.Stop();
+        }
 
         // ── Length. A wrong duration, a wrong STFT hop and a stale LSTM sequence length all land here,
         //    and all of them produce audio rather than an error. EXACT, not approximate: the reference
@@ -143,8 +164,12 @@ public abstract partial class MLTestBase
             throw new Exception($"best-fit gain {scale:F3} on {BackendName} (correlation {correlation:F4}) "
                 + "- correlated but at the wrong level");
 
+        var warmth = sw == null
+            ? $"warm not measured (cold exceeded the {warmBudgetMs / 1000}s budget for a second pass)"
+            : $"warm {sw.ElapsedMilliseconds} ms = RTF {sw.Elapsed.TotalSeconds / audio.Seconds:F2}x";
         Console.WriteLine($"[Kokoro] \"{KokoroReferenceLine}\" -> {audio.Samples.Length} samples "
-            + $"({audio.Seconds:F2}s) in {sw.ElapsedMilliseconds} ms, RTF {sw.Elapsed.TotalSeconds / audio.Seconds:F2}x, "
-            + $"peak {peak:F3}, correlation {correlation:F4}, gain {scale:F3} on {BackendName}");
+            + $"({audio.Seconds:F2}s), {warmth} (cold {cold.ElapsedMilliseconds} ms = RTF "
+            + $"{cold.Elapsed.TotalSeconds / audio.Seconds:F2}x), peak {peak:F3}, correlation "
+            + $"{correlation:F4}, gain {scale:F3} on {BackendName}");
     });
 }
