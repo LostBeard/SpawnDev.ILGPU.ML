@@ -1,11 +1,11 @@
-<Project Sdk="Microsoft.NET.Sdk.Razor">
+﻿<Project Sdk="Microsoft.NET.Sdk.Razor">
 
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<Version>5.2.14</Version>
-		<PackageReleaseNotes>v5.2.14 - Kokoro-82M text to speech (KokoroPipeline, 28 voices), matching onnxruntime to 0.993+ correlation and faster than realtime in a browser. Fixes seven engine defects found by porting it. See CHANGELOG.md</PackageReleaseNotes>
+		<PackageReleaseNotes>v5.2.14 - Kokoro-82M text to speech (KokoroPipeline, 28 voices), matching onnxruntime to 0.994 correlation at RTF 0.32x on CUDA. New InferenceSession prepareGraph hook. Fixes nine engine defects found by porting it. See CHANGELOG.md</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

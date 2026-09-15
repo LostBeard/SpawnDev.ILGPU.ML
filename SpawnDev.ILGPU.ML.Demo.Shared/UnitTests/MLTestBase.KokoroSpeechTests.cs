@@ -172,7 +172,14 @@ public abstract partial class MLTestBase
             + $"{cold.Elapsed.TotalSeconds / audio.Seconds:F2}x), peak {peak:F3}, correlation "
             + $"{correlation:F4}, gain {scale:F3} on {BackendName}");
 
-        if (sw != null) await ReportKokoroCostSplitAsync(pipeline, pack, audio.Seconds);
+        // ⚠️ A DIAGNOSTIC MUST NEVER FAIL A CORRECTNESS GATE. Everything above this line is the gate and
+        // has already passed; everything below is reporting, and some of it calls runtime APIs whose WASM
+        // support is not something to find out from a red HeavyModel row minutes into a sweep.
+        if (sw != null)
+        {
+            try { await ReportKokoroCostSplitAsync(pipeline, pack, audio.Seconds); }
+            catch (Exception ex) { Console.WriteLine($"[KokoroCost] {BackendName}: not reported ({ex.GetType().Name}: {ex.Message})"); }
+        }
     });
 
     /// <summary>
@@ -200,13 +207,55 @@ public abstract partial class MLTestBase
     /// </remarks>
     private async Task ReportKokoroCostSplitAsync(KokoroPipeline pipeline, KokoroVoicePack pack, double seconds)
     {
+        // ⚠️ EVERY READ THAT CAN THROW HAPPENS BEFORE ANY STATIC IS SET. The caller catches, but its catch
+        // cannot run this method's `finally` - so a throw while capturing the baselines below would leave
+        // the per-node Stopwatch and the per-dispatch timestamps armed for every later test on this lane.
+        var gc0 = (Alloc: GC.GetTotalAllocatedBytes(false), Pause: GC.GetTotalPauseDuration(),
+                   G0: GC.CollectionCount(0), G1: GC.CollectionCount(1), G2: GC.CollectionCount(2));
+
         var timings = new Dictionary<string, double>();
         Graph.GraphExecutor.CapturedNodeTimingsMs = timings;
+
+        // ⭐ THE FOUR PHASES OF A WEBGPU DISPATCH, which is where a browser's per-node cost actually
+        // lives. The accelerator has accumulated these all along and nothing has ever read them for this
+        // model. Each phase has a DIFFERENT fix - shader resolve is a cache, arg build is marshalling,
+        // bind group is object creation, encode is the BeginComputePass/SetPipeline/SetBindGroup/
+        // DispatchWorkgroups/End/Dispose crossings - so "the browser is slow" is only actionable once one
+        // of the four is named. Zeros on a desktop backend, which is correct: there are no crossings there.
+        var profWasOn = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling;
+        var p0 = (SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuShaderResolveMs,
+                  SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuArgBuildMs,
+                  SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuBindGroupMs,
+                  SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuEncodeMs);
+        SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = true;
+
+        // 🔴 The GC baseline above is the one cost invisible to every other counter here, and the one that
+        // scales with what ELSE is resident. .NET WASM's GC is non-concurrent, so a collection stops the
+        // orchestrator mid-graph and its pause is a function of the LIVE heap - the other models in the
+        // worker, not this one. That is the shape of the open worker gap: identical graph, identical card,
+        // 3,889 ms in the demo worker against 1,736 ms in a page with nothing else loaded. A small pause
+        // total here exonerates the GC and makes the cost per-crossing.
         try
         {
             var probe = Stopwatch.StartNew();
             await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
             probe.Stop();
+
+            Console.WriteLine($"[KokoroCost] {BackendName} gc: "
+                + $"{(GC.GetTotalAllocatedBytes(false) - gc0.Alloc) / 1048576.0:F1} MB allocated, "
+                + $"gen0 {GC.CollectionCount(0) - gc0.G0}, gen1 {GC.CollectionCount(1) - gc0.G1}, "
+                + $"gen2 {GC.CollectionCount(2) - gc0.G2}, "
+                + $"pause {(GC.GetTotalPauseDuration() - gc0.Pause).TotalMilliseconds:F0} ms, "
+                + $"live heap {GC.GetTotalMemory(false) / 1048576.0:F0} MB");
+
+            var shaderMs = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuShaderResolveMs - p0.Item1;
+            var argMs = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuArgBuildMs - p0.Item2;
+            var bindMs = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuBindGroupMs - p0.Item3;
+            var encMs = SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.ProfileCpuEncodeMs - p0.Item4;
+            if (shaderMs + argMs + bindMs + encMs > 0.5)
+                Console.WriteLine($"[KokoroCost] {BackendName} dispatch phases: shader-resolve {shaderMs:F0} ms, "
+                    + $"arg-build {argMs:F0} ms, bind-group {bindMs:F0} ms, encode {encMs:F0} ms "
+                    + $"(total {shaderMs + argMs + bindMs + encMs:F0} ms)");
 
             var ex = Graph.GraphExecutor.LastRunTotalMs;
             var rbN = Graph.GraphExecutor.LastRunReadbackCount;
@@ -247,9 +296,11 @@ public abstract partial class MLTestBase
         }
         finally
         {
-            // ⚠️ STATIC. Left set, every later test on this lane pays the per-node Stopwatch and grows a
-            // dictionary nothing reads.
+            // ⚠️ STATIC, BOTH OF THEM. Left set, every later test on this lane pays the per-node Stopwatch
+            // and the per-dispatch timestamps, and grows a dictionary nothing reads. Restore the profiling
+            // flag to what it WAS rather than to false - something else may have turned it on.
             Graph.GraphExecutor.CapturedNodeTimingsMs = null;
+            SpawnDev.ILGPU.WebGPU.Backend.WebGPUBackend.EnableDispatchProfiling = profWasOn;
         }
     }
 }
