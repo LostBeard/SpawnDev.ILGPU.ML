@@ -117,6 +117,51 @@ graph right given what I feed it?" by splicing our tensor into the reference. Bo
 this model's vocoder takes atan2 of an STFT whose quiet bins are near zero, so perturbing onnxruntime's
 own spectrogram by one part in 1e6 moves its waveform to 0.974 against itself. See `tools/README.md`.
 
+### Changed - Kokoro graph capture is ON by default: WebGPU TTS 0.75x -> 0.19x realtime
+
+`KokoroPipeline.EnableGraphCapture` was declared without an initialiser and so defaulted to false. Every
+other pipeline in the library already defaults it true - `AudioPipelines` (Whisper), and
+`DepthEstimationPipeline`, whose comment says "ON by default: consumers forgetting the ...". Kokoro paid
+full per-dispatch cost on every utterance because nobody turned it on.
+
+MEASURED on WebGPU, warm, same shape, 2.27 s of audio over 1,850 nodes:
+
+| | capture off | capture on |
+| --- | --- | --- |
+| pass | 1,494-1,689 ms | **434-444 ms** |
+| realtime factor | 0.75x | **0.19x** |
+| readbacks | 4 (28 ms) | **0** |
+
+3.4-3.8x, status `live on WebGPU (3155 dispatches)`. Five times faster than realtime, from roughly
+realtime.
+
+The whole win is per-dispatch HOST work, which is why it shows up in a browser and not on the desktop.
+Uncaptured, WebGPU spent shader-resolve 17 ms + arg-build 323 ms + bind-group 640 ms + encode 112 ms =
+~1,091 ms of that pass preparing 1,850 dispatches on the CPU, while CUDA runs the identical graph in
+674 ms. A recorded plan re-executes them with none of that.
+
+**One captured plan per utterance LENGTH.** `SessionGraphCapture` holds one plan for one shape set and
+enforces it, and Kokoro's input is `input_ids[1, tokenCount]` - so a single shared instance meant the
+second utterance of a different length THREW rather than merely re-recording. `KokoroPipeline` now keeps
+one capture per token count, LRU-bounded by `MaxCapturedShapes` (default 6) because each plan owns the
+bind groups for ~3,155 recorded dispatches. An uncached length costs a re-record, never a wrong answer.
+
+⚠️ THE FIXTURE HID BOTH. `Pipeline_Kokoro_MatchesOnnxRuntimeWaveform` speaks the same 35 tokens every
+time, so every capture timing and every correctness result came from a run where the one variable that
+mattered never varied - and the captured path had never been under its assertions at all, because the
+timing A/B ran after them. Both are gated now: capture-on is the default the reference-waveform
+assertions run against, and `Pipeline_Kokoro_SpeaksTwoDifferentLengths` speaks 35 -> 15 -> 35 ids,
+asserting that different token counts give different sample counts (a stale replay would silently return
+the previous utterance's audio) and that the second utterance is not silence.
+
+⚠️ 0.19x is the SAME-LENGTH repeat. A first utterance at a new length still records; how often that pays
+depends on whether lengths recur within the cache, which has not been measured on real conversational text.
+
+Other backends are unaffected and say so rather than silently doing nothing: WebGL and OpenCL report
+`ineligible backend (capture is CUDA and WebGPU only)`. CUDA currently REFUSES this graph - `Node
+1243/1850 'CumSum' failed: operation not permitted when stream is capturing` - and falls back, so CUDA is
+unchanged (626 vs 633 ms, inside noise) rather than broken. That refusal is a separate defect.
+
 ### Fixed - the test harness's own comparison hung the GPU: contended atomics in `AssertCloseGpu`
 
 `ElementWiseKernels.CompareReduceImpl` - the kernel behind every `AssertCloseGpu` in the suite - did
