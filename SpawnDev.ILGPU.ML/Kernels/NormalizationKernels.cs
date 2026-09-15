@@ -589,12 +589,56 @@ public class NormalizationKernels : IDisposable
             }
             return (_capMeans, _capInvStds!);
         }
-        var means = _accelerator.Allocate1D<float>(numSlices);
-        var invStds = _accelerator.Allocate1D<float>(numSlices);
-        _allTempBufs.Add(means);
-        _allTempBufs.Add(invStds);
-        return (means, invStds);
+        // 🔴 THE SAME LEAK THE RMSNorm RING ALREADY FIXED, in the sibling that never got it. A per-call
+        // Allocate1D appended to _allTempBufs is freed only at Dispose, so every InstanceNorm call cost
+        // two accelerator buffers for the life of the session. That was tolerable when InstanceNorm was
+        // rare; it is not now that GraphOptimizer.FuseInstanceNorm emits one per adaptive-norm block -
+        // MEASURED on Kokoro-82M: 62 blocks, so ~124 buffers leaked PER UTTERANCE, growing without bound
+        // across a conversation.
+        //
+        // The ring keeps the property the per-call alloc was protecting: a slot is reused only after
+        // StatsRingSize calls, far past the two-dispatch lifetime of one call's mean/invStd pair, so the
+        // Pass1/Pass2 race under async dispatch cannot reappear.
+        //
+        // ⚠️ EXCEPT when the diagnostic capture is armed. CapturedInstanceNormPass1Outputs hands these
+        // buffers to the caller to read AFTER the forward, which a ring would overwrite. That path keeps
+        // the per-call allocation deliberately - it is opt-in, bounded by CaptureInstanceNormMaxCalls,
+        // and correctness of a diagnostic beats its memory.
+        if (CapturedInstanceNormPass1Outputs != null)
+        {
+            var dmeans = _accelerator.Allocate1D<float>(numSlices);
+            var dinvStds = _accelerator.Allocate1D<float>(numSlices);
+            _allTempBufs.Add(dmeans);
+            _allTempBufs.Add(dinvStds);
+            return (dmeans, dinvStds);
+        }
+
+        var slot = _statsNext;
+        _statsNext = (_statsNext + 1) % StatsRingSize;
+        var m = _statsMeansRing[slot];
+        if (m == null || m.Length < numSlices)
+        {
+            m?.Dispose();
+            _statsMeansRing[slot] = m = _accelerator.Allocate1D<float>(numSlices);
+        }
+        var v = _statsInvStdsRing[slot];
+        if (v == null || v.Length < numSlices)
+        {
+            v?.Dispose();
+            _statsInvStdsRing[slot] = v = _accelerator.Allocate1D<float>(numSlices);
+        }
+        return (m, v);
     }
+
+    // InstanceNorm/GroupNorm mean+invStd ring - see GetStatsScratch. Sized like the RMSNorm ring and for
+    // the same reason; 64 comfortably exceeds the 62 adaptive-norm blocks one Kokoro forward runs, so a
+    // slot is not revisited within a forward at all.
+    private const int StatsRingSize = 64;
+    private readonly MemoryBuffer1D<float, Stride1D.Dense>?[] _statsMeansRing
+        = new MemoryBuffer1D<float, Stride1D.Dense>?[StatsRingSize];
+    private readonly MemoryBuffer1D<float, Stride1D.Dense>?[] _statsInvStdsRing
+        = new MemoryBuffer1D<float, Stride1D.Dense>?[StatsRingSize];
+    private int _statsNext;
 
     // RMSNorm two-pass invRms ring: the invRms buffer (one float per row) is written by Pass 1 and read by the
     // immediately-following Pass 2 (apply). A FIXED ring of reusable buffers (each grown to the max rows it has
@@ -626,6 +670,13 @@ public class NormalizationKernels : IDisposable
     {
         foreach (var b in _allTempBufs) try { b.Dispose(); } catch { }
         _allTempBufs.Clear();
+        for (var i = 0; i < StatsRingSize; i++)
+        {
+            try { _statsMeansRing[i]?.Dispose(); } catch { }
+            try { _statsInvStdsRing[i]?.Dispose(); } catch { }
+            _statsMeansRing[i] = null;
+            _statsInvStdsRing[i] = null;
+        }
         try { _capMeans?.Dispose(); } catch { }
         try { _capInvStds?.Dispose(); } catch { }
         _capMeans = null; _capInvStds = null;

@@ -161,6 +161,28 @@ public class InferenceSession : IDisposable
     /// <summary>Access to the underlying GraphExecutor (for KV cache management).</summary>
     public GraphExecutor Executor => _executor;
 
+    /// <summary>
+    /// Per-session override of the executor's periodic GPU drain cadence
+    /// (<see cref="GraphExecutor.SyncIntervalNodes"/>). Null = the global default.
+    /// </summary>
+    /// <remarks>
+    /// Set this for a graph of MANY SMALL nodes, where each periodic flush is round-trip latency the GPU
+    /// has no work to overlap. Leave it alone for a graph with heavy per-node work, where the flush is
+    /// pipelining and raising it is SLOWER. See <see cref="GraphExecutor.SyncIntervalNodesOverride"/> for
+    /// the measurements on both sides.
+    /// </remarks>
+    public int? SyncIntervalNodesOverride
+    {
+        get => _syncIntervalNodesOverride;
+        // ⚠️ Held on the SESSION, not just handed to the current executor. RecompileForShapes builds a
+        // NEW GraphExecutor whenever an input shape changes, and a setting that lives only on the first
+        // one silently stops applying the moment that happens - which for a variable-length model is
+        // every call but the first. Cost me a measurement that read as "the override does nothing".
+        set { _syncIntervalNodesOverride = value; _executor.SyncIntervalNodesOverride = value; }
+    }
+
+    private int? _syncIntervalNodesOverride;
+
     /// <summary>The accelerator this session runs on (used by the CUDA-graph capture path).</summary>
     public Accelerator Accelerator => _accelerator;
 
@@ -282,6 +304,8 @@ public class InferenceSession : IDisposable
             Format = _executor.Format,
             CacheShapeReadbacks = _cacheShapeReadbacks,
             ActivationDtype = _executor.ActivationDtype, // carry the activation precision to the recompiled executor
+            // Carry the session's drain cadence too - see SyncIntervalNodesOverride.
+            SyncIntervalNodesOverride = _syncIntervalNodesOverride,
         };
         recompileSw.Stop();
         LastRecompileMs = recompileSw.Elapsed.TotalMilliseconds;

@@ -1,4 +1,5 @@
 ﻿using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Tensors;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -64,10 +65,54 @@ public sealed class KokoroPipeline : IDisposable
     private readonly string _styleInput;
     private readonly string _speedInput;
 
+    /// <summary>
+    /// Drain cadence for this model: effectively "let the byte cap decide".
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE SINGLE BIGGEST COST OF RUNNING THIS MODEL IN A BROWSER. Kokoro is ~1,885 nodes of very
+    /// small tensors, so the executor's default flush every 64 nodes buys no GPU/CPU overlap and costs a
+    /// full async round trip each time. MEASURED in the demo's WebGPU worker: <b>25 drains, 1,961 ms of a
+    /// 4,329 ms synthesis</b>. On CUDA the identical 25 drains cost 53 ms, which is why this never showed
+    /// up on the desktop. Output is bit-identical either way.
+    /// </remarks>
+    private const int DrainCadenceNodes = 4096;
+
+    /// <summary>
+    /// Record the GPU dispatches once and replay them, instead of walking 1,885 nodes every utterance.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 🔴 THIS MODEL IS THE CASE CAPTURE EXISTS FOR, and it had never been tried on it. The browser cost
+    /// of this engine is per-node HOST orchestration - MEASURED on Kokoro in a worker: 2,755 ms of
+    /// "residual (dispatch+CPU+alloc)" out of a 3,889 ms synthesis - and a recorded dispatch plan does the
+    /// same work in microseconds. The documented win where it applies is 58x on the dispatch half
+    /// (ZipVoice's Euler step, 8,578 ms -> 147 ms).
+    /// </para>
+    /// <para>
+    /// ⚠️ WHY IT APPLIES HERE AND NOT TO ZIPVOICE: capture is refused for graphs containing If/Loop/Scan,
+    /// because running a subgraph body allocates inside the recording window - uncatchable on CUDA, a hung
+    /// device on WebGPU. Kokoro contains NONE of the three (checked, not assumed: the whole graph is
+    /// Conv/MatMul/elementwise plus one NonZero and one ScatterND).
+    /// </para>
+    /// <para>
+    /// ⚠️ Opt-in until measured on this machine. <see cref="SessionGraphCapture"/> falls through to a
+    /// direct forward whenever it cannot record - an ineligible backend, or a refusal - so a failure here
+    /// costs speed and never correctness. Read <see cref="CaptureStatus"/> rather than assuming it
+    /// engaged: "requested" is not "live".
+    /// </para>
+    /// </remarks>
+    public bool EnableGraphCapture { get; set; }
+
+    /// <summary>What the capture actually did - never infer this from <see cref="EnableGraphCapture"/>.</summary>
+    public string CaptureStatus => _capture?.CaptureStatus ?? "not attempted";
+
+    private SessionGraphCapture? _capture;
+
     private KokoroPipeline(InferenceSession session, Accelerator accelerator)
     {
         _session = session;
         _accelerator = accelerator;
+        session.SyncIntervalNodesOverride = DrainCadenceNodes;
         // 🔴 RESOLVED FROM THE GRAPH, NOT HARDCODED. Two exports of this same model are in circulation and
         // they do not agree on names: onnx-community's serves `input_ids` -> `waveform`, KokoroSharp's
         // ships `tokens` -> `audio`. Same 2,463-node graph, same operators, same weights. Hardcoding
@@ -193,7 +238,15 @@ public sealed class KokoroPipeline : IDisposable
         Dictionary<string, Tensor> outputs;
         try
         {
-            outputs = await _session.RunAsync(inputs).ConfigureAwait(false);
+            if (EnableGraphCapture)
+            {
+                _capture ??= new SessionGraphCapture(_session, _accelerator);
+                outputs = await _capture.RunAsync(inputs).ConfigureAwait(false);
+            }
+            else
+            {
+                outputs = await _session.RunAsync(inputs).ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {

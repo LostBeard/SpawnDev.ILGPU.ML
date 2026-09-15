@@ -1,4 +1,4 @@
-using ILGPU;
+﻿using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Operators;
@@ -32,6 +32,10 @@ public class GraphExecutor : IDisposable
     // (refcount build) + a LINQ Constant scan + a node walk to strip stale constants on EVERY token — the
     // super-linear per-node CPU residual that forced multimodal prefill token-by-token. Built lazily.
     private Dictionary<string, int>? _baseRefCounts;       // node-input refcounts; graph OUTPUTS + WEIGHTS pinned to int.MaxValue
+
+    /// <summary>Names a node produces that NOTHING reads - returned as soon as the node has run.</summary>
+    /// <remarks>See where this is built: the refcount table cannot see them, so without this they leak.</remarks>
+    private HashSet<string>? _deadOutputs;
     private Dictionary<string, float[]>? _cleanConstants;   // _constantValues with non-Constant-node outputs already stripped
     // CUDA-graph capture: the full runtimeConstants snapshot from the last warm pass (UseCaptureParamSlots &&
     // !SuppressDrains). Seeded into the capture pass so it needs no readbacks yet elides identically to warm.
@@ -145,6 +149,28 @@ public class GraphExecutor : IDisposable
                     rc[inputName] = rc.GetValueOrDefault(inputName, 0) + 1;
         foreach (var name in _graph.OutputNames) rc[name] = int.MaxValue;
         foreach (var name in _weights.Keys) rc[name] = int.MaxValue;
+
+        // 🔴 A PRODUCED-BUT-UNREAD OUTPUT IS A LEAK. `rc` is built from node INPUTS only, so a name
+        // nothing consumes never gets an entry, never reaches zero, and is never returned. ONNX is full
+        // of them: every optional output an exporter emitted and no consumer wanted.
+        // MEASURED on Kokoro-82M: the shared LSTM's Y_h and Y_c (`LSTM_output_1`/`_output_2`, [2,1,256],
+        // zero consumers) leaked EVERY forward - the accelerator's child-object count grew by a flat 26
+        // per pass with no sign of levelling off, which is unbounded GPU growth over a long session, and
+        // it also made the graph permanently ineligible for dispatch-plan capture (whose warm-up check
+        // refuses to record while allocations are still growing).
+        var graphOutputs = new HashSet<string>(_graph.OutputNames, StringComparer.Ordinal);
+        var dead = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in _graph.Nodes)
+            foreach (var outName in node.OutputNames)
+                if (!string.IsNullOrEmpty(outName)
+                    && !rc.ContainsKey(outName)            // nothing reads it
+                    && !graphOutputs.Contains(outName)     // and it is not a result
+                    && !_weights.ContainsKey(outName))
+                    dead.Add(outName);
+        _deadOutputs = dead;
+        if (VerboseLogging && dead.Count > 0)
+            Console.WriteLine($"[GraphExecutor] {dead.Count} produced-but-unread output(s) will be "
+                + $"released immediately: {string.Join(", ", dead.Take(6))}");
 
         var clean = _constantValues != null
             ? new Dictionary<string, float[]>(_constantValues)
@@ -266,6 +292,37 @@ public class GraphExecutor : IDisposable
     /// held longer (higher peak GPU memory). Tunable so the autoregressive decode loop can trade
     /// memory for latency.</summary>
     public static int SyncIntervalNodes = 64;
+
+    /// <summary>Per-session override of <see cref="SyncIntervalNodes"/>. Null = use the static default.</summary>
+    /// <remarks>
+    /// 🔴 THIS IS PER SESSION BECAUSE THE RIGHT ANSWER IS PER MODEL, and the two known cases point in
+    /// OPPOSITE directions. The periodic flush is pipelining: it lets the GPU start while the CPU keeps
+    /// dispatching. When per-node GPU work is LARGE that is a win - raising it made Gemma4 SLOWER, which
+    /// is why the default stays 64. When a graph is many SMALL nodes the GPU has nothing to overlap and
+    /// the flush is pure round-trip latency.
+    /// <para>
+    /// MEASURED on Kokoro-82M (1,885 nodes, tiny tensors) in a browser worker: <b>25 drains costing
+    /// 1,961 ms of a 4,329 ms synthesis</b> - 45% of the whole render - against ~1 ms per drain on CUDA,
+    /// where the same cadence is free. Raising the interval takes it to 3 drains. Output is BIT-IDENTICAL
+    /// either way (verified: correlation 0.9940, same max|diff|, same first differing sample) - this
+    /// changes only WHEN buffers are recycled, never the math.
+    /// </para>
+    /// ⚠️ <see cref="MaxPendingReleaseBytes"/> still bounds peak memory independently, which is what makes
+    /// raising this safe: the byte cap is the real guard, the node cadence is a latency/pipelining knob.
+    /// <para>
+    /// ⚠️ AND THE SAVING IS NOT THE WHOLE DRAIN TIME. Raising the cadence moved Kokoro's warm worker
+    /// synthesis 4,329 -> 3,889 ms, not the ~1.7 s the drain column suggested: most of that column was
+    /// REAL GPU work being waited on, which simply re-attributes itself to dispatch when the waits are
+    /// removed (drains 1,961 -> 429 ms, residual 1,691 -> 2,755 ms). Adding a cheap submit-only
+    /// <c>Flush()</c> at the old cadence to restore CPU/GPU overlap changed nothing measurable
+    /// (3,889 vs 3,874 ms), so it is deliberately NOT here - the overlap was not the mechanism.
+    /// </para>
+    /// </remarks>
+    public int? SyncIntervalNodesOverride { get; set; }
+
+    /// <summary>The drain cadence in force for this executor.</summary>
+    private int EffectiveSyncInterval => SyncIntervalNodesOverride is > 0 ? SyncIntervalNodesOverride.Value
+                                                                          : SyncIntervalNodes;
 
     /// <summary>Memory bound on the async deferred-release window: when the bytes of buffers awaiting
     /// release (dead by refcount, but held until a drain so a still-queued kernel can't read freed memory)
@@ -890,6 +947,7 @@ public class GraphExecutor : IDisposable
         // Mark external inputs as "never release"
         foreach (var name in inputs.Keys)
             refCounts[name] = int.MaxValue;
+
 
         // Runtime constant values: starts with initializer constants, grows as small
         // intermediate tensors (shape vectors, scalars) are captured back to CPU.
@@ -2508,6 +2566,38 @@ public class GraphExecutor : IDisposable
             }
         }
 
+        /// <summary>
+        /// Release the outputs a node produced that NOTHING will ever read.
+        /// </summary>
+        /// <remarks>
+        /// 🔴 These cannot go through <c>ReleaseConsumedInputs</c>, because that walks refcounts and a
+        /// name with no consumer never gets one - it is invisible to the whole lifetime mechanism, which
+        /// is exactly why it leaked silently. See where <c>_deadOutputs</c> is built for the measurement.
+        /// ⚠️ Deferred like every other release, never returned immediately: the node's own kernel may
+        /// still be queued against this buffer, and handing it back to the pool before the drain is how a
+        /// later Rent reads memory the GPU is still writing.
+        /// </remarks>
+        void ReleaseDeadOutputs(CompiledNode n)
+        {
+            if (_deadOutputs is not { Count: > 0 }) return;
+            foreach (var outName in n.OutputNames)
+            {
+                if (string.IsNullOrEmpty(outName) || !_deadOutputs.Contains(outName)) continue;
+                if (halfTensors.TryGetValue(outName, out var hdead))
+                {
+                    halfTensors.Remove(outName);
+                    pendingHalfReleases.Add(hdead);
+                    pendingReleaseBytes += (long)hdead.ElementCount * 2;
+                }
+                else if (tensors.TryGetValue(outName, out var dead))
+                {
+                    tensors.Remove(outName);
+                    pendingReleases.Add(dead);
+                    pendingReleaseBytes += (long)dead.ElementCount * sizeof(float);
+                }
+            }
+        }
+
         // Periodic GPU command-buffer drain: flush + wait every SyncIntervalNodes nodes, or early when the
         // deferred-release backlog exceeds MaxPendingReleaseBytes, then return the deferred buffers. Shared by
         // both execution paths so peak GPU memory is bounded to ~(live set + cap) regardless of which path ran.
@@ -2516,7 +2606,7 @@ public class GraphExecutor : IDisposable
             // CUDA-graph capture records this forward; a synchronize would abort the capture. The
             // captured forward is warm, so skipping the drain leaks no buffers within the single pass.
             if (SuppressDrains) return;
-            if (nodeIdx % SyncIntervalNodes == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
+            if (nodeIdx % EffectiveSyncInterval == 0 || pendingReleaseBytes >= MaxPendingReleaseBytes)
             {
                 _drainSw.Restart();
                 try { await _accelerator.SynchronizeAsync(); }
@@ -2695,6 +2785,7 @@ public class GraphExecutor : IDisposable
                     if (CaptureTraceFile != null) { try { System.IO.File.AppendAllText(CaptureTraceFile, "   -> ELIDED\n"); } catch { } }
                     elidedOutputs.Add(node.OutputNames[0]);
                     ReleaseConsumedInputs(node);
+                    ReleaseDeadOutputs(node);
                     nodeIdx++;
                     LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~cpu-elided");
                     continue;
@@ -2722,6 +2813,7 @@ public class GraphExecutor : IDisposable
                 {
                     halfTensors[node.OutputNames[0]] = halfOut;
                     ReleaseConsumedInputs(node);
+                    ReleaseDeadOutputs(node);
                     nodeIdx++;
                     LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}~f16");
                     await DrainPointAsync();
@@ -4196,6 +4288,7 @@ public class GraphExecutor : IDisposable
 
             // Defer buffer release to sync points to prevent reuse while GPU is in-flight
             ReleaseConsumedInputs(node);
+            ReleaseDeadOutputs(node);
 
             nodeIdx++;
             LastRunOpLog.Add($"{nodeIdx:D4} {node.OpType}");

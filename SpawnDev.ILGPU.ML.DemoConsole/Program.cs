@@ -305,6 +305,28 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
         SpawnDev.ILGPU.ML.Graph.GraphExecutor.CaptureMaxElements = 4096;
     }
 
+    // KOKORO_STAGES=1 buckets every compiled node by the stage its NAME puts it in, with node counts,
+    // output ELEMENT counts and per-node time.
+    //
+    // 🔴 WHY. The browser cost of this engine is per-node host orchestration - MEASURED at ~1.5 ms per
+    // node in a worker - so a node that computes 182 floats costs the same to dispatch as one that
+    // computes 54,600. That is the whole case for running part of a graph somewhere without dispatch
+    // overhead (Wasm/SIMD) and part of it on the GPU: it only pays if the cheap-to-compute nodes are also
+    // the MANY nodes. This says whether that is true for a given model, which is not something to assume.
+    var stageBuckets = Environment.GetEnvironmentVariable("KOKORO_STAGES") == "1";
+    if (stageBuckets)
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs = new Dictionary<string, double>();
+
+    // KOKORO_SYNC_INTERVAL=<n> overrides GraphExecutor.SyncIntervalNodes for this run. Each periodic
+    // drain is an async GPU round trip - MEASURED at ~78 ms in a browser worker against ~1 ms on CUDA -
+    // and at the default 64 a 1,885-node graph pays ~29 of them. The byte cap
+    // (MaxPendingReleaseBytes) bounds peak memory independently, so this trades only latency.
+    if (int.TryParse(Environment.GetEnvironmentVariable("KOKORO_SYNC_INTERVAL"), out var ksi) && ksi > 0)
+    {
+        SpawnDev.ILGPU.ML.Graph.GraphExecutor.SyncIntervalNodes = ksi;
+        Console.WriteLine($"  SyncIntervalNodes = {ksi}");
+    }
+
     ILGPU.Context? kctx = null;
     ILGPU.Runtime.Accelerator? kacc = null;
     try
@@ -330,6 +352,10 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
         using var modelStream = new MemoryStream(modelBytes, writable: false);
         using var pipeline = await SpawnDev.ILGPU.ML.Pipelines.KokoroPipeline
             .CreateFromStreamAsync(kacc, modelStream);
+        // KOKORO_CAPTURE=1 records the dispatch plan and replays it. ⚠️ Read the STATUS afterwards:
+        // "requested" is not "live" - SessionGraphCapture falls through to a direct forward silently
+        // whenever it cannot record, which is a speed difference that looks like nothing at all.
+        pipeline.EnableGraphCapture = Environment.GetEnvironmentVariable("KOKORO_CAPTURE") == "1";
         // ⚠️ The COMPILED node count, printed every run. This engine costs ~1 ms per real node in a
         // browser, so the count IS the speed estimate - and a fusion pass that silently stops matching
         // (an exporter changes one attribute and the pattern is gone) shows up here and nowhere else.
@@ -346,6 +372,57 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
                             + $"({audio.Tokens} tokens, {audio.DroppedPhonemes} dropped)");
             if (pass == 2)
             {
+                // ⚠️ The executor's own split, and the NAMES of every mid-graph readback. MEASURED in
+                // the browser worker: drains + readbacks are 59% of a warm synthesis, while the residual
+                // alone already matches a whole page-context run - so the round trips ARE the gap. The
+                // names are a property of the GRAPH, not the backend, so CUDA names the same culprits in
+                // seconds instead of minutes.
+                var ex = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CumulativeTotalMs;
+                var rbN = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CumulativeReadbackCount;
+                var rbMs = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CumulativeReadbackMs;
+                var drN = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CumulativeSyncDrainCount;
+                var drMs = SpawnDev.ILGPU.ML.Graph.GraphExecutor.CumulativeSyncDrainMs;
+                Console.WriteLine($"  executor {ex:F0}ms | readbacks {rbN} ({rbMs:F0}ms) | "
+                                + $"drains {drN} ({drMs:F0}ms) | residual {ex - rbMs - drMs:F0}ms");
+                var rbNames = SpawnDev.ILGPU.ML.Graph.GraphExecutor.LastRunReadbackNames;
+                if (rbNames is { Count: > 0 })
+                    Console.WriteLine($"  READBACK NODES ({rbNames.Count}): {string.Join(", ", rbNames)}");
+
+                if (stageBuckets
+                    && SpawnDev.ILGPU.ML.Graph.GraphExecutor.CapturedNodeTimingsMs is { } timings)
+                {
+                    // The stage a node belongs to, from its ONNX name. Coarse on purpose: the question is
+                    // "encoder half or generator half", because that is where a placement split would cut.
+                    static string Stage(string key)
+                    {
+                        var name = key[(key.IndexOf('_') + 1)..];
+                        name = name[(name.IndexOf('_') + 1)..];
+                        if (name.Contains("/generator/")) return "decoder/generator";
+                        if (name.StartsWith("/decoder")) return "decoder (pre-generator)";
+                        if (name.Contains("/bert")) return "encoder/bert";
+                        if (name.Contains("/predictor")) return "encoder/predictor";
+                        if (name.StartsWith("/encoder")) return "encoder (other)";
+                        return "other";
+                    }
+                    var byStage = timings.GroupBy(kv => Stage(kv.Key))
+                        .Select(g => (Stage: g.Key, Nodes: g.Count(), Ms: g.Sum(x => x.Value)))
+                        .OrderByDescending(g => g.Nodes).ToList();
+                    var totalNodes = byStage.Sum(g => g.Nodes);
+                    var totalMs = byStage.Sum(g => g.Ms);
+                    Console.WriteLine($"  STAGES ({totalNodes} timed nodes, {totalMs:F0} ms on this backend):");
+                    foreach (var g in byStage)
+                        Console.WriteLine($"    {g.Stage,-26} {g.Nodes,5} nodes ({g.Nodes * 100.0 / totalNodes,4:F1}%)"
+                                        + $"  {g.Ms,8:F1} ms ({g.Ms * 100.0 / Math.Max(totalMs, 1e-9),4:F1}%)"
+                                        + $"  {g.Ms / g.Nodes,6:F3} ms/node");
+                    // ⚠️ The browser's cost is ~1.5 ms PER NODE regardless of size, so the node-count
+                    // column - not this backend's millisecond column - is what predicts it.
+                    Console.WriteLine($"    -> at the browser's ~1.5 ms/node, the node split alone implies "
+                                    + string.Join(", ", byStage.Select(g => $"{g.Stage}={g.Nodes * 1.5:F0}ms")));
+                }
+
+                Console.WriteLine($"  capture: requested={pipeline.EnableGraphCapture} "
+                                + $"status={pipeline.CaptureStatus}");
+
                 var peak = 0f;
                 foreach (var s in audio.Samples) { var a = Math.Abs(s); if (a > peak) peak = a; }
                 Console.WriteLine($"  peak amplitude {peak:F3}"
