@@ -95,13 +95,38 @@ public sealed class KokoroPipeline : IDisposable
     /// Conv/MatMul/elementwise plus one NonZero and one ScatterND).
     /// </para>
     /// <para>
-    /// ⚠️ Opt-in until measured on this machine. <see cref="SessionGraphCapture"/> falls through to a
-    /// direct forward whenever it cannot record - an ineligible backend, or a refusal - so a failure here
-    /// costs speed and never correctness. Read <see cref="CaptureStatus"/> rather than assuming it
-    /// engaged: "requested" is not "live".
+    /// ⭐ NOW ON BY DEFAULT - MEASURED 2026-09-15, and it is the difference between "about realtime" and
+    /// "five times faster than realtime" in a browser. WebGPU, warm, same shape, 2.27 s of audio over
+    /// 1,850 nodes:
+    /// <code>
+    ///   capture off : 1,689 ms   RTF 0.75x
+    ///   capture on  :   444 ms   RTF 0.20x     3.80x, status "live on WebGPU (3155 dispatches)"
+    /// </code>
+    /// The whole win is per-dispatch HOST work. Uncaptured, WebGPU spent arg-build 323 ms + bind-group
+    /// 640 ms + encode 112 ms = ~1,091 ms of that 1,689 ms preparing 1,850 dispatches on the CPU; CUDA
+    /// runs the identical graph in 674 ms. A recorded plan re-executes them with none of that.
+    /// </para>
+    /// <para>
+    /// 🔴 IT WAS OFF ONLY BECAUSE NOBODY TURNED IT ON. Every other pipeline in this library already
+    /// defaults it true - AudioPipelines (Whisper), DepthEstimationPipeline ("ON by default: consumers
+    /// forgetting the ..."). This property was declared without an initialiser and so defaulted to false,
+    /// and Kokoro paid full dispatch cost on every utterance for it. The remark below used to read
+    /// "opt-in until measured on this machine"; it has now been measured.
+    /// </para>
+    /// <para>
+    /// ⚠️ <see cref="SessionGraphCapture"/> falls through to a direct forward whenever it cannot record -
+    /// an ineligible backend, or a refusal - so a failure costs speed and never correctness. WebGL and
+    /// OpenCL report "ineligible backend (capture is CUDA and WebGPU only)" and are unaffected. CUDA
+    /// currently REFUSES this graph - "Node 1243/1850 'CumSum' failed: operation not permitted when stream
+    /// is capturing" - and falls back, so CUDA is unchanged (676 ms vs 622 ms, inside noise) rather than
+    /// broken. That refusal is a separate defect worth fixing; it is not a reason to leave the browser
+    /// paying 3.8x.
+    /// </para>
+    /// <para>
+    /// ⚠️ Read <see cref="CaptureStatus"/> rather than assuming it engaged: "requested" is not "live".
     /// </para>
     /// </remarks>
-    public bool EnableGraphCapture { get; set; }
+    public bool EnableGraphCapture { get; set; } = true;
 
     /// <summary>What the capture actually did - never infer this from <see cref="EnableGraphCapture"/>.</summary>
     public string CaptureStatus => _capture?.CaptureStatus ?? "not attempted";

@@ -365,6 +365,56 @@ public abstract partial class MLTestBase
                 }
             }
 
+            // GRAPH CAPTURE A/B - the lever that removes ALL the per-dispatch prep, not one phase of it.
+            //
+            // WebGPU spends the bulk of a Kokoro pass building dispatches on the CPU: arg-build 323 ms +
+            // bind-group 640 ms + encode 112 ms = ~1,091 ms of a ~1,539 ms pass, for 1,850 nodes. CUDA runs
+            // the same 1,850 nodes in 674 ms. Graph capture records the command plan once and re-executes
+            // it, so that whole cost collapses on every pass after the first.
+            //
+            // 🔴 EVERY OTHER PIPELINE IN THIS LIBRARY DEFAULTS IT ON - AudioPipelines (Whisper) = true,
+            // DepthEstimationPipeline = true ("ON by default: consumers forgetting the ..."). KokoroPipeline
+            // declares `public bool EnableGraphCapture { get; set; }` and so defaults to FALSE. Kokoro is the
+            // one pipeline that never got it.
+            //
+            // ⚠️ Capture needs several passes before a plan is live (warm / probe / record), so a single
+            // timed run would measure recording, not replay. And CaptureStatus is reported rather than
+            // inferred - the type's own docs say "requested is not live".
+            double uncapturedMs = -1;
+            string capStatus = pipeline.CaptureStatus;
+            string? captureFailure = null;
+            var capWasOn = pipeline.EnableGraphCapture;
+            try
+            {
+                // ⚠️ THE BASELINE IS THE ONE THAT HAS TO BE FORCED NOW. Capture is the DEFAULT, so `probe`
+                // above is already a captured pass - comparing it against another captured pass reports
+                // ~1.00x and reads as "capture does nothing", which is the opposite of the truth. Turn it
+                // OFF for the baseline instead.
+                pipeline.EnableGraphCapture = false;
+                await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+                var capClock = Stopwatch.StartNew();
+                await pipeline.SpeakTokensAsync(KokoroReferenceTokens, pack);
+                capClock.Stop();
+                uncapturedMs = capClock.Elapsed.TotalMilliseconds;
+            }
+            catch (Exception capEx)
+            {
+                var cm = capEx.Message.Replace("\r", "").Replace("\n", " | ");
+                captureFailure = cm.Length > 1200 ? cm[..1200] : cm;
+            }
+            finally
+            {
+                pipeline.EnableGraphCapture = capWasOn;
+            }
+
+            if (captureFailure != null)
+                Console.WriteLine($"[KokoroCost] {BackendName} GRAPH CAPTURE A/B: BASELINE FAILED - {captureFailure}");
+            else
+                Console.WriteLine($"[KokoroCost] {BackendName} GRAPH CAPTURE A/B: "
+                    + $"off {uncapturedMs:F0} ms -> on {probe.ElapsedMilliseconds} ms "
+                    + $"({(probe.ElapsedMilliseconds > 0 ? uncapturedMs / probe.ElapsedMilliseconds : 0):F2}x) | status={capStatus} | "
+                    + $"RTF on={(probe.ElapsedMilliseconds / 1000.0) / seconds:F2}x (<1 = faster than realtime)");
+
             if (cacheFailure != null)
                 Console.WriteLine($"[KokoroCost] {BackendName} BIND-GROUP CACHE A/B: STILL BROKEN — {cacheFailure}");
             else if (cachedMs >= 0)
