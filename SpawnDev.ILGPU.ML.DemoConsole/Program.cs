@@ -368,8 +368,22 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
                         + $"fused-atan2 {SpawnDev.ILGPU.ML.Graph.GraphOptimizer.LastAtan2Fused})");
         // ⚠️ TWICE. The first call compiles kernels, which is a one-off this engine pays per process and
         // which would otherwise be reported as the model's speed. The second is the steady state.
-        for (var pass = 1; pass <= 2; pass++)
+        //
+        // 🔴 AND THEN A DIFFERENT LENGTH, which is the case the two passes above CANNOT see. Repeating one
+        // utterance measures a warm compiled shape and a warm pool; a product speaks a different-length
+        // line every time, and this engine recompiles per input shape into a 3-entry LRU. MEASURED in the
+        // demo's browser worker before the shared pool: a new shape cost 1,491 device allocations and RTF
+        // 1.81x where the repeat cost 5 and 0.75x. A gate that only ever repeats itself reports the good
+        // number and never the one a user gets.
+        for (var pass = 1; pass <= 3; pass++)
         {
+            if (pass == 3)
+            {
+                var other = "The quick brown fox jumps over the lazy dog, and then it does so again.";
+                phonemes = SpawnDev.Phonemizer.EmbeddedData.CreatePhonemizer().ToSymbols(other);
+                Console.WriteLine($"  pass 3 uses a DIFFERENT length ({phonemes.Count} phonemes) - the "
+                                + "shape-recompile path");
+            }
             // ⭐ WHAT ONE FORWARD ALLOCATES ON THE MANAGED HEAP. Free to collect, and it is one half of the
             // open worker-gap question: .NET WASM's GC is non-concurrent, so if a forward churns tens of MB
             // then a browser worker with other models resident pays collection pauses this desktop run
@@ -377,10 +391,16 @@ if (args.Length > 0 && args[0] == "KOKOROSPEAK")
             var gcAlloc0 = GC.GetTotalAllocatedBytes(false);
             var gcG0 = GC.CollectionCount(0);
             var gcPause0 = GC.GetTotalPauseDuration();
+            // ⭐ DEVICE allocations, not managed ones. A warm pool rents; a pool that was just created
+            // allocates. This is the number that separates "this engine costs N ms per node" from "this
+            // forward refilled a buffer pool", and the two are indistinguishable in the executor's
+            // residual column without it.
+            var devAlloc0 = SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations;
             var audio = await pipeline.SpeakAsync(phonemes, pack);
             Console.WriteLine($"  pass {pass}: {audio.Samples.Length} samples = {audio.Seconds:F2}s of audio "
                             + $"in {audio.InferenceMs:F0} ms  ->  RTF {audio.RealtimeFactor:F2}x "
-                            + $"({audio.Tokens} tokens, {audio.DroppedPhonemes} dropped) | gc "
+                            + $"({audio.Tokens} tokens, {audio.DroppedPhonemes} dropped) | device allocations "
+                            + $"{SpawnDev.ILGPU.ML.Tensors.BufferPool.TotalDeviceAllocations - devAlloc0} | gc "
                             + $"{(GC.GetTotalAllocatedBytes(false) - gcAlloc0) / 1048576.0:F1} MB, "
                             + $"gen0 {GC.CollectionCount(0) - gcG0}, "
                             + $"pause {(GC.GetTotalPauseDuration() - gcPause0).TotalMilliseconds:F0} ms");

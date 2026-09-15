@@ -835,14 +835,45 @@ public class GraphExecutor : IDisposable
     /// under-pressure <c>AllocateWithReclaim</c> reclaim (buffer dispose) fired at. -1 when no run is active.</summary>
     public static int CurrentRunNodeIndex = -1;
 
+    /// <summary>
+    /// The intermediate-tensor pool this executor rents from. Exposed so a session can hand the SAME pool
+    /// to the executors it recompiles for other input shapes - see <paramref name="sharedPool"/>.
+    /// </summary>
+    public Tensors.BufferPool Pool => _pool;
+
+    /// <summary>True when this executor created its pool and must therefore dispose it.</summary>
+    private readonly bool _ownsPool;
+
+    /// <param name="sharedPool">
+    /// An existing intermediate pool to rent from instead of creating one.
+    /// </param>
+    /// <remarks>
+    /// 🔴 WHY THIS PARAMETER EXISTS. A pool per executor is correct until a session recompiles for a new
+    /// INPUT SHAPE, which it does whenever a sequence length changes - and then the new executor starts
+    /// with an EMPTY pool and re-allocates every intermediate from the device. For a model whose input
+    /// length changes on every call (any TTS utterance, any chat turn) that is every call.
+    /// <para>
+    /// MEASURED on Kokoro in the demo's browser worker, the same sentence twice: a NEW shape cost
+    /// <b>1,491 device allocations</b> for one 1,850-node forward and ran at RTF 1.81x; the REPEAT, which
+    /// hit the shape-executor cache and therefore a warm pool, cost <b>5</b> and ran at <b>0.75x</b>. The
+    /// difference is not per-node dispatch cost, though it lands in the same "residual" column and looks
+    /// exactly like it - and reading it as such is how the same number was called a "worker gap" for days.
+    /// </para>
+    /// <para>
+    /// ⚠️ OWNERSHIP. Whoever creates the pool disposes it. An executor handed a shared pool must not,
+    /// or the next executor rents from a disposed one - the same rule as the accelerator itself.
+    /// </para>
+    /// </remarks>
     public GraphExecutor(Accelerator accelerator, CompiledGraph graph,
         Dictionary<string, Tensor> weights, Dictionary<string, float[]>? constantValues = null,
         Dictionary<string, ArrayView1D<byte, Stride1D.Dense>>? quantizedWeights = null,
-        Operators.OperatorRegistry? registry = null)
+        Operators.OperatorRegistry? registry = null,
+        Tensors.BufferPool? sharedPool = null)
     {
         _accelerator = accelerator;
         _graph = graph;
-        _pool = new BufferPool(accelerator);
+        _ownsPool = sharedPool == null;
+        _pool = sharedPool ?? new BufferPool(accelerator);
         _weights = weights;
         _constantValues = constantValues;
         _quantizedWeights = quantizedWeights;
@@ -4659,7 +4690,8 @@ public class GraphExecutor : IDisposable
 
     public void Dispose()
     {
-        _pool.Dispose();
+        // ⚠️ Only if we made it. A shared pool outlives this executor by design - see the constructor.
+        if (_ownsPool) _pool.Dispose();
         _kvCache?.Dispose();
         _kvCacheFlagBuf?.Dispose();
         _readbackStaging?.Dispose(); _readbackStaging = null;

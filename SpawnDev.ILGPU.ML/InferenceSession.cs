@@ -298,8 +298,22 @@ public class InferenceSession : IDisposable
         // tensor's EMPTY view — a CUDA illegal memory access at the first quantized node. This was
         // the gemma4 multi-token (seq>1) fault: seq=1 matched the base compile shape and never
         // recompiled, so only recompiled (seq>1) executors faulted. 2026-06-12.
+        // 🔴 THE SAME INTERMEDIATE POOL AS THE BASE EXECUTOR, and this is the difference between a model
+        // that speaks faster than realtime and one that does not. Without it every recompile starts from
+        // an EMPTY pool and re-allocates every intermediate from the device - and a model whose input
+        // length changes on each call recompiles on each call, so it pays that every time.
+        //
+        // MEASURED on Kokoro in the demo's browser worker, the SAME sentence twice: a new shape cost
+        // 1,491 device allocations and RTF 1.81x, the cache-hitting repeat cost 5 and RTF 0.75x. The pool
+        // buckets by NextPowerOf2, so a 65-token run's buffers largely fit a 35-token one - there is
+        // nothing shape-specific about them.
+        //
+        // ⚠️ Safe because these executors run one at a time (a session serialises its forwards) and every
+        // Rent rebinds a name to the buffer it just handed out. The base executor keeps ownership: it
+        // created the pool, it disposes it, and an evicted shape executor must not take it down with it.
         var exec = new GraphExecutor(_accelerator, compiled, _weights, _recompileFloatSeed,
-            quantizedWeights: _executor.QuantizedWeights, registry: _registry)
+            quantizedWeights: _executor.QuantizedWeights, registry: _registry,
+            sharedPool: _executor.Pool)
         {
             Format = _executor.Format,
             CacheShapeReadbacks = _cacheShapeReadbacks,
