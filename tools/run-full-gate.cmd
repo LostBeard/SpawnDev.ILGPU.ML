@@ -29,4 +29,9 @@ echo PMT_EXCLUDE_CATEGORIES=[%PMT_EXCLUDE_CATEGORIES%]  ^(empty = default, Heavy
 echo LOG=[%LOG%] >> "%LOG%"
 dotnet test PlaywrightMultiTest\PlaywrightMultiTest.csproj -c Release --logger "trx;LogFileName=%TRX%" --results-directory PlaywrightMultiTest\TestResults >> "%LOG%" 2>&1
 echo PMT_EXITCODE=%ERRORLEVEL% >> "%LOG%"
+
+rem  Attribute the failures before anyone reads the count. On 2026-09-15 "Failed: 348" was 346 pieces of
+rem  wreckage from ONE device hang plus 2 real defects, and the raw number reads as a broad regression.
+dotnet run "%~dp0gate-summary.cs" -- "%LOG%" >> "%LOG%" 2>&1
+
 echo === PMT full sweep end %DATE% %TIME% === >> "%LOG%"

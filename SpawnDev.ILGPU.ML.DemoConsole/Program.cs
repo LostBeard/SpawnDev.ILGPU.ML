@@ -714,6 +714,26 @@ if (args.Length > 0 && args[0] == "SHMEMRACE")
     return 0;
 }
 
+// Investigation diagnostic (NOT a PMT test): prices the InstanceNorm PASS 1 LAUNCH SHAPE - one thread
+// per (N,C) slice, each looping `spatial` twice serially. On 2026-09-15 that dispatch tripped the
+// Windows TDR on WebGPU (DXGI_ERROR_DEVICE_HUNG) and the device loss took the whole WebGPU lane with
+// it (345 downstream DEVICE_REMOVED). A scoped re-run PASSED, so pass/fail cannot settle it - only the
+// dispatch duration can. See MLTestBase.InstanceNormPass1Diagnostic.
+// Usage: INORMBENCH [Cuda|OpenCL|CPU] [reps]
+if (args.Length > 0 && args[0] == "INORMBENCH")
+{
+    string backend = args.Length > 1 ? args[1] : "Cuda";
+    int reps = args.Length > 2 && int.TryParse(args[2], out var ib) ? ib : 20;
+    SpawnDev.ILGPU.ML.Demo.Shared.UnitTests.MLTestBase harness = backend switch
+    {
+        "Cuda" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CudaTests(),
+        "OpenCL" => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.OpenCLTests(),
+        _ => new SpawnDev.ILGPU.ML.DemoConsole.UnitTests.CPUTests(),
+    };
+    await harness.DiagnoseInstanceNormPass1(reps);
+    return 0;
+}
+
 // Investigation diagnostic (NOT a PMT test): runs the REAL committed
 // GGUFDecodeKVCache_IncrementalMatchesFullRecompute test method directly on the chosen backend in a
 // plain console (null SynchronizationContext) with wall-clock timing + PID print. If it blocks here

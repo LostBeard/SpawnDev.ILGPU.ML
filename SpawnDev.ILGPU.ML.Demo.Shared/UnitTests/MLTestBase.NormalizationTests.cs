@@ -138,6 +138,21 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task InstanceNorm_StyleMosaicShape_MatchesCpu() => await RunTest(async accelerator =>
     {
+        // ⚠️ STEP-TIMED ON PURPOSE. This test hung the D3D12 device twice (2026-09-14 overnight sweep, and
+        // again on 2026-09-15 after the InstanceNorm launch-shape fix), taking the whole WebGPU lane with it
+        // both times - and it printed NOTHING, so the only evidence was "exceeded timeout of 30000ms" plus
+        // DXGI_ERROR_DEVICE_HUNG. That is not enough to name a step, and it sent me down two wrong theories:
+        // Pass 1's launch shape (MEASURED 4.62 ms on WebGPU) and AssertCloseGpu's contended atomics
+        // (MEASURED 43.5 ms at this size). Neither is 30 seconds. Both were plausible; both were wrong.
+        //
+        // A test that can hang the shared browser device must say what it was doing when it did. Each line
+        // flushes as it happens, so a timeout leaves the last completed step in the log and the NEXT one is
+        // the culprit. Console.WriteLine is correct here - in Blazor WASM it goes to the browser console and
+        // PMT prints the console block for a FAILING test. (Console.Error.WriteLine would raise a Blazor
+        // error UI and fail the test by itself.)
+        var swStep = System.Diagnostics.Stopwatch.StartNew();
+        void Step(string what) { Console.WriteLine($"[MosaicStep] {what} +{swStep.ElapsedMilliseconds} ms"); swStep.Restart(); }
+
         // Tight repro for Data's WebGL StyleMosaic mean-error 47.29 (2026-05-04).
         // First InstanceNorm call in StyleMosaic graph: N=1, C=32, H=W=224 -> spatial=50176.
         // Pass 1 capture (means + invStds) was bit-identical WebGPU vs WebGL; Pass 2 suspect.
@@ -145,10 +160,12 @@ public abstract partial class MLTestBase
         int N = 1, C = 32, H = 224, W = 224;
         int spatial = H * W;
         int total = N * C * spatial;
+        Step("enter");
         var input = RandomFloats(total, seed: 170, scale: 5f);
         var scale = RandomFloats(C, seed: 171, scale: 1f);
         var bias = RandomFloats(C, seed: 172, scale: 0.5f);
         for (int i = 0; i < C; i++) scale[i] = MathF.Abs(scale[i]) + 0.5f;
+        Step($"RandomFloats({total})");
 
         float eps = 1e-5f;
         var expected = new float[total];
@@ -172,16 +189,22 @@ public abstract partial class MLTestBase
             }
         }
 
+        Step("cpu reference");
+
         using var inBuf = accelerator.Allocate1D(input);
         using var outBuf = accelerator.Allocate1D<float>(total);
         using var sBuf = accelerator.Allocate1D(scale);
         using var bBuf = accelerator.Allocate1D(bias);
+        Step("allocate + upload");
 
         var norm = new NormalizationKernels(accelerator);
         norm.InstanceNorm(inBuf.View, outBuf.View, sBuf.View, bBuf.View, N, C, spatial);
+        Step("InstanceNorm dispatch (enqueue only)");
         await accelerator.SynchronizeAsync();
+        Step($"synchronize (path={(NormalizationKernels.LastStatsPathWasCooperative ? $"COOP T={NormalizationKernels.LastStatsGroupSize}" : "SERIAL")})");
 
         await AssertCloseGpu(accelerator, outBuf.View.SubView(0, total), expected, 1e-3f, "InstanceNorm 1x32x224x224: ");
+        Step("AssertCloseGpu");
     });
 
     [TestMethod(Timeout = 90000)]

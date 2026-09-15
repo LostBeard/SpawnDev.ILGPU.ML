@@ -48,6 +48,34 @@ public class NormalizationKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense>,
         int, float>? _instanceNormMeanVarKernel;
 
+    // Cooperative (group-per-slice) InstanceNorm Pass 1 — the same treatment RMSNorm already has above, in the
+    // sibling that never got it. Loaded lazily on the first non-WebGL call; _iNormCoopGroup caches the group size.
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>,
+        int, float>? _instanceNormMeanVarCoopKernel;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _instanceNormPartialStatsCoopKernel;
+    private Action<KernelConfig, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _instanceNormPartialSqDevCoopKernel;
+    private int _iNormCoopGroup;
+    // Upper bound on the cooperative Pass-1 group size — also the compile-time size of the kernel's per-thread
+    // partial-sums shared array (InstanceNormMeanVarCoopImpl). The runtime group T is capped to this.
+    private const int MaxINormGroup = 256;
+    // Below this many spatial elements per slice the group would spend more time at its two barriers than in the
+    // loop, so the serial kernel stays. Both sides are covered by the committed tests: InstanceNorm_MatchesCpu
+    // (spatial=64) takes the serial path, InstanceNorm_StyleTransferDims/StyleMosaicShape (spatial=50176) the
+    // cooperative one — so neither branch is a gate that never fires.
+    private const int MinCoopSpatialPerThread = 4;
+
+    // A/B ESCAPE HATCH: ILGPU_ML_INORM_COOP=0 forces the old one-thread-per-slice Pass 1 back on, so the
+    // cooperative path can be priced against it in one run (DemoConsole INORMBENCH) instead of across two
+    // builds. Same opt-out convention as FusedDequantMatMul's GGUF_GEMV_V2. Read ONCE into a static — a
+    // getenv on a per-call kernel path is itself a cost, and this must not move the number it measures.
+    // ⚠️ This switch gates the DISPATCH, i.e. the thing it names. Prove that before trusting any A/B from it:
+    // with COOP=0 the StyleMosaic row must move, and if it does not, the switch is not reaching the code.
+    private static readonly bool CoopInstanceNormEnabled =
+        Environment.GetEnvironmentVariable("ILGPU_ML_INORM_COOP") != "0";
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
@@ -269,6 +297,80 @@ public class NormalizationKernels : IDisposable
     }
 
     /// <summary>
+    /// InstanceNorm Pass 1, COOPERATIVE: one GROUP per (N,C) slice instead of one THREAD, with the T threads
+    /// splitting the spatial loop between them and combining through shared memory. Same two-pass math and same
+    /// float accumulation as <see cref="InstanceNormMeanVarImpl"/>, so the results agree to the CPU-reference
+    /// tolerance; the summation ORDER differs (strided partials, not one serial sweep), which if anything is the
+    /// more accurate of the two — the partials are ~spatial/T terms long instead of spatial.
+    ///
+    /// 🔴 WHY THIS EXISTS. <see cref="InstanceNormMeanVarImpl"/> launches exactly N*C threads, each looping
+    /// <paramref name="spatial"/> TWICE. For Kokoro's adaptive-norm blocks that is small; for a feature map it is
+    /// not: at N=1, C=32, spatial=50176 it is 32 threads doing 100,352 serial strided loads each, so the dispatch
+    /// duration grows with spatial and is bounded by nothing. On 2026-09-15 that dispatch ran past the Windows TDR
+    /// budget on WebGPU and the OS removed the device — DXGI_ERROR_DEVICE_HUNG in
+    /// InstanceNorm_StyleMosaicShape_MatchesCpu, then 345 downstream DEVICE_REMOVED failures as every later WebGPU
+    /// test failed to create an accelerator on the dead device. A scoped re-run of the same test PASSED, which is
+    /// what a dispatch sitting ON the TDR boundary looks like; a pass/fail re-run can never settle it, only the
+    /// measured duration can (DemoConsole INORMBENCH prices it).
+    ///
+    /// Filling the group removes the exposure by construction rather than by widening a timeout.
+    /// </summary>
+    private static void InstanceNormMeanVarCoopImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> means,
+        ArrayView1D<float, Stride1D.Dense> invStds,
+        int spatial, float eps)
+    {
+        int slice = Grid.IdxX;      // one group per (N,C) slice
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int ncBase = slice * spatial;
+
+        var part = SharedMemory.Allocate<float>(MaxINormGroup);   // per-thread partials (T <= MaxINormGroup)
+        var bcast = SharedMemory.Allocate<float>(1);              // the slice mean, published to the group
+
+        // Phase A — mean. FLOAT accumulate (NOT double): f64 here takes the WebGPU/WebGL f64-emulation path,
+        // which produces NaN/Inf in this kernel (the constraint InstanceNormMeanVarImpl already documents).
+        float local = 0f;
+        for (int i = tid; i < spatial; i += T) local += input[ncBase + i];
+        part[tid] = local;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            float sum = 0f;
+            for (int t = 0; t < T; t++) sum += part[t];
+            bcast[0] = sum / spatial;
+        }
+        Group.Barrier();
+        float mean = bcast[0];
+
+        // Phase B — Σ(x-mean)² around that mean: the SAME numerically-stable two-pass form the serial kernel
+        // uses, not Σx²−(Σx)² (see InstanceNormPartialSqDevImpl on why the one-pass form cancels catastrophically
+        // on conv-biased feature maps: large mean, small variance).
+        //
+        // ⚠️ part[] is REUSED here, and that is safe without another barrier: the only reader of the phase-A
+        // partials is thread 0, between the first and second barrier. Every thread reaches the write below only
+        // after passing the SECOND barrier, which thread 0 reaches only after finishing those reads.
+        float localVar = 0f;
+        for (int i = tid; i < spatial; i += T)
+        {
+            float d = input[ncBase + i] - mean;
+            localVar += d * d;
+        }
+        part[tid] = localVar;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            float varSum = 0f;
+            for (int t = 0; t < T; t++) varSum += part[t];
+            means[slice] = mean;
+            invStds[slice] = 1f / MathF.Sqrt(varSum / spatial + eps);
+        }
+    }
+
+    /// <summary>
     /// InstanceNorm Pass 2: apply normalization using pre-computed mean/invStd.
     /// One thread per element. No loops — O(1) per thread.
     /// </summary>
@@ -313,9 +415,22 @@ public class NormalizationKernels : IDisposable
         int spatial)
     {
         int ncBase = sliceIdx * spatial;
-        // FLOAT accumulate (NOT double): keeps the tiled GroupNorm browser-safe (f64 in-kernel NaNs on WebGPU/WebGL)
-        // AND order-matched to the full decode's float InstanceNorm (so at grid=1 the per-tile partial == the full
-        // single-pass sum, exactly). The host combines these float partials in double (BufferPool-side, not a kernel).
+        // FLOAT accumulate (NOT double): keeps the tiled GroupNorm browser-safe (f64 in-kernel NaNs on WebGPU/WebGL).
+        // The host combines these float partials in double (BufferPool-side, not a kernel).
+        //
+        // ⚠️ THE "order-matched to the full decode's InstanceNorm, so at grid=1 the per-tile partial == the full
+        // single-pass sum exactly" CLAIM THAT USED TO BE HERE IS NO LONGER TRUE, and nothing depended on it:
+        // InstanceNorm() Pass 1 now reduces COOPERATIVELY on a long slice (InstanceNormMeanVarCoopImpl), a
+        // different summation order. Nothing cross-checks the two - TiledStatSync_GlobalStatsMatchFullInstanceNorm
+        // and the TiledGroupNorm tests both score against a CPU double reference at their own tolerance, and
+        // TiledVaeOps only ever combines these partials with each other. Left as a note rather than deleted,
+        // because a reader who remembers the old invariant needs to know it was retired deliberately.
+        //
+        // ⚠️ THIS KERNEL IS NOW THE FALLBACK, not the default: InstanceNormPartialStats dispatches
+        // InstanceNormPartialStatsCoopImpl whenever CoopStatsApplies says so, and reaches this body only on
+        // WebGL, a tiny group, or a slice too short to divide. It kept the one-thread-per-slice shape that cost
+        // the WebGPU lane on 2026-09-15 - and on the LARGEST slices in the engine, since this is the tiled VAE
+        // decode's stat pass. MEASURED (RTX 4070, [1,32,50176]): 2.01 ms serial -> 0.04 ms cooperative.
         float sum = 0f, sumSq = 0f;
         for (int i = 0; i < spatial; i++)
         {
@@ -461,6 +576,53 @@ public class NormalizationKernels : IDisposable
     /// Off by default; opt-in for codegen bug investigation (e.g. WebGL Style transfer
     /// mean error 36-56 vs WebGPU pass).
     /// </summary>
+    /// <summary>Runs InstanceNorm Pass 1 as one GROUP per slice (see <see cref="InstanceNormMeanVarCoopImpl"/>),
+    /// returning false when the caller must fall through to the one-thread-per-slice serial kernel: WebGL (no
+    /// shared memory / no group barrier in the TF path — the same exclusion <see cref="TryFusedRMSNorm"/> makes),
+    /// a group too small to be worth the barriers, or a slice too short to divide.</summary>
+    /// <summary>The ONE predicate all three cooperative per-slice stat paths share (mean/var, partial stats,
+    /// partial sq-dev), so they cannot drift into disagreeing about when a group is worth using. Returns false -
+    /// caller falls through to its one-thread-per-slice kernel - on WebGL (no shared memory / no group barrier in
+    /// the TF path, the same exclusion <see cref="TryFusedRMSNorm"/> makes), a group too small to pay for its
+    /// barriers, or a slice too short to divide.</summary>
+    /// <summary>DIAGNOSTIC: which Pass-1 path the LAST per-slice stat dispatch took, and the group size it
+    /// used. Exists because on 2026-09-15 a CUDA measurement of the cooperative path was allowed to stand in
+    /// for the WebGPU behaviour, and WebGPU is the backend whose device was being lost - "it is 39x faster"
+    /// was true and irrelevant. A path that is merely BELIEVED to be taken is not evidence.</summary>
+    public static bool LastStatsPathWasCooperative { get; private set; }
+    /// <summary>The group size the last cooperative stat dispatch used; 0 when it took the serial path.</summary>
+    public static int LastStatsGroupSize { get; private set; }
+
+    private bool CoopStatsApplies(int numSlices, int spatial, out int groupSize)
+    {
+        groupSize = 0;
+        LastStatsPathWasCooperative = false;
+        LastStatsGroupSize = 0;
+        if (!CoopInstanceNormEnabled) return false;
+        if (numSlices <= 0 || _accelerator.AcceleratorType == AcceleratorType.WebGL) return false;
+        int T = _iNormCoopGroup != 0 ? _iNormCoopGroup
+            : (_iNormCoopGroup = Math.Min(MaxINormGroup, (int)_accelerator.MaxNumThreadsPerGroup));
+        if (T < 32) return false;                                 // group too small — keep the serial kernel
+        if (spatial < T * MinCoopSpatialPerThread) return false;  // slice too short to divide profitably
+        groupSize = T;
+        LastStatsPathWasCooperative = true;
+        LastStatsGroupSize = T;
+        return true;
+    }
+
+    private bool TryCoopInstanceNormStats(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> means, ArrayView1D<float, Stride1D.Dense> invStds,
+        int numSlices, int spatial, float epsilon)
+    {
+        if (!CoopStatsApplies(numSlices, spatial, out int T)) return false;
+        _instanceNormMeanVarCoopKernel ??= _accelerator.LoadStreamKernel<
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int, float>(InstanceNormMeanVarCoopImpl);
+        _instanceNormMeanVarCoopKernel(new KernelConfig(new Index1D(numSlices), new Index1D(T)),
+            input, means, invStds, spatial, epsilon);
+        return true;
+    }
+
     public static List<(int callIdx, int N, int C, int spatial, MemoryBuffer1D<float, Stride1D.Dense> means, MemoryBuffer1D<float, Stride1D.Dense> invStds)>? CapturedInstanceNormPass1Outputs { get; set; }
     public static int CaptureInstanceNormMaxCalls { get; set; } = 4;
     private static int _instanceNormCallIdx;
@@ -484,7 +646,8 @@ public class NormalizationKernels : IDisposable
         // ⚠️ The CALLER's epsilon, not a constant. ONNX InstanceNormalization declares `epsilon`
         // and this ignored it, so a model asking for anything but the 1e-5 default was quietly
         // computed wrong. The default here keeps every existing caller on the number it already had.
-        _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, epsilon);
+        if (!TryCoopInstanceNormStats(input, inMeans.View, inInvStds.View, numSlices, spatial, epsilon))
+            _instanceNormMeanVarKernel!(numSlices, input, inMeans.View, inInvStds.View, spatial, epsilon);
 
         // DIAGNOSTIC capture (opt-in): record buffer refs so caller can async-read.
         // The temp buffers are held alive by _allTempBufs until Dispose, so it's
@@ -517,7 +680,8 @@ public class NormalizationKernels : IDisposable
         EnsureLoaded();
         int numSlices = N * C;
         var (inMeans, inInvStds) = GetStatsScratch(numSlices);
-        _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, epsilon);
+        if (!TryCoopInstanceNormStats(data, inMeans.View, inInvStds.View, numSlices, spatial, epsilon))
+            _instanceNormMeanVarKernel!(numSlices, data, inMeans.View, inInvStds.View, spatial, epsilon);
         _instanceNormApplyInPlaceKernel!(N * C * spatial, data, scale, bias, inMeans.View, inInvStds.View, N, C, spatial);
     }
 
@@ -529,7 +693,86 @@ public class NormalizationKernels : IDisposable
         int N, int C, int spatial)
     {
         EnsureLoaded();
+        if (CoopStatsApplies(N * C, spatial, out int T))
+        {
+            _instanceNormPartialStatsCoopKernel ??= _accelerator.LoadStreamKernel<
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialStatsCoopImpl);
+            _instanceNormPartialStatsCoopKernel(new KernelConfig(new Index1D(N * C), new Index1D(T)),
+                input, sums, sumSqs, spatial);
+            return;
+        }
         _instanceNormPartialStatsKernel!(N * C, input, sums, sumSqs, spatial);
+    }
+
+    /// <summary>Cooperative <see cref="InstanceNormPartialStatsImpl"/>: one GROUP per slice. Same float
+    /// accumulation, same two outputs; the T threads split the spatial sweep and combine through shared memory.
+    /// This is the tiled VAE decode's stat pass, and its slices are the LARGEST in the engine (a 256 MiB feature
+    /// map), so it carried the same unbounded-dispatch exposure that cost the WebGPU lane on 2026-09-15.</summary>
+    private static void InstanceNormPartialStatsCoopImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sums,
+        ArrayView1D<float, Stride1D.Dense> sumSqs,
+        int spatial)
+    {
+        int slice = Grid.IdxX;
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int ncBase = slice * spatial;
+
+        var partSum = SharedMemory.Allocate<float>(MaxINormGroup);
+        var partSq = SharedMemory.Allocate<float>(MaxINormGroup);
+
+        float sum = 0f, sumSq = 0f;
+        for (int i = tid; i < spatial; i += T)
+        {
+            float v = input[ncBase + i];
+            sum += v; sumSq += v * v;
+        }
+        partSum[tid] = sum;
+        partSq[tid] = sumSq;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            float s = 0f, q = 0f;
+            for (int t = 0; t < T; t++) { s += partSum[t]; q += partSq[t]; }
+            sums[slice] = s;
+            sumSqs[slice] = q;
+        }
+    }
+
+    /// <summary>Cooperative <see cref="InstanceNormPartialSqDevImpl"/>: one GROUP per slice, same stable
+    /// Σ(x-mean)² around an externally supplied mean.</summary>
+    private static void InstanceNormPartialSqDevCoopImpl(
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> sqDevs,
+        ArrayView1D<float, Stride1D.Dense> means,
+        int spatial)
+    {
+        int slice = Grid.IdxX;
+        int tid = Group.IdxX;
+        int T = Group.DimX;
+        int ncBase = slice * spatial;
+        float mean = means[slice];
+
+        var part = SharedMemory.Allocate<float>(MaxINormGroup);
+
+        float local = 0f;
+        for (int i = tid; i < spatial; i += T)
+        {
+            float d = input[ncBase + i] - mean;
+            local += d * d;
+        }
+        part[tid] = local;
+        Group.Barrier();
+
+        if (tid == 0)
+        {
+            float q = 0f;
+            for (int t = 0; t < T; t++) q += part[t];
+            sqDevs[slice] = q;
+        }
     }
 
     /// <summary>Partial Σ(x-mean)² per slice given an external per-slice <paramref name="means"/> (length N*C).
@@ -539,6 +782,15 @@ public class NormalizationKernels : IDisposable
         int N, int C, int spatial)
     {
         EnsureLoaded();
+        if (CoopStatsApplies(N * C, spatial, out int T))
+        {
+            _instanceNormPartialSqDevCoopKernel ??= _accelerator.LoadStreamKernel<
+                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+                ArrayView1D<float, Stride1D.Dense>, int>(InstanceNormPartialSqDevCoopImpl);
+            _instanceNormPartialSqDevCoopKernel(new KernelConfig(new Index1D(N * C), new Index1D(T)),
+                input, sqDevs, means, spatial);
+            return;
+        }
         _instanceNormPartialSqDevKernel!(N * C, input, sqDevs, means, spatial);
     }
 

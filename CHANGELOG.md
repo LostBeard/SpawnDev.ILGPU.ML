@@ -117,6 +117,91 @@ graph right given what I feed it?" by splicing our tensor into the reference. Bo
 this model's vocoder takes atan2 of an STFT whose quiet bins are near zero, so perturbing onnxruntime's
 own spectrogram by one part in 1e6 moves its waveform to 0.974 against itself. See `tools/README.md`.
 
+### Fixed - the test harness's own comparison hung the GPU: contended atomics in `AssertCloseGpu`
+
+`ElementWiseKernels.CompareReduceImpl` - the kernel behind every `AssertCloseGpu` in the suite - did
+`Atomic.Add(ref results[0], d)` and `Atomic.Max(ref results[1], d)` for **every element against the same two
+addresses**. That is N serialized read-modify-writes: a parallel dispatch that executes end to end, growing
+linearly with tensor size at roughly 3.9 µs per element on WebGPU.
+
+MEASURED on a 1,605,632-element compare (RTX 4070), before and after:
+
+| backend | atomics | two-stage | |
+| --- | --- | --- | --- |
+| WebGPU | **6,180 ms** | **16.9 ms** | 366x |
+| OpenCL | **14,032 ms** | **1.4 ms** | ~10,000x |
+| CPU | 570.9 ms | 4.4 ms | 130x |
+| Wasm | 58.4 ms | 16.0 ms | 3.7x |
+| WebGL | 44.7 ms | 15.3 ms | 2.9x |
+| CUDA | 4.6 ms | 1.2 ms | 3.8x |
+
+Inside the failing test, under real lane pressure, that single call measured **12,063 ms against a 30,000 ms
+timeout**. On WebGPU a 6-12 s dispatch is squarely in Windows TDR range, and it is what raised
+`DXGI_ERROR_DEVICE_HUNG` in `InstanceNorm_StyleMosaicShape_MatchesCpu` on 2026-09-14 and again on 09-15,
+costing the whole WebGPU lane both times (345 downstream `DEVICE_REMOVED` failures the first time).
+
+The tell was hiding in plain sight: that test compares 1,605,632 elements and its passing neighbour
+`InstanceNorm_StyleTransferDims_MatchesCpu` compares 150,528 - **10.7x**. Nothing about either kernel.
+CUDA hid the defect completely (hardware float atomics, 4.6 ms) and WebGL never executed it at all (it took
+a readback fallback), so only the strictest backend ever reported it. OpenCL paid 14 s per large compare
+indefinitely without hanging, and so without complaint.
+
+Replaced with a two-stage reduction: 1024 threads stride through the tensor into per-thread partials, then
+one thread folds the partials. **No atomics and no shared memory**, so it is identical on every backend -
+which also let the WebGL special case be deleted rather than maintained alongside. That fallback had been
+doing a full-tensor `CopyToHostAsync` (6.4 MB) to produce two floats.
+
+### Fixed - InstanceNorm Pass 1 ran on N*C threads
+
+`NormalizationKernels.InstanceNormMeanVarImpl` launched exactly one thread per (N,C) slice, each looping
+`spatial` twice serially, so the dispatch duration grew with the feature map and was bounded by nothing.
+At `[1, 32, 224, 224]` that is 32 threads doing 100,352 serial strided loads each.
+
+⚠️ **This was NOT the cause of the device hang** - that was the harness's comparison kernel, above. The
+launch shape was found while investigating the hang, is a genuine inefficiency, and is fixed on its own
+merits. On WebGPU this dispatch measures **4.62 ms**; it was never the 30 seconds. Recorded plainly because
+the fix shipped in the same change and it would be easy to read it as the hang's remedy.
+
+Pass 1 now reduces cooperatively, one GROUP per slice, through shared memory - the same treatment
+`RMSNorm` has had since the fused path was added, in the sibling that never got it. Same stable two-pass
+math, same float accumulation (f64 in this kernel takes the WebGPU/WebGL emulation path and produces
+NaN/Inf); the summation order differs, and the partials are `spatial/T` terms instead of `spatial`, so if
+anything it is the more accurate of the two. WebGL keeps the serial kernel, the same exclusion
+`TryFusedRMSNorm` makes.
+
+MEASURED on an RTX 4070 (CUDA), mean of 20 dispatch+synchronize pairs, via
+`DemoConsole INORMBENCH` - which is committed, because the dispatch duration is the only thing that
+can settle an intermittent device hang:
+
+| shape `[N, C, spatial]` | before | after | |
+| --- | --- | --- | --- |
+| `[1, 3, 64]` | 0.02 ms | 0.02 ms | below the threshold - takes the serial path by design |
+| `[1, 3, 50176]` | 2.12 ms | 0.08 ms | 26x |
+| `[1, 32, 50176]` (the shape that hung) | **3.94 ms** | **0.10 ms** | **39x** |
+| `[1, 64, 50176]` | 3.99 ms | 0.10 ms | 40x |
+
+For scale: Pass 2 writes all 1.6M elements in **0.03 ms**. Pass 1 read the same data twice and wrote 32
+floats, and took 66x longer than Pass 2 - the cost was the launch shape, not the work. The in-place path
+(`InstanceNormInPlace`, which `GraphExecutor` uses on a single-consumer intermediate - the 256 MiB SD VAE
+feature map) gets the same fix.
+
+`ILGPU_ML_INORM_COOP=0` forces the old kernel back, so the two can be priced in one run.
+
+`InstanceNormPartialStats` and `InstanceNormPartialSqDev` - the tiled VAE decode's stat pass, and the
+largest slices in the engine - get the same treatment behind the same `CoopStatsApplies` predicate, so the
+three cooperative paths cannot drift into disagreeing about when a group is worth using. MEASURED on the
+same card and shape: **2.01 ms -> 0.04 ms (50x)**.
+
+Audited for the same launch shape across the kernels. `GlobalAvgPoolImpl` ("one thread per (n, c)", serial
+over `spatial`) carries it too. It backs the ONNX `GlobalAveragePool` operator, where `spatial` is simply
+whatever the feature map is at that node - 49 at a classifier head, but a squeeze-excitation block pools at
+its block's **full** resolution, so a large-spatial consumer is likely rather than absent. Its only test used
+spatial=49, which could never have caught a problem that appears only at full resolution;
+`GlobalAvgPool_FullResolutionSpatial_MatchesCpu` now covers `[1, 16, 224, 224]`.
+
+`RMSNormStatsImpl` has the shape by design - it is the WebGL-only fallback that `TryFusedRMSNorm` already
+bypasses everywhere else.
+
 ## 5.2.13
 
 ### Changed - BREAKING: model delivery no longer uses WebTorrent

@@ -58,4 +58,8 @@ echo PMT_CONSOLE_LOG=[%PMT_CONSOLE_LOG%] >> "%LOG%"
 echo LOG=[%LOG%] >> "%LOG%"
 dotnet test PlaywrightMultiTest\PlaywrightMultiTest.csproj -c Release >> "%LOG%" 2>&1
 echo PMT_EXITCODE=%ERRORLEVEL% >> "%LOG%"
+
+rem  Attribute the failures before anyone reads the count - see the note in run-full-gate.cmd.
+dotnet run "%~dp0gate-summary.cs" -- "%LOG%" >> "%LOG%" 2>&1
+
 echo === PMT scoped gate end %DATE% %TIME% === >> "%LOG%"

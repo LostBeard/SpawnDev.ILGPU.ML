@@ -2293,39 +2293,88 @@ public class ElementWiseKernels : IDisposable
     //  GPU-side verification (no large CPU readbacks)
     // ─────────────────────────────────────────────────────────────
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _compareReduceKernel;
     private MemoryBuffer1D<float, Stride1D.Dense>? _compareResultBuf;
 
     /// <summary>
     /// GPU kernel: compute |actual[i] - expected[i]|, atomically accumulate sum and max
     /// into results[0] (sum) and results[1] (max). Results buffer must be zeroed first.
     /// </summary>
-    private static void CompareReduceImpl(Index1D idx,
+    // ── Two-stage compare reduction ──
+    //
+    // 🔴 WHAT THE ATOMIC VERSION COST. Every element did Atomic.Add and Atomic.Max against THE SAME TWO
+    // ADDRESSES, so N elements meant N serialized read-modify-writes on one dword - a parallel dispatch that
+    // executes end to end. MEASURED 2026-09-15 on a 1,605,632-element compare (RTX 4070):
+    //
+    //     WebGPU 6,180 ms   OpenCL 14,032 ms   CUDA 4.6 ms   Wasm 58 ms   WebGL 45 ms
+    //
+    // linear in N at ~3.9 µs/element on WebGPU. CUDA hides it in hardware float atomics; WebGL never ran it
+    // (it took the readback fallback). This is the TEST HARNESS - AssertCloseGpu - so every test comparing a
+    // large tensor paid it, and on WebGPU a 6-12 s dispatch is squarely in Windows TDR territory. That is
+    // what hung the D3D12 device in InstanceNorm_StyleMosaicShape_MatchesCpu and cost the whole WebGPU lane,
+    // twice. OpenCL never hung, so it simply paid 14 s a compare in silence.
+    //
+    // ⚠️ AND IT HID FROM ITS OWN BENCHMARK. A first attempt to price it built `actual` FROM `expected`, so
+    // every absDiff was 0 and Atomic.Max never had to swap - it reported 43.5 ms and "exonerated" the
+    // atomics. Pick the fixture from the PROPERTY (contention needs a max that keeps moving), not from
+    // convenience. See [[fb-choose-fixture-violate]].
+    //
+    // The replacement is the shape [[ref-one-thread-per-output]] already records for ReduceMin/Max: a fixed
+    // number of threads stride through the tensor into per-thread partials, then ONE thread folds the
+    // partials. No atomics and no shared memory, so it is identical on every backend - which is also why the
+    // WebGL special case and its full-tensor CopyToHostAsync could be deleted rather than kept in parallel.
+    private const int ComparePartials = 1024;
+
+    private static void ComparePartialImpl(Index1D p,
         ArrayView1D<float, Stride1D.Dense> actual,
         ArrayView1D<float, Stride1D.Dense> expected,
-        ArrayView1D<float, Stride1D.Dense> results)
+        ArrayView1D<float, Stride1D.Dense> partialSums,
+        ArrayView1D<float, Stride1D.Dense> partialMaxes,
+        int count)
     {
-        float diff = actual[idx] - expected[idx];
-        float absDiff = diff < 0f ? -diff : diff;
-        Atomic.Add(ref results[0], absDiff);
-        Atomic.Max(ref results[1], absDiff);
+        // Stride equals the launched thread count, so the reads are coalesced across threads and every
+        // element is visited exactly once.
+        float sum = 0f, max = 0f;
+        for (int i = p; i < count; i += ComparePartials)
+        {
+            float d = actual[i] - expected[i];
+            if (d < 0f) d = -d;
+            sum += d;
+            if (d > max) max = d;
+        }
+        partialSums[p] = sum;
+        partialMaxes[p] = max;
     }
 
-    // No-atomic per-element absDiff kernel. WebGL fallback - WebGL doesn't
-    // support Atomic.Max so the GPU reduction path can't compile there.
+    /// <summary>Folds the <see cref="ComparePartials"/> partials into results[0]=sum, results[1]=max.
+    /// One thread, <see cref="ComparePartials"/> iterations - trivial next to the strided pass, and it keeps
+    /// the readback at the 2 floats the caller already expected.</summary>
+    private static void CompareFoldImpl(Index1D _,
+        ArrayView1D<float, Stride1D.Dense> partialSums,
+        ArrayView1D<float, Stride1D.Dense> partialMaxes,
+        ArrayView1D<float, Stride1D.Dense> results,
+        int used)
+    {
+        float sum = 0f, max = 0f;
+        for (int i = 0; i < used; i++)
+        {
+            sum += partialSums[i];
+            float m = partialMaxes[i];
+            if (m > max) max = m;
+        }
+        results[0] = sum;
+        results[1] = max;
+    }
+
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _compareDiffKernel;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _compareDiffBuf;
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _comparePartialKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, int>? _compareFoldKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _comparePartialSums, _comparePartialMaxes;
 
-    private static void CompareDiffImpl(Index1D idx,
-        ArrayView1D<float, Stride1D.Dense> actual,
-        ArrayView1D<float, Stride1D.Dense> expected,
-        ArrayView1D<float, Stride1D.Dense> diffs)
-    {
-        float diff = actual[idx] - expected[idx];
-        diffs[idx] = diff < 0f ? -diff : diff;
-    }
+    // (The WebGL-only per-element absDiff kernel and its full-tensor buffer lived here. Both existed solely
+    // because WebGL has no Atomic.Max; the two-stage reduction above uses no atomics on any backend, so the
+    // fallback had nothing left to fall back from. It is deleted rather than kept beside the general path -
+    // a second implementation of one job is where a fix lands on only one of them.)
 
     /// <summary>
     /// Compare two GPU buffers and return (meanError, maxError).
@@ -2340,42 +2389,33 @@ public class ElementWiseKernels : IDisposable
         ArrayView1D<float, Stride1D.Dense> expected,
         int count)
     {
-        if (_accelerator.AcceleratorType == AcceleratorType.WebGL)
-        {
-            _compareDiffKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-                ArrayView1D<float, Stride1D.Dense>>(CompareDiffImpl);
-
-            // Reuse buffer when same size; reallocate when size grows.
-            if (_compareDiffBuf == null || _compareDiffBuf.Length < count)
-            {
-                _compareDiffBuf?.Dispose();
-                _compareDiffBuf = _accelerator.Allocate1D<float>(count);
-            }
-
-            _compareDiffKernel(count, actual, expected, _compareDiffBuf.View);
-            await _accelerator.SynchronizeAsync();
-
-            var diffs = await _compareDiffBuf.CopyToHostAsync<float>(0, count);
-            float sumAbsDiff = 0f, maxAbsDiff = 0f;
-            for (int i = 0; i < count; i++)
-            {
-                float d = diffs[i];
-                sumAbsDiff += d;
-                if (d > maxAbsDiff) maxAbsDiff = d;
-            }
-            return (sumAbsDiff / count, maxAbsDiff);
-        }
-
-        _compareReduceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+        // ONE path for every backend now. The WebGL fork that used to live here ran a per-element absDiff
+        // kernel and then CopyToHostAsync'd the WHOLE tensor to reduce it on the CPU - 6.4 MB across the
+        // boundary for two floats, which is the bulk-copy rule's exact prohibition. It existed only because
+        // WebGL has no Atomic.Max. Removing the atomics removed the reason for the fork, and a single path
+        // cannot develop the "a guard on only one of the two" disease.
+        _comparePartialKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
-            ArrayView1D<float, Stride1D.Dense>>(CompareReduceImpl);
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(ComparePartialImpl);
+        _compareFoldKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, int>(CompareFoldImpl);
 
-        // Allocate or reuse 2-element results buffer [sum, max], zero it
+        // 🔴 ALWAYS EXACTLY ComparePartials THREADS. The stride inside ComparePartialImpl is the compile-time
+        // constant, so launching min(ComparePartials, count) threads instead - which looks like the thrifty
+        // thing to do - leaves every element between `count` and ComparePartials VISITED BY NOBODY, and the
+        // comparison silently reports a smaller error over a subset. When a strided loop's stride is a
+        // constant, the launch width is not a free parameter: it must equal that constant.
+        // For count < ComparePartials the surplus threads simply run zero iterations and publish the correct
+        // identities (0 for sum, 0 for max), so the fold stays exact with no special case.
+        _comparePartialSums ??= _accelerator.Allocate1D<float>(ComparePartials);
+        _comparePartialMaxes ??= _accelerator.Allocate1D<float>(ComparePartials);
         _compareResultBuf ??= _accelerator.Allocate1D<float>(2);
-        _compareResultBuf.CopyFromCPU(new float[] { 0f, 0f });
 
-        _compareReduceKernel(count, actual, expected, _compareResultBuf.View);
+        _comparePartialKernel(ComparePartials, actual, expected,
+            _comparePartialSums.View, _comparePartialMaxes.View, count);
+        _compareFoldKernel(1, _comparePartialSums.View, _comparePartialMaxes.View,
+            _compareResultBuf.View, ComparePartials);
         await _accelerator.SynchronizeAsync();
 
         var results = await _compareResultBuf.CopyToHostAsync<float>(0, 2);
@@ -2386,52 +2426,77 @@ public class ElementWiseKernels : IDisposable
     //  GPU-side finite-check verification (no large CPU readback)
     // ─────────────────────────────────────────────────────────────
 
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _finiteCheckReduceKernel;
-    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>,
-        ArrayView1D<float, Stride1D.Dense>>? _finiteCheckTagKernel;
     private MemoryBuffer1D<float, Stride1D.Dense>? _finiteCheckResultBuf;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _finiteCheckTagBuf;
 
     /// <summary>
     /// GPU kernel: classify v as NaN/Inf/finite, atomically accumulate
     /// nanCount(results[0]) + absSum(results[1]) + absMax(results[2]).
     /// AggressiveInlining per `feedback_methodimpl_inlining_directives.md`.
     /// </summary>
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static void FiniteCheckReduceImpl(Index1D idx,
+    // 🔴 THE IDENTICAL DEFECT THE COMPARE PATH JUST SHED, in the sibling twenty lines away.
+    // FiniteCheckReduceImpl used to do Atomic.Add(results[1]) + Atomic.Max(results[2]) per element against
+    // the SAME addresses - the exact contention that cost 6,180 ms on WebGPU and 14,032 ms on OpenCL for a
+    // 1.6M compare, and hung the D3D12 device. It was found by grepping the library for every Atomic.Add /
+    // Atomic.Max after fixing the first one, because fixing one of two siblings and leaving the other is
+    // this codebase's recurring failure (see the InstanceNorm/RMSNorm cooperative path, and the scratch-ring
+    // note in NormalizationKernels).
+    //
+    // Same two-stage shape: ComparePartials threads stride into per-thread partials, one thread folds. No
+    // atomics anywhere, so the WebGL tag-buffer fallback - which read the WHOLE tensor back to the host to
+    // produce three numbers - is deleted with it.
+    private static void FiniteCheckPartialImpl(Index1D p,
         ArrayView1D<float, Stride1D.Dense> data,
-        ArrayView1D<float, Stride1D.Dense> results)
+        ArrayView1D<float, Stride1D.Dense> partialNaN,
+        ArrayView1D<float, Stride1D.Dense> partialSums,
+        ArrayView1D<float, Stride1D.Dense> partialMaxes,
+        int count)
     {
-        float v = data[idx];
-        bool isNaN = v != v;
-        bool isInf = v > 1.7e38f || v < -1.7e38f;
-        if (isNaN || isInf)
+        float nan = 0f, sum = 0f, max = 0f;
+        for (int i = p; i < count; i += ComparePartials)
         {
-            Atomic.Add(ref results[0], 1f);
+            float v = data[i];
+            bool isNaN = v != v;
+            bool isInf = v > 1.7e38f || v < -1.7e38f;
+            if (isNaN || isInf) nan += 1f;
+            else
+            {
+                float absV = v < 0f ? -v : v;
+                sum += absV;
+                if (absV > max) max = absV;
+            }
         }
-        else
-        {
-            float absV = v < 0f ? -v : v;
-            Atomic.Add(ref results[1], absV);
-            Atomic.Max(ref results[2], absV);
-        }
+        partialNaN[p] = nan;
+        partialSums[p] = sum;
+        partialMaxes[p] = max;
     }
 
-    /// <summary>
-    /// WebGL fallback (no atomics): emit |v| or NaN-marker per element.
-    /// CPU side counts NaN + accumulates absSum + absMax from the tag buffer only.
-    /// </summary>
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static void FiniteCheckTagImpl(Index1D idx,
-        ArrayView1D<float, Stride1D.Dense> data,
-        ArrayView1D<float, Stride1D.Dense> tags)
+    /// <summary>Folds the finite-check partials into results[0]=nanCount, [1]=absSum, [2]=absMax.</summary>
+    private static void FiniteCheckFoldImpl(Index1D _,
+        ArrayView1D<float, Stride1D.Dense> partialNaN,
+        ArrayView1D<float, Stride1D.Dense> partialSums,
+        ArrayView1D<float, Stride1D.Dense> partialMaxes,
+        ArrayView1D<float, Stride1D.Dense> results,
+        int used)
     {
-        float v = data[idx];
-        bool isNaN = v != v;
-        bool isInf = v > 1.7e38f || v < -1.7e38f;
-        tags[idx] = (isNaN || isInf) ? float.NaN : (v < 0f ? -v : v);
+        float nan = 0f, sum = 0f, max = 0f;
+        for (int i = 0; i < used; i++)
+        {
+            nan += partialNaN[i];
+            sum += partialSums[i];
+            float m = partialMaxes[i];
+            if (m > max) max = m;
+        }
+        results[0] = nan;
+        results[1] = sum;
+        results[2] = max;
     }
+
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _finiteCheckPartialKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _finiteCheckFoldKernel;
+    private MemoryBuffer1D<float, Stride1D.Dense>? _finiteCheckPartialNaN,
+        _finiteCheckPartialSums, _finiteCheckPartialMaxes;
 
     /// <summary>
     /// GPU-side finite check + reduction. Returns (nanCount, absSum, absMax).
@@ -2443,33 +2508,25 @@ public class ElementWiseKernels : IDisposable
     public async Task<(int nanCount, float absSum, float absMax)> FiniteCheckOnGpuAsync(
         ArrayView1D<float, Stride1D.Dense> data, int count)
     {
-        if (_accelerator.AcceleratorType == AcceleratorType.WebGL)
-        {
-            _finiteCheckTagKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-                ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FiniteCheckTagImpl);
-            if (_finiteCheckTagBuf == null || _finiteCheckTagBuf.Length < count)
-            {
-                _finiteCheckTagBuf?.Dispose();
-                _finiteCheckTagBuf = _accelerator.Allocate1D<float>(count);
-            }
-            _finiteCheckTagKernel(count, data, _finiteCheckTagBuf.View);
-            await _accelerator.SynchronizeAsync();
-            var tags = await _finiteCheckTagBuf.CopyToHostAsync<float>(0, count);
-            int nan = 0; float sumAbs = 0f, maxAbs = 0f;
-            for (int i = 0; i < count; i++)
-            {
-                float t = tags[i];
-                if (t != t) nan++;
-                else { sumAbs += t; if (t > maxAbs) maxAbs = t; }
-            }
-            return (nan, sumAbs, maxAbs);
-        }
+        // One path for every backend - see the note on the kernels above. The launch width must equal the
+        // stride constant, so it is always ComparePartials; surplus threads run zero iterations and publish
+        // the correct identities.
+        _finiteCheckPartialKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(FiniteCheckPartialImpl);
+        _finiteCheckFoldKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(FiniteCheckFoldImpl);
 
-        _finiteCheckReduceKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
-            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(FiniteCheckReduceImpl);
+        _finiteCheckPartialNaN ??= _accelerator.Allocate1D<float>(ComparePartials);
+        _finiteCheckPartialSums ??= _accelerator.Allocate1D<float>(ComparePartials);
+        _finiteCheckPartialMaxes ??= _accelerator.Allocate1D<float>(ComparePartials);
         _finiteCheckResultBuf ??= _accelerator.Allocate1D<float>(3);
-        _finiteCheckResultBuf.CopyFromCPU(new float[] { 0f, 0f, 0f });
-        _finiteCheckReduceKernel(count, data, _finiteCheckResultBuf.View);
+
+        _finiteCheckPartialKernel(ComparePartials, data,
+            _finiteCheckPartialNaN.View, _finiteCheckPartialSums.View, _finiteCheckPartialMaxes.View, count);
+        _finiteCheckFoldKernel(1, _finiteCheckPartialNaN.View, _finiteCheckPartialSums.View,
+            _finiteCheckPartialMaxes.View, _finiteCheckResultBuf.View, ComparePartials);
         await _accelerator.SynchronizeAsync();
         var results = await _finiteCheckResultBuf.CopyToHostAsync<float>(0, 3);
         return ((int)results[0], results[1], results[2]);
@@ -2482,9 +2539,12 @@ public class ElementWiseKernels : IDisposable
         foreach (var buf in _oldStridesBufs) buf.Dispose();
         _oldStridesBufs.Clear();
         _compareResultBuf?.Dispose();
-        _compareDiffBuf?.Dispose();
+        _comparePartialSums?.Dispose();
+        _comparePartialMaxes?.Dispose();
         _nearestParamsBuf?.Dispose();
         _finiteCheckResultBuf?.Dispose();
-        _finiteCheckTagBuf?.Dispose();
+        _finiteCheckPartialNaN?.Dispose();
+        _finiteCheckPartialSums?.Dispose();
+        _finiteCheckPartialMaxes?.Dispose();
     }
 }
