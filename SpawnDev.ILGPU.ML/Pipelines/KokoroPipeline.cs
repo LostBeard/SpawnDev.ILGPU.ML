@@ -281,12 +281,26 @@ public sealed class KokoroPipeline : IDisposable
         _tail = tail;
         TailStatus = tailStatus;
         session.SyncIntervalNodesOverride = DrainCadenceNodes;
-        // 🔴 BROWSER BACKENDS ONLY, because the problem it solves is theirs. A drain is a full async GPU
-        // round trip in a browser and ~free on a desktop backend - the cadence note above measured the
-        // same 25 drains at 1,961 ms on WebGPU and 53 ms on CUDA. Raising the byte budget everywhere
-        // would hold up to DrainByteBudget of dead buffers in real VRAM on CUDA/OpenCL to buy back
-        // milliseconds that were never being spent.
-        if (accelerator.AcceleratorType is AcceleratorType.WebGPU or AcceleratorType.WebGL or AcceleratorType.Wasm)
+        // 🔴 WEBGPU ONLY. RAISING THIS NEEDS **BOTH** HALVES TO HOLD, AND I SHIPPED IT WITH ONE.
+        //
+        // Half one - the drain has to be worth avoiding. It is a full async GPU round trip in a browser
+        // and ~free on a desktop backend: the same 25 drains measured 1,961 ms on WebGPU and 53 ms on
+        // CUDA. That is why CUDA/OpenCL are excluded (raising it there was MEASURED as a 1.77x
+        // regression - pure allocator pressure for latency that was never being spent).
+        //
+        // Half two - the device has to be able to AFFORD the backlog, because the budget is held as live
+        // GPU memory. I first wrote this as "browser backends" on half one alone, and WebGL promptly died:
+        //
+        //   Node 1496/1850 'Sin' failed: RangeError: Array buffer allocation failed
+        //   Inputs: [1,128,76441] (9,784,448 elements)
+        //
+        // on a 260-token utterance (MEASURED 2026-09-15). WebGL and Wasm have expensive drains AND scarce
+        // memory, so raising the cap there trades a latency win for an OUT-OF-MEMORY CRASH. A discrete GPU
+        // behind WebGPU has 12 GB and does not care; a WebGL context does.
+        //
+        // ⚠️ So the predicate is not "is this a browser" - it is "are drains expensive here AND is memory
+        // plentiful here". Only WebGPU answers yes to both.
+        if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
             session.MaxPendingReleaseBytesOverride = DrainByteBudget;
         // 🔴 RESOLVED FROM THE GRAPH, NOT HARDCODED. Two exports of this same model are in circulation and
         // they do not agree on names: onnx-community's serves `input_ids` -> `waveform`, KokoroSharp's

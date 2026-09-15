@@ -818,6 +818,19 @@ public class GraphExecutor : IDisposable
     /// <summary>DIAGNOSTIC: total wall-clock ms spent in those periodic + final GPU sync-drains. Reset per RunAsync.</summary>
     public static double LastRunSyncDrainMs;
 
+    /// <summary>DIAGNOSTIC: total bytes of intermediates deferred for release across the most recent
+    /// RunAsync, and the largest backlog reached before a drain cleared it. Reset per RunAsync.</summary>
+    /// <remarks>
+    /// 🔴 THESE SAY WHETHER A DRAIN COUNT IS INHERENT OR A SYMPTOM. Drains fire on EITHER the node cadence
+    /// or <see cref="MaxPendingReleaseBytesOverride"/>, so when the cadence is set above the node count -
+    /// as Kokoro's is - every drain is the BYTE CAP, and the drain count is really a statement about how
+    /// much intermediate memory the graph churns. Without these you can see that a pass drained 4 times and
+    /// have no idea whether that is 4 x 2 GiB of genuine traffic or one runaway allocation re-tripping it.
+    /// </remarks>
+    public static long LastRunDeferredReleaseBytes;
+    /// <summary>Largest <c>pendingReleaseBytes</c> backlog reached in the most recent RunAsync.</summary>
+    public static long LastRunPeakPendingReleaseBytes;
+
     // ── Cumulative counters, across MANY RunAsync calls ────────────────────────────────────────────────
     //
     // ⚠️ WHY THESE EXIST. Every LastRun* field above is overwritten by the NEXT RunAsync, so for a pipeline
@@ -2690,6 +2703,8 @@ public class GraphExecutor : IDisposable
         LastRunReadbackNames.Clear();
         LastRunSyncDrainCount = 0;
         LastRunSyncDrainMs = 0;
+        LastRunDeferredReleaseBytes = 0;
+        LastRunPeakPendingReleaseBytes = 0;
         var _runSw = System.Diagnostics.Stopwatch.StartNew();
         var _drainSw = new System.Diagnostics.Stopwatch();
         var tensors = new Dictionary<string, Tensor>();
@@ -2873,6 +2888,11 @@ public class GraphExecutor : IDisposable
                     _pool.ReturnHalf(h);
                 pendingReleases.Clear();
                 pendingHalfReleases.Clear();
+                // Account the backlog this drain just cleared, BEFORE zeroing it - the backlog only grows
+                // between drains, so sampling here captures both the running total and the true peak.
+                LastRunDeferredReleaseBytes += pendingReleaseBytes;
+                if (pendingReleaseBytes > LastRunPeakPendingReleaseBytes)
+                    LastRunPeakPendingReleaseBytes = pendingReleaseBytes;
                 pendingReleaseBytes = 0;
             }
         }
@@ -4608,6 +4628,11 @@ public class GraphExecutor : IDisposable
                 _pool.ReturnHalf(h);
             pendingReleases.Clear();
             pendingHalfReleases.Clear();
+            // The TAIL backlog - whatever accumulated since the last periodic drain. Without this the
+            // deferred-bytes total under-reports by up to one whole cap's worth on every run.
+            LastRunDeferredReleaseBytes += pendingReleaseBytes;
+            if (pendingReleaseBytes > LastRunPeakPendingReleaseBytes)
+                LastRunPeakPendingReleaseBytes = pendingReleaseBytes;
         }
 
         // BREAK-LEAK RECLAIM (Tuvok 2026-07-11): a break-based PARTIAL run (the tiled VAE decode captures the

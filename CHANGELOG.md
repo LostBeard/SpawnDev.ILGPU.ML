@@ -43,10 +43,12 @@ the fixed 512 MiB cap fires proportionally more often the longer the sentence - 
 15 at 180, 27 at 360**, the last costing 5,123 ms of a 10,126 ms pass. Kokoro now sets 2 GiB; drains went
 to 4 and 7.
 
-🔴 **Kokoro raises it on BROWSER backends only**, and that distinction is worth more than the fix. Raising
-it everywhere was a large CUDA regression - the drains it buys back are ~free on a desktop backend (the
-same 25 drains measured 1,961 ms on WebGPU and 53 ms on CUDA), while holding 2 GiB of dead buffers makes
-the allocator work harder. MEASURED on CUDA, same reply:
+🔴 **Kokoro raises it on WEBGPU ONLY, and it takes BOTH halves of the condition to say why.**
+
+*Half one - the drain has to be worth avoiding.* It is a full async GPU round trip in a browser and ~free
+on a desktop backend (the same 25 drains measured 1,961 ms on WebGPU and 53 ms on CUDA). Raising it on
+CUDA/OpenCL was a large regression: pure allocator pressure bought for latency that was never being spent.
+MEASURED on CUDA, same reply:
 
 ```
                  2 GiB everywhere      browser-only
@@ -57,6 +59,19 @@ whole reply     22,618 ms RTF 0.42x   12,756 ms RTF 0.24x
 
 **1.77x on CUDA**, and the per-chunk growth disappears. A latency knob applied where the latency was never
 being spent is a straight memory cost.
+
+*Half two - the device has to be able to AFFORD the backlog,* because the budget is held as live GPU
+memory. Shipping on half one alone ("browser backends") promptly killed WebGL:
+
+```
+Node 1496/1850 'Sin' failed: RangeError: Array buffer allocation failed
+Inputs: [1,128,76441] (9,784,448 elements)
+```
+
+on a 260-token utterance. WebGL and Wasm have expensive drains AND scarce memory, so raising the cap there
+trades a latency win for an out-of-memory crash. A discrete GPU behind WebGPU has 12 GB and does not care.
+So the predicate is not "is this a browser" - it is "are drains expensive here AND is memory plentiful
+here", and only WebGPU answers yes to both.
 
 ⚠️ Carried through `RecompileForShapes`, which a variable-length model hits on every new length - a
 setting that lives only on the first executor silently stops applying exactly when it matters.

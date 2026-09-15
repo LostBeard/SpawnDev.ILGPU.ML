@@ -44,6 +44,7 @@ public abstract partial class MLTestBase
     [TestMethod(Timeout = 900000, Category = "HeavyModel,WasmHeavy")]
     public async Task Pipeline_Kokoro_SpeaksTwoDifferentLengths() => await RunTest(async accelerator =>
     {
+        RequireShippableTtsBackend(accelerator);
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 

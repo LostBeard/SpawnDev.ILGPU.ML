@@ -305,28 +305,7 @@ namespace PlaywrightMultiTest
                                 // number before 2026-07-03 was CPU-rasterizer time. Real Chrome exposes
                                 // the hardware adapter (it is what users run anyway).
                                 Channel = "chrome",
-                                Args = new[]
-                                {
-                                    "--enable-unsafe-webgpu",
-                                    // NO "Vulkan" here: forcing Chromium's Vulkan feature on Windows pushed
-                                    // Dawn off its native D3D12 path and the bundled Chromium silently fell
-                                    // back to the SwiftShader SOFTWARE adapter (vendor=google,
-                                    // arch=swiftshader, isFallbackAdapter=true - caught by
-                                    // WebGPU_AdapterIdentity_Probe 2026-07-03). Every WebGPU perf number
-                                    // measured before this fix was CPU-software-rasterizer time.
-                                    "--enable-features=WebGPUService,SkiaGraphite,FileSystemAccessPersistentPermission",
-                                    "--ignore-gpu-blocklist",
-                                    // Fail loudly rather than silently falling back to SwiftShader again.
-                                    "--disable-software-rasterizer",
-                                    // Unquantized GPU timestamps for 'timestamp-query' (Chrome otherwise
-                                    // rounds to 100us, which zeroes most per-pass durations in the
-                                    // dispatch-plan kernel attribution).
-                                    "--enable-webgpu-developer-features",
-                                    "--no-sandbox",
-                                    // Auto-grant file system write permission (no prompt)
-                                    "--disable-features=FileSystemAccessPermissionPrompt",
-                                    "--allow-file-access-from-files"
-                                }
+                                Args = BuildChromiumArgs()
                             }).ConfigureAwait(false);
                         testableProject.Browser = testableProject.BrowserContext.Browser;
                         // Grant all available permissions to avoid prompts
@@ -1378,6 +1357,66 @@ namespace PlaywrightMultiTest
         // Matched against the TEST CLASS name (WebGPUTests, CudaTests, OpenCLTests, CPUTests, WebGLTests,
         // WasmTests, DefaultTests, IntegrationTests), substring, case-insensitive - so "WebGPU" also
         // selects WebGPUNoSubgroupsTests, which is what you want when scoping to a backend.
+        /// <summary>
+        /// Chromium launch args, plus Dawn's shader dump when <c>PMT_DAWN_DUMP=1</c>.
+        /// </summary>
+        /// <remarks>
+        /// 🔴 WHY THE DUMP MATTERS HERE. A Kokoro pass on WebGPU splits roughly into host dispatch prep
+        /// and GPU execution waited on at the drains (~3.3 s of an ~8.5 s pass, MEASURED 2026-09-15). The
+        /// host half has been attributed precisely (<c>createBindGroup</c> marshalling); the GPU half has
+        /// only ever been measured IN AGGREGATE, so "it is just real GPU work" is an assumption, not a
+        /// finding. The shaders are what settle it.
+        /// <para>
+        /// <c>dump_shaders</c> makes Tint emit the TRANSLATED BACKEND shader (HLSL on D3D12, SPIR-V on
+        /// Vulkan) as well as the WGSL we handed it, so the question "is this kernel efficient" is
+        /// answered by what the driver actually compiles rather than by what we think we emitted.
+        /// <c>disable_symbol_renaming</c> keeps our <c>v_NNN</c> names so the dump is greppable.
+        /// </para>
+        /// <para>
+        /// ⚠️ Ported from SpawnDev.ILGPU's PMT, which has had this since the bf16 radix
+        /// ordering-transform miscompile. It was missing here, so the one repo containing the models
+        /// worth profiling was the one that could not dump their shaders. Off by default - debug only,
+        /// no effect on a normal run.
+        /// </para>
+        ///   <c>PMT_DAWN_DUMP=1 PMT_DAWN_LOG=&lt;path&gt; PMT_LANES=WebGPU PMT_FILTER=Kokoro ...</c>
+        /// </remarks>
+        private static string[] BuildChromiumArgs()
+        {
+            var args = new List<string>
+            {
+                "--enable-unsafe-webgpu",
+                // NO "Vulkan" here: forcing Chromium's Vulkan feature on Windows pushed Dawn off its
+                // native D3D12 path and the bundled Chromium silently fell back to the SwiftShader
+                // SOFTWARE adapter (vendor=google, arch=swiftshader, isFallbackAdapter=true - caught by
+                // WebGPU_AdapterIdentity_Probe 2026-07-03). Every WebGPU perf number measured before
+                // that fix was CPU-software-rasterizer time.
+                "--enable-features=WebGPUService,SkiaGraphite,FileSystemAccessPersistentPermission",
+                "--ignore-gpu-blocklist",
+                // Fail loudly rather than silently falling back to SwiftShader again.
+                "--disable-software-rasterizer",
+                // Unquantized GPU timestamps for 'timestamp-query' (Chrome otherwise rounds to 100us,
+                // which zeroes most per-pass durations in the dispatch-plan kernel attribution).
+                "--enable-webgpu-developer-features",
+                "--no-sandbox",
+                // Auto-grant file system write permission (no prompt)
+                "--disable-features=FileSystemAccessPermissionPrompt",
+                "--allow-file-access-from-files"
+            };
+
+            if (Environment.GetEnvironmentVariable("PMT_DAWN_DUMP") == "1")
+            {
+                var logFile = Environment.GetEnvironmentVariable("PMT_DAWN_LOG")
+                    ?? Path.Combine(Path.GetTempPath(), "chrome_dawn_dump.log");
+                try { if (File.Exists(logFile)) File.Delete(logFile); } catch { /* stale log, not fatal */ }
+                args.Add("--enable-dawn-features=dump_shaders,disable_symbol_renaming");
+                args.Add("--enable-logging");
+                args.Add($"--log-file={logFile}");
+                args.Add("--v=1");
+                LogStatus($"[PMT_DAWN_DUMP] Tint shader dump ON -> {logFile}");
+            }
+            return args.ToArray();
+        }
+
         private static string[]? LaneFilter()
         {
             var env = Environment.GetEnvironmentVariable("PMT_LANES");
