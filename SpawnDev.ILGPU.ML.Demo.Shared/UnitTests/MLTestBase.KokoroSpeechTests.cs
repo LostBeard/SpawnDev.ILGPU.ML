@@ -263,6 +263,10 @@ public abstract partial class MLTestBase
             // object - per dispatch. A high hit rate makes that column irreducible; a low one makes it a
             // pool-stability problem with an obvious fix. The counters have always been exposed and, like
             // the phase timers, have never been read for this model.
+            // ⚠️ SAY WHEN IT IS NOT MEASURED. The demo's copy of this reported "0 hits / 0 misses" for
+            // three runs before I noticed that was a failed cast, not an idle cache - and a zero like that
+            // gets quoted. A diagnostic that cannot tell "measured zero" from "not measured" is worse than
+            // one that is absent.
             if (pipeline.Session.Accelerator is SpawnDev.ILGPU.WebGPU.WebGPUAccelerator wgpu)
             {
                 var hits = wgpu.BindGroupCacheHits;
@@ -270,6 +274,11 @@ public abstract partial class MLTestBase
                 Console.WriteLine($"[KokoroCost] {BackendName} bind-group cache: {hits} hits, {misses} misses "
                     + $"({(hits + misses > 0 ? hits * 100.0 / (hits + misses) : 0):F1}% hit), "
                     + $"{wgpu.BindGroupCacheEntryCount} entries");
+            }
+            else
+            {
+                Console.WriteLine($"[KokoroCost] {BackendName} bind-group cache: not available "
+                    + $"({pipeline.Session.Accelerator.GetType().Name} is not a WebGPUAccelerator)");
             }
 
             var ex = Graph.GraphExecutor.LastRunTotalMs;

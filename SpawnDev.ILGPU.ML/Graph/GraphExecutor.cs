@@ -844,6 +844,9 @@ public class GraphExecutor : IDisposable
     /// <summary>True when this executor created its pool and must therefore dispose it.</summary>
     private readonly bool _ownsPool;
 
+    /// <summary>True when this executor built its own kernel helpers rather than sharing the registry's.</summary>
+    private readonly bool _ownsKernels;
+
     /// <param name="sharedPool">
     /// An existing intermediate pool to rent from instead of creating one.
     /// </param>
@@ -878,9 +881,23 @@ public class GraphExecutor : IDisposable
         _constantValues = constantValues;
         _quantizedWeights = quantizedWeights;
         _registry = registry;
-        _ew = new ElementWiseKernels(accelerator);
-        _precisionAware = new PrecisionAwareKernels(accelerator);
-        _normalization = new NormalizationKernels(accelerator);
+        // 🔴 THE REGISTRY ALREADY OWNS THESE, and building a second set per executor is what makes a
+        // recompiled shape expensive. Each of these classes caches its ILGPU kernels in INSTANCE fields
+        // (`_roundKernel ??= LoadAutoGroupedStreamKernel(...)`), so a fresh set starts with every cache
+        // empty and the first forward re-loads every kernel it touches.
+        //
+        // MEASURED on Kokoro in the demo's browser worker, the same sentence on a NEW input shape versus a
+        // REPEAT that hits the shape-executor cache: 3,036 ms of residual against 1,635 ms, a 1,401 ms
+        // penalty of which the device allocations account for **39 ms** and the four WebGPU dispatch
+        // phases for **80 ms**. Neither is the cost; a per-executor kernel cache that starts empty is.
+        //
+        // ⚠️ OWNERSHIP, and it removes a hazard rather than adding one. OperatorRegistry.Dispose already
+        // documents that an executor tearing down ITS copies can unload a module out from under the
+        // registry's (MEASURED: 0xC0000005 in cuModuleUnload). One owner, one disposal, no such race.
+        _ownsKernels = registry == null;
+        _ew = registry?.ElementWise ?? new ElementWiseKernels(accelerator);
+        _precisionAware = registry?.PrecisionAware ?? new PrecisionAwareKernels(accelerator);
+        _normalization = registry?.Normalization ?? new NormalizationKernels(accelerator);
         LastInitializerDataTypesCount = graph.InitializerDataTypes?.Count ?? -1;
         _integerTensorNames = BuildIntegerTensorNames(graph);
         LastIntegerTensorCount = _integerTensorNames.Count;
@@ -4700,9 +4717,13 @@ public class GraphExecutor : IDisposable
             foreach (var b in _retiredReadbackStaging) { try { b.Dispose(); } catch { } }
             _retiredReadbackStaging = null;
         }
-        _ew.Dispose();
-        _precisionAware.Dispose();
-        _normalization.Dispose();
+        // Only ours - see the constructor. The registry disposes the shared ones.
+        if (_ownsKernels)
+        {
+            _ew.Dispose();
+            _precisionAware.Dispose();
+            _normalization.Dispose();
+        }
         _convert?.Dispose();
 
         // ── And the MANAGED heap, which on Blazor WASM is the scarce one ─────────────────────────────

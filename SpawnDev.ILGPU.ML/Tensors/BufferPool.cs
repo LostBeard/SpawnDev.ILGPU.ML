@@ -1,4 +1,4 @@
-using System.IO;
+﻿using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using ILGPU;
@@ -268,6 +268,20 @@ public class BufferPool : IDisposable
     public static int TotalDeviceAllocations;
 
     /// <summary>
+    /// Cumulative wall time inside the device allocation itself (the <c>AllocateWithReclaim</c> call).
+    /// </summary>
+    /// <remarks>
+    /// 🔴 A COUNT IS NOT A COST. MEASURED on Kokoro in a browser worker: sharing the pool across shape
+    /// executors cut a new shape's fresh allocations 1,491 -> 589 and bought only ~170 ms of a ~1,280 ms
+    /// cold-shape penalty, which prices an allocation at ~0.19 ms and rules it out as the cause - while
+    /// the four WebGPU dispatch phases came back near-identical cold and warm (1,195 ms vs 1,117 ms),
+    /// ruling those out too. Something else carries that second, and a counter that reports only "how
+    /// many" cannot say whether it is this one. So this measures the allocation, rather than inviting the
+    /// next reader to price it by arithmetic the way I just did.
+    /// </remarks>
+    public static double TotalDeviceAllocationMs;
+
+    /// <summary>
     /// Names of the most recent FRESH device allocations (pool misses). A count says a forward leaks
     /// buffers; this says WHICH rents, which is what points at the operator responsible.
     /// Capped, and only appended when <see cref="TraceFreshAllocNames"/> is on.
@@ -445,6 +459,7 @@ public class BufferPool : IDisposable
         TotalDeviceAllocations++;
         if (TraceFreshAllocNames && RecentFreshAllocNames.Count < 4000)
             RecentFreshAllocNames.Add($"{name ?? "(unnamed)"}#{bucketSize}");
+        var _allocSw = System.Diagnostics.Stopwatch.StartNew();
         MemoryBuffer1D<float, Stride1D.Dense> newBuffer = _accelerator.AllocateWithReclaim(
             () => _accelerator.Allocate1D<float>(bucketSize),   // allocate
             DisposeBucketedBuffers,                             // reclaim (dispose Returned-not-live), returns bytes freed
@@ -457,6 +472,7 @@ public class BufferPool : IDisposable
                        $"({live / 1048576}MB) + {_allHalfBuffers.Count} fp16 ({half / 1048576}MB). Exceeds VRAM — " +
                        "needs tiled execution or fp16 activations.";
             });
+        TotalDeviceAllocationMs += _allocSw.Elapsed.TotalMilliseconds;
         _allBuffers.Add(newBuffer);
         // DIAGNOSTIC (Tuvok 2026-07-11): a NEW (not bucket-reused) large allocation DURING a run. On a warm,
         // resident pipeline these should be ~0 per gen (the working set reuses returned buckets). A buffer that
