@@ -80,6 +80,11 @@ public abstract partial class MLTestBase
         // "Download" is BOTH, and calling the total "network bound" without this split was exactly the
         // mistake made on 2026-09-15 - these files come off a VM on the same 1 Gb/s LAN, where 41.6 MB/s
         // is about a third of the link, so the limit is something we own until proven otherwise.
+        // ⚠️ WITH DownloadParallelism > 1 THE FETCH FIGURE IS A SUM OVER CONCURRENT REQUESTS, so it
+        // exceeds wall clock and the "unaccounted" remainder goes NEGATIVE (MEASURED: fetch 96,750 ms of
+        // a 33,062 ms download = 298%). That is the instrument double-counting overlap, not a bug in the
+        // download. Only the wall-clock line above is meaningful on the parallel path; the split is valid
+        // only when parallelism is 1.
         var fetchMs = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchMs;
         var storeMs = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastStoreWriteMs;
         var fetchMiB = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchBytes / 1048576.0;

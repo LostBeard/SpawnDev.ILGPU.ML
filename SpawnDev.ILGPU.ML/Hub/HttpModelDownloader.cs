@@ -254,7 +254,32 @@ public class HttpModelDownloader
     /// above are worth more than the code.
     /// </para>
     /// </remarks>
-    public bool UseSegmentedDownload { get; set; } = false;
+    public bool UseSegmentedDownload { get; set; } = true;
+
+    /// <summary>
+    /// How many ranged requests to keep in flight. 1 = serial, which measured SLOWER than streaming.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE HUB LIMIT IS PER-CONNECTION, MEASURED WITH curl FROM THIS MACHINE 2026-09-15:
+    /// <code>
+    ///   single stream   38.9 MB/s
+    ///   4 parallel      23.2 + 22.8 + 13.1 + 13.1 = 72.1 MB/s aggregate
+    /// </code>
+    /// A single connection leaves more than half the available throughput unused - and the browser's
+    /// 40.1 MB/s wall-clock download matches curl's single-stream number exactly, so the transport was
+    /// never our code.
+    /// <para>
+    /// ⚠️ THIS IS WHY PARALLEL HELPS WHERE SEGMENTING ALONE DID NOT. Serial 64 MiB ranges were SLOWER
+    /// than streaming (46.6s vs 43.6s) because they removed the overlap a streaming body gets for free.
+    /// Parallel ranges add capacity that is provably idle instead of removing work that was overlapping.
+    /// </para>
+    /// <para>
+    /// ⚠️ FETCHED IN PARALLEL, WRITTEN IN ORDER: the store's write stream is sequential, so segments are
+    /// requested concurrently and each written only when it is next in sequence. Peak JS memory is about
+    /// <c>SegmentBytes x DownloadParallelism</c>.
+    /// </para>
+    /// </remarks>
+    public int DownloadParallelism { get; set; } = 4;
 
     private async Task DownloadAsync(string url, string key, long resumeFrom, string? knownETag,
         IProgress<ModelDownloadProgress>? progress, CancellationToken ct)
@@ -365,19 +390,63 @@ public class HttpModelDownloader
             // streaming loop, which is unchanged and remains the fallback for origins without ranges.
             if (UseSegmentedDownload && SegmentBytes > 0 && status == 206)
             {
-                var segResponse = response;          // the first segment is already in hand
+                // Fetch segments CONCURRENTLY, write them IN ORDER. The store's write stream is
+                // sequential, so a completed later segment waits its turn; the win is purely that the
+                // network has several requests outstanding at once (see DownloadParallelism).
+                async Task<Uint8Array> FetchSegmentAsync(long start)
+                {
+                    var h = new Dictionary<string, string>
+                    {
+                        ["Range"] = $"bytes={start}-{start + SegmentBytes - 1}",
+                    };
+                    // If-Range: a file that changed underneath us answers 200, and we fail loudly rather
+                    // than splicing two different versions together.
+                    if (!string.IsNullOrEmpty(etag)) h["If-Range"] = etag!;
+
+                    var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var r = await _js.Fetch(url, new FetchOptions { Headers = h, Signal = abortSignal })
+                        .ConfigureAwait(false);
+                    using (r)
+                    {
+                        if (!r.Ok)
+                            throw new HttpRequestException(
+                                $"Model download failed mid-file: {(int)r.Status} {r.StatusText} " +
+                                $"for {url} at byte {start}");
+                        if ((int)r.Status != 206)
+                            throw new IOException(
+                                $"Origin stopped honouring Range at byte {start} for {url} " +
+                                $"(status {(int)r.Status}). The file may have changed mid-download; the " +
+                                "partial is checkpointed, so a retry resumes from the last durable byte.");
+                        var bytes = await r.Bytes().ConfigureAwait(false);
+                        AddFetch((System.Diagnostics.Stopwatch.GetTimestamp() - t0)
+                                 * (1000.0 / System.Diagnostics.Stopwatch.Frequency), bytes.Length);
+                        return bytes;
+                    }
+                }
+
+                var inFlight = new Queue<Task<Uint8Array>>();
+                // The first segment's response is already in hand - consume it as segment 0.
+                var firstT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                var firstBytes = await response.Bytes().ConfigureAwait(false);
+                AddFetch((System.Diagnostics.Stopwatch.GetTimestamp() - firstT0)
+                         * (1000.0 / System.Diagnostics.Stopwatch.Frequency), firstBytes.Length);
+                inFlight.Enqueue(Task.FromResult(firstBytes));
+
+                long nextRequestAt = resumeFrom + firstBytes.Length;
+                int parallel = Math.Max(1, DownloadParallelism);
+                while (inFlight.Count < parallel && (total <= 0 || nextRequestAt < total))
+                {
+                    inFlight.Enqueue(FetchSegmentAsync(nextRequestAt));
+                    nextRequestAt += SegmentBytes;
+                }
+
                 try
                 {
-                    while (true)
+                    while (inFlight.Count > 0)
                     {
                         ct.ThrowIfCancellationRequested();
-
-                        // ONE crossing for the whole segment; the bytes stay a JS Uint8Array.
-                        var _fT0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                        using var segBytes = await segResponse.Bytes().ConfigureAwait(false);
+                        using var segBytes = await inFlight.Dequeue().ConfigureAwait(false);
                         var segLen = segBytes.Length;
-                        AddFetch((System.Diagnostics.Stopwatch.GetTimestamp() - _fT0)
-                                 * (1000.0 / System.Diagnostics.Stopwatch.Frequency), segLen);
                         if (segLen == 0) break;
 
                         await WriteChunkAsync(dest, segBytes, ct).ConfigureAwait(false);
@@ -398,34 +467,23 @@ public class HttpModelDownloader
                         ActiveDownloadsChanged?.Invoke();
 
                         if (total > 0 && received >= total) break;
-
-                        // Next segment. If-Range so a file that changed underneath us answers 200 and we
-                        // fail loudly rather than splicing two different versions together.
-                        var nextHeaders = new Dictionary<string, string>
+                        // Top the pipeline back up.
+                        if (total <= 0 || nextRequestAt < total)
                         {
-                            ["Range"] = $"bytes={received}-{received + SegmentBytes - 1}",
-                        };
-                        if (!string.IsNullOrEmpty(etag)) nextHeaders["If-Range"] = etag!;
-
-                        segResponse.Dispose();
-                        segResponse = await _js.Fetch(url, new FetchOptions
-                        {
-                            Headers = nextHeaders,
-                            Signal = abortSignal,
-                        }).ConfigureAwait(false);
-
-                        if (!segResponse.Ok)
-                            throw new HttpRequestException(
-                                $"Model download failed mid-file: {(int)segResponse.Status} " +
-                                $"{segResponse.StatusText} for {url} at byte {received}");
-                        if ((int)segResponse.Status != 206)
-                            throw new IOException(
-                                $"Origin stopped honouring Range at byte {received} for {url} " +
-                                $"(status {(int)segResponse.Status}). The file may have changed mid-download; " +
-                                "the partial is checkpointed, so a retry resumes from the last durable byte.");
+                            inFlight.Enqueue(FetchSegmentAsync(nextRequestAt));
+                            nextRequestAt += SegmentBytes;
+                        }
                     }
                 }
-                finally { segResponse.Dispose(); }
+                finally
+                {
+                    // Drain anything still outstanding so a failure cannot leave fetches running.
+                    while (inFlight.Count > 0)
+                    {
+                        try { (await inFlight.Dequeue().ConfigureAwait(false)).Dispose(); }
+                        catch { /* already failing; nothing to add */ }
+                    }
+                }
 
                 await dest.FlushAsync(ct).ConfigureAwait(false);
                 await _store.SetStateAsync(key, url, total, written, true, etag, ct).ConfigureAwait(false);
