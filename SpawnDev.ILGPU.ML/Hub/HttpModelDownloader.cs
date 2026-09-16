@@ -54,6 +54,38 @@ public class HttpModelDownloader
     /// <summary>Minimum gap between progress reports. The final report is always sent.</summary>
     public int ProgressIntervalMs { get; set; } = 100;
 
+    // ── FETCH vs OPFS-WRITE split ───────────────────────────────────────────────────────────────
+    //
+    // 🔴 "DOWNLOAD" IS TWO THINGS AND THIS PATH TIMED NEITHER. A download here is fetch -> coalesce
+    // JS-side -> write to the store, and the reported MB/s covers all of it. MEASURED 2026-09-15:
+    // Qwen3-1.7B (1.83 GB) downloaded at 41.6 MB/s, which I reported as "network bound". TJ: "not even
+    // close. those files are downloading from a VM on this very same 1 GB/s lan." He is right - a
+    // gigabit LAN should deliver 100+ MB/s, so 41.6 is about a third of the link and the bottleneck is
+    // something we own, not the wire.
+    //
+    // Without this split there is no way to tell a slow SERVER/link from slow OPFS WRITES, and the
+    // upload path had exactly this blind spot until it was instrumented an hour earlier (where it
+    // turned out the GPU write was free and the read dominated 11.5:1). Same mistake, same fix:
+    // measure the two halves instead of naming one.
+    //
+    // Cheap enough to leave on: two Stopwatch timestamps per fetch chunk.
+
+    /// <summary>Cumulative ms inside <c>reader.Read()</c> - the fetch/network half. Reset per download.</summary>
+    public static double LastFetchMs { get; private set; }
+    /// <summary>Cumulative ms writing to the store (OPFS) including coalesced flushes. Reset per download.</summary>
+    public static double LastStoreWriteMs { get; private set; }
+    /// <summary>Bytes seen by the fetch half. Reset per download.</summary>
+    public static long LastFetchBytes { get; private set; }
+
+    private static void ResetTransferCensus()
+    {
+        LastFetchMs = 0; LastStoreWriteMs = 0; LastFetchBytes = 0; LastFetchChunks = 0;
+    }
+    /// <summary>Fetch chunks seen. Reset per download - the loop cost scales with THIS, not with bytes.</summary>
+    public static long LastFetchChunks { get; private set; }
+    private static void AddFetch(double ms, long bytes) { LastFetchMs += ms; LastFetchBytes += bytes; LastFetchChunks++; }
+    private static void AddStoreWrite(double ms) { LastStoreWriteMs += ms; }
+
     /// <summary>Chunks delivered by <c>fetch</c> during the most recent download (diagnostic).</summary>
     public long LastDownloadChunks { get; private set; }
 
@@ -231,6 +263,7 @@ public class HttpModelDownloader
         // a short download still produces real intermediate progress.
         var lastReport = Environment.TickCount64 - ProgressIntervalMs;
         var lastCheckpoint = written;
+        ResetTransferCensus();
         long chunkCount = 0, writeCount = 0;
         Uint8Array? writeBuffer = null;
         long bufferFill = 0;
@@ -250,7 +283,11 @@ public class HttpModelDownloader
                         ct.ThrowIfCancellationRequested();
                     }
 
+                    var _fetchT0 = System.Diagnostics.Stopwatch.GetTimestamp();
                     using var result = await reader.Read().ConfigureAwait(false);
+                    AddFetch((System.Diagnostics.Stopwatch.GetTimestamp() - _fetchT0)
+                             * (1000.0 / System.Diagnostics.Stopwatch.Frequency),
+                             result.Done || result.Value == null ? 0 : result.Value.Length);
                     if (result.Done) break;
 
                     // 🔴 The chunk stays a JS Uint8Array from here to the store. Never ReadBytes() it.
@@ -371,12 +408,21 @@ public class HttpModelDownloader
     /// non-JS store (a desktop file store), where a managed copy is the only option and is correct.</remarks>
     private static async Task WriteChunkAsync(Stream dest, Uint8Array chunk, CancellationToken ct)
     {
-        if (dest is SpawnDev.SpawnJS.Toolbox.IJSWriteStream js)
+        var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
         {
-            await js.WriteUint8ArrayAsync(chunk, ct).ConfigureAwait(false);
-            return;
+            if (dest is SpawnDev.SpawnJS.Toolbox.IJSWriteStream js)
+            {
+                await js.WriteUint8ArrayAsync(chunk, ct).ConfigureAwait(false);
+                return;
+            }
+            await dest.WriteAsync(chunk.ReadBytes(), ct).ConfigureAwait(false);
         }
-        await dest.WriteAsync(chunk.ReadBytes(), ct).ConfigureAwait(false);
+        finally
+        {
+            AddStoreWrite((System.Diagnostics.Stopwatch.GetTimestamp() - t0)
+                          * (1000.0 / System.Diagnostics.Stopwatch.Frequency));
+        }
     }
 
     /// <summary>

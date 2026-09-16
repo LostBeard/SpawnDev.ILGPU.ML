@@ -76,6 +76,24 @@ public abstract partial class MLTestBase
         Console.WriteLine($"[LoadBench] DOWNLOAD to OPFS: {dlSec:F1}s = {mb / Math.Max(0.001, dlSec):F1} MB/s " +
                           $"({progressReports} progress reports, last {lastBytes:N0}/{totalBytes:N0})");
 
+        // ── DOWNLOAD SPLIT: fetch (network) vs store write (OPFS) ────────────────────────────────
+        // "Download" is BOTH, and calling the total "network bound" without this split was exactly the
+        // mistake made on 2026-09-15 - these files come off a VM on the same 1 Gb/s LAN, where 41.6 MB/s
+        // is about a third of the link, so the limit is something we own until proven otherwise.
+        var fetchMs = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchMs;
+        var storeMs = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastStoreWriteMs;
+        var fetchMiB = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchBytes / 1048576.0;
+        Console.WriteLine($"[LoadBench] DOWNLOAD SPLIT: fetch {fetchMs:F0} ms "
+            + $"({(fetchMs > 0 ? fetchMiB / (fetchMs / 1000.0) : 0):F0} MB/s) | "
+            + $"store write {storeMs:F0} ms "
+            + $"({(storeMs > 0 ? fetchMiB / (storeMs / 1000.0) : 0):F0} MB/s) | "
+            + $"fetch+write {fetchMs + storeMs:F0} ms of {dlSec * 1000:F0} ms "
+            + $"({(dlSec > 0 ? (fetchMs + storeMs) / (dlSec * 1000) * 100 : 0):F0}%) | "
+            + $"{fetchMiB:F0} MiB over {SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks:N0} fetch chunks "
+            + $"({(SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks > 0 ? fetchMiB * 1024 / SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks : 0):F0} KiB each, "
+            + $"unaccounted {dlSec * 1000 - fetchMs - storeMs:F0} ms = "
+            + $"{(SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks > 0 ? (dlSec * 1000 - fetchMs - storeMs) / SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks * 1000 : 0):F0} us/chunk)");
+
         // ── WARM: load from the cache onto the GPU ───────────────────────────────────────────────────
         // TraceWeightLoad prints the stream-READ vs GPU-WRITE split, which is what says whether the
         // remaining time is delivery or upload.
