@@ -213,15 +213,114 @@ public class HttpModelDownloader
     /// </para>
     /// <para>
     /// ⚠️ It also keeps everything the chunk loop gave us: progress per segment, a durable checkpoint per
-    /// segment (resume granularity becomes 64 MiB rather than 8 MiB, still durable), and If-Range so a
+    /// segment (resume granularity is one segment, still durable), and If-Range so a
     /// file that changes mid-download restarts instead of splicing two versions together.
     /// </para>
     /// <para>
-    /// ⚠️ Peak JS memory is ONE segment. 64 MiB is the trade: large enough that per-request overhead is
-    /// noise against a gigabit link, small enough to be nothing on any machine that can run a 1.8 GB model.
+    /// ⚠️ THIS IS NOW ONLY THE CEILING - the actual segment is sized by TIME, see
+    /// <see cref="TargetSecondsPerSegment"/>. It was a flat 64 MiB until TJ called it (2026-09-15):
+    /// *"64mb is kind of big if that is the progress
+    /// increment for downloads... js interop calls are not that intensive and good feedback for the user
+    /// is better than shaving a few seconds off. not everyone has fiber."* Both halves are right:
+    /// <list type="bullet">
+    /// <item>On a 2 MB/s link a 64 MiB step is a bar that freezes for <b>32 seconds</b> at a time.</item>
+    /// <item>A segment is also the durable checkpoint, so a drop re-downloaded up to 64 MiB - worst
+    /// exactly on the connections that drop.</item>
+    /// <item>The interop it was buying is measurably nothing. The streaming loop's 9.7 s of interop was
+    /// 90,692 iterations = <b>0.107 ms each</b>; 4 MiB segments make a 1.83 GB file 458 requests ≈ 0.05 s.
+    /// Optimising that against a frozen progress bar was the wrong trade.</item>
+    /// </list>
+    /// MEASURED on the 1.83 GB model, same machine and hub, four rules:
+    /// <code>
+    ///   64 MiB fixed                35.8 s  48.8 MB/s    31 reports
+    ///    4 MiB fixed                46.3 s  37.8 MB/s   441 reports   &lt;-- 29% SLOWER
+    ///   time-sized, 64 MiB cap      35.0 s  49.9 MB/s    71 reports
+    ///   time-sized, 16 MiB cap      35.9 s  48.7 MB/s   113 reports   &lt;-- SHIPPED
+    /// </code>
+    /// 16 MiB costs nothing measurable against 64 MiB and gives 3.6x the progress updates, so it is the
+    /// ceiling. Peak JS memory is <c>SegmentBytes x DownloadParallelism</c> = 64 MiB, down from 256 MiB.
+    /// <para>
+    /// ⚠️ The ceiling alone is NOT the fix - sizing by time is. A fixed 16 MiB on a 2 MB/s link is still
+    /// an 8-second freeze; the time rule picks ~3 MiB there and only reaches this cap when the connection
+    /// can actually fill it.
+    /// </para>
     /// </para>
     /// </remarks>
-    public int SegmentBytes { get; set; } = 64 * 1024 * 1024;
+    public int SegmentBytes { get; set; } = 16 * 1024 * 1024;   // TJ 2026-09-15: "middle ground... 16mb"
+
+    /// <summary>
+    /// Smallest segment the adaptive sizing will pick, and the size of the FIRST bounded range.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 THE BUG THIS EXISTS FOR (2026-09-15, caught by `OpfsModelCache_ProgressFiresDuringDownload` on
+    /// all three browser backends): the segmented path reports progress ONCE PER SEGMENT, so a file
+    /// smaller than one segment produced exactly two reports - 0% and 100% - and a progress bar that
+    /// never moves. The 2 MB test file fit inside a single 64 MiB segment; the 1.83 GB benchmark hid it
+    /// completely because 28 segments look like healthy progress. **A granularity chosen for throughput
+    /// silently became the granularity of the UI.**
+    ///
+    /// The first range is issued BEFORE the total is known (that is the point - its 206 Content-Range is
+    /// what tells us the total), so it cannot itself be sized from the total. It is therefore this
+    /// probe-sized request, and every later segment is sized from the total that came back. One extra
+    /// round trip on a multi-GB download is noise; a dead progress bar on every small model is not.
+    /// </remarks>
+    public int MinSegmentBytes { get; set; } = 512 * 1024;
+
+    /// <summary>
+    /// How long ONE segment should take to fetch. This - not a byte count - is what sizes a segment, so
+    /// the progress bar updates at roughly this interval on ANY connection.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 SIZING BY BYTES CANNOT SATISFY BOTH ENDS, MEASURED 2026-09-15 on the 1.83 GB model:
+    /// <code>
+    ///   64 MiB segments   35.8 s  48.8 MB/s   31 reports
+    ///    4 MiB segments   46.3 s  37.8 MB/s  441 reports   &lt;-- 29% SLOWER
+    /// </code>
+    /// The 4 MiB cost is NOT interop (that is 0.107 ms per iteration, nothing). It is per-request latency
+    /// and a fresh TCP ramp per range: at 48 MB/s a 4 MiB segment is over in ~100 ms, so the overhead is
+    /// most of it. **But that is only true on a fast link.** At 2 MB/s the same 4 MiB segment takes 2 s
+    /// and the identical overhead is ~1% - invisible. The variable that actually matters is TIME, and
+    /// sizing by time gives both ends what they need:
+    /// <list type="bullet">
+    /// <item>fast link  -&gt; large segments, full throughput, and the bar still ticks every ~1.5 s
+    /// because the whole download is short;</item>
+    /// <item>slow link  -&gt; small segments, a bar that moves every ~1.5 s, and finer resume
+    /// checkpoints, which is exactly where a dropped connection is likely.</item>
+    /// </list>
+    /// </remarks>
+    public double TargetSecondsPerSegment { get; set; } = 1.5;
+
+    /// <summary>
+    /// Segment size from the MEASURED per-connection rate. Each segment is fetched on its own connection,
+    /// so bytes/elapsed summed over completed fetches is the right rate for "how long will one more take"
+    /// - it is per-connection by construction, which is why the parallel-inflated wall-clock figure does
+    /// not distort it. Falls back to <see cref="MinSegmentBytes"/> until there is a sample.
+    /// </summary>
+    private long EffectiveSegmentBytes()
+    {
+        if (LastFetchMs <= 0 || LastFetchBytes <= 0) return MinSegmentBytes;
+        return SegmentBytesForRate(LastFetchBytes / LastFetchMs, TargetSecondsPerSegment,
+                                   MinSegmentBytes, SegmentBytes);
+    }
+
+    /// <summary>
+    /// The sizing law, as a pure function so it can be gated directly: how many bytes to ask for when one
+    /// connection is moving <paramref name="bytesPerMs"/> and a segment should take
+    /// <paramref name="targetSeconds"/>. Clamped to [<paramref name="min"/>, <paramref name="max"/>].
+    /// </summary>
+    /// <remarks>
+    /// Public because the behaviour that matters to a user - "the bar moves about every
+    /// <paramref name="targetSeconds"/> seconds on ANY connection" - lives entirely here, and a test that
+    /// only watches a 2 MB download over a fast LAN cannot observe it.
+    /// </remarks>
+    public static long SegmentBytesForRate(double bytesPerMs, double targetSeconds, long min, long max)
+    {
+        if (!(bytesPerMs > 0) || !(targetSeconds > 0)) return min;
+        var want = bytesPerMs * targetSeconds * 1000.0;
+        if (want <= min) return min;
+        if (want >= max) return max;
+        return (long)want;
+    }
 
     /// <summary>
     /// Fetch the file as bounded ranges instead of streaming one body. <b>Default FALSE - it MEASURED
@@ -291,7 +390,9 @@ public class HttpModelDownloader
         // back to the streaming chunk loop below, exactly as before.
         if (UseSegmentedDownload && SegmentBytes > 0)
         {
-            headers["Range"] = $"bytes={resumeFrom}-{resumeFrom + SegmentBytes - 1}";
+            // Probe-sized, NOT SegmentBytes: see MinSegmentBytes. The total is unknown here, and a
+            // first range big enough to swallow a small file entirely is what killed the progress bar.
+            headers["Range"] = $"bytes={resumeFrom}-{resumeFrom + MinSegmentBytes - 1}";
             if (!string.IsNullOrEmpty(knownETag)) headers["If-Range"] = knownETag!;
         }
         else if (resumeFrom > 0)
@@ -366,10 +467,6 @@ public class HttpModelDownloader
         // this a caller cannot render a progress bar at all until the first interval elapses - and for a
         // file that finishes faster than ProgressIntervalMs the ONLY report was the final 100%, which is
         // indistinguishable from no progress reporting at all. It also hands the UI the total immediately.
-        // Report ONCE up front, as soon as the total is known and before a single byte is read. Without
-        // this a caller cannot render a progress bar at all until the first interval elapses - and for a
-        // file that finishes faster than ProgressIntervalMs the ONLY report was the final 100%, which is
-        // indistinguishable from no progress reporting at all. It also hands the UI the total immediately.
         progress?.Report(new ModelDownloadProgress(received, total, resumed));
 
         // Deliberately NOT `TickCount64`: seeding with "now" suppressed the first in-loop report for a
@@ -393,11 +490,11 @@ public class HttpModelDownloader
                 // Fetch segments CONCURRENTLY, write them IN ORDER. The store's write stream is
                 // sequential, so a completed later segment waits its turn; the win is purely that the
                 // network has several requests outstanding at once (see DownloadParallelism).
-                async Task<Uint8Array> FetchSegmentAsync(long start)
+                async Task<Uint8Array> FetchSegmentAsync(long start, long len)
                 {
                     var h = new Dictionary<string, string>
                     {
-                        ["Range"] = $"bytes={start}-{start + SegmentBytes - 1}",
+                        ["Range"] = $"bytes={start}-{start + len - 1}",
                     };
                     // If-Range: a file that changed underneath us answers 200, and we fail loudly rather
                     // than splicing two different versions together.
@@ -433,11 +530,14 @@ public class HttpModelDownloader
                 inFlight.Enqueue(Task.FromResult(firstBytes));
 
                 long nextRequestAt = resumeFrom + firstBytes.Length;
+                // NOW the total is known (the first 206 carried Content-Range), so size the rest of the
+                // segments to produce a bar with real steps instead of one 64 MiB jump.
                 int parallel = Math.Max(1, DownloadParallelism);
                 while (inFlight.Count < parallel && (total <= 0 || nextRequestAt < total))
                 {
-                    inFlight.Enqueue(FetchSegmentAsync(nextRequestAt));
-                    nextRequestAt += SegmentBytes;
+                    var seg = EffectiveSegmentBytes();
+                    inFlight.Enqueue(FetchSegmentAsync(nextRequestAt, seg));
+                    nextRequestAt += seg;
                 }
 
                 try
@@ -470,8 +570,11 @@ public class HttpModelDownloader
                         // Top the pipeline back up.
                         if (total <= 0 || nextRequestAt < total)
                         {
-                            inFlight.Enqueue(FetchSegmentAsync(nextRequestAt));
-                            nextRequestAt += SegmentBytes;
+                            // Re-sized per request, so the segment tracks the connection as it ramps up
+                            // (or degrades) instead of being fixed by the first sample.
+                            var seg = EffectiveSegmentBytes();
+                            inFlight.Enqueue(FetchSegmentAsync(nextRequestAt, seg));
+                            nextRequestAt += seg;
                         }
                     }
                 }

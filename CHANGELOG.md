@@ -45,6 +45,42 @@ forward-only non-seekable stream comparing boxed runtime TYPE as well as value, 
 observes the parser's real first read rather than copying the private constant, non-GGUF fail-fast with a
 byte count, and truncated-stream detection.
 
+### Fixed - a download segment was also the progress increment and the resume checkpoint
+
+A segment is simultaneously the download's throughput unit, its progress increment, and its durable
+resume checkpoint. Sizing it for the first silently set the other two, and at a flat 64 MiB that meant a
+progress bar frozen for 32 seconds at a time on a 2 MB/s link, and up to 64 MiB re-downloaded after a
+dropped connection - worst precisely on the connections that drop. A file smaller than one segment (the
+2 MB test model) reported only 0% and 100%, caught by `OpfsModelCache_ProgressFiresDuringDownload`
+failing on all three browser backends.
+
+Shrinking the segment is not the answer either - the cost is per-request latency and a fresh TCP ramp per
+range, not interop (interop is 0.107 ms per iteration). MEASURED on the 1.83 GB model, same machine and
+hub:
+
+```
+  64 MiB fixed                35.8 s  48.8 MB/s    31 reports
+   4 MiB fixed                46.3 s  37.8 MB/s   441 reports   <-- 29% SLOWER
+  time-sized, 64 MiB cap      35.0 s  49.9 MB/s    71 reports
+  time-sized, 16 MiB cap      35.9 s  48.7 MB/s   113 reports   <-- shipped
+```
+
+That overhead only bites on a fast link: at 48 MB/s a 4 MiB segment is over in ~100 ms so the overhead is
+most of it, while at 2 MB/s the same segment takes 2 s and the identical overhead is ~1%. The variable
+that matters is TIME, so `HttpModelDownloader` now sizes each segment from the MEASURED per-connection
+rate to take `TargetSecondsPerSegment` (1.5 s), clamped to [`MinSegmentBytes` 512 KiB, `SegmentBytes`
+16 MiB]. Fast links keep full throughput and tick more often than the target; slow links get small
+segments, a live bar, and fine-grained resume. Peak JS memory falls from 256 MiB to 64 MiB
+(`SegmentBytes x DownloadParallelism`).
+
+The first bounded range is `MinSegmentBytes` rather than a full segment, because it is issued before the
+total is known - its 206 `Content-Range` is what reports the total - so a first range large enough to
+swallow a small file entirely is what killed the bar.
+
+New gate `MLTestBase.DownloadSegmentSizingTests` (2 tests x 6 backends) asserts the update interval holds
+from 0.5 to 120 MB/s, since a 2 MB download over a fast LAN cannot observe slow-connection behaviour. The
+sizing law is exposed as the pure `HttpModelDownloader.SegmentBytesForRate` for exactly that reason.
+
 ### Added - `HYDRATE SPLIT` accounting in `LargeModel_LoadBenchmark`
 
 `GGUFModel.LastHydrateMs` / `LastHydrateBytes` / `LastHydrateTensors` / `LastHydrateLargestBytes` report
