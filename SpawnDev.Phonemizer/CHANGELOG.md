@@ -1,5 +1,25 @@
 # SpawnDev.Phonemizer Changelog
 
+## 1.1.1
+
+### Added
+
+- **`EcosystemNames`, applied by `EmbeddedData.CreatePhonemizer`** - proper nouns this ecosystem says out
+  loud that CMUdict has never heard of.
+
+  A mispronounced name is the one defect the pipeline cannot see. It is not dropped, it is not unmapped,
+  and every phoneme it produces is a real phoneme with a real model token - so the frontend reports 100%
+  coverage while the voice says something else entirely. The only instrument is a person listening.
+
+  MEASURED 2026-09-16: `"Reachy"` phonemized to `ɹiˈeɪki` - "ree-AY-kee", three syllables, stress on a
+  vowel the word does not contain. The rules are behaving correctly; English spells `ch` as /k/ often
+  enough (*ache*, *stomach*, *chrome*) that a model learned from a dictionary will reach for it. It now
+  reads `ɹˈiːtʃi`.
+
+  Applied at construction, so a caller's own `Define` still wins - which is the right order for a name
+  somebody pronounces differently.
+
+
 ## 1.1.0 (2026-08-29)
 
 ### Added

@@ -2,6 +2,29 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.16 - the capture that started and said nothing
+
+`MediaStreamCapture.AudioLoop` had this:
+
+```csharp
+try { res = await _audioReader.Read(); }
+catch { break; }
+```
+
+A failing reader exited the loop quietly, so the caller saw a capture that had **started** and then
+delivered nothing, forever, with `LastAudioError` still `null`. That is indistinguishable from a silent
+room, and it is worth more than a log line: each diagnosis attempt against real hardware costs a deploy
+and several minutes.
+
+It now records the exception and reports it through `OnAudioError` before stopping, records separately
+that the track ENDED (not an error, but from outside identical to the loop dying), and logs that the loop
+started plus the first frame's sample count and rate - "did my consumer run" and "did it receive
+anything" being the first two questions of every "it cannot hear me" report.
+
+Also pulls **SpawnDev.Phonemizer 1.1.1**, so `CreatePhonemizer` knows the ecosystem's own proper nouns.
+A mispronounced name passes every automated check there is - nothing dropped, nothing unmapped, 100%
+coverage - while the voice says a different word.
+
 ## Unreleased - GGUF header: parsed once per load, and the retry stopped re-materialising it
 
 MEASURED 2026-09-16, Qwen3-1.7B-Q8_0 (1,749 MiB, 151,936 tokens + 151,387 merges), WebGPU in the browser

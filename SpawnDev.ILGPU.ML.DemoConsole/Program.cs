@@ -216,6 +216,11 @@ if (args.Length > 0 && args[0] == "KOKOROFIT")
         Console.WriteLine($"  \"{text}\"");
         Console.WriteLine($"    {symbols.Count} symbols -> {tokens.Length} tokens (incl. 2 pad), "
                         + $"{dropped} dropped");
+        // PRINT WHAT IT WILL ACTUALLY SAY. Counting symbols proves they are all encodable and says
+        // nothing about whether they are the RIGHT ones - a name the letter-to-sound model guesses wrong
+        // ("Reachy" as ree-kee) fits the vocabulary perfectly and is still wrong out loud. This is the
+        // only cheap way to check a pronunciation without rendering audio and listening to it.
+        Console.WriteLine($"    {string.Join("", symbols)}");
     }
     var fit = totalSymbols == 0 ? 100 : (totalSymbols - totalDropped) * 100.0 / totalSymbols;
     Console.WriteLine($"KOKOROFIT: {totalSymbols - totalDropped}/{totalSymbols} symbols encodable ({fit:F1}%)");

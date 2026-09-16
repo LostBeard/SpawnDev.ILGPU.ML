@@ -153,6 +153,38 @@ public abstract partial class MLTestBase
     });
 
     [TestMethod]
+    public async Task Phonemizer_SaysTheEcosystemsOwnNamesCorrectly() => await RunPureTest(() =>
+    {
+        // A MISPRONOUNCED NAME PASSES EVERY OTHER CHECK. It is not dropped, not unmapped, and every
+        // phoneme it produces is real and encodable - coverage reports 100% while the voice says a
+        // different word. Only a person listening catches it, which is how "Reachy" reached a shipped
+        // robot as "ree-AY-kee" (MEASURED 2026-09-16: the rules produced IPA with no CH in it at all,
+        // because English spells ch as /k/ often enough - ache, stomach, chrome - that a model learned
+        // from a dictionary reaches for it).
+        var phonemizer = EmbeddedData.CreatePhonemizer();
+
+        var reachy = phonemizer.ToIpa("Reachy");
+        if (!reachy.Contains("tʃ"))
+            throw new Exception($"\"Reachy\" has no CH in it: \"{reachy}\" - it will be said ree-kee");
+        if (reachy.Contains('k'))
+            throw new Exception($"\"Reachy\" came out with a K: \"{reachy}\"");
+
+        // The stress belongs on the FIRST syllable. Getting this wrong moves the emphasis without
+        // changing a single sound, which leaves a name recognisable and still wrong.
+        var stress = reachy.IndexOf('ˈ');
+        if (stress < 0) throw new Exception($"\"Reachy\" has no primary stress: \"{reachy}\"");
+        if (reachy[(stress + 1)..].Contains('i') && reachy[..stress].Contains('i'))
+            throw new Exception($"the stress is on the wrong syllable of \"{reachy}\"");
+
+        // It has to survive being said in a sentence, not only alone - the same path a reply takes.
+        var sentence = phonemizer.ToIpa("Hello, this is Reachy speaking.");
+        if (!sentence.Contains("tʃ"))
+            throw new Exception($"\"Reachy\" lost its CH inside a sentence: \"{sentence}\"");
+
+        return Task.CompletedTask;
+    });
+
+    [TestMethod]
     public async Task Phonemizer_DefineBeatsGuessingAndSurvivesASentence() => await RunPureTest(() =>
     {
         // A name you KNOW should never be guessed at. Letter-to-sound is right about half the time,

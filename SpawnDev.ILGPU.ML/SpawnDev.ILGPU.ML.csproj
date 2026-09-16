@@ -5,7 +5,7 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<Version>5.2.16</Version>
-		<PackageReleaseNotes>v5.2.15 - GGUF header parsing read once instead of field by field: the "parse" stage of a warm model load falls 2.2s to 0.6s and a cached 1.83 GB load 4.5s to 2.8s (408 to 614 MB/s). Download segments are now sized by measured connection rate (~1.5s each, capped 16 MiB) so the progress bar and resume checkpoints stay useful on slow links without losing throughput. See CHANGELOG.md</PackageReleaseNotes>
+		<PackageReleaseNotes>v5.2.16 - Speech input and pronunciation. MediaStreamCapture no longer swallows the reason its audio loop stopped: a bare catch on the stream reader turned every capture failure into a capture that had started and then delivered nothing, forever, with LastAudioError still null - indistinguishable from a silent room. It now reports the exception, distinguishes a track that ENDED from one that threw, and logs that the loop started plus the first frame's size and rate, which are the first two questions any "it cannot hear me" report asks. Pulls SpawnDev.Phonemizer 1.1.1, whose CreatePhonemizer teaches itself the ecosystem's proper nouns - a name the letter-to-sound rules guess wrong passes every check there is, because every phoneme it emits is valid and encodable while the voice says a different word.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

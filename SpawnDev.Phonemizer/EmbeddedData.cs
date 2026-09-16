@@ -28,8 +28,17 @@ public static class EmbeddedData
         => LetterToSound.Parse(ReadLines("lts-model.txt.gz"));
 
     /// <summary>A phonemizer with everything wired up, which is what most callers want.</summary>
+    /// <remarks>
+    /// Includes <see cref="EcosystemNames"/>, because a name the letter-to-sound rules guess is wrong in a
+    /// way no check can see: every phoneme it emits is valid and encodable, so coverage reports 100% while
+    /// the voice says the wrong word. A caller may still <c>Define</c> over any of them afterwards.
+    /// </remarks>
     public static EnglishPhonemizer CreatePhonemizer()
-        => new(LoadDictionary()) { LetterToSound = LoadLetterToSound() };
+    {
+        var phonemizer = new EnglishPhonemizer(LoadDictionary()) { LetterToSound = LoadLetterToSound() };
+        EcosystemNames.Apply(phonemizer);
+        return phonemizer;
+    }
 
     private static IEnumerable<string> ReadLines(string resourceName)
     {

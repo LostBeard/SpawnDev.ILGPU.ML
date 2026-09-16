@@ -25,8 +25,8 @@
       which is GPL-3. Zero dependencies, browser-capable, data embedded. Tying it to an ML runtime nobody
       needs for text-to-phonemes would be the wrong shape.
     -->
-    <Version>1.1.0</Version>
-    <PackageReleaseNotes>v1.1.0 - Define/Remove a pronunciation at runtime, so a name you know is told rather than guessed. New PhonemeVocabulary maps symbols to a model token ids and back. Acronyms are spelled out and possessives resolve their stem instead of being guessed. Text fixes: grouped numbers no longer read as years, clock times lose their colon, street St. is no longer saint, ampersand and number sign are no longer silent, co-op is no longer COMPANY op, units and arithmetic are spoken. Behaviour is unchanged for anyone who defines nothing.</PackageReleaseNotes>
+    <Version>1.1.1</Version>
+    <PackageReleaseNotes>v1.1.1 - CreatePhonemizer now teaches itself the ecosystem's own proper nouns (EcosystemNames), because a name the letter-to-sound rules guess wrong passes every automated check there is: it is not dropped, not unmapped, and every phoneme it emits is real and encodable, so coverage reports 100% while the voice says a different word. Only a listener catches it. MEASURED: "Reachy" came out as IPA r-i-EI-k-i (ree-AY-kee, three syllables, stress on a vowel the word does not contain) because English spells ch as /k/ often enough - ache, stomach, chrome - that a model learned from a dictionary reaches for it. A caller's own Define still overrides anything here. Behaviour is otherwise unchanged.</PackageReleaseNotes>
     <IsPackable>true</IsPackable>
     <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
     <EmbedAllSources>true</EmbedAllSources>
