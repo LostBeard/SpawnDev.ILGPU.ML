@@ -81,6 +81,19 @@ public abstract partial class MLTestBase
         // remaining time is delivery or upload.
         var prevTrace = InferenceSession.TraceWeightLoad;
         InferenceSession.TraceWeightLoad = true;
+
+        // 🔴 THE SPLIT THIS BENCHMARK KEPT PROMISING AND NEVER PRINTED. The remarks above say
+        // "TraceWeightLoad prints the stream-READ vs GPU-WRITE split", but TraceWeightLoad only logs
+        // per-tensor anomalies - the actual read/write accumulators live on BrowserStreamUpload behind
+        // their OWN flag, and nothing ever set it. So the one question this test exists to answer -
+        // is a slow load the OPFS read or the queue.writeBuffer upload - has never had an answer.
+        //
+        // TJ 2026-09-15: "turn that trace on and get the split." The open number it is aimed at: a
+        // recorded 92.8 s load of which 71 s was attributed to "upload", on a path that streams 16 MiB
+        // chunks JS-side and should move 1.8 GB in a couple of seconds.
+        var prevStreamTrace = SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming;
+        SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = true;
+        SpawnDev.ILGPU.BrowserBufferPolicy.ResetStreamUploadTiming();
         try
         {
             var stages = new List<(string Stage, double Sec)>();
@@ -114,6 +127,28 @@ public abstract partial class MLTestBase
                                   $"cache open {openSec:F2}s");
                 foreach (var (stage, sec) in stages)
                     Console.WriteLine($"[LoadBench]   stage {stage,-12} {sec,7:F1}s");
+
+                // ── THE SPLIT ────────────────────────────────────────────────────────────────────
+                // readMs  = IJSReadStream.ReadUint8ArrayAsync  (OPFS / delivery)
+                // writeMs = IBrowserMemoryBuffer.CopyFromJS    (queue.writeBuffer, JS -> GPU)
+                // Whichever dominates names the lever. If NEITHER does, the time is in the graph
+                // walk around them and chunk size is irrelevant.
+                var readMs = SpawnDev.ILGPU.BrowserBufferPolicy.StreamReadMs;
+                var writeMs = SpawnDev.ILGPU.BrowserBufferPolicy.StreamWriteMs;
+                var sBytes = SpawnDev.ILGPU.BrowserBufferPolicy.StreamBytes;
+                var sChunks = SpawnDev.ILGPU.BrowserBufferPolicy.StreamChunks;
+                var sMiB = sBytes / 1048576.0;
+                Console.WriteLine($"[LoadBench] STREAM SPLIT: {sMiB:F0} MiB over {sChunks:N0} chunks "
+                    + $"({(sChunks > 0 ? sMiB / sChunks : 0):F1} MiB/chunk) | "
+                    + $"read {readMs:F0} ms ({(readMs > 0 ? sMiB / (readMs / 1000.0) : 0):F0} MB/s) | "
+                    + $"write {writeMs:F0} ms ({(writeMs > 0 ? sMiB / (writeMs / 1000.0) : 0):F0} MB/s) | "
+                    + $"read+write {readMs + writeMs:F0} ms of a {loadSec * 1000:F0} ms load "
+                    + $"({(loadSec > 0 ? (readMs + writeMs) / (loadSec * 1000) * 100 : 0):F0}%)");
+                if (sChunks == 0)
+                    Console.WriteLine("[LoadBench] ⚠️ ZERO chunks streamed - this load did NOT take the "
+                        + "JS-side streaming path, so the split above describes nothing. Check that the "
+                        + "source is an IJSReadStream (the .NET fallback CopyFromCPUs instead).");
+
                 Console.WriteLine($"[LoadBench] COLD TOTAL (download + load): {dlSec + loadSec:F1}s");
 
                 // Prove the model actually works - a load benchmark that measured a broken pipeline would
@@ -132,6 +167,7 @@ public abstract partial class MLTestBase
         finally
         {
             InferenceSession.TraceWeightLoad = prevTrace;
+            SpawnDev.ILGPU.BrowserBufferPolicy.TraceStreamUploadTiming = prevStreamTrace;
         }
     });
 
