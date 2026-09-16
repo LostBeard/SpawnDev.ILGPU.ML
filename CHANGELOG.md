@@ -2,6 +2,56 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.15
+
+### Fixed - GGUF header parsing was half of a warm model load, and it was not I/O
+
+The "parse" stage of a cached GGUF load was the single largest item in a warm load - larger than the OPFS
+read and the GPU upload combined - so the load was never I/O bound and tuning chunk sizes would have
+optimised the half that was not the problem. MEASURED on WebGPU / RTX 4070, Qwen3-1.7B-Q8_0 (1,749 MiB),
+via `LargeModel_LoadBenchmark`:
+
+```
+                  BEFORE     AFTER
+warm load          4.5 s     2.8 s      408 -> 614 MB/s end to end
+  parse            2.2 s     0.6 s      <- this change
+  upload           1.8 s     1.8 s
+  OPFS read       1.60 s    1.51 s      1,157 MB/s (at the OPFS ceiling)
+  GPU write       0.15 s    0.16 s      10,936 MB/s (never the problem)
+```
+
+It was not the byte count. The header is 5.7 MiB of a 1,749 MiB file and its tensor table parses in 9 ms.
+It was the COUNT: Qwen3's tokenizer metadata is 303,323 length-prefixed strings (`tokenizer.ggml.tokens`
+151,936 + `merges` 151,387 + `token_type` 151,936), and both stream entry points in `GGUFParser` walked
+them one field at a time. `ParseHeader` issued a `Stream.Read` per field with a fresh `byte[]` each time;
+`ParseHeaderAsync` ran every field through an `async` state machine, where one `u64` is 3 async frames
+plus 2 four-byte allocations and one string is ~6 awaits plus 3 allocations - roughly 1.8M state-machine
+transitions and ~900K tiny allocations on the single-threaded WASM managed heap.
+
+Both now read the header region once with multi-MiB reads and parse it with the SAME `byte[]` cursor that
+`GGUFParser.Parse(byte[])` already used, which also removes two duplicate copies of the metadata boxing
+rules (`UInt8` -> byte, `Int8` -> sbyte, `Int64` -> long, which callers pattern-match on). A/B on the real
+file, same bytes and same 303K strings: per-field over a stream 2,657 ms, from memory 16 ms.
+
+The header's length is not known until it is parsed, so the readers take a 4 MiB chunk, try, and double on
+overrun. Growth is geometric with buffer reuse (bytes pulled from the stream is the final capacity, not a
+re-read), and the stream is still only ever read FORWARD, so the non-seekable HTTP and WebTorrent sources
+are unaffected. A bad magic, unsupported version or unknown value type fails immediately rather than
+growing the buffer, so pointing the parser at a non-GGUF URL can no longer pull the whole file into memory
+before reporting that the first four bytes were wrong.
+
+New gate `MLTestBase.GGUFHeaderParseTests` (4 tests x 6 backends): stream-vs-in-memory equivalence over a
+forward-only non-seekable stream comparing boxed runtime TYPE as well as value, a grow-and-retry test that
+observes the parser's real first read rather than copying the private constant, non-GGUF fail-fast with a
+byte count, and truncated-stream detection.
+
+### Added - `HYDRATE SPLIT` accounting in `LargeModel_LoadBenchmark`
+
+`GGUFModel.LastHydrateMs` / `LastHydrateBytes` / `LastHydrateTensors` / `LastHydrateLargestBytes` report
+what `HydrateNonQuantizedAsync` pulls into the managed heap, because its "only small tensors, bounded
+memory" claim had never been checked against a cost. It holds: for Qwen3-1.7B-Q8_0 it is 113 tensors,
+0.47 MiB total, 4.3 KiB average, and 107 ms - 3.8% of the old parse stage, not its cause.
+
 ## 5.2.14
 
 ### Fixed - Kokoro streaming TTS stalled at the utterance lengths a real reply uses

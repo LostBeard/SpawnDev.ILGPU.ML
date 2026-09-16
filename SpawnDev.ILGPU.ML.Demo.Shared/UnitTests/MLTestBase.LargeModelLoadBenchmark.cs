@@ -182,6 +182,24 @@ public abstract partial class MLTestBase
                         + "JS-side streaming path, so the split above describes nothing. Check that the "
                         + "source is an IJSReadStream (the .NET fallback CopyFromCPUs instead).");
 
+                // ── HYDRATE SPLIT: what the "parse" stage actually costs ─────────────────────────
+                // The stage table above showed parse at 2.2s of a 4.5s warm load - MORE than the OPFS
+                // read and the GPU write COMBINED, so the load is not I/O bound and tuning chunk size
+                // would be optimizing the half that is not the problem. Nearly all of "parse" is
+                // HydrateNonQuantizedAsync, which reads non-quantized tensor regions into byte[] - the
+                // WASM managed heap. bytes vs COUNT tells us which lever: a few large regions is
+                // bandwidth, many small regions is per-read OPFS latency (84 MB/s at 64 KiB vs
+                // 985 MB/s at 4 MiB, MEASURED 09-14), and they need opposite fixes.
+                var hydMs = SpawnDev.ILGPU.ML.GGUF.GGUFModel.LastHydrateMs;
+                var hydMiB = SpawnDev.ILGPU.ML.GGUF.GGUFModel.LastHydrateBytes / 1048576.0;
+                var hydN = SpawnDev.ILGPU.ML.GGUF.GGUFModel.LastHydrateTensors;
+                var hydMaxMiB = SpawnDev.ILGPU.ML.GGUF.GGUFModel.LastHydrateLargestBytes / 1048576.0;
+                Console.WriteLine($"[LoadBench] HYDRATE SPLIT: {hydMs:F0} ms | {hydMiB:F1} MiB into the "
+                    + $"MANAGED HEAP over {hydN:N0} regions "
+                    + $"({(hydN > 0 ? hydMiB * 1024 / hydN : 0):F0} KiB avg, {hydMaxMiB:F1} MiB largest) | "
+                    + $"{(hydMs > 0 ? hydMiB / (hydMs / 1000.0) : 0):F0} MB/s | "
+                    + $"{(hydN > 0 ? hydMs / hydN : 0):F2} ms per region");
+
                 Console.WriteLine($"[LoadBench] COLD TOTAL (download + load): {dlSec + loadSec:F1}s");
 
                 // Prove the model actually works - a load benchmark that measured a broken pipeline would

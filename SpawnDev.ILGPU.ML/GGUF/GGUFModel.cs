@@ -78,6 +78,14 @@ public class GGUFModel
     {
         if (SourceStream == null) return;
         _regionCache ??= new Dictionary<long, byte[]>();
+        // ⚠️ THE COMMENT ABOVE IS AN ASSUMPTION ("only small tensors, bounded memory") AND THIS MEASURES
+        // IT. Hydration is the bulk of the "parse" stage - 2.2s of a 4.5s warm load for Qwen3-1.7B Q8_0,
+        // MEASURED 2026-09-15 - and it reads into byte[], i.e. through the single-threaded WASM managed
+        // heap. Two very different causes produce that number and they need opposite fixes: a FEW LARGE
+        // non-quantized tensors (heap/bandwidth bound) or MANY SMALL seek+reads (OPFS latency bound -
+        // small reads measured 84 MB/s against 985 MB/s at size). Counting both settles it.
+        var _hydT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        long _hydBytes = 0, _hydCount = 0, _hydLargest = 0;
         foreach (var t in Tensors)
         {
             ct.ThrowIfCancellationRequested();
@@ -89,8 +97,22 @@ public class GGUFModel
             if (byteSize <= 0) continue;
             var (buf, _) = await SourceBytesAsync(off, byteSize).ConfigureAwait(false);
             _regionCache[off] = buf;
+            _hydBytes += byteSize; _hydCount++;
+            if (byteSize > _hydLargest) _hydLargest = byteSize;
         }
+        LastHydrateMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _hydT0)
+                        * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        LastHydrateBytes = _hydBytes; LastHydrateTensors = _hydCount; LastHydrateLargestBytes = _hydLargest;
     }
+
+    /// <summary>Wall ms in the most recent <see cref="HydrateNonQuantizedAsync"/> (diagnostic).</summary>
+    public static double LastHydrateMs { get; private set; }
+    /// <summary>Bytes it pulled into the managed heap (diagnostic).</summary>
+    public static long LastHydrateBytes { get; private set; }
+    /// <summary>Non-quantized tensors it read (diagnostic) - the read COUNT, which is what latency scales with.</summary>
+    public static long LastHydrateTensors { get; private set; }
+    /// <summary>Largest single region read (diagnostic) - separates "small norms" from "a big tensor".</summary>
+    public static long LastHydrateLargestBytes { get; private set; }
 
     /// <summary>Async twin of <see cref="GetTensorRowFloat32"/> — gathers one row over an async stream so the
     /// browser (async-only TorrentReadStream/OPFS) can do the gemma4 host-side token-embedding gather. The

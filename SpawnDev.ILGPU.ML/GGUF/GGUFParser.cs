@@ -107,6 +107,51 @@ public static class GGUFParser
                $"{model.Metadata.Count} metadata keys";
     }
 
+    // ── Header parsing: READ THE REGION ONCE, THEN PARSE IT IN MEMORY ────────────────────────────────
+    //
+    // 🔴 MEASURED 2026-09-15, Qwen3-1.7B-Q8_0: the "parse" stage was 2.2 s of a 4.5 s warm load - MORE
+    // than the OPFS read (1.6 s) and the GPU write (0.15 s) combined, so the load was never I/O bound and
+    // tuning chunk size would have optimised the half that was not the problem.
+    //
+    // It is not the bytes. The header is 5.7 MiB of a 1,749 MiB file, and the tensor table inside it costs
+    // 9 ms. It is the COUNT: the tokenizer metadata is 303,323 length-prefixed strings
+    // (tokenizer.ggml.tokens 151,936 + merges 151,387 + token_type 151,936), and BOTH old stream paths
+    // walked them one field at a time:
+    //   - ParseHeader (sync)  : SReadBytes did a raw Stream.Read PER FIELD, allocating a byte[] each time.
+    //   - ParseHeaderAsync    : every field was an `async` state machine over a 64 KiB buffer, and one
+    //                           u64 is 3 async frames + 2 four-byte allocations, one string ~6 awaits and
+    //                           3 allocations -> ~1.8M state-machine transitions and ~900K tiny byte[]
+    //                           allocations, on the single-threaded WASM managed heap.
+    // A/B on the real file, same bytes, same 303K strings, same UTF8 decode (MEASURED):
+    //   per-field over a FileStream .......... 2,657 ms
+    //   parse from a byte[] already in memory ..... 16 ms      <- 162x, and the parse was never the cost
+    //
+    // So both entry points now do what TJ asked for on 2026-09-15 - "sometimes just reading the entire
+    // data model into memory and single reading and writing all at once is faster" - and then run the SAME
+    // byte[] cursor that Parse(byte[]) uses. That is deliberate: the boxing rules (UInt8 -> byte, Int8 ->
+    // sbyte, Int64 -> long ... callers pattern-match on them with `is long a`) now exist in exactly ONE
+    // place instead of the three copies that were here, so they cannot drift apart.
+    //
+    // ⚠️ We do not know the header's length until we have parsed it, so this reads a chunk, tries, and
+    // grows on overrun. Growth is geometric and the buffer is reused, so total bytes pulled from the
+    // stream is just the final capacity (< 2x the header) - and the retry re-parses only the prefix it
+    // already has, which the 16 ms figure above says is free. The stream is only ever read FORWARD and
+    // never seeked, preserving the forward-only contract that the HTTP/WebTorrent sources rely on.
+    //
+    // ⚠️ Over-reading PAST the header is safe here and always was: CreateFromGGUFStreamAsync requires a
+    // seekable stream and every later read addresses an ABSOLUTE offset (DataStartOffset + tensor offset,
+    // and SourceBytesAsync seeks). The old 64 KiB buffer over-read for the same reason.
+
+    /// <summary>First header read, and the growth step. Covers a 5.7 MiB Qwen3-class header in two reads.</summary>
+    private const int HeaderReadChunkBytes = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// Refuse to grow past this. A header is megabytes; anything demanding more is a corrupt or non-GGUF
+    /// stream, and without this bound a bad length field would pull a multi-GB weight blob into memory
+    /// looking for an end that never comes.
+    /// </summary>
+    private const int MaxHeaderBytes = 256 * 1024 * 1024;
+
     /// <summary>
     /// Parse ONLY the GGUF header (metadata + tensor infos) from a stream, WITHOUT reading the
     /// tensor-data section. For inspecting large LLM weights from a stream (HttpClient, FileStream,
@@ -116,46 +161,19 @@ public static class GGUFParser
     /// </summary>
     public static GGUFModel ParseHeader(Stream s)
     {
-        long pos = 0;
-        uint magic = SReadUInt32(s, ref pos);
-        if (magic != GGUF_MAGIC)
-            throw new InvalidOperationException($"Not a GGUF file (magic: 0x{magic:X8}, expected 0x{GGUF_MAGIC:X8})");
-
-        var model = new GGUFModel { Version = SReadUInt32(s, ref pos) };
-        if (model.Version < 2 || model.Version > 3)
-            throw new InvalidOperationException($"Unsupported GGUF version: {model.Version} (expected 2 or 3)");
-
-        ulong tensorCount = SReadUInt64(s, ref pos);
-        ulong metadataCount = SReadUInt64(s, ref pos);
-
-        model.Metadata = new Dictionary<string, object>();
-        for (ulong i = 0; i < metadataCount; i++)
+        var buf = new byte[HeaderReadChunkBytes];
+        int len = 0;
+        while (true)
         {
-            var key = SReadString(s, ref pos);
-            var valueType = (GGUFValueType)SReadUInt32(s, ref pos);
-            model.Metadata[key] = SReadValue(s, valueType, ref pos);
+            while (len < buf.Length)
+            {
+                int n = s.Read(buf, len, buf.Length - len);
+                if (n == 0) break;
+                len += n;
+            }
+            if (TryParseHeaderFromBuffer(Exact(buf, len), out var model)) return model;
+            GrowOrThrow(ref buf, len);
         }
-
-        model.Tensors = new GGUFTensorInfo[tensorCount];
-        for (ulong i = 0; i < tensorCount; i++)
-        {
-            var name = SReadString(s, ref pos);
-            uint nDims = SReadUInt32(s, ref pos);
-            var dims = new long[nDims];
-            for (int d = 0; d < (int)nDims; d++)
-                dims[d] = (long)SReadUInt64(s, ref pos);
-            var type = (GGMLType)SReadUInt32(s, ref pos);
-            ulong offset = SReadUInt64(s, ref pos);
-            model.Tensors[i] = new GGUFTensorInfo { Name = name, Dimensions = dims, Type = type, DataOffset = offset };
-        }
-
-        uint alignment = 32;
-        if (model.Metadata.TryGetValue("general.alignment", out var alignVal) && alignVal is long a)
-            alignment = (uint)a;
-        model.Alignment = alignment;
-        long dataStart = (pos + alignment - 1) / alignment * alignment;
-        model.DataStartOffset = dataStart;
-        return model;
     }
 
     /// <summary>
@@ -168,224 +186,103 @@ public static class GGUFParser
     /// </summary>
     public static async ValueTask<GGUFModel> ParseHeaderAsync(Stream s, CancellationToken ct = default)
     {
-        var r = new AsyncByteSource(s);
-
-        uint magic = await r.ReadUInt32Async(ct).ConfigureAwait(false);
-        if (magic != GGUF_MAGIC)
-            throw new InvalidOperationException($"Not a GGUF file (magic: 0x{magic:X8}, expected 0x{GGUF_MAGIC:X8})");
-
-        var model = new GGUFModel { Version = await r.ReadUInt32Async(ct).ConfigureAwait(false) };
-        if (model.Version < 2 || model.Version > 3)
-            throw new InvalidOperationException($"Unsupported GGUF version: {model.Version} (expected 2 or 3)");
-
-        ulong tensorCount = await r.ReadUInt64Async(ct).ConfigureAwait(false);
-        ulong metadataCount = await r.ReadUInt64Async(ct).ConfigureAwait(false);
-
-        model.Metadata = new Dictionary<string, object>();
-        for (ulong i = 0; i < metadataCount; i++)
+        var buf = new byte[HeaderReadChunkBytes];
+        int len = 0;
+        while (true)
         {
-            var key = await r.ReadStringAsync(ct).ConfigureAwait(false);
-            var valueType = (GGUFValueType)await r.ReadUInt32Async(ct).ConfigureAwait(false);
-            model.Metadata[key] = await r.ReadValueAsync(valueType, ct).ConfigureAwait(false);
+            // ONE await per multi-MiB read instead of one per field. This is the whole fix.
+            while (len < buf.Length)
+            {
+                int n = await s.ReadAsync(buf.AsMemory(len, buf.Length - len), ct).ConfigureAwait(false);
+                if (n == 0) break;
+                len += n;
+            }
+            if (TryParseHeaderFromBuffer(Exact(buf, len), out var model)) return model;
+            GrowOrThrow(ref buf, len);
         }
-
-        model.Tensors = new GGUFTensorInfo[tensorCount];
-        for (ulong i = 0; i < tensorCount; i++)
-        {
-            var name = await r.ReadStringAsync(ct).ConfigureAwait(false);
-            uint nDims = await r.ReadUInt32Async(ct).ConfigureAwait(false);
-            var dims = new long[nDims];
-            for (int d = 0; d < (int)nDims; d++)
-                dims[d] = (long)await r.ReadUInt64Async(ct).ConfigureAwait(false);
-            var type = (GGMLType)await r.ReadUInt32Async(ct).ConfigureAwait(false);
-            ulong offset = await r.ReadUInt64Async(ct).ConfigureAwait(false);
-            model.Tensors[i] = new GGUFTensorInfo { Name = name, Dimensions = dims, Type = type, DataOffset = offset };
-        }
-
-        uint alignment = 32;
-        if (model.Metadata.TryGetValue("general.alignment", out var alignVal) && alignVal is long a)
-            alignment = (uint)a;
-        model.Alignment = alignment;
-        long dataStart = (r.Position + alignment - 1) / alignment * alignment;
-        model.DataStartOffset = dataStart;
-        return model;
     }
 
     /// <summary>
-    /// Buffered, forward-only ASYNC byte source over a stream. Mirrors the sequential SRead* helpers but
-    /// fills its buffer via <see cref="Stream.ReadAsync(Memory{byte},CancellationToken)"/> only, so it
-    /// works on async-only streams. Position tracks total bytes consumed (for the data-start alignment).
+    /// A byte[] whose Length is EXACTLY the bytes we hold, so that any read past the end of what we have
+    /// throws instead of quietly parsing the uninitialised tail as data. That exception is the "need more
+    /// bytes" signal, so the exact length is load-bearing, not tidiness.
     /// </summary>
-    private sealed class AsyncByteSource
+    private static byte[] Exact(byte[] buf, int len) => len == buf.Length ? buf : buf[..len];
+
+    /// <summary>
+    /// Double the buffer for another attempt, or throw if the stream is exhausted (we read less than we
+    /// asked for) or the header has grown past all reason.
+    /// </summary>
+    private static void GrowOrThrow(ref byte[] buf, int len)
     {
-        private readonly Stream _s;
-        private readonly byte[] _buf = new byte[64 * 1024];
-        private int _bufPos, _bufLen;
-        public long Position { get; private set; }
+        if (len < buf.Length)
+            throw new EndOfStreamException(
+                $"GGUF header truncated: the stream ended after {len:N0} bytes and the header did not parse.");
+        if (buf.Length >= MaxHeaderBytes)
+            throw new InvalidOperationException(
+                $"GGUF header did not parse within {MaxHeaderBytes:N0} bytes - corrupt file or bad length field.");
+        Array.Resize(ref buf, Math.Min(buf.Length * 2, MaxHeaderBytes));
+    }
 
-        public AsyncByteSource(Stream s) => _s = s;
-
-        public async ValueTask<byte[]> ReadBytesAsync(int n, CancellationToken ct)
+    /// <summary>
+    /// Parse the header out of an in-memory buffer. Returns false ONLY when it ran off the end of the
+    /// buffer (i.e. we need more bytes). A bad magic, an unsupported version or an unknown value type is
+    /// a real defect in the data and propagates immediately - without that distinction, pointing this at
+    /// a non-GGUF stream would keep doubling the buffer and pull the entire file into memory before
+    /// admitting the first four bytes were already wrong.
+    /// </summary>
+    private static bool TryParseHeaderFromBuffer(byte[] data, out GGUFModel model)
+    {
+        model = null!;
+        try
         {
-            var outBuf = new byte[n];
-            int got = 0;
-            while (got < n)
+            int pos = 0;
+            uint magic = ReadUInt32(data, ref pos);
+            if (magic != GGUF_MAGIC)
+                throw new InvalidOperationException($"Not a GGUF file (magic: 0x{magic:X8}, expected 0x{GGUF_MAGIC:X8})");
+
+            var m = new GGUFModel { Version = ReadUInt32(data, ref pos) };
+            if (m.Version < 2 || m.Version > 3)
+                throw new InvalidOperationException($"Unsupported GGUF version: {m.Version} (expected 2 or 3)");
+
+            ulong tensorCount = ReadUInt64(data, ref pos);
+            ulong metadataCount = ReadUInt64(data, ref pos);
+
+            m.Metadata = new Dictionary<string, object>();
+            for (ulong i = 0; i < metadataCount; i++)
             {
-                if (_bufPos >= _bufLen)
-                {
-                    _bufPos = 0;
-                    _bufLen = await _s.ReadAsync(_buf.AsMemory(0, _buf.Length), ct).ConfigureAwait(false);
-                    if (_bufLen == 0)
-                        throw new EndOfStreamException($"GGUF header truncated: wanted {n} bytes at pos {Position}, got {got}.");
-                }
-                int take = Math.Min(n - got, _bufLen - _bufPos);
-                Array.Copy(_buf, _bufPos, outBuf, got, take);
-                _bufPos += take;
-                got += take;
+                var key = ReadString(data, ref pos);
+                var valueType = (GGUFValueType)ReadUInt32(data, ref pos);
+                m.Metadata[key] = ReadValue(data, ref pos, valueType);
             }
-            Position += n;
-            return outBuf;
-        }
 
-        public async ValueTask<uint> ReadUInt32Async(CancellationToken ct)
-        {
-            var b = await ReadBytesAsync(4, ct).ConfigureAwait(false);
-            return (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
-        }
-
-        public async ValueTask<ulong> ReadUInt64Async(CancellationToken ct)
-        {
-            ulong lo = await ReadUInt32Async(ct).ConfigureAwait(false);
-            ulong hi = await ReadUInt32Async(ct).ConfigureAwait(false);
-            return lo | (hi << 32);
-        }
-
-        public async ValueTask<ushort> ReadUInt16Async(CancellationToken ct)
-        {
-            var b = await ReadBytesAsync(2, ct).ConfigureAwait(false);
-            return (ushort)(b[0] | (b[1] << 8));
-        }
-
-        public async ValueTask<string> ReadStringAsync(CancellationToken ct)
-        {
-            ulong len = await ReadUInt64Async(ct).ConfigureAwait(false);
-            var b = await ReadBytesAsync((int)len, ct).ConfigureAwait(false);
-            return Encoding.UTF8.GetString(b);
-        }
-
-        public async ValueTask<object> ReadValueAsync(GGUFValueType type, CancellationToken ct)
-        {
-            switch (type)
+            m.Tensors = new GGUFTensorInfo[tensorCount];
+            for (ulong i = 0; i < tensorCount; i++)
             {
-                case GGUFValueType.UInt8: return (await ReadBytesAsync(1, ct).ConfigureAwait(false))[0];
-                case GGUFValueType.Int8: return (sbyte)(await ReadBytesAsync(1, ct).ConfigureAwait(false))[0];
-                case GGUFValueType.UInt16: return await ReadUInt16Async(ct).ConfigureAwait(false);
-                case GGUFValueType.Int16: return (short)await ReadUInt16Async(ct).ConfigureAwait(false);
-                case GGUFValueType.UInt32: return await ReadUInt32Async(ct).ConfigureAwait(false);
-                case GGUFValueType.Int32: return (int)await ReadUInt32Async(ct).ConfigureAwait(false);
-                case GGUFValueType.UInt64: return await ReadUInt64Async(ct).ConfigureAwait(false);
-                case GGUFValueType.Int64: return (long)await ReadUInt64Async(ct).ConfigureAwait(false);
-                case GGUFValueType.Float32: return BitConverter.ToSingle(await ReadBytesAsync(4, ct).ConfigureAwait(false), 0);
-                case GGUFValueType.Float64: return BitConverter.ToDouble(await ReadBytesAsync(8, ct).ConfigureAwait(false), 0);
-                case GGUFValueType.Bool: return (await ReadBytesAsync(1, ct).ConfigureAwait(false))[0] != 0;
-                case GGUFValueType.String: return await ReadStringAsync(ct).ConfigureAwait(false);
-                case GGUFValueType.Array: return await ReadArrayAsync(ct).ConfigureAwait(false);
-                default: throw new NotSupportedException($"Unknown GGUF value type: {type}");
+                var name = ReadString(data, ref pos);
+                uint nDims = ReadUInt32(data, ref pos);
+                var dims = new long[nDims];
+                for (int d = 0; d < (int)nDims; d++)
+                    dims[d] = (long)ReadUInt64(data, ref pos);
+                var type = (GGMLType)ReadUInt32(data, ref pos);
+                ulong offset = ReadUInt64(data, ref pos);
+                m.Tensors[i] = new GGUFTensorInfo { Name = name, Dimensions = dims, Type = type, DataOffset = offset };
             }
-        }
 
-        public async ValueTask<object> ReadArrayAsync(CancellationToken ct)
+            uint alignment = 32;
+            if (m.Metadata.TryGetValue("general.alignment", out var alignVal) && alignVal is long a)
+                alignment = (uint)a;
+            m.Alignment = alignment;
+            // pos is the absolute file offset of the end of the header, because the buffer starts at
+            // byte 0 of the file. Over-read beyond `pos` is irrelevant - callers seek by absolute offset.
+            m.DataStartOffset = (pos + alignment - 1) / alignment * alignment;
+            model = m;
+            return true;
+        }
+        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException)
         {
-            var elemType = (GGUFValueType)await ReadUInt32Async(ct).ConfigureAwait(false);
-            ulong count = await ReadUInt64Async(ct).ConfigureAwait(false);
-            if (elemType == GGUFValueType.String)
-            {
-                var arr = new string[count];
-                for (ulong i = 0; i < count; i++) arr[i] = await ReadStringAsync(ct).ConfigureAwait(false);
-                return arr;
-            }
-            var result = new object[count];
-            for (ulong i = 0; i < count; i++) result[i] = await ReadValueAsync(elemType, ct).ConfigureAwait(false);
-            return result;
+            return false; // ran off the end of what we have: the caller reads more and retries
         }
-    }
-
-    // ── Stream binary readers (sequential, header-only) ──
-
-    private static byte[] SReadBytes(Stream s, int n, ref long pos)
-    {
-        var buf = new byte[n];
-        int total = 0;
-        while (total < n)
-        {
-            int r = s.Read(buf, total, n - total);
-            if (r == 0) throw new EndOfStreamException($"GGUF header truncated: wanted {n} bytes at pos {pos}, got {total}.");
-            total += r;
-        }
-        pos += n;
-        return buf;
-    }
-
-    private static uint SReadUInt32(Stream s, ref long pos)
-    {
-        var b = SReadBytes(s, 4, ref pos);
-        return (uint)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
-    }
-
-    private static ulong SReadUInt64(Stream s, ref long pos)
-    {
-        ulong lo = SReadUInt32(s, ref pos);
-        ulong hi = SReadUInt32(s, ref pos);
-        return lo | (hi << 32);
-    }
-
-    private static ushort SReadUInt16(Stream s, ref long pos)
-    {
-        var b = SReadBytes(s, 2, ref pos);
-        return (ushort)(b[0] | (b[1] << 8));
-    }
-
-    private static string SReadString(Stream s, ref long pos)
-    {
-        ulong len = SReadUInt64(s, ref pos);
-        var b = SReadBytes(s, (int)len, ref pos);
-        return Encoding.UTF8.GetString(b);
-    }
-
-    private static object SReadValue(Stream s, GGUFValueType type, ref long pos)
-    {
-        switch (type)
-        {
-            case GGUFValueType.UInt8: return SReadBytes(s, 1, ref pos)[0];
-            case GGUFValueType.Int8: return (sbyte)SReadBytes(s, 1, ref pos)[0];
-            case GGUFValueType.UInt16: return SReadUInt16(s, ref pos);
-            case GGUFValueType.Int16: return (short)SReadUInt16(s, ref pos);
-            case GGUFValueType.UInt32: return SReadUInt32(s, ref pos);
-            case GGUFValueType.Int32: return (int)SReadUInt32(s, ref pos);
-            case GGUFValueType.UInt64: return SReadUInt64(s, ref pos);
-            case GGUFValueType.Int64: return (long)SReadUInt64(s, ref pos);
-            case GGUFValueType.Float32: return BitConverter.ToSingle(SReadBytes(s, 4, ref pos), 0);
-            case GGUFValueType.Float64: return BitConverter.ToDouble(SReadBytes(s, 8, ref pos), 0);
-            case GGUFValueType.Bool: return SReadBytes(s, 1, ref pos)[0] != 0;
-            case GGUFValueType.String: return SReadString(s, ref pos);
-            case GGUFValueType.Array: return SReadArray(s, ref pos);
-            default: throw new NotSupportedException($"Unknown GGUF value type: {type}");
-        }
-    }
-
-    private static object SReadArray(Stream s, ref long pos)
-    {
-        var elemType = (GGUFValueType)SReadUInt32(s, ref pos);
-        ulong count = SReadUInt64(s, ref pos);
-        if (elemType == GGUFValueType.String)
-        {
-            var arr = new string[count];
-            for (ulong i = 0; i < count; i++) arr[i] = SReadString(s, ref pos);
-            return arr;
-        }
-        var result = new object[count];
-        for (ulong i = 0; i < count; i++) result[i] = SReadValue(s, elemType, ref pos);
-        return result;
     }
 
     // ── Binary readers ──
