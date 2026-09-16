@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## SpawnDev.ILGPU.ML.WebTorrent 1.0.1
+
+Pins **SpawnDev.WebTorrent 4.2.8**. Nothing in this package changed - it carried a break transitively,
+which is exactly why the pin has to move.
+
+1.0.0 pinned 4.2.7, which is binary-broken against SpawnDev.SpawnJS 2.1.17. 4.2.7 was compiled against
+SpawnJS 2.1.7, where `FileSystemWritableFileStream.Seek` and `.Truncate` took a `ulong`; 2.1.17 takes a
+`long`. The change is source-compatible, so no build, restore or publish reports it, but the shipped IL
+still calls the `ulong` overloads and NuGet resolves 2.1.17 beside them - `MissingMethodException` at
+runtime on the `createWritable` piece-write path, only when that path runs.
+
+⭐ A fix in a lower library reaches nobody until every downstream pin is bumped and shipped. Consumers on
+1.0.0 get 4.2.7 transitively and are still broken.
+
 ## 5.2.15
 
 ### Fixed - GGUF header parsing was half of a warm model load, and it was not I/O

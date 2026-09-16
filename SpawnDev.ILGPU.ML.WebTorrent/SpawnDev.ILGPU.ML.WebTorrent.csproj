@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>1.0.0</Version>
-		<PackageReleaseNotes>v1.0.0 - Initial release. WebTorrent model delivery for SpawnDev.ILGPU.ML, split out so the main package no longer depends on SpawnDev.WebTorrent. Supplies HubModelStream, an IModelSource that streams models from the SpawnDev hub as lazy-hash torrents: seekable with random access, OPFS-cached by piece, resumed across reloads and seeded to peers. Optional - SpawnDev.ILGPU.ML delivers models over plain HTTP by default; swap a HubModelStream in wherever a HubModelSource is used to get P2P delivery with no other changes.</PackageReleaseNotes>
+		<Version>1.0.1</Version>
+		<PackageReleaseNotes>v1.0.1 - Pins SpawnDev.WebTorrent 4.2.8. 1.0.0 pinned 4.2.7, which is binary-broken against SpawnDev.SpawnJS 2.1.17: 4.2.7 was compiled against SpawnJS 2.1.7, where FileSystemWritableFileStream.Seek and .Truncate took a ulong, and 2.1.17 takes a long. The change is source-compatible, so nothing in a build, restore or publish reports it, but the shipped IL still calls the ulong overloads and NuGet loads 2.1.17 beside them - MissingMethodException at runtime on the createWritable piece-write path. Nothing in THIS package changed; it carried the break transitively, which is the whole reason the pin has to move. Consumers on 1.0.0 should upgrade.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -33,7 +33,7 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.7" />
+		<PackageReference Include="SpawnDev.WebTorrent" Version="4.2.8" />
 	</ItemGroup>
 
 	<ItemGroup>
