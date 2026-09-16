@@ -2,6 +2,56 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased - GGUF header: parsed once per load, and the retry stopped re-materialising it
+
+MEASURED 2026-09-16, Qwen3-1.7B-Q8_0 (1,749 MiB, 151,936 tokens + 151,387 merges), WebGPU in the browser
+via `LargeModel_LoadBenchmark`:
+
+| | before | after |
+|---|---|---|
+| header parses per load | 2, 421 ms total | **1, 220 ms total** |
+| `parse` stage | 0.6 s | **0.3 s** |
+| WARM LOAD | 2.8 s | **2.6 s** |
+
+### Fixed - the header was parsed TWICE per model load
+
+`GgufTextGenerationPipeline` needs the header for the tokenizer and chat format; `InferenceSession`
+needs it for the graph. The session kept its parsed model in a LOCAL, so the pipeline had no way to get
+it and parsed the same bytes again - and `CreateFromFileAsync` opened a second `FileStream` to do it.
+`InferenceSession.GgufModel` now exposes it and both factories use it. That also removes the second live
+copy of a 303K-string vocab from the WASM heap.
+
+⚠️ The null case **throws** instead of falling back to a parse. A silent fallback is precisely how this
+duplicate survived unnoticed.
+
+⚠️ How it hid: `GGUFParser.LastHeader*` describes ONE call, so the second parse overwrote the first one's
+numbers and a load that parsed twice reported the cost of parsing once. `GGUFParser.TotalHeaderParses`
+COUNTS them, and counting is what made it visible.
+
+### Fixed - the grow-and-retry loop re-materialised the vocab
+
+A 5.68 MiB header against a 4 MiB first read meant the first attempt materialised ~70% of the vocab and
+threw it away. `TryScanHeaderEnd` now walks the header allocation-free to find its end - no string
+decoded, no dictionary built, a numeric array skipped in one add - so the retry is cheap and the
+materialising parse runs exactly once. The exact-length buffer copy that existed only to signal "need
+more bytes" is gone with it.
+
+Desktop (`ModelInspector.Console --parsebench --only=stream`, min of 15, three processes per arm):
+**37.5 ms -> 18.5 ms (2.0x)**. In the browser the same change is 227 ms -> 194 ms (1.17x) - a scan costs
+22% of a materialise in WASM against ~10% on desktop, so it does not carry over intact.
+
+### Added
+
+`GGUFParser.LastHeaderScanCount/ScanMs/ParseMs/ReadMs/BufferMs/BytesRead` and the cumulative
+`TotalHeaderParses`/`TotalHeaderMs`, printed by `LargeModel_LoadBenchmark` as `HEADER TOTAL` and
+`HEADER SPLIT`. `ModelInspector.Console --parsebench <file.gguf>` splits the stage on the desktop.
+
+### Known, not fixed
+
+`Gemma4MultimodalPipeline.CreateAsync` and `CreateFromStreamsAsync` have the SAME duplicate parse. The
+fix is the same plus re-pointing `SourceStream` at their separate gather stream, but neither path has an
+end-to-end gate and a mistake there is a disposed-stream read at inference time.
+
 ## SpawnDev.ILGPU.ML.WebTorrent 1.0.1
 
 Pins **SpawnDev.WebTorrent 4.2.8**. Nothing in this package changed - it carried a break transitively,

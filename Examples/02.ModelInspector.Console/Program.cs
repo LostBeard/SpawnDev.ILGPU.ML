@@ -26,6 +26,18 @@ using SpawnDev.ILGPU.ML.GGUF;
 if (args.Contains("--ci"))
     return await RunSelfCheck();
 
+// --parsebench <file.gguf> : split the header-parse stage into read / scan / materialise.
+//
+// 🔴 WHY IT EXISTS. The 09-15 rewrite took GGUF header parse from 2.2s to 0.6s by reading the header
+// region once instead of per field. What it left behind is a grow-and-retry loop: the first read is
+// 4 MiB, a Qwen3-class header is ~5.7 MiB, so the FIRST attempt materialises ~70% of a 300K-string
+// vocab, throws all of it away on overrun, doubles the buffer and materialises the whole thing again.
+// That was written down as "the vocab is parsed ~1.7 times" and never measured. This measures it.
+//
+// Runs off a MemoryStream as well as the file, so the number is parse cost and not disk weather.
+if (args.Contains("--parsebench"))
+    return await ParseBench(args.FirstOrDefault(a => !a.StartsWith("--")));
+
 // --tensors=<prefix,prefix,...> : dump RAW per-tensor dims (no template collapse) for tensors whose
 // name starts with any prefix. Surfaces per-layer shape VARIANCE the collapsed template view can hide
 // (e.g. a frontier arch where global vs sliding layers carry different head_dim / KV-head counts).
@@ -185,6 +197,114 @@ static void Report(string source, InspectionResult r, CompatibilityResult c)
 
     H("Engine compatibility");
     Console.WriteLine($"  {c.Summary}");
+}
+
+// Splits the header stage so each piece has ONE owner, per the lesson that a stage LABEL is not a cause.
+async Task<int> ParseBench(string? path)
+{
+    if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+    {
+        Console.Error.WriteLine("Usage: ModelInspector.Console --parsebench <file.gguf>");
+        return 2;
+    }
+
+    // 1. What IS the header? Parse it once off the file so we learn its true length.
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    GGUFModel probe;
+    await using (var fs0 = File.OpenRead(path))
+        probe = await GGUFParser.ParseHeaderAsync(fs0);
+    var fileMs = sw.Elapsed.TotalMilliseconds;
+
+    int headerBytes = (int)probe.DataStartOffset;
+    var fi = new FileInfo(path);
+    Console.WriteLine($"file          : {fi.Name}  {fi.Length:N0} B");
+    Console.WriteLine($"header        : {headerBytes:N0} B  ({headerBytes / 1048576.0:F2} MiB)"
+                      + $"  metadata keys {probe.Metadata.Count}, tensors {probe.Tensors.Length}");
+    var vocab = probe.Metadata.TryGetValue("tokenizer.ggml.tokens", out var tv) && tv is string[] ta ? ta.Length : 0;
+    var merges = probe.Metadata.TryGetValue("tokenizer.ggml.merges", out var mv) && mv is string[] ma ? ma.Length : 0;
+    Console.WriteLine($"vocab strings : tokens {vocab:N0}, merges {merges:N0}");
+
+    // 2. The header bytes, in memory. Everything below runs off THIS, so no measurement includes disk.
+    var head = new byte[headerBytes];
+    await using (var fs1 = File.OpenRead(path))
+    {
+        int got = 0;
+        while (got < head.Length)
+        {
+            int n = await fs1.ReadAsync(head.AsMemory(got, head.Length - got));
+            if (n == 0) break;
+            got += n;
+        }
+    }
+
+    // 3. ONE materialising parse of a buffer that already holds the whole header. This is the FLOOR:
+    //    the work that must happen no matter how the bytes arrive.
+    //    Warm once - a first pass pays JIT and dictionary growth that the steady state does not.
+    _ = GGUFParser.Parse(head);
+    _ = GGUFParser.ParseHeaderAsync(new MemoryStream(head, false)).AsTask().GetAwaiter().GetResult();
+
+    // ⚠️ Interleaved, not one batch then the other. Run to run this machine moves a parse by 20%+, so
+    // two batches measured back to back can differ by more than the change being tested. Alternating
+    // puts both paths in the same weather, and MIN is what to read: the fastest observed run is the one
+    // with the least interference in it.
+    // ⚠️ --only isolates ONE path per process. Interleaving them in one process looked fair and was not:
+    // the stream path allocates multi-MiB buffers, so it moves the GC schedule under the floor path and
+    // the SAME Parse(byte[]) call measured 8.9 ms in one configuration and 14.3 ms in another. A shared
+    // managed heap is shared state, and a benchmark that shares it is measuring both arms at once.
+    var only = args.FirstOrDefault(a => a.StartsWith("--only=", StringComparison.Ordinal))?["--only=".Length..];
+    bool doFloor = only is null or "floor", doStream = only is null or "stream";
+
+    const int Iters = 15;
+    var floor = new List<double>(Iters);
+    var stream = new List<double>(Iters);
+    for (int i = 0; i < Iters; i++)
+    {
+        if (doFloor) floor.Add(Time(() => GGUFParser.Parse(head)));
+        if (doStream) stream.Add(Time(() =>
+        {
+            using var ms = new MemoryStream(head, writable: false);
+            return GGUFParser.ParseHeaderAsync(ms).AsTask().GetAwaiter().GetResult();
+        }));
+    }
+    if (floor.Count == 0) floor.Add(double.NaN);
+    if (stream.Count == 0) stream.Add(double.NaN);
+    while (floor.Count < Iters) floor.Add(double.NaN);
+    while (stream.Count < Iters) stream.Add(double.NaN);
+    floor.Sort(); stream.Sort();
+    double floorMs = floor[0], streamMs = stream[0];
+    double floorMed = floor[Iters / 2], streamMed = stream[Iters / 2];
+
+    // 5. The stage split, straight from the parser's own counters - so the phases SUM to the total
+    //    instead of being attributed by argument.
+    using (var ms2 = new MemoryStream(head, writable: false))
+        await GGUFParser.ParseHeaderAsync(ms2);
+    Console.WriteLine();
+    Console.WriteLine($"scans .......... {GGUFParser.LastHeaderScanCount} x, {GGUFParser.LastHeaderScanMs,7:F1} ms total");
+    Console.WriteLine($"materialise .... {GGUFParser.LastHeaderParseMs,7:F1} ms");
+    Console.WriteLine($"stream read .... {GGUFParser.LastHeaderReadMs,7:F1} ms  ({GGUFParser.LastHeaderBytesRead:N0} B)");
+    Console.WriteLine($"buffer mgmt .... {GGUFParser.LastHeaderBufferMs,7:F1} ms  (Array.Resize on grow)");
+
+    Console.WriteLine();
+    Console.WriteLine($"                                     min      median   ({Iters} interleaved runs)");
+    Console.WriteLine($"parse once, in memory .......... {floorMs,8:F1} {floorMed,9:F1} ms   <- the floor");
+    Console.WriteLine($"ParseHeaderAsync over memory ... {streamMs,8:F1} {streamMed,9:F1} ms   <- what we actually do");
+    Console.WriteLine($"ParseHeaderAsync over the file . {fileMs,8:F1}           ms   (single cold run, includes I/O)");
+    Console.WriteLine($"RATIO (stream / floor) ......... {streamMs / floorMs,8:F2} {streamMed / floorMed,9:F2}x");
+    Console.WriteLine();
+    Console.WriteLine(streamMs / floorMs > 1.25
+        ? $"=> the header is materialised about {streamMs / floorMs:F2} times. The overshoot is thrown-away work."
+        : "=> the header is materialised about once; there is no re-parse left to remove.");
+    return 0;
+
+    static double Time(Func<GGUFModel> f)
+    {
+        var w = System.Diagnostics.Stopwatch.StartNew();
+        var m = f();
+        w.Stop();
+        // A benchmark that never looks at the result can be optimised into measuring nothing.
+        if (m.Tensors.Length == 0) throw new Exception("parse returned no tensors");
+        return w.Elapsed.TotalMilliseconds;
+    }
 }
 
 static void Usage() => Console.Error.WriteLine(

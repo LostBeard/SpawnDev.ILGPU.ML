@@ -158,6 +158,30 @@ public class InferenceSession : IDisposable
     /// <summary>Model name (from graph metadata).</summary>
     public string ModelName { get; private set; } = "";
 
+    /// <summary>
+    /// The parsed GGUF header this session was built from, or null if it was not built from a GGUF.
+    /// <para>
+    /// 🔴 MEASURED 2026-09-16, Qwen3-1.7B-Q8_0 on WebGPU. Without this, a model load parsed the header
+    /// TWICE: <see cref="Pipelines.GgufTextGenerationPipeline"/> needs it for the tokenizer and chat
+    /// format, this method needs it for the graph, and because the model was a LOCAL here the pipeline
+    /// had no way to get it except to parse the same bytes again.
+    /// <code>
+    ///                          before                       after
+    ///   header parses      2, 421 ms total              1, 220 ms total
+    ///   "parse" stage      0.6 s                        0.3 s
+    ///   WARM LOAD          2.8 s                        2.6 s
+    /// </code>
+    /// It also deletes the second live copy of the 303K-string vocab on the WASM heap.
+    /// <para>
+    /// ⚠️ How it stayed hidden: <c>GGUFParser.LastHeader*</c> describes ONE call, so the second parse
+    /// overwrote the first one's numbers and a load that parsed twice reported the cost of parsing once.
+    /// Only COUNTING the calls (<c>GGUFParser.TotalHeaderParses</c>) made it visible - the same lesson as
+    /// "print bytes AND count" from the original per-field parse work.
+    /// </para>
+    /// </para>
+    /// </summary>
+    public GGUF.GGUFModel? GgufModel { get; private set; }
+
     /// <summary>Access to the underlying GraphExecutor (for KV cache management).</summary>
     public GraphExecutor Executor => _executor;
 
@@ -2098,6 +2122,8 @@ public class InferenceSession : IDisposable
         // Dynamic-shape recompilation: a Run at a growing decode length recompiles (CPU-only; GPU weights
         // are reused) rather than running the seq=1 compile shape and dropping all but the first token.
         session.EnableShapeRecompilation(graph, constSeed, floatSeed, enableOptimization: true);
+        // Hand the parsed header to the caller so nobody has to parse these bytes a second time.
+        session.GgufModel = ggufModel;
         return session;
     }
 

@@ -142,8 +142,128 @@ public static class GGUFParser
     // seekable stream and every later read addresses an ABSOLUTE offset (DataStartOffset + tensor offset,
     // and SourceBytesAsync seeks). The old 64 KiB buffer over-read for the same reason.
 
+    // ── The retry no longer re-materialises the vocab ───────────────────────────────────────────────
+    //
+    // 🔴 MEASURED 2026-09-16, Qwen3-1.7B-Q8_0 header (5,951,136 B = 5.68 MiB, 151,936 tokens +
+    // 151,387 merges), desktop .NET Release. `ModelInspector.Console --parsebench --only=stream`,
+    // min of 15, THREE separate processes per arm, off a MemoryStream so no disk is in the number:
+    //
+    //   ParseHeaderAsync, before ....... 37.5 / 37.9 / 38.7 ms
+    //   ParseHeaderAsync, after ........ 18.4 / 18.5 / 18.8 ms      <- 2.0x
+    //
+    // Where the old time went. The first read is 4 MiB against a 5.68 MiB header, so the first attempt
+    // MATERIALISED about 70% of a 303K-string vocab - every string allocated and UTF8-decoded, into a
+    // Dictionary - and then threw all of it away on the overrun.
+    //
+    // Two things were removed:
+    //   1. The wasted materialise. TryScanHeaderEnd walks the SAME structure allocation-free: no string
+    //      decoded, no dictionary built, no array materialised, and a numeric array skipped in ONE add
+    //      rather than a loop. The grow-and-retry loop now retries the CHEAP walk - both scans together
+    //      cost 3.1 ms - and the materialising parse runs exactly once.
+    //   2. The exact-length copy. `Exact(buf, len)` sliced the 8 MiB buffer down to the 5.95 MiB actually
+    //      held, purely so that an overrun would throw; that is a large-object allocation, a zeroing and
+    //      a memcpy to say what an int already says. The scan bounds-checks against an explicit `limit`
+    //      instead. MEASURED at 5.7 ms of a 39.9 ms parse before it was removed.
+    //
+    // ⚠️ MEASURE THE ARMS IN SEPARATE PROCESSES. Interleaving them in one process looked fair and was
+    // not: the stream path's multi-MiB buffers move the GC schedule under the floor path, and the same
+    // untouched Parse(byte[]) call measured 8.9 ms in one configuration and 14.3 ms in another. A shared
+    // managed heap is shared state.
+    //
+    // ⚠️ This is a SECOND walker over the same format, which is exactly the duplication the 09-15
+    // rewrite removed. It knows only SIZES - values still have exactly one reader - and it is pinned by
+    // the EXISTING MLTestBase.GGUFHeaderParseTests rather than by care:
+    //   - GGUFHeader_StreamParsersMatchInMemoryOracle: both stream paths vs Parse(byte[]) over a fixture
+    //     carrying all 13 value types, comparing DataStartOffset and every value's RUNTIME TYPE. A
+    //     FixedSizeOf entry that is wrong by one byte desyncs the scan and fails here.
+    //   - GGUFHeader_GrowAndRetry_IsActuallyExercised: proves the fixture really does overrun the first
+    //     read, so the scan runs TWICE and the second scan's agreement is what is being checked.
+    //   - GGUFHeader_TruncatedStream_Throws: cuts the header mid-vocab. This is the guard for the new
+    //     risk introduced by dropping the exact-length slice - the parse now runs over a buffer that is
+    //     LARGER than the content, so a scan that over-reported would hand it an uninitialised tail.
+    //   - GGUFHeader_NonGGUF_FailsFastWithoutBufferingTheStream: the scan keeps the fail-fast contract,
+    //     propagating bad magic/version/value-type instead of treating them as "need more bytes".
+
     /// <summary>First header read, and the growth step. Covers a 5.7 MiB Qwen3-class header in two reads.</summary>
     private const int HeaderReadChunkBytes = 4 * 1024 * 1024;
+
+    // ── Diagnostics for the header stage ────────────────────────────────────────────────────────────
+    // Same shape as GGUFModel.LastHydrateMs and the GraphExecutor.LastRun* counters. A stage that cannot
+    // report its own split gets optimised by argument instead of by measurement.
+
+    /// <summary>How many times the cheap scan ran for the last stream header parse (1 = no grow).</summary>
+    public static int LastHeaderScanCount { get; private set; }
+
+    /// <summary>Total time in the cheap scans for the last stream header parse.</summary>
+    public static double LastHeaderScanMs { get; private set; }
+
+    /// <summary>Time in the single materialising parse for the last stream header parse.</summary>
+    public static double LastHeaderParseMs { get; private set; }
+
+    /// <summary>Time spent reading from the stream for the last stream header parse.</summary>
+    public static double LastHeaderReadMs { get; private set; }
+
+    /// <summary>Time spent resizing and slicing buffers for the last stream header parse.</summary>
+    public static double LastHeaderBufferMs { get; private set; }
+
+    /// <summary>Bytes pulled from the stream for the last stream header parse.</summary>
+    public static long LastHeaderBytesRead { get; private set; }
+
+    /// <summary>
+    /// How many times a stream header parse has been performed, process-wide, and their total cost.
+    /// CUMULATIVE - never reset by a parse.
+    /// <para>
+    /// 🔴 The Last* counters above describe ONE call, which is exactly why they could not see that a
+    /// single model load parses the header TWICE: the second call overwrites the first one's numbers and
+    /// the total looks like the cost of one parse. Counting calls is what made the duplicate visible.
+    /// </para>
+    /// </summary>
+    public static int TotalHeaderParses { get; private set; }
+
+    /// <summary>Total time in stream header parses, process-wide. See <see cref="TotalHeaderParses"/>.</summary>
+    public static double TotalHeaderMs { get; private set; }
+
+    /// <summary>Zero the cumulative counters, so one load can be measured on its own.</summary>
+    public static void ResetHeaderTotals() { TotalHeaderParses = 0; TotalHeaderMs = 0; }
+
+    private static void ResetHeaderStats()
+    {
+        LastHeaderScanCount = 0;
+        LastHeaderScanMs = LastHeaderParseMs = LastHeaderReadMs = LastHeaderBufferMs = 0;
+        LastHeaderBytesRead = 0;
+    }
+
+    private static double MsSince(long t0) =>
+        (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+    /// <summary>
+    /// Everything the sync and async entry points do AFTER a read: decide whether the header is all
+    /// here, and materialise it if so.
+    /// <para>
+    /// The two entry points can only differ in the read itself (<c>Read</c> vs <c>await ReadAsync</c>);
+    /// sharing the decision keeps them from drifting, which is the failure the 09-15 rewrite was about -
+    /// it deleted three copies of the value-reading rules for the same reason.
+    /// </para>
+    /// </summary>
+    private static bool TryCompleteHeader(byte[] buf, int len, out GGUFModel model)
+    {
+        var tScan = System.Diagnostics.Stopwatch.GetTimestamp();
+        bool complete = TryScanHeaderEnd(buf, len, out _);
+        LastHeaderScanMs += MsSince(tScan);
+        LastHeaderScanCount++;
+
+        if (!complete) { model = null!; return false; }
+
+        // No exact-length copy: the scan already proved the header ends inside `len`, so the
+        // materialising parse cannot run off into the buffer's uninitialised tail.
+        var tParse = System.Diagnostics.Stopwatch.GetTimestamp();
+        model = ParseWholeHeader(buf, len);
+        LastHeaderParseMs = MsSince(tParse);
+
+        TotalHeaderParses++;
+        TotalHeaderMs += LastHeaderScanMs + LastHeaderParseMs + LastHeaderReadMs + LastHeaderBufferMs;
+        return true;
+    }
 
     /// <summary>
     /// Refuse to grow past this. A header is megabytes; anything demanding more is a corrupt or non-GGUF
@@ -161,18 +281,29 @@ public static class GGUFParser
     /// </summary>
     public static GGUFModel ParseHeader(Stream s)
     {
+        // Reset here too, or a sync parse leaves the previous async parse's numbers standing and the
+        // next reader of LastHeader* is looking at a different call than the one they just made.
+        ResetHeaderStats();
         var buf = new byte[HeaderReadChunkBytes];
         int len = 0;
         while (true)
         {
+            var tRead = System.Diagnostics.Stopwatch.GetTimestamp();
             while (len < buf.Length)
             {
                 int n = s.Read(buf, len, buf.Length - len);
                 if (n == 0) break;
                 len += n;
             }
-            if (TryParseHeaderFromBuffer(Exact(buf, len), out var model)) return model;
+            LastHeaderReadMs += MsSince(tRead);
+            LastHeaderBytesRead = len;
+
+            // Cheap walk decides whether we have the whole header; only then do we materialise it.
+            if (TryCompleteHeader(buf, len, out var model)) return model;
+
+            var tGrow = System.Diagnostics.Stopwatch.GetTimestamp();
             GrowOrThrow(ref buf, len);
+            LastHeaderBufferMs += MsSince(tGrow);
         }
     }
 
@@ -186,28 +317,34 @@ public static class GGUFParser
     /// </summary>
     public static async ValueTask<GGUFModel> ParseHeaderAsync(Stream s, CancellationToken ct = default)
     {
+        ResetHeaderStats();
         var buf = new byte[HeaderReadChunkBytes];
         int len = 0;
         while (true)
         {
             // ONE await per multi-MiB read instead of one per field. This is the whole fix.
+            var tRead = System.Diagnostics.Stopwatch.GetTimestamp();
             while (len < buf.Length)
             {
                 int n = await s.ReadAsync(buf.AsMemory(len, buf.Length - len), ct).ConfigureAwait(false);
                 if (n == 0) break;
                 len += n;
             }
-            if (TryParseHeaderFromBuffer(Exact(buf, len), out var model)) return model;
+            LastHeaderReadMs += MsSince(tRead);
+            LastHeaderBytesRead = len;
+
+            // Cheap walk decides whether we have the whole header; only then do we materialise it.
+            if (TryCompleteHeader(buf, len, out var model)) return model;
+
+            var tGrow = System.Diagnostics.Stopwatch.GetTimestamp();
             GrowOrThrow(ref buf, len);
+            LastHeaderBufferMs += MsSince(tGrow);
         }
     }
 
-    /// <summary>
-    /// A byte[] whose Length is EXACTLY the bytes we hold, so that any read past the end of what we have
-    /// throws instead of quietly parsing the uninitialised tail as data. That exception is the "need more
-    /// bytes" signal, so the exact length is load-bearing, not tidiness.
-    /// </summary>
-    private static byte[] Exact(byte[] buf, int len) => len == buf.Length ? buf : buf[..len];
+    // `Exact(buf, len)` used to live here: it sliced the buffer down to the bytes actually held, so that a
+    // read past the end threw and became the "need more bytes" signal. The scan carries that signal now -
+    // it bounds-checks against an explicit `limit` - so the slice was pure cost and is gone.
 
     /// <summary>
     /// Double the buffer for another attempt, or throw if the stream is exhausted (we read less than we
@@ -222,6 +359,158 @@ public static class GGUFParser
             throw new InvalidOperationException(
                 $"GGUF header did not parse within {MaxHeaderBytes:N0} bytes - corrupt file or bad length field.");
         Array.Resize(ref buf, Math.Min(buf.Length * 2, MaxHeaderBytes));
+    }
+
+    /// <summary>
+    /// The materialising parse, run ONCE on a buffer the scan has already proved holds the whole header.
+    /// An overrun here is not "need more bytes" - the scan just walked the same structure to the end of
+    /// it - so it is a disagreement between the two walkers and must be loud rather than an infinite
+    /// grow loop. <c>GGUFHeader_ScanEndMatchesParseEnd</c> is what keeps it from happening.
+    /// </summary>
+    private static GGUFModel ParseWholeHeader(byte[] data, int limit)
+    {
+        if (TryParseHeaderFromBuffer(data, out var model)) return model;
+        throw new InvalidOperationException(
+            "GGUF header scan and parse disagree: the scan found a complete header within "
+            + $"{limit:N0} bytes but the parse ran off the end of it. This is a parser defect, "
+            + "not a bad file.");
+    }
+
+    /// <summary>
+    /// Walk the header WITHOUT materialising anything, to find where it ends.
+    /// No string is decoded, no dictionary or array is built, and a numeric array is skipped in one
+    /// add rather than per element - so this costs a fraction of a real parse and is what the
+    /// grow-and-retry loop repeats.
+    /// <para>
+    /// Same contract as <see cref="TryParseHeaderFromBuffer"/>: false means ONLY "ran off the end, need
+    /// more bytes". A bad magic, an unsupported version or an unknown value type is a defect in the data
+    /// and propagates immediately, so a non-GGUF stream still fails on its first four bytes instead of
+    /// being buffered in full.
+    /// </para>
+    /// </summary>
+    /// <param name="limit">
+    /// How many bytes of <paramref name="data"/> actually hold stream content. The buffer is usually
+    /// LARGER than that (it is sized in 4 MiB steps), and passing the count instead of slicing the array
+    /// down to it is what keeps this allocation-free - MEASURED at 5.7 ms of a 39.9 ms header parse for a
+    /// single 5.95 MiB exact-length copy, which is a large-object allocation, a zeroing and a memcpy to
+    /// tell the walker something an int already says.
+    /// </param>
+    private static bool TryScanHeaderEnd(byte[] data, int limit, out int end)
+    {
+        end = 0;
+        try
+        {
+            int pos = 0;
+            uint magic = ReadU32(data, limit, ref pos);
+            if (magic != GGUF_MAGIC)
+                throw new InvalidOperationException($"Not a GGUF file (magic: 0x{magic:X8}, expected 0x{GGUF_MAGIC:X8})");
+
+            uint version = ReadU32(data, limit, ref pos);
+            if (version < 2 || version > 3)
+                throw new InvalidOperationException($"Unsupported GGUF version: {version} (expected 2 or 3)");
+
+            ulong tensorCount = ReadU64(data, limit, ref pos);
+            ulong metadataCount = ReadU64(data, limit, ref pos);
+
+            for (ulong i = 0; i < metadataCount; i++)
+            {
+                SkipString(data, limit, ref pos);
+                SkipValue(data, limit, ref pos, (GGUFValueType)ReadU32(data, limit, ref pos));
+            }
+
+            for (ulong i = 0; i < tensorCount; i++)
+            {
+                SkipString(data, limit, ref pos);
+                uint nDims = ReadU32(data, limit, ref pos);
+                Advance(limit, ref pos, (long)nDims * 8);   // dims
+                Advance(limit, ref pos, 4);                 // GGMLType
+                Advance(limit, ref pos, 8);                 // data offset
+            }
+
+            end = pos;
+            return true;
+        }
+        catch (Exception ex) when (ex is IndexOutOfRangeException or ArgumentOutOfRangeException or ArgumentException)
+        {
+            return false; // ran off the end of what we have: the caller reads more and retries
+        }
+    }
+
+    /// <summary>
+    /// Move the cursor <paramref name="n"/> bytes, refusing to pass <paramref name="limit"/>. Skipping is
+    /// not reading, so nothing else would notice an overrun - without this bounds check the scan would
+    /// sail past the end on a bad length field and report a header that is not there.
+    /// </summary>
+    private static void Advance(int limit, ref int pos, long n)
+    {
+        if (n < 0 || pos + n > limit) throw new IndexOutOfRangeException();
+        pos += (int)n;
+    }
+
+    /// <summary>
+    /// Fixed-width reads for the SCAN path. They bounds-check against <paramref name="limit"/> rather
+    /// than the array, because the array is deliberately bigger than the content and its own bounds
+    /// check would happily read uninitialised tail bytes as header data.
+    /// </summary>
+    private static uint ReadU32(byte[] data, int limit, ref int pos)
+    {
+        if (pos + 4 > limit) throw new IndexOutOfRangeException();
+        return ReadUInt32(data, ref pos);
+    }
+
+    private static ulong ReadU64(byte[] data, int limit, ref int pos)
+    {
+        if (pos + 8 > limit) throw new IndexOutOfRangeException();
+        return ReadUInt64(data, ref pos);
+    }
+
+    private static void SkipString(byte[] data, int limit, ref int pos)
+    {
+        ulong len = ReadU64(data, limit, ref pos);
+        // A corrupt length can be anything up to 2^64-1. Compare in ulong BEFORE narrowing, or the cast
+        // to long goes negative (or wraps small) and the cursor leaves the buffer unnoticed.
+        if (len > (ulong)(limit - pos)) throw new IndexOutOfRangeException();
+        pos += (int)len;
+    }
+
+    /// <summary>
+    /// Byte width of a fixed-size GGUF scalar, or -1 for the variable-length types (String, Array).
+    /// ⚠️ This is the scanner's ONLY piece of format knowledge that <see cref="ReadValue"/> also holds,
+    /// so it is the one thing that can drift. An entry that is wrong by a single byte desyncs the scan
+    /// and fails <c>GGUFHeader_StreamParsersMatchInMemoryOracle</c>, whose fixture carries all 13 types.
+    /// A NEW value type added to <see cref="ReadValue"/> and not here throws <see cref="NotSupportedException"/>
+    /// on the first scan rather than silently mis-sizing anything.
+    /// </summary>
+    private static int FixedSizeOf(GGUFValueType type) => type switch
+    {
+        GGUFValueType.UInt8 or GGUFValueType.Int8 or GGUFValueType.Bool => 1,
+        GGUFValueType.UInt16 or GGUFValueType.Int16 => 2,
+        GGUFValueType.UInt32 or GGUFValueType.Int32 or GGUFValueType.Float32 => 4,
+        GGUFValueType.UInt64 or GGUFValueType.Int64 or GGUFValueType.Float64 => 8,
+        GGUFValueType.String or GGUFValueType.Array => -1,
+        _ => throw new NotSupportedException($"Unknown GGUF value type: {type}")
+    };
+
+    private static void SkipValue(byte[] data, int limit, ref int pos, GGUFValueType type)
+    {
+        int fixedSize = FixedSizeOf(type);
+        if (fixedSize > 0) { Advance(limit, ref pos, fixedSize); return; }
+        if (type == GGUFValueType.String) { SkipString(data, limit, ref pos); return; }
+
+        // Array
+        var elemType = (GGUFValueType)ReadU32(data, limit, ref pos);
+        ulong count = ReadU64(data, limit, ref pos);
+        int elemSize = FixedSizeOf(elemType);
+        if (elemSize > 0)
+        {
+            // The whole point: a 151,936-element numeric array costs one add, not 151,936 iterations.
+            // Divide rather than multiply so a hostile count cannot overflow into a small positive
+            // number and let the cursor walk off the end while still reporting a complete header.
+            if (count > (ulong)(limit - pos) / (ulong)elemSize) throw new IndexOutOfRangeException();
+            pos += (int)(count * (ulong)elemSize);
+            return;
+        }
+        for (ulong i = 0; i < count; i++) SkipValue(data, limit, ref pos, elemType);
     }
 
     /// <summary>

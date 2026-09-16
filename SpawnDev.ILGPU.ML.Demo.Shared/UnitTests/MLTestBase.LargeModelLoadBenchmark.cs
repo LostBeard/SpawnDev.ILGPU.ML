@@ -130,6 +130,9 @@ public abstract partial class MLTestBase
         try
         {
             var stages = new List<(string Stage, double Sec)>();
+            // Count header parses for THIS load only.
+            SpawnDev.ILGPU.ML.GGUF.GGUFParser.ResetHeaderTotals();
+
             var stageWatch = Stopwatch.StartNew();
             var lastStageAt = 0.0;
 
@@ -199,6 +202,21 @@ public abstract partial class MLTestBase
                     + $"({(hydN > 0 ? hydMiB * 1024 / hydN : 0):F0} KiB avg, {hydMaxMiB:F1} MiB largest) | "
                     + $"{(hydMs > 0 ? hydMiB / (hydMs / 1000.0) : 0):F0} MB/s | "
                     + $"{(hydN > 0 ? hydMs / hydN : 0):F2} ms per region");
+
+                // ── HEADER SPLIT: the grow-and-retry loop, from the parser's own counters ────────
+                // The header is 5.68 MiB against a 4 MiB first read, so this loop runs twice. Until
+                // 2026-09-16 BOTH passes materialised the 303K-string vocab and the first one's work was
+                // thrown away; now the retry is an allocation-free scan and the materialise happens once.
+                // scans > 1 with a materialise anywhere near the scan total means that regressed.
+                // 🔴 COUNT the parses, do not just time the last one. The Last* fields describe a single
+                // call, so a load that parses the header twice reports the cost of one and looks fine.
+                Console.WriteLine($"[LoadBench] HEADER TOTAL: {SpawnDev.ILGPU.ML.GGUF.GGUFParser.TotalHeaderParses} "
+                    + $"header parse(s) this load, {SpawnDev.ILGPU.ML.GGUF.GGUFParser.TotalHeaderMs:F0} ms total");
+
+                Console.WriteLine($"[LoadBench] HEADER SPLIT: {SpawnDev.ILGPU.ML.GGUF.GGUFParser.LastHeaderScanCount} scan(s) "
+                    + $"{SpawnDev.ILGPU.ML.GGUF.GGUFParser.LastHeaderScanMs:F0} ms | materialise {SpawnDev.ILGPU.ML.GGUF.GGUFParser.LastHeaderParseMs:F0} ms | "
+                    + $"read {SpawnDev.ILGPU.ML.GGUF.GGUFParser.LastHeaderReadMs:F0} ms | buffer {SpawnDev.ILGPU.ML.GGUF.GGUFParser.LastHeaderBufferMs:F0} ms | "
+                    + $"{SpawnDev.ILGPU.ML.GGUF.GGUFParser.LastHeaderBytesRead:N0} B pulled");
 
                 Console.WriteLine($"[LoadBench] COLD TOTAL (download + load): {dlSec + loadSec:F1}s");
 
