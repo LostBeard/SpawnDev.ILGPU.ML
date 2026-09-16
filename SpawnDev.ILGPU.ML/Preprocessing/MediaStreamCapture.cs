@@ -251,6 +251,7 @@ public class MediaStreamCapture : IDisposable
             using var readable = _audioProcessor.Readable;
             _audioReader = readable.GetReader();
 
+            _loggedFirstAudioFrame = false;
             _audioCts = new CancellationTokenSource();
             _ = AudioLoop(_audioCts.Token);
             return true;
@@ -290,8 +291,11 @@ public class MediaStreamCapture : IDisposable
         }
     }
 
+    private bool _loggedFirstAudioFrame;
+
     private async Task AudioLoop(CancellationToken ct)
     {
+        Console.WriteLine("[capture] audio loop started");
         // Nothing may escape this method. An unhandled exception on a runtime callback EXITS the .NET
         // WASM runtime, taking the whole page with it - so a failure is reported through OnAudioError.
         try
@@ -300,8 +304,27 @@ public class MediaStreamCapture : IDisposable
             {
                 ReadableStreamReaderReadResponse res;
                 try { res = await _audioReader.Read(); }
-                catch { break; }
-                if (res.Done) { res.Dispose(); break; }
+                catch (Exception ex)
+                {
+                    // A BARE `catch { break; }` USED TO BE HERE, and it hid the only fact worth having.
+                    // When the reader throws - a track this browser will not attach a processor to, a
+                    // reader already locked, a track that ended under us - the loop exited quietly and
+                    // the caller saw a capture that had "started" and then delivered nothing at all,
+                    // forever, with LastAudioError still null. That is indistinguishable from a silent
+                    // room, and it cost a full hardware run to even locate. Report and then stop.
+                    LastAudioError = ex;
+                    try { OnAudioError?.Invoke(ex); } catch { }
+                    break;
+                }
+                if (res.Done)
+                {
+                    // Not an error - the track ended - but the consumer still needs to know why the
+                    // frames stopped, because from outside it looks the same as the loop dying.
+                    res.Dispose();
+                    LastAudioError = new InvalidOperationException(
+                        "the audio track ended, so there are no more frames to read");
+                    break;
+                }
 
                 // The chunk of an audio MediaStreamTrackProcessor is an AudioData, not a byte view -
                 // read it with the correct wrapper type rather than the reader's byte-typed Value.
@@ -314,6 +337,14 @@ public class MediaStreamCapture : IDisposable
                     // 0 = native: hand over the frame's own rate and do not touch the samples.
                     int rate = _audioTargetRate > 0 ? _audioTargetRate : (int)audioData.SampleRate;
                     var samples = await MediaInterop.FromAudioDataAsync(audioData, rate);
+                    // The FIRST frame is the one that proves the pipeline runs at all. Everything after
+                    // it is the caller's business; whether this line is ever reached is ours.
+                    if (!_loggedFirstAudioFrame)
+                    {
+                        _loggedFirstAudioFrame = true;
+                        Console.WriteLine($"[capture] first audio frame: {samples.Length} samples @{rate} Hz "
+                            + $"(source rate {(int)audioData.SampleRate} Hz)");
+                    }
                     if (samples.Length > 0) OnAudioReady?.Invoke(samples, rate);
                 }
                 finally
