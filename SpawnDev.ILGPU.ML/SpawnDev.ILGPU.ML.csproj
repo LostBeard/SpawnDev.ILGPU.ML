@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.17</Version>
-		<PackageReleaseNotes>v5.2.17 - a decode capture that cannot be built no longer kills generation. WebGPUDecodeCapture.TryCaptureAsync THREW on a structural parity mismatch between its two probe captures, while its caller already handled null correctly (decode directly, stop attempting capture for the session). A capture is an optimisation, and an optimisation that cannot be built must never be load-bearing - this turned "this graph cannot be accelerated" into "chat does not work at all", with the user seeing only 'Error: /api/chat: decode capture parity mismatch'. The mismatch is still reported loudly with its counts, and the untrustworthy diff is still never replayed; only the throw is gone.</PackageReleaseNotes>
+		<Version>5.2.18</Version>
+		<PackageReleaseNotes>v5.2.18 - building a decode capture can no longer fail a generation, whatever goes wrong. 5.2.17 made ONE guard inside TryCaptureAsync return null instead of throwing, and the next report was a different guard in the same method - 'attention slot count mismatch 44/49' - still killing every chat turn. Guards are exactly what gets added to over time, so catching them one at a time at the throw site is a losing shape; the contract now lives at the call site in GgufGenerator, beside the fallback. A capture is an OPTIMISATION and the fallback next to it is a complete, correct decode, so a capture that cannot be built is a performance outcome and never a failed answer. The failure is still reported loudly and capture is disabled for the session.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

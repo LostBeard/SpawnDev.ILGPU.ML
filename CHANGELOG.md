@@ -2,6 +2,20 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.18 - a capture that cannot be built, for ANY reason, is not a failed generation
+
+5.2.17 made one guard inside `WebGPUDecodeCapture.TryCaptureAsync` return null instead of throwing. The
+very next report was a DIFFERENT guard in the same method - `attention slot count mismatch 44/49` - still
+killing every chat turn on the shipped demo.
+
+🔴 **Catching them one at a time at the throw site is a losing shape.** Guards are precisely the thing a
+capture path accumulates. The contract belongs where the fallback lives, so `GgufGenerator` now wraps the
+capture attempt: whatever goes wrong, the capture is abandoned, `EnableWebGPUDecodeCapture` goes false for
+the session, and `RunDirectAsync` produces the step - a complete, correct decode.
+
+A capture is an OPTIMISATION. The failure is still reported loudly with its type and message; only its
+ability to take the product down is gone.
+
 ## 5.2.17 - an optimisation that cannot be built must not be load-bearing
 
 `WebGPUDecodeCapture.TryCaptureAsync` **threw** on a structural parity mismatch between its two probe

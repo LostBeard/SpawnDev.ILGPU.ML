@@ -245,12 +245,35 @@ public sealed class GgufGenerator : IDisposable
                     // prefix-cache reuse; prefill/multi-token steps below stay on the direct path).
                     if (_decodeCapture == null)
                     {
-                        _decodeCapture = await WebGPUDecodeCapture.TryCaptureAsync(_session, stepIds[0], _argmax);
+                        // 🔴 NOTHING ABOUT BUILDING A CAPTURE MAY BE FATAL. A capture is an OPTIMISATION -
+                        // replay a recorded dispatch plan instead of walking the graph - and the fallback
+                        // right below is a complete, correct decode. So a capture that cannot be built is
+                        // a performance outcome, never a failed generation.
+                        //
+                        // ⚠️ THE NARROW FIX WAS NOT ENOUGH. 5.2.17 made one guard inside TryCaptureAsync
+                        // return null instead of throwing ("decode capture parity mismatch"), and the very
+                        // next report was a DIFFERENT guard in the same method - "attention slot count
+                        // mismatch 44/49" - still killing every chat turn. Guards are exactly the thing
+                        // that gets added to over time, so catching them one by one at the throw site is a
+                        // losing shape. The contract belongs here, where the fallback lives: whatever goes
+                        // wrong, this optimisation is abandoned and the model still answers.
+                        try
+                        {
+                            _decodeCapture = await WebGPUDecodeCapture.TryCaptureAsync(_session, stepIds[0], _argmax);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Loud, once - EnableWebGPUDecodeCapture goes false below, so this cannot spam.
+                            Console.WriteLine($"[capture] decode capture ABANDONED: {ex.GetType().Name}: "
+                                + $"{ex.Message}. Decoding directly; this session will not retry capture.");
+                            _decodeCapture = null;
+                        }
+
                         if (_decodeCapture != null)
                             outputs = _decodeCapture.Outputs;   // the capture pass IS this step's forward
                         else
                         {
-                            EnableWebGPUDecodeCapture = false;  // non-WebGPU: don't retry every step
+                            EnableWebGPUDecodeCapture = false;  // non-WebGPU, or uncapturable: don't retry
                             outputs = await RunDirectAsync();
                         }
                     }
