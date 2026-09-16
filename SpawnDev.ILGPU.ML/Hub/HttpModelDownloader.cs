@@ -80,9 +80,23 @@ public class HttpModelDownloader
     private static void ResetTransferCensus()
     {
         LastFetchMs = 0; LastStoreWriteMs = 0; LastFetchBytes = 0; LastFetchChunks = 0;
+        LastCheckpointMs = 0; LastCheckpoints = 0; LastCoalesceMs = 0;
     }
     /// <summary>Fetch chunks seen. Reset per download - the loop cost scales with THIS, not with bytes.</summary>
     public static long LastFetchChunks { get; private set; }
+
+    // ⚠️ THE UNACCOUNTED TIME HAD (AT LEAST) TWO CANDIDATES AND DIVIDING BY ONE OF THEM PROVED NOTHING.
+    // 12,211 ms of a 44 s download sat outside fetch and store-write. That is 132 us x 92,182 fetch
+    // chunks (per-chunk interop) OR 56 ms x ~218 checkpoints (an OPFS flush + a resume-state write every
+    // 8 MiB) - both divide neatly, and I asserted the first. TJ: "that does not seem correct."
+    // These time the two suspects directly so the remainder is a real remainder.
+
+    /// <summary>Cumulative ms in the every-8-MiB checkpoint (dest.FlushAsync + store.SetStateAsync).</summary>
+    public static double LastCheckpointMs { get; private set; }
+    /// <summary>Checkpoints taken. Reset per download.</summary>
+    public static long LastCheckpoints { get; private set; }
+    /// <summary>Cumulative ms in the JS-side coalescing copy (<c>writeBuffer.Set</c>) plus chunk length reads.</summary>
+    public static double LastCoalesceMs { get; private set; }
     private static void AddFetch(double ms, long bytes) { LastFetchMs += ms; LastFetchBytes += bytes; LastFetchChunks++; }
     private static void AddStoreWrite(double ms) { LastStoreWriteMs += ms; }
 
@@ -176,11 +190,86 @@ public class HttpModelDownloader
         => await _store.OpenReadAsync(key, ct).ConfigureAwait(false)
            ?? throw new IOException($"Store has no readable entry for '{key}' after a successful download.");
 
+    /// <summary>
+    /// Bytes pulled per ranged request in the segmented path. One <c>fetch</c> + one
+    /// <c>response.bytes()</c> + one store write per segment.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 WHY SEGMENTS INSTEAD OF A CHUNK LOOP. Streaming the body pulls ~20 KB per
+    /// <c>reader.Read()</c>, and each iteration crosses .NET-&gt;JS several times (read the result's
+    /// value, read its length, copy it into the staging buffer, dispose the chunk, dispose the result).
+    /// MEASURED 2026-09-15 on Qwen3-1.7B (1.83 GB) over the hub:
+    /// <code>
+    ///   DOWNLOAD 43.6s | fetch 29,356 ms | store write 2,211 ms
+    ///   90,692 fetch chunks of 20 KiB
+    ///   checkpoints  1,178 ms (109)   coalesce Set 1,164 ms   UNATTRIBUTED 9,690 ms
+    /// </code>
+    /// 9.7 s - 22% of the download - was per-iteration interop, and neither of the two things I first
+    /// blamed (checkpointing, the staging copy) accounted for it: both were ~1.2 s. 9,690 ms over 90,692
+    /// iterations is 107 us each, which is 4-5 SpawnJS crossings at the 4-19 us a bare crossing measured.
+    /// <para>
+    /// A 64 MiB segment fetched with <c>response.bytes()</c> is ONE Uint8Array in ONE crossing, so the
+    /// whole file costs ~28 iterations instead of 90,692 - and the bytes still never touch the .NET heap.
+    /// </para>
+    /// <para>
+    /// ⚠️ It also keeps everything the chunk loop gave us: progress per segment, a durable checkpoint per
+    /// segment (resume granularity becomes 64 MiB rather than 8 MiB, still durable), and If-Range so a
+    /// file that changes mid-download restarts instead of splicing two versions together.
+    /// </para>
+    /// <para>
+    /// ⚠️ Peak JS memory is ONE segment. 64 MiB is the trade: large enough that per-request overhead is
+    /// noise against a gigabit link, small enough to be nothing on any machine that can run a 1.8 GB model.
+    /// </para>
+    /// </remarks>
+    public int SegmentBytes { get; set; } = 64 * 1024 * 1024;
+
+    /// <summary>
+    /// Fetch the file as bounded ranges instead of streaming one body. <b>Default FALSE - it MEASURED
+    /// SLOWER.</b>
+    /// </summary>
+    /// <remarks>
+    /// 🔴 A NEGATIVE RESULT, KEPT SO IT IS NOT RE-TRIED. Segmenting removes the per-chunk interop the
+    /// streaming loop pays (see <see cref="SegmentBytes"/>) and it does remove it - but the download gets
+    /// SLOWER overall. MEASURED 2026-09-15, Qwen3-1.7B (1.83 GB) over the hub, same machine, same file:
+    /// <code>
+    ///                     streaming          segmented 64 MiB
+    ///   DOWNLOAD          43.6s 40.1 MB/s    46.6s 37.6 MB/s
+    ///     fetch           29.4s 60 MB/s      43.4s 40 MB/s
+    ///     store write      2.2s               1.9s
+    ///     unattributed     9.7s               0.5s     &lt;-- the interop really did go away
+    ///     iterations     90,692                 28
+    /// </code>
+    /// The 9.7 s of interop vanished exactly as intended, and it bought nothing: fetch throughput fell
+    /// from 60 to 40 MB/s and the total rose by 3 s.
+    /// <para>
+    /// ⚠️ WHY, AND IT IS THE LESSON: one streaming body downloads WHILE we process it. Discrete range
+    /// requests serialize - request, wait for the whole segment, write, request again - with no overlap
+    /// and a fresh ramp per request. The streaming loop's "29.4 s of fetch" was overlapping with our own
+    /// work, so treating it as pure cost and the 9.7 s as pure waste was reading a concurrency window as
+    /// a bill. Overlapping the next fetch with the current write would recover the serialization but not
+    /// the per-request throughput drop, so it still cannot beat 43.6 s.
+    /// </para>
+    /// <para>
+    /// Kept because it is the correct path for an origin that cannot stream, and because the numbers
+    /// above are worth more than the code.
+    /// </para>
+    /// </remarks>
+    public bool UseSegmentedDownload { get; set; } = false;
+
     private async Task DownloadAsync(string url, string key, long resumeFrom, string? knownETag,
         IProgress<ModelDownloadProgress>? progress, CancellationToken ct)
     {
         var headers = new Dictionary<string, string>();
-        if (resumeFrom > 0)
+        // Segmented: ask for a BOUNDED range from the start, so the first response is a 206 carrying
+        // Content-Range (which gives the true total) and a body small enough to take in one
+        // response.bytes(). An origin that ignores Range answers 200 with the whole body and we fall
+        // back to the streaming chunk loop below, exactly as before.
+        if (UseSegmentedDownload && SegmentBytes > 0)
+        {
+            headers["Range"] = $"bytes={resumeFrom}-{resumeFrom + SegmentBytes - 1}";
+            if (!string.IsNullOrEmpty(knownETag)) headers["If-Range"] = knownETag!;
+        }
+        else if (resumeFrom > 0)
         {
             headers["Range"] = $"bytes={resumeFrom}-";
             // If the origin's copy changed since our partial was written it answers 200 with the whole body
@@ -271,6 +360,84 @@ public class HttpModelDownloader
         var dest = await _store.OpenWriteAsync(key, resumeFrom, ct).ConfigureAwait(false);
         await using (dest.ConfigureAwait(false))
         {
+            // ── SEGMENTED PATH: one fetch + one response.bytes() + one store write per 64 MiB ────────
+            // Taken only when the origin honoured the bounded Range (206). Otherwise fall through to the
+            // streaming loop, which is unchanged and remains the fallback for origins without ranges.
+            if (UseSegmentedDownload && SegmentBytes > 0 && status == 206)
+            {
+                var segResponse = response;          // the first segment is already in hand
+                try
+                {
+                    while (true)
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        // ONE crossing for the whole segment; the bytes stay a JS Uint8Array.
+                        var _fT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        using var segBytes = await segResponse.Bytes().ConfigureAwait(false);
+                        var segLen = segBytes.Length;
+                        AddFetch((System.Diagnostics.Stopwatch.GetTimestamp() - _fT0)
+                                 * (1000.0 / System.Diagnostics.Stopwatch.Frequency), segLen);
+                        if (segLen == 0) break;
+
+                        await WriteChunkAsync(dest, segBytes, ct).ConfigureAwait(false);
+                        writeCount++;
+                        written += segLen;
+                        received += segLen;
+
+                        // Durable checkpoint per segment - resume granularity is SegmentBytes.
+                        var _cT0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                        await dest.FlushAsync(ct).ConfigureAwait(false);
+                        await _store.SetStateAsync(key, url, total, written, false, etag, ct).ConfigureAwait(false);
+                        LastCheckpointMs += (System.Diagnostics.Stopwatch.GetTimestamp() - _cT0)
+                                            * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                        LastCheckpoints++;
+
+                        tracker.Received = received;
+                        progress?.Report(new ModelDownloadProgress(received, total, resumed));
+                        ActiveDownloadsChanged?.Invoke();
+
+                        if (total > 0 && received >= total) break;
+
+                        // Next segment. If-Range so a file that changed underneath us answers 200 and we
+                        // fail loudly rather than splicing two different versions together.
+                        var nextHeaders = new Dictionary<string, string>
+                        {
+                            ["Range"] = $"bytes={received}-{received + SegmentBytes - 1}",
+                        };
+                        if (!string.IsNullOrEmpty(etag)) nextHeaders["If-Range"] = etag!;
+
+                        segResponse.Dispose();
+                        segResponse = await _js.Fetch(url, new FetchOptions
+                        {
+                            Headers = nextHeaders,
+                            Signal = abortSignal,
+                        }).ConfigureAwait(false);
+
+                        if (!segResponse.Ok)
+                            throw new HttpRequestException(
+                                $"Model download failed mid-file: {(int)segResponse.Status} " +
+                                $"{segResponse.StatusText} for {url} at byte {received}");
+                        if ((int)segResponse.Status != 206)
+                            throw new IOException(
+                                $"Origin stopped honouring Range at byte {received} for {url} " +
+                                $"(status {(int)segResponse.Status}). The file may have changed mid-download; " +
+                                "the partial is checkpointed, so a retry resumes from the last durable byte.");
+                    }
+                }
+                finally { segResponse.Dispose(); }
+
+                await dest.FlushAsync(ct).ConfigureAwait(false);
+                await _store.SetStateAsync(key, url, total, written, true, etag, ct).ConfigureAwait(false);
+                progress?.Report(new ModelDownloadProgress(received, total, resumed));
+                LastDownloadChunks = LastFetchChunks;
+                LastDownloadWrites = writeCount;
+                LastDownloadBytes = written - resumeFrom;
+                _active.TryRemove(key, out _);
+                ActiveDownloadsChanged?.Invoke();
+                return;
+            }
+
             using var body = response.Body ?? throw new InvalidOperationException($"Response for {url} had no body.");
             using var reader = body.GetReader();
             try
@@ -308,8 +475,11 @@ public class HttpModelDownloader
                     {
                         if (bufferFill + chunkLength > WriteBufferSize) await FlushAsync().ConfigureAwait(false);
                         // TypedArray.set: a JS-side copy into the staging buffer, no managed array involved.
+                        var _coT0 = System.Diagnostics.Stopwatch.GetTimestamp();
                         writeBuffer ??= new Uint8Array(WriteBufferSize);
                         writeBuffer.Set(chunk, bufferFill);
+                        LastCoalesceMs += (System.Diagnostics.Stopwatch.GetTimestamp() - _coT0)
+                                          * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
                         bufferFill += chunkLength;
                     }
                     received += chunkLength;
@@ -317,8 +487,12 @@ public class HttpModelDownloader
                     // Checkpoint only what is DURABLE - `written`, never `received`. A resume trusts this.
                     if (written - lastCheckpoint >= CheckpointInterval)
                     {
+                        var _cpT0 = System.Diagnostics.Stopwatch.GetTimestamp();
                         await dest.FlushAsync(ct).ConfigureAwait(false);
                         await _store.SetStateAsync(key, url, total, written, false, etag, ct).ConfigureAwait(false);
+                        LastCheckpointMs += (System.Diagnostics.Stopwatch.GetTimestamp() - _cpT0)
+                                            * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                        LastCheckpoints++;
                         lastCheckpoint = written;
                     }
 

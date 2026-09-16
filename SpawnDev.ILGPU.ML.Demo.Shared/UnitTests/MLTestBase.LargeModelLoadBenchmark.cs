@@ -91,8 +91,18 @@ public abstract partial class MLTestBase
             + $"({(dlSec > 0 ? (fetchMs + storeMs) / (dlSec * 1000) * 100 : 0):F0}%) | "
             + $"{fetchMiB:F0} MiB over {SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks:N0} fetch chunks "
             + $"({(SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks > 0 ? fetchMiB * 1024 / SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks : 0):F0} KiB each, "
-            + $"unaccounted {dlSec * 1000 - fetchMs - storeMs:F0} ms = "
-            + $"{(SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks > 0 ? (dlSec * 1000 - fetchMs - storeMs) / SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks * 1000 : 0):F0} us/chunk)");
+            + $"rest {dlSec * 1000 - fetchMs - storeMs:F0} ms)");
+
+        // ⚠️ The "rest" above had TWO plausible owners and dividing by one of them proved nothing.
+        // These time both directly; whatever is STILL left over is a genuine remainder.
+        var cpMs = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastCheckpointMs;
+        var cps = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastCheckpoints;
+        var coMs = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastCoalesceMs;
+        var chunks = SpawnDev.ILGPU.ML.Hub.HttpModelDownloader.LastFetchChunks;
+        Console.WriteLine($"[LoadBench] LOOP SPLIT: checkpoints {cpMs:F0} ms over {cps:N0} "
+            + $"({(cps > 0 ? cpMs / cps : 0):F1} ms each) | coalesce Set {coMs:F0} ms over {chunks:N0} "
+            + $"({(chunks > 0 ? coMs / chunks * 1000 : 0):F0} us each) | STILL UNATTRIBUTED "
+            + $"{dlSec * 1000 - fetchMs - storeMs - cpMs - coMs:F0} ms");
 
         // ── WARM: load from the cache onto the GPU ───────────────────────────────────────────────────
         // TraceWeightLoad prints the stream-READ vs GPU-WRITE split, which is what says whether the
