@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.16</Version>
-		<PackageReleaseNotes>v5.2.16 - Speech input and pronunciation. MediaStreamCapture no longer swallows the reason its audio loop stopped: a bare catch on the stream reader turned every capture failure into a capture that had started and then delivered nothing, forever, with LastAudioError still null - indistinguishable from a silent room. It now reports the exception, distinguishes a track that ENDED from one that threw, and logs that the loop started plus the first frame's size and rate, which are the first two questions any "it cannot hear me" report asks. Pulls SpawnDev.Phonemizer 1.1.1, whose CreatePhonemizer teaches itself the ecosystem's proper nouns - a name the letter-to-sound rules guess wrong passes every check there is, because every phoneme it emits is valid and encodable while the voice says a different word.</PackageReleaseNotes>
+		<Version>5.2.17</Version>
+		<PackageReleaseNotes>v5.2.17 - a decode capture that cannot be built no longer kills generation. WebGPUDecodeCapture.TryCaptureAsync THREW on a structural parity mismatch between its two probe captures, while its caller already handled null correctly (decode directly, stop attempting capture for the session). A capture is an optimisation, and an optimisation that cannot be built must never be load-bearing - this turned "this graph cannot be accelerated" into "chat does not work at all", with the user seeing only 'Error: /api/chat: decode capture parity mismatch'. The mismatch is still reported loudly with its counts, and the untrustworthy diff is still never replayed; only the throw is gone.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

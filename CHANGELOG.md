@@ -2,6 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.17 - an optimisation that cannot be built must not be load-bearing
+
+`WebGPUDecodeCapture.TryCaptureAsync` **threw** on a structural parity mismatch between its two probe
+captures. Its caller in `GgufGenerator` already handles `null` exactly right - run the step directly and
+stop attempting capture for the rest of the session - so a recoverable condition was being turned into a
+total outage by a method whose name promises otherwise.
+
+MEASURED 2026-09-16: every chat turn on the SpawnDev.AI demo failed with
+`Error: /api/chat: decode capture parity mismatch: ops 592/597, scalars 536/536, copies 56/61`, and the
+user saw nothing else.
+
+Unchanged: the mismatch is still reported with its counts, and the untrustworthy diff is still never
+replayed. The capture is abandoned entirely - that was always the right response. Only the throw is gone.
+
+🔴 **The underlying mismatch is still open** and worth fixing: +5 dispatches and +5 copies with scalars
+identical says one structure repeated five times takes a different branch at `p0+1` than at `p0`.
+
 ## 5.2.16 - the capture that started and said nothing
 
 `MediaStreamCapture.AudioLoop` had this:

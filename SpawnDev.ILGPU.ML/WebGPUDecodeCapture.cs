@@ -251,10 +251,30 @@ public sealed class WebGPUDecodeCapture : IDisposable
                 if (planA.DispatchCount != planB.DispatchCount
                     || planA.ScalarSnapshots.Count != planB.ScalarSnapshots.Count
                     || planA.CopyEntries.Count != planB.CopyEntries.Count)
-                    throw new InvalidOperationException(
-                        $"decode capture parity mismatch: ops {planA.DispatchCount}/{planB.DispatchCount}, " +
+                {
+                    // 🔴 LOUD, BUT NOT FATAL. A mismatch means the two captures took different graph
+                    // paths, so no diff between them is trustworthy and this graph must NOT be replayed -
+                    // that part is unchanged, and abandoning the capture entirely is the whole response.
+                    //
+                    // ⚠️ What changed is that it no longer THROWS. This method is `TryCaptureAsync`, and
+                    // its caller (GgufGenerator) already handles null exactly right: run the step
+                    // directly and stop attempting capture for the rest of the session. Throwing instead
+                    // turned "this graph cannot be accelerated" into "chat does not work at all" - and it
+                    // did, for hours, on a shipped demo, with the user seeing only
+                    // "Error: /api/chat: decode capture parity mismatch". A capture is an OPTIMISATION;
+                    // an optimisation that cannot be built must never be load-bearing.
+                    //
+                    // The counts stay in the log because they are the whole diagnosis: +5 ops and +5
+                    // copies with scalars identical says one structure repeated five times took a
+                    // different branch at p0+1 than at p0.
+                    Console.WriteLine(
+                        $"[capture] decode capture ABANDONED - parity mismatch: " +
+                        $"ops {planA.DispatchCount}/{planB.DispatchCount}, " +
                         $"scalars {planA.ScalarSnapshots.Count}/{planB.ScalarSnapshots.Count}, " +
-                        $"copies {planA.CopyEntries.Count}/{planB.CopyEntries.Count}");
+                        $"copies {planA.CopyEntries.Count}/{planB.CopyEntries.Count}. " +
+                        $"Decoding directly; this session will not retry capture.");
+                    return null;
+                }
 
                 // Scalar bytes: diff as 4-byte ints (all cursor-dependent scalars are ints - a
                 // non-int-aligned diff throws).
