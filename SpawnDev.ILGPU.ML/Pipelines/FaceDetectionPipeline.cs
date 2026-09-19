@@ -3,6 +3,7 @@ using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -39,17 +40,57 @@ public class FaceDetectionPipeline : IDisposable
     /// <summary>
     /// Detect faces in an RGBA image.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="DetectAsync(TypedArray, int, int, float, float)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<FaceDetectionResult> DetectAsync(
         int[] rgbaPixels, int width, int height,
         float confidenceThreshold = 0.5f,
         float iouThreshold = 0.3f)
     {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await DetectAsync(rgbaBuf.View, width, height, confidenceThreshold, iouThreshold)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<FaceDetectionResult> DetectAsync(
+        TypedArray rgbaPixels, int width, int height,
+        float confidenceThreshold = 0.5f,
+        float iouThreshold = 0.3f)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await DetectAsync(rgbaBuf.View, width, height, confidenceThreshold, iouThreshold)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<FaceDetectionResult> DetectAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float confidenceThreshold = 0.5f,
+        float iouThreshold = 0.3f)
+        => DetectCoreAsync(rgbaPixels, width, height, confidenceThreshold, iouThreshold);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<FaceDetectionResult> DetectAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float confidenceThreshold = 0.5f,
+        float iouThreshold = 0.3f)
+        => DetectCoreAsync(rgbaPixels.View, width, height, confidenceThreshold, iouThreshold);
+
+    private async Task<FaceDetectionResult> DetectCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float confidenceThreshold, float iouThreshold)
+    {
         var sw = Stopwatch.StartNew();
 
         // Preprocess: RGBA → NCHW float [0,1] for 128×128
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.ForwardNormalized01(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize);
+        _preprocess.ForwardNormalized01(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize);
 
         // BlazeFace expects NHWC — transpose NCHW→NHWC on GPU (no CPU round-trip)
         int H = _inputSize, W = _inputSize;
@@ -62,11 +103,11 @@ public class FaceDetectionPipeline : IDisposable
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
-        });
+        }).ConfigureAwait(false);
 
         // Read outputs
-        var regressors = await ReadOutputAsync(outputs, 0, 896 * 16);
-        var classificators = await ReadOutputAsync(outputs, 1, 896);
+        var regressors = await ReadOutputAsync(outputs, 0, 896 * 16).ConfigureAwait(false);
+        var classificators = await ReadOutputAsync(outputs, 1, 896).ConfigureAwait(false);
 
         // Decode detections
         var faces = DecodeDetections(regressors, classificators, width, height,
@@ -91,8 +132,8 @@ public class FaceDetectionPipeline : IDisposable
         int elems = Math.Min(output.ElementCount, expectedElems);
         using var readBuf = _accelerator.Allocate1D<float>(elems);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await _accelerator.SynchronizeAsync();
-        return await readBuf.CopyToHostAsync<float>(0, elems);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        return await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
     }
 
     private DetectedFace[] DecodeDetections(float[] regressors, float[] classificators,

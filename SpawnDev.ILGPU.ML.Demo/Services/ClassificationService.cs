@@ -2,6 +2,7 @@ using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Pipelines;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Demo.Services;
@@ -70,6 +71,21 @@ public class ClassificationService : IDisposable
     /// <summary>Classify an RGBA image. Returns results + inference time.</summary>
     public async Task<(ClassificationResult[] predictions, double inferenceMs)> ClassifyAsync(
         int[] rgbaPixels, int width, int height, int topK = 5)
+    {
+        if (_pipeline == null) throw new InvalidOperationException("Model not loaded");
+
+        var sw = Stopwatch.StartNew();
+        var results = await _pipeline.ClassifyAsync(rgbaPixels, width, height, topK);
+        sw.Stop();
+
+        return (results, sw.Elapsed.TotalMilliseconds);
+    }
+
+    /// <summary>
+    /// Browser path: classify from a JS typed array (no managed int[] round-trip).
+    /// </summary>
+    public async Task<(ClassificationResult[] predictions, double inferenceMs)> ClassifyAsync(
+        TypedArray rgbaPixels, int width, int height, int topK = 5)
     {
         if (_pipeline == null) throw new InvalidOperationException("Model not loaded");
 

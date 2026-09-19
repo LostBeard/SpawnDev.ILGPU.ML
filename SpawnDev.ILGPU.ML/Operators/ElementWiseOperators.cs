@@ -242,9 +242,7 @@ public class SigmoidOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAw
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        // Copy then in-place
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.Activations.SigmoidInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+        reg.Activations.Sigmoid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
     public bool TryExecuteHalf(OnnxOpContext ctx, PrecisionAwareInput[] inputs, Tensors.HalfTensor output, Kernels.PrecisionAwareKernels pak)
     {
@@ -261,8 +259,7 @@ public class SiLUOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.Activations.SiLUInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+        reg.Activations.SiLU(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -298,8 +295,7 @@ public class TanhOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.Activations.TanhInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+        reg.Activations.Tanh(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -388,7 +384,8 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
         {
             // Safe two-step: copy a → output, then add b in-place.
             // Avoids 3-way aliasing (a, b, output may share same GPU buffer on WebGPU).
-            reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
+            // CopyFrom (native GPU→GPU) preferred over Scale(×1) — no kernel dispatch.
+            output.Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
             reg.ElementWise.AddInPlace(output.Data, b.Data, a.ElementCount);
         }
         else if (b.ElementCount == 1 && a.ElementCount == output.ElementCount)
@@ -397,14 +394,14 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             // tensor has no last dimension, and Shape[^1] on an empty shape throws rather than returning
             // anything. Not an edge case here - the flow-matching decoder feeds its timestep in as a true
             // 0-d tensor and adds it to a [1,384] embedding, which crashed the whole graph.
-            reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
+            output.Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
             reg.ElementWise.AddBias(output.Data, b.Data, a.ElementCount, 1);
         }
         else if (a.ElementCount == 1 && b.ElementCount == output.ElementCount)
         {
             // Same case with the operands the other way round; addition commutes, so the scalar is
             // applied to a copy of b.
-            reg.ElementWise.Scale(b.Data, output.Data, b.ElementCount, 1f);
+            output.Data.SubView(0, b.ElementCount).CopyFrom(b.Data.SubView(0, b.ElementCount));
             reg.ElementWise.AddBias(output.Data, a.Data, b.ElementCount, 1);
         }
         else if (b.ElementCount == BroadcastShapeHelpers.LastDim(a) && b.Shape.Length > 0 && b.Shape[^1] == b.ElementCount)
@@ -413,7 +410,7 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             // elements in its LAST dim) keeps a per-channel bias shaped [C,1,1] — which also satisfies
             // ElementCount==a.Shape[^1] when C==W (SD-VAE GroupNorm β [256,1,1]) — from being applied per-W;
             // it falls through to the general N-D broadcast (correct per-channel). See MulOperator for detail.
-            reg.ElementWise.Scale(a.Data, output.Data, a.ElementCount, 1f);
+            output.Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
             reg.ElementWise.AddBias(output.Data, b.Data, a.ElementCount, b.ElementCount);
         }
         else if (a.Rank == 4 && b.Rank == 1 && b.ElementCount == a.Shape[1])
@@ -422,7 +419,7 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
             // AddBias broadcasts over the last dim. For NCHW we need per-channel.
             // Reshape conceptually: each C-channel has H*W elements
             int C = a.Shape[1]; int spatial = a.Shape[2] * a.Shape[3];
-            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
+            ctx.Outputs[0].Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
             // Use BroadcastMul pattern but for Add — need a per-channel add kernel
             // For now, iterate channels on CPU dispatch (each channel gets AddBias)
             for (int nc = 0; nc < a.Shape[0] * C; nc++)
@@ -430,8 +427,6 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
                 int c = nc % C;
                 int offset = nc * spatial;
                 // Add scalar bias[c] to each element in this channel's spatial slice
-                // We don't have a scalar-add kernel, so use AddBias with spatial=1 trick
-                // Actually, just use Scale(1) + AddBias over the spatial dim
                 reg.ElementWise.AddBias(
                     ctx.Outputs[0].Data.SubView(offset, spatial),
                     b.Data.SubView(c, 1), spatial, 1);
@@ -440,7 +435,7 @@ public class AddOperator(OperatorRegistry reg) : IOnnxOperator, IPrecisionAwareO
         else if (b.ElementCount == 1)
         {
             // Scalar broadcast
-            reg.ElementWise.Scale(a.Data, ctx.Outputs[0].Data, a.ElementCount, 1f);
+            ctx.Outputs[0].Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
             reg.ElementWise.AddBias(ctx.Outputs[0].Data, b.Data, a.ElementCount, 1);
         }
         else
@@ -1033,10 +1028,10 @@ public class ExpandOperator(OperatorRegistry reg) : IOnnxOperator
         var output = ctx.Outputs[0];
         int outCount = output.ElementCount;
 
-        // Simple case: same element count — just copy
+        // Simple case: same element count — just copy (native GPU→GPU, not Scale×1)
         if (input.ElementCount == outCount)
         {
-            reg.ElementWise.Scale(input.Data, output.Data, outCount, 1f);
+            output.Data.SubView(0, outCount).CopyFrom(input.Data.SubView(0, outCount));
             return;
         }
 
@@ -1252,8 +1247,7 @@ public class HardSigmoidOperator(OperatorRegistry reg) : IOnnxOperator
         // ONNX spec defaults: alpha=0.2, beta=0.5
         float alpha = ctx.GetFloat("alpha", 0.2f);
         float beta = ctx.GetFloat("beta", 0.5f);
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.Activations.HardSigmoidInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount, alpha, beta);
+        reg.Activations.HardSigmoid(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, alpha, beta);
     }
 }
 
@@ -1264,8 +1258,7 @@ public class HardSwishOperator(OperatorRegistry reg) : IOnnxOperator
         => new[] { inputs[0] };
     public void Execute(OnnxOpContext ctx)
     {
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
-        reg.Activations.HardSwishInPlace(ctx.Outputs[0].Data, ctx.Outputs[0].ElementCount);
+        reg.Activations.HardSwish(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount);
     }
 }
 
@@ -1278,7 +1271,8 @@ public class DropoutOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         // Inference mode: output = input (no dropout applied)
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        int count = ctx.Inputs[0].ElementCount;
+        ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
     }
 }
 
@@ -1583,11 +1577,11 @@ public class LogSoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         for (int i = 0; i < axis; i++) rows *= shape[i];
         // Copy input to output, run softmax, then log (using temp to avoid aliasing)
         int total = ctx.Inputs[0].ElementCount;
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFrom(ctx.Inputs[0].Data.SubView(0, total));
         reg.Softmax.Forward(ctx.Outputs[0].Data, rows, cols);
         var tempBuf = ctx.Pool.Rent(new[] { total });
         reg.ElementWise.Log(ctx.Outputs[0].Data, tempBuf.Data, total);
-        reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFrom(tempBuf.Data.SubView(0, total));
     }
 }
 
@@ -1614,8 +1608,8 @@ public class SumOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         int count = ctx.Outputs[0].ElementCount;
-        // Copy first input to output
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+        // Copy first input to output (native GPU→GPU)
+        ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
         // Add remaining inputs using temp buffer to avoid aliasing (output as both input and output)
         if (ctx.Inputs.Length > 1)
         {
@@ -1631,7 +1625,7 @@ public class SumOperator(OperatorRegistry reg) : IOnnxOperator
                 if (inCount == count)
                 {
                     reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.Data, count);
-                    reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, count, 1f);
+                    ctx.Outputs[0].Data.SubView(0, count).CopyFrom(tempBuf.Data.SubView(0, count));
                 }
                 else if (inCount == 1)
                 {
@@ -1657,7 +1651,7 @@ public class MeanOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         int count = ctx.Outputs[0].ElementCount;
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+        ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
         if (ctx.Inputs.Length > 1)
         {
             var tempBuf = ctx.Pool.Rent(new[] { count });
@@ -1672,7 +1666,7 @@ public class MeanOperator(OperatorRegistry reg) : IOnnxOperator
                 if (inCount == count)
                 {
                     reg.ElementWise.Add(ctx.Outputs[0].Data, ctx.Inputs[i].Data, tempBuf.Data, count);
-                    reg.ElementWise.Scale(tempBuf.Data, ctx.Outputs[0].Data, count, 1f);
+                    ctx.Outputs[0].Data.SubView(0, count).CopyFrom(tempBuf.Data.SubView(0, count));
                 }
                 else if (inCount == 1)
                 {

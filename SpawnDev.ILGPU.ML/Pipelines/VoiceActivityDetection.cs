@@ -421,6 +421,26 @@ public sealed class VoiceActivityDetector : IDisposable
         }
     }
 
+    /// <summary>
+    /// Browser path: accept a JS <see cref="SpawnDev.SpawnJS.JSObjects.Float32Array"/> chunk.
+    /// </summary>
+    /// <remarks>
+    /// Endpointing retains host samples for <see cref="SpeechSegment"/> emission, so the chunk crosses
+    /// into managed memory once via <c>ToArray</c>. Prefer this overload over converting in the caller.
+    /// For a single aligned 512-sample VAD frame with no segment buffering, use
+    /// <see cref="SileroVad.ProcessFrameAsync(SpawnDev.SpawnJS.JSObjects.Float32Array)"/> directly
+    /// (JS→GPU via <c>UploadToDevice</c>, no managed heap).
+    /// </remarks>
+    public Task AcceptWaveformAsync(SpawnDev.SpawnJS.JSObjects.Float32Array samples, int offset = 0, int count = -1)
+    {
+        ArgumentNullException.ThrowIfNull(samples);
+        var host = samples.ToArray();
+        if (offset == 0 && (count < 0 || count == host.Length))
+            return AcceptWaveformAsync(host);
+        if (count < 0) count = host.Length - offset;
+        return AcceptWaveformAsync(host, offset, count);
+    }
+
     private async Task ProcessFrameAsync()
     {
         int window = SileroVad.WindowSize;

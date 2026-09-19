@@ -4,10 +4,9 @@ using ILGPU.Runtime;
 namespace SpawnDev.ILGPU.ML.Kernels;
 
 /// <summary>
-/// GPU kernels for audio preprocessing.
-/// Replaces CPU-side AudioPreprocessor with GPU-native execution.
-/// FFT stays CPU (complex recursive algorithm), but windowing,
-/// mel filterbank application, and log scaling run on GPU.
+/// GPU kernels for audio preprocessing building blocks (window, mel matmul, log, normalize, resample).
+/// Whisper's full centred STFT → log-mel lives in <see cref="Preprocessing.WhisperMelPreprocessor"/>
+/// (direct real DFT for N=400, oracle-matched to <c>AudioPreprocessor.ComputeLogMelSpectrogram</c>).
 /// </summary>
 public class AudioKernels
 {

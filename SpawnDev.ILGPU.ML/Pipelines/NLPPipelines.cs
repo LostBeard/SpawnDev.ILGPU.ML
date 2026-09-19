@@ -68,10 +68,10 @@ public class TextClassificationPipeline : IDisposable
         var outputs = await _session.RunAsync(inputs);
         var output = outputs[_session.OutputNames[0]];
 
-        // Read logits (num_labels values)
+        // Read logits (num_labels values) — CopyFrom preferred over Scale(×1)
         int numLabels = _labels.Length;
         using var readBuf = _accelerator.Allocate1D<float>(numLabels);
-        new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, numLabels), readBuf.View, numLabels, 1f);
+        readBuf.View.SubView(0, numLabels).CopyFrom(output.Data.SubView(0, numLabels));
         await _accelerator.SynchronizeAsync();
         var logits = await readBuf.CopyToHostAsync<float>(0, numLabels);
 
@@ -441,6 +441,10 @@ public class TextGenerationPipeline : IDisposable
         // Greedy selection stays GPU-side (read back one index, not the vocab). Sampling needs the host
         // distribution, so it reuses ONE readback buffer across tokens instead of allocating per token.
         using var argmax = new GpuArgMax(_accelerator);
+        // Fixed-shape inputs: allocate once, CopyFromCPU each step (never dispose mid-loop — WebGPU lifetime).
+        using var idsBuf = _accelerator.Allocate1D(idsFloat);
+        using var maskBuf = _accelerator.Allocate1D(maskFloat);
+        using var posBuf = _accelerator.Allocate1D(posFloat);
         MemoryBuffer1D<float, Stride1D.Dense>? sampleBuf = null;
         for (int step = 0; step < maxTokens; step++)
         {
@@ -450,10 +454,8 @@ public class TextGenerationPipeline : IDisposable
 
             // Only input_ids changes per step; mask/pos are constant. Pad the tail.
             for (int i = 0; i < ctx; i++) idsFloat[i] = i < valid ? allTokens[i] : PadToken;
-
-            using var idsBuf = _accelerator.Allocate1D(idsFloat);
-            using var maskBuf = _accelerator.Allocate1D(maskFloat);
-            using var posBuf = _accelerator.Allocate1D(posFloat);
+            idsBuf.View.CopyFromCPU(idsFloat);
+            // mask/pos uploaded once above; unchanged across steps
 
             var inputs = new Dictionary<string, Tensor>();
             inputs[inputNames[0]] = new Tensor(idsBuf.View, new[] { 1, ctx });

@@ -2,6 +2,7 @@ using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -35,17 +36,52 @@ public class BackgroundRemovalPipeline : IDisposable
     /// Remove background from an RGBA image.
     /// Returns the original image with background pixels made transparent.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="RemoveBackgroundAsync(TypedArray, int, int, float)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<BackgroundRemovalResult> RemoveBackgroundAsync(
         int[] rgbaPixels, int width, int height,
         float threshold = 0.5f)
+    {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await RemoveBackgroundAsync(rgbaBuf.View, width, height, threshold).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<BackgroundRemovalResult> RemoveBackgroundAsync(
+        TypedArray rgbaPixels, int width, int height,
+        float threshold = 0.5f)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await RemoveBackgroundAsync(rgbaBuf.View, width, height, threshold).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<BackgroundRemovalResult> RemoveBackgroundAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float threshold = 0.5f)
+        => RemoveBackgroundCoreAsync(rgbaPixels, width, height, threshold);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<BackgroundRemovalResult> RemoveBackgroundAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float threshold = 0.5f)
+        => RemoveBackgroundCoreAsync(rgbaPixels.View, width, height, threshold);
+
+    private async Task<BackgroundRemovalResult> RemoveBackgroundCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float threshold)
     {
         var sw = Stopwatch.StartNew();
 
         // Preprocess: RGBA → NCHW float with RMBG normalization
         // RMBG uses mean=[0.5, 0.5, 0.5], std=[1.0, 1.0, 1.0] → (pixel/255 - 0.5)
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize,
+        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize,
             new[] { 0.5f, 0.5f, 0.5f }, new[] { 1.0f, 1.0f, 1.0f });
 
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
@@ -54,15 +90,15 @@ public class BackgroundRemovalPipeline : IDisposable
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
-        });
+        }).ConfigureAwait(false);
 
         // Read mask output — typically [1, 1, H, W] or [1, H, W]
         var output = outputs[_session.OutputNames[0]];
         int maskSize = output.ElementCount;
         using var readBuf = _accelerator.Allocate1D<float>(maskSize);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, maskSize), readBuf.View, maskSize, 1f);
-        await _accelerator.SynchronizeAsync();
-        var rawMask = await readBuf.CopyToHostAsync<float>(0, maskSize);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        var rawMask = await readBuf.CopyToHostAsync<float>(0, maskSize).ConfigureAwait(false);
 
         // Determine mask spatial dimensions
         int maskH = output.Shape.Length >= 3 ? output.Shape[^2] : _inputSize;
@@ -79,11 +115,18 @@ public class BackgroundRemovalPipeline : IDisposable
         // Resize mask to original image dimensions
         var resizedMask = ResizeMask(rawMask, maskW, maskH, width, height);
 
+        // Host RGBA for alpha compositing (GPU→GPU CopyFrom + async readback)
+        int pixelCount = width * height;
+        using var rgbaHostBuf = _accelerator.Allocate1D<int>(pixelCount);
+        rgbaHostBuf.View.CopyFrom(rgbaPixels.SubView(0, pixelCount));
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        var hostRgba = await rgbaHostBuf.CopyToHostAsync<int>(0, pixelCount).ConfigureAwait(false);
+
         // Apply mask: set alpha channel based on mask value
-        var resultPixels = new int[width * height];
-        for (int i = 0; i < width * height; i++)
+        var resultPixels = new int[pixelCount];
+        for (int i = 0; i < pixelCount; i++)
         {
-            int rgba = rgbaPixels[i];
+            int rgba = hostRgba[i];
             int r = rgba & 0xFF;
             int g = (rgba >> 8) & 0xFF;
             int b = (rgba >> 16) & 0xFF;

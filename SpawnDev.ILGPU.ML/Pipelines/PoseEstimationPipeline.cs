@@ -1,7 +1,9 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -37,46 +39,71 @@ public class PoseEstimationPipeline : IDisposable
     /// <summary>
     /// Estimate pose keypoints from an RGBA image.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="EstimateAsync(TypedArray, int, int, float)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<PoseResult> EstimateAsync(
         int[] rgbaPixels, int width, int height,
         float confidenceThreshold = 0.3f)
     {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await EstimateAsync(rgbaBuf.View, width, height, confidenceThreshold).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<PoseResult> EstimateAsync(
+        TypedArray rgbaPixels, int width, int height,
+        float confidenceThreshold = 0.3f)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await EstimateAsync(rgbaBuf.View, width, height, confidenceThreshold).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<PoseResult> EstimateAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float confidenceThreshold = 0.3f)
+        => EstimateCoreAsync(rgbaPixels, width, height, confidenceThreshold);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<PoseResult> EstimateAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float confidenceThreshold = 0.3f)
+        => EstimateCoreAsync(rgbaPixels.View, width, height, confidenceThreshold);
+
+    private async Task<PoseResult> EstimateCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        float confidenceThreshold)
+    {
         var sw = Stopwatch.StartNew();
 
-        // MoveNet expects NHWC [0,255] — simple bilinear resize on CPU
-        var floatInput = new float[_inputSize * _inputSize * 3];
-        for (int y = 0; y < _inputSize; y++)
-        {
-            for (int x = 0; x < _inputSize; x++)
-            {
-                int srcX = x * width / _inputSize;
-                int srcY = y * height / _inputSize;
-                srcX = Math.Clamp(srcX, 0, width - 1);
-                srcY = Math.Clamp(srcY, 0, height - 1);
-                int srcIdx = srcY * width + srcX;
-                int rgba = rgbaPixels[srcIdx];
-                int dstIdx = (y * _inputSize + x) * 3;
-                floatInput[dstIdx + 0] = (rgba & 0xFF);           // R
-                floatInput[dstIdx + 1] = ((rgba >> 8) & 0xFF);    // G
-                floatInput[dstIdx + 2] = ((rgba >> 16) & 0xFF);   // B
-            }
-        }
-        using var inputBuf = _accelerator.Allocate1D(floatInput);
-        var inputTensor = new Tensor(inputBuf.View, new[] { 1, _inputSize, _inputSize, 3 });
+        // MoveNet expects NHWC [0,255]: GPU resize+unpack via ForwardRaw, then CHW→HWC transpose
+        int H = _inputSize, W = _inputSize;
+        using var preprocessed = _accelerator.Allocate1D<float>(3 * H * W);
+        _preprocess.ForwardRaw(rgbaPixels, preprocessed.View, width, height, W, H);
+
+        using var nhwcBuf = _accelerator.Allocate1D<float>(3 * H * W);
+        new TransposeKernel(_accelerator).Transpose(preprocessed.View, nhwcBuf.View,
+            new[] { 3, H, W }, new[] { 1, 2, 0 }); // CHW → HWC
+        var inputTensor = new Tensor(nhwcBuf.View, new[] { 1, H, W, 3 });
 
         // Run inference
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
-        });
+        }).ConfigureAwait(false);
 
         // Read output [1, 1, 17, 3] = 51 floats
         var output = outputs[_session.OutputNames[0]];
         int elems = Math.Min(output.ElementCount, 51);
         using var readBuf = _accelerator.Allocate1D<float>(elems);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await _accelerator.SynchronizeAsync();
-        var outputData = await readBuf.CopyToHostAsync<float>(0, elems);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        var outputData = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 
         // Decode keypoints
         var keypoints = PoseSkeleton.DecodeMoveNetOutput(outputData, width, height);

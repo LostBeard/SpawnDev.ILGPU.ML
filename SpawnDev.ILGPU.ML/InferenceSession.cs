@@ -516,8 +516,9 @@ public class InferenceSession : IDisposable
                 }
                 else
                 {
-                    // GPU→GPU copy via Scale kernel
-                    registry.ElementWise.Scale(view.Value.SubView(0, count), ownBuf.View, count, 1f);
+                    // GPU→GPU copy via CopyFrom — native CopyBufferToBuffer on WebGPU,
+                    // preferred over Scale(×1) (no kernel dispatch).
+                    ownBuf.View.SubView(0, count).CopyFrom(view.Value.SubView(0, count));
                 }
                 weights[name] = new Tensor(ownBuf.View, shape, name);
                 loadedCount++;

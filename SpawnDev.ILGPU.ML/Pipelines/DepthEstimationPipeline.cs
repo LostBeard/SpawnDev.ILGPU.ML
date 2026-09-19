@@ -1,6 +1,8 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
@@ -151,7 +153,7 @@ public class DepthEstimationPipeline : IDisposable
     }
 
     /// <summary>
-    /// Estimate depth from an RGBA image.
+    /// Estimate depth from an RGBA image (managed pixels — desktop / oracle).
     /// Returns a depth map normalized to [0, 1] (higher = closer).
     ///
     /// Output dimensions:
@@ -162,23 +164,58 @@ public class DepthEstimationPipeline : IDisposable
     ///   outputWidth > 0 &amp;&amp; outputHeight > 0 → exact size (may not preserve aspect).
     /// Resize is done on the accelerator via bilinear interpolation — no CPU readback of the raw map.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="EstimateAsync(TypedArray, int, int, int, int)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<DepthResult> EstimateAsync(int[] rgbaPixels, int width, int height,
         int outputWidth = 0, int outputHeight = 0)
     {
-        // Upload and preprocess
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await EstimateAsync(rgbaBuf.View, width, height, outputWidth, outputHeight)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<DepthResult> EstimateAsync(TypedArray rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await EstimateAsync(rgbaBuf.View, width, height, outputWidth, outputHeight)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// GPU-resident packed RGBA — no upload. Use when the frame is already on the accelerator
+    /// (e.g. SpawnScene <c>GpuImage.PackedRgba</c>).
+    /// </summary>
+    public Task<DepthResult> EstimateAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
+        => EstimateHostCoreAsync(rgbaPixels, width, height, outputWidth, outputHeight);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<DepthResult> EstimateAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
+        => EstimateHostCoreAsync(rgbaPixels.View, width, height, outputWidth, outputHeight);
+
+    private async Task<DepthResult> EstimateHostCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        int outputWidth, int outputHeight)
+    {
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize);
+        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize);
 
-        // Create input tensor
         var inputTensor = new Tensor(preprocessed.View, InputTensorShape());
-
-        // Run inference
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
-        });
-        await _accelerator.SynchronizeAsync();
+        }).ConfigureAwait(false);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
 
         var output = outputs[_session.OutputNames[0]];
         int rawSize = output.ElementCount;
@@ -186,21 +223,17 @@ public class DepthEstimationPipeline : IDisposable
         int rawW = output.Shape.Length >= 3 ? output.Shape[^1] : _inputSize;
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[Depth CPU] Output: shape=[{string.Join(",", output.Shape)}], elements={rawSize}");
 
-        // Resolve output dimensions (default = source size, preserves source aspect).
         var (outW, outH) = ResolveOutputSize(width, height, rawW, rawH, outputWidth, outputHeight);
         int outSize = outW * outH;
 
-        // GPU-side bilinear resize from raw model output (rawW × rawH) → (outW × outH).
-        // TensorView<float> carries shape inline — no scalar W/H kernel params needed.
         var post = _postprocess;
         using var resized = _accelerator.Allocate1D<float>(outSize);
         var srcView = new Tensors.TensorView<float>(output.Data.SubView(0, rawSize), new[] { rawH, rawW });
         var dstView = new Tensors.TensorView<float>(resized.View, new[] { outH, outW });
         post.ResizeBilinear(srcView, dstView);
-        await _accelerator.SynchronizeAsync();
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
 
-        // Read resized depth to CPU for min/max + normalization.
-        var rawDepth = await resized.CopyToHostAsync<float>(0, outSize);
+        var rawDepth = await resized.CopyToHostAsync<float>(0, outSize).ConfigureAwait(false);
         float min = rawDepth.Min();
         float max = rawDepth.Max();
         float range = max - min;
@@ -245,27 +278,46 @@ public class DepthEstimationPipeline : IDisposable
     /// presentation via ICanvasRenderer. The raw depth values stay on the accelerator;
     /// nothing about them leaves the GPU through this contract.
     ///
-    /// Output dimensions follow the same convention as <see cref="EstimateAsync"/>:
-    ///   (0, 0) → match source (width, height), preserving aspect ratio.
-    ///   (w, 0) / (0, h) → fit one axis, derive the other from source aspect.
-    ///   (w, h) → exact.
-    /// Resize is bilinear, executed on the accelerator before colormap.
+    /// Output dimensions follow the same convention as <see cref="EstimateAsync(int[], int, int, int, int)"/>.
     /// Caller owns the returned buffer and must dispose it.
     ///
     /// If you also need the raw depth buffer (to re-apply a different palette later or
     /// run additional postprocessing without re-running inference) use
-    /// <see cref="EstimateGpuRawAsync"/> + <see cref="ApplyColormapGpuAsync"/> instead.
+    /// <see cref="EstimateGpuRawAsync(int[], int, int, int, int)"/> + <see cref="ApplyColormapGpuAsync"/> instead.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer the <see cref="TypedArray"/> or GPU-view overloads.
+    /// </remarks>
     public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
         int[] rgbaPixels, int width, int height,
         int outputWidth = 0, int outputHeight = 0)
     {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await EstimateGpuAsync(rgbaBuf.View, width, height, outputWidth, outputHeight)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Browser path — JS typed array → GPU without a managed heap crossing.</summary>
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
+        TypedArray rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await EstimateGpuAsync(rgbaBuf.View, width, height, outputWidth, outputHeight)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
+    {
         var (rawDepth, minD, maxD, outW, outH) = await EstimateGpuRawAsync(
-            rgbaPixels, width, height, outputWidth, outputHeight);
+            rgbaPixels, width, height, outputWidth, outputHeight).ConfigureAwait(false);
         try
         {
             var resultBuf = await ApplyColormapGpuAsync(rawDepth.View, outW, outH, minD, maxD,
-                Kernels.ImagePostprocessKernel.PalettePlasma);
+                Kernels.ImagePostprocessKernel.PalettePlasma).ConfigureAwait(false);
             return (resultBuf, outW, outH);
         }
         finally
@@ -274,22 +326,67 @@ public class DepthEstimationPipeline : IDisposable
         }
     }
 
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> EstimateGpuAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        int outputWidth = 0, int outputHeight = 0)
+        => EstimateGpuAsync(rgbaPixels.View, width, height, outputWidth, outputHeight);
+
     /// <summary>
     /// Run depth inference and return the raw normalized-range depth as a GPU buffer
     /// alongside its min/max scalars and dimensions. The buffer stays on the accelerator —
     /// callers can apply <see cref="ApplyColormapGpuAsync"/> as many times as they like
     /// (e.g. when a UI palette toggle changes) without re-running inference.
     ///
-    /// Output dimensions follow the same convention as <see cref="EstimateAsync"/>.
+    /// Output dimensions follow the same convention as <see cref="EstimateAsync(int[], int, int, int, int)"/>.
     /// Caller owns the returned <see cref="MemoryBuffer1D{T, TStride}"/> and must dispose
     /// it when finished.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="EstimateGpuRawAsync(TypedArray, int, int, int, int)"/>
+    /// or a GPU-resident view — this path copies through the managed heap solely to upload.
+    /// </remarks>
     public async Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
         EstimateGpuRawAsync(int[] rgbaPixels, int width, int height,
             int outputWidth = 0, int outputHeight = 0)
     {
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await EstimateGpuRawAsync(rgbaBuf.View, width, height, outputWidth, outputHeight)
+            .ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// Browser path: RGBA as a JS typed array. Uploads via <see cref="MediaInterop.UploadToDevice{T}"/>
+    /// — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
+        EstimateGpuRawAsync(TypedArray rgbaPixels, int width, int height,
+            int outputWidth = 0, int outputHeight = 0)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await EstimateGpuRawAsync(rgbaBuf.View, width, height, outputWidth, outputHeight)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// GPU-resident packed RGBA — no upload. Prefer this when the frame is already on the
+    /// accelerator (SpawnScene <c>GpuImage</c>); avoids the GPU→JS→.NET→GPU round-trip.
+    /// </summary>
+    public Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
+        EstimateGpuRawAsync(ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+            int outputWidth = 0, int outputHeight = 0)
+        => EstimateGpuRawCoreAsync(rgbaPixels, width, height, outputWidth, outputHeight);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
+        EstimateGpuRawAsync(MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+            int outputWidth = 0, int outputHeight = 0)
+        => EstimateGpuRawCoreAsync(rgbaPixels.View, width, height, outputWidth, outputHeight);
+
+    private async Task<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>
+        EstimateGpuRawCoreAsync(ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+            int outputWidth, int outputHeight)
+    {
         // Graph-capture path (opt-in; CUDA graphs / WebGPU dispatch plans): preprocess into a STABLE input
         // buffer the captured graph reads, then capture-once / replay-many. The per-frame preprocess dispatch
         // writes fresh data into that stable buffer and is queue-ordered before the replay's submit, so the
@@ -310,7 +407,7 @@ public class DepthEstimationPipeline : IDisposable
             transientInput = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
             preInput = transientInput.View;
         }
-        _preprocess.Forward(rgbaBuf.View, preInput, width, height, _inputSize, _inputSize);
+        _preprocess.Forward(rgbaPixels, preInput, width, height, _inputSize, _inputSize);
 
         var inputTensor = new Tensor(preInput, InputTensorShape());
         var inputDict = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
@@ -330,6 +427,15 @@ public class DepthEstimationPipeline : IDisposable
         else if (useCapture)   // WebGPU
         {
             var shape = InputTensorShape();
+            // Same gate SessionGraphCapture now applies: a pool reclaim since recording leaves this plan's
+            // bind groups pointing at disposed buckets. Drop and recapture rather than submit garbage
+            // (or hit the ReplayAsync InvalidatedByReclaim throw).
+            if (_webGpuCapture != null && _webGpuCapture.InvalidatedByReclaim)
+            {
+                _webGpuCapture.Dispose();
+                _webGpuCapture = null;
+                _captureShape = null;
+            }
             if (_webGpuCapture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
             {
                 _webGpuCapture?.Dispose();

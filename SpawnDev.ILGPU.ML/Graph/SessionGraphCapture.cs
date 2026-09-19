@@ -135,6 +135,33 @@ public sealed class SessionGraphCapture : IDisposable
                     "SessionGraphCapture: input shapes changed after capture - use one instance per fixed shape set.");
         }
 
+        // 🔴 DROP A PLAN THE POOL HAS INVALIDATED. WebGPUGraphCapture records bind groups that reference
+        // pooled intermediates. BufferPool reclaim (AllocateWithReclaim under VRAM pressure - and Whisper's
+        // encoder is enough to trip it on a shared browser GPU) DESTROYS those buffers while this wrapper
+        // still holds a "live" plan. ReplayAsync used to only LOG the mismatch and submit anyway, which
+        // surfaces as "[Buffer (unlabeled)] used in submit while destroyed" on some graphs and as SILENT
+        // garbage outputs on others.
+        //
+        // MEASURED on hands-free: after one Whisper transcription Silero's speech probability stuck at
+        // ~0.02–0.05 with the input meter still moving on real speech (peakP never crossed the 0.5
+        // threshold). A page refresh rebuilt the VAD capture and hearing returned. Dropping here forces a
+        // recapture (or a direct forward) instead of a deaf endpointer until reload.
+        if (_webGpu != null && _webGpu.InvalidatedByReclaim)
+        {
+            Console.WriteLine(
+                $"[SessionGraphCapture] dropping WebGPU plan: BufferPool reclaim ×"
+                + $"{Tensors.BufferPool.ReclaimFireCount - _webGpu.ReclaimGenerationAtCapture} since recording "
+                + $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed this process) - "
+                + "bind groups may reference destroyed buffers");
+            try { _webGpu.Dispose(); } catch { }
+            _webGpu = null;
+            foreach (var b in _ownedInputs) { try { b.Dispose(); } catch { } }
+            _ownedInputs.Clear();
+            _capturedShapes = null;
+            _captureAttempted = false;
+            CaptureStatus = "dropped: BufferPool reclaim invalidated the recorded plan; will recapture";
+        }
+
         if (!_captureAttempted)
         {
             _captureAttempted = true;

@@ -217,8 +217,8 @@ public class CastOperator(OperatorRegistry reg) : IOnnxOperator
         }
         else
         {
-            // Float-to-float or other: just copy
-            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+            // Float-to-float or other: just copy (native GPU→GPU, not Scale×1)
+            ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
         }
     }
 }
@@ -841,7 +841,7 @@ public class CastLikeOperator(OperatorRegistry reg) : IOnnxOperator
     {
         // CastLike: cast input to same type as target_type input. Our engine is all float32.
         int count = ctx.Inputs[0].ElementCount;
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+        ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
     }
 }
 
@@ -943,7 +943,8 @@ public class MeanVarianceNormalizationOperator(OperatorRegistry reg) : IOnnxOper
         var xVals = ctx.TryGetInputValues(0);
         if (xVals == null)
         {
-            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+            int n = ctx.Inputs[0].ElementCount;
+            ctx.Outputs[0].Data.SubView(0, n).CopyFrom(ctx.Inputs[0].Data.SubView(0, n));
             return;
         }
 
@@ -1147,7 +1148,7 @@ public class UniqueOperator(OperatorRegistry reg) : IOnnxOperator
         if (xVals == null)
         {
             int count = ctx.Inputs[0].ElementCount;
-            reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, count, 1f);
+            ctx.Outputs[0].Data.SubView(0, count).CopyFrom(ctx.Inputs[0].Data.SubView(0, count));
             return;
         }
 

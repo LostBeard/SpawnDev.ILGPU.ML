@@ -1,5 +1,6 @@
 using SpawnDev.SpawnJS;
 using SpawnDev.SpawnJS.JSObjects;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
 namespace SpawnDev.ILGPU.ML.Preprocessing;
 
@@ -8,12 +9,14 @@ namespace SpawnDev.ILGPU.ML.Preprocessing;
 /// Combines MediaInterop (efficient pixel/audio extraction) with InferenceRateController
 /// (FPS limiting, motion gating) to provide a zero-configuration capture loop.
 ///
-/// Usage:
+/// Usage (browser — prefer the JS path):
 /// <code>
 /// var capture = new MediaStreamCapture(js);
 /// await capture.StartWebcamAsync(640, 480);
-/// capture.OnFrameReady += (rgba, w, h) => { /* preprocess and run inference */ };
+/// capture.OnFrameReadyJs += (rgba, w, h) => { /* UploadToDevice / pipeline TypedArray overload */ };
 /// </code>
+/// Desktop/managed consumers may use <see cref="OnFrameReady"/> (<c>byte[]</c>); that path
+/// crosses into the .NET heap via <c>ReadBytes</c> and should not be the browser default.
 /// </summary>
 public class MediaStreamCapture : IDisposable
 {
@@ -40,17 +43,52 @@ public class MediaStreamCapture : IDisposable
     public bool IsCapturing => _isCapturing;
 
     /// <summary>
-    /// Fired when a new video frame is captured.
-    /// Parameters: (byte[] rgba, int width, int height)
+    /// Fired when a new video frame is captured as managed RGBA bytes.
+    /// Parameters: (byte[] rgba, int width, int height).
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="OnFrameReadyJs"/>. This event pulls the frame onto the .NET
+    /// heap via <c>ReadBytes</c>. It is kept for desktop/managed consumers and for callers that truly
+    /// need <c>byte[]</c> (file save, CPU codecs). Subscribing only to this event still works — the
+    /// capture loop converts from the JS typed array when needed — but it is the slow path.
+    /// </remarks>
     public event Action<byte[], int, int>? OnFrameReady;
+
+    /// <summary>
+    /// Fired when a new video frame is captured as a JS typed array (RGBA <see cref="Uint8ClampedArray"/>).
+    /// Parameters: (TypedArray rgba, int width, int height).
+    /// </summary>
+    /// <remarks>
+    /// The preferred browser path: pixels never enter the .NET managed heap. Hand the array to
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> or a pipeline's <c>TypedArray</c> overload.
+    /// Ownership: the capture loop disposes the array after synchronous handlers return — upload or
+    /// clone inside the handler if you need the pixels after the event returns.
+    /// </remarks>
+    public event Action<TypedArray, int, int>? OnFrameReadyJs;
 
     /// <summary>
     /// Fired for every chunk of captured microphone audio, as MONO float32 at the rate requested from
     /// <see cref="StartMicrophoneAsync"/> (16 kHz by default, which is what Whisper expects).
     /// Parameters: (float[] samples, int sampleRate)
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="OnAudioReadyJs"/>. This event pulls each chunk onto the .NET
+    /// heap. Kept for desktop/managed consumers and utterance ring buffers that still need <c>float[]</c>.
+    /// </remarks>
     public event Action<float[], int>? OnAudioReady;
+
+    /// <summary>
+    /// Fired for every chunk of captured microphone audio as a JS <see cref="Float32Array"/> (mono float32).
+    /// Parameters: (Float32Array samples, int sampleRate).
+    /// </summary>
+    /// <remarks>
+    /// Preferred browser path when the chunk can stay in JS (f32 source, no per-chunk resample). Ownership:
+    /// the capture loop disposes the array after synchronous handlers return — clone or transfer inside
+    /// the handler if you need the samples after the event returns. When downmix/resample/s16 forces a
+    /// host path, a new <see cref="Float32Array"/> is still delivered here so VAD/worker callers never
+    /// need to convert themselves.
+    /// </remarks>
+    public event Action<Float32Array, int>? OnAudioReadyJs;
 
     /// <summary>
     /// Fired when audio capture STOPS because of an error - an unreadable sample format, most likely.
@@ -78,7 +116,8 @@ public class MediaStreamCapture : IDisposable
 
     /// <summary>
     /// Start capturing video from the user's webcam.
-    /// Frames are delivered via OnFrameReady at TargetFps.
+    /// Frames are delivered via <see cref="OnFrameReadyJs"/> (preferred) and/or <see cref="OnFrameReady"/>
+    /// at <see cref="TargetFps"/>.
     /// </summary>
     public async Task<bool> StartWebcamAsync(int width = 640, int height = 480, bool facingUser = true)
     {
@@ -136,18 +175,15 @@ public class MediaStreamCapture : IDisposable
     }
 
     /// <summary>
-    /// Start capturing microphone audio. Chunks arrive on <see cref="OnAudioReady"/> as mono float32
-    /// resampled to <paramref name="targetSampleRate"/>, ready to hand straight to a speech model.
+    /// Start capturing microphone audio. Chunks arrive on <see cref="OnAudioReadyJs"/> (preferred in
+    /// browser) and/or <see cref="OnAudioReady"/> as mono float32 resampled to
+    /// <paramref name="targetSampleRate"/>, ready to hand straight to a speech model.
     /// </summary>
     /// <remarks>
     /// Uses <c>MediaStreamTrackProcessor</c> - the browser hands us decoded <c>AudioData</c> frames
     /// directly, so there is no <c>ScriptProcessorNode</c> on the audio thread and no polling loop.
-    /// <para>
-    /// Audio DOES cross into the .NET heap here, against the usual "bulk data stays in JS" rule. It is
-    /// the justified exception: a chunk is one AudioData frame (order of 10 ms - a few hundred floats),
-    /// speech models consume CPU-side float samples anyway, and the mel preprocessing that follows is
-    /// CPU work. Video frames, orders of magnitude larger, keep using the JS-side path.
-    /// </para>
+    /// Prefer <see cref="OnAudioReadyJs"/> so f32 frames never enter the .NET heap; subscribe to
+    /// <see cref="OnAudioReady"/> only when you truly need managed PCM (utterance ring, WAV write).
     /// </remarks>
     /// <returns>True if the microphone opened and the read loop started.</returns>
     /// <param name="targetSampleRate">
@@ -336,16 +372,52 @@ public class MediaStreamCapture : IDisposable
                 {
                     // 0 = native: hand over the frame's own rate and do not touch the samples.
                     int rate = _audioTargetRate > 0 ? _audioTargetRate : (int)audioData.SampleRate;
-                    var samples = await MediaInterop.FromAudioDataAsync(audioData, rate);
-                    // The FIRST frame is the one that proves the pipeline runs at all. Everything after
-                    // it is the caller's business; whether this line is ever reached is ours.
-                    if (!_loggedFirstAudioFrame)
+                    bool wantJs = OnAudioReadyJs != null;
+                    bool wantManaged = OnAudioReady != null;
+                    if (!wantJs && !wantManaged) continue;
+
+                    Float32Array? jsChunk = null;
+                    float[]? managed = null;
+                    try
                     {
-                        _loggedFirstAudioFrame = true;
-                        Console.WriteLine($"[capture] first audio frame: {samples.Length} samples @{rate} Hz "
-                            + $"(source rate {(int)audioData.SampleRate} Hz)");
+                        // Prefer staying in JS: f32 mono planar at the delivery rate.
+                        string fmt = audioData.Format ?? "f32-planar";
+                        bool f32 = fmt.StartsWith("f32", StringComparison.Ordinal);
+                        bool planar = fmt.EndsWith("-planar", StringComparison.Ordinal);
+                        int channels = Math.Max(1, audioData.NumberOfChannels);
+                        int srcRate = (int)audioData.SampleRate;
+                        bool canStayJs = wantJs && f32 && planar && channels == 1 && srcRate == rate;
+
+                        if (canStayJs)
+                        {
+                            jsChunk = await MediaInterop.FromAudioDataPlaneJSAsync(audioData, 0);
+                            if (wantManaged) managed = jsChunk.ToArray();
+                        }
+                        else
+                        {
+                            managed = await MediaInterop.FromAudioDataAsync(audioData, rate);
+                            if (wantJs && managed.Length > 0)
+                            {
+                                jsChunk = new Float32Array(managed.Length);
+                                jsChunk.Set(managed);
+                            }
+                        }
+
+                        if (!_loggedFirstAudioFrame)
+                        {
+                            _loggedFirstAudioFrame = true;
+                            int n = managed?.Length ?? (jsChunk != null ? (int)jsChunk.Length : 0);
+                            Console.WriteLine($"[capture] first audio frame: {n} samples @{rate} Hz "
+                                + $"(source rate {srcRate} Hz, js={!canStayJs || wantJs})");
+                        }
+
+                        if (jsChunk != null && jsChunk.Length > 0) OnAudioReadyJs?.Invoke(jsChunk, rate);
+                        if (managed != null && managed.Length > 0) OnAudioReady?.Invoke(managed, rate);
                     }
-                    if (samples.Length > 0) OnAudioReady?.Invoke(samples, rate);
+                    finally
+                    {
+                        try { jsChunk?.Dispose(); } catch { }
+                    }
                 }
                 finally
                 {
@@ -388,8 +460,8 @@ public class MediaStreamCapture : IDisposable
     }
 
     /// <summary>
-    /// Capture a single frame right now (outside the automatic loop).
-    /// Returns RGBA pixel data.
+    /// Capture a single frame right now (outside the automatic loop) as managed RGBA bytes.
+    /// ⚠️ IN A BROWSER, prefer <see cref="CaptureFrameJs"/> — this path uses <c>ReadBytes</c>.
     /// </summary>
     public byte[]? CaptureFrame()
     {
@@ -398,9 +470,24 @@ public class MediaStreamCapture : IDisposable
     }
 
     /// <summary>
+    /// Capture a single frame as a JS typed array (RGBA), without crossing into the .NET heap.
+    /// Caller disposes the returned array. Prefer this for anything headed to an accelerator.
+    /// </summary>
+    public TypedArray? CaptureFrameJs()
+    {
+        if (_video == null) return null;
+        return _interop.FromVideoElementJS(_video, Width, Height);
+    }
+
+    /// <summary>
     /// Capture a single frame and preprocess it for a specific model.
     /// Returns a float tensor ready for inference.
     /// </summary>
+    /// <remarks>
+    /// Still managed: <see cref="MediaInterop.VideoToTensor"/> runs CPU resize/normalize. Frame extract
+    /// inside that helper should migrate to <c>*JS</c> + GPU preprocess separately; this overload is
+    /// unchanged for callers that already need a host float tensor.
+    /// </remarks>
     public float[]? CaptureAndPreprocess(ModelConfig config)
     {
         if (_video == null) return null;
@@ -418,13 +505,43 @@ public class MediaStreamCapture : IDisposable
             {
                 if (_video == null) break;
 
-                if (rateController.ShouldRunInference(prevFrame))
+                // Time gate only here (null skips motion — we evaluate motion after we have the new frame).
+                if (rateController.ShouldRunInference(null))
                 {
-                    var rgba = _interop.FromVideoElement(_video, Width, Height);
-                    rateController.MarkInferenceRun(rgba);
-                    prevFrame = rgba;
+                    using var rgbaJs = _interop.FromVideoElementJS(_video, Width, Height);
 
-                    OnFrameReady?.Invoke(rgba, Width, Height);
+                    bool needManaged = OnFrameReady != null || MotionThreshold > 0;
+                    byte[]? rgba = null;
+                    if (needManaged)
+                    {
+                        rgba = rgbaJs.ReadBytes();
+                        if (MotionThreshold > 0 && prevFrame != null)
+                        {
+                            float motion = VideoPreprocessor.ComputeMotionScore(prevFrame, rgba);
+                            if (motion < MotionThreshold)
+                            {
+                                // Still count the attempt so FPS limiting stays honest, but do not deliver.
+                                rateController.MarkInferenceRun(rgba);
+                                prevFrame = rgba;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Preferred browser delivery — no ReadBytes when only OnFrameReadyJs is subscribed
+                    // and motion gating is off.
+                    OnFrameReadyJs?.Invoke(rgbaJs, Width, Height);
+
+                    if (rgba != null)
+                    {
+                        rateController.MarkInferenceRun(rgba);
+                        prevFrame = rgba;
+                        OnFrameReady?.Invoke(rgba, Width, Height);
+                    }
+                    else
+                    {
+                        rateController.MarkInferenceRun(null);
+                    }
                 }
 
                 // Yield to keep UI responsive

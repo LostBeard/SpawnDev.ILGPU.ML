@@ -5,13 +5,76 @@ using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Multimodal;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
-/// <summary>A decoded image for <see cref="Gemma4MultimodalPipeline"/>: 8-bit interleaved RGB (HWC,
-/// length = Width*Height*3). Decoding (PNG/JPEG → RGB) is the caller's job — ImageSharp/System.Drawing on
-/// desktop, canvas/<see cref="MediaInterop"/> in the browser — so the library stays decoder-agnostic.</summary>
-public readonly record struct ImageInput(byte[] Rgb, int Width, int Height);
+/// <summary>
+/// A decoded image for <see cref="Gemma4MultimodalPipeline"/>: 8-bit interleaved <b>RGB</b> (HWC,
+/// length = Width*Height*3) — not RGBA. Decoding (PNG/JPEG → RGB) is the caller's job —
+/// ImageSharp/System.Drawing on desktop, canvas/<see cref="MediaInterop"/> in the browser — so the
+/// library stays decoder-agnostic.
+/// </summary>
+/// <remarks>
+/// Browser callers with a JS typed array of RGB bytes should use <see cref="FromRgbTypedArray"/>
+/// (one <c>ReadBytes</c> for CPU <see cref="Gemma4ImagePreprocessor"/>) or
+/// <see cref="UploadRgbToDevice"/> when they only need the bytes on the GPU. There is no GPU
+/// smart_resize/im2col path yet, so generation still goes through host RGB for preprocess.
+/// </remarks>
+public readonly record struct ImageInput(byte[] Rgb, int Width, int Height)
+{
+    /// <summary>
+    /// Browser path: packed RGB TypedArray (<c>byteLength &gt;= Width*Height*3</c>, not RGBA).
+    /// Copies once via <c>ReadBytes</c> for CPU <see cref="Gemma4ImagePreprocessor"/> — prefer this
+    /// over converting in the caller. Does not invent a GPU preprocess path.
+    /// </summary>
+    public static ImageInput FromRgbTypedArray(TypedArray rgbBytes, int width, int height)
+    {
+        ArgumentNullException.ThrowIfNull(rgbBytes);
+        long expected = (long)width * height * 3;
+        if (rgbBytes.ByteLength < expected)
+            throw new ArgumentException(
+                $"RGB TypedArray byteLength {rgbBytes.ByteLength} is shorter than width*height*3 ({expected}). " +
+                "ImageInput expects interleaved RGB (3 bytes/pixel), not RGBA.",
+                nameof(rgbBytes));
+        return new ImageInput(rgbBytes.ReadBytes(0, expected), width, height);
+    }
+
+    /// <summary>
+    /// Zero-copy JS→GPU upload of packed RGB (<c>Width*Height*3</c> bytes) via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — bytes never enter the .NET managed heap.
+    /// Caller owns the returned buffer. Throws on non-browser accelerators.
+    /// </summary>
+    /// <remarks>
+    /// Useful when RGB is already contiguous in JS and the next consumer is a GPU kernel.
+    /// <see cref="Gemma4MultimodalPipeline"/> generation still needs host RGB for
+    /// <see cref="Gemma4ImagePreprocessor"/> today — use <see cref="FromRgbTypedArray"/> for that.
+    /// </remarks>
+    public static MemoryBuffer1D<byte, Stride1D.Dense> UploadRgbToDevice(
+        Accelerator accelerator, TypedArray rgbBytes, int width, int height)
+    {
+        ArgumentNullException.ThrowIfNull(accelerator);
+        ArgumentNullException.ThrowIfNull(rgbBytes);
+        long expected = (long)width * height * 3;
+        if (rgbBytes.ByteLength < expected)
+            throw new ArgumentException(
+                $"RGB TypedArray byteLength {rgbBytes.ByteLength} is shorter than width*height*3 ({expected}). " +
+                "Expected interleaved RGB (3 bytes/pixel), not RGBA.",
+                nameof(rgbBytes));
+
+        var buf = accelerator.Allocate1D<byte>(expected);
+        try
+        {
+            MediaInterop.UploadToDevice(rgbBytes, buf);
+            return buf;
+        }
+        catch
+        {
+            buf.Dispose();
+            throw;
+        }
+    }
+}
 
 /// <summary>
 /// First-class MULTIMODAL generation for Gemma 4 12B "Unified" (encoder-free): text + image + audio + video

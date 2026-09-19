@@ -671,7 +671,7 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
 
         // Subtract zero points if provided
         var aAdj = ctx.Pool.Rent(aShape, "_mmi_a");
-        reg.ElementWise.Scale(a.Data, aAdj.Data, a.ElementCount, 1f);
+        aAdj.Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
         if (ctx.Inputs.Length > 2 && ctx.Inputs[2] != null)
         {
             // ⚠️ THE COUNT COMES FROM THE SHAPE, NOT FROM A READBACK. This used to call
@@ -715,7 +715,7 @@ public class MatMulIntegerOperator(OperatorRegistry reg) : IOnnxOperator
         }
 
         var bAdj = ctx.Pool.Rent(bShape, "_mmi_b");
-        reg.ElementWise.Scale(b.Data, bAdj.Data, b.ElementCount, 1f);
+        bAdj.Data.SubView(0, b.ElementCount).CopyFrom(b.Data.SubView(0, b.ElementCount));
         if (ctx.Inputs.Length > 3 && ctx.Inputs[3] != null)
         {
             // Same as a_zero_point above: the count is the SHAPE, and reading it back only forced a GPU
@@ -918,7 +918,7 @@ public class QLinearMatMulOperator(OperatorRegistry reg) : IOnnxOperator
         var aScale = ctx.TryGetInputValues(1);
         var aZero = ctx.TryGetInputValues(2);
         var aDequant = ctx.Pool.Rent(aShape, "_qlm_a");
-        reg.ElementWise.Scale(a.Data, aDequant.Data, a.ElementCount, 1f);
+        aDequant.Data.SubView(0, a.ElementCount).CopyFrom(a.Data.SubView(0, a.ElementCount));
         if (aZero != null && aZero.Length > 0)
         {
             var zpBuf = ctx.Pool.Rent(new[] { 1 }, "_qlm_azp");
@@ -933,7 +933,7 @@ public class QLinearMatMulOperator(OperatorRegistry reg) : IOnnxOperator
         var bScale = ctx.TryGetInputValues(4);
         var bZero = ctx.TryGetInputValues(5);
         var bDequant = ctx.Pool.Rent(bShape, "_qlm_b");
-        reg.ElementWise.Scale(b.Data, bDequant.Data, b.ElementCount, 1f);
+        bDequant.Data.SubView(0, b.ElementCount).CopyFrom(b.Data.SubView(0, b.ElementCount));
         if (bZero != null && bZero.Length > 0)
         {
             var zpBuf = ctx.Pool.Rent(new[] { 1 }, "_qlm_bzp");

@@ -3,6 +3,7 @@ using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using SpawnDev.SpawnJS.JSObjects;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -52,6 +53,9 @@ public class SpeechRecognitionPipeline : IDisposable
     /// </para>
     /// </remarks>
     private Graph.SessionGraphCapture? _encoderCapture;
+
+    /// <summary>GPU log-mel (pad → centred STFT → Slaney mel → Whisper normalize). Lazy; session-owned.</summary>
+    private WhisperMelPreprocessor? _melPreprocess;
 
     /// <summary>Enable capture/replay of the encoder. Off runs a plain forward.</summary>
     public bool EnableGraphCapture { get; set; } = true;
@@ -209,38 +213,79 @@ public class SpeechRecognitionPipeline : IDisposable
 
     /// <summary>
     /// Transcribe audio samples to text.
-    /// Handles resampling, mel spectrogram, encoder, and autoregressive decoder.
+    /// Handles resampling, GPU mel spectrogram, encoder, and autoregressive decoder.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="TranscribeAsync(Float32Array, int)"/> when samples are still
+    /// a JS typed array — that path uploads via <see cref="MediaInterop.UploadToDevice{T}"/> with no
+    /// managed-heap crossing for the waveform (at 16 kHz). Non-16 kHz still needs a host resample until
+    /// GPU windowed-sinc lands.
+    /// </remarks>
     public async Task<TranscriptionResult> TranscribeAsync(
         float[] audioSamples, int sampleRate = 16000)
     {
-        var sw = Stopwatch.StartNew();
-
-        // 1. Resample to 16kHz
+        ArgumentNullException.ThrowIfNull(audioSamples);
         if (sampleRate != AudioPreprocessor.WhisperSampleRate)
             audioSamples = AudioPreprocessor.Resample(audioSamples, sampleRate, AudioPreprocessor.WhisperSampleRate);
 
-        // 2. Pad/trim to 30 seconds
-        audioSamples = AudioPreprocessor.PadOrTrim(audioSamples, AudioPreprocessor.WhisperSampleRate * 30);
+        using var pcmBuf = _accelerator.Allocate1D(audioSamples.Length == 0 ? new float[1] : audioSamples);
+        return await TranscribeCoreFromPcmAsync(pcmBuf.View, audioSamples.Length).ConfigureAwait(false);
+    }
 
-        // 3. Compute log-mel spectrogram [80, 3000]
-        // ⚠️ TIMED SEPARATELY. This is a CPU STFT in the middle of a GPU pipeline, and it runs over the
-        // PADDED 30 s regardless of how long the utterance actually was - so it is a fixed per-call cost
-        // that endpointing cannot reduce. The graph executor's counters cannot see it, because it never
-        // reaches the executor.
+    /// <summary>
+    /// Browser path: accept PCM as a JS <see cref="Float32Array"/> and upload straight to the device.
+    /// </summary>
+    /// <remarks>
+    /// At 16 kHz there is no managed-heap crossing for the waveform: <see cref="MediaInterop.UploadToDevice{T}"/>
+    /// then <see cref="WhisperMelPreprocessor"/> keeps mel on-device into the encoder. Non-16 kHz still
+    /// <c>ToArray</c>s once for the CPU windowed-sinc resampler (aliasing-safe; linear GPU resample is not
+    /// a drop-in). Prefer this overload over converting in the caller.
+    /// </remarks>
+    public async Task<TranscriptionResult> TranscribeAsync(
+        Float32Array audioSamples, int sampleRate = 16000)
+    {
+        ArgumentNullException.ThrowIfNull(audioSamples);
+        if (sampleRate != AudioPreprocessor.WhisperSampleRate)
+            return await TranscribeAsync(audioSamples.ToArray(), sampleRate).ConfigureAwait(false);
+
+        int n = (int)audioSamples.Length;
+        var pcmBuf = _accelerator.Allocate1D<float>(Math.Max(n, 1));
+        try
+        {
+            if (n > 0)
+                MediaInterop.UploadToDevice(audioSamples, pcmBuf);
+            return await TranscribeCoreFromPcmAsync(pcmBuf.View, n).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Mel dispatches may still reference pcm on WebGPU/Wasm until drained.
+            await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+            pcmBuf.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Core path: 16 kHz PCM already on-device → GPU mel → encoder → decoder.
+    /// </summary>
+    private async Task<TranscriptionResult> TranscribeCoreFromPcmAsync(
+        ArrayView1D<float, Stride1D.Dense> pcm,
+        int pcmLength)
+    {
+        var sw = Stopwatch.StartNew();
+
+        // GPU log-mel [80, 3000] — pad/trim + centred STFT + Slaney mel + Whisper normalize on-device.
+        // Timed separately: fixed cost over the padded 30 s window (endpointing cannot shrink it).
         var melSw = Stopwatch.StartNew();
-        var mel = AudioPreprocessor.ComputeLogMelSpectrogram(audioSamples);
+        _melPreprocess ??= new WhisperMelPreprocessor(_accelerator);
+        using var melBuf = _accelerator.Allocate1D<float>(WhisperMelPreprocessor.MelLength);
+        _melPreprocess.ComputeLogMelSpectrogram(pcm, pcmLength, melBuf.View);
+        // Drain before the encoder capture may reorder work; also lets Float32Array finally dispose pcm.
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
         melSw.Stop();
         var melMs = melSw.Elapsed.TotalMilliseconds;
 
-        // 4. Run encoder
-        // ⚠️ TIMED SEPARATELY from the decoder, because they are now different KINDS of cost and only one
-        // of them is addressable the same way. The encoder is ONE run at a fixed shape and is capturable;
-        // the decoder is N runs whose past-K/V grow a position each step, so no recorded plan is valid
-        // twice. An executor total of "11 graph runs" cannot be apportioned between them by eye, and
-        // guessing which dominates would pick the next piece of work.
+        // Run encoder (capturable — fixed [1,80,3000] shape).
         var encSw = Stopwatch.StartNew();
-        using var melBuf = _accelerator.Allocate1D(mel);
         var melTensor = new Tensor(melBuf.View, new[] { 1, 80, 3000 });
         _encoderCapture ??= new Graph.SessionGraphCapture(_encoderSession, _accelerator);
         _encoderCapture.Enabled = EnableGraphCapture;
@@ -252,10 +297,7 @@ public class SpeechRecognitionPipeline : IDisposable
         encSw.Stop();
         double encoderMs = encSw.Elapsed.TotalMilliseconds;
 
-        // 5. Autoregressive decoder
-        // The .en checkpoints carry no language token at all, so asking one for a language other than
-        // English cannot be honoured - and honouring it silently as English is exactly the failure this
-        // pipeline cannot detect from the outside.
+        // Autoregressive decoder (unchanged from here).
         var requestedLanguage = (Language ?? string.Empty).Trim().Trim('<', '>', '|').ToLowerInvariant();
         if (requestedLanguage.Length == 0) requestedLanguage = "en";
         if (IsEnglishOnlyModel && requestedLanguage != "en")
@@ -269,7 +311,6 @@ public class SpeechRecognitionPipeline : IDisposable
             : new List<int> { SOT, ResolveLanguageToken(), TRANSCRIBE, NO_TIMESTAMPS };
         int promptLength = tokens.Count;
 
-        // Greedy next-token selection stays GPU-side: read back one index per token, not the whole vocab.
         using var argmax = new GpuArgMax(_accelerator);
 
         double prefillMs = 0, stepsMs = 0, stepSetupMs = 0, stepRunMs = 0, stepArgmaxMs = 0;
@@ -281,7 +322,6 @@ public class SpeechRecognitionPipeline : IDisposable
         else
         for (int step = 0; step < MaxTokens; step++)
         {
-            // Create input_ids tensor
             var inputIds = tokens.Select(t => (float)t).ToArray();
             using var idsBuf = _accelerator.Allocate1D(inputIds);
             var idsTensor = new Tensor(idsBuf.View, new[] { 1, tokens.Count });
@@ -295,21 +335,17 @@ public class SpeechRecognitionPipeline : IDisposable
             var decoderOutputs = await _decoderSession.RunAsync(decoderInputs);
             var logits = decoderOutputs[_decoderSession.OutputNames[0]];
 
-            // Last-position logits — shape [1, seq_len, vocab_size].
             int vocabSize = logits.Shape.Length >= 3 ? logits.Shape[^1] : 51865;
             int lastPosOffset = (tokens.Count - 1) * vocabSize;
 
-            // Greedy argmax ON THE GPU — read back ONLY the winning index, not the whole ~52K-float vocab every
-            // token (Rule 4: no unnecessary copies). GpuArgMax tie-breaks lowest-index, identical to the old CPU
-            // first-max-wins scan; its partial buffers are reused, so there is no per-token allocation.
             int nextToken = await argmax.ArgMaxAsync(logits.Data.SubView(lastPosOffset, vocabSize), vocabSize);
             OnTokenGenerated?.Invoke(step, nextToken);
 
             if (nextToken == EOT) break;
             tokens.Add(nextToken);
-            // Hard stop at the positional-embedding count - past it the decoder indexes off the end.
             if (tokens.Count >= MaxTargetPositions) break;
         }
+
 
         sw.Stop();
 
@@ -455,6 +491,8 @@ public class SpeechRecognitionPipeline : IDisposable
     public void Dispose()
     {
         _encoderCapture?.Dispose();
+        _melPreprocess?.Dispose();
+        _melPreprocess = null;
         _encoderSession?.Dispose();
         _decoderSession?.Dispose();
         _decoderWithPastSession?.Dispose();

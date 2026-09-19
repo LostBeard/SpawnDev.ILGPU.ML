@@ -157,6 +157,105 @@ public abstract partial class MLTestBase
                         + $"SileroVad vs direct session {worstClass:E2}");
     });
 
+    /// <summary>
+    /// Hands-free regression: after Whisper (or any other session) trips BufferPool reclaim, Silero's
+    /// captured WebGPU plan must be dropped and recaptured — not replayed against destroyed bind groups.
+    /// </summary>
+    /// <remarks>
+    /// MEASURED in the demo: input meter moved on real speech while speech probability stuck at ~0.02–0.05
+    /// until a page refresh rebuilt the VAD. <see cref="WebGPUGraphCapture.InvalidatedByReclaim"/> was
+    /// already true; ReplayAsync only logged and kept submitting. SessionGraphCapture now drops the plan.
+    /// Bumping <see cref="BufferPool.ReclaimFireCount"/> mid-stream is enough to trip the same gate without
+    /// loading Whisper.
+    /// </remarks>
+    [TestMethod(Timeout = 600000)]
+    public async Task Vad_SileroVad_SurvivesBufferPoolReclaimAfterCapture() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType != AcceleratorType.WebGPU)
+            throw new UnsupportedTestException(
+                $"reclaim-invalidates-WebGPU-capture is a WebGPU concern; this lane is {accelerator.AcceleratorType}");
+
+        var assets = GetHttpClient();
+        if (assets == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var json = await assets.GetStringAsync("references/vad/silero_vad_librivox.json");
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+        int window = root.GetProperty("window").GetInt32();
+        int frames = root.GetProperty("frames").GetInt32();
+        if (window != SileroWindow)
+            throw new Exception($"fixture window is {window}, expected {SileroWindow}");
+
+        var wavBytes = await assets.GetByteArrayAsync("test-audio/librivox-public-domain.wav");
+        var samples = WavDecoder.DecodeWavFile(wavBytes)
+            ?? throw new Exception("could not decode test-audio/librivox-public-domain.wav");
+        if (samples.Length / window < frames)
+            throw new Exception($"audio holds {samples.Length / window} frames, fixture expects {frames}");
+
+        var modelBytes = await assets.GetByteArrayAsync("references/vad/silero_vad.onnx");
+        var frame = new float[window];
+
+        // Baseline: uninterrupted capture + replay over the whole clip.
+        var expected = new float[frames];
+        using (var baseline = SileroVad.Create(accelerator, modelBytes))
+        {
+            for (int f = 0; f < frames; f++)
+            {
+                Array.Copy(samples, f * window, frame, 0, window);
+                expected[f] = await baseline.ProcessFrameAsync(frame);
+            }
+            if (!baseline.IsCaptured)
+                throw new Exception("baseline SileroVad never captured on WebGPU - gate cannot fire");
+        }
+
+        // Victim: same audio, but the pool reclaim counter advances after capture is live — the condition
+        // Whisper's encoder leaves Silero in on a shared browser GPU.
+        int bumpAt = Math.Min(8, Math.Max(1, frames / 8));
+        var got = new float[frames];
+        int reclaimBefore = BufferPool.ReclaimFireCount;
+        try
+        {
+            using var victim = SileroVad.Create(accelerator, modelBytes);
+            for (int f = 0; f < frames; f++)
+            {
+                if (f == bumpAt)
+                {
+                    if (!victim.IsCaptured)
+                        throw new Exception($"victim not captured by frame {bumpAt} - cannot simulate reclaim");
+                    BufferPool.ReclaimFireCount = reclaimBefore + 1;
+                }
+                Array.Copy(samples, f * window, frame, 0, window);
+                got[f] = await victim.ProcessFrameAsync(frame);
+            }
+            if (!victim.IsCaptured)
+                throw new Exception("after reclaim bump SileroVad should have recaptured, but IsCaptured is false");
+        }
+        finally
+        {
+            BufferPool.ReclaimFireCount = reclaimBefore;
+        }
+
+        double worst = 0; int worstAt = -1;
+        for (int f = 0; f < frames; f++)
+        {
+            double d = Math.Abs(got[f] - expected[f]);
+            if (d > worst) { worst = d; worstAt = f; }
+        }
+        // Recapture pays warm forwards on clones; the caller's h/c still advance once per frame, so
+        // probabilities must stay frame-identical to the uninterrupted baseline (same tolerance as the
+        // wrapper-vs-direct gate above).
+        if (worst > 1e-4)
+            throw new Exception(
+                $"SileroVad drifted after a mid-stream BufferPool reclaim bump at frame {bumpAt}: "
+              + $"worst |d|={worst:E3} at frame {worstAt} (got {got[worstAt]:F6}, expected {expected[worstAt]:F6}). "
+              + "SessionGraphCapture must drop InvalidatedByReclaim plans and recapture — replaying them "
+              + "is how hands-free went deaf until page refresh.");
+
+        int speech = got.Count(p => p >= 0.5f);
+        Console.WriteLine($"[Vad] reclaim-after-capture: {frames} frames, bump@{bumpAt}, "
+                        + $"max |d| vs uninterrupted {worst:E2}, {speech} frames >= 0.5");
+    });
+
     private static async Task<float[]> ReadTensor(Accelerator accelerator,
         Dictionary<string, Tensor> outputs, string name, int count)
     {

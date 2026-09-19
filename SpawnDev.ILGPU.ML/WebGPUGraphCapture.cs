@@ -396,11 +396,17 @@ public sealed class WebGPUGraphCapture : IDisposable
         // Say it BEFORE the submit that would fail. A replay against a pool that has freed buffers since
         // the recording surfaces as "[Buffer (unlabeled)] used in submit while destroyed", which names
         // neither the buffer nor the reason; this names the reason. See ReclaimGenerationAtCapture.
+        //
+        // 🔴 DO NOT REPLAY. Logging and continuing was how Silero went deaf after Whisper on a shared
+        // WebGPU device: InvalidatedByReclaim was true, the warning printed (or not, in a worker), and
+        // submit still ran against destroyed bind-group memory → near-zero speech probabilities with a
+        // live input meter. SessionGraphCapture drops the plan before calling us; if something still
+        // reaches here, refuse rather than submit garbage.
         if (InvalidatedByReclaim)
-            Console.WriteLine("[WebGPUGraphCapture] ⚠️ replaying a plan recorded before "
-                + $"{Tensors.BufferPool.ReclaimFireCount - ReclaimGenerationAtCapture} pool reclaim(s) "
-                + $"({Tensors.BufferPool.ReclaimFreedBytes / 1048576.0:F0} MiB freed since process start) - "
-                + "its bind groups may reference destroyed buffers.");
+            throw new InvalidOperationException(
+                $"WebGPUGraphCapture: BufferPool reclaim ×{Tensors.BufferPool.ReclaimFireCount - ReclaimGenerationAtCapture} "
+                + "since this plan was recorded - refusing replay against possibly destroyed bind groups. "
+                + "Drop the capture (SessionGraphCapture does this) and recapture or run direct.");
 
         var t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         foreach (var (name, t) in newInputs)

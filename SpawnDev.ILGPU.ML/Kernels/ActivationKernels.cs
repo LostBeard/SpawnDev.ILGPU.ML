@@ -5,7 +5,8 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 
 /// <summary>
 /// GPU activation function kernels. All use auto-grouped 1D dispatch.
-/// In-place variants avoid extra buffer allocation.
+/// In-place variants avoid extra buffer allocation; out-of-place variants write
+/// to a separate output (preferred over CopyFrom + InPlace — one dispatch).
 /// </summary>
 public class ActivationKernels
 {
@@ -22,9 +23,16 @@ public class ActivationKernels
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>>? _swiGLU;
 
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _sigmoid;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _tanh;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _silu;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _hardSigmoid;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>? _hardSigmoidParams;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _hardSwish;
+
     public ActivationKernels(Accelerator accelerator) => _accelerator = accelerator;
 
-    // ── Kernel implementations ──
+    // ── Kernel implementations (in-place) ──
 
     private static void SigmoidInPlaceImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> data)
     {
@@ -117,6 +125,67 @@ public class ActivationKernels
         data[idx] = x * y;
     }
 
+    // ── Kernel implementations (out-of-place) — same math as InPlace, separate src/dst ──
+
+    private static void SigmoidImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        float x = input[idx];
+        if (x > 80f) { output[idx] = 1f; return; }
+        if (x < -80f) { output[idx] = 0f; return; }
+        output[idx] = 1f / (1f + MathF.Exp(-x));
+    }
+
+    private static void TanhImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        float x = input[idx];
+        if (x > 40f) { output[idx] = 1f; return; }
+        if (x < -40f) { output[idx] = -1f; return; }
+        float e2x = MathF.Exp(2f * x);
+        output[idx] = (e2x - 1f) / (e2x + 1f);
+    }
+
+    private static void SiLUImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        float x = input[idx];
+        if (x > 80f) { output[idx] = x; return; }
+        if (x < -80f) { output[idx] = 0f; return; }
+        float sig = 1f / (1f + MathF.Exp(-x));
+        output[idx] = x * sig;
+    }
+
+    private static void HardSigmoidImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        float x = input[idx];
+        float y = x / 6f + 0.5f;
+        if (y < 0f) y = 0f;
+        if (y > 1f) y = 1f;
+        output[idx] = y;
+    }
+
+    private static void HardSigmoidParamsImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, float alpha, float beta)
+    {
+        float x = input[idx];
+        float y = alpha * x + beta;
+        if (y < 0f) y = 0f;
+        if (y > 1f) y = 1f;
+        output[idx] = y;
+    }
+
+    private static void HardSwishImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output)
+    {
+        float x = input[idx];
+        float y = x / 6f + 0.5f;
+        if (y < 0f) y = 0f;
+        if (y > 1f) y = 1f;
+        output[idx] = x * y;
+    }
+
     // ── Public API ──
 
     public void SigmoidInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
@@ -143,6 +212,30 @@ public class ActivationKernels
     public void HardSwishInPlace(ArrayView1D<float, Stride1D.Dense> data, int count)
     { EnsureLoaded(); _hardSwishInPlace!(count, data); }
 
+    /// <summary>Out-of-place Sigmoid: output[i] = sigmoid(input[i]). Prefer over CopyFrom + InPlace.</summary>
+    public void Sigmoid(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded(); _sigmoid!(count, input, output); }
+
+    /// <summary>Out-of-place Tanh.</summary>
+    public void Tanh(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded(); _tanh!(count, input, output); }
+
+    /// <summary>Out-of-place SiLU (Swish): output[i] = input[i] * sigmoid(input[i]).</summary>
+    public void SiLU(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded(); _silu!(count, input, output); }
+
+    /// <summary>Out-of-place HardSigmoid with HardSwish defaults (alpha=1/6, beta=0.5).</summary>
+    public void HardSigmoid(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded(); _hardSigmoid!(count, input, output); }
+
+    /// <summary>Out-of-place HardSigmoid with configurable alpha/beta.</summary>
+    public void HardSigmoid(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count, float alpha, float beta)
+    { EnsureLoaded(); _hardSigmoidParams!(count, input, output, alpha, beta); }
+
+    /// <summary>Out-of-place HardSwish: output[i] = input[i] * HardSigmoid(input[i]).</summary>
+    public void HardSwish(ArrayView1D<float, Stride1D.Dense> input, ArrayView1D<float, Stride1D.Dense> output, int count)
+    { EnsureLoaded(); _hardSwish!(count, input, output); }
+
     private void EnsureLoaded()
     {
         var a = _accelerator;
@@ -154,5 +247,12 @@ public class ActivationKernels
         _hardSwishInPlace ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>>(HardSwishInPlaceImpl);
         _swiGLU ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SwiGLUImpl);
+
+        _sigmoid ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SigmoidImpl);
+        _tanh ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(TanhImpl);
+        _silu ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(SiLUImpl);
+        _hardSigmoid ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(HardSigmoidImpl);
+        _hardSigmoidParams ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float, float>(HardSigmoidParamsImpl);
+        _hardSwish ??= a.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>(HardSwishImpl);
     }
 }

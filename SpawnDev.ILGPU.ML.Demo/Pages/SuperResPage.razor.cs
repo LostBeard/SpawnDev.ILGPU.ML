@@ -6,6 +6,7 @@ using SpawnDev.SpawnJS.JSObjects;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
 using System.Diagnostics;
@@ -21,7 +22,8 @@ public partial class SuperResPage : IDisposable
     private SuperResolutionPipeline? _pipeline;
     private Context? _context;
     private Accelerator? _accelerator;
-    private int[]? _rgbaPixels;
+    /// <summary>Packed RGBA kept as a JS typed array so UpscaleAsync never crosses into managed memory.</summary>
+    private Uint8ClampedArray? _rgbaJs;
     private int _imageWidth, _imageHeight;
 
     // OPT-IN: the model is NOT downloaded/loaded on page entry. It loads on the first real
@@ -112,8 +114,12 @@ public partial class SuperResPage : IDisposable
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
-            using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>();
+            using var src = MediaInterop.FromImageDataJS(imageData);
+            _rgbaJs?.Dispose();
+            // Clone into an owned Uint8ClampedArray so ImageData dispose cannot free the pixels
+            // we hand to UpscaleAsync on a later click.
+            _rgbaJs = new Uint8ClampedArray(checked((int)src.Length));
+            _rgbaJs.Set(src);
             _imageWidth = w; _imageHeight = h;
 
             // Opt-in load: pull the model on first use (user picked an image), not on page entry.
@@ -129,7 +135,7 @@ public partial class SuperResPage : IDisposable
 
     private async Task RunSuperRes()
     {
-        if (_pipeline == null || _rgbaPixels == null) return;
+        if (_pipeline == null || _rgbaJs == null) return;
         _isRunning = true;
         StateHasChanged();
         await Task.Yield();
@@ -137,7 +143,7 @@ public partial class SuperResPage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var result = await _pipeline.UpscaleAsync(_rgbaPixels, _imageWidth, _imageHeight);
+            var result = await _pipeline.UpscaleAsync(_rgbaJs, _imageWidth, _imageHeight);
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
             _enhancedImageUrl = Services.ImageDisplayHelper.ToDataUrl(JS, result.RgbaPixels, result.Width, result.Height);
@@ -196,12 +202,14 @@ public partial class SuperResPage : IDisposable
     {
         _enhancedImageUrl = null;
         _imageDataUrl = null;
-        _rgbaPixels = null;
+        _rgbaJs?.Dispose();
+        _rgbaJs = null;
         StateHasChanged();
     }
 
     public void Dispose()
     {
+        _rgbaJs?.Dispose();
         _pipeline?.Dispose();
         _session?.Dispose();
         _accelerator?.Dispose();

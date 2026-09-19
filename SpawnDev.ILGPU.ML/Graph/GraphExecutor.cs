@@ -1926,7 +1926,7 @@ public class GraphExecutor : IDisposable
                         {
                             int elCount = outTensor.ElementCount;
                             var stage = ReadbackStagingView(elCount);   // pooled - see _readbackStaging
-                            _ew.Scale(outTensor.Data.SubView(0, elCount), stage, elCount, 1f);
+                            stage.CopyFrom(outTensor.Data.SubView(0, elCount));
                             _accelerator.Synchronize();
                             runtimeConstants[outName] = _readbackStaging!.View.SubView(0, elCount).GetAsArray1D();
                         }
@@ -4409,10 +4409,10 @@ public class GraphExecutor : IDisposable
                             if (outTensor.Data.Length == 0)
                                 throw new InvalidOperationException("outTensor.Data has zero length");
                             var srcView = outTensor.Data.SubView(0, elCount);
-                            captureStage = $"scale[{elCount}]";
-                            // GPU→GPU copy via Scale kernel (works on all backends),
+                            captureStage = $"copyfrom[{elCount}]";
+                            // GPU→GPU copy via CopyFrom (native on all backends; preferred over Scale×1),
                             // then async readback via CopyToHostAsync(offset, count).
-                            _ew.Scale(srcView, stage, elCount, 1f);
+                            stage.CopyFrom(srcView);
                             captureStage = $"sync[{elCount}]";
                             var _rbSw = System.Diagnostics.Stopwatch.StartNew();
                             await _accelerator.SynchronizeAsync();

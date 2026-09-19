@@ -6,6 +6,7 @@ using SpawnDev.SpawnJS.JSObjects;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.Hub;
 using SpawnDev.ILGPU.ML.Pipelines;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.Rendering;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
@@ -22,7 +23,8 @@ public partial class StylePage : IDisposable
     private StyleTransferPipeline? _pipeline;
     private Context? _context;
     private Accelerator? _accelerator;
-    private int[]? _rgbaPixels;
+    /// <summary>Packed RGBA kept as a JS typed array so TransferAsync never crosses into managed memory.</summary>
+    private Uint8ClampedArray? _rgbaJs;
     private int _imageWidth, _imageHeight;
 
     // GPU-direct canvas rendering for zero-copy output
@@ -134,8 +136,12 @@ public partial class StylePage : IDisposable
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
-            using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>();
+            using var src = MediaInterop.FromImageDataJS(imageData);
+            _rgbaJs?.Dispose();
+            // Clone into an owned Uint8ClampedArray so ImageData dispose cannot free the pixels
+            // we hand to TransferAsync on a later click.
+            _rgbaJs = new Uint8ClampedArray(checked((int)src.Length));
+            _rgbaJs.Set(src);
             _imageWidth = w; _imageHeight = h;
 
             // Opt-in load: pull the style model on first use (user picked an image), not on page entry.
@@ -151,7 +157,7 @@ public partial class StylePage : IDisposable
 
     private async Task RunStyleTransfer()
     {
-        if (_pipeline == null || _rgbaPixels == null) return;
+        if (_pipeline == null || _rgbaJs == null) return;
         _isRunning = true;
         StateHasChanged();
         await Task.Yield();
@@ -159,7 +165,7 @@ public partial class StylePage : IDisposable
         try
         {
             var sw = Stopwatch.StartNew();
-            var result = await _pipeline.TransferAsync(_rgbaPixels, _imageWidth, _imageHeight);
+            var result = await _pipeline.TransferAsync(_rgbaJs, _imageWidth, _imageHeight);
             sw.Stop();
             _inferenceMs = sw.Elapsed.TotalMilliseconds;
 
@@ -219,7 +225,8 @@ public partial class StylePage : IDisposable
     {
         _styledImageUrl = null;
         _imageDataUrl = null;
-        _rgbaPixels = null;
+        _rgbaJs?.Dispose();
+        _rgbaJs = null;
         StateHasChanged();
     }
 
@@ -232,6 +239,7 @@ public partial class StylePage : IDisposable
 
     public void Dispose()
     {
+        _rgbaJs?.Dispose();
         _lastFrameBuffer?.Dispose();
         _canvasRenderer?.Dispose();
         _pipeline?.Dispose();

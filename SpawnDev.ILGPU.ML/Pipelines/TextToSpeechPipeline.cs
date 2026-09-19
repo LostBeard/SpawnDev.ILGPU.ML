@@ -1,6 +1,8 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using SpawnDev.SpawnJS.JSObjects;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
@@ -49,6 +51,10 @@ public class TextToSpeechPipeline : IDisposable
     /// Synthesize speech from text.
     /// Returns raw PCM float audio at SampleRate Hz.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="SynthesizeAsync(Float32Array, Float32Array)"/> when token ids
+    /// and the speaker embedding are still JS typed arrays.
+    /// </remarks>
     public async Task<TTSResult> SynthesizeAsync(float[] tokenIds, float[] speakerEmbedding)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -83,6 +89,60 @@ public class TextToSpeechPipeline : IDisposable
         if (InferenceSession.VerboseLogging) Console.WriteLine($"[TTS] Audio output: [{string.Join(",", audioTensor.Shape)}], samples={audioLen}");
 
         // Read audio to CPU
+        using var readBuf = _accelerator.Allocate1D<float>(audioLen);
+        new ElementWiseKernels(_accelerator).Scale(
+            audioTensor.Data.SubView(0, audioLen), readBuf.View, audioLen, 1f);
+        await _accelerator.SynchronizeAsync();
+        var audio = await readBuf.CopyToHostAsync<float>(0, audioLen);
+
+        sw.Stop();
+        double duration = (double)audioLen / SampleRate;
+
+        return new TTSResult(audio, SampleRate, duration, sw.Elapsed.TotalMilliseconds);
+    }
+
+    /// <summary>
+    /// Browser path: token ids and speaker embedding as JS <see cref="Float32Array"/>.
+    /// Uploads via <see cref="MediaInterop.UploadToDevice{T}"/> — no managed heap crossing for inputs.
+    /// </summary>
+    /// <remarks>
+    /// Speaker embedding is uploaded the same way as the <c>float[]</c> overload (reserved for full
+    /// SpeechT5 decode; the current simplified vocoder path does not consume it yet).
+    /// </remarks>
+    public async Task<TTSResult> SynthesizeAsync(Float32Array tokenIds, Float32Array speakerEmbedding)
+    {
+        ArgumentNullException.ThrowIfNull(tokenIds);
+        ArgumentNullException.ThrowIfNull(speakerEmbedding);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        int seqLen = checked((int)tokenIds.Length);
+        using var tokenBuf = _accelerator.Allocate1D<float>(seqLen);
+        MediaInterop.UploadToDevice(tokenIds, tokenBuf);
+        var tokenTensor = new Tensor(tokenBuf.View, new[] { 1, seqLen });
+
+        var encoderOutputs = await _encoder.RunAsync(new Dictionary<string, Tensor>
+        {
+            [_encoder.InputNames[0]] = tokenTensor
+        });
+
+        var encoderHidden = encoderOutputs[_encoder.OutputNames[0]];
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[TTS] Encoder output: [{string.Join(",", encoderHidden.Shape)}]");
+
+        int speakerLen = checked((int)speakerEmbedding.Length);
+        using var speakerBuf = _accelerator.Allocate1D<float>(speakerLen);
+        MediaInterop.UploadToDevice(speakerEmbedding, speakerBuf);
+
+        var vocoderOutputs = await _vocoder.RunAsync(new Dictionary<string, Tensor>
+        {
+            [_vocoder.InputNames[0]] = encoderHidden
+        });
+
+        var audioTensor = vocoderOutputs[_vocoder.OutputNames[0]];
+        int audioLen = audioTensor.ElementCount;
+
+        if (InferenceSession.VerboseLogging) Console.WriteLine($"[TTS] Audio output: [{string.Join(",", audioTensor.Shape)}], samples={audioLen}");
+
         using var readBuf = _accelerator.Allocate1D<float>(audioLen);
         new ElementWiseKernels(_accelerator).Scale(
             audioTensor.Data.SubView(0, audioLen), readBuf.View, audioLen, 1f);

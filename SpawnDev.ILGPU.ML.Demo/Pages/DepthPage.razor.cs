@@ -23,7 +23,8 @@ public partial class DepthPage : IDisposable
     private DepthEstimationPipeline? _pipeline;
     private Context? _context;
     private Accelerator? _accelerator;
-    private int[]? _rgbaPixels;
+    /// <summary>Packed RGBA kept as a JS typed array so EstimateGpuRawAsync never crosses into managed memory.</summary>
+    private Uint8ClampedArray? _rgbaJs;
     private int _imageWidth, _imageHeight;
 
     // GPU-direct rendering. Raw depth stays on GPU so palette switches re-dispatch only
@@ -137,8 +138,12 @@ public partial class DepthPage : IDisposable
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
-            using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>();
+            using var src = MediaInterop.FromImageDataJS(imageData);
+            _rgbaJs?.Dispose();
+            // Clone into an owned Uint8ClampedArray so ImageData dispose cannot free the pixels
+            // we hand to EstimateGpuRawAsync on a later click.
+            _rgbaJs = new Uint8ClampedArray(checked((int)src.Length));
+            _rgbaJs.Set(src);
             _imageWidth = w; _imageHeight = h;
 
             // Opt-in load: pull the model on first use (user picked an image), not on page entry.
@@ -156,7 +161,7 @@ public partial class DepthPage : IDisposable
 
     private async Task RunDepthEstimation()
     {
-        if (_pipeline == null || _rgbaPixels == null || _accelerator == null) return;
+        if (_pipeline == null || _rgbaJs == null || _accelerator == null) return;
         _isRunning = true;
         _statusMessage = "Running depth estimation...";
         StateHasChanged();
@@ -170,9 +175,10 @@ public partial class DepthPage : IDisposable
             // The colormap is a separate accelerator-side step; on palette change we
             // re-dispatch ApplyColormapGpuAsync against the cached raw depth — no
             // re-inference, no host readback of depth values.
+            // TypedArray overload: JS → GPU via CopyFromJS (no managed int[] round-trip).
             _gpuRawDepth?.Dispose();
             var (rawDepth, minD, maxD, w, h) = await _pipeline.EstimateGpuRawAsync(
-                _rgbaPixels, _imageWidth, _imageHeight);
+                _rgbaJs, _imageWidth, _imageHeight);
             _gpuRawDepth = rawDepth;
             _gpuRawMinDepth = minD;
             _gpuRawMaxDepth = maxD;
@@ -356,7 +362,8 @@ public partial class DepthPage : IDisposable
     {
         _hasDepthResult = false;
         _imageDataUrl = null;
-        _rgbaPixels = null;
+        _rgbaJs?.Dispose();
+        _rgbaJs = null;
         _canvasRenderer?.Dispose();
         _canvasRenderer = null;
         _canvasReady = false;
@@ -371,6 +378,7 @@ public partial class DepthPage : IDisposable
 
     public void Dispose()
     {
+        _rgbaJs?.Dispose();
         _canvasRenderer?.Dispose();
         _gpuDepthBuffer?.Dispose();
         _gpuRawDepth?.Dispose();

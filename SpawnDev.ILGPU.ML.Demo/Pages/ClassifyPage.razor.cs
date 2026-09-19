@@ -5,6 +5,7 @@ using SpawnDev.SpawnJS;
 using SpawnDev.SpawnJS.JSObjects;
 using SpawnDev.ILGPU.ML.Demo.Services;
 using SpawnDev.ILGPU.ML.Hub;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.WebGPU;
 using SpawnDev.ILGPU.WebGPU.Backend;
 
@@ -19,7 +20,8 @@ public partial class ClassifyPage : IDisposable
     private Context? _context;
     private Accelerator? _accelerator;
     private byte[]? _imageBytes;
-    private int[]? _rgbaPixels;
+    /// <summary>Packed RGBA kept as a JS typed array so ClassifyAsync never crosses into managed memory.</summary>
+    private Uint8ClampedArray? _rgbaJs;
     private int _imageWidth;
     private int _imageHeight;
 
@@ -168,12 +170,16 @@ public partial class ClassifyPage : IDisposable
             using var ctx = canvas.Get2DContext();
             ctx.DrawImage(bitmap, 0, 0, w, h);
             using var imageData = ctx.GetImageData(0, 0, w, h);
-            using var data = imageData.Data;
-            _rgbaPixels = data.Read<int>();
+            using var src = MediaInterop.FromImageDataJS(imageData);
+            _rgbaJs?.Dispose();
+            // Clone into an owned Uint8ClampedArray so ImageData dispose cannot free the pixels
+            // we hand to ClassifyAsync on a later click.
+            _rgbaJs = new Uint8ClampedArray(checked((int)src.Length));
+            _rgbaJs.Set(src);
             _imageWidth = w;
             _imageHeight = h;
 
-            Console.WriteLine($"[Classify] Decoded: {w}x{h}, {_rgbaPixels.Length} pixels");
+            Console.WriteLine($"[Classify] Decoded: {w}x{h}, {_rgbaJs.Length} bytes");
 
             // Opt-in load: pull the model on first use (user picked an image), not on page entry.
             if (!_isModelLoaded && !_isModelLoading)
@@ -190,7 +196,7 @@ public partial class ClassifyPage : IDisposable
 
     private async Task RunInference()
     {
-        if (_classService == null || _rgbaPixels == null) return;
+        if (_classService == null || _rgbaJs == null) return;
 
         _isRunning = true;
         _predictions = null;
@@ -201,7 +207,7 @@ public partial class ClassifyPage : IDisposable
         try
         {
             var (results, ms) = await _classService.ClassifyAsync(
-                _rgbaPixels, _imageWidth, _imageHeight);
+                _rgbaJs, _imageWidth, _imageHeight);
 
             _inferenceMs = ms;
             _predictions = results.Select(r => new Components.ConfidenceBars.Prediction
@@ -239,6 +245,7 @@ public partial class ClassifyPage : IDisposable
 
     public void Dispose()
     {
+        _rgbaJs?.Dispose();
         _classService?.Dispose();
         _accelerator?.Dispose();
         _context?.Dispose();

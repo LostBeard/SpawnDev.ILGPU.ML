@@ -1,5 +1,8 @@
+using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
@@ -59,15 +62,45 @@ public class Image3DPipeline : IDisposable
     /// Reconstruct a 3D mesh from a single RGBA image.
     /// Returns vertices and triangle indices for mesh export.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="ReconstructAsync(TypedArray, int, int)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<Image3DResult> ReconstructAsync(int[] rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await ReconstructAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<Image3DResult> ReconstructAsync(TypedArray rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await ReconstructAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<Image3DResult> ReconstructAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => ReconstructCoreAsync(rgbaPixels, width, height);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<Image3DResult> ReconstructAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => ReconstructCoreAsync(rgbaPixels.View, width, height);
+
+    private async Task<Image3DResult> ReconstructCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // Step 1: Preprocess image to model input format
         int inputSize = 224; // TripoSR expects 224x224
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * inputSize * inputSize);
-        _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, inputSize, inputSize);
+        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, inputSize, inputSize);
 
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, inputSize, inputSize });
 
@@ -75,29 +108,29 @@ public class Image3DPipeline : IDisposable
         var tokenizerOutputs = await _imageTokenizer.RunAsync(new Dictionary<string, Tensor>
         {
             [_imageTokenizer.InputNames[0]] = inputTensor
-        });
+        }).ConfigureAwait(false);
         var visualTokens = tokenizerOutputs[_imageTokenizer.OutputNames[0]];
 
         // Step 3: Backbone → triplane features
         var backboneOutputs = await _backbone.RunAsync(new Dictionary<string, Tensor>
         {
             [_backbone.InputNames[0]] = visualTokens
-        });
+        }).ConfigureAwait(false);
         var triplaneFeatures = backboneOutputs[_backbone.OutputNames[0]];
 
         // Step 4: Post-processor → 3D volume occupancy field
         var postOutputs = await _postProcessor.RunAsync(new Dictionary<string, Tensor>
         {
             [_postProcessor.InputNames[0]] = triplaneFeatures
-        });
+        }).ConfigureAwait(false);
         var volume = postOutputs[_postProcessor.OutputNames[0]];
 
         // Step 5: Read volume to CPU for MarchingCubes
         int volumeSize = volume.ElementCount;
         using var readBuf = _accelerator.Allocate1D<float>(volumeSize);
         new ElementWiseKernels(_accelerator).Scale(volume.Data.SubView(0, volumeSize), readBuf.View, volumeSize, 1f);
-        await _accelerator.SynchronizeAsync();
-        var volumeData = await readBuf.CopyToHostAsync<float>(0, volumeSize);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        var volumeData = await readBuf.CopyToHostAsync<float>(0, volumeSize).ConfigureAwait(false);
 
         // Step 6: MarchingCubes → mesh
         int res = VolumeResolution;

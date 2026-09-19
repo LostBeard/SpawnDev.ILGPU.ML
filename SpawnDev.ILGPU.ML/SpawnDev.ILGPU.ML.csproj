@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.18</Version>
-		<PackageReleaseNotes>v5.2.18 - building a decode capture can no longer fail a generation, whatever goes wrong. 5.2.17 made ONE guard inside TryCaptureAsync return null instead of throwing, and the next report was a different guard in the same method - 'attention slot count mismatch 44/49' - still killing every chat turn. Guards are exactly what gets added to over time, so catching them one at a time at the throw site is a losing shape; the contract now lives at the call site in GgufGenerator, beside the fallback. A capture is an OPTIMISATION and the fallback next to it is a complete, correct decode, so a capture that cannot be built is a performance outcome and never a failed answer. The failure is still reported loudly and capture is disabled for the session.</PackageReleaseNotes>
+		<Version>5.2.19</Version>
+		<PackageReleaseNotes>v5.2.19 - JS data stays off the managed heap. Plans/gpu-whisper-mel-zerocopy.md</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

@@ -2,6 +2,7 @@ using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 using System.Diagnostics;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
@@ -61,8 +62,44 @@ public class ZeroShotClassificationPipeline : IDisposable
     /// Classify an image against N text descriptions.
     /// Returns predictions ranked by similarity.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="ClassifyAsync(TypedArray, int, int, string[])"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<ZeroShotResult> ClassifyAsync(
         int[] rgbaPixels, int width, int height,
+        string[] textDescriptions)
+    {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await ClassifyAsync(rgbaBuf.View, width, height, textDescriptions).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<ZeroShotResult> ClassifyAsync(
+        TypedArray rgbaPixels, int width, int height,
+        string[] textDescriptions)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await ClassifyAsync(rgbaBuf.View, width, height, textDescriptions).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<ZeroShotResult> ClassifyAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        string[] textDescriptions)
+        => ClassifyCoreAsync(rgbaPixels, width, height, textDescriptions);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<ZeroShotResult> ClassifyAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
+        string[] textDescriptions)
+        => ClassifyCoreAsync(rgbaPixels.View, width, height, textDescriptions);
+
+    private async Task<ZeroShotResult> ClassifyCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
         string[] textDescriptions)
     {
         if (_tokenizer == null)
@@ -71,13 +108,13 @@ public class ZeroShotClassificationPipeline : IDisposable
         var sw = Stopwatch.StartNew();
 
         // Encode image
-        var imageEmbedding = await EncodeImageAsync(rgbaPixels, width, height);
+        var imageEmbedding = await EncodeImageAsync(rgbaPixels, width, height).ConfigureAwait(false);
 
         // Encode all text descriptions
         var textEmbeddings = new float[textDescriptions.Length][];
         for (int i = 0; i < textDescriptions.Length; i++)
         {
-            textEmbeddings[i] = await EncodeTextAsync(textDescriptions[i]);
+            textEmbeddings[i] = await EncodeTextAsync(textDescriptions[i]).ConfigureAwait(false);
         }
 
         // Compute cosine similarities and apply logit scale
@@ -115,12 +152,42 @@ public class ZeroShotClassificationPipeline : IDisposable
     /// <summary>
     /// Encode an image to a normalized embedding vector.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="EncodeImageAsync(TypedArray, int, int)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<float[]> EncodeImageAsync(int[] rgbaPixels, int width, int height)
     {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await EncodeImageAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array. Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<float[]> EncodeImageAsync(TypedArray rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await EncodeImageAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<float[]> EncodeImageAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => EncodeImageCoreAsync(rgbaPixels, width, height);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<float[]> EncodeImageAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => EncodeImageCoreAsync(rgbaPixels.View, width, height);
+
+    private async Task<float[]> EncodeImageCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+    {
         // Preprocess: RGBA → NCHW with CLIP normalization
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.Forward(rgbaBuf.View, preprocessed.View, width, height, _inputSize, _inputSize,
+        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize,
             ClipMean, ClipStd);
 
         var inputTensor = new Tensor(preprocessed.View, new[] { 1, 3, _inputSize, _inputSize });
@@ -128,14 +195,14 @@ public class ZeroShotClassificationPipeline : IDisposable
         var outputs = await _visionSession.RunAsync(new Dictionary<string, Tensor>
         {
             [_visionSession.InputNames[0]] = inputTensor
-        });
+        }).ConfigureAwait(false);
 
         var output = outputs[_visionSession.OutputNames[0]];
         int elems = Math.Min(output.ElementCount, _embeddingDim);
         using var readBuf = _accelerator.Allocate1D<float>(elems);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await _accelerator.SynchronizeAsync();
-        var embedding = await readBuf.CopyToHostAsync<float>(0, elems);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        var embedding = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 
         // L2 normalize
         return L2Normalize(embedding);
@@ -161,14 +228,14 @@ public class ZeroShotClassificationPipeline : IDisposable
         var outputs = await _textSession.RunAsync(new Dictionary<string, Tensor>
         {
             [_textSession.InputNames[0]] = inputTensor
-        });
+        }).ConfigureAwait(false);
 
         var output = outputs[_textSession.OutputNames[0]];
         int elems = Math.Min(output.ElementCount, _embeddingDim);
         using var readBuf = _accelerator.Allocate1D<float>(elems);
         new ElementWiseKernels(_accelerator).Scale(output.Data.SubView(0, elems), readBuf.View, elems, 1f);
-        await _accelerator.SynchronizeAsync();
-        var embedding = await readBuf.CopyToHostAsync<float>(0, elems);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        var embedding = await readBuf.CopyToHostAsync<float>(0, elems).ConfigureAwait(false);
 
         return L2Normalize(embedding);
     }

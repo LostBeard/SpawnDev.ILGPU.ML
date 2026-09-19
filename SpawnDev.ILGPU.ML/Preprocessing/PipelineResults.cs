@@ -287,11 +287,10 @@ public class TranscriptionResult
     /// Wall time computing the log-mel spectrogram, in milliseconds.
     /// </summary>
     /// <remarks>
-    /// ⚠️ Broken out because it is a CPU cost inside an otherwise GPU pipeline, and because it is FIXED
-    /// rather than proportional to the utterance: the audio is padded to a flat 30 s before the STFT runs,
-    /// so a four-word turn pays exactly what a full half-minute does. That is why endpointing shortened the
-    /// RECORDING without shortening the transcription, and attributing it needs its own number - the
-    /// executor counters cannot see work that never reaches the executor.
+    /// ⚠️ Broken out because it is FIXED rather than proportional to the utterance: the audio is padded to
+    /// a flat 30 s before the STFT runs, so a four-word turn pays exactly what a full half-minute does.
+    /// On the GPU path (<see cref="WhisperMelPreprocessor"/>) this is device work that still sits outside
+    /// the encoder/decoder executor counters; attributing it needs its own number.
     /// </remarks>
     public double MelTimeMs { get; init; }
 

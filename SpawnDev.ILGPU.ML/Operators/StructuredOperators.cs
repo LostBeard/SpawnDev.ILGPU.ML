@@ -141,7 +141,7 @@ public class SoftmaxOperator(OperatorRegistry reg) : IOnnxOperator
         if (axis < 0) axis = 0;
 
         // Copy input to output first
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f);
+        ctx.Outputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount).CopyFrom(ctx.Inputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount));
 
         // ONNX opset 13+: Softmax operates on a SINGLE axis.
         // For shape [A, B, C, D] with axis=2: softmax over C for each (A*B) × D combination.
@@ -956,7 +956,7 @@ public class ReduceSumOperator(OperatorRegistry reg) : IOnnxOperator
         var shape = ctx.Inputs[0].Shape;
         var normalizedAxes = ReduceOps.ResolveAxes(ctx, shape.Length);
         if (normalizedAxes.Length == 0) // noop_with_empty_axes=1 → identity
-        { reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f); return; }
+        { ctx.Outputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount).CopyFrom(ctx.Inputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount)); return; }
 
         int firstAxis = normalizedAxes[0];
         int lastAxis = normalizedAxes[^1];
@@ -979,7 +979,7 @@ public class ReduceMaxOperator(OperatorRegistry reg) : IOnnxOperator
         var shape = ctx.Inputs[0].Shape;
         var normalizedAxes = ReduceOps.ResolveAxes(ctx, shape.Length);
         if (normalizedAxes.Length == 0) // noop_with_empty_axes=1 → identity
-        { reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f); return; }
+        { ctx.Outputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount).CopyFrom(ctx.Inputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount)); return; }
 
         int firstAxis = normalizedAxes[0];
         int lastAxis = normalizedAxes[^1];
@@ -1000,7 +1000,7 @@ public class ReduceMinOperator(OperatorRegistry reg) : IOnnxOperator
         var shape = ctx.Inputs[0].Shape;
         var normalizedAxes = ReduceOps.ResolveAxes(ctx, shape.Length);
         if (normalizedAxes.Length == 0) // noop_with_empty_axes=1 → identity
-        { reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, ctx.Inputs[0].ElementCount, 1f); return; }
+        { ctx.Outputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount).CopyFrom(ctx.Inputs[0].Data.SubView(0, ctx.Inputs[0].ElementCount)); return; }
 
         int firstAxis = normalizedAxes[0];
         int lastAxis = normalizedAxes[^1];
@@ -1187,7 +1187,7 @@ public class ScatterNDOperator(OperatorRegistry reg) : IOnnxOperator
             reduction = redStr.ToLowerInvariant();
 
         // Copy data to output first
-        reg.ElementWise.Scale(data.Data, output.Data, data.ElementCount, 1f);
+        output.Data.SubView(0, data.ElementCount).CopyFrom(data.Data.SubView(0, data.ElementCount));
 
         // Read indices from GPU (small tensor, constant in most models)
         var idxFloats = ctx.TryGetInputValues(1);
@@ -1885,7 +1885,7 @@ public class PadOperator(OperatorRegistry reg) : IOnnxOperator
         else
         {
             // No padding — just copy
-            reg.ElementWise.Scale(input.Data, ctx.Outputs[0].Data, input.ElementCount, 1f);
+            ctx.Outputs[0].Data.SubView(0, input.ElementCount).CopyFrom(input.Data.SubView(0, input.ElementCount));
             return;
         }
 
@@ -2587,7 +2587,7 @@ public class ScatterElementsOperator(OperatorRegistry reg) : IOnnxOperator
 
         int total = ctx.Inputs[0].ElementCount;
         // Copy data to output first
-        reg.ElementWise.Scale(ctx.Inputs[0].Data, ctx.Outputs[0].Data, total, 1f);
+        ctx.Outputs[0].Data.SubView(0, total).CopyFrom(ctx.Inputs[0].Data.SubView(0, total));
 
         if (dataVals == null || idxVals == null || updateVals == null)
         {

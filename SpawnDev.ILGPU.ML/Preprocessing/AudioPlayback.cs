@@ -48,9 +48,32 @@ public sealed class AudioPlayback : IDisposable
     /// The clip's duration in seconds. Playback continues after this returns - await
     /// <see cref="WaitForEndAsync"/> to follow it.
     /// </returns>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="PlayAsync(Float32Array, int)"/> when samples are already a
+    /// JS typed array — this path allocates a new <see cref="Float32Array"/> solely to feed the
+    /// AudioBuffer.
+    /// </remarks>
     public async Task<double> PlayAsync(float[] samples, int sampleRate)
     {
         if (samples == null || samples.Length == 0)
+            throw new ArgumentException("nothing to play", nameof(samples));
+        if (sampleRate <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sampleRate), sampleRate, "sample rate must be positive");
+
+        using var channel = new Float32Array(samples);
+        return await PlayAsync(channel, sampleRate).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: play mono PCM that is already a JS <see cref="Float32Array"/> — no managed
+    /// <c>float[]</c> crossing. The typed array is copied into the <see cref="AudioBuffer"/> channel
+    /// and is not disposed by this method (caller retains ownership).
+    /// </summary>
+    public async Task<double> PlayAsync(Float32Array samples, int sampleRate)
+    {
+        ArgumentNullException.ThrowIfNull(samples);
+        long len = samples.Length;
+        if (len == 0)
             throw new ArgumentException("nothing to play", nameof(samples));
         if (sampleRate <= 0)
             throw new ArgumentOutOfRangeException(nameof(sampleRate), sampleRate, "sample rate must be positive");
@@ -66,12 +89,10 @@ public sealed class AudioPlayback : IDisposable
         // the browser resamples on playback. Writing 24 kHz samples into a 48 kHz buffer without saying so
         // plays everything an octave low at double speed - which sounds like a broken model, not a
         // mislabelled buffer.
-        var buffer = _ctx.CreateBuffer(1, samples.Length, sampleRate);
-        // The typed-array crossing is the ONE copy: samples go straight into a Float32Array rather than
-        // element-by-element through interop, which for a few seconds of 24 kHz audio is the difference
-        // between one transfer and six figures of them.
-        using var channel = new Float32Array(samples);
-        buffer.CopyToChannel(channel, 0);
+        int n = checked((int)len);
+        var buffer = _ctx.CreateBuffer(1, n, sampleRate);
+        // Typed array → AudioBuffer channel: the ONE copy, and it stays in JS.
+        buffer.CopyToChannel(samples, 0);
 
         var source = _ctx.CreateBufferSource();
         source.Buffer = buffer;
@@ -81,7 +102,7 @@ public sealed class AudioPlayback : IDisposable
 
         _source = source;
         IsPlaying = true;
-        return samples.Length / (double)sampleRate;
+        return n / (double)sampleRate;
     }
 
     /// <summary>Wait until the current clip finishes (or returns immediately if nothing is playing).</summary>

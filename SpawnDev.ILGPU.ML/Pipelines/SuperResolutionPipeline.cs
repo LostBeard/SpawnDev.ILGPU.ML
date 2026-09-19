@@ -1,6 +1,8 @@
 using ILGPU;
 using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.Preprocessing;
 using SpawnDev.ILGPU.ML.Tensors;
+using TypedArray = SpawnDev.SpawnJS.JSObjects.TypedArray;
 
 namespace SpawnDev.ILGPU.ML.Pipelines;
 
@@ -61,33 +63,94 @@ public class SuperResolutionPipeline : IDisposable
     /// indices and coordinates — runs on CPU. The only host readback is the final
     /// RGBA result.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="UpscaleAsync(TypedArray, int, int)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<SuperResResult> UpscaleAsync(int[] rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await UpscaleAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array (e.g. <c>ImageData.Data</c>). Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<SuperResResult> UpscaleAsync(TypedArray rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await UpscaleAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<SuperResResult> UpscaleAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => UpscaleHostCoreAsync(rgbaPixels, width, height);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<SuperResResult> UpscaleAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => UpscaleHostCoreAsync(rgbaPixels.View, width, height);
+
+    private async Task<SuperResResult> UpscaleHostCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
     {
         int dstW = width * _upscaleFactor;
         int dstH = height * _upscaleFactor;
 
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         using var rgbaOutBuf = _accelerator.Allocate1D<int>(dstW * dstH);
-        await RunTiledAsync(rgbaBuf.View, rgbaOutBuf.View, width, height, dstW, dstH);
-        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, dstW * dstH);
+        await RunTiledAsync(rgbaPixels, rgbaOutBuf.View, width, height, dstW, dstH).ConfigureAwait(false);
+        var result = await rgbaOutBuf.CopyToHostAsync<int>(0, dstW * dstH).ConfigureAwait(false);
         return new SuperResResult(result, dstW, dstH, _upscaleFactor);
     }
 
     /// <summary>
     /// Upscale an RGBA image and return result as GPU MemoryBuffer2D for zero-copy
     /// presentation via ICanvasRenderer. Same tile-based algorithm as
-    /// <see cref="UpscaleAsync"/>, but the final RGBA stays on the GPU.
+    /// <see cref="UpscaleAsync(int[], int, int)"/>, but the final RGBA stays on the GPU.
     /// Caller owns the returned buffer and must dispose it.
     /// </summary>
+    /// <remarks>
+    /// ⚠️ IN A BROWSER, prefer <see cref="UpscaleGpuAsync(TypedArray, int, int)"/> or a
+    /// GPU-resident view overload — this path pulls the frame onto the managed heap solely to upload it.
+    /// </remarks>
     public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
         int[] rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromManaged(_accelerator, rgbaPixels, width, height);
+        return await UpscaleGpuAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Browser path: RGBA still a JS typed array. Uploads via
+    /// <see cref="MediaInterop.UploadToDevice{T}"/> — pixels never enter the .NET managed heap.
+    /// </summary>
+    public async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
+        TypedArray rgbaPixels, int width, int height)
+    {
+        using var rgbaBuf = RgbaUpload.FromTypedArray(_accelerator, rgbaPixels, width, height);
+        return await UpscaleGpuAsync(rgbaBuf.View, width, height).ConfigureAwait(false);
+    }
+
+    /// <summary>GPU-resident packed RGBA — no upload.</summary>
+    public Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => UpscaleGpuCoreAsync(rgbaPixels, width, height);
+
+    /// <summary>Same as the view overload; accepts an owned buffer.</summary>
+    public Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuAsync(
+        MemoryBuffer1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
+        => UpscaleGpuCoreAsync(rgbaPixels.View, width, height);
+
+    private async Task<(MemoryBuffer2D<int, Stride2D.DenseX> Buffer, int Width, int Height)> UpscaleGpuCoreAsync(
+        ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height)
     {
         int dstW = width * _upscaleFactor;
         int dstH = height * _upscaleFactor;
 
-        using var rgbaBuf = _accelerator.Allocate1D(rgbaPixels);
         var resultBuf = _accelerator.Allocate2DDenseX<int>(new Index2D(dstW, dstH));
-        await RunTiledAsync(rgbaBuf.View, resultBuf.View.BaseView, width, height, dstW, dstH);
+        await RunTiledAsync(rgbaPixels, resultBuf.View.BaseView, width, height, dstW, dstH).ConfigureAwait(false);
         return (resultBuf, dstW, dstH);
     }
 

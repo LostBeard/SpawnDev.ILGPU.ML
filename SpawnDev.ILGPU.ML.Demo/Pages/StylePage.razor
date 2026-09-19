@@ -240,7 +240,7 @@ const out = await pipe(imageUrl);
         _styledImageUrl = null;
         await LoadStyle(name);
         // Auto-re-run if image already loaded
-        if (_isModelLoaded && _rgbaPixels != null)
+        if (_isModelLoaded && _rgbaJs != null)
             await RunStyleTransfer();
     }
     private async Task HandleFrame(byte[] frameBytes)

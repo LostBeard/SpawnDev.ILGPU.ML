@@ -102,6 +102,10 @@ public sealed class GgufGenerator : IDisposable
     /// </summary>
     public bool EnableWebGPUDecodeCapture { get; set; }
     private WebGPUDecodeCapture? _decodeCapture;
+    /// <summary>Recycled input_ids upload buffer (capacity = maxSeqLen). Avoids per-token Allocate1D.</summary>
+    private MemoryBuffer1D<float, Stride1D.Dense>? _inputIdsBuf;
+    /// <summary>Recycled logits staging for sampling readback. Avoids per-token Allocate1D(vocab).</summary>
+    private MemoryBuffer1D<float, Stride1D.Dense>? _logitsReadBuf;
     /// <summary>Diagnostics: (ops, scalar/copy/slot patch counts) of the active decode capture, or null.</summary>
     public (int Ops, int Scalars, int Copies, int Slots)? DecodeCaptureInfo =>
         _decodeCapture is { } c ? (c.DispatchCount, c.PatchCounts.Scalars, c.PatchCounts.Copies, c.PatchCounts.Slots) : null;
@@ -231,12 +235,10 @@ public sealed class GgufGenerator : IDisposable
             if (ct.IsCancellationRequested) { stop = StopReason.Cancelled; break; }
 
             IReadOnlyDictionary<string, Tensor>? outputs;
-            MemoryBuffer1D<float, Stride1D.Dense>? inBuf = null;
             int? fastToken = null;        // greedy single-fence replay token (skips the logits section)
             float[]? fastLogits = null;   // sampled single-fence replay logits (host array, skips the GPU read)
             bool wantSampling = config?.Strategy is "top_k" or "top_p";
             bool wantRepPen = config?.RepetitionPenalty is float rpv && rpv != 1.0f;
-            try
             {
                 if (EnableWebGPUDecodeCapture && stepIds.Length == 1)
                 {
@@ -296,11 +298,9 @@ public sealed class GgufGenerator : IDisposable
 
                 async Task<IReadOnlyDictionary<string, Tensor>> RunDirectAsync()
                 {
-                    var idf = new float[stepIds.Length];
-                    for (int i = 0; i < stepIds.Length; i++) idf[i] = stepIds[i];
-                    inBuf = _accelerator.Allocate1D(idf);
+                    var idView = UploadInputIds(stepIds);
                     return await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
-                    { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
+                    { ["input_ids"] = new Tensor(idView, new[] { 1, stepIds.Length }, "input_ids") });
                 }
 
             int next;
@@ -336,8 +336,8 @@ public sealed class GgufGenerator : IDisposable
             }
             else
             {
-                using var read = _accelerator.Allocate1D<float>(vocab);
-                await read.View.CopyFromAsync(lastLogits);
+                var read = EnsureLogitsReadBuf(vocab);
+                await read.View.SubView(0, vocab).CopyFromAsync(lastLogits);
                 await _accelerator.SynchronizeAsync();
                 var logits = await read.CopyToHostAsync<float>(0, vocab);
                 if (repPen)
@@ -379,7 +379,7 @@ public sealed class GgufGenerator : IDisposable
 
             stepIds = new[] { next }; // incremental decode: after the prefill, feed only the new token
             }
-            finally { inBuf?.Dispose(); }
+            // _inputIdsBuf / _logitsReadBuf are instance-owned — disposed in Dispose(), never per-token
         }
 
         // Flush the detokenizer + any held-back safe tail (only if we didn't stop on a stop string).
@@ -451,12 +451,10 @@ public sealed class GgufGenerator : IDisposable
         double ttftMs = 0;
         for (int step = 0; step < maxNew; step++)
         {
-            var idf = new float[stepIds.Length];
-            for (int i = 0; i < stepIds.Length; i++) idf[i] = stepIds[i];
+            var idView = UploadInputIds(stepIds);
             var sw = step == 0 ? System.Diagnostics.Stopwatch.StartNew() : null;
-            using var inBuf = _accelerator.Allocate1D(idf);
             var outputs = await _session.RunDecodeStepAsync(new Dictionary<string, Tensor>
-            { ["input_ids"] = new Tensor(inBuf.View, new[] { 1, stepIds.Length }, "input_ids") });
+            { ["input_ids"] = new Tensor(idView, new[] { 1, stepIds.Length }, "input_ids") });
 
             var logitsT = outputs.TryGetValue("logits", out var l) ? l : outputs.Values.First();
             int vocab = logitsT.Shape[^1];
@@ -497,6 +495,33 @@ public sealed class GgufGenerator : IDisposable
         return window;
     }
 
+    /// <summary>Upload <paramref name="stepIds"/> into the recycled instance buffer; returns a view of length N.
+    /// Buffer is sized to <see cref="_maxSeqLen"/> once and never disposed mid-generation (WebGPU lifetime).</summary>
+    private ArrayView1D<float, Stride1D.Dense> UploadInputIds(int[] stepIds)
+    {
+        int n = stepIds.Length;
+        if (n > _maxSeqLen)
+            throw new ArgumentOutOfRangeException(nameof(stepIds), n, $"input_ids length {n} exceeds maxSeqLen {_maxSeqLen}");
+        _inputIdsBuf ??= _accelerator.Allocate1D<float>(_maxSeqLen);
+        var idf = new float[n];
+        for (int i = 0; i < n; i++) idf[i] = stepIds[i];
+        _inputIdsBuf.View.SubView(0, n).CopyFromCPU(idf);
+        return _inputIdsBuf.View.SubView(0, n);
+    }
+
+    /// <summary>Recycled logits staging buffer for sampling readback (grows to vocab once).</summary>
+    private MemoryBuffer1D<float, Stride1D.Dense> EnsureLogitsReadBuf(int vocab)
+    {
+        if (_logitsReadBuf == null || _logitsReadBuf.Length < vocab)
+        {
+            // Grow only between tokens (prior step fully drained). Retire old buffer to Dispose().
+            var old = _logitsReadBuf;
+            _logitsReadBuf = _accelerator.Allocate1D<float>(vocab);
+            old?.Dispose();
+        }
+        return _logitsReadBuf;
+    }
+
     /// <summary>Index of the earliest stop-string match at or after <paramref name="from"/>, or -1.</summary>
     private static int EarliestStopMatch(StringBuilder sb, int from, IReadOnlyList<string>? stops)
     {
@@ -535,6 +560,13 @@ public sealed class GgufGenerator : IDisposable
         return 0;
     }
 
-    /// <summary>Releases the decode KV-cache + argmax buffers. Does NOT dispose the session or accelerator (caller-owned).</summary>
-    public void Dispose() { _decodeCapture?.Dispose(); _decodeCapture = null; _cache.Dispose(); _argmax.Dispose(); }
+    /// <summary>Releases the decode KV-cache + argmax + recycled decode buffers. Does NOT dispose the session or accelerator (caller-owned).</summary>
+    public void Dispose()
+    {
+        _decodeCapture?.Dispose(); _decodeCapture = null;
+        _inputIdsBuf?.Dispose(); _inputIdsBuf = null;
+        _logitsReadBuf?.Dispose(); _logitsReadBuf = null;
+        _cache.Dispose();
+        _argmax.Dispose();
+    }
 }
