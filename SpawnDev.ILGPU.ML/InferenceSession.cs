@@ -1469,7 +1469,11 @@ public class InferenceSession : IDisposable
             int extLoaded = 0;
             foreach (var init in parsedModel.Graph.Initializers)
             {
-                if (init.DataLocation != 1 || init.ExternalData == null) continue;
+                if (init.DataLocation != 1) continue;
+                if (init.ExternalData == null)
+                    throw new InvalidOperationException(
+                        $"Initializer '{init.Name}' has data_location=EXTERNAL but no external_data entries were parsed. " +
+                        "Streaming ONNX parser must parse TensorProto field 13 (external_data).");
                 if (!graph.Initializers.TryGetValue(init.Name, out var shape)) continue;
                 if (gpuWeights.ContainsKey(init.Name)) continue;
                 int elems = shape.Length > 0 ? shape.Aggregate(1, (a, b) => a * b) : 1;
@@ -1481,6 +1485,13 @@ public class InferenceSession : IDisposable
                 loaded++; extLoaded++;
             }
             if (VerboseLogging) Console.WriteLine($"[InferenceSession] external-data (stream): {extLoaded} weights streamed from model.onnx_data (zero-copy)");
+        }
+        else if (parsedModel.Graph.Initializers.Any(i => i.DataLocation == 1))
+        {
+            var first = parsedModel.Graph.Initializers.First(i => i.DataLocation == 1).Name;
+            throw new InvalidOperationException(
+                $"Model has external-data initializers (e.g. '{first}') but no externalDataStream was provided. " +
+                "Pass model.onnx_data via CreateFromOnnxStreamAsync(..., externalDataStream:) or CreateFromHubAsync.");
         }
 
         foreach (var name in compiled.InitializerNames)
@@ -1506,6 +1517,12 @@ public class InferenceSession : IDisposable
                 loaded++;
             }
         }
+
+        // Fail loud: every initializer a compiled node reads as a REAL GPU tensor must be uploaded.
+        // Missing external data (SpawnScene DAv3: silent null model.onnx_data) used to surface much later as
+        // "Tensor '/backbone/Transpose_output_0' not found (needed by Resize) producerOp=NONE".
+        AssertGpuConsumedInitializersUploaded(compiled, gpuWeights);
+
         onProgress?.Invoke("upload", 100);
 
         if (VerboseLogging) Console.WriteLine($"[InferenceSession] ONNX (stream): {modelInfo.Name}, {compiled.Nodes.Length} nodes, {loaded} weights uploaded");
@@ -1522,6 +1539,43 @@ public class InferenceSession : IDisposable
         session.EnableShapeRecompilation(graph, _constSeed, _floatSeed, enableOptimization);
         return session;
     }
+
+    /// <summary>
+    /// Every initializer a compiled node reads as a real GPU tensor (not a CPU shape-param slot) must be
+    /// present in <paramref name="gpuWeights"/>. Catches missing external-data uploads at load time instead
+    /// of a mid-forward "Tensor 'X' not found (producerOp=NONE)" on Resize/MatMul.
+    /// </summary>
+    private static void AssertGpuConsumedInitializersUploaded(
+        CompiledGraph compiled, Dictionary<string, Tensor> gpuWeights)
+    {
+        foreach (var node in compiled.Nodes)
+        {
+            for (int i = 0; i < node.InputNames.Length; i++)
+            {
+                var name = node.InputNames[i];
+                if (string.IsNullOrEmpty(name)) continue;
+                if (IsOnnxShapeParamSlot(node.OpType, i)) continue;
+                if (!compiled.InitializerNames.Contains(name)) continue;
+                if (gpuWeights.ContainsKey(name)) continue;
+                throw new InvalidOperationException(
+                    $"GPU-consumed initializer '{name}' was not uploaded (needed by {node.OpType} as input[{i}]). " +
+                    "Likely missing external data (model.onnx_data) or a stream-upload skip. " +
+                    "For hub loads, ensure CreateFromHubAsync opened the external-data file (do not pass a silent null stream).");
+            }
+        }
+    }
+
+    // Mirrors GraphExecutor.IsShapeParamSlot — keep in sync. Shape-param inputs may live only in
+    // ConstantData / runtimeConstants and need not be GPU buffers when unused as tensor data.
+    private static bool IsOnnxShapeParamSlot(string opType, int slot) => opType switch
+    {
+        "Reshape" or "Expand" or "Unsqueeze" or "Squeeze" or "Tile" or "Pad" => slot == 1,
+        "ConstantOfShape" => slot == 0,
+        "Slice" => slot >= 1 && slot <= 4,
+        "Resize" => slot >= 1 && slot <= 3,
+        "Range" => slot >= 0 && slot <= 2,
+        _ => false,
+    };
 
     /// <summary>
     /// Convert OnnxModelInfo (from native parser) to ModelGraph (used by GraphCompiler).

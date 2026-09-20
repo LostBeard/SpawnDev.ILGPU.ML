@@ -47,6 +47,9 @@ public class DepthEstimationPipeline : IDisposable
     private MemoryBuffer1D<float, Stride1D.Dense>? _captureInputBuf;
     private int[]? _captureShape;
 
+    /// <summary>Underlying session — diagnostics (weight presence) and advanced callers.</summary>
+    public InferenceSession Session => _session;
+
     public DepthEstimationPipeline(InferenceSession session, Accelerator accelerator,
         int inputSize = 0)
     {
@@ -125,13 +128,25 @@ public class DepthEstimationPipeline : IDisposable
             // External-data model (DAv3): model.onnx is a SMALL structure file (weights live in model.onnx_data).
             // Fetch the structure whole (KBs) and STREAM only the big weights file — keeps the 100+ MB weights
             // off the managed heap. On the torrent source it also avoids a lazy-hash same-directory collision
-            // that otherwise gave the model.onnx_data stream model.onnx's length (both live under onnx/). If
-            // model.onnx_data is absent (a mislabeled single-file export), extData stays null and the structure
-            // file carries any weights.
+            // that otherwise gave the model.onnx_data stream model.onnx's length (both live under onnx/).
+            //
+            // ⚠️ FAIL LOUD when the external-data file is requested but missing. Swallowing OpenAsync used to
+            // leave extData=null, so large initializers (DAv3 pos-embed `/backbone/Transpose_output_0`) never
+            // uploaded — Resize then threw "Tensor not found (producerOp=NONE elideBlocked=True)". Single-file
+            // models must pass externalDataFile: "" (DAv2) so they take the else branch below.
             var modelBytes = await source.FetchBytesAsync(repoId, modelFile, ct).ConfigureAwait(false);
             modelStream = new System.IO.MemoryStream(modelBytes);
-            try { extData = await source.OpenAsync(repoId, externalDataFile, ct).ConfigureAwait(false); }
-            catch { extData = null; }
+            try
+            {
+                extData = await source.OpenAsync(repoId, externalDataFile, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                await modelStream.DisposeAsync().ConfigureAwait(false);
+                throw new InvalidOperationException(
+                    $"External-data model '{repoId}' requires '{externalDataFile}' but it could not be opened. " +
+                    $"Pass externalDataFile: \"\" for single-file ONNX exports. Inner: {ex.Message}", ex);
+            }
         }
         else
         {
@@ -508,6 +523,244 @@ public class DepthEstimationPipeline : IDisposable
         postprocess.DepthToColormapPalette(depthView, rgbaView, minDepth, maxDepth, palette);
         await _accelerator.SynchronizeAsync();
         return resultBuf;
+    }
+
+    /// <summary>
+    /// Joint multi-view depth (DAv3-native): pack N RGBA frames into <c>[1,N,3,H,W]</c>, run one forward,
+    /// return per-view GPU depth maps plus optional confidence / extrinsics / intrinsics by output name.
+    /// Graph capture is skipped (N varies). Session shape-recompile handles N ≠ compile-time num_images.
+    /// </summary>
+    /// <param name="frames">Packed RGBA int buffers, one per view (same layout as monocular EstimateGpuRaw).</param>
+    /// <param name="widths">Source width per view.</param>
+    /// <param name="heights">Source height per view.</param>
+    /// <param name="outputWidth">0 = match first frame width.</param>
+    /// <param name="outputHeight">0 = match first frame height.</param>
+    public async Task<MultiViewDepthGpuResult> EstimateMultiViewGpuAsync(
+        IReadOnlyList<ArrayView1D<int, Stride1D.Dense>> frames,
+        IReadOnlyList<int> widths, IReadOnlyList<int> heights,
+        int outputWidth = 0, int outputHeight = 0)
+    {
+        int n = frames.Count;
+        if (n < 1) throw new ArgumentException("At least one view is required.", nameof(frames));
+        if (widths.Count != n || heights.Count != n)
+            throw new ArgumentException("widths/heights length must match frames.");
+
+        int chw = 3 * _inputSize * _inputSize;
+        using var stacked = _accelerator.Allocate1D<float>(n * (long)chw);
+        for (int i = 0; i < n; i++)
+        {
+            _preprocess.Forward(frames[i], stacked.View.SubView(i * chw, chw),
+                widths[i], heights[i], _inputSize, _inputSize);
+        }
+
+        var inputShape = new[] { 1, n, 3, _inputSize, _inputSize };
+        var inputTensor = new Tensor(stacked.View, inputShape);
+        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [_session.InputNames[0]] = inputTensor
+        }).ConfigureAwait(false);
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+
+        var depthTensor = FindOutput(outputs, "predicted_depth")
+            ?? outputs[_session.OutputNames[0]];
+        var views = await SplitDepthViewsAsync(depthTensor, n, widths[0], heights[0], outputWidth, outputHeight)
+            .ConfigureAwait(false);
+
+        IReadOnlyList<MemoryBuffer1D<float, Stride1D.Dense>>? confMaps = null;
+        var confTensor = FindOutput(outputs, "confidence");
+        if (confTensor != null)
+        {
+            confMaps = await SplitPlaneViewsAsync(confTensor, n, views[0].Width, views[0].Height)
+                .ConfigureAwait(false);
+        }
+
+        float[][]? extrinsics = await TryReadPoseMatricesAsync(FindOutput(outputs, "extrinsics"), n, expectedElemsPerView: 12)
+            .ConfigureAwait(false);
+        float[][]? intrinsics = await TryReadPoseMatricesAsync(FindOutput(outputs, "intrinsics"), n, expectedElemsPerView: 9)
+            .ConfigureAwait(false);
+
+        if (InferenceSession.VerboseLogging)
+            Console.WriteLine($"[Depth-MV] N={n} depthViews={views.Count} conf={(confMaps != null)} " +
+                $"extrinsics={(extrinsics != null)} intrinsics={(intrinsics != null)}");
+
+        return new MultiViewDepthGpuResult
+        {
+            Views = views,
+            ConfidenceMaps = confMaps,
+            Extrinsics = extrinsics,
+            Intrinsics = intrinsics,
+        };
+    }
+
+    /// <summary>Managed-RGBA convenience: uploads each frame then runs <see cref="EstimateMultiViewGpuAsync"/>.</summary>
+    public async Task<MultiViewDepthGpuResult> EstimateMultiViewGpuAsync(
+        IReadOnlyList<int[]> rgbaFrames, IReadOnlyList<int> widths, IReadOnlyList<int> heights,
+        int outputWidth = 0, int outputHeight = 0)
+    {
+        int n = rgbaFrames.Count;
+        var uploads = new MemoryBuffer1D<int, Stride1D.Dense>[n];
+        var views = new ArrayView1D<int, Stride1D.Dense>[n];
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                uploads[i] = RgbaUpload.FromManaged(_accelerator, rgbaFrames[i], widths[i], heights[i]);
+                views[i] = uploads[i].View;
+            }
+            return await EstimateMultiViewGpuAsync(views, widths, heights, outputWidth, outputHeight)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            for (int i = 0; i < n; i++)
+                uploads[i]?.Dispose();
+        }
+    }
+
+    private static Tensor? FindOutput(Dictionary<string, Tensor> outputs, string nameHint)
+    {
+        foreach (var (name, t) in outputs)
+        {
+            if (name.Equals(nameHint, StringComparison.OrdinalIgnoreCase))
+                return t;
+            // Some exports prefix with "/" or a path segment.
+            if (name.EndsWith("/" + nameHint, StringComparison.OrdinalIgnoreCase)
+                || name.EndsWith(nameHint, StringComparison.OrdinalIgnoreCase))
+                return t;
+        }
+        return null;
+    }
+
+    private async Task<List<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>>
+        SplitDepthViewsAsync(Tensor depthTensor, int n, int srcW, int srcH, int outputWidth, int outputHeight)
+    {
+        // Common shapes: [1,N,H,W], [N,H,W], [1,N,1,H,W], or flat N*H*W.
+        var shape = depthTensor.Shape;
+        int rawH, rawW, viewElems;
+        if (shape.Length >= 4 && shape[^3] == n)
+        {
+            rawH = shape[^2]; rawW = shape[^1];
+            viewElems = rawH * rawW;
+        }
+        else if (shape.Length >= 3 && shape[0] == n)
+        {
+            rawH = shape[^2]; rawW = shape[^1];
+            viewElems = rawH * rawW;
+        }
+        else if (shape.Length >= 4 && shape[1] == n)
+        {
+            rawH = shape[^2]; rawW = shape[^1];
+            viewElems = rawH * rawW;
+        }
+        else
+        {
+            // Fallback: divide total elements evenly across N (square-ish spatial).
+            int total = depthTensor.ElementCount;
+            if (total % n != 0)
+                throw new InvalidOperationException(
+                    $"predicted_depth element count {total} is not divisible by num_images={n} (shape=[{string.Join(",", shape)}])");
+            viewElems = total / n;
+            rawH = rawW = (int)MathF.Round(MathF.Sqrt(viewElems));
+            if (rawH * rawW != viewElems)
+            {
+                // Prefer H=W from compile input size when reshape is awkward.
+                rawH = _inputSize; rawW = viewElems / Math.Max(1, rawH);
+                if (rawH * rawW != viewElems)
+                    throw new InvalidOperationException(
+                        $"Cannot infer per-view HxW from predicted_depth shape=[{string.Join(",", shape)}] N={n}");
+            }
+        }
+
+        var (outW, outH) = ResolveOutputSize(srcW, srcH, rawW, rawH, outputWidth, outputHeight);
+        int outSize = outW * outH;
+        var list = new List<(MemoryBuffer1D<float, Stride1D.Dense>, float, float, int, int)>(n);
+
+        for (int i = 0; i < n; i++)
+        {
+            long offset = (long)i * viewElems;
+            var srcSub = depthTensor.Data.SubView(offset, viewElems);
+            var rawDepth = _accelerator.Allocate1D<float>(outSize);
+            if (outW == rawW && outH == rawH)
+            {
+                rawDepth.View.CopyFrom(srcSub.SubView(0, outSize));
+            }
+            else
+            {
+                var srcView = new Tensors.TensorView<float>(srcSub, new[] { rawH, rawW });
+                var dstView = new Tensors.TensorView<float>(rawDepth.View, new[] { outH, outW });
+                _postprocess.ResizeBilinear(srcView, dstView);
+            }
+            var (minD, maxD) = await _postprocess.MinMaxAsync(rawDepth.View, outSize).ConfigureAwait(false);
+            list.Add((rawDepth, minD, maxD, outW, outH));
+        }
+        return list;
+    }
+
+    private async Task<List<MemoryBuffer1D<float, Stride1D.Dense>>> SplitPlaneViewsAsync(
+        Tensor planeTensor, int n, int outW, int outH)
+    {
+        int total = planeTensor.ElementCount;
+        if (total % n != 0)
+            throw new InvalidOperationException(
+                $"Plane tensor element count {total} not divisible by N={n}");
+        int viewElems = total / n;
+        int rawH = outH, rawW = outW;
+        if (viewElems != outW * outH)
+        {
+            rawH = (int)MathF.Round(MathF.Sqrt(viewElems));
+            rawW = viewElems / Math.Max(1, rawH);
+        }
+        var list = new List<MemoryBuffer1D<float, Stride1D.Dense>>(n);
+        for (int i = 0; i < n; i++)
+        {
+            var srcSub = planeTensor.Data.SubView((long)i * viewElems, viewElems);
+            var buf = _accelerator.Allocate1D<float>(outW * outH);
+            if (rawW == outW && rawH == outH)
+                buf.View.CopyFrom(srcSub.SubView(0, outW * outH));
+            else
+            {
+                var srcView = new Tensors.TensorView<float>(srcSub, new[] { rawH, rawW });
+                var dstView = new Tensors.TensorView<float>(buf.View, new[] { outH, outW });
+                _postprocess.ResizeBilinear(srcView, dstView);
+            }
+            list.Add(buf);
+        }
+        await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        return list;
+    }
+
+    /// <summary>
+    /// Read a pose/matrix tensor to per-view float arrays. Returns null if missing, wrong size, or all-zero/NaN.
+    /// </summary>
+    private async Task<float[][]?> TryReadPoseMatricesAsync(Tensor? tensor, int n, int expectedElemsPerView)
+    {
+        if (tensor == null) return null;
+        int total = tensor.ElementCount;
+        if (total < n * expectedElemsPerView) return null;
+        int perView = total / n;
+        if (perView < expectedElemsPerView) return null;
+
+        // Tiny readback (N*12 floats) — stage into a buffer so WebGPU/Wasm async path works.
+        using var stage = _accelerator.Allocate1D<float>(total);
+        stage.View.CopyFrom(tensor.Data.SubView(0, total));
+        float[] host = await stage.CopyToHostAsync<float>(0, total).ConfigureAwait(false);
+
+        var result = new float[n][];
+        bool anyNonZero = false;
+        for (int i = 0; i < n; i++)
+        {
+            var row = new float[expectedElemsPerView];
+            int baseOff = i * perView;
+            for (int k = 0; k < expectedElemsPerView; k++)
+            {
+                float v = host[baseOff + k];
+                if (float.IsNaN(v) || float.IsInfinity(v)) return null;
+                row[k] = v;
+                if (MathF.Abs(v) > 1e-8f) anyNonZero = true;
+            }
+            result[i] = row;
+        }
+        return anyNonZero ? result : null;
     }
 
     public void Dispose()
