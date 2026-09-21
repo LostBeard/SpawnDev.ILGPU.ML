@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.20-local.4</Version>
+		<Version>5.2.20-local.5</Version>
 		<PackageReleaseNotes>v5.2.20-local.3 - MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

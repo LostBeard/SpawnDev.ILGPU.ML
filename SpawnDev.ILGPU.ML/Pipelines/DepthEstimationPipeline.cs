@@ -715,6 +715,14 @@ public class DepthEstimationPipeline : IDisposable
         // resolution from its input.
         var (cropX, cropY, cropW, cropH) = ContentRect(srcW, srcH, rawW, rawH);
 
+        // The resolution the model actually PREDICTS at, which is not always its input size -
+        // a DPT-style head often emits at a fraction of it. Everything past this point is
+        // upsampling, and soft edges in the final map are explained here or nowhere.
+        Console.WriteLine(
+            $"[Depth-MV] predicted {rawW}x{rawH} from a {_inputSize}x{_inputSize} input " +
+            $"-> content {cropW}x{cropH} -> out {outW}x{outH} " +
+            $"({(float)outW / Math.Max(1, cropW):F1}x upsample)");
+
         for (int i = 0; i < n; i++)
         {
             long offset = (long)i * viewElems;
