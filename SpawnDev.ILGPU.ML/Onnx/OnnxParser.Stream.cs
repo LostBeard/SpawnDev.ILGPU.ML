@@ -245,8 +245,21 @@ public static partial class OnnxParser
                     }
                     break;
                 }
+                case 13: // external_data (repeated StringStringEntryProto) — MUST parse, not skip.
+                {
+                    // ⚠️ WAS in the default skip: DataLocation=1 was set but ExternalData stayed null, so
+                    // CreateFromOnnxStreamAsync skipped EVERY external weight (DAv3 pos-embed
+                    // `/backbone/Transpose_output_0` never uploaded → Resize "Tensor not found").
+                    int plen = checked((int)await r.ReadVarintAsync().ConfigureAwait(false));
+                    var pb = await r.ReadBytesAsync(plen).ConfigureAwait(false);
+                    var pr = new ProtobufReader(pb);
+                    var (key, val) = ParseStringStringEntry(ref pr);
+                    tensor.ExternalData ??= new Dictionary<string, string>();
+                    tensor.ExternalData[key] = val;
+                    break;
+                }
                 case 14: tensor.DataLocation = (int)await r.ReadVarintAsync().ConfigureAwait(false); break; // data_location (1 = external → loader skips)
-                default: await r.SkipFieldAsync(wire).ConfigureAwait(false); break;                     // string_data(6)/uint64(11)/doc_string(12)/external_data(13)
+                default: await r.SkipFieldAsync(wire).ConfigureAwait(false); break;                     // string_data(6)/uint64(11)/doc_string(12)
             }
         }
 

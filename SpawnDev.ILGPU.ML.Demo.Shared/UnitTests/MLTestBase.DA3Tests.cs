@@ -1030,4 +1030,153 @@ public abstract partial class MLTestBase
             Graph.GraphExecutor.CapturedNodeTimingsMs = null;
         }
     });
+
+    /// <summary>
+    /// SpawnScene production load path: hub/stream + native 5-D + default fold/elide ON.
+    /// Gates that the DINOv2 pos-embed initializer <c>/backbone/Transpose_output_0</c> lands in
+    /// gpuWeights (Resize slot 0) and that a 518 forward produces a non-flat depth map.
+    /// The historical SpawnScene failure was "Tensor '/backbone/Transpose_output_0' not found
+    /// (needed by Resize) producerOp=NONE elideBlocked=True" when external data was silently dropped.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task DA3Small_HubStream_PosEmbedUploaded_ProducesDepth() => await RunTest(async accelerator =>
+    {
+        // Fast backends first; Wasm/WebGL are known-slow DAv3 lanes.
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: DAv3 hub/stream gate skips slow lanes");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        // Leave fold/elide at process defaults (SpawnScene does not flip them).
+        // Prefer hub source matching the platform: OPFS in browser, FileModelStore on desktop.
+        Hub.IModelSource source;
+        IDisposable? disposableSource = null;
+        var js = SpawnDev.SpawnJS.SpawnJSRuntime.Instance;
+        if (js != null && js.IsBrowser)
+        {
+            var hub = new Hub.HubModelSource(js);
+            source = hub;
+            disposableSource = hub;
+        }
+        else
+        {
+            source = new Hub.HttpClientModelSource(http);
+        }
+
+        try
+        {
+            using var pipeline = await Pipelines.DepthEstimationPipeline.CreateFromHubAsync(
+                accelerator, source, ModelHub.KnownModels.DepthAnythingV3Small,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["pixel_values"] = new[] { 1, 1, 3, 518, 518 }
+                });
+
+            // Gate 1: pos-embed weight present under the Resize input name.
+            const string posEmbed = "/backbone/Transpose_output_0";
+            if (pipeline.Session.TryGetWeight(posEmbed) == null)
+                throw new Exception(
+                    $"hub/stream load dropped pos-embed initializer '{posEmbed}' — " +
+                    "Resize will throw producerOp=NONE. Check model.onnx_data was opened.");
+
+            // Gate 2: end-to-end forward must not throw the Resize diagnostic; depth must vary.
+            const int W = 518, H = 518;
+            var rgba = new int[W * H];
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                {
+                    int v = (int)(x / (float)(W - 1) * 255f);
+                    rgba[y * W + x] = (255 << 24) | (v << 16) | (v << 8) | v;
+                }
+
+            var (rawDepth, minD, maxD, outW, outH) = await pipeline.EstimateGpuRawAsync(rgba, W, H);
+            using (rawDepth)
+            {
+                float range = maxD - minD;
+                if (range < 0.01f)
+                    throw new Exception($"DA3 hub/stream depth map is flat (range={range:F6})");
+                Console.WriteLine(
+                    $"[DA3-HubStream] PASS weights={pipeline.Session.WeightCount} " +
+                    $"posEmbed=yes {outW}x{outH} range={range:F6} (ref ~0.1365)");
+            }
+        }
+        finally
+        {
+            disposableSource?.Dispose();
+        }
+    });
+
+    /// <summary>
+    /// Joint multi-view N=2: pack [1,2,3,518,518], assert two non-flat depth maps and (when present)
+    /// non-null extrinsics. CUDA/OpenCL first; WebGPU allowed; Wasm/WebGL skip.
+    /// </summary>
+    [TestMethod(Timeout = 900000, Category = "HeavyModel")]
+    public async Task DA3Small_MultiView_N2_ProducesDepthAndExtrinsics() => await RunTest(async accelerator =>
+    {
+        if (accelerator.AcceleratorType is AcceleratorType.WebGL or AcceleratorType.Wasm or AcceleratorType.CPU)
+            throw new UnsupportedTestException($"{accelerator.AcceleratorType}: DAv3 multi-view gate targets CUDA/OpenCL/WebGPU (CPU exceeds HeavyModel console cap)");
+
+        var http = GetHttpClient();
+        if (http == null) throw new UnsupportedTestException("HttpClient not available");
+
+        var onnxBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            HuggingFaceClient.GetDownloadUrl(ModelHub.KnownModels.DepthAnythingV3Small, "onnx/model.onnx"));
+        var extDataBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
+            HuggingFaceClient.GetDownloadUrl(ModelHub.KnownModels.DepthAnythingV3Small, "onnx/model.onnx_data"));
+
+        using var session = InferenceSession.CreateFromOnnx(accelerator, onnxBytes,
+            inputShapes: new Dictionary<string, int[]> { ["pixel_values"] = new[] { 1, 1, 3, 518, 518 } },
+            externalData: extDataBytes);
+        using var pipeline = new Pipelines.DepthEstimationPipeline(session, accelerator);
+        pipeline.EnableGraphCapture = false;
+
+        Console.WriteLine($"[DA3-MV] outputs=[{string.Join(",", session.OutputNames)}]");
+
+        const int W = 518, H = 518;
+        var rgbaA = new int[W * H];
+        var rgbaB = new int[W * H];
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+            {
+                int vA = (int)(x / (float)(W - 1) * 255f);
+                int vB = (int)(y / (float)(H - 1) * 255f);
+                rgbaA[y * W + x] = (255 << 24) | (vA << 16) | (vA << 8) | vA;
+                rgbaB[y * W + x] = (255 << 24) | (vB << 16) | (vB << 8) | vB;
+            }
+
+        using var mv = await pipeline.EstimateMultiViewGpuAsync(
+            new[] { rgbaA, rgbaB }, new[] { W, W }, new[] { H, H }, outputWidth: W, outputHeight: H);
+
+        if (mv.ViewCount != 2)
+            throw new Exception($"expected 2 depth views, got {mv.ViewCount}");
+
+        for (int i = 0; i < 2; i++)
+        {
+            var (_, minD, maxD, outW, outH) = mv.Views[i];
+            float range = maxD - minD;
+            if (range < 0.01f)
+                throw new Exception($"view {i} depth flat range={range:F6}");
+            if (outW != W || outH != H)
+                throw new Exception($"view {i} size {outW}x{outH}, expected {W}x{H}");
+            Console.WriteLine($"[DA3-MV] view{i} range={range:F6} {outW}x{outH}");
+        }
+
+        // Extrinsics: preferred but some exports may omit / zero them — report, don't hard-fail if null.
+        if (mv.Extrinsics != null)
+        {
+            if (mv.Extrinsics.Length != 2)
+                throw new Exception($"extrinsics length {mv.Extrinsics.Length}, expected 2");
+            for (int i = 0; i < 2; i++)
+            {
+                if (mv.Extrinsics[i].Length < 12)
+                    throw new Exception($"extrinsics[{i}] length {mv.Extrinsics[i].Length}");
+                Console.WriteLine($"[DA3-MV] extrinsics[{i}]=[{string.Join(",", mv.Extrinsics[i].Take(12).Select(v => v.ToString("F3")))}]");
+            }
+        }
+        else
+            Console.WriteLine("[DA3-MV] extrinsics=null (model did not emit usable poses — depth still joint)");
+
+        Console.WriteLine($"[DA3-MV] PASS N=2 conf={(mv.ConfidenceMaps != null)} intrinsics={(mv.Intrinsics != null)}");
+    });
 }

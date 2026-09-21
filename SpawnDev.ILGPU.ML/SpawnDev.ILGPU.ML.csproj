@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.19</Version>
-		<PackageReleaseNotes>v5.2.19 - JS data stays off the managed heap. Plans/gpu-whisper-mel-zerocopy.md</PackageReleaseNotes>
+		<Version>5.2.20-local.4</Version>
+		<PackageReleaseNotes>v5.2.20-local.3 - MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

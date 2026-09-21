@@ -19,12 +19,35 @@ public class ImagePreprocessKernel
 {
     private readonly Accelerator _accelerator;
 
-    // params: [srcW, srcH, dstW, dstH] + mean[3] + invStd[3] packed as float bits in int buffer
+    // params: [srcW, srcH, dstW, dstH] + mean[3] + invStd[3] + [padX, padY, contentW, contentH]
     private Action<Index1D,
         ArrayView1D<int, Stride1D.Dense>,    // RGBA pixels [srcH * srcW] as packed uint32
         ArrayView1D<float, Stride1D.Dense>,  // output NCHW [3, dstH, dstW]
-        ArrayView1D<float, Stride1D.Dense>>? // params [10]: srcW, srcH, dstW, dstH, meanR, meanG, meanB, invStdR, invStdG, invStdB
+        ArrayView1D<float, Stride1D.Dense>>? // params [14], see ParamCount
         _preprocessKernel;
+
+    /// <summary>Floats in the kernel parameter buffer.</summary>
+    private const int ParamCount = 14;
+
+    /// <summary>
+    /// Where a source image of <paramref name="srcW"/> x <paramref name="srcH"/> lands inside a
+    /// <paramref name="dstW"/> x <paramref name="dstH"/> input tensor when its aspect ratio is
+    /// preserved, centred.
+    ///
+    /// Model inputs are usually square (518x518 for Depth Anything) while photographs are not,
+    /// and resizing each axis independently stretches the picture - a 3:4 phone frame goes into
+    /// a square input 33% too wide. Depth models are trained on aspect-correct images and the
+    /// geometry they return from a stretched one is wrong in a way that looks like noise.
+    /// </summary>
+    public static (int ContentW, int ContentH, int PadX, int PadY) Letterbox(
+        int srcW, int srcH, int dstW, int dstH)
+    {
+        if (srcW <= 0 || srcH <= 0) return (dstW, dstH, 0, 0);
+        float s = MathF.Min((float)dstW / srcW, (float)dstH / srcH);
+        int cw = Math.Max(1, Math.Min(dstW, (int)MathF.Round(srcW * s)));
+        int ch = Math.Max(1, Math.Min(dstH, (int)MathF.Round(srcH * s)));
+        return (cw, ch, (dstW - cw) / 2, (dstH - ch) / 2);
+    }
 
     public ImagePreprocessKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -47,9 +70,24 @@ public class ImagePreprocessKernel
         int dy = rem / dstW;
         int dx = rem % dstW;
 
+        // Letterbox: the source occupies only [padX, padX+contentW) x [padY, padY+contentH)
+        // of the destination. contentW <= 0 means the legacy behaviour - stretch each axis
+        // independently to fill the whole destination - which is what every caller that has
+        // not opted in still gets.
+        int padX = (int)p[10]; int padY = (int)p[11];
+        int contentW = (int)p[12]; int contentH = (int)p[13];
+        if (contentW <= 0 || contentH <= 0) { contentW = dstW; contentH = dstH; padX = 0; padY = 0; }
+
+        // Coordinates inside the content rect, clamped so the padding replicates the border
+        // rather than introducing a black frame. The pad is cropped away afterwards, so its
+        // only job is to not invent an edge the model would read as a real one.
+        int lx = dx - padX; int ly = dy - padY;
+        if (lx < 0) lx = 0; if (lx >= contentW) lx = contentW - 1;
+        if (ly < 0) ly = 0; if (ly >= contentH) ly = contentH - 1;
+
         // Bilinear sample coordinates (half-pixel centered)
-        float fy = ((dy + 0.5f) * srcH / dstH) - 0.5f;
-        float fx = ((dx + 0.5f) * srcW / dstW) - 0.5f;
+        float fy = ((ly + 0.5f) * srcH / contentH) - 0.5f;
+        float fx = ((lx + 0.5f) * srcW / contentW) - 0.5f;
 
         // Two-statement floor: prevents ILGPU optimizer from eliding floor() before int cast.
         // (int)x truncates toward zero — wrong for negative values (e.g., -0.357 → 0, should be -1).
@@ -87,22 +125,33 @@ public class ImagePreprocessKernel
     /// Output: NCHW float [3, dstH, dstW].
     /// Uses ImageNet default normalization unless overridden.
     /// </summary>
+    /// <param name="preserveAspect">
+    /// Letterbox instead of stretching each axis to fill the input. OFF by default so existing
+    /// callers are unchanged: some models genuinely expect the squashed square. Depth models do
+    /// not - see <see cref="Letterbox"/>. When on, the caller must crop the model's output back
+    /// to the content rect, which <see cref="Letterbox"/> also returns.
+    /// </param>
     public void Forward(
         ArrayView1D<int, Stride1D.Dense> rgba,
         ArrayView1D<float, Stride1D.Dense> output,
         int srcW, int srcH, int dstW, int dstH,
-        float[]? mean = null, float[]? std = null)
+        float[]? mean = null, float[]? std = null,
+        bool preserveAspect = false)
     {
         EnsureLoaded();
 
         mean ??= new[] { 0.485f, 0.456f, 0.406f }; // ImageNet RGB mean
         std ??= new[] { 0.229f, 0.224f, 0.225f };   // ImageNet RGB std
 
-        _paramsBuf ??= _accelerator.Allocate1D<float>(10);
+        int cw = 0, ch = 0, px = 0, py = 0;
+        if (preserveAspect) (cw, ch, px, py) = Letterbox(srcW, srcH, dstW, dstH);
+
+        _paramsBuf ??= _accelerator.Allocate1D<float>(ParamCount);
         _paramsBuf.CopyFromCPU(new float[] {
             srcW, srcH, dstW, dstH,
             mean[0], mean[1], mean[2],
-            1f / std[0], 1f / std[1], 1f / std[2]
+            1f / std[0], 1f / std[1], 1f / std[2],
+            px, py, cw, ch
         });
 
         int totalOutput = 3 * dstH * dstW;
@@ -154,8 +203,8 @@ public class ImagePreprocessKernel
         ArrayView1D<float, Stride1D.Dense> output,
         int srcW, int srcH, int dstW, int dstH)
     {
-        _paramsBuf ??= _accelerator.Allocate1D<float>(10);
-        _paramsBuf.CopyFromCPU(new float[] { srcW, srcH, dstW, dstH, 0, 0, 0, 0, 0, 0 });
+        _paramsBuf ??= _accelerator.Allocate1D<float>(ParamCount);
+        _paramsBuf.CopyFromCPU(new float[] { srcW, srcH, dstW, dstH, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
 
         _yChannelKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<int, Stride1D.Dense>,

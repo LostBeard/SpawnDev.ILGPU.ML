@@ -132,6 +132,63 @@ public class ImagePostprocessKernel : IDisposable
         _resizeFloatTensorViewKernel(dst.ElementCount, src, dst);
     }
 
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int>? _resizeRectKernel;
+
+    /// <summary>
+    /// Bilinear-resize a RECTANGLE of a single-channel map to <c>dstW x dstH</c>.
+    ///
+    /// Needed by any model fed a letterboxed input: only the content rect of its output is
+    /// real, and the padding either side has to be discarded rather than resampled into the
+    /// result. Resizing the whole padded square instead squeezes the picture back the way the
+    /// letterbox just un-squeezed it, which is worse than not letterboxing at all.
+    /// </summary>
+    public void ResizeBilinearFromRect(
+        ArrayView1D<float, Stride1D.Dense> src, int srcW, int srcH,
+        int rectX, int rectY, int rectW, int rectH,
+        ArrayView1D<float, Stride1D.Dense> dst, int dstW, int dstH)
+    {
+        _resizeRectKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int, int, int, int>(ResizeBilinearFromRectImpl);
+        _resizeRectKernel(dstW * dstH, src, dst, srcW, srcH, rectX, rectY, rectW, rectH, dstW, dstH);
+    }
+
+    private static void ResizeBilinearFromRectImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> src,
+        ArrayView1D<float, Stride1D.Dense> dst,
+        int srcW, int srcH, int rectX, int rectY, int rectW, int rectH, int dstW, int dstH)
+    {
+        int dy = idx / dstW;
+        int dx = idx % dstW;
+
+        float fy = ((dy + 0.5f) * rectH / dstH) - 0.5f + rectY;
+        float fx = ((dx + 0.5f) * rectW / dstW) - 0.5f + rectX;
+
+        // Two-statement floor, as elsewhere in this file: ILGPU elides floor() before an int
+        // cast otherwise, and truncation is wrong for negatives.
+        float floorY = MathF.Floor(fy); float floorX = MathF.Floor(fx);
+        int y0 = (int)floorY; int y1 = y0 + 1;
+        int x0 = (int)floorX; int x1 = x0 + 1;
+        float ty = fy - floorY; float tx = fx - floorX;
+
+        // Clamp inside the RECT, not the whole source: the padding outside it is not data.
+        int loY = rectY, hiY = rectY + rectH - 1;
+        int loX = rectX, hiX = rectX + rectW - 1;
+        if (y0 < loY) y0 = loY; if (y0 > hiY) y0 = hiY;
+        if (y1 < loY) y1 = loY; if (y1 > hiY) y1 = hiY;
+        if (x0 < loX) x0 = loX; if (x0 > hiX) x0 = hiX;
+        if (x1 < loX) x1 = loX; if (x1 > hiX) x1 = hiX;
+
+        float v00 = src[y0 * srcW + x0];
+        float v01 = src[y0 * srcW + x1];
+        float v10 = src[y1 * srcW + x0];
+        float v11 = src[y1 * srcW + x1];
+
+        dst[idx] = v00 * (1f - ty) * (1f - tx) + v01 * (1f - ty) * tx
+                 + v10 * ty * (1f - tx) + v11 * ty * tx;
+    }
+
     /// <summary>
     /// Bilinear-resize a single-channel float map <c>[srcH * srcW] → [dstH * dstW]</c>
     /// on GPU. Legacy overload — prefer <see cref="ResizeBilinear(Tensors.TensorView{float}, Tensors.TensorView{float})"/>
