@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.20-local.6</Version>
-		<PackageReleaseNotes>v5.2.20-local.6 - SpawnDev.ILGPU 5.2.15 (WebGL loop compile time, struct layout and sub-word SubView fixes); MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
+		<Version>5.2.20-local.7</Version>
+		<PackageReleaseNotes>v5.2.20-local.7 - SpawnDev.ILGPU 5.2.16 (Algorithms.Fork 2.3.5 RoundToEven fix; WebGL loop compile time, struct layout and sub-word SubView fixes); MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>
@@ -35,7 +35,7 @@
 
 	<ItemGroup>
 		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.17" />
-		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.15" />
+		<PackageReference Include="SpawnDev.ILGPU" Version="5.2.16" />
 	</ItemGroup>
 
 	<ItemGroup>
