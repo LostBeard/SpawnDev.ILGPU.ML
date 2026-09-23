@@ -487,6 +487,31 @@ public class BufferPool : IDisposable
         return newTensor;
     }
 
+    /// <summary>Bytes held in the free buckets (Returned, not live), fp32 and fp16 together. What
+    /// <see cref="ReleaseFreeBuffers"/> would give back.</summary>
+    public long FreeBucketedBytes
+    {
+        get
+        {
+            long total = 0;
+            foreach (var stack in _buckets.Values) foreach (var b in stack) total += b.LengthInBytes;
+            foreach (var stack in _halfBuckets.Values) foreach (var b in stack) total += b.LengthInBytes;
+            return total;
+        }
+    }
+
+    /// <summary>
+    /// Dispose every free (Returned, not live) bucketed buffer and return the bytes freed. The explicit,
+    /// caller-driven form of the under-pressure reclaim: a model that has finished its run and is
+    /// idle holds its whole activation arena in these buckets (a 6-view DAv3 forward: 3.9 GB, MEASURED
+    /// 2026-09-23) and nothing else on the GPU can have it back until this is called or the pool is
+    /// disposed. On WebGPU the under-pressure path cannot fire at all - createBuffer never throws
+    /// synchronously - so this is the ONLY way that memory comes back short of disposing the session.
+    /// Pending dispatches are flushed first (see the encoder-safety note inside). Live tensors and
+    /// permanent weights are untouched; the next run re-allocates on demand.
+    /// </summary>
+    public long ReleaseFreeBuffers() => DisposeBucketedBuffers();
+
     /// <summary>
     /// Dispose all AVAILABLE (Returned, not-live) bucketed buffers, reclaiming their GPU memory. Live (rented)
     /// buffers — held in <c>_namedBuffers</c> until Returned — and permanent weights are untouched. Called under

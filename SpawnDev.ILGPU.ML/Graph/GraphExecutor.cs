@@ -1,4 +1,4 @@
-﻿using ILGPU;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Kernels;
 using SpawnDev.ILGPU.ML.Operators;
@@ -745,6 +745,53 @@ public class GraphExecutor : IDisposable
     /// A freshly-recompiled executor starts at 0 and allocates one per distinct intermediate-buffer
     /// size on its first Run — lets the decode loop see whether per-step cost is fresh-pool churn.</summary>
     public int AllocatedBufferCount => _pool.AllocatedBufferCount;
+
+    /// <summary>Bytes of GPU memory this executor's pool holds in its free buckets (Returned, not live).
+    /// This is the activation arena a forward leaves behind for the next one to reuse; see
+    /// <see cref="ReleaseWorkingMemory"/>.</summary>
+    public long PooledFreeBytes => _pool.FreeBucketedBytes;
+
+    /// <summary>
+    /// Hand a run's OUTPUT tensors back to the pool. A graph output is rented like any intermediate
+    /// but is pinned (never refcount-released) because it is the result, and outside the decode loop
+    /// nothing ever returned it: the next run rents the same output NAME and the pool's name record
+    /// moves to the new buffer, leaving the old one in <c>_allBuffers</c> with nothing pointing at it.
+    /// One leaked set of outputs per forward, forever.
+    ///
+    /// MEASURED 2026-09-23, SpawnScene DrJohnson, DAv3 multi-view N=6 at 672x672: predicted_depth and
+    /// confidence are 2.7M floats each, a 4M-float bucket each, so every joint pass left 32 MiB of
+    /// outputs behind (plus the rest), +90 MB/pass over 14 passes, on top of the 3.9 GB arena. The
+    /// GPU process was at 7.4 GB dedicated when Chrome dropped the device.
+    ///
+    /// Call this once the caller has copied or consumed everything it needs from the outputs. After it,
+    /// the tensors are invalid. Outputs that alias an input or a weight are skipped (not pool-owned),
+    /// and a name the pool no longer records is a no-op, so calling this twice is harmless.
+    /// </summary>
+    public void ReturnOutputs(IEnumerable<Tensor> outputs)
+    {
+        foreach (var t in outputs)
+        {
+            if (t.Name == null || _weights.ContainsKey(t.Name)) continue;
+            _pool.Return(t);
+        }
+        // The decode loop recycles the prior run's outputs itself at the next RunAsync; those are
+        // now already back in the buckets, and returning them a second time after a re-rent of the
+        // same name would pool a LIVE buffer.
+        _priorRunOutputs = null;
+    }
+
+    /// <summary>
+    /// Dispose every free (Returned, not live) bucketed buffer in this executor's pool and return the
+    /// bytes freed. Live tensors and weights are untouched; the next run re-allocates what it needs.
+    ///
+    /// The pool keeps every intermediate a forward Returned, bucketed by size, so it can hand them out
+    /// again without allocating. That is the right trade while a model is being run back to back, and
+    /// the wrong one the moment the run is over and something else needs the GPU: a 6-view DAv3
+    /// forward leaves 3.9 GB in the buckets (MEASURED, above), and on WebGPU there is no OOM to
+    /// trigger the under-pressure reclaim - <c>createBuffer</c> never throws synchronously, the GPU
+    /// process just dies. Pending dispatches are flushed first so nothing in flight is destroyed.
+    /// </summary>
+    public long ReleaseWorkingMemory() => _pool.ReleaseFreeBuffers();
 
     /// <summary>Quantized weight byte buffers on GPU (Q4_0, Q8_0, etc.)
     /// for fused dequantization during MatMul.</summary>

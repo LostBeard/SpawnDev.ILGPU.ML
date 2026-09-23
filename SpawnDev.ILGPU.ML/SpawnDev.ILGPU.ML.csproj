@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.20-local.7</Version>
-		<PackageReleaseNotes>v5.2.20-local.7 - SpawnDev.ILGPU 5.2.16 (Algorithms.Fork 2.3.5 RoundToEven fix; WebGL loop compile time, struct layout and sub-word SubView fixes); MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
+		<Version>5.2.20-local.8</Version>
+		<PackageReleaseNotes>v5.2.20-local.8 - InferenceSession.ReturnOutputs / ReleaseWorkingMemory / PooledFreeBytes, BufferPool.ReleaseFreeBuffers, DepthEstimationPipeline.ReleaseWorkingMemory; depth pipeline returns every run's outputs (was +90 MB per DAv3 joint pass). v5.2.20-local.7 - SpawnDev.ILGPU 5.2.16 (Algorithms.Fork 2.3.5 RoundToEven fix; WebGL loop compile time, struct layout and sub-word SubView fixes); MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

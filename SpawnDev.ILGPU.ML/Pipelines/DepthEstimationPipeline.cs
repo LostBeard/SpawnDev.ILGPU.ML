@@ -60,6 +60,22 @@ public class DepthEstimationPipeline : IDisposable
     /// <summary>Underlying session — diagnostics (weight presence) and advanced callers.</summary>
     public InferenceSession Session => _session;
 
+    /// <summary>
+    /// Give back the GPU memory a forward leaves parked for the next one (the session's free
+    /// activation buckets, plus any graph-capture plan, whose bind groups would point at the
+    /// disposed buckets). Weights stay; the next estimate re-allocates and, if capturing, re-records.
+    /// Returns the bytes freed. Call it when the depth work is done for now and the GPU is needed for
+    /// something else: on SpawnScene DrJohnson a finished 6-view DAv3 cascade held 3.9 GB here while
+    /// the splat trainer tried to allocate its own 1.2 GB, and Chrome dropped the device at 7.4 GB.
+    /// </summary>
+    public long ReleaseWorkingMemory()
+    {
+        _capture?.Dispose(); _capture = null;
+        _webGpuCapture?.Dispose(); _webGpuCapture = null;
+        _captureShape = null;
+        return _session.ReleaseWorkingMemory();
+    }
+
     public DepthEstimationPipeline(InferenceSession session, Accelerator accelerator,
         int inputSize = 0)
     {
@@ -269,6 +285,7 @@ public class DepthEstimationPipeline : IDisposable
             post.ResizeBilinear(srcView, dstView);
         }
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+        _session.ReturnOutputs(outputs);   // resized holds everything we need from them
 
         var rawDepth = await resized.CopyToHostAsync<float>(0, outSize).ConfigureAwait(false);
         float min = rawDepth.Min();
@@ -450,7 +467,10 @@ public class DepthEstimationPipeline : IDisposable
         var inputTensor = new Tensor(preInput, InputTensorShape());
         var inputDict = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
 
+        // Outputs from a plain session run are pool-rented and ours to hand back once consumed; a
+        // capture replay writes into the plan's fixed buffers, which the capture owns.
         Dictionary<string, Tensor> outputs;
+        bool ownOutputs;
         if (useCapture && _accelerator.AcceleratorType == AcceleratorType.Cuda)
         {
             var shape = InputTensorShape();
@@ -460,6 +480,7 @@ public class DepthEstimationPipeline : IDisposable
                 _capture = await CudaGraphCapture.TryCaptureAsync(_session, inputDict);   // first frame at this resolution
                 _captureShape = shape;
             }
+            ownOutputs = _capture == null;
             outputs = _capture != null ? await _capture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
         }
         else if (useCapture)   // WebGPU
@@ -482,11 +503,13 @@ public class DepthEstimationPipeline : IDisposable
             }
             // inputDict wraps the SAME stable buffer the capture reads (fresh frame written by the
             // preprocess dispatch above), so ReplayAsync's same-buffer check skips the input copy.
+            ownOutputs = _webGpuCapture == null;
             outputs = _webGpuCapture != null ? await _webGpuCapture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
         }
         else
         {
             outputs = await _session.RunAsync(inputDict);
+            ownOutputs = true;
         }
 
         var output = outputs[_session.OutputNames[0]];
@@ -530,6 +553,7 @@ public class DepthEstimationPipeline : IDisposable
         }
 
         transientInput?.Dispose();   // the stable capture input buffer is a member (disposed in Dispose)
+        if (ownOutputs) _session.ReturnOutputs(outputs);   // consumed above (resize + min/max); leaked otherwise
         return (rawDepth, minD, maxD, outW, outH);
     }
 
@@ -617,6 +641,11 @@ public class DepthEstimationPipeline : IDisposable
         if (InferenceSession.VerboseLogging)
             Console.WriteLine($"[Depth-MV] N={n} depthViews={views.Count} conf={(confMaps != null)} " +
                 $"extrinsics={(extrinsics != null)} intrinsics={(intrinsics != null)}");
+
+        // Every output has been split into caller-owned per-view buffers or read to the host above.
+        // Without this, each joint pass left its predicted_depth + confidence (two 16 MiB buckets at
+        // N=6, 672x672) orphaned in the pool: +90 MB per pass on DrJohnson, MEASURED 2026-09-23.
+        _session.ReturnOutputs(outputs);
 
         return new MultiViewDepthGpuResult
         {

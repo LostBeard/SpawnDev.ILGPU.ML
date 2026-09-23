@@ -1,4 +1,4 @@
-﻿using ILGPU;
+using ILGPU;
 using ILGPU.Runtime;
 using SpawnDev.ILGPU.ML.Graph;
 using SpawnDev.ILGPU.ML.Operators;
@@ -312,7 +312,7 @@ public class InferenceSession : IDisposable
         {
             var evict = _shapeExecutorLru[0];
             _shapeExecutorLru.RemoveAt(0);
-            if (_shapeExecutors.Remove(evict, out var old)) old.Dispose();
+            if (_shapeExecutors.Remove(evict, out var old)) { if (ReferenceEquals(_lastRunExecutor, old)) _lastRunExecutor = null; old.Dispose(); }
         }
         return exec;
     }
@@ -2605,7 +2605,50 @@ public class InferenceSession : IDisposable
         var exec = ResolveExecutor(inputs);
         var result = exec.Run(inputs);
         LastExecutorBufferCount = exec.AllocatedBufferCount;
+        _lastRunExecutor = exec;
         return result;
+    }
+
+    // The executor whose pool owns the outputs of the most recent Run/RunAsync; ReturnOutputs routes
+    // there, because a shape-recompiled executor has its OWN pool and the main one would not know
+    // the names.
+    private GraphExecutor? _lastRunExecutor;
+
+    /// <summary>
+    /// Give the outputs of the last <see cref="Run"/> / <see cref="RunAsync"/> back to the executor's
+    /// pool. Outputs are pool-rented and pinned; outside the decode loop nothing returns them, so every
+    /// forward otherwise leaks one full set (see <see cref="GraphExecutor.ReturnOutputs"/> for the
+    /// measurement). Call once you have consumed them; the tensors are invalid afterwards. Aliased and
+    /// already-returned names are no-ops.
+    /// </summary>
+    public void ReturnOutputs(Dictionary<string, Tensor> outputs)
+        => (_lastRunExecutor ?? _executor).ReturnOutputs(outputs.Values);
+
+    /// <summary>
+    /// Release the activation arena of every executor this session owns (main and per-shape) and
+    /// return the bytes freed. Weights stay resident; the next run re-allocates its intermediates. For
+    /// a model that is done for now but should not be unloaded - a depth model whose pose passes are
+    /// finished while training starts on the same GPU - this is the difference between 3.9 GB and 0
+    /// left behind (MEASURED 2026-09-23, DAv3 multi-view N=6, see <see cref="GraphExecutor.ReleaseWorkingMemory"/>).
+    /// </summary>
+    public long ReleaseWorkingMemory()
+    {
+        long freed = _executor.ReleaseWorkingMemory();
+        foreach (var exec in _shapeExecutors.Values) freed += exec.ReleaseWorkingMemory();
+        freed += _pool.ReleaseFreeBuffers();
+        return freed;
+    }
+
+    /// <summary>Bytes every executor's pool currently holds in its free buckets; what
+    /// <see cref="ReleaseWorkingMemory"/> would free.</summary>
+    public long PooledFreeBytes
+    {
+        get
+        {
+            long total = _executor.PooledFreeBytes + _pool.FreeBucketedBytes;
+            foreach (var exec in _shapeExecutors.Values) total += exec.PooledFreeBytes;
+            return total;
+        }
     }
 
     /// <summary>Async inference — required for browser backends (WebGPU/WebGL/Wasm): a synchronous
@@ -2618,6 +2661,7 @@ public class InferenceSession : IDisposable
         var exec = ResolveExecutor(inputs);
         var result = await exec.RunAsync(inputs);
         LastExecutorBufferCount = exec.AllocatedBufferCount;
+        _lastRunExecutor = exec;
         return result;
     }
 
