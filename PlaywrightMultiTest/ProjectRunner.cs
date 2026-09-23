@@ -412,6 +412,7 @@ namespace PlaywrightMultiTest
                             var category = row.TryGetProperty("category", out var catProp) ? (catProp.GetString() ?? "") : "";
                             var rowTest = new ProjectTest(testableProject, typeName, methodName, testPageUrl) { Category = category };
 
+                            if (!string.IsNullOrEmpty(typeName)) _enumeratedTypeNames.Add(typeName);
                             if (filter != null && !MatchesFilter(filter, rowTest))
                             {
                                 continue;
@@ -524,6 +525,7 @@ namespace PlaywrightMultiTest
                         if (string.IsNullOrWhiteSpace(methodName)) continue;
 
                         var rowTest = new ProjectTest(testableProject, typeName!, methodName!) { Category = category };
+                        if (!string.IsNullOrEmpty(typeName)) _enumeratedTypeNames.Add(typeName);
                         if (filter != null && !MatchesFilter(filter, rowTest))
                         {
                             continue;
@@ -678,10 +680,24 @@ namespace PlaywrightMultiTest
                     var nmt11 = true;
                 }
             }
+            // A scope that selects nothing must FAIL, not pass. With PMT_FILTER / PMT_LANES matching zero
+            // real tests only the Build rows remain, the run reports "Passed!" and it reads exactly like the
+            // scoped test passing. PMT_LANES matches the test CLASS name (DesktopXTests, WebGPUTests, ...),
+            // not a lane label like "cpu", which is the easy way to hit this.
+            if ((!string.IsNullOrEmpty(filter) || laneFilter != null)
+                && TestableProjects.Count > 0
+                && !TestableProjects.Any(p => p.Tests.Any(t => t.TestTypeName != null)))
+            {
+                var scopeTest = new ProjectTest(TestableProjects[0], "PMT scope matched no tests");
+                scopeTest.SetError($"PMT_FILTER='{filter}' PMT_LANES='{(laneFilter == null ? "" : string.Join(",", laneFilter))}' selected 0 tests. PMT_LANES matches test class names; the classes here are: {string.Join(", ", _enumeratedTypeNames.Distinct())}");
+                TestableProjects[0].Tests.Add(scopeTest);
+            }
             LogStatus($"Init() complete. Total projects={TestableProjects.Count}, " +
                 $"total tests={TestableProjects.Sum(p => p.Tests.Count)}");
             var nmt = true;
         }
+        // Every test class name seen during enumeration, before scoping - named in the "matched no tests" error.
+        readonly List<string> _enumeratedTypeNames = new();
         IEnumerable<TestCaseData>? _TestCases;
         public IEnumerable<TestCaseData> TestCases => _TestCases ??= GetPlaywrightTasks();
 
