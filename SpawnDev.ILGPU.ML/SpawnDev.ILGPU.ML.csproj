@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.20-local.8</Version>
-		<PackageReleaseNotes>v5.2.20-local.8 - InferenceSession.ReturnOutputs / ReleaseWorkingMemory / PooledFreeBytes, BufferPool.ReleaseFreeBuffers, DepthEstimationPipeline.ReleaseWorkingMemory; depth pipeline returns every run's outputs (was +90 MB per DAv3 joint pass). v5.2.20-local.7 - SpawnDev.ILGPU 5.2.16 (Algorithms.Fork 2.3.5 RoundToEven fix; WebGL loop compile time, struct layout and sub-word SubView fixes); MultiViewDepthGpuResult.DetachConfidenceMaps for SpawnScene confidence plumbing</PackageReleaseNotes>
+		<Version>5.2.20</Version>
+		<PackageReleaseNotes>v5.2.20 - InferenceSession.ReturnOutputs / ReleaseWorkingMemory / PooledFreeBytes; BufferPool.ReleaseFreeBuffers; DepthEstimationPipeline returns every run's outputs and exposes ReleaseWorkingMemory. Fixes WebGPU device loss after multi-view DAv3 (SpawnScene DrJohnson: +90 MB/pass orphaned outputs + 3.9 GB arena left through training; GPU process hit 7.4 GB). Includes local.7 DetachConfidenceMaps + ILGPU 5.2.16.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

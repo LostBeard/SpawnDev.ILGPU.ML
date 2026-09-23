@@ -2,6 +2,26 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.20 - return graph outputs; free the activation arena between workloads
+
+`InferenceSession.Run` left every graph OUTPUT live in the BufferPool forever: outputs are rented and
+pinned, and outside the decode loop nothing returned them. Free intermediate buckets were never
+reclaimed on WebGPU either (`createBuffer` never throws, so the under-pressure path never fires).
+
+MEASURED 2026-09-23 on SpawnScene DrJohnson (14-pass DAv3 N=6): +90 MB orphaned outputs per joint
+pass on top of a 3.9 GB free-bucket arena that stayed resident through training. Chrome's GPU
+process hit 7.4 GB dedicated VRAM and dropped the device (`device.lost` reason=unknown). One
+`ReleaseWorkingMemory` after the cascade freed 4322 MB; the trainer's 913k densify Resize then
+completed and training ran to DONE.
+
+- `InferenceSession.ReturnOutputs` / `ReleaseWorkingMemory` / `PooledFreeBytes`
+- `BufferPool.ReleaseFreeBuffers` (public form of the under-pressure reclaim)
+- `DepthEstimationPipeline` returns every run's outputs once consumed; exposes `ReleaseWorkingMemory`
+  (also drops any graph-capture plan whose bind groups would dangle)
+- `SessionOutputLifetimeTests` (red-checked)
+
+Also ships: local.7 `MultiViewDepthGpuResult.DetachConfidenceMaps`; SpawnDev.ILGPU 5.2.16.
+
 ## 5.2.18 - a capture that cannot be built, for ANY reason, is not a failed generation
 
 5.2.17 made one guard inside `WebGPUDecodeCapture.TryCaptureAsync` return null instead of throwing. The
