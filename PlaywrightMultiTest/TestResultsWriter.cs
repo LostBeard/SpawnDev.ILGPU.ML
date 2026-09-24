@@ -13,6 +13,8 @@ namespace PlaywrightMultiTest;
 public static class TestResultsWriter
 {
     private static readonly string OutputDir;
+    /// <summary>The run's <c>_mldump/</c> folder (solution root).</summary>
+    public static string MlDumpDir => OutputDir;
     private static readonly string LatestPath;
     private static readonly string TimestampedPath;
     private static readonly List<TestResultEntry> _results = new();

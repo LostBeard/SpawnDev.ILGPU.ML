@@ -69,6 +69,24 @@ namespace PlaywrightMultiTest
                     await next();
                 });
 
+                // Test OUTPUT sink: POST /__pmt/out/<relative path> writes the body to
+                // _mldump/test-out/<relative path>. A browser test has no file system, and
+                // Console.WriteLine output is summarised away, so without this a WebGPU test can
+                // compare against a reference but can never hand its raw tensors back for a
+                // side-by-side (the DAv3 ORT/Transformers.js parity images are the first user).
+                // Loopback only (see Listen above); the path is confined to test-out/.
+                app.MapPost("/__pmt/out/{**name}", async (Microsoft.AspNetCore.Http.HttpContext ctx, string name) =>
+                {
+                    var root = Path.GetFullPath(Path.Combine(TestResultsWriter.MlDumpDir, "test-out"));
+                    var dest = Path.GetFullPath(Path.Combine(root, name));
+                    if (!dest.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        return Microsoft.AspNetCore.Http.Results.BadRequest("path escapes test-out");
+                    Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                    await using (var fs = File.Create(dest))
+                        await ctx.Request.Body.CopyToAsync(fs);
+                    return Microsoft.AspNetCore.Http.Results.Ok(dest);
+                });
+
                 // enable 404 fallback to default root
                 app.UseStatusCodePagesWithReExecute(string.IsNullOrEmpty(RequestPath) ? "/" : RequestPath);
 

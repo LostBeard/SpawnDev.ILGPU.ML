@@ -125,6 +125,33 @@ with every sample zero, and Whisper turns silence into confident fluent text.
 **The working approach:** replace `getUserMedia` before the app boots (Playwright `AddInitScriptAsync`)
 with a looping `BufferSource` of a known WAV. `drive-mic-capture.cs` does this.
 
+## DAv3 (Depth Anything 3): ours vs onnxruntime vs Transformers.js - `tools/dav3/`
+
+Three engines, one model file (hash-checked: hub == HF main == what the tests load), the SAME input
+tensors. Run in this order:
+
+| step | answers |
+|---|---|
+| `python tools/dav3/dav3_reference.py [--only a,b]` | Native onnxruntime (CPU) reference for 10 cases: single view square 518/672/896 (SpawnScene's letterbox) and the official NON-square shape, joint multi-view N=2/4/6, batch_size=2. Writes inputs + all four outputs (depth, confidence, extrinsics, intrinsics) to `Demo/wwwroot/test-refs/dav3/` (gitignored, ~130 MB). Keeps a local model copy in `_mldump/models/` because onnxruntime refuses external data through the hub's sshfs mount. |
+| PMT `DA3_OrtParity_SingleView/_MultiView/_Batch2` | Our engine vs that reference, per VIEW, every output, direct forward AND captured replay (`WebGPUGraphCapture` / `CudaGraphCapture`). Scope: `PMT_EXCLUDE_CATEGORIES=__none__ PMT_FILTER=DA3_OrtParity PMT_LANES=WebGPUTests`. Raw outputs + timings land in `_mldump/test-out/dav3/<backend>/` via PMT's `POST /__pmt/out/` sink. |
+| PMT `DA3_Preprocess_Letterbox_MatchesReference` | Proves the reference's numpy emulation of `ImagePreprocessKernel` IS what SpawnScene feeds (same decoded RGBA through the real kernel). |
+| `node tools/dav3/dav3-tjs.mjs [--device webgpu\|wasm]` | Transformers.js 4.3.0 in SYSTEM Chrome (logs the adapter; Playwright's Chromium is SwiftShader) on the same inputs, never touching huggingface.co. |
+| `python tools/dav3/dav3_compare.py` | `_mldump/test-out/dav3/compare/`: per-case PNG (input, ORT, each engine, abs diff x100) + `summary.md` (per-view relRMS/corr, camera diffs, all timings). |
+| `python tools/dav3/dav3_quality.py` | Is the INPUT costing quality? Engine-independent (ORT only) vs COLMAP ground truth on tandt Truck + DrJohnson: sparse-depth AbsRel/delta1, intrinsics focal error, joint camera-centre + rotation error, for our letterbox vs the official DA3 preprocessing vs filter-only and stretch variants. |
+
+⚠️ **Transformers.js cannot run DAv3 through `pipeline('depth-estimation')`.** The export ships no
+`preprocessor_config.json`, and the library only knows depth_anything v1/v2, whose processor emits
+RANK-4 `pixel_values`; DAv3 is rank 5. Load `AutoModelForDepthEstimation` and hand it the 5-D tensor.
+It then returns all four outputs.
+
+⚠️ **DrJohnson is not a pose benchmark at a 4-frame stride**: consecutive picks differ by 50-170 deg of
+TRUE rotation, so every preprocessing variant (official included) scores ~90 deg. Use Truck for poses.
+
+⚠️ `dav3-ort-baseline.mjs` / `ort-comparison.html` (July) launch Playwright's bundled Chromium (which
+on this machine exposes only SwiftShader, MEASURED 2026-09-09), feed one random 518 input, compare no
+outputs, and fetch from huggingface.co. Their July "ORT-Web 73 ms warm" sits near the 61 ms
+`dav3-tjs.mjs` MEASURED 2026-09-23 on system Chrome / RTX 4070. Use `dav3-tjs.mjs`.
+
 ## ZipVoice (voice-cloning TTS)
 
 `zipvoice-harness` (roundtrip / synth / compare / endtoend / verify / trimsweep / runonnx) ·

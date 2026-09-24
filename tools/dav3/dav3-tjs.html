@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DAv3 Transformers.js run</title>
+</head>
+<body>
+<pre id="log">loading...</pre>
+<script type="module">
+// Driven by dav3-tjs.mjs. Runs onnx-community/depth-anything-v3-small through Transformers.js on the
+// SAME input tensors the ORT-CPU reference and our PMT parity test use, times load/cold/warm, and
+// POSTs every output back so dav3_compare.py can put the engines side by side.
+//
+// Why not pipeline('depth-estimation'): the export ships no preprocessor_config.json, and Transformers.js
+// only knows depth_anything v1/v2, whose processor emits RANK-4 pixel_values. DAv3 is rank 5
+// [batch, num_images, 3, H, W] (see ILGPU.ML ref-dav3-rank-5). Every browser DAv3 user we found
+// (e.g. the HF Space enter-the-painting) builds the tensor by hand for that reason; so do we.
+const q = new URLSearchParams(location.search);
+const TJS = q.get('tjs') || '4.3.0';
+const device = q.get('device') || 'webgpu';
+const cases = (q.get('cases') || '').split(',').filter(Boolean);
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; console.log('[TJS] ' + s); };
+
+window.__done = false;
+window.__results = [];
+try {
+    const { env, AutoModelForDepthEstimation, Tensor } =
+        await import(`https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TJS}`);
+    env.allowRemoteModels = false;          // never reach huggingface.co; the harness serves the hub's bytes
+    env.allowLocalModels = true;
+    env.localModelPath = '/models/';
+    env.useBrowserCache = false;            // a cache hit would hide the real load time
+
+    // Prove the adapter is the real GPU: Playwright's bundled Chromium only ever offers SwiftShader,
+    // and a software-WebGPU number looks like a slow engine rather than a wrong setup.
+    if (navigator.gpu) {
+        const a = await navigator.gpu.requestAdapter();
+        window.__adapter = a ? `${a.info.vendor}/${a.info.architecture}/${a.info.description} fallback=${a.info.isFallbackAdapter}` : 'none';
+        log('adapter ' + window.__adapter);
+    }
+    let t0 = performance.now();
+    const model = await AutoModelForDepthEstimation.from_pretrained('onnx-community/depth-anything-v3-small',
+        { device, dtype: 'fp32' });
+    const loadMs = performance.now() - t0;
+    log(`transformers.js ${TJS} device=${device} load=${loadMs.toFixed(0)}ms`);
+
+    for (const name of cases) {
+        const man = await (await fetch('/refs/manifest.json')).json();
+        const c = man.cases[name];
+        const input = new Float32Array(await (await fetch(`/refs/${name}.input.f32`)).arrayBuffer());
+        const feed = { pixel_values: new Tensor('float32', input, c.input_shape) };
+        const r = { name, device, shape: c.input_shape, loadMs };
+        try {
+            t0 = performance.now();
+            const out = await model(feed);
+            r.coldMs = performance.now() - t0;
+            r.outputs = {};
+            for (const [k, v] of Object.entries(out)) {
+                const data = v.data instanceof Float32Array ? v.data : new Float32Array(v.data);
+                r.outputs[k] = v.dims;
+                await fetch(`/out/tjs-${device}/${name}.${k}.f32`, { method: 'POST', body: data });
+            }
+            const warm = [];
+            for (let i = 0; i < 3; i++) {
+                t0 = performance.now();
+                await model(feed);
+                warm.push(performance.now() - t0);
+            }
+            warm.sort((a, b) => a - b);
+            r.warmMs = warm[1];
+            log(`${name} [${c.input_shape.join('x')}] cold=${r.coldMs.toFixed(0)}ms warm=${r.warmMs.toFixed(0)}ms outputs=${JSON.stringify(r.outputs)}`);
+        } catch (e) {
+            r.error = String(e && e.message || e);
+            log(`${name} FAILED: ${r.error}`);
+        }
+        window.__results.push(r);
+    }
+} catch (e) {
+    window.__error = String(e && e.stack || e);
+    log('FATAL ' + window.__error);
+}
+window.__done = true;
+</script>
+</body>
+</html>
