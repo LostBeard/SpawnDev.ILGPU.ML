@@ -89,6 +89,39 @@ public class DepthEstimationPipeline : IDisposable
         return (w, h);
     }
 
+    /// <summary>
+    /// Where the picture sits inside the model input, in model-input pixels: the letterbox content
+    /// rectangle, or the whole input for <see cref="DepthResizeMode.NativeAspect"/> / <see cref="DepthResizeMode.Stretch"/>.
+    /// Every per-pixel output is cropped to this region before it is resized to the caller's grid.
+    /// </summary>
+    public (int X, int Y, int Width, int Height) ModelContentRect(int srcW, int srcH)
+    {
+        var (inW, inH) = ModelInputSize(srcW, srcH);
+        if (ResizeMode != DepthResizeMode.Letterbox || srcW <= 0 || srcH <= 0) return (0, 0, inW, inH);
+        var (cw, ch, px, py) = Kernels.ImagePreprocessKernel.Letterbox(srcW, srcH, _inputSize, _inputSize);
+        return (px, py, cw, ch);
+    }
+
+    /// <summary>
+    /// Re-express a 3x3 row-major pinhole K predicted in MODEL-INPUT pixels in an output grid of
+    /// <paramref name="outW"/> x <paramref name="outH"/> that covers <paramref name="contentRect"/> (see
+    /// <see cref="ModelContentRect"/>): subtract the pad offset, scale each axis. Edge convention (pixel
+    /// edges on integers, a centred principal point is W/2), the convention DAv3 predicts in.
+    /// </summary>
+    public static float[] IntrinsicsToOutputGrid(float[] k, (int X, int Y, int Width, int Height) contentRect, int outW, int outH)
+    {
+        if (k.Length < 9) throw new ArgumentException("K must be 3x3 row-major (9 values).", nameof(k));
+        float sx = (float)outW / contentRect.Width;
+        float sy = (float)outH / contentRect.Height;
+        var r = (float[])k.Clone();
+        r[0] = k[0] * sx;                       // fx
+        r[1] = k[1] * sx;                       // skew (u = fx x + s y + cx, so it scales with u)
+        r[2] = (k[2] - contentRect.X) * sx;     // cx
+        r[4] = k[4] * sy;                       // fy
+        r[5] = (k[5] - contentRect.Y) * sy;     // cy
+        return r;
+    }
+
     // NativeAspect's stage-1 image (packed RGBA, device-resident). Grows; the old one is disposed only
     // after an awaited drain, because a queued dispatch may still read it (Wasm frees on dispose).
     private MemoryBuffer1D<int, Stride1D.Dense>? _nativeScratch;
@@ -254,6 +287,16 @@ public class DepthEstimationPipeline : IDisposable
         if (inputSize <= 0)
         {
             var firstShape = session.InputShapes.Values.FirstOrDefault();
+            // Letterbox / Stretch build a SQUARE input of one side; a non-square binding used to be read as its WIDTH,
+            // silently. SpawnScene's "aspect-matched 32x43 grid measured 4 dB worse" (2026-09-20) was in fact a 448x448
+            // square with fewer picture patches - the non-square tensor never reached the model. NativeAspect is the
+            // real non-square path.
+            if (firstShape != null && firstShape.Length >= 4 && firstShape[^1] > 0 && firstShape[^2] > 0
+                && firstShape[^1] != firstShape[^2])
+                throw new ArgumentException(
+                    $"Session input bound at {firstShape[^1]}x{firstShape[^2]} (WxH) is not square. Bind a square - its side is " +
+                    "the Letterbox/Stretch input and NativeAspect's default long side - and set ResizeMode = NativeAspect for " +
+                    "an aspect-preserving tensor; or pass inputSize explicitly.", nameof(session));
             inputSize = firstShape != null && firstShape.Length >= 4 ? firstShape[^1] : 518;
         }
         _inputSize = inputSize;
@@ -737,7 +780,10 @@ public class DepthEstimationPipeline : IDisposable
         // centre-crops them to the smallest; here that would hand back depth covering a different
         // region of each source than the caller's pixel grid, silently. Refuse instead: group views
         // by ModelInputSize (SpawnScene's PlanByShape already does).
+        // Letterbox has the same problem one level down: every output is cropped with view 0's content
+        // rectangle, so a view of another aspect would come back cropped to the wrong region, silently.
         var (inW, inH) = ModelInputSize(widths[0], heights[0]);
+        var rect0 = ModelContentRect(widths[0], heights[0]);
         for (int i = 1; i < n; i++)
         {
             var (wi, hi) = ModelInputSize(widths[i], heights[i]);
@@ -745,6 +791,11 @@ public class DepthEstimationPipeline : IDisposable
                 throw new ArgumentException(
                     $"view {i} ({widths[i]}x{heights[i]}) needs a {wi}x{hi} input but view 0 ({widths[0]}x{heights[0]}) " +
                     $"needs {inW}x{inH}; a joint pass takes one shape. Group views by ModelInputSize.", nameof(frames));
+            var recti = ModelContentRect(widths[i], heights[i]);
+            if (recti != rect0)
+                throw new ArgumentException(
+                    $"view {i} ({widths[i]}x{heights[i]}) letterboxes to {recti} but view 0 ({widths[0]}x{heights[0]}) " +
+                    $"to {rect0}; a joint pass crops every output with one rectangle. Group views by aspect.", nameof(frames));
         }
 
         int chw = 3 * inW * inH;
@@ -787,14 +838,24 @@ public class DepthEstimationPipeline : IDisposable
         var confTensor = FindOutput(outputs, "confidence");
         if (confTensor != null)
         {
-            confMaps = await SplitPlaneViewsAsync(confTensor, n, views[0].Width, views[0].Height)
+            confMaps = await SplitPlaneViewsAsync(confTensor, n, widths[0], heights[0], views[0].Width, views[0].Height)
                 .ConfigureAwait(false);
         }
 
         float[][]? extrinsics = await TryReadPoseMatricesAsync(FindOutput(outputs, "extrinsics"), n, expectedElemsPerView: 12)
             .ConfigureAwait(false);
-        float[][]? intrinsics = await TryReadPoseMatricesAsync(FindOutput(outputs, "intrinsics"), n, expectedElemsPerView: 9)
+        float[][]? modelIntrinsics = await TryReadPoseMatricesAsync(FindOutput(outputs, "intrinsics"), n, expectedElemsPerView: 9)
             .ConfigureAwait(false);
+        // DAv3 predicts K in MODEL-INPUT pixels (a 672x672 letterbox, a 504x378 NativeAspect tensor). Callers
+        // unproject the depth maps returned above, so K goes back in THEIR grid. Handing out the model's K put
+        // SpawnScene's focal in the wrong units by the input/source scale, and cy off by the letterbox pad.
+        float[][]? intrinsics = null;
+        if (modelIntrinsics != null)
+        {
+            intrinsics = new float[modelIntrinsics.Length][];
+            for (int i = 0; i < modelIntrinsics.Length; i++)
+                intrinsics[i] = IntrinsicsToOutputGrid(modelIntrinsics[i], rect0, views[0].Width, views[0].Height);
+        }
 
         if (InferenceSession.VerboseLogging)
             Console.WriteLine($"[Depth-MV] N={n} depthViews={views.Count} conf={(confMaps != null)} " +
@@ -813,6 +874,7 @@ public class DepthEstimationPipeline : IDisposable
             ConfidenceMaps = confMaps,
             Extrinsics = extrinsics,
             Intrinsics = intrinsics,
+            ModelIntrinsics = modelIntrinsics,
         };
     }
 
@@ -858,42 +920,7 @@ public class DepthEstimationPipeline : IDisposable
     private async Task<List<(MemoryBuffer1D<float, Stride1D.Dense> RawDepth, float MinDepth, float MaxDepth, int Width, int Height)>>
         SplitDepthViewsAsync(Tensor depthTensor, int n, int srcW, int srcH, int outputWidth, int outputHeight)
     {
-        // Common shapes: [1,N,H,W], [N,H,W], [1,N,1,H,W], or flat N*H*W.
-        var shape = depthTensor.Shape;
-        int rawH, rawW, viewElems;
-        if (shape.Length >= 4 && shape[^3] == n)
-        {
-            rawH = shape[^2]; rawW = shape[^1];
-            viewElems = rawH * rawW;
-        }
-        else if (shape.Length >= 3 && shape[0] == n)
-        {
-            rawH = shape[^2]; rawW = shape[^1];
-            viewElems = rawH * rawW;
-        }
-        else if (shape.Length >= 4 && shape[1] == n)
-        {
-            rawH = shape[^2]; rawW = shape[^1];
-            viewElems = rawH * rawW;
-        }
-        else
-        {
-            // Fallback: divide total elements evenly across N (square-ish spatial).
-            int total = depthTensor.ElementCount;
-            if (total % n != 0)
-                throw new InvalidOperationException(
-                    $"predicted_depth element count {total} is not divisible by num_images={n} (shape=[{string.Join(",", shape)}])");
-            viewElems = total / n;
-            rawH = rawW = (int)MathF.Round(MathF.Sqrt(viewElems));
-            if (rawH * rawW != viewElems)
-            {
-                // Prefer H=W from compile input size when reshape is awkward.
-                rawH = _inputSize; rawW = viewElems / Math.Max(1, rawH);
-                if (rawH * rawW != viewElems)
-                    throw new InvalidOperationException(
-                        $"Cannot infer per-view HxW from predicted_depth shape=[{string.Join(",", shape)}] N={n}");
-            }
-        }
+        var (rawW, rawH, viewElems) = PlaneDims(depthTensor, n, "predicted_depth");
 
         var (outW, outH) = ResolveOutputSize(srcW, srcH, rawW, rawH, outputWidth, outputHeight);
         int outSize = outW * outH;
@@ -962,27 +989,74 @@ public class DepthEstimationPipeline : IDisposable
         return (x, y, w, h);
     }
 
-    private async Task<List<MemoryBuffer1D<float, Stride1D.Dense>>> SplitPlaneViewsAsync(
-        Tensor planeTensor, int n, int outW, int outH)
+    /// <summary>
+    /// Per-view (W, H, elements) of a per-pixel output, read from its SHAPE. Shared by depth and confidence:
+    /// the confidence split used to guess a square from sqrt(elements), which read every non-square
+    /// (NativeAspect) plane at the wrong width whenever the output grid differed from the model's.
+    /// </summary>
+    private (int RawW, int RawH, int ViewElems) PlaneDims(Tensor t, int n, string what)
     {
-        int total = planeTensor.ElementCount;
-        if (total % n != 0)
-            throw new InvalidOperationException(
-                $"Plane tensor element count {total} not divisible by N={n}");
-        int viewElems = total / n;
-        int rawH = outH, rawW = outW;
-        if (viewElems != outW * outH)
+        // Common shapes: [1,N,H,W], [N,H,W], [1,N,1,H,W], or flat N*H*W.
+        var shape = t.Shape;
+        int rawH, rawW, viewElems;
+        if (shape.Length >= 4 && shape[^3] == n)
         {
-            rawH = (int)MathF.Round(MathF.Sqrt(viewElems));
-            rawW = viewElems / Math.Max(1, rawH);
+            rawH = shape[^2]; rawW = shape[^1];
+            viewElems = rawH * rawW;
         }
+        else if (shape.Length >= 3 && shape[0] == n)
+        {
+            rawH = shape[^2]; rawW = shape[^1];
+            viewElems = rawH * rawW;
+        }
+        else if (shape.Length >= 4 && shape[1] == n)
+        {
+            rawH = shape[^2]; rawW = shape[^1];
+            viewElems = rawH * rawW;
+        }
+        else
+        {
+            // Fallback: divide total elements evenly across N (square-ish spatial).
+            int total = t.ElementCount;
+            if (total % n != 0)
+                throw new InvalidOperationException(
+                    $"{what} element count {total} is not divisible by num_images={n} (shape=[{string.Join(",", shape)}])");
+            viewElems = total / n;
+            rawH = rawW = (int)MathF.Round(MathF.Sqrt(viewElems));
+            if (rawH * rawW != viewElems)
+            {
+                // Prefer H=W from compile input size when reshape is awkward.
+                rawH = _inputSize; rawW = viewElems / Math.Max(1, rawH);
+                if (rawH * rawW != viewElems)
+                    throw new InvalidOperationException(
+                        $"Cannot infer per-view HxW from {what} shape=[{string.Join(",", shape)}] N={n}");
+            }
+        }
+        return (rawW, rawH, viewElems);
+    }
+
+    /// <summary>
+    /// Split a per-pixel plane (confidence) into caller-owned per-view buffers ALIGNED with the depth maps:
+    /// the same letterbox content crop (<see cref="ContentRect"/>) into the same output grid. It used to
+    /// resize the WHOLE model output, pad included, so in Letterbox mode confidence was squashed against depth.
+    /// </summary>
+    private async Task<List<MemoryBuffer1D<float, Stride1D.Dense>>> SplitPlaneViewsAsync(
+        Tensor planeTensor, int n, int srcW, int srcH, int outW, int outH)
+    {
+        var (rawW, rawH, viewElems) = PlaneDims(planeTensor, n, "confidence");
+        var (cropX, cropY, cropW, cropH) = ContentRect(srcW, srcH, rawW, rawH);
+        bool cropped = cropX != 0 || cropY != 0 || cropW != rawW || cropH != rawH;
         var list = new List<MemoryBuffer1D<float, Stride1D.Dense>>(n);
         for (int i = 0; i < n; i++)
         {
             var srcSub = planeTensor.Data.SubView((long)i * viewElems, viewElems);
             var buf = _accelerator.Allocate1D<float>(outW * outH);
-            if (rawW == outW && rawH == outH)
+            if (!cropped && rawW == outW && rawH == outH)
                 buf.View.CopyFrom(srcSub.SubView(0, outW * outH));
+            else if (cropped)
+                _postprocess.ResizeBilinearFromRect(
+                    srcSub, rawW, rawH, cropX, cropY, cropW, cropH,
+                    buf.View, outW, outH);
             else
             {
                 var srcView = new Tensors.TensorView<float>(srcSub, new[] { rawH, rawW });

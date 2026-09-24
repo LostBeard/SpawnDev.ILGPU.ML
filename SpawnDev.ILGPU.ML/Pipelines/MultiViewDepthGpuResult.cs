@@ -24,9 +24,16 @@ public sealed class MultiViewDepthGpuResult : IDisposable
     public float[][]? Extrinsics { get; init; }
 
     /// <summary>
-    /// Optional per-view 3×3 intrinsics as length-9 row-major float arrays (one per view).
+    /// Optional per-view 3×3 intrinsics as length-9 row-major float arrays (one per view), in the pixel grid
+    /// of <see cref="Views"/> (each view's Width x Height) - the grid a caller unprojects the depth in.
     /// </summary>
     public float[][]? Intrinsics { get; init; }
+
+    /// <summary>
+    /// The same intrinsics exactly as the model predicted them, in MODEL-INPUT pixels (letterbox pad included).
+    /// For parity checks against a reference runtime; use <see cref="Intrinsics"/> for geometry.
+    /// </summary>
+    public float[][]? ModelIntrinsics { get; init; }
 
     public int ViewCount => Views.Count;
 

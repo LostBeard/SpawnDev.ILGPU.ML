@@ -2,7 +2,37 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## Unreleased - WebGPU capture that fits: DAv3 joint multi-view replays in 0.4 s, not 6.4 s
+## 5.2.21 (unreleased; local 5.2.21-local.1) - the three entries below, on SpawnDev.ILGPU 5.2.17-local.2
+
+Depends on SpawnDev.ILGPU 5.2.17-local.2: the WebGPU short-circuit phi fix (NativeAspect's area resample
+zeroed tie pixels without it) and `CopyFromJS` now submitting pending kernels before it writes
+(`MediaInterop`'s JS pixel upload goes through it).
+
+### Unreleased - DAv3 joint pass: every output in the caller's pixel grid
+
+**`MultiViewDepthGpuResult.Intrinsics` was the model's K, in MODEL-INPUT pixels** (a 672x672 letterbox, a
+504x378 NativeAspect tensor), while the depth maps beside it come back in the caller's output grid. SpawnScene
+copied K straight into the cameras it unprojects depth with: focal in the wrong units by the input/source scale,
+cy off by the letterbox pad. DAv3's raw principal point on TempleRing is exactly (336, 336) - the centre of the
+672 tensor, 96 px below the picture's centre in 640x480.
+
+- `Intrinsics` is now in `Views`' grid (`IntrinsicsToOutputGrid`: subtract the pad, scale per axis, edge
+  convention). `ModelIntrinsics` keeps the raw K for parity checks. `ModelContentRect(srcW, srcH)` is public.
+- **Confidence maps were resized from the WHOLE model output, pad included**, so in Letterbox mode they were
+  squashed against the (cropped) depth - 13-22% relRMS off the reference crop. They now take the same content
+  crop as depth. Their size was also guessed as sqrt(elements), which read every non-square (NativeAspect)
+  plane at the wrong width when the output grid differed from the model's; both splits now read the shape.
+- A joint pass whose views letterbox to different rectangles is refused (it was cropped with view 0's).
+- **A non-square session binding is refused.** Letterbox/Stretch build a square of one side and read a
+  non-square binding as its WIDTH, silently: SpawnScene's 2026-09-20 "aspect-matched 32x43 grid measured 4 dB
+  worse" was a 448x448 square with fewer picture patches. NativeAspect is the aspect-preserving path.
+- Gate: `DA3_MultiView_OutputGrid_IntrinsicsAndConfidence` - TempleRing x4 letterboxed into 672 against
+  onnxruntime: at a 1:1 grid depth and confidence equal the reference crop and K equals the reference K minus the
+  pad; at 640x480 and 1280x960 K scales exactly and the principal point is centred; non-square binding throws.
+  Negative controls for a 1-row shift and a missing pad offset. Red-checked: crop off -> confidence 1.3e-1 to
+  2.2e-1 relRMS (gate 5e-3); conversion off -> 16 K failures.
+
+### Unreleased - WebGPU capture that fits: DAv3 joint multi-view replays in 0.4 s, not 6.4 s
 
 **A WebGPU graph capture pinned every intermediate of the graph for the plan's lifetime.** The capture pass
 suppresses drains, and immediate buffer return is CUDA-only, so nothing released during the recorded forward
@@ -32,7 +62,7 @@ equals its direct peak. In a full WebGPU gate the old regime also lost the devic
   53 passed, 0 DAv3 failures. ZipVoice (default regime) 5/5 alone; its full-gate failures are ORDER effects
   present on the prior commit too (a Reshape resolves [1748,437] for a [669,669] bias after other models ran).
 
-## Unreleased - DepthResizeMode.NativeAspect: Depth Anything 3's own preprocessing, on the device
+### Unreleased - DepthResizeMode.NativeAspect: Depth Anything 3's own preprocessing, on the device
 
 `DepthEstimationPipeline.ResizeMode = DepthResizeMode.NativeAspect` (opt-in; `Letterbox` stays the default)
 feeds DAv3 exactly what its reference pipeline does (ByteDance-Seed/Depth-Anything-3 `input_processor.py`,

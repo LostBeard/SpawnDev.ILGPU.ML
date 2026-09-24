@@ -211,7 +211,7 @@ public abstract partial class MLTestBase
                 var (relX, _, _) = Da3Compare(await mv.Views[0].RawDepth.View.CopyToHostAsync(), depthRef.AsSpan(w * h, w * h));
                 if (relX <= Da3DepthRelRmsGate) failures.Add($"{name}: view 0 vs view 1's reference PASSED - gate cannot discriminate");
 
-                foreach (var (outName, per, got) in new[] { ("extrinsics", 12, mv.Extrinsics), ("intrinsics", 9, mv.Intrinsics) })
+                foreach (var (outName, per, got) in new[] { ("extrinsics", 12, mv.Extrinsics), ("intrinsics", 9, mv.ModelIntrinsics) })
                 {
                     if (got == null) { failures.Add($"{name}#{pass}: {outName} missing"); continue; }
                     var r = await F32(http, $"test-refs/dav3/{name}.{outName}.f32");
