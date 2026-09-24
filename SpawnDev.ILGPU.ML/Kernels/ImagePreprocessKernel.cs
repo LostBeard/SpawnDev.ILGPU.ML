@@ -15,7 +15,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 ///
 /// This replaces 4 separate kernels with one GPU pass — no intermediate buffers.
 /// </summary>
-public class ImagePreprocessKernel
+public partial class ImagePreprocessKernel
 {
     private readonly Accelerator _accelerator;
 

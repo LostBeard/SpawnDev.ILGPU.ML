@@ -11,6 +11,25 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// </summary>
 public record DepthResult(float[] DepthMap, int Width, int Height, float MinDepth, float MaxDepth);
 
+/// <summary>How <see cref="DepthEstimationPipeline"/> turns a picture into the model's input tensor.</summary>
+public enum DepthResizeMode
+{
+    /// <summary>Fit inside the compiled square, centred, border replicated into the pad; the pad is
+    /// cropped off the output. The historical default.</summary>
+    Letterbox,
+    /// <summary>Squash each axis to the compiled square independently (distorts aspect).</summary>
+    Stretch,
+    /// <summary>
+    /// Depth Anything 3's own preprocessing: long side = <see cref="DepthEstimationPipeline.ProcessResolution"/>,
+    /// aspect kept, NO padding, each side rounded to the nearest multiple of the ViT patch, OpenCV
+    /// area / cubic resampling (<see cref="Kernels.ImagePreprocessKernel.ForwardNativeAspect"/>). The input
+    /// tensor is non-square and follows the picture; the model must accept dynamic height/width (DAv3 does).
+    /// MEASURED 2026-09-23 vs COLMAP ground truth on Truck: joint depth AbsRel 0.111 vs Letterbox's 0.150,
+    /// camera-centre error 3.1% vs 9.6%, focal error 19% vs 44% - and fewer tokens (no pad patches).
+    /// </summary>
+    NativeAspect,
+}
+
 /// <summary>
 /// High-level monocular depth estimation pipeline.
 /// Wraps InferenceSession with image preprocessing and depth postprocessing.
@@ -36,7 +55,75 @@ public class DepthEstimationPipeline : IDisposable
     /// it returns is distorted in a way that reads as bad depth. Settable so a caller that has
     /// calibrated against the old behaviour can keep it.
     /// </summary>
-    public bool PreserveAspect { get; set; } = true;
+    public bool PreserveAspect
+    {
+        get => ResizeMode != DepthResizeMode.Stretch;
+        set => ResizeMode = !value ? DepthResizeMode.Stretch
+            : ResizeMode == DepthResizeMode.Stretch ? DepthResizeMode.Letterbox : ResizeMode;
+    }
+
+    /// <summary>
+    /// How the picture becomes the input tensor. <see cref="DepthResizeMode.Letterbox"/> by default;
+    /// <see cref="DepthResizeMode.NativeAspect"/> is the Depth Anything 3 reference preprocessing and
+    /// MEASURED more accurate for DAv3 (see the enum).
+    /// </summary>
+    public DepthResizeMode ResizeMode { get; set; } = DepthResizeMode.Letterbox;
+
+    /// <summary>
+    /// <see cref="DepthResizeMode.NativeAspect"/> only: the long side, in pixels, before rounding to the
+    /// patch grid. 0 = the compiled input's side (so a session bound at 518 keeps ~518's patch budget).
+    /// The DA3 reference default is 504.
+    /// </summary>
+    public int ProcessResolution { get; set; }
+
+    /// <summary><see cref="DepthResizeMode.NativeAspect"/> only: the ViT patch both sides are rounded to (14 for Depth Anything).</summary>
+    public int PatchSize { get; set; } = 14;
+
+    private int LongSide => ProcessResolution > 0 ? ProcessResolution : _inputSize;
+
+    /// <summary>The model input (width, height) this pipeline builds for a <paramref name="srcW"/> x <paramref name="srcH"/> picture.</summary>
+    public (int Width, int Height) ModelInputSize(int srcW, int srcH)
+    {
+        if (ResizeMode != DepthResizeMode.NativeAspect) return (_inputSize, _inputSize);
+        var (_, _, w, h) = Kernels.ImagePreprocessKernel.NativeAspectSizes(srcW, srcH, LongSide, PatchSize);
+        return (w, h);
+    }
+
+    // NativeAspect's stage-1 image (packed RGBA, device-resident). Grows; the old one is disposed only
+    // after an awaited drain, because a queued dispatch may still read it (Wasm frees on dispose).
+    private MemoryBuffer1D<int, Stride1D.Dense>? _nativeScratch;
+
+    private async Task<ArrayView1D<int, Stride1D.Dense>> NativeScratchAsync(int srcW, int srcH)
+    {
+        int need = Kernels.ImagePreprocessKernel.NativeAspectScratchLength(srcW, srcH, LongSide, PatchSize);
+        if (need == 0) return default;
+        if (_nativeScratch == null || _nativeScratch.Length < need)
+        {
+            if (_nativeScratch != null)
+            {
+                await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+                _nativeScratch.Dispose();
+            }
+            _nativeScratch = _accelerator.Allocate1D<int>(need);
+        }
+        return _nativeScratch.View;
+    }
+
+    /// <summary>Picture -> one view's CHW input slice, per <see cref="ResizeMode"/>. Device only.</summary>
+    private async Task PreprocessAsync(ArrayView1D<int, Stride1D.Dense> rgba, int srcW, int srcH,
+        ArrayView1D<float, Stride1D.Dense> dst)
+    {
+        if (ResizeMode == DepthResizeMode.NativeAspect)
+        {
+            var scratch = await NativeScratchAsync(srcW, srcH).ConfigureAwait(false);
+            _preprocess.ForwardNativeAspect(rgba, srcW, srcH, dst, scratch, LongSide, PatchSize);
+        }
+        else
+        {
+            _preprocess.Forward(rgba, dst, srcW, srcH, _inputSize, _inputSize,
+                preserveAspect: ResizeMode == DepthResizeMode.Letterbox);
+        }
+    }
 
     /// <summary>
     /// Opt-in graph capture for the VIDEO / repeat-inference path (default off; CUDA + WebGPU, no-op elsewhere).
@@ -99,10 +186,11 @@ public class DepthEstimationPipeline : IDisposable
     /// DAv3 = 5-D [1,1,3,H,W] (the num_images dim). Same CHW element count, different rank — we MUST feed the
     /// rank the graph was compiled for, or the model reads the channel dim (3) as num_images and returns garbage.
     /// </summary>
-    private int[] InputTensorShape()
-        => _session.InputShapes.TryGetValue(_session.InputNames[0], out var s)
-           && s.Length >= 4 && s.Aggregate(1, (a, b) => a * b) == 3 * _inputSize * _inputSize
-            ? s : new[] { 1, 3, _inputSize, _inputSize };
+    private int[] InputTensorShape(int h, int w)
+    {
+        bool fiveD = _session.InputShapes.TryGetValue(_session.InputNames[0], out var s) && s.Length == 5;
+        return fiveD ? new[] { 1, 1, 3, h, w } : new[] { 1, 3, h, w };
+    }
 
     /// <summary>
     /// Create a depth pipeline from ONNX streams — zero-copy JS→GPU on browser (the model bytes never enter the
@@ -248,11 +336,11 @@ public class DepthEstimationPipeline : IDisposable
         ArrayView1D<int, Stride1D.Dense> rgbaPixels, int width, int height,
         int outputWidth, int outputHeight)
     {
-        using var preprocessed = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-        _preprocess.Forward(rgbaPixels, preprocessed.View, width, height, _inputSize, _inputSize,
-            preserveAspect: PreserveAspect);
+        var (inW, inH) = ModelInputSize(width, height);
+        using var preprocessed = _accelerator.Allocate1D<float>(3 * inW * inH);
+        await PreprocessAsync(rgbaPixels, width, height, preprocessed.View).ConfigureAwait(false);
 
-        var inputTensor = new Tensor(preprocessed.View, InputTensorShape());
+        var inputTensor = new Tensor(preprocessed.View, InputTensorShape(inH, inW));
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
             [_session.InputNames[0]] = inputTensor
@@ -449,22 +537,33 @@ public class DepthEstimationPipeline : IDisposable
         bool useCapture = EnableGraphCapture
             && (_accelerator.AcceleratorType == AcceleratorType.Cuda
                 || _accelerator.AcceleratorType == AcceleratorType.WebGPU);
+        var (inW, inH) = ModelInputSize(width, height);
+        int inElems = 3 * inW * inH;
         MemoryBuffer1D<float, Stride1D.Dense>? transientInput = null;
         ArrayView1D<float, Stride1D.Dense> preInput;
         if (useCapture)
         {
-            _captureInputBuf ??= _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
-            preInput = _captureInputBuf.View;
+            if (_captureInputBuf != null && _captureInputBuf.Length < inElems)
+            {
+                // A NativeAspect picture bigger than any before: the recorded plans read the old stable
+                // buffer, so they go with it. Drain first - a replay may still be reading it.
+                await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+                _capture?.Dispose(); _capture = null;
+                _webGpuCapture?.Dispose(); _webGpuCapture = null;
+                _captureShape = null;
+                _captureInputBuf.Dispose(); _captureInputBuf = null;
+            }
+            _captureInputBuf ??= _accelerator.Allocate1D<float>(inElems);
+            preInput = _captureInputBuf.View.SubView(0, inElems);
         }
         else
         {
-            transientInput = _accelerator.Allocate1D<float>(3 * _inputSize * _inputSize);
+            transientInput = _accelerator.Allocate1D<float>(inElems);
             preInput = transientInput.View;
         }
-        _preprocess.Forward(rgbaPixels, preInput, width, height, _inputSize, _inputSize,
-            preserveAspect: PreserveAspect);
+        await PreprocessAsync(rgbaPixels, width, height, preInput).ConfigureAwait(false);
 
-        var inputTensor = new Tensor(preInput, InputTensorShape());
+        var inputTensor = new Tensor(preInput, InputTensorShape(inH, inW));
         var inputDict = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
 
         // Outputs from a plain session run are pool-rented and ours to hand back once consumed; a
@@ -473,7 +572,7 @@ public class DepthEstimationPipeline : IDisposable
         bool ownOutputs;
         if (useCapture && _accelerator.AcceleratorType == AcceleratorType.Cuda)
         {
-            var shape = InputTensorShape();
+            var shape = inputTensor.Shape;
             if (_capture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
             {
                 _capture?.Dispose();
@@ -485,7 +584,7 @@ public class DepthEstimationPipeline : IDisposable
         }
         else if (useCapture)   // WebGPU
         {
-            var shape = InputTensorShape();
+            var shape = inputTensor.Shape;
             // Same gate SessionGraphCapture now applies: a pool reclaim since recording leaves this plan's
             // bind groups pointing at disposed buckets. Drop and recapture rather than submit garbage
             // (or hit the ReplayAsync InvalidatedByReclaim throw).
@@ -603,16 +702,27 @@ public class DepthEstimationPipeline : IDisposable
         if (widths.Count != n || heights.Count != n)
             throw new ArgumentException("widths/heights length must match frames.");
 
-        int chw = 3 * _inputSize * _inputSize;
-        using var stacked = _accelerator.Allocate1D<float>(n * (long)chw);
-        for (int i = 0; i < n; i++)
+        // One joint forward takes ONE tensor shape. In NativeAspect every view's shape follows its own
+        // picture, so views that land on different grids cannot share a pass. The DA3 reference
+        // centre-crops them to the smallest; here that would hand back depth covering a different
+        // region of each source than the caller's pixel grid, silently. Refuse instead: group views
+        // by ModelInputSize (SpawnScene's PlanByShape already does).
+        var (inW, inH) = ModelInputSize(widths[0], heights[0]);
+        for (int i = 1; i < n; i++)
         {
-            _preprocess.Forward(frames[i], stacked.View.SubView(i * chw, chw),
-                widths[i], heights[i], _inputSize, _inputSize,
-                preserveAspect: PreserveAspect);
+            var (wi, hi) = ModelInputSize(widths[i], heights[i]);
+            if (wi != inW || hi != inH)
+                throw new ArgumentException(
+                    $"view {i} ({widths[i]}x{heights[i]}) needs a {wi}x{hi} input but view 0 ({widths[0]}x{heights[0]}) " +
+                    $"needs {inW}x{inH}; a joint pass takes one shape. Group views by ModelInputSize.", nameof(frames));
         }
 
-        var inputShape = new[] { 1, n, 3, _inputSize, _inputSize };
+        int chw = 3 * inW * inH;
+        using var stacked = _accelerator.Allocate1D<float>(n * (long)chw);
+        for (int i = 0; i < n; i++)
+            await PreprocessAsync(frames[i], widths[i], heights[i], stacked.View.SubView(i * chw, chw)).ConfigureAwait(false);
+
+        var inputShape = new[] { 1, n, 3, inH, inW };
         var inputTensor = new Tensor(stacked.View, inputShape);
         var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
         {
@@ -748,7 +858,7 @@ public class DepthEstimationPipeline : IDisposable
         // a DPT-style head often emits at a fraction of it. Everything past this point is
         // upsampling, and soft edges in the final map are explained here or nowhere.
         Console.WriteLine(
-            $"[Depth-MV] predicted {rawW}x{rawH} from a {_inputSize}x{_inputSize} input " +
+            $"[Depth-MV] predicted {rawW}x{rawH} ({ResizeMode}) " +
             $"-> content {cropW}x{cropH} -> out {outW}x{outH} " +
             $"({(float)outW / Math.Max(1, cropW):F1}x upsample)");
 
@@ -783,11 +893,12 @@ public class DepthEstimationPipeline : IDisposable
     /// <summary>
     /// The region of a model output that holds real picture, given a letterboxed input of
     /// <paramref name="srcW"/> x <paramref name="srcH"/>. The whole output when
-    /// <see cref="PreserveAspect"/> is off.
+    /// <see cref="ResizeMode"/> is not <see cref="DepthResizeMode.Letterbox"/>.
     /// </summary>
     private (int X, int Y, int W, int H) ContentRect(int srcW, int srcH, int rawW, int rawH)
     {
-        if (!PreserveAspect || srcW <= 0 || srcH <= 0) return (0, 0, rawW, rawH);
+        // Only a letterbox has padding to crop: NativeAspect's whole output is picture.
+        if (ResizeMode != DepthResizeMode.Letterbox || srcW <= 0 || srcH <= 0) return (0, 0, rawW, rawH);
 
         var (cw, ch, px, py) = Kernels.ImagePreprocessKernel.Letterbox(
             srcW, srcH, _inputSize, _inputSize);
@@ -876,6 +987,8 @@ public class DepthEstimationPipeline : IDisposable
         _webGpuCapture = null;
         _captureInputBuf?.Dispose();
         _captureInputBuf = null;
+        _nativeScratch?.Dispose();
+        _nativeScratch = null;
         _postprocess.Dispose();
     }
 }

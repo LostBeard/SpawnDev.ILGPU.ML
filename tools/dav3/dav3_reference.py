@@ -34,6 +34,13 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
+# OpenCV's OWN resize, not Intel IPP's. The pip wheel routes uint8 INTER_CUBIC through IPP, which
+# differs from OpenCV's algorithm by 1 LSB on ~1.3% of pixels (MEASURED 2026-09-23, IPP 2026.0 AVX-512)
+# and depends on the CPU dispatch - so "the official preprocessing" is not bit-defined across machines.
+# The reference pins the defined algorithm, which ImagePreprocessKernel.ForwardNativeAspect ports
+# (tools/dav3/check_cv2_port.py: 0.014% / 0.001% off with IPP off, float summation order only).
+cv2.ipp.setUseIPP(False)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 DEFAULT_OUT = os.path.join(REPO, "SpawnDev.ILGPU.ML.Demo", "wwwroot", "test-refs", "dav3")
@@ -78,6 +85,7 @@ CASES = {
     "off_truck":      ([truck(1)], "official", 504),               # the official non-square shape
     "s672_bath":      ([bathroom(0)], "ours", 672),                # 12 MP phone photo, joint-path grid
     "off_bath":       ([bathroom(0)], "official", 504),
+    "off896_temple":  ([temple(1)], "official", 896),              # 640x480 GROWN: the stage-1 cubic path
     "s896_bath":      ([bathroom(0)], "ours", 896),                # SpawnScene's high-detail single view
     # --- multi view (batch 1, N images) ----------------------------------------------------
     "mv2_drj_off":    ([drj("IMG_6292.jpg"), drj("IMG_6299.jpg")], "official", 504),
@@ -223,6 +231,7 @@ def main():
         "model": "onnx-community/depth-anything-v3-small",
         "model_sha256": MODEL_SHA256,
         "onnxruntime": ort.__version__,
+        "opencv": cv2.__version__, "opencv_ipp": bool(cv2.ipp.useIPP()),
         "ort_session_load_ms": round(load_ms),
     })
 
@@ -248,13 +257,14 @@ def main():
             v.tofile(os.path.join(a.out, f"{name}.{n}.f32"))
             case["outputs"][n] = {"shape": list(v.shape), "min": float(v.min()), "max": float(v.max()),
                                   "mean": float(v.mean()), "nan": int(np.isnan(v).sum())}
-        # The decoded pixels of each "ours" view, so a test can push them through the REAL
-        # ImagePreprocessKernel and prove this script's emulation is what SpawnScene feeds.
-        # Skipped above 4 MP (a 12 MP phone photo is 50 MB of RGBA and proves nothing more).
-        if prep == "ours":
+        # The decoded pixels of every view, so a test can push them through the REAL device
+        # preprocessing (ImagePreprocessKernel.Forward for "ours", ForwardNativeAspect for "official")
+        # and prove it produces this exact tensor. Up to 16 MP: the 12 MP phone photo is the 8x
+        # INTER_AREA downscale, the case the area filter exists for.
+        if True:
             flat = [p for p in (images if not isinstance(images[0], list) else sum(images, []))]
             dims = [Image.open(p).size for p in flat]
-            if all(w * h <= 4_000_000 for w, h in dims):
+            if all(w * h <= 16_000_000 for w, h in dims):
                 case["rgba"] = []
                 for i, p in enumerate(flat):
                     rgba = np.asarray(Image.open(p).convert("RGBA"), np.uint8)

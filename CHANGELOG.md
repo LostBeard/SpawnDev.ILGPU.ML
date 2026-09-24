@@ -2,6 +2,36 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased - DepthResizeMode.NativeAspect: Depth Anything 3's own preprocessing, on the device
+
+`DepthEstimationPipeline.ResizeMode = DepthResizeMode.NativeAspect` (opt-in; `Letterbox` stays the default)
+feeds DAv3 exactly what its reference pipeline does (ByteDance-Seed/Depth-Anything-3 `input_processor.py`,
+`upper_bound_resize`): long side = `ProcessResolution` (0 = the compiled side), aspect kept, NO padding, each
+side rounded to the nearest multiple of 14, OpenCV INTER_AREA when shrinking / INTER_CUBIC when growing.
+The input tensor follows the picture's shape; single view, capture/replay and joint multi-view all work.
+
+Why: MEASURED against COLMAP ground truth (`tools/dav3/dav3_quality.py`, Truck), the letterbox costs DAv3
+real accuracy - joint depth AbsRel 0.150 vs 0.111, camera-centre error 9.6% vs 3.1%, focal error 44% vs 19%
+- because the model reads the replicated-border padding as picture. The resize filter alone is worth little.
+
+- `ImagePreprocessKernel.ForwardNativeAspect`: two device dispatches, zero host copies (packed RGBA view in,
+  NCHW view out, stage-1 image in a device scratch). AREA is exact integer arithmetic in int32 (identical on
+  every backend); CUBIC ports OpenCV's float-quantised fraction and 11-bit fixed-point taps. Against OpenCV
+  (its own algorithm, IPP off): never more than 1 uint8 LSB; area 0.000-0.016% of values, cubic 0.014%
+  (CUDA/CPU/Wasm) to 0.33% (WebGL) because GPU float division is not correctly rounded. For scale, Intel
+  IPP's cubic is 1.3% off OpenCV's own.
+- Stage 2 is one thread per OUTPUT ELEMENT: one thread writing three planes silently lost stores on WebGL.
+- Multi-view refuses views that land on different input shapes (the reference centre-crops them, which would
+  hand back depth misaligned with the caller's pixels) - group views by `ModelInputSize`.
+- Needs SpawnDev.ILGPU 5.2.17-local.1: the WGSL walker dropped the phi on a nested short-circuit edge, which
+  zeroed one channel of every exact .5 tie with an odd quotient on WebGPU.
+
+Gates: `DA3_NativeAspect_Preprocess_MatchesReference` (all 6 backends, bilinear negative control),
+`DA3_NativeAspect_Pipeline_MatchesOrt` (single view + replay + regrow, joint multi-view depth/poses/
+intrinsics, mixed-shape refusal; WebGPU depth relRMS <= 1.2e-4). Measurements, not gates:
+`DA3_MultiView_Profile`, `DA3_MultiView_ScalingSweep` (WebGPU capture's pool peak passes 12 GB at 4 views
+@518 and replay falls from ~55 ms/view to 7.5 s - the capture pins every intermediate; CUDA's does not).
+
 ## 5.2.20 - return graph outputs; free the activation arena between workloads
 
 `InferenceSession.Run` left every graph OUTPUT live in the BufferPool forever: outputs are rented and
