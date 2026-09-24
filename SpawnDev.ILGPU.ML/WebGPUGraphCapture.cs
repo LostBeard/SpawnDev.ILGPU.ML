@@ -29,6 +29,35 @@ namespace SpawnDev.ILGPU.ML;
 /// </summary>
 public sealed class WebGPUGraphCapture : IDisposable
 {
+    /// <summary>
+    /// Default for <see cref="TryCaptureAsync"/>'s <c>keepDrains</c>: keep a normal forward's periodic drains
+    /// (deferred buffer release) in the capture pass instead of pinning every intermediate for the plan's
+    /// lifetime. OFF by default - opt in per model once its replay is gated.
+    /// </summary>
+    /// <remarks>
+    /// MEASURED 2026-09-23, DAv3 518 on a 12 GB RTX 4070 (DA3_MultiView_ScalingSweep): without it the
+    /// capture's pool peak is 3.9 / 7.4 / 8.3 / 14.3 / 16.1 GB at 1-6 views and the replay falls off a cliff
+    /// (164 ms at 3 views, 7.5 s at 4) once it no longer fits; with it the peak equals a plain forward's
+    /// (0.8-2.7 GB) and 6 views replay in 0.4 s, bit-exact vs onnxruntime (DepthEstimationPipeline opts in).
+    /// <para>
+    /// 🔴 NOT safe for every graph yet. ZipVoice's fm_decoder replays WRONG with it (16,900 of 16,900,
+    /// Pipeline_ZipVoice_CaptureReplayFidelity) and right without. Measured and ruled out: the output's buffer
+    /// is never returned in the capture pass, and no buffer is read-before-written at the level of node
+    /// inputs/outputs (DiagnoseOutputRecycling). What remains are buffers operators rent INTERNALLY under
+    /// colliding names - the pool trace shows 201 ALIEN-RETURNs per capture (`_mmi_a/_mmi_b` at nodes 26 and
+    /// 46, the DynamicQuantize `_scale/_quantized/_zero_point` temps), BufferPool's documented, unfixed
+    /// name-ownership leak. Fix that before enabling this more widely.
+    /// </para>
+    /// </remarks>
+    public static bool KeepDrainsDuringCapture { get; set; }
+
+    /// <summary>DIAGNOSTIC: log every pool return during the capture pass and report, in
+    /// <see cref="LastOutputRecyclingReport"/>, whether any buffer a captured output views was returned.</summary>
+    public static bool DiagnoseOutputRecycling { get; set; }
+
+    /// <summary>See <see cref="DiagnoseOutputRecycling"/>.</summary>
+    public static string? LastOutputRecyclingReport { get; private set; }
+
     private readonly Accelerator _accelerator;
     private readonly WebGPUDispatchPlan _plan;
     private readonly Dictionary<string, Tensor> _inputBuffers;   // stable device inputs the plan reads
@@ -185,8 +214,10 @@ public sealed class WebGPUGraphCapture : IDisposable
     /// records a third forward. Returns null when the accelerator is not WebGPU. The <paramref name="inputs"/>
     /// device buffers become this capture's stable inputs.
     /// </summary>
-    public static async Task<WebGPUGraphCapture?> TryCaptureAsync(InferenceSession session, Dictionary<string, Tensor> inputs)
+    public static async Task<WebGPUGraphCapture?> TryCaptureAsync(InferenceSession session, Dictionary<string, Tensor> inputs,
+        bool? keepDrains = null)
     {
+        bool keep = keepDrains ?? KeepDrainsDuringCapture;
         var acc = session.Accelerator;
         if (acc is not WebGPUAccelerator webGpu) return null;
 
@@ -281,7 +312,15 @@ public sealed class WebGPUGraphCapture : IDisposable
             // buffer-return perturbs the stable regime; the plan records every dispatch as it encodes.
             Dictionary<string, Tensor> capOut;
             GraphExecutor.SuppressDrains = true;
+            if (DiagnoseOutputRecycling) { BufferPool.ReturnLog = new(); GraphExecutor.CaptureAccessLog = new(); }
+            // ...but keep the drains themselves: without them nothing released during the recorded
+            // forward is recycled and the plan pins every intermediate of the graph (16 GB for DAv3 at
+            // 6 views, 7.5 s replays once it no longer fits). See GraphExecutor.KeepDrainsDuringCapture.
+            GraphExecutor.KeepDrainsDuringCapture = keep;
             var plan = webGpu.BeginDispatchCapture();
+            // What the plan has recorded so far: the executor pins the outputs of any node that recorded
+            // NOTHING in this pass (see GraphExecutor.CaptureRecordedWorkCounter).
+            GraphExecutor.CaptureRecordedWorkCounter = keep ? () => plan.DispatchCount : null;
             try
             {
                 capOut = await session.RunAsync(inputs);
@@ -294,9 +333,52 @@ public sealed class WebGPUGraphCapture : IDisposable
             finally
             {
                 GraphExecutor.SuppressDrains = false;
+                GraphExecutor.KeepDrainsDuringCapture = false;
+                GraphExecutor.CaptureRecordedWorkCounter = null;
             }
             webGpu.EndDispatchCapture();
             await acc.SynchronizeAsync();
+            if (BufferPool.ReturnLog is { } retLog)
+            {
+                // Did the capture pass hand a buffer that a captured OUTPUT views back to the pool? If so the
+                // plan may have recorded a later write into it, and every replay returns the overwrite.
+                var sb = new System.Text.StringBuilder();
+                foreach (var (name, t) in capOut)
+                {
+                    MemoryBuffer? ob = null;
+                    try { ob = ((IArrayView)t.Data).Buffer; } catch { }
+                    var hits = retLog.Where(e => ReferenceEquals(e.Buffer, ob)).ToList();
+                    sb.Append($"'{name}' ({(ob == null ? "?" : "#" + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(ob).ToString("x6"))}): ");
+                    sb.Append(hits.Count == 0 ? "never returned; " : string.Join(", ", hits.Select(h => $"returned as '{h.Name}' at node {h.Node}")) + "; ");
+                }
+                // READ-BEFORE-WRITE: buffers the plan reads before its first write to them, then writes later.
+                var rbw = new System.Text.StringBuilder();
+                int hazards = 0;
+                if (GraphExecutor.CaptureAccessLog is { } acc2)
+                {
+                    var firstWrite = new Dictionary<MemoryBuffer, int>(ReferenceEqualityComparer.Instance);
+                    for (int i = 0; i < acc2.Count; i++)
+                        foreach (var b in acc2[i].OutBufs)
+                            if (b != null && !firstWrite.ContainsKey(b)) firstWrite[b] = i;
+                    var reported = new HashSet<MemoryBuffer>(ReferenceEqualityComparer.Instance);
+                    for (int i = 0; i < acc2.Count; i++)
+                    {
+                        var e = acc2[i];
+                        for (int k = 0; k < e.InBufs.Length; k++)
+                        {
+                            var b = e.InBufs[k];
+                            if (b == null || !firstWrite.TryGetValue(b, out int w) || w <= i || !reported.Add(b)) continue;
+                            hazards++;
+                            if (hazards <= 12)
+                                rbw.Append($"'{e.InNames[k]}' read by #{e.Node} {e.Op} before written by #{acc2[w].Node} {acc2[w].Op} "
+                                    + $"('{string.Join(",", acc2[w].OutNames)}'); ");
+                        }
+                    }
+                    GraphExecutor.CaptureAccessLog = null;
+                }
+                LastOutputRecyclingReport = $"{retLog.Count} returns in the capture pass | {sb}| READ-BEFORE-WRITE buffers: {hazards} | {rbw}";
+                BufferPool.ReturnLog = null;
+            }
 
             // Read the capture pass's OWN result while it is still the only thing that has run. See
             // RecordCapturePassOutput for why no caller can otherwise see this value: the enclosing
@@ -376,6 +458,8 @@ public sealed class WebGPUGraphCapture : IDisposable
             FusedAttentionKernel.UseStableCaptureSlots = false;
             GraphExecutor.UseCaptureParamSlots = false;
             GraphExecutor.SuppressDrains = false;
+            GraphExecutor.KeepDrainsDuringCapture = false;
+            GraphExecutor.CaptureRecordedWorkCounter = null;
             GraphCompiler.ShapeSubgraphFoldEnabled = prevFold;
             GraphExecutor.ShapeInterpElideDispatch = prevElide;
             GraphExecutor.ShapeInterpValidate = prevValidate;

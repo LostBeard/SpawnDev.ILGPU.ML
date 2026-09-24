@@ -18,6 +18,10 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.UnitTests;
 /// </summary>
 public abstract partial class MLTestBase
 {
+    // The regime DepthEstimationPipeline records DAv3 with (see WebGPUGraphCapture.KeepDrainsDuringCapture).
+    // Flip to false to reproduce the pin-everything capture and its cliff.
+    const bool SweepKeepDrains = true;
+
     [TestMethod(Timeout = 3600000, Category = "HeavyModel")]
     public async Task<string> DA3_MultiView_ScalingSweep() => await RunTest(async accelerator =>
     {
@@ -57,7 +61,7 @@ public abstract partial class MLTestBase
                 long replayMs = -1; double gpuWait = -1; long peakCapture = -1;
                 if (accelerator.AcceleratorType == AcceleratorType.WebGPU)
                 {
-                    using var cap = await WebGPUGraphCapture.TryCaptureAsync(session, feed);
+                    using var cap = await WebGPUGraphCapture.TryCaptureAsync(session, feed, keepDrains: SweepKeepDrains);
                     if (cap != null)
                     {
                         peakCapture = BufferPool.PeakTotalBytes;
@@ -91,9 +95,13 @@ public abstract partial class MLTestBase
                         replayMs = rt[1];
                     }
                 }
-                report.AppendLine($"  {n} | {directMs} | {replayMs} ({gpuWait:F0}) | {peakDirect / 1048576} / {peakCapture / 1048576}");
+                report.AppendLine($"  {n} | {directMs} | {replayMs} ({gpuWait:F0}) | {peakDirect / 1048576} / {peakCapture / 1048576}"
+                    + (accelerator.AcceleratorType == AcceleratorType.WebGPU
+                        ? $" | keepDrains={SweepKeepDrains}" : ""));
                 rows.Add(new { n, directMs, replayMs, gpuWait, peakDirectBytes = peakDirect, peakCaptureBytes = peakCapture });
-                Console.WriteLine($"[DA3-ORT] sweep {backend} N={n} direct={directMs} replay={replayMs} gpuWait={gpuWait:F0} peakMB={peakDirect / 1048576}/{peakCapture / 1048576}");
+                Console.WriteLine($"[DA3-ORT] sweep {backend} N={n} direct={directMs} replay={replayMs} gpuWait={gpuWait:F0} peakMB={peakDirect / 1048576}/{peakCapture / 1048576}"
+                    + (accelerator.AcceleratorType == AcceleratorType.WebGPU
+                        ? $" keepDrains={SweepKeepDrains}" : ""));
             }
         }
         finally { BufferPool.TrackPeaks = trackWas; }

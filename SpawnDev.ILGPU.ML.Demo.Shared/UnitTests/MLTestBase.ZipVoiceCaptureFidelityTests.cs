@@ -445,8 +445,28 @@ public abstract partial class MLTestBase
         // suspicion. ⚠️ If probing everything HEALS the real capture the way it heals the emulation, that
         // is itself the finding: the fault is an ordering hazard, and the window has to be walked back.
         Graph.GraphExecutor.NodeProbeFirst64 = new System.Collections.Generic.Dictionary<string, float[]>();
-        var capturePass = await graphs.RunDecoderAsync(
-            tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+        // Pool-ownership trace across the same call: a buffer READ while it sits in the free list
+        // (USE-AFTER-RETURN) or pooled under a name that does not own it (ALIEN-RETURN) is exactly how a
+        // replay reads another tensor's bytes while the pass it recorded read the right ones.
+        bool prevTrace = Tensors.BufferPool.TracePoolOwnership;
+        Tensors.BufferPool.ResetPoolOwnershipTrace();
+        Tensors.BufferPool.TracePoolOwnership = true;
+        WebGPUGraphCapture.DiagnoseOutputRecycling = true;
+        float[] capturePass;
+        try
+        {
+            capturePass = await graphs.RunDecoderAsync(
+                tCapture, x, encoding.TextCondition, speech, guidance, numFrames, featDim);
+        }
+        finally { Tensors.BufferPool.TracePoolOwnership = prevTrace; WebGPUGraphCapture.DiagnoseOutputRecycling = false; }
+        Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] OUTPUT RECYCLING: {WebGPUGraphCapture.LastOutputRecyclingReport ?? "(no report)"}");
+        lock (Tensors.BufferPool.PoolOwnershipViolations)
+        {
+            var v = Tensors.BufferPool.PoolOwnershipViolations;
+            Console.WriteLine($"[Benchmark] ZipVoiceFidelity [{accelerator.AcceleratorType}] POOL TRACE across the capture call "
+                + $"(KeepDrainsDuringCapture={WebGPUGraphCapture.KeepDrainsDuringCapture}): {v.Count} violation(s)"
+                + (v.Count > 0 ? " | " + string.Join(" | ", v.Take(15)) : ""));
+        }
         var realCapProbe = Graph.GraphExecutor.NodeProbeFirst64!;
         Graph.GraphExecutor.NodeProbeFirst64 = null;
         Graph.GraphExecutor.NodeProbeFromIndex = 0;

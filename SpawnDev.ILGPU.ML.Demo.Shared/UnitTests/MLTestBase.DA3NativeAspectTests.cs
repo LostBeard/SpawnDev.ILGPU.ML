@@ -199,30 +199,35 @@ public abstract partial class MLTestBase
             int n = shape[1], h = shape[3], w = shape[4];
             var frames = new List<int[]>(); var ws = new List<int>(); var hs = new List<int>();
             for (int v = 0; v < n; v++) { var (p, sw, sh) = await Rgba(name, v, c); frames.Add(p); ws.Add(sw); hs.Add(sh); }
-            using var mv = await pipe.EstimateMultiViewGpuAsync(frames, ws, hs, w, h);
             var depthRef = await F32(http, $"test-refs/dav3/{name}.predicted_depth.f32");
-            for (int v = 0; v < n; v++)
-                Gate($"{name}/v{v}", await mv.Views[v].RawDepth.View.CopyToHostAsync(), depthRef.AsSpan(v * w * h, w * h), Da3DepthRelRmsGate);
-            // The gate must be able to fail: view 0 against view 1's reference.
-            var (relX, _, _) = Da3Compare(await mv.Views[0].RawDepth.View.CopyToHostAsync(), depthRef.AsSpan(w * h, w * h));
-            if (relX <= Da3DepthRelRmsGate) failures.Add($"{name}: view 0 vs view 1's reference PASSED - gate cannot discriminate");
-
-            foreach (var (outName, per, got) in new[] { ("extrinsics", 12, mv.Extrinsics), ("intrinsics", 9, mv.Intrinsics) })
+            // Pass 0 runs direct; the joint path captures only when a shape REPEATS, so pass 1 records and
+            // replays and pass 2 is a pure replay. All three must match onnxruntime.
+            for (int pass = 0; pass < 3; pass++)
             {
-                if (got == null) { failures.Add($"{name}: {outName} missing"); continue; }
-                var r = await F32(http, $"test-refs/dav3/{name}.{outName}.f32");
-                double maxAbs = 0, refMax = 0;
+                using var mv = await pipe.EstimateMultiViewGpuAsync(frames, ws, hs, w, h);
                 for (int v = 0; v < n; v++)
-                    for (int k = 0; k < per; k++)
-                    {
-                        maxAbs = Math.Max(maxAbs, Math.Abs(got[v][k] - r[v * per + k]));
-                        refMax = Math.Max(refMax, Math.Abs(r[v * per + k]));
-                    }
-                double rel = maxAbs / Math.Max(1e-12, refMax);
-                report.Append($"{name}.{outName} rel={rel:E1}; ");
-                // Preprocessing differs from the reference by the odd uint8 LSB, which the camera
-                // heads see as input noise: 10x the tensor-identical parity gate.
-                if (!(rel <= 10 * Da3CameraRelGate)) failures.Add($"{name}.{outName}: max|diff| {rel:E2} of max|ref|");
+                    Gate($"{name}#{pass}/v{v}", await mv.Views[v].RawDepth.View.CopyToHostAsync(), depthRef.AsSpan(v * w * h, w * h), Da3DepthRelRmsGate);
+                // The gate must be able to fail: view 0 against view 1's reference.
+                var (relX, _, _) = Da3Compare(await mv.Views[0].RawDepth.View.CopyToHostAsync(), depthRef.AsSpan(w * h, w * h));
+                if (relX <= Da3DepthRelRmsGate) failures.Add($"{name}: view 0 vs view 1's reference PASSED - gate cannot discriminate");
+
+                foreach (var (outName, per, got) in new[] { ("extrinsics", 12, mv.Extrinsics), ("intrinsics", 9, mv.Intrinsics) })
+                {
+                    if (got == null) { failures.Add($"{name}#{pass}: {outName} missing"); continue; }
+                    var r = await F32(http, $"test-refs/dav3/{name}.{outName}.f32");
+                    double maxAbs = 0, refMax = 0;
+                    for (int v = 0; v < n; v++)
+                        for (int k = 0; k < per; k++)
+                        {
+                            maxAbs = Math.Max(maxAbs, Math.Abs(got[v][k] - r[v * per + k]));
+                            refMax = Math.Max(refMax, Math.Abs(r[v * per + k]));
+                        }
+                    double rel = maxAbs / Math.Max(1e-12, refMax);
+                    report.Append($"{name}#{pass}.{outName} rel={rel:E1}; ");
+                    // Preprocessing differs from the reference by the odd uint8 LSB, which the camera
+                    // heads see as input noise: 10x the tensor-identical parity gate.
+                    if (!(rel <= 10 * Da3CameraRelGate)) failures.Add($"{name}#{pass}.{outName}: max|diff| {rel:E2} of max|ref|");
+                }
             }
         }
 

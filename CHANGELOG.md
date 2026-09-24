@@ -2,6 +2,36 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## Unreleased - WebGPU capture that fits: DAv3 joint multi-view replays in 0.4 s, not 6.4 s
+
+**A WebGPU graph capture pinned every intermediate of the graph for the plan's lifetime.** The capture pass
+suppresses drains, and immediate buffer return is CUDA-only, so nothing released during the recorded forward
+was recycled. MEASURED 2026-09-23, DAv3 @518 on a 12 GB RTX 4070 (`DA3_MultiView_ScalingSweep`): capture pool
+peak 3.9 / 7.4 / 8.3 / 14.3 / 16.1 GB at 1-6 views against a plain forward's 0.8-2.7 GB; replay 55 / 107 / 164 ms
+at 1-3 views, then **7.5 s at 4** - VRAM pinned at the ceiling, GPU 6-33% busy (WDDM paging). CUDA's capture peak
+equals its direct peak. In a full WebGPU gate the old regime also lost the device on SD-Turbo's capture.
+
+- `WebGPUGraphCapture.TryCaptureAsync(..., keepDrains: true)` keeps a normal forward's periodic drains (deferred
+  release) in the capture pass - the reuse schedule already proven by every plain forward. A drain inside the
+  recording window is legal on WebGPU. Outputs of a node that recorded NO GPU work in the pass (bytes the plan
+  will never reproduce) are pinned for the pass (`GraphExecutor.CaptureRecordedWorkCounter`).
+  Result: peak 1.1-3.5 GB, replay **55 / 105 / 162 / 233 / 309 / 392 ms** at 1-6 views (Transformers.js: 598 ms
+  at 6 views; our CUDA: 705 ms).
+- **Opt-in, OFF by default** (`WebGPUGraphCapture.KeepDrainsDuringCapture`). `DepthEstimationPipeline` opts in;
+  its replay is gated bit-exact vs onnxruntime. ZipVoice's fm_decoder replays WRONG with it (16,900 of 16,900)
+  and right without. Ruled out by measurement (`DiagnoseOutputRecycling`): its output's buffer is never
+  returned in the capture pass, and no node-level buffer is read before it is written. Remaining suspect:
+  operator-INTERNAL temps rented under colliding names (201 ALIEN-RETURNs per capture - `_mmi_*`,
+  DynamicQuantize temps; BufferPool's documented, unfixed name-ownership leak). Fix that before widening.
+- `DepthEstimationPipeline.EstimateMultiViewGpuAsync` now captures too (it ran every joint pass direct:
+  ~3.4 s at 6 views @518). Separate capture slot from single view, and a joint shape is captured only when it
+  REPEATS (recording costs ~3 forwards; a one-off shape runs direct). SpawnScene's chunked passes repeat one
+  shape.
+- Gates: `DA3_NativeAspect_Pipeline_MatchesOrt` now runs each joint case three times (direct, record+replay,
+  replay) against onnxruntime; `DA3_OrtParity_*` checks the replay path at every shape. WebGPU/CUDA/OpenCL:
+  53 passed, 0 DAv3 failures. ZipVoice (default regime) 5/5 alone; its full-gate failures are ORDER effects
+  present on the prior commit too (a Reshape resolves [1748,437] for a [669,669] bias after other models ran).
+
 ## Unreleased - DepthResizeMode.NativeAspect: Depth Anything 3's own preprocessing, on the device
 
 `DepthEstimationPipeline.ResizeMode = DepthResizeMode.NativeAspect` (opt-in; `Letterbox` stays the default)

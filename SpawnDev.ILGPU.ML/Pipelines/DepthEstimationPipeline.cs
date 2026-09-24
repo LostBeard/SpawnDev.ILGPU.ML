@@ -139,10 +139,89 @@ public class DepthEstimationPipeline : IDisposable
     // sat unused (Captain's rule: if it should always be on, it lives in the pipeline). Opt OUT for
     // one-shot workloads where the first-capture warmup (a few forwards) outweighs the replay win.
     // CUDA + WebGPU; no-op elsewhere. Bit-exactness gated (video gate + Captured_518_MatchesHost).
-    private CudaGraphCapture? _capture;
-    private WebGPUGraphCapture? _webGpuCapture;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _captureInputBuf;
-    private int[]? _captureShape;
+    /// <summary>
+    /// One captured plan and the STABLE input buffer it reads, for one input shape. Single-view and joint
+    /// multi-view keep separate slots so alternating between them does not re-record either plan.
+    /// </summary>
+    private sealed class CaptureSlot : IDisposable
+    {
+        public CudaGraphCapture? Cuda;
+        public WebGPUGraphCapture? WebGpu;
+        public int[]? Shape;
+        public int[]? LastDirectShape;   // capture-on-repeat: the shape of the previous uncaptured call
+        public MemoryBuffer1D<float, Stride1D.Dense>? Input;
+        public void DropPlans() { Cuda?.Dispose(); Cuda = null; WebGpu?.Dispose(); WebGpu = null; Shape = null; }
+        public void Dispose() { DropPlans(); Input?.Dispose(); Input = null; }
+    }
+    private readonly CaptureSlot _singleSlot = new();
+    private readonly CaptureSlot _multiSlot = new();
+
+    private bool UseCapture => EnableGraphCapture
+        && (_accelerator.AcceleratorType == AcceleratorType.Cuda || _accelerator.AcceleratorType == AcceleratorType.WebGPU);
+
+    /// <summary>The slot's stable input buffer, grown if needed (growing drops its plans: they read the old one).</summary>
+    private async Task<ArrayView1D<float, Stride1D.Dense>> SlotInputAsync(CaptureSlot slot, int elems)
+    {
+        if (slot.Input != null && slot.Input.Length < elems)
+        {
+            // Bigger than any input before: the recorded plans read the old stable buffer, so they go with it.
+            // Drain first - a replay may still be reading it.
+            await _accelerator.SynchronizeAsync().ConfigureAwait(false);
+            slot.DropPlans();
+            slot.Input.Dispose(); slot.Input = null;
+        }
+        slot.Input ??= _accelerator.Allocate1D<float>(elems);
+        return slot.Input.View.SubView(0, elems);
+    }
+
+    /// <summary>
+    /// Forward through the slot's captured plan (capture on first use at a shape, replay after), or a plain
+    /// forward when capture is unavailable. <c>Own</c> = the outputs are pool-rented and must be handed back
+    /// with ReturnOutputs; a replay's outputs belong to the capture.
+    /// </summary>
+    private async Task<(Dictionary<string, Tensor> Outputs, bool Own)> RunWithSlotAsync(
+        CaptureSlot slot, Dictionary<string, Tensor> inputDict, int[] shape, bool captureOnFirstUse = true)
+    {
+        // Recording costs ~3 forwards (two warm passes + the recorded one). With captureOnFirstUse off, a shape
+        // runs direct the first time and is captured only when it comes back - a one-off shape never pays.
+        bool planMatches = slot.Shape != null && shape.AsSpan().SequenceEqual(slot.Shape);
+        if (!captureOnFirstUse && !planMatches
+            && (slot.LastDirectShape == null || !shape.AsSpan().SequenceEqual(slot.LastDirectShape)))
+        {
+            slot.LastDirectShape = (int[])shape.Clone();
+            return (await _session.RunAsync(inputDict), true);
+        }
+        slot.LastDirectShape = null;
+        if (_accelerator.AcceleratorType == AcceleratorType.Cuda)
+        {
+            if (slot.Cuda == null || slot.Shape == null || !shape.AsSpan().SequenceEqual(slot.Shape))
+            {
+                slot.DropPlans();
+                slot.Cuda = await CudaGraphCapture.TryCaptureAsync(_session, inputDict);   // first run at this shape
+                slot.Shape = shape;
+            }
+            return slot.Cuda != null
+                ? (await slot.Cuda.ReplayAsync(inputDict), false)
+                : (await _session.RunAsync(inputDict), true);
+        }
+        // WebGPU. Same gate SessionGraphCapture applies: a pool reclaim since recording leaves this plan's bind
+        // groups pointing at disposed buckets. Drop and recapture rather than submit garbage.
+        if (slot.WebGpu != null && slot.WebGpu.InvalidatedByReclaim) slot.DropPlans();
+        if (slot.WebGpu == null || slot.Shape == null || !shape.AsSpan().SequenceEqual(slot.Shape))
+        {
+            slot.DropPlans();
+            // keepDrains: DAv3's capture recycles buffers on a plain forward's schedule instead of pinning every
+            // intermediate - 16 GB -> 2.7 GB at 6 views @518 and 6.4 s -> 0.4 s replays on a 12 GB card. Gated
+            // bit-exact vs onnxruntime by DA3_OrtParity_* / DA3_NativeAspect_Pipeline_MatchesOrt (replay path).
+            slot.WebGpu = await WebGPUGraphCapture.TryCaptureAsync(_session, inputDict, keepDrains: true);
+            slot.Shape = shape;
+        }
+        // inputDict wraps the SAME stable buffer the capture reads (fresh data written by the preprocess
+        // dispatch), so ReplayAsync's same-buffer check skips the input copy.
+        return slot.WebGpu != null
+            ? (await slot.WebGpu.ReplayAsync(inputDict), false)
+            : (await _session.RunAsync(inputDict), true);
+    }
 
     /// <summary>Underlying session — diagnostics (weight presence) and advanced callers.</summary>
     public InferenceSession Session => _session;
@@ -157,9 +236,8 @@ public class DepthEstimationPipeline : IDisposable
     /// </summary>
     public long ReleaseWorkingMemory()
     {
-        _capture?.Dispose(); _capture = null;
-        _webGpuCapture?.Dispose(); _webGpuCapture = null;
-        _captureShape = null;
+        _singleSlot.DropPlans();
+        _multiSlot.DropPlans();
         return _session.ReleaseWorkingMemory();
     }
 
@@ -534,28 +612,13 @@ public class DepthEstimationPipeline : IDisposable
         // writes fresh data into that stable buffer and is queue-ordered before the replay's submit, so the
         // replay reads the new frame with NO extra copy. Falls back to a normal forward on other backends or
         // if capture is unavailable (TryCaptureAsync returns null). Non-capture path uses a transient input.
-        bool useCapture = EnableGraphCapture
-            && (_accelerator.AcceleratorType == AcceleratorType.Cuda
-                || _accelerator.AcceleratorType == AcceleratorType.WebGPU);
+        bool useCapture = UseCapture;
         var (inW, inH) = ModelInputSize(width, height);
         int inElems = 3 * inW * inH;
         MemoryBuffer1D<float, Stride1D.Dense>? transientInput = null;
         ArrayView1D<float, Stride1D.Dense> preInput;
         if (useCapture)
-        {
-            if (_captureInputBuf != null && _captureInputBuf.Length < inElems)
-            {
-                // A NativeAspect picture bigger than any before: the recorded plans read the old stable
-                // buffer, so they go with it. Drain first - a replay may still be reading it.
-                await _accelerator.SynchronizeAsync().ConfigureAwait(false);
-                _capture?.Dispose(); _capture = null;
-                _webGpuCapture?.Dispose(); _webGpuCapture = null;
-                _captureShape = null;
-                _captureInputBuf.Dispose(); _captureInputBuf = null;
-            }
-            _captureInputBuf ??= _accelerator.Allocate1D<float>(inElems);
-            preInput = _captureInputBuf.View.SubView(0, inElems);
-        }
+            preInput = await SlotInputAsync(_singleSlot, inElems).ConfigureAwait(false);
         else
         {
             transientInput = _accelerator.Allocate1D<float>(inElems);
@@ -570,41 +633,8 @@ public class DepthEstimationPipeline : IDisposable
         // capture replay writes into the plan's fixed buffers, which the capture owns.
         Dictionary<string, Tensor> outputs;
         bool ownOutputs;
-        if (useCapture && _accelerator.AcceleratorType == AcceleratorType.Cuda)
-        {
-            var shape = inputTensor.Shape;
-            if (_capture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
-            {
-                _capture?.Dispose();
-                _capture = await CudaGraphCapture.TryCaptureAsync(_session, inputDict);   // first frame at this resolution
-                _captureShape = shape;
-            }
-            ownOutputs = _capture == null;
-            outputs = _capture != null ? await _capture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
-        }
-        else if (useCapture)   // WebGPU
-        {
-            var shape = inputTensor.Shape;
-            // Same gate SessionGraphCapture now applies: a pool reclaim since recording leaves this plan's
-            // bind groups pointing at disposed buckets. Drop and recapture rather than submit garbage
-            // (or hit the ReplayAsync InvalidatedByReclaim throw).
-            if (_webGpuCapture != null && _webGpuCapture.InvalidatedByReclaim)
-            {
-                _webGpuCapture.Dispose();
-                _webGpuCapture = null;
-                _captureShape = null;
-            }
-            if (_webGpuCapture == null || _captureShape == null || !shape.AsSpan().SequenceEqual(_captureShape))
-            {
-                _webGpuCapture?.Dispose();
-                _webGpuCapture = await WebGPUGraphCapture.TryCaptureAsync(_session, inputDict);   // first frame at this resolution
-                _captureShape = shape;
-            }
-            // inputDict wraps the SAME stable buffer the capture reads (fresh frame written by the
-            // preprocess dispatch above), so ReplayAsync's same-buffer check skips the input copy.
-            ownOutputs = _webGpuCapture == null;
-            outputs = _webGpuCapture != null ? await _webGpuCapture.ReplayAsync(inputDict) : await _session.RunAsync(inputDict);
-        }
+        if (useCapture)
+            (outputs, ownOutputs) = await RunWithSlotAsync(_singleSlot, inputDict, inputTensor.Shape).ConfigureAwait(false);
         else
         {
             outputs = await _session.RunAsync(inputDict);
@@ -685,7 +715,7 @@ public class DepthEstimationPipeline : IDisposable
     /// <summary>
     /// Joint multi-view depth (DAv3-native): pack N RGBA frames into <c>[1,N,3,H,W]</c>, run one forward,
     /// return per-view GPU depth maps plus optional confidence / extrinsics / intrinsics by output name.
-    /// Graph capture is skipped (N varies). Session shape-recompile handles N ≠ compile-time num_images.
+    /// Captured per (N, H, W) like the single-view path (own slot). Session shape-recompile handles N ≠ compile-time num_images.
     /// </summary>
     /// <param name="frames">Packed RGBA int buffers, one per view (same layout as monocular EstimateGpuRaw).</param>
     /// <param name="widths">Source width per view.</param>
@@ -718,16 +748,34 @@ public class DepthEstimationPipeline : IDisposable
         }
 
         int chw = 3 * inW * inH;
-        using var stacked = _accelerator.Allocate1D<float>(n * (long)chw);
+        // The joint pass captures too, once per (N, H, W): SpawnScene's chunked passes repeat one shape, and a
+        // direct forward pays ~2,500 per-node dispatch crossings - MEASURED 2026-09-23, 6 views @518 on WebGPU:
+        // direct 3.4 s, replay 0.4 s (Transformers.js 0.6 s). Own slot, so single-view calls do not evict it.
+        bool useCapture = UseCapture;
+        MemoryBuffer1D<float, Stride1D.Dense>? transientStacked = null;
+        ArrayView1D<float, Stride1D.Dense> stackedView;
+        if (useCapture)
+            stackedView = await SlotInputAsync(_multiSlot, n * chw).ConfigureAwait(false);
+        else
+        {
+            transientStacked = _accelerator.Allocate1D<float>(n * (long)chw);
+            stackedView = transientStacked.View;
+        }
         for (int i = 0; i < n; i++)
-            await PreprocessAsync(frames[i], widths[i], heights[i], stacked.View.SubView(i * chw, chw)).ConfigureAwait(false);
+            await PreprocessAsync(frames[i], widths[i], heights[i], stackedView.SubView(i * chw, chw)).ConfigureAwait(false);
 
         var inputShape = new[] { 1, n, 3, inH, inW };
-        var inputTensor = new Tensor(stacked.View, inputShape);
-        var outputs = await _session.RunAsync(new Dictionary<string, Tensor>
+        var inputTensor = new Tensor(stackedView, inputShape);
+        var mvInputs = new Dictionary<string, Tensor> { [_session.InputNames[0]] = inputTensor };
+        Dictionary<string, Tensor> outputs;
+        bool ownOutputs;
+        if (useCapture)
+            (outputs, ownOutputs) = await RunWithSlotAsync(_multiSlot, mvInputs, inputShape, captureOnFirstUse: false).ConfigureAwait(false);
+        else
         {
-            [_session.InputNames[0]] = inputTensor
-        }).ConfigureAwait(false);
+            outputs = await _session.RunAsync(mvInputs).ConfigureAwait(false);
+            ownOutputs = true;
+        }
         await _accelerator.SynchronizeAsync().ConfigureAwait(false);
 
         var depthTensor = FindOutput(outputs, "predicted_depth")
@@ -755,7 +803,9 @@ public class DepthEstimationPipeline : IDisposable
         // Every output has been split into caller-owned per-view buffers or read to the host above.
         // Without this, each joint pass left its predicted_depth + confidence (two 16 MiB buckets at
         // N=6, 672x672) orphaned in the pool: +90 MB per pass on DrJohnson, MEASURED 2026-09-23.
-        _session.ReturnOutputs(outputs);
+        // (A replay's outputs belong to the capture and are not handed back.)
+        if (ownOutputs) _session.ReturnOutputs(outputs);
+        transientStacked?.Dispose();   // drained above (SynchronizeAsync + per-view readbacks)
 
         return new MultiViewDepthGpuResult
         {
@@ -981,12 +1031,8 @@ public class DepthEstimationPipeline : IDisposable
 
     public void Dispose()
     {
-        _capture?.Dispose();
-        _capture = null;
-        _webGpuCapture?.Dispose();
-        _webGpuCapture = null;
-        _captureInputBuf?.Dispose();
-        _captureInputBuf = null;
+        _singleSlot.Dispose();
+        _multiSlot.Dispose();
         _nativeScratch?.Dispose();
         _nativeScratch = null;
         _postprocess.Dispose();

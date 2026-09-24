@@ -156,6 +156,12 @@ public class BufferPool : IDisposable
     /// view. Off by default (a library never logs unconditionally).</summary>
     public static bool TracePoolOwnership
         = Environment.GetEnvironmentVariable("ML_TRACE_POOL") is "1" or "true";
+    /// <summary>
+    /// DIAGNOSTIC: when non-null, every <see cref="Return"/>/<see cref="ReturnHalf"/> appends (name, the buffer it
+    /// put in the free list, node index). Lets a capture name WHICH release recycled a buffer an output views.
+    /// </summary>
+    public static List<(string Name, MemoryBuffer Buffer, int Node)>? ReturnLog;
+
     /// <summary>Every ownership violation seen since the last <see cref="ResetPoolOwnershipTrace"/>, in order.
     /// Non-empty after a run = the pool handed the same buffer to two live tensors.</summary>
     public static readonly List<string> PoolOwnershipViolations = new();
@@ -651,6 +657,7 @@ public class BufferPool : IDisposable
                                   $"(node {Graph.GraphExecutor.CurrentRunNodeIndex}, ownAlreadyFree={IsBufferFree(actual)})");
             }
             _namedBuffers.Remove(name);
+            ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
             int bucketSize = (int)buffer.Length;
             if (!_buckets.TryGetValue(bucketSize, out var stack))
             {
@@ -728,6 +735,7 @@ public class BufferPool : IDisposable
                                   $"- {Bid(buffer)} goes into the free bucket while STILL LIVE (node {Graph.GraphExecutor.CurrentRunNodeIndex})");
             }
             _halfNamedBuffers.Remove(name);
+            ReturnLog?.Add((name, buffer, Graph.GraphExecutor.CurrentRunNodeIndex));
             int bucketSize = (int)buffer.Length;
             if (!_halfBuckets.TryGetValue(bucketSize, out var stack))
             {

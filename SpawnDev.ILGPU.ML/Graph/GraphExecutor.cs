@@ -601,6 +601,54 @@ public class GraphExecutor : IDisposable
     /// </remarks>
     public static bool CaptureImmediateReturn = true;
 
+    /// <summary>
+    /// Set by <see cref="WebGPUGraphCapture"/> around its capture pass: keep the periodic drains (and so the
+    /// deferred buffer release) of a normal forward, instead of skipping them like CUDA's capture must.
+    /// Default false - CUDA capture and <see cref="WebGPUDecodeCapture"/> are unchanged.
+    /// </summary>
+    /// <remarks>
+    /// 🔴 WITHOUT THEM A WEBGPU CAPTURE PINS EVERY INTERMEDIATE OF THE GRAPH. The capture pass sets
+    /// <see cref="SuppressDrains"/>, and immediate return is CUDA-only (it corrupted ZipVoice's WebGPU
+    /// capture pass, see the <c>captureImmediate</c> note), so with no drain nothing released during the
+    /// recorded forward was ever recycled. MEASURED 2026-09-23, DAv3 at 518 (DA3_MultiView_ScalingSweep,
+    /// RTX 4070 12 GB): pool peak during capture 3.9 / 7.4 / 8.3 / 14.3 / 16.1 GB at 1-6 views against a
+    /// direct forward's 0.8-2.7 GB, and the replay went from ~55 ms per view to 7.5 s the moment the plan
+    /// no longer fit - VRAM pinned at the ceiling, GPU 6-33% busy (WDDM paging). CUDA's capture peak equals
+    /// its direct peak.
+    /// <para>
+    /// A drain inside the recording window is legal on WebGPU (it is a submit-and-wait; the plan records
+    /// pipelines, bind groups and dimensions, not encoder boundaries - the final-sync note below measured
+    /// exactly this). With the drains, the capture pass recycles buffers on the SAME schedule as a plain
+    /// forward - release only after the GPU has finished with them - rather than the immediate reuse that
+    /// corrupted ZipVoice. The replay then re-issues that schedule in order.
+    /// </para>
+    /// <para>
+    /// ⚠️ Still NOT safe for every graph: ZipVoice's fm_decoder replays wrong with it too, which is why it is
+    /// opt-in per capture - see <see cref="WebGPUGraphCapture.KeepDrainsDuringCapture"/> for what has been
+    /// measured and ruled out.
+    /// </para>
+    /// </remarks>
+    public static bool KeepDrainsDuringCapture;
+
+    /// <summary>
+    /// Set by <see cref="WebGPUGraphCapture"/> alongside <see cref="KeepDrainsDuringCapture"/>: the recording
+    /// plan's work count (dispatches + copies + clears). A node across which it does not move RECORDED
+    /// NOTHING - its output holds bytes the plan will never reproduce (a value already sitting in a buffer
+    /// when recording began: an If constant branch, a cached value). Such outputs are PINNED for the pass -
+    /// never recycled inside the plan - because a later recorded write into that buffer would be replayed
+    /// before every read of it after the first. Everything the plan does write recycles normally.
+    /// </summary>
+    public static Func<int>? CaptureRecordedWorkCounter;
+
+    /// <summary>
+    /// DIAGNOSTIC (capture pass with <see cref="CaptureRecordedWorkCounter"/> set): when non-null, every node
+    /// that recorded work appends its input and output tensor names and the buffers they view, in execution
+    /// order. <see cref="WebGPUGraphCapture"/> turns it into a READ-BEFORE-WRITE report: a buffer the plan
+    /// reads before it first writes it holds bytes from OUTSIDE the plan, and a later write into it in the
+    /// same plan is replayed before every read after the first.
+    /// </summary>
+    public static List<(int Node, string Op, string[] InNames, MemoryBuffer?[] InBufs, string[] OutNames, MemoryBuffer?[] OutBufs)>? CaptureAccessLog;
+
 
     /// <summary>
     /// DIAGNOSTIC: when non-null, records the first up-to-64 floats of every node's first output, keyed by
@@ -2823,6 +2871,63 @@ public class GraphExecutor : IDisposable
         var halfTensors = new Dictionary<string, HalfTensor>();
         var pendingHalfReleases = new List<HalfTensor>();
 
+        // Capture pass keeping its drains: outputs of nodes that recorded no GPU work (see
+        // CaptureRecordedWorkCounter). Null outside that regime, so a normal forward is untouched.
+        var pinCounter = SuppressDrains && KeepDrainsDuringCapture ? CaptureRecordedWorkCounter : null;
+        var capturePinned = new HashSet<string>();
+        CompiledNode? pinPrevNode = null;
+        int pinPrevMark = 0;
+        long pinnedBytesFloor = 0;
+        MemoryBuffer? BufOf(string name)
+        {
+            try
+            {
+                if (tensors.TryGetValue(name, out var t)) return ((IArrayView)t.Data).Buffer;
+                if (halfTensors.TryGetValue(name, out var h)) return ((IArrayView)h.Data).Buffer;
+            }
+            catch { }
+            return null;
+        }
+        void ClassifyForCapture(CompiledNode n, int markAtStart)
+        {
+            if (pinCounter!() != markAtStart)
+            {
+                // the node recorded work: its outputs are replayed
+                if (CaptureAccessLog is { } log)
+                {
+                    var ins = n.InputNames.Where(x => !string.IsNullOrEmpty(x)).ToArray();
+                    var outs = n.OutputNames.Where(x => !string.IsNullOrEmpty(x)).ToArray();
+                    log.Add((nodeIdx - 1, n.OpType, ins, ins.Select(BufOf).ToArray(), outs, outs.Select(BufOf).ToArray()));
+                }
+                return;
+            }
+            foreach (var outName in n.OutputNames)
+            {
+                if (string.IsNullOrEmpty(outName)) continue;
+                MemoryBuffer? outBuf = null;
+                try
+                {
+                    if (tensors.TryGetValue(outName, out var ot)) outBuf = ((IArrayView)ot.Data).Buffer;
+                    else if (halfTensors.TryGetValue(outName, out var oh)) outBuf = ((IArrayView)oh.Data).Buffer;
+                }
+                catch { }
+                if (outBuf == null) continue;   // not a GPU tensor (CPU-resolved / elided): nothing to pin
+                // A zero-copy view of an input is exactly as replayable as that input.
+                string? aliasOf = null;
+                foreach (var inName in n.InputNames)
+                {
+                    if (string.IsNullOrEmpty(inName)) continue;
+                    try
+                    {
+                        if (tensors.TryGetValue(inName, out var it) && ReferenceEquals(((IArrayView)it.Data).Buffer, outBuf)) { aliasOf = inName; break; }
+                        if (halfTensors.TryGetValue(inName, out var ih) && ReferenceEquals(((IArrayView)ih.Data).Buffer, outBuf)) { aliasOf = inName; break; }
+                    }
+                    catch { }
+                }
+                if (aliasOf == null || capturePinned.Contains(aliasOf)) capturePinned.Add(outName);
+            }
+        }
+
         // Decrement each consumed input's refcount and, when it hits zero, defer-release its buffer (low-p or
         // fp32) until the next drain (ordered, browser-safe). Shared by the normal fp32 path and the F16
         // precision-aware pass-through below — single source of truth for input lifetime.
@@ -2913,8 +3018,9 @@ public class GraphExecutor : IDisposable
         {
             // CUDA-graph capture records this forward; a synchronize would abort the capture. The
             // captured forward is warm, so skipping the drain leaks no buffers within the single pass.
-            if (SuppressDrains) return;
-            if (nodeIdx % EffectiveSyncInterval == 0 || pendingReleaseBytes >= EffectiveMaxPendingReleaseBytes)
+            // A WebGPU forward capture keeps its drains - see KeepDrainsDuringCapture.
+            if (SuppressDrains && !KeepDrainsDuringCapture) return;
+            if (nodeIdx % EffectiveSyncInterval == 0 || pendingReleaseBytes - pinnedBytesFloor >= EffectiveMaxPendingReleaseBytes)
             {
                 _drainSw.Restart();
                 try { await _accelerator.SynchronizeAsync(); }
@@ -2929,6 +3035,29 @@ public class GraphExecutor : IDisposable
                 }
                 _drainSw.Stop(); LastRunSyncDrainCount++; LastRunSyncDrainMs += _drainSw.Elapsed.TotalMilliseconds;
                 // Now safe to return deferred buffers — GPU has finished reading them
+                if (pinCounter != null && capturePinned.Count > 0)
+                {
+                    // Pinned buffers stay out of the pool until the end of the forward (the final release
+                    // returns them, as it always has); the byte counter is left at their total so the cap
+                    // still reflects what is pending.
+                    var keep = new List<Tensor>(); var keepH = new List<HalfTensor>(); long keepBytes = 0;
+                    foreach (var t in pendingReleases)
+                        if (t.Name != null && capturePinned.Contains(t.Name)) { keep.Add(t); keepBytes += (long)t.ElementCount * sizeof(float); }
+                        else _pool.Return(t);
+                    foreach (var h in pendingHalfReleases)
+                        if (h.Name != null && capturePinned.Contains(h.Name)) { keepH.Add(h); keepBytes += (long)h.ElementCount * 2; }
+                        else _pool.ReturnHalf(h);
+                    pendingReleases.Clear(); pendingReleases.AddRange(keep);
+                    pendingHalfReleases.Clear(); pendingHalfReleases.AddRange(keepH);
+                    LastRunDeferredReleaseBytes += pendingReleaseBytes - keepBytes;
+                    if (pendingReleaseBytes > LastRunPeakPendingReleaseBytes)
+                        LastRunPeakPendingReleaseBytes = pendingReleaseBytes;
+                    pendingReleaseBytes = keepBytes;
+                    // Pinned bytes are permanent for this pass: without discounting them a pinned set above
+                    // the cap would force a drain after every node.
+                    pinnedBytesFloor = keepBytes;
+                    return;
+                }
                 foreach (var t in pendingReleases)
                     _pool.Return(t);
                 foreach (var h in pendingHalfReleases)
@@ -2998,6 +3127,14 @@ public class GraphExecutor : IDisposable
         foreach (var node in _graph.Nodes)
         {
             CurrentRunNodeIndex = nodeIdx;   // published for BufferPool reclaim attribution (see CurrentRunNodeIndex doc)
+            if (pinCounter != null)
+            {
+                // The previous node has finished (every path ends it before the next iteration); its
+                // consumers release its outputs later, so classifying here always precedes their recycling.
+                if (pinPrevNode != null) ClassifyForCapture(pinPrevNode, pinPrevMark);
+                pinPrevNode = node;
+                pinPrevMark = pinCounter();
+            }
             // DIAGNOSTIC (CaptureTraceFile): append+flush BEFORE any per-node work so a native fault
             // (access violation / driver fault, uncatchable) on ANY path — elided, view, f16, or real
             // dispatch — leaves this node as the file's last line. See CaptureTraceFile doc.
@@ -4020,6 +4157,7 @@ public class GraphExecutor : IDisposable
                     for (int d = 0; d < rshape.Length; d++) if (rshape[d] <= 0) rshape[d] = 1;
                     if (TensorHelpers.ElementCount(rshape) == src.ElementCount && _pool.Rename(srcName, outName))
                     {
+                        if (capturePinned.Contains(srcName)) capturePinned.Add(outName);   // same buffer, same replayability
                         tensors[outName] = new Tensor(src.Data, rshape, outName);
                         tensors.Remove(srcName);
                         refCounts[srcName] = 0;   // buffer handed off to outName; never re-release srcName
