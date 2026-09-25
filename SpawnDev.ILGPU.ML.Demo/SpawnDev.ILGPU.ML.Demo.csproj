@@ -24,8 +24,8 @@
 	</ItemGroup>
 
 	<ItemGroup>
-		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.4" />
-		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="10.0.4" PrivateAssets="all" />
+		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly" Version="10.0.12" />
+		<PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.DevServer" Version="10.0.12" PrivateAssets="all" />
 		<!-- Direct ref so the whole graph (incl. WebTorrent's lower transitive pin) resolves UP to the
 		     current AsyncFileSystem: the WebTorrent download store needs a Uint8Array-capable FS for its
 		     zero-copy path. 2.2.0 also pins SpawnJS 2.1.17, matching the rest of the chain - an older
@@ -37,7 +37,7 @@
 		     fell back to the 128 MiB default. It must now also be >= the version SpawnDev.ILGPU.ML requires
 		     (2.1.15 introduced OPFSStream, which OpfsModelCache delivers models through), or NuGet fails the
 		     build with an NU1605 downgrade rather than silently resolving low. -->
-		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.17" />
+		<PackageReference Include="SpawnDev.SpawnJS" Version="2.1.19" />
 	</ItemGroup>
 
 	<ItemGroup>
