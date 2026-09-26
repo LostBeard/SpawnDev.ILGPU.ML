@@ -7,7 +7,7 @@ Native GPU neural-network inference for .NET / Blazor WebAssembly, built on Spaw
 | Doc | What it covers |
 |-----|----------------|
 | [**DEMO_AND_MODEL_STATUS.md**](DEMO_AND_MODEL_STATUS.md) | **Source of truth for what actually works.** Per-demo VERIFIED / PARTIAL / WIP status with the test that proves each one. Read this before trusting any "it works" claim elsewhere. |
-| [**system-one.md**](system-one.md) | **System One decision heads** — typed choice/score/noul over float state, training, masks, weight save/load, Classic Snake demo |
+| [**system-one.md**](system-one.md) | **System One decision heads** — package API (choice/score/noul, masks, weights) + Classic Snake **demo** reference (`SnakeSystemOneSpec` is not NuGet) |
 | [`../README.md`](../README.md) | Project overview, quick start, API, supported backends |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | Release-accurate fixes per version (often the most candid record) |
 | [`../Plans/`](../Plans/) | Engineering roadmaps and design notes |

@@ -6,7 +6,7 @@
 <PageTitle>System One Snake — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="System One Snake"
-            Description="A local System One decision head (probabilities, no text generation) plays Classic Snake on your GPU. Safe teacher + legal-action masking — inspired by the Jev/Laya category, not a Laya weight port."
+            Description="A local System One decision head (probabilities, no text generation) plays Classic Snake on your GPU. Safe teacher + legal-action masking — inspired by the Jev/Laya category, not a Laya weight port. Snake helpers are demo-only; the NuGet API is generic SystemOneDecisionHead."
             Status="@DemoLayout.DemoStatus.Beta"
             StatusMessage="Trains on-device from a flood-fill safe teacher (anti-stall hunger). Illegal moves masked; trained head cached in localStorage."
             AvailableBackends="@_backends"
@@ -113,7 +113,7 @@
     </div>
 
     <PipelineHowTo OurCode="@_howToCs"
-                   DocsNote="System One returns structured probabilities — it never generates text." />
+                   DocsNote="SystemOneDecisionHead is in the NuGet package (typed probs, no text). Snake dims, teacher, and trainer stay in Demo.Shared — Docs/system-one.md." />
 
 </DemoLayout>
 

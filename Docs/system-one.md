@@ -6,33 +6,30 @@ Backed by a tiny GPU MLP via [`TrainableModel`](../SpawnDev.ILGPU.ML/Training/Tr
 
 | Piece | Where |
 |-------|--------|
-| Library API | `SpawnDev.ILGPU.ML.SystemOne` |
+| **Library (NuGet)** | `SpawnDev.ILGPU.ML.SystemOne` — `SystemOneDecisionHead`, questions/answers, `SystemOneChoiceMask`, weight export/import |
 | Training MLP | `SpawnDev.ILGPU.ML.Training.TrainableModel` |
-| Classic Snake demo | `/snake` (train on-device, play human or GPU) |
+| **Classic Snake demo** | `/snake` + `Demo.Shared/Games/Snake` — game, encoder, teacher, trainer, `SnakeSystemOneSpec` (**not** in the package) |
 | Tests | `PMT_FILTER=SystemOne` |
+
+> **Boundary:** the published package never names Snake. Use `new SystemOneDecisionHead(accelerator, stateDim, numOptions, hidden)`. The Snake demo calls that via `SnakeSystemOneSpec.CreateHead` in Demo.Shared only.
 
 ---
 
 ## Basics
 
-### Create a head
+### Create a head (package API)
 
 ```csharp
 using SpawnDev.ILGPU.ML.SystemOne;
 
-// Generic — any stateDim / numOptions
 using var head = new SystemOneDecisionHead(
     accelerator,
     stateDim: 16,
     numOptions: 4,
     hidden: 64,
     maxBatchSize: 64);
-
-// Classic Snake demo helper (Demo.Shared — not in the NuGet package):
-// using var snakeHead = SnakeSystemOneSpec.CreateHead(accelerator);
 ```
 
-Snake dims live in demo-only [`SnakeSystemOneSpec`](../SpawnDev.ILGPU.ML.Demo.Shared/Games/Snake/SnakeSystemOneSpec.cs) (`StateDim=40`, `NumActions=4`, `Hidden=128`). The library ships only the generic head.
 ### Ask questions
 
 ```csharp
@@ -87,7 +84,7 @@ Labels are class indices in `[0, NumOptions)`.
 ### Save / load weights
 
 ```csharp
-byte[] blob = await head.ExportWeightsAsync(); // ~23 KB for Snake (5764 floats + headers)
+byte[] blob = await head.ExportWeightsAsync(); // FP32 + small headers
 head.ImportWeights(blob);                      // dims must match this head
 ```
 
@@ -97,40 +94,47 @@ Format: `S1DH` header (stateDim / numOptions / hidden) + `TMPL` MLP blob (arch +
 
 | Sink | When |
 |------|------|
-| **localStorage** (base64) | Tiny heads (Snake ~31 KB string). Demo uses this. |
-| **OPFS / file** | Multi-MB blobs, or when you already stream models that way. |
-
-Bump [`SnakeSystemOneSpec.WeightsCacheVersion`](../SpawnDev.ILGPU.ML.Demo.Shared/Games/Snake/SnakeSystemOneSpec.cs) when encoder/teacher semantics change so demo caches invalidate.
+| **localStorage** (base64) | Tiny heads (Snake demo ≈ 23 KB binary / ~31 KB string) |
+| **OPFS / file** | Multi-MB blobs, or when you already stream models that way |
 
 ---
 
-## Classic Snake (demo reference)
+## Classic Snake (demo only — not NuGet)
 
-Live at **`/snake`**. Flow:
+Live at **`/snake`**. The page "How it works" panel shows the same package constructor the demo uses under the hood.
+
+Flow:
 
 1. Pick backend (WebGPU / WebGL / Wasm in browser).
 2. **Train head** — behavioral clone of a flood-fill **safe teacher** (food only if path to tail remains; hunger / anti-stall at long length).
 3. Head is **cached in localStorage**; reload restores without retrain.
 4. Switch to **System One**, Start — each tick: encode → masked choose → step.
 
-Demo helpers (not in the NuGet package; live under `Demo.Shared`):
+Helpers under `SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake` (demo / tests only):
 
 | Type | Role |
 |------|------|
-| `SnakeSystemOneSpec` | Demo-only dims + `CreateHead` (not in NuGet) |
+| `SnakeSystemOneSpec` | `StateDim=40`, `NumActions=4`, `Hidden=128`, `CreateHead`, cache version |
 | `SnakeGame` | Grid sim |
-| `SnakeStateEncoder` | 40-float features |
+| `SnakeStateEncoder` | 40-float features (must match `SnakeSystemOneSpec.StateDim`) |
 | `SnakeTeacher` | Safe heuristic policy |
 | `SnakeSystemOneTrainer` | Collect + BC train + agreement / score eval |
 | `SnakeSystemOnePolicy` | Encode + legal mask + play-time shields |
+| `SnakeHeadCache` | Demo localStorage (browser project) |
 
 ```csharp
+using SpawnDev.ILGPU.ML.SystemOne;
+using SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake;
+
+// Same as: new SystemOneDecisionHead(accelerator, 40, 4, hidden: 128)
 using var head = SnakeSystemOneSpec.CreateHead(accelerator);
 await SnakeSystemOneTrainer.TrainAsync(head); // defaults: 4096 samples, 80 epochs
 
 var (action, answer, ms) = await SnakeSystemOnePolicy.DecideAsync(head, game);
 game.SetAction(action);
 ```
+
+Bump `SnakeSystemOneSpec.WeightsCacheVersion` when encoder/teacher semantics change so demo caches invalidate.
 
 **Play shields** (policy, not the MLP): refuse illegal moves; prefer safe food when hunger is high; avoid pure tail-orbit stalls. The teacher alone already clears a teacher score floor in tests; the clone is gated on held-out agreement and mean policy score.
 
@@ -148,11 +152,11 @@ state[StateDim]
   → Softmax  → Choice / Score / Noul views
 ```
 
-No shared text encoder. State is **your** features. Keep encoding deterministic and documented (`SnakeSystemOneSpec` comments list the Snake layout).
+No shared text encoder. State is **your** features. Keep encoding deterministic and documented (Snake layout is commented on `SnakeSystemOneSpec` in the demo).
 
 ### Building a non-Snake head
 
-1. Define `StateDim` and option keys.
+1. Define `StateDim` and option keys in **your** app (not in this library).
 2. `new SystemOneDecisionHead(acc, stateDim, numOptions, hidden)`.
 3. Collect `(state, label)` with a teacher, oracle, or human.
 4. Train with `TrainStep` / epoch loss readback.
@@ -163,16 +167,16 @@ No shared text encoder. State is **your** features. Keep encoding deterministic 
 
 - Reuse one head / `TrainableModel` — scratch buffers allocate in `Build`, not per step.
 - Prefer `TrainStep` + `readLoss: false`; one `ReadLastLossAsync` per epoch.
-- Flush every few batches (`SnakeSystemOneTrainer.FlushEveryBatches = 8`).
+- Flush every few batches (`SnakeSystemOneTrainer.FlushEveryBatches = 8` in the demo trainer).
 - Staging arrays for `CopyFromCPU` must be **exact length** (`batch * InputSize`); `SubView` + `Span` is not supported.
 
 ### Masking details
 
-`SystemOneChoiceMask.Apply` zeros disallowed options, renormalizes, and if the raw argmax was illegal picks the best allowed survivor. If every option is false, behavior is defined in code (do not ship an all-false mask).
+`SystemOneChoiceMask.Apply` zeros disallowed options, renormalizes, and if the raw argmax was illegal picks the best allowed survivor. If every option is false, the original answer is returned unchanged.
 
 ### Per-step stateful games (future)
 
-Snake KV-style caches are position-addressed and idempotent. If you add a **shift-register** or recurrent state for another game, follow the three contracts in the library CLAUDE.md (stable bindings, snapshot around capture, veto prefix reuse). Snake today has no such cache.
+If you add a **shift-register** or recurrent state for another game, follow the three contracts in the library CLAUDE.md (stable bindings, snapshot around capture, veto prefix reuse). Snake today has no such cache.
 
 ### Out of scope (Phase 2+)
 
@@ -194,8 +198,8 @@ Notable cases:
 
 | Test | Asserts |
 |------|---------|
-| `SystemOne_SnakeTeacher_*` | Legality, score floor, no tail-orbit stall |
-| `SystemOne_Choice*` / `ScoreAndNoul` / `Decide` | API + mask + latency |
+| `SystemOne_SnakeTeacher_*` | Legality, score floor, no tail-orbit stall (demo teacher) |
+| `SystemOne_Choice*` / `ScoreAndNoul` / `Decide` | Package API + mask + latency |
 | `SystemOne_Snake_BehavioralClone_AgreesWithTeacher` | BC agreement ≥ 85%, policy mean ≥ 12 |
 | `SystemOne_Weights_RoundTrip_PreservesProbs` | Export/import bit-stable Softmax |
 
