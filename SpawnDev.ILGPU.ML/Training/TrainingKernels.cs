@@ -194,6 +194,8 @@ public class TrainingKernels
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, int, int, int>? _linearForwardKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>? _addBiasKernel;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _biasGradKernel;
 
     /// <summary>
     /// Linear forward: output = input @ weight^T.
@@ -225,6 +227,47 @@ public class TrainingKernels
         for (int i = 0; i < I; i++)
             sum += input[b * I + i] * weight[o * I + i];
         output[idx] = sum;
+    }
+
+    /// <summary>In-place: output[b, o] += bias[o] for each batch row.</summary>
+    public void AddBias(
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        int batchSize, int outFeatures)
+    {
+        _addBiasKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int>(AddBiasImpl);
+        _addBiasKernel(batchSize * outFeatures, output, bias, outFeatures);
+    }
+
+    private static void AddBiasImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> output,
+        ArrayView1D<float, Stride1D.Dense> bias,
+        int O)
+    {
+        output[idx] += bias[idx % O];
+    }
+
+    /// <summary>gradBias[o] = sum over batch of gradOutput[b, o].</summary>
+    public void BiasGradient(
+        ArrayView1D<float, Stride1D.Dense> gradOutput,
+        ArrayView1D<float, Stride1D.Dense> gradBias,
+        int batchSize, int outFeatures)
+    {
+        _biasGradKernel ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>(BiasGradientImpl);
+        _biasGradKernel(outFeatures, gradOutput, gradBias, batchSize, outFeatures);
+    }
+
+    private static void BiasGradientImpl(Index1D o,
+        ArrayView1D<float, Stride1D.Dense> gradOutput,
+        ArrayView1D<float, Stride1D.Dense> gradBias,
+        int B, int O)
+    {
+        float sum = 0f;
+        for (int b = 0; b < B; b++)
+            sum += gradOutput[b * O + o];
+        gradBias[o] = sum;
     }
 
     // ═══════════════════════════════════════════════════════════

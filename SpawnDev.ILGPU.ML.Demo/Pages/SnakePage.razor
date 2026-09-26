@@ -1,0 +1,171 @@
+@page "/snake"
+@using SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake
+@using SpawnDev.ILGPU.ML.SystemOne
+@implements IAsyncDisposable
+
+<PageTitle>System One Snake — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="System One Snake"
+            Description="A local System One decision head (probabilities, no text generation) plays Classic Snake on your GPU. Safe teacher + legal-action masking — inspired by the Jev/Laya category, not a Laya weight port."
+            Status="@DemoLayout.DemoStatus.Beta"
+            StatusMessage="Trains on-device from a flood-fill safe teacher (anti-stall hunger). Illegal moves masked; trained head cached in localStorage."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_decisionMs"
+            IsRunning="@_isPlaying"
+            ShowModelProgress="@_isTraining"
+            IsModelLoading="@_isTraining"
+            IsModelLoaded="@_headReady"
+            ModelProgressPercent="@_trainProgress"
+            ModelName="Snake decision head"
+            ModelSizeMB="0.01">
+
+    <div class="snake-layout" tabindex="0" @ref="_focusRef" @onkeydown="OnKeyDown">
+        <div class="snake-board-wrap">
+            <div class="snake-board" style="grid-template-columns: repeat(@_game.GridSize, 1fr);">
+                @for (int y = 0; y < _game.GridSize; y++)
+                {
+                    @for (int x = 0; x < _game.GridSize; x++)
+                    {
+                        var cellClass = CellClass(x, y);
+                        <div class="snake-cell @cellClass"></div>
+                    }
+                }
+            </div>
+            @if (!_game.IsAlive)
+            {
+                <div class="snake-overlay">Game Over — score @_game.Score</div>
+            }
+        </div>
+
+        <div class="snake-side">
+            <div class="snake-stats">
+                <span>Score <strong>@_game.Score</strong></span>
+                <span>Length <strong>@_game.Length</strong></span>
+                <span class="source-badge @(_mode == PlayMode.SystemOne ? "ml" : "human")">
+                    @(_mode == PlayMode.SystemOne ? "System One (GPU)" : "Human")
+                </span>
+            </div>
+
+            <div class="mode-row">
+                <button class="mode-btn @(_mode == PlayMode.Human ? "active" : "")" @onclick="() => SetMode(PlayMode.Human)">You play</button>
+                <button class="mode-btn @(_mode == PlayMode.SystemOne ? "active" : "")" @onclick="() => SetMode(PlayMode.SystemOne)" disabled="@(!_headReady)">System One</button>
+            </div>
+
+            <div class="ctrl-row">
+                @if (!_isPlaying && _game.IsAlive)
+                {
+                    <button class="run-btn" @onclick="StartPlay" disabled="@(!_ready)">Start</button>
+                }
+                else if (_isPlaying)
+                {
+                    <button class="run-btn run-btn-pause" @onclick="PausePlay">Pause</button>
+                }
+                <button class="canvas-btn" @onclick="ResetGame">Reset</button>
+                @if (!_isTraining)
+                {
+                    <button class="run-btn" @onclick="TrainHeadAsync" disabled="@(!_ready)">
+                        @(_headReady ? "Retrain" : "Train head")
+                    </button>
+                }
+                @if (_hasCachedHead && !_isTraining)
+                {
+                    <button class="canvas-btn" @onclick="ClearCachedHead">Clear cache</button>
+                }
+            </div>
+
+            @if (!string.IsNullOrEmpty(_status))
+            {
+                <p class="snake-status">@_status</p>
+            }
+
+            <h3 class="panel-title">Controls</h3>
+            <div class="dpad">
+                <div class="dpad-spacer"></div>
+                <div class="dpad-key @ActiveClass(SnakeAction.Up)">UP<span class="dpad-pct">@Pct("up")</span></div>
+                <div class="dpad-spacer"></div>
+                <div class="dpad-key @ActiveClass(SnakeAction.Left)">LEFT<span class="dpad-pct">@Pct("left")</span></div>
+                <div class="dpad-key @ActiveClass(SnakeAction.Down)">DOWN<span class="dpad-pct">@Pct("down")</span></div>
+                <div class="dpad-key @ActiveClass(SnakeAction.Right)">RIGHT<span class="dpad-pct">@Pct("right")</span></div>
+            </div>
+
+            <div class="prob-bars">
+                @foreach (var key in SnakeStateEncoder.ActionKeys)
+                {
+                    var p = _lastProbs.GetValueOrDefault(key, 0f);
+                    <div class="prob-row">
+                        <span class="prob-label">@key.ToUpperInvariant()</span>
+                        <div class="prob-track"><div class="prob-fill" style="width: @(p * 100)%;"></div></div>
+                        <span class="prob-val">@(p.ToString("P0"))</span>
+                    </div>
+                }
+            </div>
+
+            @if (_decisionMs > 0)
+            {
+                <p class="latency-line">Decision: <strong>@_decisionMs.ToString("F2") ms</strong></p>
+            }
+
+            <p class="hint">Arrow keys / WASD when you play. System One asks a choice question each tick.</p>
+        </div>
+    </div>
+
+    <PipelineHowTo OurCode="@_howToCs"
+                   DocsNote="System One returns structured probabilities — it never generates text." />
+
+</DemoLayout>
+
+<style>
+    .snake-layout { display: grid; grid-template-columns: minmax(280px, 420px) 1fr; gap: 1.25rem; outline: none; }
+    .snake-board-wrap { position: relative; }
+    .snake-board {
+        display: grid; gap: 2px; aspect-ratio: 1; width: 100%;
+        background: #0b1220; border: 2px solid rgba(56,189,248,0.25); border-radius: 12px; padding: 4px;
+    }
+    .snake-cell { border-radius: 3px; background: rgba(255,255,255,0.03); }
+    .snake-cell.body { background: #22c55e; }
+    .snake-cell.head { background: #4ade80; box-shadow: 0 0 8px rgba(74,222,128,0.5); }
+    .snake-cell.food { background: #f43f5e; box-shadow: 0 0 8px rgba(244,63,94,0.45); }
+    .snake-overlay {
+        position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: rgba(0,0,0,0.55); color: #f1f5f9; font-weight: 700; border-radius: 12px; font-size: 1.1rem;
+    }
+    .snake-stats { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; color: #94a3b8; margin-bottom: 0.75rem; }
+    .snake-stats strong { color: #f1f5f9; }
+    .source-badge { padding: 0.2rem 0.55rem; border-radius: 999px; font-size: 0.75rem; font-weight: 700; }
+    .source-badge.human { background: rgba(148,163,184,0.15); color: #cbd5e1; }
+    .source-badge.ml { background: rgba(56,189,248,0.15); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.35); }
+    .mode-row, .ctrl-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .mode-btn {
+        padding: 0.4rem 0.85rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04); color: #94a3b8; font-weight: 600; cursor: pointer;
+    }
+    .mode-btn.active { background: rgba(56,189,248,0.12); color: #7dd3fc; border-color: rgba(56,189,248,0.35); }
+    .mode-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .run-btn { padding: 0.45rem 1rem; border-radius: 8px; border: none; background: linear-gradient(135deg, #0ea5e9, #22c55e); color: white; font-weight: 700; cursor: pointer; }
+    .run-btn-pause { background: linear-gradient(135deg, #64748b, #475569); }
+    .canvas-btn { padding: 0.4rem 0.85rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.05); color: #94a3b8; font-weight: 600; cursor: pointer; }
+    .snake-status { color: #7dd3fc; font-size: 0.85rem; }
+    .panel-title { color: #f1f5f9; font-size: 0.95rem; font-weight: 600; margin: 0.5rem 0 0.6rem; }
+    .dpad { display: grid; grid-template-columns: repeat(3, 72px); gap: 0.35rem; margin-bottom: 1rem; }
+    .dpad-key {
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        height: 56px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1);
+        background: rgba(255,255,255,0.04); color: #64748b; font-size: 0.7rem; font-weight: 800; letter-spacing: 0.04em;
+    }
+    .dpad-key.active { background: rgba(34,197,94,0.2); border-color: rgba(34,197,94,0.5); color: #86efac; transform: scale(1.04); }
+    .dpad-pct { font-size: 0.65rem; font-weight: 600; color: #94a3b8; margin-top: 2px; }
+    .dpad-spacer { height: 56px; }
+    .prob-bars { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.75rem; }
+    .prob-row { display: grid; grid-template-columns: 52px 1fr 40px; gap: 0.4rem; align-items: center; }
+    .prob-label { font-size: 0.7rem; color: #94a3b8; font-weight: 700; }
+    .prob-track { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
+    .prob-fill { height: 100%; background: linear-gradient(90deg, #0ea5e9, #22c55e); border-radius: 4px; }
+    .prob-val { font-size: 0.7rem; color: #64748b; font-family: monospace; text-align: right; }
+    .latency-line { color: #94a3b8; font-size: 0.85rem; }
+    .latency-line strong { color: #7dd3fc; }
+    .hint { color: #64748b; font-size: 0.8rem; margin-top: 0.75rem; }
+    @@media (max-width: 768px) { .snake-layout { grid-template-columns: 1fr; } }
+</style>

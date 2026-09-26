@@ -4,8 +4,8 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.21</Version>
-		<PackageReleaseNotes>v5.2.21</PackageReleaseNotes>
+		<Version>5.2.22</Version>
+		<PackageReleaseNotes>v5.2.22: System One decision heads (choice/score/noul), Classic Snake demo, TrainableModel weight export/import. See CHANGELOG.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<EmbedAllSources>true</EmbedAllSources>

@@ -2,13 +2,48 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
-## 5.2.21 (unreleased; local 5.2.21-local.1) - the three entries below, on SpawnDev.ILGPU 5.2.17-local.2
+## 5.2.22 (2026-09-26) - System One decision heads + Classic Snake
 
-Depends on SpawnDev.ILGPU 5.2.17-local.2: the WebGPU short-circuit phi fix (NativeAspect's area resample
+Depends on SpawnDev.ILGPU **5.2.17** (same as 5.2.21).
+
+### System One — typed local decisions (not text generation)
+
+Inspired by the Jev/Laya System One category: structured choice / score / noul answers over a float
+state vector. **Not** a Laya/Jev weight or text-encoder port.
+
+- **`SystemOneDecisionHead`** — tiny GPU MLP (`TrainableModel`: Linear → ReLU → Linear → Softmax).
+  Factories: `CreateForSnake`, or custom `stateDim` / `numOptions` / `hidden`.
+- **Questions / answers** — `ChoiceQuestion`, `ScoreQuestion`, `NoulQuestion` and matching answer types;
+  `DecideAsync` batches questions on one state and reports `DecisionLatencyMs`.
+- **Legal-action mask** — `ChooseAsync` / `DecideAsync` accept `bool[] allowedMask`; illegal options
+  zeroed and renormalized (`SystemOneChoiceMask`).
+- **Weight export/import** — `ExportWeightsAsync` / `ImportWeights` (S1DH + TMPL FP32 blob). Snake head
+  ≈ 23 KB binary (~31 KB base64). Round-trip gated by `SystemOne_Weights_RoundTrip_PreservesProbs`.
+- **`TrainableModel`** — persistent train scratch, `TrainStep` without per-batch host loss,
+  `ExportWeightsAsync` / `ImportWeights` for any built MLP.
+- **Docs** — [`Docs/system-one.md`](Docs/system-one.md) (basics + advanced). Demo status: `/snake` ✅ VERIFIED.
+
+### Classic Snake demo (`/snake`)
+
+- Flood-fill **safe teacher** (food only if path to tail; hunger / anti-stall at long length).
+- Behavioral clone train on-device; play human or System One with masked illegal moves + play shields.
+- **localStorage cache** of the trained head (`WeightsCacheVersion` invalidates on encoder bumps).
+- Evidence: `SystemOne_Snake_BehavioralClone_AgreesWithTeacher`, teacher legality/score/anti-stall tests.
+  Live scores on WebGPU have reached the 70s (teacher-quality ceiling varies by seed).
+
+### 5.2.21 content included if you skipped that local/unreleased drop
+
+DAv3 joint-pass intrinsics/confidence in the caller pixel grid, WebGPU capture `KeepDrainsDuringCapture`
+(opt-in; DepthEstimation opts in), and `DepthResizeMode.NativeAspect` — see the 5.2.21 section below if
+that version was only on the local feed for you.
+
+## 5.2.21 (2026-09-26) - DAv3 output grid + WebGPU capture drains + NativeAspect
+
+Depends on SpawnDev.ILGPU 5.2.17: the WebGPU short-circuit phi fix (NativeAspect's area resample
 zeroed tie pixels without it) and `CopyFromJS` now submitting pending kernels before it writes
 (`MediaInterop`'s JS pixel upload goes through it).
 
-### Unreleased - DAv3 joint pass: every output in the caller's pixel grid
+### DAv3 joint pass: every output in the caller's pixel grid
 
 **`MultiViewDepthGpuResult.Intrinsics` was the model's K, in MODEL-INPUT pixels** (a 672x672 letterbox, a
 504x378 NativeAspect tensor), while the depth maps beside it come back in the caller's output grid. SpawnScene
@@ -32,7 +67,7 @@ cy off by the letterbox pad. DAv3's raw principal point on TempleRing is exactly
   Negative controls for a 1-row shift and a missing pad offset. Red-checked: crop off -> confidence 1.3e-1 to
   2.2e-1 relRMS (gate 5e-3); conversion off -> 16 K failures.
 
-### Unreleased - WebGPU capture that fits: DAv3 joint multi-view replays in 0.4 s, not 6.4 s
+### WebGPU capture that fits: DAv3 joint multi-view replays in 0.4 s, not 6.4 s
 
 **A WebGPU graph capture pinned every intermediate of the graph for the plan's lifetime.** The capture pass
 suppresses drains, and immediate buffer return is CUDA-only, so nothing released during the recorded forward
@@ -62,7 +97,7 @@ equals its direct peak. In a full WebGPU gate the old regime also lost the devic
   53 passed, 0 DAv3 failures. ZipVoice (default regime) 5/5 alone; its full-gate failures are ORDER effects
   present on the prior commit too (a Reshape resolves [1748,437] for a [669,669] bias after other models ran).
 
-### Unreleased - DepthResizeMode.NativeAspect: Depth Anything 3's own preprocessing, on the device
+### DepthResizeMode.NativeAspect: Depth Anything 3's own preprocessing, on the device
 
 `DepthEstimationPipeline.ResizeMode = DepthResizeMode.NativeAspect` (opt-in; `Letterbox` stays the default)
 feeds DAv3 exactly what its reference pipeline does (ByteDance-Seed/Depth-Anything-3 `input_processor.py`,

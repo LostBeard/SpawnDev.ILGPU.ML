@@ -16,9 +16,10 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 
 > **What actually works:** [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth — a per-demo **VERIFIED / PARTIAL / WIP** table with the test that proves each one. We mark stubs as WIP honestly, so a demo never lies to you.
 
-- **Demos** - **13 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, CLIP, background-removal, super-res, text-gen, embeddings, inspector, benchmark, and speech-to-text), plus several PARTIAL/WIP (image-to-3D, voice-collab, SD-Turbo image-gen are not done yet). See the status doc for exactly which.
+- **System One decision heads** *(new in 5.2.22)* — typed choice / score / noul over a float state vector (Jev/Laya-inspired category, not a weight port). Tiny GPU MLP via `TrainableModel`, legal-action masks, FP32 weight export/import. Classic Snake demo at `/snake` trains on-device from a safe teacher and caches ~23 KB heads in localStorage. [**Docs/system-one.md**](Docs/system-one.md)
+- **Demos** - **14 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, CLIP, background-removal, super-res, text-gen, embeddings, inspector, benchmark, speech-to-text, **and System One Snake**), plus several PARTIAL/WIP (image-to-3D, voice-collab, SD-Turbo image-gen are not done yet). See the status doc for exactly which.
 - **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
-- **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
+- **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Softmax-CE MLP training powers System One heads. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
 - **Local GGUF LLM inference + Ollama-compatible server** *(new in preview.5)* — run quantized LLMs (Qwen, Gemma, Llama) fully on your GPU with KV-cache decode; the Example 06 server is a drop-in Ollama replacement (OpenAI, Ollama, and Anthropic-Messages APIs) that works with the Claude CLI. ~51 tok/s decode on qwen2.5-coder:7b Q4_K_M (RTX 4070) via dp4a int8 GEMV + warp-cooperative register/flash attention (CUDA + WebGPU).
 - **TurboQuant KV cache compression** — 4-5x compression of attention cache with selectable modes: **4-bit** (0.9954 cosine, ~4x), **3-bit+QJL** (0.9944 cosine, ~4x, unbiased inner products — default), or **3-bit** (0.9833 cosine, 5.3x max savings). Data-oblivious (no calibration). Automatic and transparent — every autoregressive model benefits.
@@ -194,6 +195,21 @@ var results = await pipeline.ClassifyAsync(rgbaPixels, width, height);
 
 Console.WriteLine($"{results[0].Label}: {results[0].Confidence:P1}");
 // Output: "tiger cat: 52.0%"
+```
+
+### System One — typed decisions over float state
+
+Local decision head (choice / score / noul), not text generation. Inspired by the Jev/Laya System One category; not a Laya weight port. Full guide: [**Docs/system-one.md**](Docs/system-one.md). Demo: `/snake`.
+
+```csharp
+using SpawnDev.ILGPU.ML.SystemOne;
+
+using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
+float[] state = /* length == head.StateDim */;
+var q = new ChoiceQuestion("move", "up", "down", "left", "right");
+bool[] legal = [true, true, false, true]; // mask illegal actions
+var ans = await head.ChooseAsync(state, q, legal);
+byte[] blob = await head.ExportWeightsAsync(); // ~23 KB for Snake; ImportWeights to restore
 ```
 
 ### Using a Kernel Directly
@@ -431,6 +447,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | **Comic Chat AI** | A comic strip chat room where every character is an AI running locally. Add characters, give them personalities ("sarcastic pirate", "enthusiastic scientist"), and watch them debate in comic panel format. Tiered LLM: Phi-4 Mini (4GB+), Mistral NeMo (8GB+), or Phi-4 14B (12GB+) with per-character system prompts — same model, different personalities. Auto-detected or selectable. Inspired by Microsoft Comic Chat (1996), reimagined with local AI. | Multiple AI characters with genuine personality differences, powered by up to a 14B LLM on your GPU, debating and joking in comic panels. Pure nostalgia meets bleeding-edge tech. |
 | **Inside the Network** | Peek inside the neural network. See feature maps, attention patterns, and activation heatmaps as the model processes your image — layer by layer. Scrub through layers to see what the GPU "sees." | Educational and mesmerizing. Shows that neural networks aren't magic — they're math running on your GPU, and you can watch it happen. |
 | **Draw to Train** | Draw custom gestures on an interactive canvas, train a CNN classifier in real-time on your GPU, then watch it classify as you draw. Live loss/accuracy curves during training. The model learns in seconds — and you can test it immediately by drawing new shapes. Export trained models as ONNX. | Most browser ML can only do inference. This is full GPU training: forward pass, backpropagation, gradient descent — all in C# compute shaders on WebGPU. No server, no Python, no CUDA install. Draw → Train → Use, all in one browser tab. |
+| **System One Snake** | Classic Snake controlled by a local System One decision head (Softmax probs, no text). Train on-device from a flood-fill safe teacher; illegal moves masked; ~23 KB head cached in localStorage. | Shows typed decisions + GPU training without a language model. Docs: [system-one.md](Docs/system-one.md). |
 | **Pipeline Composer** | Visual drag-and-drop model builder. Compose neural network architectures by wiring blocks: Conv2D → ReLU → MaxPool → Linear. Auto-propagation of tensor shapes through the graph. Dimension mismatch highlighting (orange = warning, red = error). Three-stage workflow: Data → Architecture → Train & Run. Save/load pipeline configurations as JSON. | Build a complete ML pipeline visually — define your data source, compose your model architecture, configure training, watch it learn, run inference. No code required. Inspired by visual ML tools, but running entirely on your GPU in the browser. |
 | **Voice Collaboration** | Talk to your AI dev team. Whisper STT on your GPU, tiered LLM reasoning (3.8B–14B, auto-selected or user choice), SpeechT5 TTS responds with voice — all neural, all GPU, all private. Multiple agents with distinct personas and voices. | The full voice AI pipeline on YOUR hardware: speech → LLM (up to 14B) → voice. No cloud. No API key. No data leaves your device. The best model your GPU can run, automatically or by choice. |
 

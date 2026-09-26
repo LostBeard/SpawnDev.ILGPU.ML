@@ -37,7 +37,8 @@
 | `/generate` | Image generation (SD-Turbo) | 🚧 **WIP** | Pipeline wired, but only diffusion **math** is tested (`Diffusion_BetaSchedule`, `_GaussianNoise_Statistics`) — **no SD-Turbo end-to-end image test** |
 | `/voice-collab` | Voice collaboration | 🚧 **WIP** | "Phase 1: Web Speech API" (browser built-in); the **GPU Whisper option is disabled**. Not the on-device GPU voice stack the name implies |
 | `/image-to-3d` | Image → 3D model | 🚧 **WIP** | `GenerateModel()` is a **no-op** (`=> Task.CompletedTask`); `DownloadMesh()`/`OpenInSpawnScene()` are empty. The button does nothing yet |
-| `/train` | On-device training | 🟡 **PARTIAL** | `TrainableModel.TrainStepAsync` present; flag as PARTIAL until a green end-to-end training test is cited here |
+| `/train` | On-device training | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` and `SystemOne_Snake_BehavioralClone_AgreesWithTeacher` |
+| `/snake` | System One Classic Snake | ✅ **VERIFIED** | Local decision head (choice + legal mask) cloned from a safe flood-fill teacher. Evidence: `SystemOne_Snake_BehavioralClone_AgreesWithTeacher`, `SystemOne_Weights_RoundTrip_PreservesProbs`, teacher legality/score/anti-stall tests. Docs: [`system-one.md`](system-one.md) |
 | `/` | Home | Meta | Landing page (operator count now rendered live from the registry) |
 | `/tests` | Test runner | Meta | Hosts the PlaywrightMultiTest UI |
 | `/models` | Model browser | Meta | HuggingFace hub browser |
