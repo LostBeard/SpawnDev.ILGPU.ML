@@ -35,9 +35,9 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 - **Model Inspector** — drop any model file (ONNX, TFLite, GGUF, SafeTensors, and more) for instant architecture analysis and compatibility check. No other browser ML library has this.
 - **P2P Model Delivery + Shared Compute** — OPTIONAL, via the separate `SpawnDev.ILGPU.ML.WebTorrent` package: [SpawnDev.WebTorrent](https://github.com/LostBeard/SpawnDev.WebTorrent) decentralized model delivery over BitTorrent. The core library delivers models over plain HTTP through the hub and does NOT depend on WebTorrent; `HubModelStream` implements the same `IModelSource`, so P2P is a one-line swap. BEP 46 DHT mutable items enable AI agents to share state (KV cache, model weights, coordination) across devices via the DHT — no central server. Ed25519 signing (RFC 8032). Foundation for `AcceleratorType.P2P` distributed compute.
 
-## What's verified in `4.0.0-preview.5`
+## Demo Highlights
 
-Six demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + OpenCL — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries:
+End-to-end demos on WebGPU (and the other backends) — fully native C# kernels, no ONNX Runtime, no JS bridge, no native binaries. Full VERIFIED / WIP table: [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md).
 
 | Demo | Model | Pipeline |
 |------|-------|----------|
@@ -47,14 +47,15 @@ Six demos are end-to-end working today on WebGPU + WebGL + Wasm + CPU + CUDA + O
 | ![Background Removal — Person](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_BackgroundRemoval-Person.jpg) | **Background removal** — RMBG-1.4 | `BackgroundRemovalPipeline` |
 | ![Super Resolution — Tree](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-05-23-11-37_SuperResolution-Tree.jpg) | **3x super-resolution** — ESPCN, tile-based with color and source-aspect preservation | `SuperResolutionPipeline` |
 | ![Pose Estimation — Push-up](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-06-01-15-21_PoseEstimation-Runner.jpg) | **Pose estimation** — MoveNet Lightning (17 keypoints), skeleton overlaid on a GPU-rendered frame | `PoseEstimationPipeline` |
+| ![System One Snake — score 72](SpawnDev.ILGPU.ML.Demo/wwwroot/screenshots/2026-09-26-13-24_SystemOneSnake-2.jpg) | **System One Snake** — local decision head (choice probs, no text); on-device BC from a safe teacher; legal-action mask | `SystemOneDecisionHead` (`/snake`) |
 
-Every result above is rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
+Vision results above are rendered directly from a GPU buffer to an HTML `<canvas>` via the library's `ICanvasRenderer` — no PNG encode, no base64 data URL, no host readback of pixel data. The depth and super-res pipelines preserve source aspect ratio (e.g., a 16:9 photo produces a 16:9 result, not a square). Super-res uses tile-based inference so the full source resolution gets the model's enhancement, not just a thumbnail.
 
-The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes.
+The pose keypoints match ONNX Runtime 1.24.3 across all six backends, and the `/pose` demo supports both live webcam and file-upload modes. System One Snake trains and plays entirely on-device (~15 ms/decision on WebGPU); see [**Docs/system-one.md**](Docs/system-one.md).
 
-**Text generation** is verified end-to-end on WebGPU as the 7th demo pipeline: the `/text-gen` demo streams DistilGPT-2 from the SpawnDev hub (`hub.spawndev.com`) over a **seekable stream straight to the GPU** — plain HTTP, cached in OPFS, so the model is never held whole in memory — then runs autoregressive generation entirely on-device. The **Model Inspector** (`/inspector`) is fully working: drop a local file or paste a hub/HuggingFace URL and any ONNX/TFLite/GGUF/SafeTensors model is parsed structure-only (weights skipped) into an architecture summary + operator-compatibility report — GPT-2 reports **100% supported**. No other browser ML library has either.
+**Text generation** is verified end-to-end on WebGPU: the `/text-gen` demo streams DistilGPT-2 from the SpawnDev hub (`hub.spawndev.com`) over a **seekable stream straight to the GPU** — plain HTTP, cached in OPFS, so the model is never held whole in memory — then runs autoregressive generation entirely on-device. The **Model Inspector** (`/inspector`) is fully working: drop a local file or paste a hub/HuggingFace URL and any ONNX/TFLite/GGUF/SafeTensors model is parsed structure-only (weights skipped) into an architecture summary + operator-compatibility report — GPT-2 reports **100% supported**. No other browser ML library has either.
 
-9 more pipelines exist in the codebase (object detection, face detection, other NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — that's the work ahead.
+More pipelines exist in the codebase (object detection, face detection, other NLP, diffusion, TTS, single-image-to-3D) but aren't all verified end-to-end yet on every backend — see the status doc.
 
 ## Universal Model Loading
 
