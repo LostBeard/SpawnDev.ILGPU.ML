@@ -9,7 +9,7 @@ namespace SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake;
 public static class SnakeSystemOnePolicy
 {
     public static readonly ChoiceQuestion MoveQuestion =
-        new("Which way should the snake move?", SystemOneSnakeSpec.ActionKeys);
+        new("Which way should the snake move?", SnakeSystemOneSpec.ActionKeys);
 
     /// <summary>
     /// One decision with wall-clock latency. Always masks illegal moves before argmax.
@@ -20,9 +20,9 @@ public static class SnakeSystemOnePolicy
         SystemOneDecisionHead head,
         SnakeGame game)
     {
-        if (head.StateDim != SystemOneSnakeSpec.StateDim || head.NumOptions != SystemOneSnakeSpec.NumActions)
+        if (head.StateDim != SnakeSystemOneSpec.StateDim || head.NumOptions != SnakeSystemOneSpec.NumActions)
             throw new ArgumentException(
-                $"Head must be CreateForSnake() (state={SystemOneSnakeSpec.StateDim}, actions=4).");
+                $"Head must be SnakeSystemOneSpec.CreateHead() (state={SnakeSystemOneSpec.StateDim}, actions=4).");
 
         var state = SnakeStateEncoder.Encode(game);
         var mask = SnakeTeacher.LegalMask(game);

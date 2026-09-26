@@ -119,7 +119,7 @@ public class TrainableModel : IDisposable
     {
         int inElems = batchSize * InputSize;
         // SubView + CopyFromCPU requires T[] (IContiguousArrayView), not Span on SubView.
-        // Callers must pass exact-length staging arrays (Snake trainer does).
+        // Callers must pass exact-length staging arrays (batch * InputSize).
         if (inputData.Length != inElems)
             throw new ArgumentException($"Expected input length {inElems}, got {inputData.Length}.", nameof(inputData));
         if (targetLabels.Length != batchSize)

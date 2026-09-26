@@ -15,7 +15,7 @@ public partial class SnakePage : IAsyncDisposable
 {
     private const string _howToCs = """
 // Local System One head: state → masked choice (no text generation)
-using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
+using var head = SnakeSystemOneSpec.CreateHead(accelerator);
 await SnakeSystemOneTrainer.TrainAsync(head); // clone the safe teacher
 // Optional: head.ExportWeightsAsync() → localStorage via SnakeHeadCache
 
@@ -94,7 +94,7 @@ game.SetAction(action); // illegal moves already zeroed via allowedMask
         try
         {
             _head?.Dispose();
-            _head = SystemOneDecisionHead.CreateForSnake(_accelerator);
+            _head = SnakeSystemOneSpec.CreateHead(_accelerator);
             _head.ImportWeights(blob);
             _headReady = true;
             _status = $"Loaded cached head ({blob.Length / 1024f:F1} KB). Switch to System One, or retrain.";
@@ -193,7 +193,7 @@ game.SetAction(action); // illegal moves already zeroed via allowedMask
         try
         {
             _head?.Dispose();
-            _head = SystemOneDecisionHead.CreateForSnake(_accelerator);
+            _head = SnakeSystemOneSpec.CreateHead(_accelerator);
 
             float loss = await SnakeSystemOneTrainer.TrainAsync(
                 _head,

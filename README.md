@@ -205,12 +205,12 @@ Local decision head (choice / score / noul), not text generation. Inspired by th
 ```csharp
 using SpawnDev.ILGPU.ML.SystemOne;
 
-using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
+using var head = new SystemOneDecisionHead(accelerator, stateDim: 40, numOptions: 4, hidden: 128);
 float[] state = /* length == head.StateDim */;
 var q = new ChoiceQuestion("move", "up", "down", "left", "right");
 bool[] legal = [true, true, false, true]; // mask illegal actions
 var ans = await head.ChooseAsync(state, q, legal);
-byte[] blob = await head.ExportWeightsAsync(); // ~23 KB for Snake; ImportWeights to restore
+byte[] blob = await head.ExportWeightsAsync(); // tiny FP32 blob; ImportWeights to restore
 ```
 
 ### Using a Kernel Directly

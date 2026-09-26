@@ -2,6 +2,17 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.23 (2026-09-26) - System One library is generic (Snake stays in the demo)
+
+**Bugfix:** 5.2.22 shipped `SystemOneSnakeSpec` and `CreateForSnake` inside the NuGet package.
+Those are Classic Snake demo details, not library API. Removed from `SpawnDev.ILGPU.ML`.
+
+- Library keeps: `SystemOneDecisionHead`, questions/answers, `SystemOneChoiceMask`, weight export/import.
+- Demo-only: `SnakeSystemOneSpec` (+ `CreateHead`) under `Demo.Shared/Games/Snake`, with the game/teacher/encoder.
+- Docs updated to show the generic constructor as the package entry point.
+
+Breaking for anyone who called `CreateForSnake` / `SystemOneSnakeSpec` from a package reference (unlikely outside this repo's demo). Use `new SystemOneDecisionHead(acc, stateDim, numOptions, hidden)` or the demo helper.
+
 ## 5.2.22 (2026-09-26) - System One decision heads + Classic Snake
 
 Depends on SpawnDev.ILGPU **5.2.17** (same as 5.2.21).
@@ -12,7 +23,7 @@ Inspired by the Jev/Laya System One category: structured choice / score / noul a
 state vector. **Not** a Laya/Jev weight or text-encoder port.
 
 - **`SystemOneDecisionHead`** — tiny GPU MLP (`TrainableModel`: Linear → ReLU → Linear → Softmax).
-  Factories: `CreateForSnake`, or custom `stateDim` / `numOptions` / `hidden`.
+  Construct with `stateDim` / `numOptions` / `hidden` (5.2.23 removed the Snake factory from the package).
 - **Questions / answers** — `ChoiceQuestion`, `ScoreQuestion`, `NoulQuestion` and matching answer types;
   `DecideAsync` batches questions on one state and reports `DecisionLatencyMs`.
 - **Legal-action mask** — `ChooseAsync` / `DecideAsync` accept `bool[] allowedMask`; illegal options

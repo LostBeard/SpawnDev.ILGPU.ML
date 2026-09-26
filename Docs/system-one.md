@@ -20,20 +20,19 @@ Backed by a tiny GPU MLP via [`TrainableModel`](../SpawnDev.ILGPU.ML/Training/Tr
 ```csharp
 using SpawnDev.ILGPU.ML.SystemOne;
 
-// Snake-sized defaults (40-dim state, 4 actions, hidden 128)
-using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
-
-// Or custom dims
-using var head2 = new SystemOneDecisionHead(
+// Generic — any stateDim / numOptions
+using var head = new SystemOneDecisionHead(
     accelerator,
     stateDim: 16,
     numOptions: 4,
     hidden: 64,
     maxBatchSize: 64);
+
+// Classic Snake demo helper (Demo.Shared — not in the NuGet package):
+// using var snakeHead = SnakeSystemOneSpec.CreateHead(accelerator);
 ```
 
-`CreateForSnake` matches [`SystemOneSnakeSpec`](../SpawnDev.ILGPU.ML/SystemOne/SystemOneSnakeSpec.cs) (`StateDim=40`, `NumActions=4`, `Hidden=128`). The demo encoder must stay in lockstep with `StateDim`.
-
+Snake dims live in demo-only [`SnakeSystemOneSpec`](../SpawnDev.ILGPU.ML.Demo.Shared/Games/Snake/SnakeSystemOneSpec.cs) (`StateDim=40`, `NumActions=4`, `Hidden=128`). The library ships only the generic head.
 ### Ask questions
 
 ```csharp
@@ -101,7 +100,7 @@ Format: `S1DH` header (stateDim / numOptions / hidden) + `TMPL` MLP blob (arch +
 | **localStorage** (base64) | Tiny heads (Snake ~31 KB string). Demo uses this. |
 | **OPFS / file** | Multi-MB blobs, or when you already stream models that way. |
 
-Bump [`SystemOneSnakeSpec.WeightsCacheVersion`](../SpawnDev.ILGPU.ML/SystemOne/SystemOneSnakeSpec.cs) when encoder/teacher semantics change so demo caches invalidate.
+Bump [`SnakeSystemOneSpec.WeightsCacheVersion`](../SpawnDev.ILGPU.ML.Demo.Shared/Games/Snake/SnakeSystemOneSpec.cs) when encoder/teacher semantics change so demo caches invalidate.
 
 ---
 
@@ -118,6 +117,7 @@ Demo helpers (not in the NuGet package; live under `Demo.Shared`):
 
 | Type | Role |
 |------|------|
+| `SnakeSystemOneSpec` | Demo-only dims + `CreateHead` (not in NuGet) |
 | `SnakeGame` | Grid sim |
 | `SnakeStateEncoder` | 40-float features |
 | `SnakeTeacher` | Safe heuristic policy |
@@ -125,7 +125,7 @@ Demo helpers (not in the NuGet package; live under `Demo.Shared`):
 | `SnakeSystemOnePolicy` | Encode + legal mask + play-time shields |
 
 ```csharp
-using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
+using var head = SnakeSystemOneSpec.CreateHead(accelerator);
 await SnakeSystemOneTrainer.TrainAsync(head); // defaults: 4096 samples, 80 epochs
 
 var (action, answer, ms) = await SnakeSystemOnePolicy.DecideAsync(head, game);
@@ -148,7 +148,7 @@ state[StateDim]
   → Softmax  → Choice / Score / Noul views
 ```
 
-No shared text encoder. State is **your** features. Keep encoding deterministic and documented (`SystemOneSnakeSpec` comments list the Snake layout).
+No shared text encoder. State is **your** features. Keep encoding deterministic and documented (`SnakeSystemOneSpec` comments list the Snake layout).
 
 ### Building a non-Snake head
 

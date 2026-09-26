@@ -12,7 +12,7 @@ namespace SpawnDev.ILGPU.ML.SystemOne;
 /// <remarks>
 /// Typical use:
 /// <code>
-/// using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
+/// using var head = new SystemOneDecisionHead(accelerator, stateDim: 40, numOptions: 4);
 /// var answer = await head.ChooseAsync(state, question, allowedMask);
 /// </code>
 /// Pass <c>allowedMask</c> whenever the environment can forbid options (illegal moves, closed gates).
@@ -45,14 +45,6 @@ public sealed class SystemOneDecisionHead : IDisposable
         _model.Build(maxBatchSize: maxBatchSize);
     }
 
-    /// <summary>4-way direction head sized for <see cref="SystemOneSnakeSpec"/>.</summary>
-    public static SystemOneDecisionHead CreateForSnake(Accelerator accelerator) =>
-        new(accelerator,
-            SystemOneSnakeSpec.StateDim,
-            SystemOneSnakeSpec.NumActions,
-            SystemOneSnakeSpec.Hidden,
-            SystemOneSnakeSpec.TrainMaxBatch);
-
     /// <summary>
     /// One Softmax-CE training step. Labels are class indices in [0, NumOptions).
     /// Pass <paramref name="readLoss"/> false in hot loops; use <see cref="ReadLastLossAsync"/> per epoch.
@@ -69,7 +61,7 @@ public sealed class SystemOneDecisionHead : IDisposable
     public Task<float> ReadLastLossAsync(int batchSize) => _model.ReadLastLossAsync(batchSize);
 
     /// <summary>
-    /// Export head identity + MLP weights (FP32). Suitable for localStorage (~tens of KB for Snake).
+    /// Export head identity + MLP weights (FP32). Suitable for localStorage on tiny heads.
     /// </summary>
     public async Task<byte[]> ExportWeightsAsync()
     {

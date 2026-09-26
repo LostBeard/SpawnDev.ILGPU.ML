@@ -123,12 +123,12 @@ public abstract partial class MLTestBase
         for (int e = 0; e < 40; e++)
             await head.TrainStepAsync(inputs, labels, 16, 0.15f);
 
-        var q = new ChoiceQuestion("dir", SystemOneSnakeSpec.ActionKeys);
+        var q = new ChoiceQuestion("dir", SnakeSystemOneSpec.ActionKeys);
         var raw = await head.ChooseAsync(new float[] { 1f, 0f }, q);
         // Forbid the raw winner — mask must pick something else among allowed.
         var mask = new bool[4];
         for (int i = 0; i < 4; i++)
-            mask[i] = SystemOneSnakeSpec.ActionKeys[i] != raw.Choice;
+            mask[i] = SnakeSystemOneSpec.ActionKeys[i] != raw.Choice;
         if (!mask.Any(x => x))
             throw new Exception("Need at least one allowed option.");
 
@@ -168,12 +168,12 @@ public abstract partial class MLTestBase
     [TestMethod]
     public async Task SystemOne_Decide_ReportsLatency() => await RunTest(async accelerator =>
     {
-        using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
-        var state = new float[SystemOneSnakeSpec.StateDim];
+        using var head = SnakeSystemOneSpec.CreateHead(accelerator);
+        var state = new float[SnakeSystemOneSpec.StateDim];
         state[2] = 1f;
         var questions = new Dictionary<string, SystemOneQuestion>
         {
-            ["move"] = new ChoiceQuestion("move", SystemOneSnakeSpec.ActionKeys),
+            ["move"] = new ChoiceQuestion("move", SnakeSystemOneSpec.ActionKeys),
         };
         var resp = await head.DecideAsync(state, questions);
         if (!resp.Answers.ContainsKey("move"))
@@ -181,14 +181,14 @@ public abstract partial class MLTestBase
         if (resp.DecisionLatencyMs < 0)
             throw new Exception("Negative latency.");
         if (head.StateDim != SnakeStateEncoder.StateDim)
-            throw new Exception("CreateForSnake state dim != encoder.");
+            throw new Exception("SnakeSystemOneSpec.CreateHead state dim != encoder.");
         Console.WriteLine($"[SystemOne] Decide latency={resp.DecisionLatencyMs:F3} ms params={head.ParameterCount}");
     });
 
     [TestMethod(Timeout = 300000)]
     public async Task SystemOne_Snake_BehavioralClone_AgreesWithTeacher() => await RunTest(async accelerator =>
     {
-        using var head = SystemOneDecisionHead.CreateForSnake(accelerator);
+        using var head = SnakeSystemOneSpec.CreateHead(accelerator);
         float loss = await SnakeSystemOneTrainer.TrainAsync(
             head,
             sampleCount: 4096,

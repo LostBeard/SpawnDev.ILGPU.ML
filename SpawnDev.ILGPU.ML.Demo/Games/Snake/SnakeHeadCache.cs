@@ -1,4 +1,4 @@
-using SpawnDev.ILGPU.ML.SystemOne;
+using SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake;
 using SpawnDev.SpawnJS;
 using SpawnDev.SpawnJS.JSObjects;
 
@@ -6,13 +6,13 @@ namespace SpawnDev.ILGPU.ML.Demo.Games.Snake;
 
 /// <summary>
 /// Persist a trained Snake System One head in browser localStorage (base64 of the FP32 blob).
-/// Cache key includes <see cref="SystemOneSnakeSpec.WeightsCacheVersion"/> so encoder/teacher
+/// Cache key includes <see cref="SnakeSystemOneSpec.WeightsCacheVersion"/> so encoder/teacher
 /// bumps invalidate stale heads automatically.
 /// </summary>
 internal static class SnakeHeadCache
 {
     private static string StorageKey =>
-        $"spawndev_ilgpu_ml_snake_s1_v{SystemOneSnakeSpec.WeightsCacheVersion}";
+        $"spawndev_ilgpu_ml_snake_s1_v{SnakeSystemOneSpec.WeightsCacheVersion}";
 
     public static bool TryLoad(SpawnJSRuntime js, out byte[] blob)
     {

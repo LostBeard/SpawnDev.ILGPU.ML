@@ -1,10 +1,13 @@
-namespace SpawnDev.ILGPU.ML.SystemOne;
+using ILGPU.Runtime;
+using SpawnDev.ILGPU.ML.SystemOne;
+
+namespace SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake;
 
 /// <summary>
-/// Shared dimensions for the Classic Snake System One head.
-/// The demo encoder (<c>SnakeStateEncoder</c>) must match <see cref="StateDim"/>.
+/// Classic Snake dimensions for a System One head. Lives in the demo, not the NuGet library —
+/// the library only provides the generic <see cref="SystemOneDecisionHead"/>.
 /// </summary>
-public static class SystemOneSnakeSpec
+public static class SnakeSystemOneSpec
 {
     /// <summary>
     /// Compact feature layout (40 floats):
@@ -24,4 +27,8 @@ public static class SystemOneSnakeSpec
     public const int WeightsCacheVersion = 2;
 
     public static readonly string[] ActionKeys = ["up", "down", "left", "right"];
+
+    /// <summary>Head sized for <see cref="SnakeStateEncoder"/>.</summary>
+    public static SystemOneDecisionHead CreateHead(Accelerator accelerator) =>
+        new(accelerator, StateDim, NumActions, Hidden, TrainMaxBatch);
 }

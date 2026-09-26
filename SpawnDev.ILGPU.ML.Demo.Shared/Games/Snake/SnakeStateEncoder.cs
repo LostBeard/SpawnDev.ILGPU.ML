@@ -1,15 +1,13 @@
-using SpawnDev.ILGPU.ML.SystemOne;
-
 namespace SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake;
 
 /// <summary>
-/// Compact float features for System One. Layout must match <see cref="SystemOneSnakeSpec.StateDim"/>.
+/// Compact float features for System One. Layout must match <see cref="SnakeSystemOneSpec.StateDim"/>.
 /// </summary>
 public static class SnakeStateEncoder
 {
-    public const int StateDim = SystemOneSnakeSpec.StateDim;
+    public const int StateDim = SnakeSystemOneSpec.StateDim;
 
-    public static readonly string[] ActionKeys = SystemOneSnakeSpec.ActionKeys;
+    public static readonly string[] ActionKeys = SnakeSystemOneSpec.ActionKeys;
 
     public static float[] Encode(SnakeGame game)
     {
