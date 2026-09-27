@@ -65,7 +65,7 @@
                         {
                             rank++;
                             <div class="result-bar-row">
-                                <span class="result-medal">@(rank switch { 1 => "&#x1F947;", 2 => "&#x1F948;", 3 => "&#x1F949;", _ => "" })</span>
+                                <span class="result-medal">@(rank switch { 1 => "🥇", 2 => "🥈", 3 => "🥉", _ => "" })</span>
                                 <span class="result-backend">@r.BackendName</span>
                                 <div class="result-bar-track">
                                     <div class="result-bar-fill @(rank == 1 ? "fastest" : "")"

@@ -119,7 +119,7 @@
     @if (_compatibility != null)
     {
         <div class="compat-box @(_compatibility.IsFullySupported ? "compat-ok" : "compat-warn")">
-            <span class="compat-icon">@(_compatibility.IsFullySupported ? "&#x2705;" : "&#x26A0;")</span>
+            <span class="compat-icon">@(_compatibility.IsFullySupported ? "✅" : "⚠")</span>
             <span class="compat-text">@_compatibility.Summary</span>
         </div>
     }

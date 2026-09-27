@@ -14,11 +14,11 @@ var outPath = args.FirstOrDefault(a => a.EndsWith(".json"))
 
 string[] routes =
 [
-    "/", "/getting-started", "/pipelines", "/ai-chat", "/gemma-chat",
+    "/", "/getting-started", "/pipelines", "/ai-chat",
     "/classify", "/depth", "/detect", "/style", "/remove-bg", "/pose", "/super-res", "/face", "/clip",
     "/sentiment", "/embeddings", "/whisper", "/text-gen",
     "/generate", "/image-to-3d", "/depth-voxel",
-    "/assistant", "/comic-chat", "/explain", "/train", "/snake", "/voice-collab",
+    "/explain", "/train", "/snake",
     "/benchmark", "/models", "/cache", "/inspector", "/tests",
 ];
 

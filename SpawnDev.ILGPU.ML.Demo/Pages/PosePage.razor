@@ -17,7 +17,7 @@
             OnBackendChange="@HandleBackendChange"
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
-            ShowFps="true"
+            ShowFps="@(_inputMode == "webcam")"
             ShowModelProgress="true"
             ModelName="@(_modelVariant == "lightning" ? "MoveNet Lightning" : "MoveNet Thunder")"
             IsModelLoading="@_isModelLoading"
@@ -33,10 +33,10 @@
                 @onclick='() => _modelVariant = "thunder"'>Thunder (accurate)</button>
 
         <label class="pose-label" style="margin-left: 1rem;">Source:</label>
+        <button class="pose-variant-btn @(_inputMode == "image" ? "active" : "")"
+                @onclick='() => _inputMode = "image"'>Image</button>
         <button class="pose-variant-btn @(_inputMode == "webcam" ? "active" : "")"
                 @onclick='() => _inputMode = "webcam"'>Webcam (live)</button>
-        <button class="pose-variant-btn @(_inputMode == "image" ? "active" : "")"
-                @onclick='() => _inputMode = "image"'>Image (upload)</button>
     </div>
 
     @if (_inputMode == "webcam")
@@ -255,7 +255,7 @@ foreach (var kp in result.Keypoints) Draw(kp.X, kp.Y, kp.Confidence);
 
     private string _selectedBackend = "WebGPU";
     private string _modelVariant = "lightning";
-    private string _inputMode = "webcam"; // "webcam" or "image"
+    private string _inputMode = "image"; // default: still image (webcam is opt-in)
     private bool _isRunning;
     private bool _isModelLoading;
     private bool _isModelLoaded;

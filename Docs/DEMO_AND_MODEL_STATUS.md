@@ -34,22 +34,20 @@
 | `/snake` | System One Classic Snake | ✅ **VERIFIED** | Package: generic `SystemOneDecisionHead`. Demo-only: game/teacher/`SnakeSystemOneSpec` under `Demo.Shared`. Evidence: `SystemOne_Snake_BehavioralClone_AgreesWithTeacher`, `SystemOne_Weights_RoundTrip_PreservesProbs`. Nav: no badge (VERIFIED). Docs: [`system-one.md`](system-one.md) |
 | `/inspector` | Model Inspector (structure + compat) | ✅ **VERIFIED** | Streams ONNX structure-only; GPT-2 100% compat after registry fix; inspect-by-URL live-hub test |
 | `/benchmark` | GPU benchmark | ✅ **VERIFIED** | MatMul / perf kernels (92-101 GFLOPS validated) |
-| `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | `GgufTextGenerationPipeline`: pick a `.gguf` → stream → chat on WebGPU. Engine verified on CUDA (qwen/smollm2/gemma3 coherent). Page mounts clean. In-browser file-pick→generate E2E = manual confirm (no model delivery in PMT yet) |
-| `/gemma-chat` | Gemma 4 multimodal chat | 🟡 **PARTIAL** | Opt-in large download from hub/ollama registry; mounts clean. Full multimodal E2E in-browser not gated in PMT |
+| `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | `GgufTextGenerationPipeline`: pick a `.gguf` → stream → chat on WebGPU. Engine verified on CUDA; TJ confirmed live in Demo 2026-09-26. Full multimodal gemma page removed from Demo (pipeline API remains). |
+| `/generate` | Image generation (SD-Turbo) | ✅ **VERIFIED** | `SDTurbo_Generate_E2E` (WebGPU/CUDA/OpenCL; Wasm skipped — weight paging tracked). Same `ImageGenerationPipeline` as SpawnDev.AI `AiImageEngine`. Demo: opt-in load on first Generate. |
 | `/depth-voxel` | Depth → 3D voxels | 🟡 **PARTIAL** | Depth pipeline runs (see `/depth`); the 3D voxel/gaussian-splat scene was never built (nav-hidden 2026-06-30). Route still mounts; shows 2D depth colormap |
 | `/explain` | Model explainability | 🟡 **PARTIAL** | Intercepts the executor; works on a limited set of models |
-| `/assistant` | AI assistant (chat) | 🟡 **PARTIAL** | Real DistilGPT-2 when a model is loaded; **falls back to `GetPlaceholderResponse` when none loaded**. README claims of Phi-4 14B / SpeechT5 voice are **aspirational — not what this page does today** |
-| `/comic-chat` | Multi-character chat | 🟡 **PARTIAL** | Same as assistant — real text-gen when loaded, `GetPlaceholderComicResponse` otherwise. No Phi-4 tiering on this page |
 | `/train` | On-device training (Draw to Learn) | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` |
-| `/generate` | Image generation (SD-Turbo) | ✅ **VERIFIED** | `SDTurbo_Generate_E2E` (WebGPU/CUDA/OpenCL; Wasm skipped — weight paging tracked). Same `ImageGenerationPipeline` as SpawnDev.AI `AiImageEngine`. Demo page: opt-in load on first Generate (was Coming-soon stub that never called `LoadModelAsync`). |
 | `/image-to-3d` | Image → 3D model | 🚧 **WIP** | Coming-soon banner honest. `GenerateModel()` is a **no-op**; download/open empty |
-| `/voice-collab` | Voice collaboration | 🚧 **WIP** | Coming-soon banner honest. Phase 1: browser Web Speech API; **GPU Whisper path disabled** |
 | `/` | Home | Meta | Landing (operator count live from `OperatorRegistry.BuiltinOpTypes` — currently **204**) |
-| `/pipelines` | Pipeline catalog | Meta | Status badges must match this doc — corrected 2026-09-26 |
+| `/pipelines` | Pipeline catalog | Meta | Status badges must match this doc |
 | `/getting-started` | Getting started | Doc | Install + first-run walkthrough |
 | `/models` | Model browser | Meta | HuggingFace hub browser |
 | `/cache` | Model cache | Meta | OPFS cache admin |
 | `/tests` | Test runner | Meta | Hosts the PlaywrightMultiTest UI |
+
+> **Removed from Demo (2026-09-26):** `/assistant`, `/comic-chat`, `/voice-collab`, `/gemma-chat`. Placeholder / unfinished UIs — use `/ai-chat` for on-device LLM chat. Library APIs (`Gemma4MultimodalPipeline`, etc.) are unchanged.
 
 ## Models (loaders vs verified inference)
 

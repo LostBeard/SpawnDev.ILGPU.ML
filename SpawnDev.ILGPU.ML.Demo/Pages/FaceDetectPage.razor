@@ -8,14 +8,14 @@
 <PageTitle>Face Detection — SpawnDev.ILGPU.ML</PageTitle>
 
 <DemoLayout Title="Face Detection &amp; Landmarks"
-            Description="Real-time face detection with landmark points. BlazeFace is only ~0.5MB — loads instantly."
+            Description="Face detection with landmark points. BlazeFace is only ~0.5MB — loads instantly. Upload an image or use the webcam."
             AvailableBackends="@_backends"
             SelectedBackend="@_selectedBackend"
             SelectedBackendChanged="@((v) => _selectedBackend = v)"
             OnBackendChange="@HandleBackendChange"
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
-            ShowFps="true"
+            ShowFps="@_useWebcam"
             ShowModelProgress="true"
             ModelName="BlazeFace"
             IsModelLoading="@_isModelLoading"
@@ -24,6 +24,10 @@
             ModelSizeMB="0.5">
 
     <div class="face-controls">
+        <div class="mode-toggle">
+            <button class="mode-btn @(!_useWebcam ? "active" : "")" @onclick="SwitchToImage">Image</button>
+            <button class="mode-btn @(_useWebcam ? "active" : "")" @onclick="SwitchToWebcam">Webcam</button>
+        </div>
         <div class="control-group">
             <label>Show:</label>
             <label class="checkbox-label"><input type="checkbox" @bind="_showBoxes" /> Boxes</label>
@@ -33,43 +37,85 @@
         <span class="face-count">Faces: @_faceCount</span>
     </div>
 
-    <div class="face-viewport">
-        <WebcamCapture OnFrameCaptured="@HandleFrame"
-                       AutoCapture="@_isModelLoaded"
-                       CaptureIntervalMs="33"
-                       ShowCaptureButton="true"
-                       Width="640" Height="480" />
+    @if (_useWebcam)
+    {
+        <div class="face-viewport">
+            <WebcamCapture OnFrameCaptured="@HandleFrame"
+                           AutoCapture="@_isModelLoaded"
+                           CaptureIntervalMs="33"
+                           ShowCaptureButton="true"
+                           Width="640" Height="480" />
 
-        @if (_faces != null && _faces.Count > 0)
-        {
-            <svg class="face-overlay" viewBox="0 0 640 480" preserveAspectRatio="xMidYMid meet">
-                @foreach (var face in _faces)
-                {
-                    @if (_showBoxes)
+            @if (_faces != null && _faces.Count > 0)
+            {
+                <svg class="face-overlay" viewBox="0 0 640 480" preserveAspectRatio="xMidYMid meet">
+                    @foreach (var face in _faces)
                     {
-                        <rect x="@face.X" y="@face.Y" width="@face.Width" height="@face.Height"
-                              fill="none" stroke="#3b82f6" stroke-width="2" rx="4" />
-                    }
-                    @if (_showConfidence)
-                    {
-                        @((MarkupString)$"<text x=\"{face.X}\" y=\"{face.Y - 6}\" fill=\"#3b82f6\" font-size=\"12\" font-weight=\"600\">{(face.Confidence * 100):F0}%</text>")
-                    }
-                    @if (_showLandmarks)
-                    {
-                        @foreach (var (lx, ly) in face.Landmarks)
+                        @if (_showBoxes)
                         {
-                            <circle cx="@lx" cy="@ly" r="3" fill="#34d399" stroke="#0f172a" stroke-width="1" />
+                            <rect x="@face.X" y="@face.Y" width="@face.Width" height="@face.Height"
+                                  fill="none" stroke="#3b82f6" stroke-width="2" rx="4" />
+                        }
+                        @if (_showConfidence)
+                        {
+                            @((MarkupString)$"<text x=\"{face.X}\" y=\"{face.Y - 6}\" fill=\"#3b82f6\" font-size=\"12\" font-weight=\"600\">{(face.Confidence * 100):F0}%</text>")
+                        }
+                        @if (_showLandmarks)
+                        {
+                            @foreach (var (lx, ly) in face.Landmarks)
+                            {
+                                <circle cx="@lx" cy="@ly" r="3" fill="#34d399" stroke="#0f172a" stroke-width="1" />
+                            }
                         }
                     }
-                }
-            </svg>
-        }
-    </div>
+                </svg>
+            }
+        </div>
+    }
+    else if (_stillImageDataUrl != null)
+    {
+        <div class="face-viewport face-still">
+            <img src="@_stillImageDataUrl" class="face-still-img" alt="Input" />
+            @if (_faces != null && _faces.Count > 0)
+            {
+                <svg class="face-overlay" viewBox="0 0 @_stillImageWidth @_stillImageHeight" preserveAspectRatio="xMidYMid meet">
+                    @foreach (var face in _faces)
+                    {
+                        @if (_showBoxes)
+                        {
+                            <rect x="@face.X" y="@face.Y" width="@face.Width" height="@face.Height"
+                                  fill="none" stroke="#3b82f6" stroke-width="@Math.Max(2, _stillImageWidth / 320)" rx="4" />
+                        }
+                        @if (_showConfidence)
+                        {
+                            @((MarkupString)$"<text x=\"{face.X}\" y=\"{face.Y - 6}\" fill=\"#3b82f6\" font-size=\"{Math.Max(10, _stillImageWidth / 50)}\" font-weight=\"600\">{(face.Confidence * 100):F0}%</text>")
+                        }
+                        @if (_showLandmarks)
+                        {
+                            @foreach (var (lx, ly) in face.Landmarks)
+                            {
+                                <circle cx="@lx" cy="@ly" r="@Math.Max(2, _stillImageWidth / 200)" fill="#34d399" stroke="#0f172a" stroke-width="1" />
+                            }
+                        }
+                    }
+                </svg>
+            }
+        </div>
+        <div class="result-actions">
+            <button class="action-btn clear-btn" @onclick="ClearStillImage">Try Another Image</button>
+        </div>
+    }
+    else
+    {
+        <ImageDropZone @bind-ImageDataUrl="_stillImageDataUrl"
+                       OnImageLoaded="@HandleStillImageLoaded"
+                       SampleImages="@_faceSamples" />
+    }
 
     @if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            BlazeFace (~0.5&nbsp;MB) loads on your first Capture click — then live detection starts automatically.
+            BlazeFace (~0.5&nbsp;MB) loads on your first image or Capture click.
         </div>
     }
 
@@ -82,6 +128,16 @@
 
 <style>
     .face-controls { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .mode-toggle {
+        display: flex; border-radius: 6px; overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .mode-btn {
+        padding: 0.3rem 0.75rem; border: none; background: rgba(255, 255, 255, 0.04);
+        color: #64748b; font-size: 0.8rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease;
+    }
+    .mode-btn.active { background: rgba(139, 92, 246, 0.2); color: #e2e8f0; }
+    .mode-btn:hover:not(.active) { background: rgba(255, 255, 255, 0.08); }
     .control-group { display: flex; align-items: center; gap: 0.75rem; }
     .control-group label:first-child { color: #64748b; font-size: 0.85rem; }
     .checkbox-label { display: flex; align-items: center; gap: 0.3rem; color: #94a3b8; font-size: 0.82rem; cursor: pointer; }
@@ -90,28 +146,33 @@
 
     .face-viewport { position: relative; border-radius: 10px; overflow: hidden; }
     .face-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
+    .face-still { width: 100%; max-width: 800px; }
+    .face-still-img { width: 100%; height: auto; display: block; border-radius: 8px; border: 1px solid rgba(255,255,255,0.1); }
+
+    .result-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+    .action-btn { padding: 0.5rem 1rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s ease; }
+    .clear-btn { border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #94a3b8; }
+    .clear-btn:hover { background: rgba(255,255,255,0.1); }
 
     .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
 </style>
 
 @code {
-    // "Show how" — the actual BlazeFace path this page runs (no Transformers.js equivalent exists).
     private const string _howToCs = """
 // Load BlazeFace (~0.5MB) from the hub and build the face pipeline on YOUR GPU — no ONNX Runtime
 using var hub = new ModelHub(JS);
-// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-// by piece, restored on reload with no re-download, and seeded to peers.
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
     accelerator, hub, ModelHub.KnownModels.BlazeFace, "model.tflite",
     http: Http);
 var pipe = new FaceDetectionPipeline(session, accelerator);
 
-// Detect — boxes + landmarks + confidence per frame, on-device
-var result = await pipe.DetectAsync(rgbaPixels, width: 640, height: 480);
+var result = await pipe.DetectAsync(rgbaPixels, width, height);
 foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks);
 """;
 
     private string _selectedBackend = "WebGPU";
+    // Image is the default — matches Style/Detect; webcam is opt-in.
+    private bool _useWebcam;
     private bool _showBoxes = true, _showLandmarks = true, _showConfidence = true;
     private int _faceCount;
     private List<FaceDetection>? _faces;
@@ -119,11 +180,21 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
     private double _modelProgress, _inferenceMs;
     private bool _processingFrame;
 
+    private string? _stillImageDataUrl;
+    private int _stillImageWidth = 640, _stillImageHeight = 480;
+
     private List<BackendSelector.BackendInfo> _backends = new()
     {
         new() { Id = "WebGPU", DisplayName = "WebGPU" },
         new() { Id = "WebGL", DisplayName = "WebGL" },
         new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private List<ImageDropZone.SampleImage> _faceSamples = new()
+    {
+        new() { Label = "Portrait", Url = "samples/portrait.jpg" },
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Dog", Url = "samples/dog.jpg" },
     };
 
     [Inject] SpawnJS.SpawnJSRuntime JS { get; set; } = default!;
@@ -133,9 +204,34 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
     private global::ILGPU.Context? _context;
     private Pipelines.FaceDetectionPipeline? _pipeline;
 
-    // OPT-IN: BlazeFace is NOT downloaded/loaded on page entry. It loads on the first real
-    // interaction (the user clicking the webcam capture button) — see HandleFrame. Once loaded,
-    // AutoCapture (bound to _isModelLoaded) starts the live feed.
+    // OPT-IN: BlazeFace loads on first image pick or webcam Capture — not on page entry.
+
+    private void SwitchToImage()
+    {
+        if (!_useWebcam) return;
+        _useWebcam = false;
+        _faces = null;
+        _faceCount = 0;
+        StateHasChanged();
+    }
+
+    private void SwitchToWebcam()
+    {
+        if (_useWebcam) return;
+        _useWebcam = true;
+        _stillImageDataUrl = null;
+        _faces = null;
+        _faceCount = 0;
+        StateHasChanged();
+    }
+
+    private void ClearStillImage()
+    {
+        _stillImageDataUrl = null;
+        _faces = null;
+        _faceCount = 0;
+        StateHasChanged();
+    }
 
     private async Task LoadModelAsync()
     {
@@ -155,8 +251,6 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
             using var hub = new Hub.ModelHub(JS);
-            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-            // by piece, restored on reload with no re-download, and seeded to peers.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
                 _accelerator, hub, Hub.ModelHub.KnownModels.BlazeFace, "model.tflite",
                 http: Http);
@@ -183,18 +277,48 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
         _accelerator?.Dispose();
         _accelerator = null;
         _isModelLoaded = false;
-        // Opt-in: only re-load if the model was already loaded; switching backend before
-        // first use must not trigger a download.
+        _faces = null;
+        _faceCount = 0;
         if (wasLoaded)
             await LoadModelAsync();
         else
             StateHasChanged();
     }
 
+    private async Task HandleStillImageLoaded(byte[] imageBytes)
+    {
+        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
+        if (_pipeline == null) return;
+        try
+        {
+            using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(
+                new[] { imageBytes }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = "image/jpeg" });
+            using var window = JS.Get<SpawnDev.SpawnJS.JSObjects.Window>("window");
+            using var bitmap = await window.CreateImageBitmap(blob);
+            int w = (int)bitmap.Width;
+            int h = (int)bitmap.Height;
+            using var canvas = new SpawnDev.SpawnJS.JSObjects.HTMLCanvasElement();
+            canvas.Width = w;
+            canvas.Height = h;
+            using var ctx = canvas.Get2DContext();
+            ctx.DrawImage(bitmap, 0, 0, w, h);
+            using var imageData = ctx.GetImageData(0, 0, w, h);
+            using var data = imageData.Data;
+            var rgbaPixels = data.Read<int>();
+            _stillImageWidth = w;
+            _stillImageHeight = h;
+
+            await RunDetection(rgbaPixels, w, h);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Face] Still image error: {ex.Message}");
+        }
+    }
+
     private async Task HandleFrame(byte[] frameBytes)
     {
         if (_processingFrame) return;
-        // Opt-in load: the first captured frame (user clicked Capture) is the first engagement.
         if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
         if (_pipeline == null) return;
         _processingFrame = true;
@@ -202,24 +326,7 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
         {
             var rgbaPixels = new int[frameBytes.Length / 4];
             Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
-
-            _isRunning = true;
-            var result = await _pipeline.DetectAsync(rgbaPixels, 640, 480);
-            _inferenceMs = result.InferenceTimeMs;
-            _faceCount = result.FaceCount;
-
-            _faces = result.Faces.Select(f => new FaceDetection
-            {
-                X = f.X,
-                Y = f.Y,
-                Width = f.Width,
-                Height = f.Height,
-                Confidence = f.Confidence,
-                Landmarks = f.Landmarks,
-            }).ToList();
-
-            _isRunning = false;
-            StateHasChanged();
+            await RunDetection(rgbaPixels, 640, 480);
         }
         catch (Exception ex)
         {
@@ -230,6 +337,32 @@ foreach (var f in result.Faces) DrawBox(f.X, f.Y, f.Width, f.Height, f.Landmarks
         {
             _processingFrame = false;
         }
+    }
+
+    private async Task RunDetection(int[] rgbaPixels, int width, int height)
+    {
+        _isRunning = true;
+        try
+        {
+            var result = await _pipeline!.DetectAsync(rgbaPixels, width, height);
+            _inferenceMs = result.InferenceTimeMs;
+            _faceCount = result.FaceCount;
+            _faces = result.Faces.Select(f => new FaceDetection
+            {
+                X = f.X,
+                Y = f.Y,
+                Width = f.Width,
+                Height = f.Height,
+                Confidence = f.Confidence,
+                Landmarks = f.Landmarks,
+            }).ToList();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Face] Inference error: {ex.Message}");
+        }
+        _isRunning = false;
+        StateHasChanged();
     }
 
     public void Dispose()

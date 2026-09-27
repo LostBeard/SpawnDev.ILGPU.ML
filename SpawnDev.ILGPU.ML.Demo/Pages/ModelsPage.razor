@@ -71,7 +71,7 @@
         @if (_customResult != null)
         {
             <div class="custom-result">
-                <span class="result-icon">@(_compatResult?.IsFullySupported == true ? "&#x2705;" : _compatResult != null ? "&#x26A0;" : "&#x23F3;")</span>
+                <span class="result-icon">@(_compatResult?.IsFullySupported == true ? "✅" : _compatResult != null ? "⚠" : "⏳")</span>
                 <span>@_customResult</span>
             </div>
         }

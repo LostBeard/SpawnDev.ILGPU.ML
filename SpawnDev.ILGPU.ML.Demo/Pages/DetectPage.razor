@@ -51,7 +51,8 @@
                             ImageWidth="640" ImageHeight="480"
                             ConfidenceThreshold="@(_confidenceThreshold / 100f)">
             <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
-                           OnImageLoaded="@HandleImageLoaded" />
+                           OnImageLoaded="@HandleImageLoaded"
+                           SampleImages="@_detectSamples" />
         </BoundingBoxOverlay>
     }
 
@@ -175,6 +176,14 @@
     private double _modelProgress;
     private double _inferenceMs;
     private List<BoundingBoxOverlay.Detection>? _detections;
+
+    private List<ImageDropZone.SampleImage> _detectSamples = new()
+    {
+        new() { Label = "Cat", Url = "samples/cat.jpg" },
+        new() { Label = "Dog", Url = "samples/dog.jpg" },
+        new() { Label = "Street", Url = "samples/street.jpg" },
+        new() { Label = "Landscape", Url = "samples/landscape.jpg" },
+    };
 
     // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
     private const string _howToCs = """

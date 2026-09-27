@@ -17,7 +17,7 @@ SpawnDev.ILGPU.ML implements neural network inference AND training as native GPU
 > **What actually works:** [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth — a per-demo **VERIFIED / PARTIAL / WIP** table with the test that proves each one. We mark stubs as WIP honestly, so a demo never lies to you.
 
 - **System One decision heads** *(5.2.22+; Snake factory removed from package in 5.2.23)* — typed choice / score / noul over a float state vector (Jev/Laya-inspired category, not a weight port). Tiny GPU MLP via `TrainableModel`, legal-action masks, FP32 weight export/import. Classic Snake at `/snake` is a **demo** (dims/teacher in `Demo.Shared`, not NuGet). [**Docs/system-one.md**](Docs/system-one.md)
-- **Demos** - **14 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, CLIP, background-removal, super-res, text-gen, embeddings, inspector, benchmark, speech-to-text, **and System One Snake**), plus several PARTIAL/WIP (image-to-3D, voice-collab, SD-Turbo image-gen are not done yet). See the status doc for exactly which.
+- **Demos** - **15 VERIFIED end-to-end** (most matched numerically against ONNX Runtime: classification, style, depth, detection, pose, face, CLIP, background-removal, super-res, text-gen, embeddings, sentiment, inspector, benchmark, speech-to-text, System One Snake, **and SD-Turbo image-gen**), plus a few PARTIAL/WIP (see status doc). On-device LLM chat lives at `/ai-chat`.
 - **16 inference pipelines** — Classification, StyleTransfer, SuperResolution, DepthEstimation, ObjectDetection, PoseEstimation, FaceDetection, TextClassification, ZeroShotClassification (CLIP), BackgroundRemoval, SpeechRecognition (Whisper), TextGeneration, FeatureExtraction, Diffusion (DDPM), TextToSpeech (SpeechT5), Image3D (TripoSR)
 - **GPU training engine** — Draw custom gestures, train a CNN classifier in real-time on your GPU, test instantly. Softmax-CE MLP training powers System One heads. Backpropagation, gradient descent, Adam optimizer — all in C# GPU kernels. No server, no Python.
 - **NLP transformers in the browser** — DistilBERT sentiment analysis, Whisper speech-to-text, text generation — all on WebGPU. No server, no upload, no cloud.
@@ -444,12 +444,10 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 
 | Demo | What It Does | Why It's Special |
 |------|-------------|-----------------|
-| **AI Assistant** | Classic MS Agent-style characters (Clippy, Merlin, …) with text chat. When DistilGPT-2 is loaded, replies are on-device; otherwise the page uses honest placeholders. Whisper/SpeechT5 voice and Phi-4 / Mistral NeMo tiering are **not wired on this page yet** (see STATUS). | Nostalgia UI on top of the real text-gen pipeline — same honesty rules as other PARTIAL demos. |
-| **Comic Chat AI** | Comic-strip chat room with per-character personalities. Same text-gen path as Assistant when a model is loaded; placeholders otherwise. No 14B tiering on this page today. | Multi-character local chat UI; engine maturity tracked under `/ai-chat` + STATUS. |
 | **Inside the Network** | Peek inside the neural network — feature maps / activations for a limited set of models. | Educational; PARTIAL — not every model is interceptable yet. |
 | **Draw to Train** | Draw gestures, train a small CNN on-device. Gesture path still PARTIAL; System One BC train is verified via `/snake`. | Browser GPU training (forward + backprop) where the path is finished. |
 | **System One Snake** | Classic Snake controlled by a local System One decision head (Softmax probs, no text). Train on-device from a flood-fill safe teacher; illegal moves masked; ~23 KB head cached in localStorage. Package API is generic; Snake code lives in Demo.Shared. | Shows typed decisions + GPU training without a language model. Docs: [system-one.md](Docs/system-one.md). |
-| **Voice Collaboration** | **Coming soon.** Phase 1 uses the browser Web Speech API. The on-device GPU Whisper + LLM + SpeechT5 stack the name implies is **not wired yet**. | Listed so the roadmap is honest — do not expect GPU voice today. |
+| **AI Chat** | On-device GGUF LLM chat (Qwen / Gemma / Llama / SmolLM). Pick a `.gguf`, stream tokens on WebGPU. | Real local chat — no API key. Prefer this over the retired Assistant / Comic Chat placeholder pages. |
 
 ### Generative & 3D Demos
 
