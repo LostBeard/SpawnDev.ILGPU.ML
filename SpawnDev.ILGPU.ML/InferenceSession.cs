@@ -3039,6 +3039,12 @@ public class InferenceSession : IDisposable
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            // Defeat a browser HTTP cache entry that stored a truncated body with a matching
+            // Content-Length (BlazeFace: CL=199050 body=199050 looked "complete", FlatBuffer OOB).
+            request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
+            {
+                NoCache = true,
+            };
 
             // In the BROWSER, HttpCompletionOption.ResponseHeadersRead does NOTHING on its own: the fetch-based
             // handler buffers the whole body into the MANAGED heap unless the request explicitly opts in to

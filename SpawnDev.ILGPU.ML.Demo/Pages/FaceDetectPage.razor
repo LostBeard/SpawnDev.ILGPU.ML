@@ -1,4 +1,5 @@
 @page "/face"
+@using System.IO
 @using SpawnDev.SpawnJS
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Pipelines
@@ -270,11 +271,28 @@
             // Bundled demo copy only — do NOT fall through to hub.spawndev.com.
             // litert-community/blaze-face returns 502 on the hub (2026-09-26); a hub fallback just
             // threw after a working (or almost-working) local path and looked like the demo was broken.
-            var session = await InferenceSession.CreateFromFileAsync(
-                _accelerator, Http, "models/blaze-face/model.tflite",
+            //
+            // Known size + cache-bust: CreateFromFileAsync/DownloadBytesChunkedAsync could "succeed" at
+            // 199050 bytes when the browser HTTP cache served a truncated body whose Content-Length
+            // matched the short length (so the incomplete-stream fallback never ran). Measured on
+            // lostbeard.github.io/face with Build 2026-09-27 04:32:24 UTC still FlatBuffer-OOB.
+            const int blazeFaceBytes = 229746;
+            var modelUrl = $"models/blaze-face/model.tflite?v={blazeFaceBytes}";
+            _modelProgress = 50;
+            StateHasChanged();
+            var bytes = await Http.GetByteArrayAsync(modelUrl);
+            Console.WriteLine($"[Face] downloaded {bytes.Length} bytes (expect {blazeFaceBytes})");
+            if (bytes.Length != blazeFaceBytes)
+                throw new InvalidDataException(
+                    $"BlazeFace download truncated or corrupt: got {bytes.Length} bytes, expected {blazeFaceBytes}. "
+                    + "Unregister the site's service worker (DevTools → Application) and reload.");
+            _modelProgress = 70;
+            StateHasChanged();
+            var session = InferenceSession.CreateFromFile(
+                _accelerator, bytes,
                 onProgress: (stage, pct) =>
                 {
-                    _modelProgress = 40 + pct * 0.55;
+                    _modelProgress = 70 + pct * 0.25;
                     StateHasChanged();
                 });
 

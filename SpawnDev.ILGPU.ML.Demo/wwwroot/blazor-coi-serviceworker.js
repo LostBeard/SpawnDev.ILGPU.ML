@@ -33,15 +33,22 @@ if (typeof window !== 'undefined') {
         var reloadCount = parseInt(sessionStorage.getItem(reloadKey) || "0", 10);
 
         if (reloadCount < 2) {
-            // Register the SW (idempotent if already registered)
-            navigator.serviceWorker
-                .register(window.document.currentScript.src)
-                .then(function (reg) {
-                    consoleLog("[COI] Service worker registered:", reg.scope);
-                })
-                .catch(function (err) {
-                    console.error("[COI] Service worker registration failed:", err);
-                });
+            // Drop every prior registration so an old COI worker (pre-/models bypass,
+            // pre-arrayBuffer wrap) cannot keep controlling fetches after a deploy.
+            // Measured 2026-09-27: new wasm loaded but old SW still truncated BlazeFace.
+            var registerFresh = function () {
+                return navigator.serviceWorker
+                    .register(window.document.currentScript.src)
+                    .then(function (reg) {
+                        consoleLog("[COI] Service worker registered:", reg.scope);
+                    })
+                    .catch(function (err) {
+                        console.error("[COI] Service worker registration failed:", err);
+                    });
+            };
+            navigator.serviceWorker.getRegistrations().then(function (regs) {
+                return Promise.all(regs.map(function (r) { return r.unregister(); }));
+            }).then(registerFresh).catch(registerFresh);
 
             // Wait for SW to be ready, then reload to pick up COI headers.
             // Timeout after 5s — if the SW doesn't activate in time, let Blazor load anyway.
@@ -116,14 +123,20 @@ if (typeof window !== 'undefined') {
         event.respondWith(
             fetch(event.request)
                 .then(function (response) {
-                    var newHeaders = new Headers(response.headers);
-                    newHeaders.set("Cross-Origin-Embedder-Policy", "credentialless");
-                    newHeaders.set("Cross-Origin-Opener-Policy", "same-origin");
-
-                    return new Response(response.body, {
-                        status: response.status,
-                        statusText: response.statusText,
-                        headers: newHeaders,
+                    // Buffer the full body BEFORE re-wrapping. Passing response.body through
+                    // `new Response(response.body, …)` truncates Blazor HttpClient streaming
+                    // (BlazeFace 229746→199050 on GH Pages even after /models/ bypass when an
+                    // older controlling SW was still active). arrayBuffer keeps length honest.
+                    return response.arrayBuffer().then(function (buf) {
+                        var newHeaders = new Headers(response.headers);
+                        newHeaders.set("Cross-Origin-Embedder-Policy", "credentialless");
+                        newHeaders.set("Cross-Origin-Opener-Policy", "same-origin");
+                        newHeaders.set("Content-Length", String(buf.byteLength));
+                        return new Response(buf, {
+                            status: response.status,
+                            statusText: response.statusText,
+                            headers: newHeaders,
+                        });
                     });
                 })
                 .catch(function (e) {

@@ -2,6 +2,14 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.27 (2026-09-27) - Face: known-size load; COI SW buffers bodies
+
+**Bug fix:** Build `2026-09-27 04:32:24 UTC` still FlatBuffer-OOB at buffer length 199050. A truncated
+browser-cache entry whose Content-Length matched the short body made the download look complete.
+`/face` now `GetByteArrayAsync` + asserts 229746. COI SW `unregister()`s prior workers and wraps via
+`arrayBuffer()` (not `response.body`). `DownloadBytesChunkedAsync` sends `Cache-Control: no-cache` on
+the first GET too.
+
 ## 5.2.26 (2026-09-27) - COI SW must not re-wrap same-origin model fetches
 
 **Bug fix:** `/face` on GH Pages still got BlazeFace as 199050 of 229746 bytes after 5.2.25. Not an
