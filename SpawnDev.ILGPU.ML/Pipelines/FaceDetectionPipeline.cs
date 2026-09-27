@@ -16,11 +16,8 @@ namespace SpawnDev.ILGPU.ML.Pipelines;
 /// MediaPipe short-range contract: input [-1,1] letterboxed 128×128, strides [8,16,16,16] → 896
 /// anchors, <c>reverse_output_order</c> yxhw boxes. Decode matches that.
 /// <para>
-/// ⚠️ 2026-09-27: on the local/MediaPipe 229746-byte model, classificators vs the ORT/TFLite
-/// reference still diverge at relRMS ~240 (<c>Pipeline_BlazeFace_Reference_MatchesOnnxRuntime</c>).
-/// Until that NHWC forward is fixed, DetectAsync will typically return 0 faces above the 0.5
-/// MediaPipe score threshold even with a correct decode. Do not mark /face VERIFIED on finite
-/// regressors alone.
+/// Forward parity (5.2.29): TFLite NHWC MaxPool + correct DepthwiseConv fused-activation field.
+/// Gate: <c>Pipeline_BlazeFace_Reference_MatchesOnnxRuntime</c> (classificator relRMS ≤ 0.05).
 /// </para>
 /// </remarks>
 public class FaceDetectionPipeline : IDisposable

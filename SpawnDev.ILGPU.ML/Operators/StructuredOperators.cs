@@ -1723,7 +1723,8 @@ public class MaxPoolOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0];
-        var (N, C, H, W) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, ctx.Format) : (x.Shape[0], 1, 1, 1);
+        var fmt = ctx.Format;
+        var (N, C, H, W) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, fmt) : (x.Shape[0], 1, 1, 1);
         var ks = ctx.GetInts("kernel_shape"); int kH = ks.Length > 0 ? ks[0] : 2; int kW = ks.Length > 1 ? ks[1] : kH;
         var st = ctx.GetInts("strides"); int sH = st.Length > 0 ? st[0] : 1; int sW = st.Length > 1 ? st[1] : sH;
         var pa = ctx.GetInts("pads"); int pH = pa.Length > 0 ? pa[0] : 0; int pW = pa.Length > 1 ? pa[1] : 0;
@@ -1736,7 +1737,10 @@ public class MaxPoolOperator(OperatorRegistry reg) : IOnnxOperator
             pH = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
             pW = autoPad == "SAME_UPPER" ? padW / 2 : padW - padW / 2;
         }
-        reg.Pooling.MaxPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
+        if (fmt == DataFormat.NHWC)
+            reg.Pooling.MaxPool2DNHWC(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
+        else
+            reg.Pooling.MaxPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
     }
 }
 
@@ -1750,7 +1754,8 @@ public class AveragePoolOperator(OperatorRegistry reg) : IOnnxOperator
     public void Execute(OnnxOpContext ctx)
     {
         var x = ctx.Inputs[0];
-        var (N, C, H, W) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, ctx.Format) : (x.Shape[0], 1, 1, 1);
+        var fmt = ctx.Format;
+        var (N, C, H, W) = x.Shape.Length >= 4 ? LayoutHelper.GetDims(x.Shape, fmt) : (x.Shape[0], 1, 1, 1);
         var ks = ctx.GetInts("kernel_shape"); int kH = ks[0]; int kW = ks.Length > 1 ? ks[1] : kH;
         var st = ctx.GetInts("strides"); int sH = st.Length > 0 ? st[0] : 1; int sW = st.Length > 1 ? st[1] : sH;
         var pa = ctx.GetInts("pads"); int pH = pa.Length > 0 ? pa[0] : 0; int pW = pa.Length > 1 ? pa[1] : 0;
@@ -1762,7 +1767,10 @@ public class AveragePoolOperator(OperatorRegistry reg) : IOnnxOperator
             pH = autoPad == "SAME_UPPER" ? padH / 2 : padH - padH / 2;
             pW = autoPad == "SAME_UPPER" ? padW / 2 : padW - padW / 2;
         }
-        reg.Pooling.AvgPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
+        if (fmt == DataFormat.NHWC)
+            reg.Pooling.AvgPool2DNHWC(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
+        else
+            reg.Pooling.AvgPool2D(x.Data, ctx.Outputs[0].Data, N, C, H, W, kH, kW, sH, sW, pH, pW);
     }
 }
 

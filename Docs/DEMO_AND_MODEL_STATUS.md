@@ -26,7 +26,7 @@
 | `/clip` | Zero-shot classification (CLIP) | ✅ **VERIFIED** | `Reference_CLIPVision_MatchesOnnxRuntime` (runs the model against ORT). ⚠️ Previously also cited `Pipeline_CLIP_Reference_CatIsTopMatch`, which never ran the model - it asserted the reference JSON was well formed, and is now named `ReferenceData_CLIP_FixtureIsWellFormed` |
 | `/remove-bg` | Background removal (RMBG) | ✅ **VERIFIED** | `Pipeline_BackgroundRemoval_RealImage_ProducesVaryingMask` (perf caveats on WebGPU compile) |
 | `/super-res` | Super-resolution (ESPCN) | ✅ **VERIFIED** | `CreateFromFile_SuperResolution_ESPCN`, `HF_DownloadAndLoadSession_SuperResolution` |
-| `/face` | Face detection (BlazeFace) | 🟡 **PARTIAL** | Model loads. Decode matches MediaPipe short-range (896 anchors, [-1,1] letterbox, yxhw). **NHWC forward diverges** from TFLite reference (classificator relRMS ~240) — live Faces: 0. Gate: `Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` (must stay red until fixed). |
+| `/face` | Face detection (BlazeFace) | ✅ **VERIFIED** | `Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` (classificator relRMS ≤ 0.05; measured ~4.6e-4) + `Pipeline_BlazeFace_Portrait_DetectsFace`. 5.2.29: NHWC MaxPool + DepthwiseConv fused-act field 4. |
 | `/sentiment` | Sentiment (DistilBERT-SST2) | ✅ **VERIFIED** | `Sentiment_DistilBertSST2_ClassifiesPositiveAndNegative`; **live gate 2026-09-26** `drive-ml-pages.cs` → `.sentiment-verdict` = POSITIVE |
 | `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` on **all-MiniLM-L6-v2** (384-dim, all six backends). **Page re-pointed 2026-09-26** off DistilBertSST2 (classifier `logits` [1,2] — threw at runtime). Gate: `drive-ml-pages.cs` `/embeddings` |
 | `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP). NOTE: superseded by `/ai-chat` for real LLM chat — candidate to retire |
@@ -59,7 +59,7 @@
 | Depth Anything V2 Small | ✅ | ✅ | ORT-matched |
 | YOLOv8-nano | ✅ | ✅ | ORT-matched |
 | MoveNet Lightning | ✅ | ✅ | ORT-matched |
-| BlazeFace | ✅ | 🟡 NHWC forward red | Loads; classificator relRMS ~240 vs TFLite ref — detection unusable until fixed |
+| BlazeFace | ✅ | ✅ VERIFIED | classificator relRMS ~4.6e-4 (5.2.29 NHWC MaxPool + depthwise fused-act) |
 | CLIP (vision) | ✅ | ✅ | ORT-matched |
 | ESPCN super-res | ✅ | ✅ | ORT-matched |
 | DistilGPT-2 / DistilBERT-SST2 | ✅ | ✅ text-gen / sentiment | DistilBERT-SST2 is the **SST-2 classifier** — one output `logits` [batch,2], **not** an embedding model |

@@ -4,12 +4,118 @@ using ILGPU.Runtime.CPU;
 using ILGPU.Runtime.Cuda;
 using SpawnDev.ILGPU.ML;
 using SpawnDev.ILGPU.ML.DemoConsole;
+using SpawnDev.ILGPU.ML.Tensors;
 using SpawnDev.UnitTesting;
 using System.Reflection;
 using System.Text.Json;
 
 // Auto-flush stdout so PlaywrightMultiTest sees output immediately
 Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+
+// BlazeFace TFLite parity probe (NOT a PMT test):
+//   dotnet run --project SpawnDev.ILGPU.ML.DemoConsole -c Release -- BLAZEDIFF [CUDA|CPU]
+if (args.Length >= 1 && args[0] == "BLAZEDIFF")
+{
+    var backend = args.Length > 1 ? args[1].ToUpperInvariant() : "CUDA";
+    var modelPath = Path.GetFullPath("SpawnDev.ILGPU.ML.Demo/wwwroot/models/blaze-face/model.tflite");
+    var refDir = Path.GetFullPath("SpawnDev.ILGPU.ML.Demo/wwwroot/references/blaze-face");
+    var modelBytes = await File.ReadAllBytesAsync(modelPath);
+    var (graph, _) = SpawnDev.ILGPU.ML.TFLite.TFLiteLoader.LoadModel(modelBytes);
+    var hist = graph.Nodes.GroupBy(n => n.OpType).OrderByDescending(g => g.Count())
+        .Select(g => $"{g.Key}:{g.Count()}");
+    Console.WriteLine($"BLAZEDIFF model={modelBytes.Length}B nodes={graph.Nodes.Count}");
+    Console.WriteLine($"  ops: {string.Join(" ", hist)}");
+    Console.WriteLine($"  Relu={graph.Nodes.Count(n => n.OpType == "Relu")} Clip={graph.Nodes.Count(n => n.OpType == "Clip")} PRelu={graph.Nodes.Count(n => n.OpType == "PRelu")} pre_act={graph.Nodes.Count(n => n.Outputs.Any(o => o.Contains("_pre_act")))}");
+
+    // Raw fused-activation field probe for first few CONV / DEPTHWISE / ADD
+    var parsed = SpawnDev.ILGPU.ML.TFLite.TFLiteParser.Parse(modelBytes);
+    var sg = parsed.Subgraphs[0];
+    var fb = new SpawnDev.ILGPU.ML.TFLite.FlatBufferReader(parsed.RawData);
+    int shown = 0;
+    for (int oi = 0; oi < sg.Operators.Length && shown < 24; oi++)
+    {
+        var op = sg.Operators[oi];
+        int bc = parsed.OperatorCodes[op.OpcodeIndex].BuiltinCode;
+        if (bc is not (3 or 4 or 0 or 18 or 9)) continue; // Conv, Depthwise, Add, Mul, FC
+        int off = op.BuiltinOptionsOffset;
+        if (off == 0) { Console.WriteLine($"  raw#{oi} bc={bc} no options"); shown++; continue; }
+        // Field indices: Conv fused=3; Depthwise fused=4 (depth_mult=3); Add/Mul/FC fused=0
+        int f0 = fb.ReadFieldByte(off, 0);
+        int f3 = fb.ReadFieldByte(off, 3);
+        int f4 = fb.ReadFieldByte(off, 4);
+        Console.WriteLine($"  raw#{oi} bc={bc} f0={f0} f3={f3} f4={f4}");
+        shown++;
+    }
+
+    ILGPU.Context ctx;
+    Accelerator acc;
+    if (backend == "CUDA")
+    {
+        ctx = MLContext.Create().ToContext();
+        acc = ctx.CreateCudaAccelerator(0);
+    }
+    else
+    {
+        ctx = MLContext.Create().ToContext();
+        acc = ctx.CreateCPUAccelerator(0);
+    }
+    using (ctx)
+    using (acc)
+    {
+        using var session = InferenceSession.CreateFromFile(acc, modelBytes);
+        Console.WriteLine($"  session nodes={session.NodeCount} outs=[{string.Join(",", session.OutputNames)}]");
+        var inBytes = await File.ReadAllBytesAsync(Path.Combine(refDir, "cat_input.bin"));
+        var input = new float[inBytes.Length / 4];
+        Buffer.BlockCopy(inBytes, 0, input, 0, inBytes.Length);
+        using var inBuf = acc.Allocate1D(input);
+        var outputs = await session.RunAsync(new Dictionary<string, Tensor>
+        {
+            [session.InputNames[0]] = new Tensor(inBuf.View, new[] { 1, 128, 128, 3 })
+        });
+        static float[] Load(string p)
+        {
+            var b = File.ReadAllBytes(p);
+            var f = new float[b.Length / 4];
+            Buffer.BlockCopy(b, 0, f, 0, b.Length);
+            return f;
+        }
+        static void Report(string name, float[] act, float[] exp)
+        {
+            int n = Math.Min(act.Length, exp.Length);
+            double sumSq = 0, sumDiff = 0, sumAE = 0, sumA = 0, sumE = 0, sumAE2 = 0;
+            float minA = float.PositiveInfinity, maxA = float.NegativeInfinity;
+            float minE = float.PositiveInfinity, maxE = float.NegativeInfinity;
+            for (int i = 0; i < n; i++)
+            {
+                float a = act[i], e = exp[i];
+                if (a < minA) minA = a; if (a > maxA) maxA = a;
+                if (e < minE) minE = e; if (e > maxE) maxE = e;
+                sumSq += e * e; sumDiff += (a - e) * (a - e); sumAE += a * e;
+                sumA += a; sumE += e; sumAE2 += a * a;
+            }
+            double rel = Math.Sqrt(sumDiff / Math.Max(1e-12, sumSq));
+            double meanA = sumA / n, meanE = sumE / n;
+            double cov = sumAE / n - meanA * meanE;
+            double varA = sumAE2 / n - meanA * meanA, varE = sumSq / n - meanE * meanE;
+            double corr = cov / Math.Max(1e-12, Math.Sqrt(Math.Max(0, varA * varE)));
+            Console.WriteLine($"  {name}: n={n} relRMS={rel:E3} corr={corr:F4} act=[{minA:F3},{maxA:F3}] exp=[{minE:F3},{maxE:F3}]");
+        }
+        async Task<float[]> Read(Tensor t, int n)
+        {
+            using var buf = acc.Allocate1D<float>(n);
+            new ElementWiseKernels(acc).Scale(t.Data.SubView(0, n), buf.View, n, 1f);
+            await acc.SynchronizeAsync();
+            return await buf.CopyToHostAsync<float>(0, n);
+        }
+        var clsName = session.OutputNames.First(n => n.Contains("classif", StringComparison.OrdinalIgnoreCase));
+        var regName = session.OutputNames.First(n => n.Contains("regress", StringComparison.OrdinalIgnoreCase));
+        var actCls = await Read(outputs[clsName], 896);
+        var actReg = await Read(outputs[regName], 896 * 16);
+        Report("classificators", actCls, Load(Path.Combine(refDir, "cat_output_classificators.bin")));
+        Report("regressors", actReg, Load(Path.Combine(refDir, "cat_output_regressors.bin")));
+    }
+    return 0;
+}
 
 // Investigation diagnostic (NOT a PMT test): can this engine run a given ONNX model at all?
 //

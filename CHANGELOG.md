@@ -2,6 +2,23 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.29 (2026-09-27) - BlazeFace /face green: NHWC MaxPool + depthwise fused-act field
+
+**Root cause of Faces: 0 (two bugs):**
+1. `TFLiteLoader` read DepthwiseConv2D fused activation from field 3 (that field is
+   `depth_multiplier`, almost always 1 = RELU) instead of field 4 → every depthwise got a
+   spurious Relu (classificator relRMS ~240 → ~1.1 once corrected).
+2. `MaxPool` / `AveragePool` always ran the NCHW kernel. BlazeFace's 3 MaxPools are NHWC —
+   each downsample scrambled channels/spatial. After NHWC MaxPool kernels:
+   classificator relRMS **4.6e-4**, regressors **2.8e-4**, corr 1.0 (CUDA BLAZEDIFF).
+
+Also: FC fused-act field 0 (not 3); Pool fused-act field 5; Conv/Depthwise dilations read from
+the correct option fields; reference gate pins the local 229746-byte model (not MediaPipe
+"latest").
+
+**Verified:** `Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` +
+`Pipeline_BlazeFace_Portrait_DetectsFace` — 6/6 on CudaTests+WebGPUTests. `/face` → VERIFIED.
+
 ## 5.2.28 (2026-09-27) - BlazeFace decode fixed; NHWC forward still red
 
 **Decode:** `FaceDetectionPipeline` now matches MediaPipe short-range (896 anchors, [-1,1]

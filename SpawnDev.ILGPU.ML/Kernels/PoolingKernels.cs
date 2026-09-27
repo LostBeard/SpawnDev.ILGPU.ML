@@ -5,7 +5,7 @@ namespace SpawnDev.ILGPU.ML.Kernels;
 
 /// <summary>
 /// GPU pooling kernels: MaxPool2D, AvgPool2D, GlobalAvgPool.
-/// Layout: NCHW. One thread per output element.
+/// Layout: NCHW and NHWC. One thread per output element.
 /// Params are captured as scalars (Lambda Kernels) per CLAUDE.md guidance —
 /// no shared buffer state, no race risk under async dispatch.
 /// </summary>
@@ -17,6 +17,10 @@ public class PoolingKernels
         int, int, int, int, int, int, int, int, int, int>? _maxPool2d;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int, int, int, int, int, int, int, int, int>? _avgPool2d;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int>? _maxPool2dNhwc;
+    private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+        int, int, int, int, int, int, int, int, int, int>? _avgPool2dNhwc;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         int, int>? _globalAvgPool;
 
@@ -80,6 +84,68 @@ public class PoolingKernels
         output[idx] = count > 0 ? sum / count : 0f;
     }
 
+    /// <summary>
+    /// MaxPool2D NHWC: input/output [N,H,W,C]. idx walks output in NHWC order.
+    /// Without this, TFLite MaxPool (BlazeFace has 3) silently ran the NCHW kernel on NHWC
+    /// buffers and scrambled every downsample — classificator relRMS stayed ~1 after the
+    /// depthwise fused-activation field fix (2026-09-27).
+    /// </summary>
+    private static void MaxPool2DNHWCImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int N, int C, int inH, int inW, int kH, int kW, int sH, int sW, int pH, int pW)
+    {
+        int outH = (inH + 2 * pH - kH) / sH + 1;
+        int outW = (inW + 2 * pW - kW) / sW + 1;
+
+        int c = idx % C; int rem = idx / C;
+        int ow = rem % outW; rem /= outW;
+        int oh = rem % outH; int n = rem / outH;
+
+        float max = -1e38f;
+        int totalK = kH * kW;
+        for (int k = 0; k < totalK; k++)
+        {
+            int ky = k / kW; int kx = k % kW;
+            int iy = oh * sH + ky - pH;
+            int ix = ow * sW + kx - pW;
+            if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+            {
+                float v = input[((n * inH + iy) * inW + ix) * C + c];
+                if (v > max) max = v;
+            }
+        }
+        output[idx] = max;
+    }
+
+    private static void AvgPool2DNHWCImpl(Index1D idx,
+        ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int N, int C, int inH, int inW, int kH, int kW, int sH, int sW, int pH, int pW)
+    {
+        int outH = (inH + 2 * pH - kH) / sH + 1;
+        int outW = (inW + 2 * pW - kW) / sW + 1;
+
+        int c = idx % C; int rem = idx / C;
+        int ow = rem % outW; rem /= outW;
+        int oh = rem % outH; int n = rem / outH;
+
+        float sum = 0f; int count = 0;
+        int totalK = kH * kW;
+        for (int k = 0; k < totalK; k++)
+        {
+            int ky = k / kW; int kx = k % kW;
+            int iy = oh * sH + ky - pH;
+            int ix = ow * sW + kx - pW;
+            if (iy >= 0 && iy < inH && ix >= 0 && ix < inW)
+            {
+                sum += input[((n * inH + iy) * inW + ix) * C + c];
+                count++;
+            }
+        }
+        output[idx] = count > 0 ? sum / count : 0f;
+    }
+
     /// <summary>GlobalAvgPool: [N, C, H, W] → [N, C, 1, 1]. One thread per (n, c).</summary>
     private static void GlobalAvgPoolImpl(Index1D idx,
         ArrayView1D<float, Stride1D.Dense> input,
@@ -123,6 +189,34 @@ public class PoolingKernels
         _avgPool2d!(N * C * outH * outW, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
     }
 
+    public void MaxPool2DNHWC(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
+    {
+        EnsureLoaded();
+        int outH = (inH + 2 * padH - kH) / strideH + 1;
+        int outW = (inW + 2 * padW - kW) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"MaxPool2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
+        _maxPool2dNhwc!(N * outH * outW * C, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
+    }
+
+    public void AvgPool2DNHWC(ArrayView1D<float, Stride1D.Dense> input,
+        ArrayView1D<float, Stride1D.Dense> output,
+        int N, int C, int inH, int inW, int kH, int kW, int strideH, int strideW, int padH, int padW)
+    {
+        EnsureLoaded();
+        int outH = (inH + 2 * padH - kH) / strideH + 1;
+        int outW = (inW + 2 * padW - kW) / strideW + 1;
+        if (outH <= 0 || outW <= 0)
+            throw new InvalidOperationException(
+                $"AvgPool2D NHWC output dimensions are invalid: outH={outH}, outW={outW} " +
+                $"(N={N}, C={C}, inH={inH}, inW={inW}, kH={kH}, kW={kW}, sH={strideH}, sW={strideW}, padH={padH}, padW={padW})");
+        _avgPool2dNhwc!(N * outH * outW * C, input, output, N, C, inH, inW, kH, kW, strideH, strideW, padH, padW);
+    }
+
     public void GlobalAvgPool(ArrayView1D<float, Stride1D.Dense> input,
         ArrayView1D<float, Stride1D.Dense> output,
         int N, int C, int spatial)
@@ -140,6 +234,12 @@ public class PoolingKernels
         _avgPool2d ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int, int, int, int, int, int, int, int, int>(AvgPool2DImpl);
+        _maxPool2dNhwc ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int, int, int, int, int, int>(MaxPool2DNHWCImpl);
+        _avgPool2dNhwc ??= a.LoadAutoGroupedStreamKernel<Index1D,
+            ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
+            int, int, int, int, int, int, int, int, int, int>(AvgPool2DNHWCImpl);
         _globalAvgPool ??= a.LoadAutoGroupedStreamKernel<Index1D,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             int, int>(GlobalAvgPoolImpl);

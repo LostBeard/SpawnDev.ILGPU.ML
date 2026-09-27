@@ -163,18 +163,16 @@ public abstract partial class MLTestBase
         var http = GetHttpClient();
         if (http == null) throw new UnsupportedTestException("HttpClient not available");
 
-        // BlazeFace is TFLite format — try Kaggle TF model first, fall back to local
+        // Reference bins were captured against wwwroot/models/blaze-face/model.tflite
+        // (229746 bytes). Do NOT prefer MediaPipe "latest" — that model drifts and used to
+        // keep this gate red for the wrong reason (relRMS ~1 while the matching local model
+        // was fine, once the depthwise fused-activation field bug was fixed).
         byte[] modelBytes;
-        try
-        {
-            modelBytes = await InferenceSession.DownloadBytesChunkedAsync(http,
-                "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite");
-        }
-        catch
-        {
-            // Fallback to local model (may be quantized with different tensor names)
-            modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite");
-        }
+        try { modelBytes = await http.GetByteArrayAsync("models/blaze-face/model.tflite"); }
+        catch (Exception ex) { throw new UnsupportedTestException($"BlazeFace model missing: {ex.Message}"); }
+        if (modelBytes.Length != 229746)
+            throw new Exception(
+                $"BlazeFace reference gate expects the pinned 229746-byte MediaPipe short-range model, got {modelBytes.Length}");
         using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
 
         // Load reference input in NHWC format (TFLite native layout)

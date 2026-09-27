@@ -4,7 +4,7 @@
 		<TargetFramework>net10.0</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-		<Version>5.2.28</Version>
+		<Version>5.2.29</Version>
 		<PackageReleaseNotes>v5.2.24: CreateFromStreamAsync — universal seekable-stream load with magic-byte auto-detect (ONNX/GGUF stream to GPU). See CHANGELOG.</PackageReleaseNotes>
 		<GeneratePackageOnBuild>True</GeneratePackageOnBuild>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>

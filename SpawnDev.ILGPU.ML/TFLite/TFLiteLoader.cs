@@ -190,14 +190,15 @@ public static class TFLiteLoader
                     });
                 }
 
-                // Handle fused activation for FC (same pattern as Conv)
-                HandleFusedActivation(graph, model, op, tensorNames, 3);
+                // FullyConnectedOptions.fused_activation_function is field 0 (NOT 3 —
+                // field 3 is asymmetric_quantize_inputs).
+                HandleFusedActivation(graph, model, op, tensorNames, 0);
                 continue;
             }
 
             // ── Multi-node decompositions for ops that don't map 1:1 ──
 
-            // RSQRT (76): 1/sqrt(x) → Sqrt then Reciprocal
+            // RSQRT (76): 1/sqrt(x) → Sqrt then Reciprocal. No fused activation.
             if (builtinCodeForNode == 76)
             {
                 string sqrtOut = tensorNames[op.Outputs[0]] + "_sqrt";
@@ -207,7 +208,6 @@ public static class TFLiteLoader
                 graph.Nodes.Add(new GraphNode { OpType = "Reciprocal",
                     Inputs = new List<string> { sqrtOut },
                     Outputs = op.Outputs.Select(i => tensorNames[i]).ToList() });
-                HandleFusedActivation(graph, model, op, tensorNames, builtinCodeForNode == 3 || builtinCodeForNode == 4 ? 6 : 3);
                 continue;
             }
 
@@ -294,9 +294,23 @@ public static class TFLiteLoader
                 }
             }
 
-            // Handle fused activations (TFLite fuses RELU/RELU6 into Conv/Pool ops)
-            if (builtinCodeForNode is 3 or 4 or 1 or 17)
-                HandleFusedActivation(graph, model, op, tensorNames, 3);
+            // Handle fused activations (TFLite fuses RELU/RELU6 into Conv/Pool ops).
+            // Field index is per-option-table — do NOT use a shared "3":
+            //   Conv2DOptions:           fused_activation = field 3
+            //   DepthwiseConv2DOptions:  depth_multiplier = field 3, fused_activation = field 4
+            //   Pool2DOptions:           filter_height = field 4, fused_activation = field 5
+            // Reading field 3 on Depthwise treated depth_multiplier (almost always 1 = RELU)
+            // as the activation → every BlazeFace depthwise got a spurious Relu → classificator
+            // relRMS ~240 and /face Faces: 0 (2026-09-27).
+            int fusedField = builtinCodeForNode switch
+            {
+                3 => 3,   // CONV_2D
+                4 => 4,   // DEPTHWISE_CONV_2D
+                1 or 17 => 5, // AVERAGE_POOL_2D / MAX_POOL_2D
+                _ => -1
+            };
+            if (fusedField >= 0)
+                HandleFusedActivation(graph, model, op, tensorNames, fusedField);
         }
 
         return (graph, weights);
@@ -428,11 +442,11 @@ public static class TFLiteLoader
     private static void ExtractConvAttributes(FlatBufferReader fb, int offset, int builtinCode,
         Dictionary<string, JsonElement> attrs)
     {
-        // Conv2DOptions / DepthwiseConv2DOptions:
-        // 0: padding (Padding enum: 0=SAME, 1=VALID)
-        // 1: stride_w (int)
-        // 2: stride_h (int)
-        // For DepthwiseConv2D: 4: depth_multiplier (int)
+        // Conv2DOptions:
+        //   0 padding, 1 stride_w, 2 stride_h, 3 fused_activation, 4 dilation_w, 5 dilation_h
+        // DepthwiseConv2DOptions:
+        //   0 padding, 1 stride_w, 2 stride_h, 3 depth_multiplier, 4 fused_activation,
+        //   5 dilation_w, 6 dilation_h
         byte padding = fb.ReadFieldByte(offset, 0);
         int strideW = fb.ReadFieldInt32(offset, 1, 1);
         int strideH = fb.ReadFieldInt32(offset, 2, 1);
@@ -443,6 +457,13 @@ public static class TFLiteLoader
             attrs["auto_pad"] = JsonSerializer.SerializeToElement("SAME_UPPER");
         else // VALID
             attrs["auto_pad"] = JsonSerializer.SerializeToElement("VALID");
+
+        int dilWField = builtinCode == 4 ? 5 : 4;
+        int dilHField = builtinCode == 4 ? 6 : 5;
+        int dilationW = fb.ReadFieldInt32(offset, dilWField, 1);
+        int dilationH = fb.ReadFieldInt32(offset, dilHField, 1);
+        if (dilationW != 1 || dilationH != 1)
+            attrs["dilations"] = JsonSerializer.SerializeToElement(new long[] { dilationH, dilationW });
 
         if (builtinCode == 4) // DEPTHWISE_CONV_2D
         {
