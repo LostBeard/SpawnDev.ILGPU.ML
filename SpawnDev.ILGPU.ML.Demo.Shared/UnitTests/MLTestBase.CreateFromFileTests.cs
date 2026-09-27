@@ -845,6 +845,40 @@ public abstract partial class MLTestBase
     });
 
     /// <summary>
+    /// OPFS / Blob streams reject sync <see cref="Stream.Read(byte[],int,int)"/>.
+    /// Detect + full <see cref="InferenceSession.CreateFromStreamAsync"/> must never touch it —
+    /// only <see cref="Stream.ReadAsync(System.Memory{byte},System.Threading.CancellationToken)"/>
+    /// (Seek/Position are pointer math). Mirrors BlobStream's contract without a browser.
+    /// </summary>
+    [TestMethod(Timeout = 120000)]
+    public async Task CreateFromStream_AsyncOnlyStream_NoSyncRead() => await RunTest(async accelerator =>
+    {
+        var http = GetHttpClient();
+        if (http == null)
+            throw new UnsupportedTestException("HttpClient not available for this backend");
+
+        var bytes = await http.GetByteArrayAsync("models/squeezenet/model.onnx");
+        using var asyncOnly = new AsyncOnlySeekableStream(bytes);
+
+        var detected = await InferenceSession.DetectModelFormatAsync(asyncOnly);
+        if (detected != ModelFormat.ONNX)
+            throw new Exception($"DetectModelFormatAsync on async-only stream got {detected}, expected ONNX");
+        if (asyncOnly.Position != 0)
+            throw new Exception($"detect left Position={asyncOnly.Position}, expected 0");
+
+        using var session = await InferenceSession.CreateFromStreamAsync(
+            accelerator, asyncOnly, streamThreshold: 4096);
+        if (session.NodeCount <= 0)
+            throw new Exception($"CreateFromStreamAsync on async-only stream produced empty graph");
+
+        Console.WriteLine(
+            $"[CreateFromStream_AsyncOnly] PASS — detect={detected}, nodes={session.NodeCount}, "
+            + $"syncReadsAttempted={asyncOnly.SyncReadAttempts} (must stay 0)");
+        if (asyncOnly.SyncReadAttempts != 0)
+            throw new Exception($"sync Read was called {asyncOnly.SyncReadAttempts} time(s) — OPFS/Blob would throw");
+    });
+
+    /// <summary>
     /// FP16 weight streaming: a fp16-source weight that needs an fp32 GPU buffer must upload the raw fp16
     /// bytes to the GPU and upcast Half→float ON THE GPU (browser: zero-copy, bytes never enter .NET) — NOT
     /// read into a managed byte[] + CPU BitConverter loop (the old path that pulled every SD-Turbo weight
@@ -1229,4 +1263,58 @@ public abstract partial class MLTestBase
                             + $"-> session with {session.NodeCount} nodes, model never on the managed heap");
         }
     });
+}
+
+/// <summary>
+/// Seekable byte[] stream mirroring <c>SpawnDev.SpawnJS.Toolbox.BlobStream</c> / OPFS Window-scope:
+/// Seek is pointer math, sync <see cref="Stream.Read(byte[],int,int)"/> throws (and is counted),
+/// only <see cref="Stream.ReadAsync(byte[],int,int,CancellationToken)"/> works. The
+/// <c>Memory&lt;byte&gt;</c> overload is intentionally NOT overridden so the base class routes it to
+/// the array ReadAsync — same as BlobStream.
+/// </summary>
+file sealed class AsyncOnlySeekableStream : Stream
+{
+    private readonly byte[] _data;
+    private long _pos;
+    public int SyncReadAttempts { get; private set; }
+
+    public AsyncOnlySeekableStream(byte[] data) => _data = data;
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        SyncReadAttempts++;
+        throw new NotSupportedException(
+            $"{nameof(AsyncOnlySeekableStream)}.Read not supported. Use ReadAsync (async-only, as OPFS/Blob in WASM).");
+    }
+
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        int n = (int)Math.Min(count, _data.Length - _pos);
+        if (n <= 0) return 0;
+        Array.Copy(_data, _pos, buffer, offset, n);
+        _pos += n;
+        return n;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        _pos = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _pos + offset,
+            SeekOrigin.End => _data.Length + offset,
+            _ => _pos,
+        };
+        return _pos;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _data.Length;
+    public override long Position { get => _pos; set => _pos = value; }
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }

@@ -679,6 +679,14 @@ public class InferenceSession : IDisposable
     /// GGUF stream loaders seek to each weight; a forward-only HTTP body cannot be used here — cache it
     /// first (that is what <see cref="Hub.HubModelSource"/> does).
     /// </para>
+    /// <para>
+    /// 🔴 <b>Async-only I/O.</b> Detection and every format handler read exclusively via
+    /// <see cref="Stream.ReadAsync(System.Memory{byte},CancellationToken)"/> — never sync
+    /// <see cref="Stream.Read(byte[],int,int)"/>. That is mandatory for browser OPFS / Blob streams
+    /// (<c>IJSReadStream</c> with <c>CanReadSync=false</c>): sync Read throws. <c>Seek</c> /
+    /// <c>Position</c> are pointer math only on those streams (no I/O) and are safe. The ONNX/GGUF
+    /// stream loaders already obey the same rule; this entry point must not break it at detect time.
+    /// </para>
     /// </remarks>
     public static async Task<InferenceSession> CreateFromStreamAsync(
         Accelerator accelerator, Stream stream,
@@ -734,6 +742,9 @@ public class InferenceSession : IDisposable
     /// <remarks>
     /// Same contract as the Model Inspector: SafeTensors is probed prefix-tolerantly (a short buffer
     /// would otherwise fail <see cref="DetectModelFormat"/>'s header-size check and mis-detect).
+    /// Prefix bytes are fetched with <see cref="Stream.ReadAsync(System.Memory{byte},CancellationToken)"/>
+    /// only — safe on OPFS / Blob (<c>IJSReadStream</c>) where sync Read throws. Rewind uses Seek/
+    /// Position (pointer math on those streams, not I/O).
     /// </remarks>
     public static async Task<ModelFormat> DetectModelFormatAsync(Stream stream, CancellationToken ct = default)
     {
@@ -744,6 +755,7 @@ public class InferenceSession : IDisposable
             start = stream.Position;
 
         var prefix = new byte[StreamDetectPrefixBytes];
+        // ReadAsync only — OPFS/Blob IJSReadStream rejects sync Stream.Read.
         int prefixLen = await ReadUpToAsync(stream, prefix, 0, prefix.Length, ct).ConfigureAwait(false);
 
         ModelFormat format;
@@ -756,7 +768,7 @@ public class InferenceSession : IDisposable
         }
 
         if (stream.CanSeek)
-            stream.Seek(start, SeekOrigin.Begin);
+            stream.Seek(start, SeekOrigin.Begin); // pointer math on BlobStream/OPFS — not a sync read
         else if (prefixLen > 0)
             throw new NotSupportedException(
                 "DetectModelFormatAsync consumed a prefix from a non-seekable stream and cannot rewind. "
@@ -791,6 +803,7 @@ public class InferenceSession : IDisposable
         int read = 0;
         while (read < bytes.Length)
         {
+            // ReadAsync only — same OPFS/Blob constraint as DetectModelFormatAsync.
             int n = await stream.ReadAsync(bytes.AsMemory(read, bytes.Length - read), ct).ConfigureAwait(false);
             if (n == 0)
                 throw new EndOfStreamException($"Expected {bytes.Length} bytes for {format}, got {read}.");
@@ -810,6 +823,11 @@ public class InferenceSession : IDisposable
         return prefix[8] == (byte)'{';
     }
 
+    /// <summary>
+    /// Fill <paramref name="buffer"/> using <see cref="Stream.ReadAsync(System.Memory{byte},CancellationToken)"/>
+    /// only — never sync <see cref="Stream.Read(byte[],int,int)"/>. OPFS / Blob (<c>IJSReadStream</c>)
+    /// throw on sync Read in the browser Window scope.
+    /// </summary>
     private static async Task<int> ReadUpToAsync(Stream stream, byte[] buffer, int offset, int count, CancellationToken ct)
     {
         int total = 0;
