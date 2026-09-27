@@ -11,11 +11,11 @@
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
             ShowModelProgress="true"
-            ModelName="DistilBERT"
+            ModelName="all-MiniLM-L6-v2"
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="257">
+            ModelSizeMB="86">
 
     <div class="embed-mode-toggle">
         <button class="mode-btn @(_mode == "similarity" ? "active" : "")" @onclick='() => _mode = "similarity"'>Similarity</button>
@@ -146,20 +146,24 @@
     private double _modelProgress, _inferenceMs;
 
     // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
+    // ⚠️ Must be an EMBEDDING model with last_hidden_state. DistilBertSST2 is a classifier
+    // (logits [batch,2]) and cannot produce embeddings — proven live 2026-09-26 when the page
+    // still pointed there and FeatureExtractionPipeline threw. Gate: Embeddings_RealTokenizer_*.
     private const string _howToCs = """
-// Load DistilBERT onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
+// Load all-MiniLM-L6-v2 onto YOUR GPU — no server, no ONNX Runtime
 using var hub = new ModelHub(JS);
-// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-// by piece, restored on reload with no re-download, and seeded to peers.
 var session = await InferenceSession.CreateFromHuggingFaceAsync(
-    accelerator, hub, ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel,
-    inputShapes: new() { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 } },
+    accelerator, hub, ModelHub.KnownModels.AllMiniLmL6V2, ModelHub.KnownFiles.OnnxModel,
+    inputShapes: new() {
+        ["input_ids"] = new[] { 1, 128 },
+        ["attention_mask"] = new[] { 1, 128 },
+        ["token_type_ids"] = new[] { 1, 128 },
+    },
     http: Http);
-var pipeline = new FeatureExtractionPipeline(session, accelerator, maxLength: 128, hiddenSize: 768);
+var pipeline = new FeatureExtractionPipeline(session, accelerator, maxLength: 128, hiddenSize: 384);
 
-// Embed two sentences and compare by meaning — runs entirely on the GPU
-var embA = await pipeline.EmbedAsync(tokensA);
-var embB = await pipeline.EmbedAsync(tokensB);
+var embA = await pipeline.EmbedAsync(sentenceA, tokenizer);
+var embB = await pipeline.EmbedAsync(sentenceB, tokenizer);
 float similarity = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedding);
 """;
 
@@ -167,7 +171,7 @@ float similarity = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedd
 import { pipeline, cos_sim } from '@huggingface/transformers';
 
 const extractor = await pipeline('feature-extraction',
-                                 'Xenova/distilbert-base-uncased', { device: 'webgpu' });
+                                 'Xenova/all-MiniLM-L6-v2', { device: 'webgpu' });
 const a = await extractor(sentenceA, { pooling: 'mean', normalize: true });
 const b = await extractor(sentenceB, { pooling: 'mean', normalize: true });
 const similarity = cos_sim(a.data, b.data);
@@ -188,8 +192,8 @@ const similarity = cos_sim(a.data, b.data);
     private FeatureExtractionPipeline? _pipeline;
     private LoadedTokenizer? _tokenizer; // real WordPiece tokenizer from the model repo (replaces the old hash)
 
-    // OPT-IN: the ~257 MB DistilBERT model loads on the first run (Compute Similarity / Search), NOT on page
-    // entry — see ComputeSimilarity / SearchCorpus. Visiting the page downloads nothing.
+    // OPT-IN: all-MiniLM-L6-v2 (~86 MB) loads on first Compare/Search — visiting the page downloads nothing.
+    // Do NOT use DistilBertSST2 here: it only emits logits [batch,2] (see LoadModelAsync comment in STATUS).
 
     private async Task LoadModelAsync()
     {
@@ -208,19 +212,21 @@ const similarity = cos_sim(a.data, b.data);
             _accelerator = await _context.CreatePreferredAcceleratorAsync();
             if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
 
-            // Use DistilBERT for embeddings (already proven to work)
             using var hub = new ModelHub(JS);
-            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-            // by piece, restored on reload with no re-download, and seeded to peers.
+            // Weights: lazy-hash torrent, OPFS-cached by piece. Pin ALL THREE inputs — MiniLM declares
+            // token_type_ids; an unpinned input runs against an unwritten buffer.
             var session = await InferenceSession.CreateFromHuggingFaceAsync(
-                _accelerator, hub, ModelHub.KnownModels.DistilBertSST2, ModelHub.KnownFiles.OnnxModel,
-                inputShapes: new Dictionary<string, int[]> { ["input_ids"] = new[] { 1, 128 }, ["attention_mask"] = new[] { 1, 128 }, },
+                _accelerator, hub, ModelHub.KnownModels.AllMiniLmL6V2, ModelHub.KnownFiles.OnnxModel,
+                inputShapes: new Dictionary<string, int[]>
+                {
+                    ["input_ids"] = new[] { 1, 128 },
+                    ["attention_mask"] = new[] { 1, 128 },
+                    ["token_type_ids"] = new[] { 1, 128 },
+                },
                 http: Http);
-            _pipeline = new FeatureExtractionPipeline(session, _accelerator, maxLength: 128, hiddenSize: 768);
+            _pipeline = new FeatureExtractionPipeline(session, _accelerator, maxLength: 128, hiddenSize: 384);
 
-            // Real WordPiece tokenizer from the model's own tokenizer.json (NOT the old word-hash) so the
-            // embeddings are computed from real vocab tokens — i.e. actually semantic.
-            var tokJson = await hub.LoadSmallFileAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
+            var tokJson = await hub.LoadSmallFileAsync(ModelHub.KnownModels.AllMiniLmL6V2, "tokenizer.json");
             _tokenizer = TokenizerLoader.FromTokenizerJson(System.Text.Encoding.UTF8.GetString(tokJson));
 
             _isModelLoaded = true;

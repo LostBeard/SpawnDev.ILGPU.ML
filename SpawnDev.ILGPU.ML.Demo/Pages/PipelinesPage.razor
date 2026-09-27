@@ -110,14 +110,17 @@
             new("Style Transfer", "Fast neural style (5 styles)", "Image-to-image restyle. ORT-matched.", "style", "Verified", Tjs: "image-to-image"),
             new("Super Resolution", "ESPCN ×3", "Upscale an image. Image-to-image.", "super-res", "Verified", Tjs: "image-to-image"),
             new("Face Detection", "BlazeFace", "Faces + landmarks. (No Transformers.js task.)", "face", "Verified", true),
-            new("Pose Estimation", "MoveNet Lightning/Thunder", "17 body keypoints. (No Transformers.js task.)", "pose", "Beta", true),
+            // Pose: ORT-matched MoveNet E2E in PMT — Docs/DEMO_AND_MODEL_STATUS.md VERIFIED (was wrongly "Beta" here).
+            new("Pose Estimation", "MoveNet Lightning/Thunder", "17 body keypoints. (No Transformers.js task.)", "pose", "Verified", true),
             new("Image Segmentation", "—", "Per-pixel object masks.", null, "Planned", Tjs: "image-segmentation"),
         }),
         new("Language", new()
         {
-            new("Feature Extraction / Similarity", "DistilBERT", "Embeddings + cosine similarity + semantic search.", "embeddings", "Verified", Tjs: "feature-extraction"),
+            // all-MiniLM-L6-v2 (384-dim) — DistilBertSST2 is a CLASSIFIER and cannot embed.
+            new("Feature Extraction / Similarity", "all-MiniLM-L6-v2", "Embeddings + cosine similarity + semantic search.", "embeddings", "Verified", Tjs: "feature-extraction"),
             new("Zero-Shot Classification", "CLIP ViT-B/32", "Classify into unseen labels (text↔image).", "clip", "Verified", Tjs: "zero-shot-image-classification"),
-            new("Text Generation", "GGUF LLMs (Qwen/Gemma/Llama/SmolLM)", "Local LLM chat, KV-cache decode — Ollama-class, not in Transformers.js.", "ai-chat", "Beyond", true, Tjs: "text-generation"),
+            // Engine verified; in-browser file-pick→generate is still a manual confirm (PARTIAL in STATUS).
+            new("Text Generation", "GGUF LLMs (Qwen/Gemma/Llama/SmolLM)", "Local LLM chat, KV-cache decode — Ollama-class, not in Transformers.js.", "ai-chat", "Beta", true, Tjs: "text-generation"),
             new("Text Generation (ONNX)", "DistilGPT-2", "ONNX text-gen pipeline (vs the GGUF chat path).", "text-gen", "Verified", Tjs: "text-generation"),
             new("Sentiment / Text Classification", "DistilBERT-SST2", "Label text (positive/negative).", "sentiment", "Verified", Tjs: "text-classification"),
             new("Fill-Mask", "BERT", "Predict masked tokens.", null, "Planned", Tjs: "fill-mask"),
@@ -128,18 +131,20 @@
         }),
         new("Audio", new()
         {
-            new("Speech to Text", "Whisper Tiny", "Transcribe audio. Encoder+decoder.", "whisper", "Beta", Tjs: "automatic-speech-recognition"),
+            // Mic→text E2E verified on all six backends (STATUS). Nav still marks beta for UX polish.
+            new("Speech to Text", "Whisper Tiny", "Transcribe audio. Encoder+decoder.", "whisper", "Verified", Tjs: "automatic-speech-recognition"),
             new("Text to Speech", "SpeechT5", "Synthesize speech (pipeline ready, demo pending).", null, "Planned", Tjs: "text-to-speech"),
         }),
         new("Multimodal", new()
         {
-            new("Image + Audio + Text Chat", "Gemma 4 (multimodal)", "Chat over images AND audio — Transformers.js has no image-text-to-text pipeline.", "gemma-chat", "Beyond", true, Tjs: "image-to-text"),
+            new("Image + Audio + Text Chat", "Gemma 4 (multimodal)", "Chat over images AND audio — Transformers.js has no image-text-to-text pipeline.", "gemma-chat", "Beta", true, Tjs: "image-to-text"),
         }),
         new("Generative & 3D (beyond Transformers.js)", new()
         {
             new("Image Generation", "SD-Turbo", "Text → image (Stable Diffusion). Not a Transformers.js task.", "generate", "Soon", true),
             new("Image to 3D", "Splatter Image / TripoSR", "Single image → 3D mesh / gaussian splat → SpawnScene render.", "image-to-3d", "Soon", true),
-            new("On-Device Training", "Backprop on the GPU", "Train a model in the browser — Transformers.js is inference-only.", "train", "Beta", true),
+            new("System One Snake", "SystemOneDecisionHead", "On-device BC train + masked decode for Classic Snake (demo-only helpers).", "snake", "Verified", true),
+            new("On-Device Training", "Backprop on the GPU", "Gesture CNN path still maturing; System One BC train is verified via /snake.", "train", "Beta", true),
         }),
     };
 }

@@ -11,6 +11,8 @@
 > Evidence basis: status reflects the cited E2E test (in `SpawnDev.ILGPU.ML.Demo.Shared/UnitTests/`) plus recent green runs. The **canonical** pass/fail at any moment is the latest `PlaywrightMultiTest` results JSON - run PMT to re-confirm before a release.
 >
 > ⚠️ **A cited test only counts if it RUNS THE MODEL.** Three tests here were named `Pipeline_*_Reference_*` and documented as validating "end-to-end pipeline correctness" while only asserting that a reference JSON was internally consistent - they would pass with the ML library deleted, and two of them were this table's evidence. Before citing a test, check that it constructs an `InferenceSession` or calls a pipeline. Fixture-integrity tests are useful, but they are named `ReferenceData_*_FixtureIsWellFormed` and they are not evidence that a demo works.
+>
+> **Live page smoke (2026-09-26):** `tools/drive-ml-pages-smoke.cs` against a Release publish — **32/32 routes mounted**, 0 pageerrors. Inference gates: `tools/drive-ml-pages.cs` — `/sentiment` ✅ POSITIVE; `/embeddings` re-pointed to all-MiniLM-L6-v2 (was DistilBertSST2 classifier — threw live until fixed this session).
 
 ## Demos
 
@@ -24,25 +26,30 @@
 | `/clip` | Zero-shot classification (CLIP) | ✅ **VERIFIED** | `Reference_CLIPVision_MatchesOnnxRuntime` (runs the model against ORT). ⚠️ Previously also cited `Pipeline_CLIP_Reference_CatIsTopMatch`, which never ran the model - it asserted the reference JSON was well formed, and is now named `ReferenceData_CLIP_FixtureIsWellFormed` |
 | `/remove-bg` | Background removal (RMBG) | ✅ **VERIFIED** | `Pipeline_BackgroundRemoval_RealImage_ProducesVaryingMask` (perf caveats on WebGPU compile) |
 | `/super-res` | Super-resolution (ESPCN) | ✅ **VERIFIED** | `CreateFromFile_SuperResolution_ESPCN`, `HF_DownloadAndLoadSession_SuperResolution` |
-| `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | Transformers.js-style `GgufTextGenerationPipeline`: pick a `.gguf` → `BlobStream`→`CreateFromStreamAsync`→streaming chat on WebGPU. Engine verified on CUDA (qwen2.5:0.5b q8_0/q4_K_M ✅ coherent; smollm2:360m ✅ coherent (BPE-merge + RoPE NORM-style fix); gemma3:270m ✅ coherent (V-norm + sliding-window rope fix, matches Ollama)). Page mounts clean (Playwright, 0 console errors). In-browser file-pick→generate E2E = manual confirm (no model delivery in PMT yet) |
+| `/face` | Face detection (BlazeFace) | ✅ **VERIFIED** | `Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` (finite regressors). Page loads on first Capture (opt-in). Live smoke mounts; webcam E2E is manual |
+| `/sentiment` | Sentiment (DistilBERT-SST2) | ✅ **VERIFIED** | `Sentiment_DistilBertSST2_ClassifiesPositiveAndNegative`; **live gate 2026-09-26** `drive-ml-pages.cs` → `.sentiment-verdict` = POSITIVE |
+| `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` on **all-MiniLM-L6-v2** (384-dim, all six backends). **Page re-pointed 2026-09-26** off DistilBertSST2 (classifier `logits` [1,2] — threw at runtime). Gate: `drive-ml-pages.cs` `/embeddings` |
 | `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP). NOTE: superseded by `/ai-chat` for real LLM chat — candidate to retire |
-| `/embeddings` | Sentence embeddings / semantic search | 🟡 **PARTIAL** | `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` runs the real pipeline on **all-MiniLM-L6-v2** and is green on all six backends (self 1.000, related 0.929 > unrelated 0.895, 384/384 dims non-zero). ⚠️ The PAGE has not been re-pointed at that model yet. ⚠️ This row cited `Pipeline_SemanticSearch_SimilarSentencesCloser` until 2026-09-08; that test uses a SENTIMENT CLASSIFIER and its own comment says it reads "first 2 logits (sentiment: [negative, positive])" - it passes, but it is not semantic search |
+| `/whisper` | Speech-to-text (Whisper) | ✅ **VERIFIED** | **mic → text works end to end.** `Pipeline_Whisper_TranscribesKnownSpeech` — same answer on **all six backends**: "All legal box recordings are in the public domain". `MLTestBase.ResamplerTests`, `MicrophoneCaptureTests`, `tools/drive-mic-capture.cs --transcribe`. Nav: no badge (VERIFIED) |
+| `/snake` | System One Classic Snake | ✅ **VERIFIED** | Package: generic `SystemOneDecisionHead`. Demo-only: game/teacher/`SnakeSystemOneSpec` under `Demo.Shared`. Evidence: `SystemOne_Snake_BehavioralClone_AgreesWithTeacher`, `SystemOne_Weights_RoundTrip_PreservesProbs`. Nav: no badge (VERIFIED). Docs: [`system-one.md`](system-one.md) |
 | `/inspector` | Model Inspector (structure + compat) | ✅ **VERIFIED** | Streams ONNX structure-only; GPT-2 100% compat after registry fix; inspect-by-URL live-hub test |
 | `/benchmark` | GPU benchmark | ✅ **VERIFIED** | MatMul / perf kernels (92-101 GFLOPS validated) |
-| `/whisper` | Speech-to-text (Whisper) | ✅ **VERIFIED** | **mic → text works end to end.** `Pipeline_Whisper_TranscribesKnownSpeech` runs the real pipeline on a known-transcript clip and gets the same answer on **all six backends**: "All legal box recordings are in the public domain" (whisper-tiny mangles the proper noun "LibriVox"; 7/8 words exact, 88% word overlap). `MLTestBase.ResamplerTests` (5) and `MLTestBase.MicrophoneCaptureTests` (5) gate the audio front end, and `tools/drive-mic-capture.cs --transcribe` drives the actual page from microphone to transcript. ⚠️ Until 2026-08-30 this row cited `Pipeline_WhisperDecoder_Reference_440HzTone`, which never ran the model, and the Start Recording button was a `=> Task.CompletedTask` stub |
-| `/depth-voxel` | Depth → 3D voxels | 🟡 **PARTIAL** | Depth pipeline runs (see `/depth`); the 3D voxel viewer UI is still placeholder |
+| `/ai-chat` | On-device LLM chat (GGUF, multi-model) | 🟡 **PARTIAL** | `GgufTextGenerationPipeline`: pick a `.gguf` → stream → chat on WebGPU. Engine verified on CUDA (qwen/smollm2/gemma3 coherent). Page mounts clean. In-browser file-pick→generate E2E = manual confirm (no model delivery in PMT yet) |
+| `/gemma-chat` | Gemma 4 multimodal chat | 🟡 **PARTIAL** | Opt-in large download from hub/ollama registry; mounts clean. Full multimodal E2E in-browser not gated in PMT |
+| `/depth-voxel` | Depth → 3D voxels | 🟡 **PARTIAL** | Depth pipeline runs (see `/depth`); the 3D voxel/gaussian-splat scene was never built (nav-hidden 2026-06-30). Route still mounts; shows 2D depth colormap |
 | `/explain` | Model explainability | 🟡 **PARTIAL** | Intercepts the executor; works on a limited set of models |
-| `/assistant` | AI assistant (chat) | 🟡 **PARTIAL** | Real DistilGPT-2 when a model is loaded; **falls back to `GetPlaceholderResponse` when none loaded** |
-| `/comic-chat` | Multi-character chat | 🟡 **PARTIAL** | Same as assistant — real text-gen when loaded, `GetPlaceholderComicResponse` otherwise |
-| `/generate` | Image generation (SD-Turbo) | 🚧 **WIP** | Pipeline wired, but only diffusion **math** is tested (`Diffusion_BetaSchedule`, `_GaussianNoise_Statistics`) — **no SD-Turbo end-to-end image test** |
-| `/voice-collab` | Voice collaboration | 🚧 **WIP** | "Phase 1: Web Speech API" (browser built-in); the **GPU Whisper option is disabled**. Not the on-device GPU voice stack the name implies |
-| `/image-to-3d` | Image → 3D model | 🚧 **WIP** | `GenerateModel()` is a **no-op** (`=> Task.CompletedTask`); `DownloadMesh()`/`OpenInSpawnScene()` are empty. The button does nothing yet |
-| `/train` | On-device training | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` and `SystemOne_Snake_BehavioralClone_AgreesWithTeacher` |
-| `/snake` | System One Classic Snake | ✅ **VERIFIED** | Package: generic `SystemOneDecisionHead`. Demo-only: game/teacher/`SnakeSystemOneSpec` under `Demo.Shared`. Evidence: `SystemOne_Snake_BehavioralClone_AgreesWithTeacher`, `SystemOne_Weights_RoundTrip_PreservesProbs`, teacher legality/score/anti-stall. Docs: [`system-one.md`](system-one.md) |
-| `/` | Home | Meta | Landing page (operator count now rendered live from the registry) |
-| `/tests` | Test runner | Meta | Hosts the PlaywrightMultiTest UI |
-| `/models` | Model browser | Meta | HuggingFace hub browser |
+| `/assistant` | AI assistant (chat) | 🟡 **PARTIAL** | Real DistilGPT-2 when a model is loaded; **falls back to `GetPlaceholderResponse` when none loaded**. README claims of Phi-4 14B / SpeechT5 voice are **aspirational — not what this page does today** |
+| `/comic-chat` | Multi-character chat | 🟡 **PARTIAL** | Same as assistant — real text-gen when loaded, `GetPlaceholderComicResponse` otherwise. No Phi-4 tiering on this page |
+| `/train` | On-device training (Draw to Learn) | 🟡 **PARTIAL** | Gesture CNN path still PARTIAL; **System One BC train is verified** — see `/snake` |
+| `/generate` | Image generation (SD-Turbo) | 🚧 **WIP** | Coming-soon banner honest. Diffusion **math** tested; **no SD-Turbo end-to-end image test**. Generate is not a working demo |
+| `/image-to-3d` | Image → 3D model | 🚧 **WIP** | Coming-soon banner honest. `GenerateModel()` is a **no-op**; download/open empty |
+| `/voice-collab` | Voice collaboration | 🚧 **WIP** | Coming-soon banner honest. Phase 1: browser Web Speech API; **GPU Whisper path disabled** |
+| `/` | Home | Meta | Landing (operator count live from `OperatorRegistry.BuiltinOpTypes` — currently **204**) |
+| `/pipelines` | Pipeline catalog | Meta | Status badges must match this doc — corrected 2026-09-26 |
 | `/getting-started` | Getting started | Doc | Install + first-run walkthrough |
+| `/models` | Model browser | Meta | HuggingFace hub browser |
+| `/cache` | Model cache | Meta | OPFS cache admin |
+| `/tests` | Test runner | Meta | Hosts the PlaywrightMultiTest UI |
 
 ## Models (loaders vs verified inference)
 
@@ -56,21 +63,20 @@
 | BlazeFace | ✅ | ✅ | `Pipeline_BlazeFace_Reference_MatchesOnnxRuntime` |
 | CLIP (vision) | ✅ | ✅ | ORT-matched |
 | ESPCN super-res | ✅ | ✅ | ORT-matched |
-| DistilGPT-2 / DistilBERT | ✅ | ✅ | text-gen verified. ⚠️ DistilBERT here is the **SST-2 classifier** - one output, `logits` [batch,2], no `last_hidden_state`, so it cannot produce embeddings |
-| all-MiniLM-L6-v2 | ✅ | ✅ embeddings | 384-dim `last_hidden_state`; the model the embeddings pipeline is gated on |
-| Whisper | ✅ | 🟡 decoder only | full speech E2E pending |
+| DistilGPT-2 / DistilBERT-SST2 | ✅ | ✅ text-gen / sentiment | DistilBERT-SST2 is the **SST-2 classifier** — one output `logits` [batch,2], **not** an embedding model |
+| all-MiniLM-L6-v2 | ✅ | ✅ embeddings | 384-dim `last_hidden_state`; **the model `/embeddings` uses** |
+| Whisper | ✅ | ✅ full STT E2E | `Pipeline_Whisper_TranscribesKnownSpeech` (encoder+decoder) on all six backends |
 | SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; not wired into a verified demo page |
-| SD-Turbo | ✅ | 🚧 | no end-to-end image test |
-| GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | **Autoregressive KV-cache decode VERIFIED** — Example 06 Ollama-compatible server (OpenAI/Ollama/Anthropic APIs, Claude CLI) E2E on CUDA/OpenCL; Ollama-oracle byte-identical; ~51 tok/s on qwen2.5-coder:7b Q4_K_M (4070). Quants: Q4_0/Q5_0/Q8_0/Q4_K/Q6_K/MXFP4 (Q5_0 added 2026-06-29, PMT 20/0 all backends). Tokenizer: proper byte-level BPE merges (qwen byte-identical; smollm2 fixed). Archs: qwen2/llama/gemma3 coherent + oracle-matched (llama needs NORM-style RoPE; gemma3 needs V-norm gated to gemma4 + sliding-window local rope base — fixed 2026-06-30). Browser: `/ai-chat` page streams a GGUF to WebGPU via the pipeline (engine PMT-verified; full in-browser file-pick→generate is manual confirm pending model delivery) |
+| SD-Turbo | ✅ | 🚧 | no end-to-end image test / demo Coming soon |
+| GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | Autoregressive KV-cache decode verified on desktop; browser `/ai-chat` streams GGUF (manual confirm for full file-pick→generate) |
 
 ## Keeping this honest
 
-- **Demo PAGES have a browser gate now**, separate from the unit tests: `tools/drive-ml-pages.cs` drives a
-  route, seeds every input its handler validates, and waits for the page's own RESULT element. Two rules it
-  encodes the hard way: a page's logging is incidental (EmbeddingsPage logs ONLY on error, so waiting for a
-  "model loaded" line reported a healthy page as a timeout), and a page that validates its inputs no-ops
-  silently when you seed only the first one. Only routes marked ✅ VERIFIED above belong in its table -
-  gating on a PARTIAL/WIP page manufactures a regression that does not exist.
-- **Operator count** is rendered live from `OperatorRegistry.BuiltinOpTypes` (the documented single source of truth) — never hardcode it again.
+- **Demo PAGES have a browser gate now**, separate from the unit tests:
+  - `tools/drive-ml-pages-smoke.cs` — every route mounts (no pageerror).
+  - `tools/drive-ml-pages.cs` — verified routes that can seed inputs and assert a **result element**.
+  Two rules the driver encodes the hard way: a page's logging is incidental (EmbeddingsPage logs ONLY on error), and a page that validates its inputs no-ops silently when you seed only the first one. Only routes marked ✅ VERIFIED belong in the inference gate table.
+- **Operator count** is rendered live from `OperatorRegistry.BuiltinOpTypes` — never hardcode it again.
 - **Before any "N tests passing" claim**, cite the latest PMT results JSON, not a memorized number.
 - **A demo graduates to ✅ VERIFIED only when a passing E2E test is cited here.** Adding a page is not the same as verifying it.
+- **`/pipelines` badges, nav menu badges, and README demo blurbs must not contradict this table.** Nav mapping: VERIFIED = no badge, PARTIAL = `beta`, WIP = `soon`. If they diverge, this file wins — fix the page/README/nav.

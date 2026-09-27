@@ -437,29 +437,28 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | Demo | What It Does |
 |------|-------------|
 | **Speech to Text** | Whisper-powered transcription. Upload audio or use the microphone — transcription runs on your GPU, never leaves your device. |
-| **Semantic Search** | Generate text embeddings. Find similar passages, rank by relevance — all computed locally. |
+| **Semantic Search** | Generate text embeddings with all-MiniLM-L6-v2. Find similar passages, rank by relevance — all computed locally. |
 | **Text Generation** | GPT-style text generation with greedy/top-K/top-P sampling, temperature control, and tokens/second counter. |
 
 ### Experimental & Fun Demos
 
 | Demo | What It Does | Why It's Special |
 |------|-------------|-----------------|
-| **AI Assistant** | Remember Clippy, Merlin, and Robby? They're back — but now they actually think. Choose from 6 classic MS Agent-style characters, talk to them via voice or text, and they respond with AI-generated text and speech. Tiered LLM selection: Phi-4 Mini 3.8B (4GB+ GPU), Mistral NeMo 12B (8GB+), or Phi-4 14B (12GB+) — auto-detected or user-selectable. Voice input via Whisper, voice output via SpeechT5 — all running on your GPU. | A real LLM running in your browser — up to 14B parameters on high-end GPUs. No API key. No server. No internet after model loads. The demo auto-selects the best model for your hardware, or you choose. The thing Microsoft dreamed of in 1997 — now running on WebGPU. |
-| **Comic Chat AI** | A comic strip chat room where every character is an AI running locally. Add characters, give them personalities ("sarcastic pirate", "enthusiastic scientist"), and watch them debate in comic panel format. Tiered LLM: Phi-4 Mini (4GB+), Mistral NeMo (8GB+), or Phi-4 14B (12GB+) with per-character system prompts — same model, different personalities. Auto-detected or selectable. Inspired by Microsoft Comic Chat (1996), reimagined with local AI. | Multiple AI characters with genuine personality differences, powered by up to a 14B LLM on your GPU, debating and joking in comic panels. Pure nostalgia meets bleeding-edge tech. |
-| **Inside the Network** | Peek inside the neural network. See feature maps, attention patterns, and activation heatmaps as the model processes your image — layer by layer. Scrub through layers to see what the GPU "sees." | Educational and mesmerizing. Shows that neural networks aren't magic — they're math running on your GPU, and you can watch it happen. |
-| **Draw to Train** | Draw custom gestures on an interactive canvas, train a CNN classifier in real-time on your GPU, then watch it classify as you draw. Live loss/accuracy curves during training. The model learns in seconds — and you can test it immediately by drawing new shapes. Export trained models as ONNX. | Most browser ML can only do inference. This is full GPU training: forward pass, backpropagation, gradient descent — all in C# compute shaders on WebGPU. No server, no Python, no CUDA install. Draw → Train → Use, all in one browser tab. |
+| **AI Assistant** | Classic MS Agent-style characters (Clippy, Merlin, …) with text chat. When DistilGPT-2 is loaded, replies are on-device; otherwise the page uses honest placeholders. Whisper/SpeechT5 voice and Phi-4 / Mistral NeMo tiering are **not wired on this page yet** (see STATUS). | Nostalgia UI on top of the real text-gen pipeline — same honesty rules as other PARTIAL demos. |
+| **Comic Chat AI** | Comic-strip chat room with per-character personalities. Same text-gen path as Assistant when a model is loaded; placeholders otherwise. No 14B tiering on this page today. | Multi-character local chat UI; engine maturity tracked under `/ai-chat` + STATUS. |
+| **Inside the Network** | Peek inside the neural network — feature maps / activations for a limited set of models. | Educational; PARTIAL — not every model is interceptable yet. |
+| **Draw to Train** | Draw gestures, train a small CNN on-device. Gesture path still PARTIAL; System One BC train is verified via `/snake`. | Browser GPU training (forward + backprop) where the path is finished. |
 | **System One Snake** | Classic Snake controlled by a local System One decision head (Softmax probs, no text). Train on-device from a flood-fill safe teacher; illegal moves masked; ~23 KB head cached in localStorage. Package API is generic; Snake code lives in Demo.Shared. | Shows typed decisions + GPU training without a language model. Docs: [system-one.md](Docs/system-one.md). |
-| **Pipeline Composer** | Visual drag-and-drop model builder. Compose neural network architectures by wiring blocks: Conv2D → ReLU → MaxPool → Linear. Auto-propagation of tensor shapes through the graph. Dimension mismatch highlighting (orange = warning, red = error). Three-stage workflow: Data → Architecture → Train & Run. Save/load pipeline configurations as JSON. | Build a complete ML pipeline visually — define your data source, compose your model architecture, configure training, watch it learn, run inference. No code required. Inspired by visual ML tools, but running entirely on your GPU in the browser. |
-| **Voice Collaboration** | Talk to your AI dev team. Whisper STT on your GPU, tiered LLM reasoning (3.8B–14B, auto-selected or user choice), SpeechT5 TTS responds with voice — all neural, all GPU, all private. Multiple agents with distinct personas and voices. | The full voice AI pipeline on YOUR hardware: speech → LLM (up to 14B) → voice. No cloud. No API key. No data leaves your device. The best model your GPU can run, automatically or by choice. |
+| **Voice Collaboration** | **Coming soon.** Phase 1 uses the browser Web Speech API. The on-device GPU Whisper + LLM + SpeechT5 stack the name implies is **not wired yet**. | Listed so the roadmap is honest — do not expect GPU voice today. |
 
 ### Generative & 3D Demos
 
 | Demo | What It Does |
 |------|-------------|
-| **Image Generation** | SD-Turbo: type a text prompt, get a 512x512 image in ONE inference step (~1 second). Real Stable Diffusion running on your GPU in the browser — no server, no API key. 2.5GB model streamed to GPU via HuggingFace CDN. Also includes DDPM MNIST (1MB) as lightweight fallback. |
-| **Image to 3D (TripoSR)** | *Planned for v4.1.0* — DINOv1 encoder + Triplane transformer + Marching Cubes. 3D format support (glTF/OBJ/SPZ/PLY) already implemented. Awaiting ONNX model conversion. |
-| **Image to Gaussian Splats (LGM)** | Drop a photo, generate 65,536 photorealistic Gaussian splats. Fly through the 3D scene in [SpawnScene](https://github.com/LostBeard/SpawnScene). Export as SPZ (15-20x compressed) or PLY. |
-| **Depth Voxel** | Live webcam depth → 3D point cloud visualization. ML inference feeding directly into 3D rendering, all on GPU, no CPU readback. |
+| **Image Generation** | **Coming soon.** SD-Turbo UI exists; diffusion math is tested; there is **no** working end-to-end image output on this page yet (STATUS: WIP). |
+| **Image to 3D (TripoSR)** | **Coming soon.** Generate/download/open are no-ops. Format helpers exist; the reconstruction model path is not wired. |
+| **Image to Gaussian Splats (LGM)** | Planned — single image → splats → [SpawnScene](https://github.com/LostBeard/SpawnScene). Not a working demo page yet. |
+| **Depth Voxel** | Route mounts; depth colormap can run. The promised 3D voxel/splat viewer was never built (STATUS: PARTIAL; hidden from nav). |
 
 ### Infrastructure Demos
 
@@ -470,9 +469,9 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | **Model Gallery** | Browse all available demo models. Load custom models from HuggingFace. |
 | **Getting Started** | 5-step interactive tutorial with code examples. |
 
-All demos include backend selection, inference timing, "100% client-side" privacy badges, keyboard shortcuts (`?` for help, `Space` = run, `D` = download), and the voice command system ("Computer, classify this image").
+All demos include backend selection, inference timing, and "100% client-side" privacy badges where applicable.
 
-Most demo pages run real models on your GPU in your browser — but not all are finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) says exactly which.
+Most demo pages run real models on your GPU in your browser — but not all are finished. [**Docs/DEMO_AND_MODEL_STATUS.md**](Docs/DEMO_AND_MODEL_STATUS.md) is the source of truth for ✅ VERIFIED vs 🟡 PARTIAL vs 🚧 WIP. If a blurb here disagrees with that file, believe the status doc.
 
 ### The Wow Factor
 

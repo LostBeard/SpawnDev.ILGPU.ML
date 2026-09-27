@@ -178,6 +178,7 @@ DocProject/Help/html
 
 # Click-Once directory
 publish/
+publish-demo-audit/
 
 # Publish Web Output
 *.[Pp]ublish.xml
