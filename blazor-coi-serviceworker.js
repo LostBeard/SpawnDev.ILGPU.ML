@@ -36,9 +36,17 @@ if (typeof window !== 'undefined') {
             // Drop every prior registration so an old COI worker (pre-/models bypass,
             // pre-arrayBuffer wrap) cannot keep controlling fetches after a deploy.
             // Measured 2026-09-27: new wasm loaded but old SW still truncated BlazeFace.
+            //
+            // Capture currentScript.src NOW — after getRegistrations().then(...) the
+            // script has finished running and document.currentScript is null
+            // (Uncaught TypeError: Cannot read properties of null (reading 'src')).
+            var swUrl = (window.document.currentScript && window.document.currentScript.src)
+                || (window.document.baseURI
+                    ? new URL("blazor-coi-serviceworker.js", window.document.baseURI).href
+                    : "blazor-coi-serviceworker.js");
             var registerFresh = function () {
                 return navigator.serviceWorker
-                    .register(window.document.currentScript.src)
+                    .register(swUrl)
                     .then(function (reg) {
                         consoleLog("[COI] Service worker registered:", reg.scope);
                     })
