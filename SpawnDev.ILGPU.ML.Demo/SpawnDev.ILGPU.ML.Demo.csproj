@@ -50,6 +50,8 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\SpawnDev.ILGPU.ML\SpawnDev.ILGPU.ML.csproj" />
+		<!-- Phonemizer: Kokoro / ZipVoice need EnglishPhonemizer in the TTS demo page. -->
+		<ProjectReference Include="..\SpawnDev.Phonemizer\SpawnDev.Phonemizer.csproj" />
 		<!-- Optional WebTorrent delivery. SpawnDev.ILGPU.ML no longer references WebTorrent; the demo keeps
 		     this so the torrent path stays available and tested. Delivery DEFAULTS to HubModelSource (plain
 		     HTTP + OPFS) - nothing here requires a WebTorrentClient to load a model. -->

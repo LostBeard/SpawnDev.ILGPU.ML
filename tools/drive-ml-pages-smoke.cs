@@ -16,7 +16,7 @@ string[] routes =
 [
     "/", "/getting-started", "/pipelines", "/ai-chat",
     "/classify", "/depth", "/detect", "/style", "/remove-bg", "/pose", "/super-res", "/face", "/clip",
-    "/sentiment", "/embeddings", "/whisper", "/text-gen",
+    "/sentiment", "/embeddings", "/whisper", "/tts", "/text-gen",
     "/generate", "/image-to-3d", "/depth-voxel",
     "/explain", "/train", "/snake",
     "/benchmark", "/models", "/cache", "/inspector", "/tests",

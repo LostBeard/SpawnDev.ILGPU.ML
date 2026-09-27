@@ -88,8 +88,7 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
-                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+    <PipelineHowTo SourceFile="Pages/EmbeddingsPage.razor" Note="all-MiniLM-L6-v2" />
 
 </DemoLayout>
 
@@ -144,38 +143,6 @@
     private List<SearchResult>? _searchResults;
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
-
-    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
-    // ⚠️ Must be an EMBEDDING model with last_hidden_state. DistilBertSST2 is a classifier
-    // (logits [batch,2]) and cannot produce embeddings — proven live 2026-09-26 when the page
-    // still pointed there and FeatureExtractionPipeline threw. Gate: Embeddings_RealTokenizer_*.
-    private const string _howToCs = """
-// Load all-MiniLM-L6-v2 onto YOUR GPU — no server, no ONNX Runtime
-using var hub = new ModelHub(JS);
-var session = await InferenceSession.CreateFromHuggingFaceAsync(
-    accelerator, hub, ModelHub.KnownModels.AllMiniLmL6V2, ModelHub.KnownFiles.OnnxModel,
-    inputShapes: new() {
-        ["input_ids"] = new[] { 1, 128 },
-        ["attention_mask"] = new[] { 1, 128 },
-        ["token_type_ids"] = new[] { 1, 128 },
-    },
-    http: Http);
-var pipeline = new FeatureExtractionPipeline(session, accelerator, maxLength: 128, hiddenSize: 384);
-
-var embA = await pipeline.EmbedAsync(sentenceA, tokenizer);
-var embB = await pipeline.EmbedAsync(sentenceB, tokenizer);
-float similarity = TextPreprocessor.CosineSimilarity(embA.Embedding, embB.Embedding);
-""";
-
-    private const string _howToJs = """
-import { pipeline, cos_sim } from '@huggingface/transformers';
-
-const extractor = await pipeline('feature-extraction',
-                                 'Xenova/all-MiniLM-L6-v2', { device: 'webgpu' });
-const a = await extractor(sentenceA, { pooling: 'mean', normalize: true });
-const b = await extractor(sentenceB, { pooling: 'mean', normalize: true });
-const similarity = cos_sim(a.data, b.data);
-""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

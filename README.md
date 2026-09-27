@@ -437,6 +437,7 @@ The demo is a Blazor WebAssembly app showcasing what's possible when GPU inferen
 | Demo | What It Does |
 |------|-------------|
 | **Speech to Text** | Whisper-powered transcription. Upload audio or use the microphone — transcription runs on your GPU, never leaves your device. |
+| **Text to Speech** | Kokoro built-in voices (type → speak) or ZipVoice one-shot cloning from a short reference clip; save clones to OPFS. Same stack as SpawnDev.AI hands-free TTS. |
 | **Semantic Search** | Generate text embeddings with all-MiniLM-L6-v2. Find similar passages, rank by relevance — all computed locally. |
 | **Text Generation** | GPT-style text generation with greedy/top-K/top-P sampling, temperature control, and tokens/second counter. |
 

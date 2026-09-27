@@ -31,6 +31,7 @@
 | `/embeddings` | Sentence embeddings / semantic search | ✅ **VERIFIED** | `Embeddings_RealTokenizer_RelatedScoresHigherThanUnrelated` on **all-MiniLM-L6-v2** (384-dim, all six backends). **Page re-pointed 2026-09-26** off DistilBertSST2 (classifier `logits` [1,2] — threw at runtime). Gate: `drive-ml-pages.cs` `/embeddings` |
 | `/text-gen` | Text generation (DistilGPT-2) | ✅ **VERIFIED** | `Pipeline_TextGeneration_ProducesTokens` + `Sampler_*` suite; **confirmed live on GH Pages 2026-06-04**. WebGPU verified; ~0.2 tok/s (perf WIP). NOTE: superseded by `/ai-chat` for real LLM chat — candidate to retire |
 | `/whisper` | Speech-to-text (Whisper) | ✅ **VERIFIED** | **mic → text works end to end.** `Pipeline_Whisper_TranscribesKnownSpeech` — same answer on **all six backends**: "All legal box recordings are in the public domain". `MLTestBase.ResamplerTests`, `MicrophoneCaptureTests`, `tools/drive-mic-capture.cs --transcribe`. Nav: no badge (VERIFIED) |
+| `/tts` | Text-to-speech (Kokoro + ZipVoice clone) | 🟡 **PARTIAL** | Page wired 2026-09-26: Kokoro built-in voices + ZipVoice one-shot clone with OPFS `VoiceLibrary` save. Engine evidence: `Pipeline_Kokoro_MatchesOnnxRuntimeWaveform`, `Pipeline_ZipVoice_SpeaksInTheBrowser`. Live Speak/clone not yet in `drive-ml-pages` gate. Nav: beta |
 | `/snake` | System One Classic Snake | ✅ **VERIFIED** | Package: generic `SystemOneDecisionHead`. Demo-only: game/teacher/`SnakeSystemOneSpec` under `Demo.Shared`. Evidence: `SystemOne_Snake_BehavioralClone_AgreesWithTeacher`, `SystemOne_Weights_RoundTrip_PreservesProbs`. Nav: no badge (VERIFIED). Docs: [`system-one.md`](system-one.md) |
 | `/inspector` | Model Inspector (structure + compat) | ✅ **VERIFIED** | Streams ONNX structure-only; GPT-2 100% compat after registry fix; inspect-by-URL live-hub test |
 | `/benchmark` | GPU benchmark | ✅ **VERIFIED** | MatMul / perf kernels (92-101 GFLOPS validated) |
@@ -64,7 +65,9 @@
 | DistilGPT-2 / DistilBERT-SST2 | ✅ | ✅ text-gen / sentiment | DistilBERT-SST2 is the **SST-2 classifier** — one output `logits` [batch,2], **not** an embedding model |
 | all-MiniLM-L6-v2 | ✅ | ✅ embeddings | 384-dim `last_hidden_state`; **the model `/embeddings` uses** |
 | Whisper | ✅ | ✅ full STT E2E | `Pipeline_Whisper_TranscribesKnownSpeech` (encoder+decoder) on all six backends |
-| SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; not wired into a verified demo page |
+| Kokoro-82M (TTS) | ✅ | ✅ waveform vs ORT | `Pipeline_Kokoro_MatchesOnnxRuntimeWaveform`; demo `/tts` Kokoro tab |
+| ZipVoice (TTS clone) | ✅ | ✅ browser speak | `Pipeline_ZipVoice_SpeaksInTheBrowser`; demo `/tts` clone tab + OPFS voice save |
+| SpeechT5 (TTS) | ✅ | 🟡 | `Pipeline_TTS_ReferenceTokensProduceAudio`; superseded for demo by Kokoro/ZipVoice |
 | SD-Turbo | ✅ | ✅ E2E | `SDTurbo_Generate_E2E` + WebGPU multi-gen gates; `/generate` wired |
 | GGUF LLMs (Qwen/Gemma/Llama/SmolLM) | ✅ **runs** (desktop + browser) | 🟡 coherent, oracle-matched on qwen | Autoregressive KV-cache decode verified on desktop; browser `/ai-chat` streams GGUF (manual confirm for full file-pick→generate) |
 

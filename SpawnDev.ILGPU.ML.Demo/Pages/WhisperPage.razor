@@ -88,8 +88,7 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
-                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+    <PipelineHowTo SourceFile="Pages/WhisperPage.razor" Note="Whisper Tiny STT" />
 
 </DemoLayout>
 
@@ -150,36 +149,6 @@
     private double _audioDurationSeconds;
     private bool _isRunning, _isModelLoading, _isModelLoaded;
     private double _modelProgress, _inferenceMs;
-
-    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
-    private const string _howToCs = """
-// Load Whisper Tiny (encoder + decoder) onto YOUR GPU (WebGPU / Wasm) — no server, no ONNX Runtime
-using var hub = new ModelHub(JS);
-// Weights stream as a LAZY-HASH torrent: random access, OPFS-cached by piece, seeded to peers
-var encoder = await InferenceSession.CreateFromHuggingFaceAsync(accelerator, hub,
-    ModelHub.KnownModels.WhisperTiny, "onnx/encoder_model.onnx", http: Http);
-var decoder = await InferenceSession.CreateFromHuggingFaceAsync(accelerator, hub,
-    ModelHub.KnownModels.WhisperTiny, "onnx/decoder_model.onnx", http: Http);
-var pipeline = new SpeechRecognitionPipeline(encoder, decoder, accelerator);
-pipeline.LoadTokenizer(tokenizerJson);
-
-// Capture the microphone as mono 16 kHz float32 - exactly what Whisper wants
-var mic = new MediaStreamCapture(JS);
-mic.OnAudioReady += (chunk, rate) => buffer.AddRange(chunk);
-await mic.StartMicrophoneAsync(16000);
-// ...then on stop, transcribe 16 kHz mono PCM samples — runs entirely on the GPU
-var result = await pipeline.TranscribeAsync(samples, 16000);
-// result.Text, result.Language
-""";
-
-    private const string _howToJs = """
-import { pipeline } from '@huggingface/transformers';
-
-const pipe = await pipeline('automatic-speech-recognition',
-                            'Xenova/whisper-tiny', { device: 'webgpu' });
-const out = await pipe(audio);
-// out: { text }
-""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

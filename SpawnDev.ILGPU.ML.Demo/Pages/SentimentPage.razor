@@ -61,8 +61,9 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
-                   DocsNote="The C# above is the actual path this page runs — the SAME DistilBERT-SST2 model as Transformers.js, with a real WordPiece tokenizer, native GPU inference, no ONNX Runtime, no server." />
+    <PipelineHowTo SourceFile="Pages/SentimentPage.razor"
+                   RelatedFiles='@(new[] { "Pages/SentimentPage.razor.cs" })'
+                   Note="DistilBERT SST-2" />
 
 </DemoLayout>
 
@@ -189,30 +190,6 @@
     };
 
     private void UseSample(string s) { _text = s; _hasResult = false; }
-
-    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent (same model).
-    private const string _howToCs = """
-// Load DistilBERT-SST2 + its real WordPiece tokenizer onto YOUR GPU — no server, no ONNX Runtime
-var modelBytes = await hub.LoadAsync(ModelHub.KnownModels.DistilBertSST2, "onnx/model.onnx");
-var tokJson    = await hub.LoadSmallFileAsync(ModelHub.KnownModels.DistilBertSST2, "tokenizer.json");
-var tokenizer  = TokenizerLoader.FromTokenizerJson(Encoding.UTF8.GetString(tokJson)); // builds WordPiece
-using var session = InferenceSession.CreateFromFile(accelerator, modelBytes);
-var pipe = new TextClassificationPipeline(session, accelerator);
-
-// Classify — [CLS] + WordPiece(text) + [SEP], runs entirely on the GPU
-var r = await pipe.ClassifyAsync("I love this movie!", tokenizer);
-// r.TopLabel == "POSITIVE", r.TopConfidence ≈ 0.9998
-""";
-
-    private const string _howToJs = """
-import { pipeline } from '@huggingface/transformers';
-
-const pipe = await pipeline('sentiment-analysis',
-    'Xenova/distilbert-base-uncased-finetuned-sst-2-english',
-    { device: 'webgpu' });
-const out = await pipe('I love this movie!');
-// out: [{ label: 'POSITIVE', score: 0.9998 }]
-""";
 
     private List<Components.BackendSelector.BackendInfo> _backends = new()
     {

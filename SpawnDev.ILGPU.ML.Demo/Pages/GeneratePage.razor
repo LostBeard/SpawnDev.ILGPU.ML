@@ -112,8 +112,7 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo OurCode="@_howToCs"
-                   DocsNote="Not a Transformers.js task — Stable Diffusion text→image on your GPU. Same ImageGenerationPipeline as SpawnDev.AI." />
+    <PipelineHowTo SourceFile="Pages/GeneratePage.razor" Note="SD-Turbo" />
 
 </DemoLayout>
 
@@ -206,18 +205,6 @@
     // Same path SpawnDev.AI.AiImageEngine uses: ImageGenerationPipeline.CreateAsync + RunAsync.
     // Evidence: SDTurbo_Generate_E2E (HeavyModel) + SDTurbo_WebGPU_ImageGen_MultiGen.
     // The prior "Coming soon" stub never called LoadModelAsync, so Generate stayed disabled forever.
-    private const string _howToCs = """
-var source = new HubModelSource(JS);   // or inject as a singleton
-var pipe = await ImageGenerationPipeline.CreateAsync(accelerator, source,
-    onProgress: (stage, pct) => Show($"{stage} {pct}%"));
-
-pipe.NumInferenceSteps = 1;   // SD-Turbo: single step
-pipe.GuidanceScale = 0f;      // SD-Turbo: no CFG
-pipe.Width = pipe.Height = 512;
-var result = await pipe.RunAsync(new ImageGenerationInput { Prompt = "a photo of a cat" });
-ShowImage(result.ImageRGBA, result.Width, result.Height);
-""";
-
     private string _selectedBackend = "WebGPU";
     private string _prompt = "a photo of a cat";
     private string _negativePrompt = "";

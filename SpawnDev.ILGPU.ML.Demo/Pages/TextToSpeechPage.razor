@@ -1,0 +1,734 @@
+@page "/tts"
+@using System.Text
+@using SpawnDev.AsyncFileSystem
+@using SpawnDev.ILGPU.ML
+@using SpawnDev.ILGPU.ML.Hub
+@using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.ML.Preprocessing
+@using SpawnDev.Phonemizer
+@using SpawnDev.SpawnJS
+@implements IDisposable
+@inject SpawnJSRuntime JS
+@inject HttpClient Http
+@inject HubModelSource ModelSource
+@inject IAsyncFS AsyncFS
+
+<PageTitle>Text to Speech — SpawnDev.ILGPU.ML</PageTitle>
+
+<DemoLayout Title="Text to Speech"
+            Description="Type text, hear it spoken. Built-in Kokoro voices (faster than realtime) or one-shot ZipVoice cloning with saved voices — all on your GPU, no server."
+            AvailableBackends="@_backends"
+            SelectedBackend="@_selectedBackend"
+            SelectedBackendChanged="@((v) => _selectedBackend = v)"
+            OnBackendChange="@HandleBackendChange"
+            InferenceTimeMs="@_inferenceMs"
+            IsRunning="@_isRunning"
+            ShowModelProgress="true"
+            ModelName="@(_mode == "kokoro" ? "Kokoro-82M" : "ZipVoice distill int8")"
+            IsModelLoading="@_isModelLoading"
+            IsModelLoaded="@(_mode == "kokoro" ? _kokoroLoaded : _zipLoaded)"
+            ModelProgressPercent="@_modelProgress"
+            ModelSizeMB="@(_mode == "kokoro" ? 326 : 200)">
+
+    <div class="tts-mode-toggle">
+        <button class="mode-btn @(_mode == "kokoro" ? "active" : "")" @onclick='() => SetMode("kokoro")'>Kokoro voices</button>
+        <button class="mode-btn @(_mode == "clone" ? "active" : "")" @onclick='() => SetMode("clone")'>Clone a voice</button>
+    </div>
+
+    @if (_mode == "kokoro")
+    {
+        <div class="tts-row">
+            <label class="tts-label">Voice</label>
+            <select class="tts-select" @bind="_kokoroVoice">
+                @foreach (var name in KokoroVoicePack.EnglishVoiceNames)
+                {
+                    <option value="@name">@FormatVoiceName(name)</option>
+                }
+            </select>
+        </div>
+    }
+    else
+    {
+        <div class="clone-panel">
+            <div class="tts-row">
+                <label class="tts-label">Saved voice</label>
+                <select class="tts-select" @bind="_selectedSavedId">
+                    <option value="">— pick or save one below —</option>
+                    @foreach (var v in _savedVoices)
+                    {
+                        <option value="@v.Id">@v.DisplayName (@FormatDuration(v))</option>
+                    }
+                </select>
+                @if (!string.IsNullOrEmpty(_selectedSavedId))
+                {
+                    <button class="tts-link-btn" @onclick="DeleteSelectedVoice" disabled="@_isRunning">Delete</button>
+                }
+            </div>
+
+            <details class="clone-add" open="@(_savedVoices.Count == 0)">
+                <summary>Save a new cloned voice</summary>
+                <p class="clone-hint">
+                    Record or upload a few seconds of clean speech, and type the EXACT words spoken.
+                    ZipVoice clones from that clip; a wrong transcript bleeds into every line.
+                </p>
+                <div class="tts-row">
+                    <label class="tts-label">Name</label>
+                    <input class="tts-input" @bind="_newVoiceName" placeholder="e.g. My voice" />
+                </div>
+                <div class="tts-row">
+                    <label class="tts-label">Transcript</label>
+                    <input class="tts-input" @bind="_newVoiceTranscript" placeholder="Exact words in the clip" />
+                </div>
+                <div class="tts-mode-toggle clone-src">
+                    <button class="mode-btn @(_cloneSrc == "mic" ? "active" : "")" @onclick='() => _cloneSrc = "mic"'>Microphone</button>
+                    <button class="mode-btn @(_cloneSrc == "file" ? "active" : "")" @onclick='() => _cloneSrc = "file"'>Upload WAV</button>
+                </div>
+                @if (_cloneSrc == "mic")
+                {
+                    <div class="mic-row">
+                        @if (!_isRecording)
+                        {
+                            <button class="mic-btn" @onclick="StartCloneRecording" disabled="@_isRunning">Record reference</button>
+                        }
+                        else
+                        {
+                            <button class="mic-btn recording" @onclick="StopCloneRecording">Stop (@_recordingSeconds.ToString("F1")s)</button>
+                        }
+                    </div>
+                }
+                else
+                {
+                    <div class="upload-zone">
+                        <p>Drop a short WAV (mono or stereo)</p>
+                        <InputFile OnChange="HandleCloneFile" accept="audio/wav,.wav" class="file-input" />
+                    </div>
+                }
+                @if (_pendingRefSamples != null)
+                {
+                    <div class="ref-ready">
+                        Reference ready: @((_pendingRefSamples.Length / (double)_pendingRefRate).ToString("F1"))s
+                        at @_pendingRefRate Hz
+                    </div>
+                }
+                <button class="speak-btn secondary" @onclick="SaveClonedVoice"
+                        disabled="@(_isRunning || _pendingRefSamples == null || string.IsNullOrWhiteSpace(_newVoiceTranscript))">
+                    Save voice
+                </button>
+            </details>
+        </div>
+    }
+
+    <div class="tts-text-block">
+        <label class="tts-label">Text to speak</label>
+        <textarea class="tts-textarea" @bind="_text" rows="4"
+                  placeholder="Type something to hear…"></textarea>
+    </div>
+
+    <div class="tts-actions">
+        <button class="speak-btn" @onclick="SpeakAsync"
+                disabled="@(_isRunning || _isModelLoading || string.IsNullOrWhiteSpace(_text))">
+            @(_isRunning ? "Speaking…" : "Speak")
+        </button>
+        @if (_lastSamples != null)
+        {
+            <button class="speak-btn secondary" @onclick="PlayLast" disabled="@_isRunning">Play again</button>
+            <button class="speak-btn secondary" @onclick="DownloadWav" disabled="@_isRunning">Download WAV</button>
+        }
+    </div>
+
+    @if (!string.IsNullOrEmpty(_status))
+    {
+        <div class="tts-status">@_status</div>
+    }
+    @if (!string.IsNullOrEmpty(_error))
+    {
+        <div class="tts-error">@_error</div>
+    }
+
+    @if (!_kokoroLoaded && !_zipLoaded && !_isModelLoading)
+    {
+        <div class="model-needed">
+            Models load on first Speak (or Save for clone). Kokoro ~326 MB; ZipVoice encoder/decoder/vocoder ~200 MB. Cached in OPFS after the first download.
+        </div>
+    }
+
+    <PrivacyBadge />
+
+    <PipelineHowTo SourceFile="Pages/TextToSpeechPage.razor"
+                   RelatedFiles='@(new[] { "VoiceLibrary.cs" })'
+                   Note="Kokoro + ZipVoice TTS" />
+
+</DemoLayout>
+
+<style>
+    .tts-mode-toggle { display: flex; border-radius: 6px; overflow: hidden; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 1rem; width: fit-content; }
+    .mode-btn { padding: 0.35rem 0.85rem; border: none; background: rgba(255,255,255,0.04); color: #64748b; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .mode-btn.active { background: rgba(139,92,246,0.2); color: #e2e8f0; }
+    .clone-src { margin: 0.75rem 0; }
+
+    .tts-row { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+    .tts-label { color: #94a3b8; font-size: 0.85rem; font-weight: 600; min-width: 5.5rem; }
+    .tts-select, .tts-input {
+        flex: 1; min-width: 12rem; padding: 0.45rem 0.65rem; border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.12); background: rgba(0,0,0,0.25); color: #e2e8f0; font-size: 0.9rem;
+    }
+    .tts-textarea {
+        width: 100%; padding: 0.75rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(0,0,0,0.25); color: #e2e8f0; font-size: 0.95rem; line-height: 1.5; resize: vertical;
+        font-family: inherit; box-sizing: border-box;
+    }
+    .tts-text-block { margin: 1rem 0; }
+    .tts-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    .speak-btn {
+        padding: 0.55rem 1.25rem; border-radius: 8px; border: 1px solid rgba(139,92,246,0.4);
+        background: rgba(139,92,246,0.2); color: #e2e8f0; font-weight: 600; cursor: pointer;
+    }
+    .speak-btn:disabled { opacity: 0.45; cursor: default; }
+    .speak-btn.secondary { border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); }
+    .tts-link-btn {
+        padding: 0.35rem 0.65rem; border-radius: 6px; border: 1px solid rgba(239,68,68,0.35);
+        background: transparent; color: #fca5a5; font-size: 0.8rem; cursor: pointer;
+    }
+
+    .clone-panel { margin-bottom: 0.5rem; }
+    .clone-add {
+        margin-top: 0.75rem; padding: 0.85rem 1rem; border-radius: 8px;
+        border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.02);
+    }
+    .clone-add summary { cursor: pointer; color: #94a3b8; font-weight: 600; margin-bottom: 0.5rem; }
+    .clone-hint { color: #64748b; font-size: 0.8rem; margin: 0 0 0.75rem; line-height: 1.4; }
+    .ref-ready { color: #6ee7b7; font-size: 0.85rem; font-family: monospace; margin: 0.5rem 0; }
+
+    .upload-zone { position: relative; border: 2px dashed rgba(255,255,255,0.15); border-radius: 10px; padding: 1.25rem; text-align: center; margin-bottom: 0.75rem; color: #94a3b8; }
+    .file-input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+    .mic-row { text-align: center; margin: 0.5rem 0 0.75rem; }
+    .mic-btn {
+        display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.55rem 1.1rem; border-radius: 50px;
+        border: 2px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06); color: #e2e8f0;
+        font-weight: 600; cursor: pointer;
+    }
+    .mic-btn.recording { border-color: #ef4444; background: rgba(239,68,68,0.1); }
+
+    .tts-status { color: #64748b; font-size: 0.85rem; font-family: monospace; margin: 0.5rem 0; }
+    .tts-error { color: #fca5a5; font-size: 0.85rem; margin: 0.5rem 0; padding: 0.5rem 0.75rem; border-radius: 6px; background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); }
+    .model-needed { margin-top: 1rem; padding: 0.75rem 1rem; background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2); border-radius: 8px; color: #fbbf24; font-size: 0.85rem; }
+</style>
+
+@code {
+    private const string KokoroRepo = KokoroVoicePack.VoiceRepoId;
+    private const string ZipVoiceRepo = "k2-fsa/ZipVoice";
+    private const string HubBaseUrl = "https://hub.spawndev.com:44365";
+    private const string VocoderArchiveUrl =
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-zipvoice-distill-zh-en-emilia.tar.bz2";
+    private const string VocoderMember = "sherpa-onnx-zipvoice-distill-zh-en-emilia/vocos_24khz.onnx";
+    private const int VocoderBytes = 54_157_409;
+    private const double MaxCloneRecordSeconds = 8.0;
+
+    private static readonly Lazy<EnglishPhonemizer> Phonemizer =
+        new(EmbeddedData.CreatePhonemizer, isThreadSafe: true);
+
+    private List<BackendSelector.BackendInfo> _backends = new()
+    {
+        new() { Id = "WebGPU", DisplayName = "WebGPU" },
+        new() { Id = "Wasm", DisplayName = "Wasm (CPU)" },
+    };
+
+    private string _selectedBackend = "WebGPU";
+    private string _mode = "kokoro";
+    private string _kokoroVoice = KokoroVoicePack.DefaultVoiceName;
+    private string _text = "Hello from SpawnDev. Type anything and press Speak.";
+    private string _status = "";
+    private string? _error;
+
+    private bool _isRunning, _isModelLoading;
+    private double _modelProgress, _inferenceMs;
+    private bool _kokoroLoaded, _zipLoaded;
+
+    private string _cloneSrc = "mic";
+    private string _newVoiceName = "";
+    private string _newVoiceTranscript = "";
+    private string _selectedSavedId = "";
+    private List<SavedVoice> _savedVoices = new();
+    private float[]? _pendingRefSamples;
+    private int _pendingRefRate = 16000;
+
+    private bool _isRecording;
+    private double _recordingSeconds;
+    private MediaStreamCapture? _mic;
+    private readonly List<float> _micSamples = new();
+    private int _micRate = 16000;
+
+    private float[]? _lastSamples;
+    private int _lastRate = KokoroPipeline.OutputSampleRate;
+
+    private global::ILGPU.Runtime.Accelerator? _accelerator;
+    private global::ILGPU.Context? _context;
+    private KokoroPipeline? _kokoro;
+    private readonly Dictionary<string, KokoroVoicePack> _packs = new(StringComparer.OrdinalIgnoreCase);
+    private ZipVoicePipeline? _zip;
+    private IlgpuZipVoiceGraphs? _zipGraphs;
+    private ZipVoiceTokenizer? _zipTok;
+    private VoiceLibrary? _voices;
+    private AudioPlayback? _playback;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _voices = new VoiceLibrary(AsyncFS);
+        _playback = new AudioPlayback(JS);
+        await RefreshSavedVoices();
+    }
+
+    private Task SetMode(string mode)
+    {
+        _mode = mode;
+        _error = null;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private static string FormatVoiceName(string name)
+    {
+        // af_heart -> AF Heart
+        var parts = name.Split('_', 2);
+        if (parts.Length != 2) return name;
+        var prefix = parts[0].ToUpperInvariant();
+        var rest = char.ToUpperInvariant(parts[1][0]) + parts[1][1..];
+        return $"{prefix} · {rest}";
+    }
+
+    private static string FormatDuration(SavedVoice v)
+        => $"{v.SampleCount / (double)Math.Max(v.SampleRate, 1):F1}s";
+
+    private async Task EnsureAcceleratorAsync()
+    {
+        if (_accelerator != null) return;
+        var builder = MLContext.Create();
+        await builder.AllAcceleratorsAsync();
+        _context = builder.ToContext();
+        _accelerator = await _context.CreatePreferredAcceleratorAsync()
+            ?? throw new InvalidOperationException("no accelerator available");
+    }
+
+    private async Task EnsureKokoroAsync()
+    {
+        if (_kokoro != null) { _kokoroLoaded = true; return; }
+        _isModelLoading = true;
+        _modelProgress = 10;
+        StateHasChanged();
+        try
+        {
+            await EnsureAcceleratorAsync();
+            _modelProgress = 30;
+            StateHasChanged();
+            await using var stream = await ModelSource.OpenAsync(KokoroRepo, "onnx/model.onnx");
+            if (stream.Length <= 0)
+                throw new Exception($"hub returned empty stream for {KokoroRepo}/onnx/model.onnx");
+            _modelProgress = 60;
+            StateHasChanged();
+            _kokoro = await KokoroPipeline.CreateFromStreamAsync(_accelerator!, stream);
+            _kokoroLoaded = true;
+            _modelProgress = 100;
+            Console.WriteLine($"[TTS] Kokoro ready ({_kokoro.Session.NodeCount} nodes) on {_accelerator!.AcceleratorType}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<KokoroVoicePack> LoadPackAsync(string name)
+    {
+        if (_packs.TryGetValue(name, out var cached)) return cached;
+        var bytes = await ModelSource.FetchBytesAsync(KokoroRepo, KokoroVoicePack.VoicePath(name));
+        var pack = KokoroVoicePack.FromBytes(name, bytes);
+        _packs[name] = pack;
+        return pack;
+    }
+
+    private async Task EnsureZipVoiceAsync()
+    {
+        if (_zip != null) { _zipLoaded = true; return; }
+        _isModelLoading = true;
+        _modelProgress = 5;
+        StateHasChanged();
+        try
+        {
+            await EnsureAcceleratorAsync();
+
+            _modelProgress = 15;
+            StateHasChanged();
+            var encStream = await ModelSource.OpenAsync(ZipVoiceRepo, "zipvoice_distill/text_encoder_int8.onnx");
+            InferenceSession encoder;
+            await using (encStream)
+                encoder = await InferenceSession.CreateFromOnnxStreamAsync(_accelerator!, encStream);
+
+            _modelProgress = 40;
+            StateHasChanged();
+            var decStream = await ModelSource.OpenAsync(ZipVoiceRepo, "zipvoice_distill/fm_decoder_int8.onnx");
+            InferenceSession decoder;
+            await using (decStream)
+                decoder = await InferenceSession.CreateFromOnnxStreamAsync(_accelerator!, decStream);
+
+            _modelProgress = 70;
+            StateHasChanged();
+            var vocoder = await LoadVocoderAsync();
+
+            _modelProgress = 90;
+            StateHasChanged();
+            await using var tokStream = await ModelSource.OpenAsync(ZipVoiceRepo, "zipvoice_distill/tokens.txt");
+            using var reader = new StreamReader(tokStream);
+            var tokensTxt = await reader.ReadToEndAsync();
+            _zipTok = ZipVoiceTokenizer.CreateFromTokens(tokensTxt);
+
+            _zipGraphs = new IlgpuZipVoiceGraphs(encoder, decoder, vocoder, _accelerator!);
+            _zip = new ZipVoicePipeline(_zipGraphs);
+            _zipLoaded = true;
+            _modelProgress = 100;
+            Console.WriteLine($"[TTS] ZipVoice ready on {_accelerator!.AcceleratorType}");
+        }
+        finally
+        {
+            _isModelLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<InferenceSession> LoadVocoderAsync()
+    {
+        var archive = Uri.EscapeDataString(VocoderArchiveUrl);
+        var member = Uri.EscapeDataString(VocoderMember);
+        var warmUrl = $"{HubBaseUrl}/src/warm?url={archive}&member={member}";
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        while (clock.Elapsed < TimeSpan.FromMinutes(30))
+        {
+            using var res = await Http.GetAsync(warmUrl);
+            if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
+                throw new Exception("hub has no /src/warm — need a SourceProxy build");
+            if (res.IsSuccessStatusCode && res.StatusCode != System.Net.HttpStatusCode.Accepted) break;
+            if (res.StatusCode != System.Net.HttpStatusCode.Accepted)
+                throw new Exception($"hub could not cache vocoder archive: {(int)res.StatusCode}");
+            _status = "Caching vocoder archive on hub…";
+            StateHasChanged();
+            await Task.Delay(TimeSpan.FromSeconds(5));
+        }
+
+        var memberUrl = $"{HubBaseUrl}/src?url={archive}&member={member}";
+        var bytes = await InferenceSession.DownloadBytesChunkedAsync(Http, memberUrl);
+        if (bytes.Length != VocoderBytes)
+            throw new Exception($"vocoder is {bytes.Length} bytes, expected {VocoderBytes:N0}");
+        return InferenceSession.CreateFromFile(_accelerator!, bytes);
+    }
+
+    private async Task SpeakAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_text)) return;
+        _error = null;
+        _isRunning = true;
+        _status = "Loading…";
+        StateHasChanged();
+        try
+        {
+            if (_mode == "kokoro")
+                await SpeakKokoroAsync();
+            else
+                await SpeakCloneAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+            Console.WriteLine($"[TTS] {ex}");
+        }
+        finally
+        {
+            _isRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task SpeakKokoroAsync()
+    {
+        await EnsureKokoroAsync();
+        var pack = await LoadPackAsync(_kokoroVoice);
+        _status = "Phonemizing…";
+        StateHasChanged();
+        var phonemes = Phonemizer.Value.ToSymbols(_text);
+        _status = "Synthesizing…";
+        StateHasChanged();
+        var audio = await _kokoro!.SpeakAsync(phonemes, pack);
+        _lastSamples = audio.Samples;
+        _lastRate = audio.SampleRate;
+        _inferenceMs = audio.InferenceMs;
+        var rtf = audio.InferenceMs / 1000.0 / Math.Max(audio.Seconds, 1e-6);
+        _status = $"{audio.Seconds:F2}s audio in {audio.InferenceMs:F0} ms (RTF {rtf:F2}x) · {audio.Tokens} tokens · {_kokoroVoice}";
+        await _playback!.PlayAsync(audio.Samples, audio.SampleRate);
+    }
+
+    private async Task SpeakCloneAsync()
+    {
+        if (string.IsNullOrEmpty(_selectedSavedId))
+            throw new InvalidOperationException("Pick a saved voice, or save a new one first.");
+
+        var meta = _savedVoices.FirstOrDefault(v => v.Id == _selectedSavedId)
+            ?? throw new InvalidOperationException("Selected voice is gone — refresh and pick again.");
+        var samples = await _voices!.ReadSamplesAsync(meta)
+            ?? throw new InvalidOperationException($"PCM missing for '{meta.DisplayName}'.");
+
+        await EnsureZipVoiceAsync();
+        _status = "Cloning…";
+        StateHasChanged();
+        var result = await _zip!.SpeakAsync(_text, meta.ReferenceText, samples, meta.SampleRate, _zipTok!);
+        _lastSamples = result.Audio;
+        _lastRate = result.SampleRate;
+        _inferenceMs = result.TotalMs;
+        var rtf = result.TotalMs / 1000.0 / Math.Max(result.DurationSeconds, 1e-6);
+        _status = $"{result.DurationSeconds:F2}s audio in {result.TotalMs:F0} ms (RTF {rtf:F2}x) · clone '{meta.DisplayName}'";
+        await _playback!.PlayAsync(result.Audio, result.SampleRate);
+    }
+
+    private async Task PlayLast()
+    {
+        if (_lastSamples == null || _playback == null) return;
+        await _playback.PlayAsync(_lastSamples, _lastRate);
+    }
+
+    private void DownloadWav()
+    {
+        if (_lastSamples == null) return;
+        try
+        {
+            var wav = EncodeWav(_lastSamples, _lastRate);
+            var dataUrl = "data:audio/wav;base64," + Convert.ToBase64String(wav);
+            using var document = JS.Get<SpawnDev.SpawnJS.JSObjects.Document>("document");
+            using var link = document.CreateElement<SpawnDev.SpawnJS.JSObjects.HTMLAnchorElement>("a");
+            link.Href = dataUrl;
+            link.Download = _mode == "kokoro" ? $"kokoro-{_kokoroVoice}.wav" : "clone.wav";
+            using var body = document.Body!;
+            body.AppendChild(link);
+            link.Click();
+            body.RemoveChild(link);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private async Task RefreshSavedVoices()
+    {
+        if (_voices == null) return;
+        _savedVoices = await _voices.ListAsync();
+        if (!string.IsNullOrEmpty(_selectedSavedId)
+            && _savedVoices.All(v => v.Id != _selectedSavedId))
+            _selectedSavedId = "";
+        StateHasChanged();
+    }
+
+    private async Task SaveClonedVoice()
+    {
+        if (_voices == null || _pendingRefSamples == null) return;
+        if (string.IsNullOrWhiteSpace(_newVoiceTranscript))
+        {
+            _error = "Transcript is required — it must match the clip exactly.";
+            return;
+        }
+        _error = null;
+        _isRunning = true;
+        StateHasChanged();
+        try
+        {
+            var name = string.IsNullOrWhiteSpace(_newVoiceName) ? "Voice" : _newVoiceName.Trim();
+            var id = VoiceLibrary.MakeId(name);
+            var saved = await _voices.SaveAsync(id, name, _newVoiceTranscript.Trim(),
+                _pendingRefSamples, _pendingRefRate);
+            _selectedSavedId = saved.Id;
+            _pendingRefSamples = null;
+            _newVoiceName = "";
+            _status = $"Saved \"{saved.DisplayName}\" ({saved.SampleCount / (double)saved.SampleRate:F1}s). Pick it above and Speak.";
+            await RefreshSavedVoices();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _isRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task DeleteSelectedVoice()
+    {
+        if (_voices == null || string.IsNullOrEmpty(_selectedSavedId)) return;
+        await _voices.DeleteAsync(_selectedSavedId);
+        _selectedSavedId = "";
+        await RefreshSavedVoices();
+    }
+
+    private async Task HandleCloneFile(InputFileChangeEventArgs e)
+    {
+        if (e.File == null) return;
+        try
+        {
+            using var stream = e.File.OpenReadStream(maxAllowedSize: 20 * 1024 * 1024);
+            var bytes = new byte[e.File.Size];
+            await stream.ReadAsync(bytes);
+            var samples = WavDecoder.DecodeWavFile(bytes);
+            if (samples == null)
+            {
+                _error = "Only WAV files are supported for upload. Use the microphone for other formats.";
+                return;
+            }
+            // WavDecoder returns mono float at the file's rate but drops the rate — Whisper path
+            // assumes 16 kHz fixtures. Read fmt sample rate from the header.
+            _pendingRefRate = ReadWavSampleRate(bytes) ?? 16000;
+            _pendingRefSamples = samples;
+            _error = null;
+            _status = $"Loaded {samples.Length / (double)_pendingRefRate:F1}s reference from file.";
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        StateHasChanged();
+    }
+
+    private static int? ReadWavSampleRate(byte[] data)
+    {
+        if (data.Length < 44) return null;
+        int pos = 12;
+        while (pos < data.Length - 8)
+        {
+            var chunkId = Encoding.ASCII.GetString(data, pos, 4);
+            int chunkSize = BitConverter.ToInt32(data, pos + 4);
+            pos += 8;
+            if (chunkId == "fmt ")
+                return BitConverter.ToInt32(data, pos + 4);
+            pos += chunkSize;
+        }
+        return null;
+    }
+
+    private async Task StartCloneRecording()
+    {
+        if (_isRecording) return;
+        _mic ??= new MediaStreamCapture(JS);
+        _mic.OnAudioReady -= OnMicAudio;
+        _mic.OnAudioReady += OnMicAudio;
+        lock (_micSamples) _micSamples.Clear();
+        _recordingSeconds = 0;
+        _pendingRefSamples = null;
+        if (!await _mic.StartMicrophoneAsync())
+        {
+            _error = $"Could not open microphone. {_mic.LastAudioError?.Message}";
+            StateHasChanged();
+            return;
+        }
+        _isRecording = true;
+        StateHasChanged();
+    }
+
+    private void OnMicAudio(float[] chunk, int rate)
+    {
+        _micRate = rate;
+        lock (_micSamples)
+        {
+            _micSamples.AddRange(chunk);
+            _recordingSeconds = _micSamples.Count / (double)rate;
+        }
+        if (_recordingSeconds >= MaxCloneRecordSeconds)
+            _ = InvokeAsync(StopCloneRecording);
+        else
+            _ = InvokeAsync(StateHasChanged);
+    }
+
+    private async Task StopCloneRecording()
+    {
+        if (!_isRecording) return;
+        _isRecording = false;
+        try { _mic?.StopMicrophone(); } catch { }
+        float[] samples;
+        lock (_micSamples) samples = _micSamples.ToArray();
+        if (samples.Length == 0)
+        {
+            _error = "No audio captured.";
+            StateHasChanged();
+            return;
+        }
+        _pendingRefSamples = samples;
+        _pendingRefRate = _micRate;
+        _status = $"Recorded {samples.Length / (double)_micRate:F1}s reference.";
+        StateHasChanged();
+        await Task.CompletedTask;
+    }
+
+    private async Task HandleBackendChange(string backend)
+    {
+        // Opt-in: only reload if a model is already resident.
+        if (!_kokoroLoaded && !_zipLoaded) return;
+        DisposeModels();
+        _accelerator?.Dispose();
+        _accelerator = null;
+        _context?.Dispose();
+        _context = null;
+        if (_mode == "kokoro") await EnsureKokoroAsync();
+        else await EnsureZipVoiceAsync();
+    }
+
+    private static byte[] EncodeWav(float[] samples, int sampleRate)
+    {
+        var pcm = new byte[samples.Length * 2];
+        for (int i = 0; i < samples.Length; i++)
+        {
+            var s = Math.Clamp(samples[i], -1f, 1f);
+            short v = (short)(s * 32767f);
+            pcm[i * 2] = (byte)(v & 0xff);
+            pcm[i * 2 + 1] = (byte)((v >> 8) & 0xff);
+        }
+        var header = new byte[44];
+        Encoding.ASCII.GetBytes("RIFF").CopyTo(header, 0);
+        BitConverter.GetBytes(36 + pcm.Length).CopyTo(header, 4);
+        Encoding.ASCII.GetBytes("WAVE").CopyTo(header, 8);
+        Encoding.ASCII.GetBytes("fmt ").CopyTo(header, 12);
+        BitConverter.GetBytes(16).CopyTo(header, 16);
+        BitConverter.GetBytes((short)1).CopyTo(header, 20);
+        BitConverter.GetBytes((short)1).CopyTo(header, 22);
+        BitConverter.GetBytes(sampleRate).CopyTo(header, 24);
+        BitConverter.GetBytes(sampleRate * 2).CopyTo(header, 28);
+        BitConverter.GetBytes((short)2).CopyTo(header, 32);
+        BitConverter.GetBytes((short)16).CopyTo(header, 34);
+        Encoding.ASCII.GetBytes("data").CopyTo(header, 36);
+        BitConverter.GetBytes(pcm.Length).CopyTo(header, 40);
+        var wav = new byte[44 + pcm.Length];
+        Buffer.BlockCopy(header, 0, wav, 0, 44);
+        Buffer.BlockCopy(pcm, 0, wav, 44, pcm.Length);
+        return wav;
+    }
+
+    private void DisposeModels()
+    {
+        _kokoro?.Dispose();
+        _kokoro = null;
+        _kokoroLoaded = false;
+        _packs.Clear();
+        // ZipVoicePipeline.Dispose is a no-op — graphs own the three sessions.
+        _zip?.Dispose();
+        _zip = null;
+        _zipGraphs?.Dispose();
+        _zipGraphs = null;
+        _zipTok = null;
+        _zipLoaded = false;
+    }
+
+    public void Dispose()
+    {
+        try { _mic?.StopMicrophone(); } catch { }
+        _mic?.Dispose();
+        _playback?.Dispose();
+        DisposeModels();
+        _accelerator?.Dispose();
+        _context?.Dispose();
+    }
+}

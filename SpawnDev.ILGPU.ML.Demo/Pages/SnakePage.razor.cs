@@ -13,19 +13,6 @@ namespace SpawnDev.ILGPU.ML.Demo.Pages;
 
 public partial class SnakePage : IAsyncDisposable
 {
-    private const string _howToCs = """
-using SpawnDev.ILGPU.ML.SystemOne;
-// Snake helpers below are Demo.Shared — not in the NuGet package.
-using SpawnDev.ILGPU.ML.Demo.Shared.Games.Snake;
-
-// Package API (generic). Same as SnakeSystemOneSpec.CreateHead(accelerator):
-using var head = new SystemOneDecisionHead(accelerator, stateDim: 40, numOptions: 4, hidden: 128);
-await SnakeSystemOneTrainer.TrainAsync(head); // BC from the safe teacher
-
-var (action, answer, ms) = await SnakeSystemOnePolicy.DecideAsync(head, game);
-game.SetAction(action); // illegal moves already zeroed via allowedMask
-""";
-
     private enum PlayMode { Human, SystemOne }
 
     [Inject] SpawnJSRuntime JS { get; set; } = default!;

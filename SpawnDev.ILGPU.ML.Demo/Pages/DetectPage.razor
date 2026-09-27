@@ -78,8 +78,7 @@
 
     <PrivacyBadge />
 
-    <PipelineHowTo OurCode="@_howToCs" TransformersJsCode="@_howToJs"
-                   DocsNote="The C# above is the actual path this page runs — native GPU inference, no ONNX Runtime, no server." />
+    <PipelineHowTo SourceFile="Pages/DetectPage.razor" Note="YOLOv8" />
 
 </DemoLayout>
 
@@ -184,31 +183,6 @@
         new() { Label = "Street", Url = "samples/street.jpg" },
         new() { Label = "Landscape", Url = "samples/landscape.jpg" },
     };
-
-    // "Show how" — the actual path this page runs, next to the Transformers.js equivalent.
-    private const string _howToCs = """
-// Load YOLOv8-Nano onto YOUR GPU (WebGPU / WebGL / Wasm) — no server, no ONNX Runtime
-using var hub = new ModelHub(JS);
-// Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-// by piece, restored on reload with no re-download, and seeded to peers.
-var session = await InferenceSession.CreateFromHuggingFaceAsync(
-    accelerator, hub, ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx",
-    http: Http);
-var pipeline = new ObjectDetectionPipeline(session, accelerator);
-
-// Detect objects in an RGBA image — runs entirely on the GPU
-var result = await pipeline.DetectAsync(rgbaPixels, width, height, confidenceThreshold: 0.5f);
-// result.Objects: [{ Label, X, Y, Width, Height, Confidence }, ...]
-""";
-
-    private const string _howToJs = """
-import { pipeline } from '@huggingface/transformers';
-
-const pipe = await pipeline('object-detection',
-                            'Xenova/yolov8n', { device: 'webgpu' });
-const out = await pipe(imageUrl);
-// out: [{ label, score, box: { xmin, ymin, xmax, ymax } }, ...]
-""";
 
     private List<BackendSelector.BackendInfo> _backends = new()
     {

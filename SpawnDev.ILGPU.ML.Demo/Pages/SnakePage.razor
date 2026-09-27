@@ -110,8 +110,9 @@
         </div>
     </div>
 
-    <PipelineHowTo OurCode="@_howToCs"
-                   DocsNote="SystemOneDecisionHead is in the NuGet package (typed probs, no text). Snake dims, teacher, and trainer stay in Demo.Shared — Docs/system-one.md." />
+    <PipelineHowTo SourceFile="Pages/SnakePage.razor"
+                   RelatedFiles='@(new[] { "Pages/SnakePage.razor.cs" })'
+                   Note="System One Snake" />
 
 </DemoLayout>
 
