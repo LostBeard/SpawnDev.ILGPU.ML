@@ -2,6 +2,28 @@
 
 Notable changes per release. Pre-stable; API will change between preview drops.
 
+## 5.2.34-local.1 (unreleased) - params buffers no longer leak one per call
+
+**Bug:** every Broadcast/Where (`ElementWiseKernels`), Slice, GatherGenericFloat/GatherElements, Scatter and
+GatedDeltaNet call allocated a FRESH small params buffer and kept the previous one in a retire list freed only in
+`Dispose()`. Race-free (a pending dispatch in an un-submitted WebGPU batch never saw its params overwritten or
+freed), but it leaked one device buffer per op call for the lifetime of the session. SpawnScene's TruckFull depth
+cascade (83 DAv3 passes on one pipeline) accumulated ~19,000 of them - ~234 per pass - and Chrome's GPU process
+died out of memory ("The GPU process died due to out of memory", device lost). Found with SpawnDev.ILGPU
+5.2.18-local.4 `WebGPUBufferAccounting.CaptureCreationSites`.
+
+**Fix:** `Kernels/ContentParamBuffers<T>` - content-addressed, WRITE-ONCE params buffers. A params array is a pure
+function of the op's shapes, so one buffer per distinct content serves every call with that content: uploaded once,
+never overwritten, never freed before `Dispose()`, so it stays race-free on every backend (pending batches, the Wasm
+worker pool, recorded capture plans). A fixed-shape model stops allocating after its first pass (and skips the
+per-call allocation + upload); a dynamic-shape model holds one buffer per distinct content, never more than before.
+The CUDA-graph capture path (`CaptureParamArena` stable slots) is unchanged. Diagnostics:
+`SliceKernel.DistinctParamsBuffers`, `GatherKernel.DistinctParamsBuffers`, `ElementWiseKernels.DistinctStridesBuffers`.
+
+Gate: `ContentParams_Slice_*`, `ContentParams_Broadcast_*`, `ContentParams_Gather_*` (interleaved different-params
+calls with no sync verified against CPU, plus the buffer count) - 18/18 on all 6 backends; red with content matching
+disabled (25/30/40 buffers where 1/2/2 expected).
+
 ## 5.2.33 (2026-09-27) - BlazeFace landmarks xywh (not reverse yxhw)
 
 **Bug:** `/face` box was correct after 5.2.32 but the 6 green landmark dots sat on

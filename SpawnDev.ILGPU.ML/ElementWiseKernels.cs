@@ -33,12 +33,8 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _addScalarInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, float>? _fillKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, DelegateSpecialization<Func<float, float, float>>>? _broadcastBinaryKernel;
-    // Kept alive until next BroadcastBinaryOpND call to avoid synchronous Synchronize()
-    // which deadlocks on WebGPU/WebGL/Wasm backends. By the next call, the GPU has
-    // finished reading the previous strides buffer.
-    private MemoryBuffer1D<float, Stride1D.Dense>? _lastStridesBuf;
-    private MemoryBuffer1D<float, Stride1D.Dense>? _broadcastStridesBuf;
-    private readonly List<MemoryBuffer1D<float, Stride1D.Dense>> _oldStridesBufs = new();
+    // Broadcast / Where strides params: one write-once device buffer per distinct content (see ContentParamBuffers).
+    private Kernels.ContentParamBuffers<float>? _stridesParams;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>>? _addInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, float>? _addScaledInPlaceKernel;
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int>? _concatLastDimKernel;
@@ -47,6 +43,9 @@ public class ElementWiseKernels : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, int, int, int, int, int>? _bicubicResizeKernel;
 
     public ElementWiseKernels(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>Broadcast/Where strides buffers held: one per DISTINCT strides content, not one per call (diagnostic).</summary>
+    public int DistinctStridesBuffers => _stridesParams?.Count ?? 0;
 
     // ─────────────────────────────────────────────────────────────
     //  Kernel implementations
@@ -712,10 +711,9 @@ public class ElementWiseKernels : IDisposable
         }
 
         // Pack strides: [rank, aStrides[0..rank], bStrides[0..rank], outStrides[0..rank]]
-        // CRITICAL: Allocate a new buffer per call — WebGPU dispatch is async,
-        // and reusing a shared buffer causes race conditions when multiple
-        // BroadcastBinaryOpND calls are queued (e.g., decomposed LayerNorm:
-        // Sub, Pow, Div, Mul all dispatch in sequence without sync).
+        // CRITICAL: never OVERWRITE a params buffer - WebGPU dispatch is async, and rewriting a shared
+        // buffer races the BroadcastBinaryOpND calls still queued (e.g., decomposed LayerNorm: Sub, Pow,
+        // Div, Mul all dispatch in sequence without sync). ContentParamBuffers writes each content once.
         int paramsSize = 1 + 3 * rank;
         var paramsData = new float[paramsSize];
         paramsData[0] = rank;
@@ -730,13 +728,10 @@ public class ElementWiseKernels : IDisposable
         }
         else
         {
-            // Accumulate stride buffers — disposal happens in Dispose().
-            // On WebGPU/WebGL/Wasm, inline disposal causes ObjectDisposedException because
-            // the buffer may still be referenced by pending dispatches in the command encoder.
-            if (_lastStridesBuf != null) _oldStridesBufs.Add(_lastStridesBuf);
-            _lastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
-            _lastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
-            paramsView = _lastStridesBuf.View.SubView(0, paramsSize);
+            // Write-once buffer per distinct strides content: never overwritten or freed before Dispose(), so a
+            // dispatch still pending in the command encoder always reads its own params. (A fresh buffer per call,
+            // retired until Dispose(), leaked one buffer per call - ~64 per DAv3 pass, 2026-09-27.)
+            paramsView = (_stridesParams ??= new Kernels.ContentParamBuffers<float>(_accelerator)).Get(paramsData);
         }
 
         var opSpec = op switch
@@ -1935,12 +1930,9 @@ public class ElementWiseKernels : IDisposable
         }
         else
         {
-            // Fresh buffer per call, deferred disposal (browser dispatch is async; reuse races
-            // pending dispatches).
-            if (_broadcastStridesBuf != null) _oldStridesBufs.Add(_broadcastStridesBuf);
-            _broadcastStridesBuf = _accelerator.Allocate1D<float>(paramsSize);
-            _broadcastStridesBuf.View.SubView(0, paramsSize).CopyFromCPU(paramsData);
-            paramsView = _broadcastStridesBuf.View;
+            // Write-once buffer per distinct strides content (browser dispatch is async; overwriting races
+            // pending dispatches, and a fresh buffer per call leaked one per call).
+            paramsView = (_stridesParams ??= new Kernels.ContentParamBuffers<float>(_accelerator)).Get(paramsData);
         }
 
         _whereBroadcastKernel!(outCount, cond, x, y, output, paramsView);
@@ -2565,10 +2557,8 @@ public class ElementWiseKernels : IDisposable
 
     public void Dispose()
     {
-        _lastStridesBuf?.Dispose();
-        _broadcastStridesBuf?.Dispose();
-        foreach (var buf in _oldStridesBufs) buf.Dispose();
-        _oldStridesBufs.Clear();
+        _stridesParams?.Dispose();
+        _stridesParams = null;
         _compareResultBuf?.Dispose();
         _comparePartialSums?.Dispose();
         _comparePartialMaxes?.Dispose();

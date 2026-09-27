@@ -47,8 +47,8 @@ public class ScatterKernel : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _scatterNDKernel;
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParams;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParams = new();
+    // One write-once device buffer per distinct params content (see ContentParamBuffers).
+    private ContentParamBuffers<int>? _params;
 
     public ScatterKernel(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -185,11 +185,10 @@ public class ScatterKernel : IDisposable
             // CUDA-graph capture: a stable per-forward slot, since cuMemAlloc mid-capture is illegal.
             return CaptureParamArena.Shared(_accelerator).RentStableSlot(packed);
         }
-        // Retire rather than dispose: the dispatch may still be pending in an un-submitted WebGPU command
-        // batch, and freeing a buffer it reads makes the GPU read zeros.
-        if (_lastParams != null) _oldParams.Add(_lastParams);
-        _lastParams = _accelerator.Allocate1D(packed);
-        return _lastParams.View;
+        // Never overwritten or freed before Dispose(): the dispatch may still be pending in an un-submitted
+        // WebGPU command batch, and freeing a buffer it reads makes the GPU read zeros. (A fresh buffer per call,
+        // retired until Dispose(), leaked one buffer per call.)
+        return (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
     }
 
     private void EnsureLoaded()
@@ -204,9 +203,7 @@ public class ScatterKernel : IDisposable
 
     public void Dispose()
     {
-        _lastParams?.Dispose();
-        _lastParams = null;
-        foreach (var b in _oldParams) b.Dispose();
-        _oldParams.Clear();
+        _params?.Dispose();
+        _params = null;
     }
 }

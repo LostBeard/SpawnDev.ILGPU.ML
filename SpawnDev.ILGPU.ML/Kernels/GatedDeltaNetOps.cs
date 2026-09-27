@@ -20,8 +20,10 @@ public sealed class GatedDeltaNetOps : IDisposable
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _grms;
 
-    private MemoryBuffer1D<int, Stride1D.Dense>? _cp, _lp, _gp;
-    private readonly List<IDisposable> _old = new();
+    // One write-once device buffer per distinct params content (see ContentParamBuffers); a fresh buffer per call
+    // retired until Dispose() leaked one buffer per call.
+    private ContentParamBuffers<int>? _params;
+    private ContentParamBuffers<int> Params => _params ??= new ContentParamBuffers<int>(_accelerator);
 
     public GatedDeltaNetOps(Accelerator accelerator) => _accelerator = accelerator;
 
@@ -39,9 +41,7 @@ public sealed class GatedDeltaNetOps : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(ConvImpl);
         int C = qDim + kDim + vDim;
         var p = new[] { seq, C, L, qDim, kDim };
-        if (_cp != null) _old.Add(_cp);
-        _cp = _accelerator.Allocate1D(p);
-        _conv(seq * C, qkv, weight, q, k, v, _cp.View);
+        _conv(seq * C, qkv, weight, q, k, v, Params.Get(p));
     }
 
     private static void ConvImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> qkv,
@@ -82,9 +82,7 @@ public sealed class GatedDeltaNetOps : IDisposable
         _l2 ??= _accelerator.LoadAutoGroupedStreamKernel<Index1D, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<int, Stride1D.Dense>>(L2Impl);
         var p = new[] { D };
-        if (_lp != null) _old.Add(_lp);
-        _lp = _accelerator.Allocate1D(p);
-        _l2(rows, x, _lp.View);   // one thread per (seq*H) head vector
+        _l2(rows, x, Params.Get(p));   // one thread per (seq*H) head vector
     }
 
     private static void L2Impl(Index1D idx, ArrayView1D<float, Stride1D.Dense> x, ArrayView1D<int, Stride1D.Dense> p)
@@ -108,9 +106,7 @@ public sealed class GatedDeltaNetOps : IDisposable
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
             ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>(GrmsImpl);
         var p = new[] { D };
-        if (_gp != null) _old.Add(_gp);
-        _gp = _accelerator.Allocate1D(p);
-        _grms(rows, scan, normW, z, outp, _gp.View);   // one thread per (seq*numVHeads) head vector
+        _grms(rows, scan, normW, z, outp, Params.Get(p));   // one thread per (seq*numVHeads) head vector
     }
 
     private static void GrmsImpl(Index1D idx, ArrayView1D<float, Stride1D.Dense> scan,
@@ -133,9 +129,7 @@ public sealed class GatedDeltaNetOps : IDisposable
 
     public void Dispose()
     {
-        _cp?.Dispose(); _lp?.Dispose(); _gp?.Dispose();
-        _cp = _lp = _gp = null;
-        foreach (var d in _old) d.Dispose();
-        _old.Clear();
+        _params?.Dispose();
+        _params = null;
     }
 }

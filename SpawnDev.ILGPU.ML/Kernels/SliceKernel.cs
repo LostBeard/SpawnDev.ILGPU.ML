@@ -39,12 +39,15 @@ public class SliceKernel : IDisposable
     // overwrite hands it the NEXT call's params and the growth-dispose frees memory under it (Wasm:
     // "RangeError: offset is out of bounds" - caught by SliceKernel_MixedRankHistory_MatchesCPU; the
     // DAv3 blocks.4 rope Slice_4 corruption on WebGPU executed with steps[3]=32 from exactly this
-    // params-content class). Each call now gets a FRESH buffer; old ones are retired here and freed
-    // in Dispose() at a safe point.
-    private MemoryBuffer1D<int, Stride1D.Dense>? _lastParams;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldParams = new();
+    // params-content class). Then each call got a FRESH buffer retired until Dispose() - race-free but it
+    // leaked one buffer per call (~111 per DAv3 pass, 2026-09-27). Now: one write-once buffer per distinct
+    // params content (ContentParamBuffers), never overwritten or freed before Dispose().
+    private ContentParamBuffers<int>? _params;
 
     public SliceKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>Device params buffers held: one per DISTINCT params content, not one per call (diagnostic).</summary>
+    public int DistinctParamsBuffers => _params?.Count ?? 0;
 
     /// <summary>
     /// Per-thread Slice: read input at the indexed source location and write to
@@ -132,10 +135,7 @@ public class SliceKernel : IDisposable
         }
         else
         {
-            // FRESH params buffer per call, previous one retired for deferred disposal (see _oldParams).
-            if (_lastParams != null) _oldParams.Add(_lastParams);
-            _lastParams = _accelerator.Allocate1D(packed);
-            paramsView = _lastParams.View;
+            paramsView = (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
         }
 
         _sliceKernel!(totalOutput, input, output, paramsView, rank);
@@ -150,9 +150,7 @@ public class SliceKernel : IDisposable
 
     public void Dispose()
     {
-        _lastParams?.Dispose();
-        _lastParams = null;
-        foreach (var b in _oldParams) b.Dispose();
-        _oldParams.Clear();
+        _params?.Dispose();
+        _params = null;
     }
 }

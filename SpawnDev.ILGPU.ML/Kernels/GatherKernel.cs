@@ -19,10 +19,16 @@ public class GatherKernel : IDisposable
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gatherElementsKernel;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _lastElementsParams;
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldElementsParams = new();
+    // GatherGenericFloat + GatherElements params: one write-once device buffer per distinct content (see
+    // ContentParamBuffers) - never overwritten or freed before Dispose(), so a dispatch pending in an
+    // un-submitted batch reads its own params. Replaced a fresh buffer per call retired until Dispose(),
+    // which leaked one buffer per call (2026-09-27).
+    private ContentParamBuffers<int>? _params;
 
     public GatherKernel(Accelerator accelerator) => _accelerator = accelerator;
+
+    /// <summary>Device params buffers held: one per DISTINCT params content, not one per call (diagnostic).</summary>
+    public int DistinctParamsBuffers => _params?.Count ?? 0;
 
     /// <summary>
     /// Gather along axis 0: output[i, :] = data[indices[i], :].
@@ -100,15 +106,10 @@ public class GatherKernel : IDisposable
 
     private Action<Index1D, ArrayView1D<float, Stride1D.Dense>, ArrayView1D<float, Stride1D.Dense>,
         ArrayView1D<float, Stride1D.Dense>, ArrayView1D<int, Stride1D.Dense>>? _gatherGenericFloatKernel;
-    private MemoryBuffer1D<int, Stride1D.Dense>? _lastGenericParams;
-    // Old per-call params buffers, retired here and disposed in Dispose() — NOT inline. On WebGPU/WebGL a
-    // dispatch batches into an un-submitted command encoder; destroying the previous call's params buffer
-    // inline (while its Gather dispatch is still pending in the batch) makes the later Queue.Submit fail
-    // "[Buffer] used in submit while destroyed" (this is the DAv3-518 RoPE node-177 bug — the RoPE dynamic-shape
-    // subgraph issues several GatherGenericFloat calls that batch together). Same deferred-disposal pattern as
-    // ElementWiseKernels.BroadcastBinaryOpND's _oldStridesBufs. Each call still gets a FRESH buffer (no
-    // write-after-read hazard from reusing one), we just free the old ones at a safe point.
-    private readonly List<MemoryBuffer1D<int, Stride1D.Dense>> _oldGenericParams = new();
+    // Params buffers are NEVER destroyed inline: on WebGPU/WebGL a dispatch batches into an un-submitted command
+    // encoder, and destroying a params buffer while its Gather is still pending makes the later Queue.Submit fail
+    // "[Buffer] used in submit while destroyed" (the DAv3-518 RoPE node-177 bug - the RoPE dynamic-shape subgraph
+    // issues several GatherGenericFloat calls that batch together). See _params.
 
     /// <summary>
     /// General Gather along any axis with float indices.
@@ -159,11 +160,7 @@ public class GatherKernel : IDisposable
         }
         else
         {
-            // Retire the previous buffer for deferred disposal (see _oldGenericParams) instead of destroying it
-            // inline — its Gather dispatch may still be pending in an un-submitted WebGPU command batch.
-            if (_lastGenericParams != null) _oldGenericParams.Add(_lastGenericParams);
-            _lastGenericParams = _accelerator.Allocate1D(packed);
-            paramsView = _lastGenericParams.View;
+            paramsView = (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
         }
         _gatherGenericFloatKernel!(outerSize * numIdx * innerSize, data, indices, output, paramsView);
     }
@@ -231,11 +228,7 @@ public class GatherKernel : IDisposable
         }
         else
         {
-            // Retire rather than dispose: the dispatch may still be pending in an un-submitted WebGPU
-            // command batch, and freeing a buffer it reads makes the GPU read zeros.
-            if (_lastElementsParams != null) _oldElementsParams.Add(_lastElementsParams);
-            _lastElementsParams = _accelerator.Allocate1D(packed);
-            paramsView = _lastElementsParams.View;
+            paramsView = (_params ??= new ContentParamBuffers<int>(_accelerator)).Get(packed);
         }
         _gatherElementsKernel!(outer * idxAxis * inner, data, indices, output, paramsView);
     }
@@ -258,13 +251,7 @@ public class GatherKernel : IDisposable
 
     public void Dispose()
     {
-        _lastGenericParams?.Dispose();
-        _lastGenericParams = null;
-        foreach (var b in _oldGenericParams) b.Dispose();
-        _oldGenericParams.Clear();
-        _lastElementsParams?.Dispose();
-        _lastElementsParams = null;
-        foreach (var b in _oldElementsParams) b.Dispose();
-        _oldElementsParams.Clear();
+        _params?.Dispose();
+        _params = null;
     }
 }
