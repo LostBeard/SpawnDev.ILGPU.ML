@@ -3,6 +3,8 @@
 @using SpawnDev.ILGPU.ML
 @using SpawnDev.ILGPU.ML.Hub
 @using SpawnDev.ILGPU.ML.Pipelines
+@using SpawnDev.ILGPU.WebGPU
+@using SpawnDev.ILGPU.WebGPU.Backend
 @implements IDisposable
 
 <PageTitle>Object Detection — SpawnDev.ILGPU.ML</PageTitle>
@@ -15,13 +17,13 @@
             OnBackendChange="@HandleBackendChange"
             InferenceTimeMs="@_inferenceMs"
             IsRunning="@_isRunning"
-            ShowFps="true"
+            ShowFps="@_useWebcam"
             ShowModelProgress="true"
             ModelName="YOLOv8-Nano"
             IsModelLoading="@_isModelLoading"
             IsModelLoaded="@_isModelLoaded"
             ModelProgressPercent="@_modelProgress"
-            ModelSizeMB="4">
+            ModelSizeMB="12.2">
 
     <div class="detect-controls">
         <label class="threshold-label">Confidence:</label>
@@ -29,8 +31,8 @@
         <span class="threshold-value">@_confidenceThreshold%</span>
 
         <div class="mode-toggle">
-            <button class="mode-btn @(_useWebcam ? "" : "active")" @onclick="() => _useWebcam = false">Image</button>
-            <button class="mode-btn @(_useWebcam ? "active" : "")" @onclick="() => _useWebcam = true">Webcam</button>
+            <button class="mode-btn @(!_useWebcam ? "active" : "")" @onclick="SwitchToImage">Image</button>
+            <button class="mode-btn @(_useWebcam ? "active" : "")" @onclick="SwitchToWebcam">Webcam</button>
         </div>
     </div>
 
@@ -40,20 +42,28 @@
                             ImageWidth="640" ImageHeight="480"
                             ConfidenceThreshold="@(_confidenceThreshold / 100f)">
             <WebcamCapture OnFrameCaptured="@HandleFrame"
-                           AutoCapture="true"
+                           AutoCapture="@_isModelLoaded"
                            CaptureIntervalMs="100"
-                           ShowCaptureButton="false" />
+                           ShowCaptureButton="true"
+                           Width="640" Height="480" />
         </BoundingBoxOverlay>
+    }
+    else if (_imageDataUrl != null)
+    {
+        <BoundingBoxOverlay Detections="@_detections"
+                            ImageWidth="@_imageWidth" ImageHeight="@_imageHeight"
+                            ConfidenceThreshold="@(_confidenceThreshold / 100f)">
+            <img src="@_imageDataUrl" alt="Input" style="max-width:100%; display:block;" />
+        </BoundingBoxOverlay>
+        <div class="result-actions">
+            <button class="action-btn" @onclick="ClearStillImage">Try Another Image</button>
+        </div>
     }
     else
     {
-        <BoundingBoxOverlay Detections="@_detections"
-                            ImageWidth="640" ImageHeight="480"
-                            ConfidenceThreshold="@(_confidenceThreshold / 100f)">
-            <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
-                           OnImageLoaded="@HandleImageLoaded"
-                           SampleImages="@_detectSamples" />
-        </BoundingBoxOverlay>
+        <ImageDropZone @bind-ImageDataUrl="_imageDataUrl"
+                       OnImageLoaded="@HandleImageLoaded"
+                       SampleImages="@_detectSamples" />
     }
 
     @if (_detections?.Any() == true)
@@ -69,10 +79,14 @@
         </div>
     }
 
-    @if (!_isModelLoaded && !_isModelLoading)
+    @if (!string.IsNullOrEmpty(_error))
+    {
+        <div class="error-banner">@_error</div>
+    }
+    else if (!_isModelLoaded && !_isModelLoading)
     {
         <div class="model-needed">
-            Loading YOLOv8-Nano (12MB) from HuggingFace CDN. Model will be cached locally after first download.
+            YOLOv8-Nano (~12&nbsp;MB) loads on your first image or Capture click.
         </div>
     }
 
@@ -91,15 +105,9 @@
         flex-wrap: wrap;
     }
 
-    .threshold-label {
-        color: #64748b;
-        font-size: 0.85rem;
-    }
+    .threshold-label { color: #64748b; font-size: 0.85rem; }
 
-    .threshold-slider {
-        width: 120px;
-        accent-color: #8b5cf6;
-    }
+    .threshold-slider { width: 120px; accent-color: #8b5cf6; }
 
     .threshold-value {
         color: #94a3b8;
@@ -127,14 +135,8 @@
         transition: all 0.15s ease;
     }
 
-    .mode-btn.active {
-        background: rgba(139, 92, 246, 0.2);
-        color: #e2e8f0;
-    }
-
-    .mode-btn:hover:not(.active) {
-        background: rgba(255, 255, 255, 0.08);
-    }
+    .mode-btn.active { background: rgba(139, 92, 246, 0.2); color: #e2e8f0; }
+    .mode-btn:hover:not(.active) { background: rgba(255, 255, 255, 0.08); }
 
     .detection-summary {
         display: flex;
@@ -162,11 +164,36 @@
         color: #fbbf24;
         font-size: 0.85rem;
     }
+
+    .error-banner {
+        margin-top: 1rem;
+        padding: 0.75rem 1rem;
+        background: rgba(248, 113, 113, 0.1);
+        border: 1px solid rgba(248, 113, 113, 0.3);
+        border-radius: 8px;
+        color: #fca5a5;
+        font-size: 0.85rem;
+    }
+
+    .result-actions { margin-top: 0.75rem; }
+
+    .action-btn {
+        padding: 0.4rem 0.9rem;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.05);
+        color: #94a3b8;
+        font-size: 0.85rem;
+        cursor: pointer;
+    }
+
+    .action-btn:hover { background: rgba(255, 255, 255, 0.1); color: #e2e8f0; }
 </style>
 
 @code {
     private string _selectedBackend = "WebGPU";
     private string? _imageDataUrl;
+    private string? _error;
     private bool _useWebcam;
     private int _confidenceThreshold = 50;
     private bool _isRunning;
@@ -174,7 +201,11 @@
     private bool _isModelLoaded;
     private double _modelProgress;
     private double _inferenceMs;
+    private int _imageWidth = 640;
+    private int _imageHeight = 480;
     private List<BoundingBoxOverlay.Detection>? _detections;
+    private bool _processingFrame;
+    private Task? _loadTask;
 
     private List<ImageDropZone.SampleImage> _detectSamples = new()
     {
@@ -198,14 +229,53 @@
     private global::ILGPU.Context? _context;
     private Pipelines.ObjectDetectionPipeline? _pipeline;
 
-    // OPT-IN: YOLOv8-Nano is NOT downloaded/loaded on page entry. It loads on the first real
-    // interaction (picking an image or switching to the webcam) — see HandleImageLoaded / HandleFrame.
+    // OPT-IN: YOLOv8 loads on first image / Capture — not on page entry.
+    // Local wwwroot model (same bytes as the hub file) — hub is optional, not required to demo.
+
+    private void SwitchToImage()
+    {
+        if (!_useWebcam) return;
+        _useWebcam = false;
+        _detections = null;
+        StateHasChanged();
+    }
+
+    private void SwitchToWebcam()
+    {
+        if (_useWebcam) return;
+        _useWebcam = true;
+        _imageDataUrl = null;
+        _detections = null;
+        StateHasChanged();
+    }
+
+    private void ClearStillImage()
+    {
+        _imageDataUrl = null;
+        _detections = null;
+        StateHasChanged();
+    }
+
+    private async Task EnsureModelAsync()
+    {
+        if (_isModelLoaded) return;
+        if (_loadTask != null)
+        {
+            await _loadTask;
+            return;
+        }
+        _loadTask = LoadModelAsync();
+        try { await _loadTask; }
+        finally { _loadTask = null; }
+    }
 
     private async Task LoadModelAsync()
     {
         try
         {
             _isModelLoading = true;
+            _error = null;
+            _modelProgress = 5;
             StateHasChanged();
 
             if (_context == null)
@@ -215,22 +285,57 @@
                 _context = builder.ToContext();
             }
 
-            _accelerator = await _context.CreatePreferredAcceleratorAsync();
-            if (_accelerator == null) { _isModelLoading = false; StateHasChanged(); return; }
+            _modelProgress = 20;
+            StateHasChanged();
+            _accelerator?.Dispose();
+            _accelerator = await CreateAcceleratorForBackendAsync(_selectedBackend);
+            if (_accelerator == null)
+            {
+                _error = $"No {_selectedBackend} device available";
+                return;
+            }
 
-            using var hub = new Hub.ModelHub(JS);
-            // Weights are delivered as a LAZY-HASH torrent: streamable with random access, OPFS-cached
-            // by piece, restored on reload with no re-download, and seeded to peers.
-            var session = await InferenceSession.CreateFromHuggingFaceAsync(
-                _accelerator, hub, Hub.ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx",
-                http: Http);
+            _modelProgress = 40;
+            StateHasChanged();
+
+            // Prefer the bundled demo copy — always available, no hub dependency.
+            // Fall back to hub if the local file is missing (e.g. stripped publish).
+            InferenceSession session;
+            try
+            {
+                session = await InferenceSession.CreateFromFileAsync(
+                    _accelerator, Http, "models/yolov8n/model.onnx",
+                    onProgress: (stage, pct) =>
+                    {
+                        _modelProgress = 40 + pct * 0.55;
+                        StateHasChanged();
+                    });
+            }
+            catch (Exception localEx)
+            {
+                Console.WriteLine($"[Detect] Local model failed ({localEx.Message}); trying hub…");
+                using var hub = new Hub.ModelHub(JS);
+                session = await InferenceSession.CreateFromHuggingFaceAsync(
+                    _accelerator, hub, Hub.ModelHub.KnownModels.YOLOv8n, "yolov8n-onnx-web/yolov8n.onnx",
+                    http: Http,
+                    onProgress: (stage, pct) =>
+                    {
+                        _modelProgress = 40 + pct * 0.55;
+                        StateHasChanged();
+                    });
+            }
+
+            _pipeline?.Dispose();
             _pipeline = new Pipelines.ObjectDetectionPipeline(session, _accelerator);
-
             _isModelLoaded = true;
+            _modelProgress = 100;
+            Console.WriteLine($"[Detect] Model loaded on {_selectedBackend}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Detect] Error: {ex.Message}");
+            _error = $"Failed to load YOLOv8: {ex.Message}";
+            Console.WriteLine($"[Detect] Error: {ex}");
+            _isModelLoaded = false;
         }
         finally
         {
@@ -239,35 +344,71 @@
         }
     }
 
-    private bool _processingFrame;
+    private async Task<global::ILGPU.Runtime.Accelerator?> CreateAcceleratorForBackendAsync(string backendId)
+    {
+        if (_context == null) return null;
+        try
+        {
+            return backendId switch
+            {
+                "WebGPU" => await CreateWebGPUAsync(),
+                "WebGL" => await CreateWebGLAsync(),
+                "Wasm" => await CreateWasmAsync(),
+                _ => null
+            };
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Detect] Backend {backendId} failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private async Task<global::ILGPU.Runtime.Accelerator?> CreateWebGPUAsync()
+    {
+        var devices = _context!.GetDevices<WebGPUILGPUDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task<global::ILGPU.Runtime.Accelerator?> CreateWebGLAsync()
+    {
+        var devices = _context!.GetDevices<SpawnDev.ILGPU.WebGL.WebGLILGPUDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
+
+    private async Task<global::ILGPU.Runtime.Accelerator?> CreateWasmAsync()
+    {
+        var devices = _context!.GetDevices<SpawnDev.ILGPU.Wasm.WasmILGPUDevice>();
+        return devices.Count > 0 ? await devices[0].CreateAcceleratorAsync(_context) : null;
+    }
 
     private async Task HandleBackendChange(string backend)
     {
+        if (backend == _selectedBackend && _isModelLoaded) return;
         bool wasLoaded = _isModelLoaded;
+        _selectedBackend = backend;
         _pipeline?.Dispose();
         _pipeline = null;
         _accelerator?.Dispose();
         _accelerator = null;
         _isModelLoaded = false;
-        // Opt-in: only re-load if the model was already loaded; switching backend before
-        // first use must not trigger a download.
+        _detections = null;
         if (wasLoaded)
-            await LoadModelAsync();
+            await EnsureModelAsync();
         else
             StateHasChanged();
     }
 
     private async Task HandleImageLoaded(byte[] imageBytes)
     {
-        if (_isModelLoading) return;
-        // Opt-in load: pull the model on first use (user picked an image), not on page entry.
-        if (!_isModelLoaded) await LoadModelAsync();
+        await EnsureModelAsync();
         if (_pipeline == null) return;
         try
         {
-            // Decode image file bytes to RGBA via browser createImageBitmap
+            _error = null;
+            var mime = SniffImageMime(imageBytes);
             using var blob = new SpawnDev.SpawnJS.JSObjects.Blob(
-                new[] { imageBytes }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = "image/png" });
+                new[] { imageBytes }, new SpawnDev.SpawnJS.JSObjects.BlobOptions { Type = mime });
             using var window = JS.Get<SpawnDev.SpawnJS.JSObjects.Window>("window");
             using var bitmap = await window.CreateImageBitmap(blob);
             int w = (int)bitmap.Width;
@@ -280,32 +421,35 @@
             using var imageData = ctx.GetImageData(0, 0, w, h);
             using var data = imageData.Data;
             var rgbaPixels = data.Read<int>();
+            _imageWidth = w;
+            _imageHeight = h;
 
             await RunDetection(rgbaPixels, w, h);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Detect] Image decode error: {ex.Message}");
+            _error = $"Image decode/inference failed: {ex.Message}";
+            Console.WriteLine($"[Detect] Image error: {ex}");
+            StateHasChanged();
         }
     }
 
     private async Task HandleFrame(byte[] frameBytes)
     {
         if (_processingFrame) return;
-        // Opt-in load: switching to the webcam is the first engagement — load the model now.
-        if (!_isModelLoaded && !_isModelLoading) await LoadModelAsync();
-        if (_pipeline == null) return;
         _processingFrame = true;
         try
         {
-            // Convert RGBA byte[] to int[] (pack 4 bytes per pixel)
+            await EnsureModelAsync();
+            if (_pipeline == null) return;
             var rgbaPixels = new int[frameBytes.Length / 4];
             Buffer.BlockCopy(frameBytes, 0, rgbaPixels, 0, frameBytes.Length);
             await RunDetection(rgbaPixels, 640, 480);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Detect] Frame error: {ex.Message}");
+            _error = $"Frame error: {ex.Message}";
+            Console.WriteLine($"[Detect] Frame error: {ex}");
         }
         finally
         {
@@ -335,10 +479,23 @@
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Detect] Inference error: {ex.Message}");
+            _error = $"Inference failed: {ex.Message}";
+            Console.WriteLine($"[Detect] Inference error: {ex}");
         }
         _isRunning = false;
         StateHasChanged();
+    }
+
+    private static string SniffImageMime(byte[] bytes)
+    {
+        if (bytes.Length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF)
+            return "image/jpeg";
+        if (bytes.Length >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47)
+            return "image/png";
+        if (bytes.Length >= 12 && bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46
+            && bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50)
+            return "image/webp";
+        return "image/jpeg";
     }
 
     public void Dispose()

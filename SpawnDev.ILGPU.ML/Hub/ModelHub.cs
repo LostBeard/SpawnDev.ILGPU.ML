@@ -347,6 +347,10 @@ public class ModelHub : IDisposable
 
         // ── Face Detection ──
         /// <summary>BlazeFace — MediaPipe face detector, TFLite format (228 KB)</summary>
+        /// <remarks>
+        /// Demo pages load <c>wwwroot/models/blaze-face/model.tflite</c> first: hub.spawndev.com has been
+        /// returning 502 for this repo (2026-09-26). Prefer the local copy for demos; hub when mirrored.
+        /// </remarks>
         public const string BlazeFace = "litert-community/blaze-face";
 
         // ── Pose Estimation ──
